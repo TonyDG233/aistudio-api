@@ -163,7 +163,7 @@ def test_parse_text_output_fallback():
 
 
 def test_parse_image_output_keeps_only_final_images_in_images_field():
-    raw = (FIXTURES / "test_image_output.json").read_text()
+    raw = (FIXTURES / "test_image_output.json").read_text(encoding="utf-8")
     output = parse_image_output(raw)
 
     assert len(output.images) == 1

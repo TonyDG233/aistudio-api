@@ -163,13 +163,15 @@ def test_js_ast_syntax_with_external_runtime():
         else:
             cmd = [runtime, "-c", str(js_file)]
 
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
         assert res.returncode == 0, (
             f"{runtime} syntax check failed for {js_file.name}:\n{res.stderr}"
         )
 
 
-def test_evaluate_wrapper_expressions_parse_cleanly():
+def test_evaluate_wrapper_expressions_parse_cleanly(tmp_path):
     """Test wrapping each script inside an expression as CDP evaluate() does."""
     runtime = shutil.which("bun") or shutil.which("node")
     if not runtime:
@@ -194,8 +196,14 @@ def test_evaluate_wrapper_expressions_parse_cleanly():
 
         prelude = "globalThis.window = globalThis; globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };"
         code = f"{prelude} try {{ new Function({wrapped!r}); }} catch (e) {{ if (e instanceof SyntaxError) throw e; }}"
-        cmd = [runtime, "-e", code]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        # Execute through a temp file: passing large JS through the Windows
+        # cmd.exe shim (bun.CMD) command line breaks under cmd quoting rules.
+        script_file = tmp_path / f"{name}.js"
+        script_file.write_text(code, encoding="utf-8")
+        cmd = [runtime, str(script_file)]
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
         assert res.returncode == 0, (
             f"SyntaxError in evaluate() wrapper for {name}:\n{res.stderr}"
         )
