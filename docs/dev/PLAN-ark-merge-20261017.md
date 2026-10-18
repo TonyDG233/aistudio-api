@@ -227,7 +227,7 @@
 | P0 | WP0 四 Spike | 全绿或设计修订；内存结论定 flag 基线 |
 | P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
 | P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测，pytest 352 全绿）；真机 prefer 非流式/流式成功、required 为 R8 500（无 200 落盘证据，见 `docs/dev/AUDIT-P2P3-20261018.md` §3）；E5 白名单补偿已入库。（2026-10-18 晨复验通过：off/prefer/required 3/3——prefer/required 日志直证 `syntheticHit=true`；pro 账号 argon 经 chat 路径首调 200；证据 `docs/dev/evidence/p2-verify/`） |
-| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。✅ 完成（2026-10-18 晚）：WP4 服务内验收 2/2（`docs/dev/evidence/p3-build3/`）；WP5 实现完毕并经真机五相位验收全绿——组路由 build 200 / argon chat 200 / 守卫 403×2 / 配额 429，决策链可 grep（`docs/dev/evidence/wp5-20261018/`）；根因与结论见 `docs/dev/AUDIT-P2P3-20261018.md` 附与附三 |
+| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。✅ 完成（2026-10-18 晚）：WP4 服务内验收 2/2（`docs/dev/evidence/p3-build3/`）；WP5 实现完毕并经真机五相位验收全绿——组路由 build 200 / argon chat 200 / 守卫 403×2 / 配额 429，决策链可 grep（`docs/dev/evidence/wp5-20261018/`）；根因与结论见 `docs/dev/AUDIT-P2P3-20261018.md` 附、附三与附四；2026-10-18 深夜追加 Build 通信加固（复用快路径实测 3.9s、过门重试环、原地恢复） |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P5 | WP6 + WP7 | 统计/UI 增量（含 formatBreakdown）、文档、质量门全绿、致谢入库 |
 
