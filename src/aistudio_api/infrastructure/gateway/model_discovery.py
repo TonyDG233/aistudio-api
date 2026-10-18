@@ -155,16 +155,23 @@ class ModelDiscoveryService:
             effective_cookies = cookies
             effective_auth_user = auth_user
             if not effective_cookies:
-                auth_file = getattr(session, "_auth_file", None) if session is not None else None
+                auth_file = (
+                    getattr(session, "_auth_file", None)
+                    if session is not None
+                    else None
+                )
                 if not auth_file:
                     try:
                         from aistudio_api.infrastructure.account.account_store import (
                             AccountStore,
                         )
+
                         store = AccountStore()
                         active = store.get_active_account()
                         if active:
-                            auth_path = store.get_auth_path_optional(active.id, require_exists=True)
+                            auth_path = store.get_auth_path_optional(
+                                active.id, require_exists=True
+                            )
                             auth_file = str(auth_path) if auth_path else None
                             effective_auth_user = active.auth_user or "0"
                     except Exception:
@@ -178,14 +185,18 @@ class ModelDiscoveryService:
                             for c in raw_cookies
                             if c.get("name")
                         }
-                        if session is not None and hasattr(session, "get_current_auth_user"):
+                        if session is not None and hasattr(
+                            session, "get_current_auth_user"
+                        ):
                             effective_auth_user = session.get_current_auth_user()
                     except Exception:
                         pass
 
             if effective_cookies:
                 try:
-                    models = await self._fetch_via_http(effective_cookies, effective_auth_user)
+                    models = await self._fetch_via_http(
+                        effective_cookies, effective_auth_user
+                    )
                     if models:
                         self._cached_models = models
                         self._last_fetched_at = time.time()

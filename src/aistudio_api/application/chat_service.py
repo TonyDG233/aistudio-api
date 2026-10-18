@@ -52,9 +52,6 @@ SCHEMA_TYPE_CODES = {
 }
 
 
-
-
-
 def _resolve_schema_type_code(schema: dict[str, object]) -> tuple[int, str, bool]:
     raw_type = schema.get("type")
     is_nullable = False

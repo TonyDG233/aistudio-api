@@ -179,6 +179,7 @@ async def test_handle_attempt_exception_retries_ambiguous_rpc_404_in_place():
             has_yielded_data=True,
         )
 
+
 @pytest.mark.asyncio
 async def test_build_gemini_streaming_response_passes_requested_model():
     from unittest.mock import MagicMock
@@ -202,7 +203,9 @@ async def test_build_gemini_streaming_response_passes_requested_model():
         yield ("finish_reason", "STOP")
 
     mock_client = MagicMock(spec=AIStudioClient)
-    mock_client.stream_generate_content = MagicMock(side_effect=fake_stream_generate_content)
+    mock_client.stream_generate_content = MagicMock(
+        side_effect=fake_stream_generate_content
+    )
 
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])]
@@ -248,7 +251,9 @@ async def test_streaming_metadata_event_does_not_block_failover():
         yield ("finish_reason", "STOP")
 
     mock_client = MagicMock(spec=AIStudioClient)
-    mock_client.stream_generate_content = MagicMock(side_effect=fake_stream_generate_content)
+    mock_client.stream_generate_content = MagicMock(
+        side_effect=fake_stream_generate_content
+    )
     mock_client.clear_templates = MagicMock()
 
     req = GeminiGenerateContentRequest(
