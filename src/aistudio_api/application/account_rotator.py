@@ -485,17 +485,39 @@ class AccountRotator:
         return self._stats.get(account_id)
 
     def is_account_available(self, account_id: str, model: str | None = None) -> bool:
-        """检查指定账号在特定模型下是否健康可用。"""
+        """检查指定账号在特定模型下是否健康可用（凭据过期账号一律不可用）。"""
+        account = self._store.get_account(account_id)
+        if account is not None and getattr(account, "expired", False):
+            return False
         stats = self.get_account_stats(account_id)
         return bool(stats and stats.is_available(model))
+
+    def _warn_if_all_expired(self) -> None:
+        """当全部账号都因凭据过期而不可调度时，显式报错（不静默回落）。"""
+        accounts = self._store.list_accounts()
+        if accounts and all(getattr(a, "expired", False) for a in accounts):
+            logger.error(
+                "所有账号凭据均已过期(credential expired)，已无可调度账号；"
+                "请重新导入 cookies (re-import cookies)"
+            )
 
     def _get_available_accounts(
         self, model: str | None = None, *, ignore_auth_cooldown: bool = False
     ) -> list[tuple[AccountMeta, AccountStats]]:
-        """获取在指定模型下尚未耗尽当日额度且未被鉴权锁定的账号列表。"""
+        """获取在指定模型下尚未耗尽当日额度且未被鉴权锁定的账号列表。
+
+        凭据过期（``AccountMeta.expired``）的账号在此统一排除出所有调度选择。
+        """
         accounts = self._store.list_accounts()
         available: list[tuple[AccountMeta, AccountStats]] = []
         for account in accounts:
+            if getattr(account, "expired", False):
+                logger.debug(
+                    "账号 %s 凭据已过期(credential expired)，已排除出调度；"
+                    "请重新导入 cookies (re-import cookies)",
+                    account.id,
+                )
+                continue
             stats = self._stats.get(account.id, AccountStats(account_id=account.id))
             if stats.is_available(model, ignore_auth_cooldown=ignore_auth_cooldown):
                 available.append((account, stats))
@@ -518,6 +540,7 @@ class AccountRotator:
                     model, ignore_auth_cooldown=True
                 )
                 if not available:
+                    self._warn_if_all_expired()
                     return None
 
             # 优先在排除失败账号的候选集中挑选
@@ -576,6 +599,7 @@ class AccountRotator:
                     model, ignore_auth_cooldown=True
                 )
                 if not available:
+                    self._warn_if_all_expired()
                     return None
 
             candidates = [

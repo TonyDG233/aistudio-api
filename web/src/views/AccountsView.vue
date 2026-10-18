@@ -8,7 +8,7 @@ import Button from '@/components/ui/Button.vue'
 import AccountTable from '@/components/accounts/AccountTable.vue'
 import CookieImportModal from '@/components/modals/CookieImportModal.vue'
 import EditAccountModal from '@/components/modals/EditAccountModal.vue'
-import { Plus, RotateCcw, ArrowRightLeft } from 'lucide-vue-next'
+import { Plus, RotateCcw, ArrowRightLeft, RefreshCw } from 'lucide-vue-next'
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
@@ -40,6 +40,10 @@ async function handleForceNext() {
   await systemStore.forceNextAccount()
   await accountsStore.fetchAll()
 }
+
+async function handleRefreshAll() {
+  await accountsStore.refreshAllAccounts()
+}
 </script>
 
 <template>
@@ -53,6 +57,17 @@ async function handleForceNext() {
       </div>
 
       <div class="flex items-center gap-2 flex-wrap">
+        <Button
+          variant="outline"
+          size="md"
+          :loading="accountsStore.refreshingAll"
+          title="刷新全部账号的档位(tier)/过期状态/邮箱；同一时间仅允许一次刷新，并发触发将返回 409"
+          @click="handleRefreshAll"
+        >
+          <RefreshCw class="w-4 h-4" />
+          <span>刷新全部账号信息</span>
+        </Button>
+
         <Button
           variant="outline"
           size="md"

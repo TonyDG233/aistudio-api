@@ -7,6 +7,8 @@ import type {
   ProbeAndImportResponse,
   ImportBundleRequest,
   ImportBundleResponse,
+  RefreshAccountsRequest,
+  RefreshAccountsResponse,
 } from '@/types'
 
 export const accountsApi = {
@@ -62,6 +64,13 @@ export const accountsApi = {
   },
   importBundle(req: ImportBundleRequest): Promise<ImportBundleResponse> {
     return request<ImportBundleResponse>('/api/accounts/import-bundle', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
+
+  refreshAccounts(req: RefreshAccountsRequest): Promise<RefreshAccountsResponse> {
+    return request<RefreshAccountsResponse>('/api/accounts/refresh', {
       method: 'POST',
       body: JSON.stringify(req),
     })

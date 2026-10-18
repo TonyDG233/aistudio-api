@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { accountsApi } from '@/api/accounts.ts'
+import { ApiError } from '@/api/client.ts'
 import { useSystemStore } from './system.ts'
 import type {
   Account,
@@ -9,6 +10,7 @@ import type {
   ImportCookiesRequest,
   ProbeAndImportRequest,
   ImportBundleRequest,
+  RefreshAccountsResponse,
 } from '@/types'
 import { useToastStore } from './toast.ts'
 
@@ -22,6 +24,8 @@ export const useAccountsStore = defineStore('accounts', () => {
   const loading = ref(false)
   const activatingId = ref<string | null>(null)
   const importing = ref(false)
+  const refreshingAll = ref(false)
+  const refreshingIds = ref<Record<string, boolean>>({})
 
   const activeId = computed(() => activeAccount.value?.id || '')
 
@@ -186,6 +190,65 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  function summarizeRefresh(res: RefreshAccountsResponse): string {
+    const expired = res.expired_count
+    const ok = res.results.filter((r) => r.ok).length
+    return `刷新完成: 成功 ${ok}/${res.refreshed_count}${expired > 0 ? `，检出过期 ${expired} 个` : ''}`
+  }
+
+  function reportRefreshError(err: unknown, fallback: string) {
+    const toast = useToastStore()
+    if (err instanceof ApiError && err.status === 409) {
+      toast.warning('已有账号信息刷新正在进行中，请稍后再试')
+      return
+    }
+    const msg = err instanceof Error ? err.message : fallback
+    toast.error(msg)
+  }
+
+  async function refreshAllAccounts() {
+    refreshingAll.value = true
+    try {
+      const res = await accountsApi.refreshAccounts({ all: true, refresh_email: true })
+      useToastStore().success(summarizeRefresh(res))
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      reportRefreshError(err, '批量刷新账号信息失败')
+      return null
+    } finally {
+      refreshingAll.value = false
+    }
+  }
+
+  async function refreshAccount(id: string) {
+    refreshingIds.value = { ...refreshingIds.value, [id]: true }
+    try {
+      const res = await accountsApi.refreshAccounts({
+        account_ids: [id],
+        refresh_email: true,
+      })
+      const result = res.results.find((r) => r.id === id)
+      const toast = useToastStore()
+      if (result && result.ok) {
+        toast.success(`刷新成功: tier=${result.tier ?? '未知'}`)
+      } else if (result && result.expired) {
+        toast.warning('凭据已过期 (401)，请重新导入 cookies')
+      } else {
+        toast.error(result?.error || '刷新失败')
+      }
+      await fetchAll()
+      return result ?? null
+    } catch (err: unknown) {
+      reportRefreshError(err, '刷新账号信息失败')
+      return null
+    } finally {
+      const next = { ...refreshingIds.value }
+      delete next[id]
+      refreshingIds.value = next
+    }
+  }
+
   return {
     accounts,
     activeAccount,
@@ -195,6 +258,8 @@ export const useAccountsStore = defineStore('accounts', () => {
     loading,
     activatingId,
     importing,
+    refreshingAll,
+    refreshingIds,
     fetchAll,
     activateAccount,
     deleteAccount,
@@ -204,5 +269,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     probeAndImport,
     importBundle,
     detectAccountEmail,
+    refreshAllAccounts,
+    refreshAccount,
   }
 })
