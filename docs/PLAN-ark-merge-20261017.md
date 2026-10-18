@@ -217,8 +217,8 @@
 |---|---|---|
 | P0 | WP0 四 Spike | 全绿或设计修订；内存结论定 flag 基线 |
 | P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
-| P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测）；真机 prefer 非流式/流式 syntheticHit=true、required 暖会话 200；E5 白名单补偿已入库 |
-| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环 |
+| P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测，pytest 352 全绿）；真机 prefer 非流式/流式成功、required 为 R8 500（无 200 落盘证据，见 `docs/AUDIT-P2P3-20261018.md` §3）；E5 白名单补偿已入库 |
+| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。（当前状态见 `docs/AUDIT-P2P3-20261018.md`：WP4 代码已落地未提交、门禁 394 全绿；服务内验收未过 TB_MISSING；本仓签名器 E2E 尚未跑通） |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P5 | WP6 + WP7 | 统计/UI 增量（含 formatBreakdown）、文档、质量门全绿、致谢入库 |
 
