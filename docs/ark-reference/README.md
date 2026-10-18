@@ -13,11 +13,12 @@
 | `build-channel/` | Build 通道 + 直连签名器原始研发文档（决策手册、方案、桥接史、封档/复活记录） | 做 WP4 时精读 |
 | `build-channel/evidence-20261017/` | MakerSuite bundle 考古证据（方法名录、wire 位置交叉验证、`M.Cn/M.GB` 签名方案、token 样本）+ 可复现脚本 | 做 WP4 时精读 |
 | `misc/create-ai-studio-app.md` | Build App 创建教程（Remix 空白应用、贴 `build.js`、公开分享、`AI_STUDIO_APP_URL`） | Spike A 环境准备 |
+| `scripts/client/` | Build App 侧客户端脚本副本（`build.js` + `index.html`；WS 任务/帧协议与 authIndex 握手的第一手来源，2026-10-18 抄入） | 做 WP4 协议核对时对照 |
 
 ## 阅读顺序建议
 
 1. 本目录 `ARK-TECHNICAL-REFERENCE.md` §1–§5（全局认知）；
-2. 计划书 `docs/PLAN-ark-merge-20261017.md`（WP0–WP9 分工）；
+2. 计划书 `docs/dev/PLAN-ark-merge-20261017.md`（WP0–WP9 分工）；
 3. WP4 开工前：`build-channel/transport-decision-and-400-triage.md` + `direct-signer-pipeline-20261017.md`
    + `evidence-20261017/README.md` -> `proxystreamedcall-transport-switch-20261017.md` -> `native-forced-tool-egress-capture-20261017.md`；
 4. WP2 开工前：`ARK-TECHNICAL-REFERENCE.md` §7（ATG）+ Ark 仓库 `src/atg/*` 源码；

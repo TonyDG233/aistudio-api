@@ -269,7 +269,7 @@ RequestHandler ──┬─ 格式 Handler（ChatCompletionsHandler / ClaudeHand
 
 ## 12. 来源与致谢
 
-- 本文件由 Ark_AIStudioToAPI 侧整理（2026-10-18），随 `docs/PLAN-ark-merge-20261017.md` 一同移交。
+- 本文件由 Ark_AIStudioToAPI 侧整理（2026-10-18），随 `docs/dev/PLAN-ark-merge-20261017.md` 一同移交。
 - 深度研究文档见 `build-channel/`：桥接史（`makersuite-generate-content-bridge-20261016.md`）、
   封档与复活（`archive-2026-10-16-build-channel-closure.md`）、直连方案（`direct-signer-pipeline-20261017.md`）、
   400 排查手册（`transport-decision-and-400-triage.md`）、bundle 考古（`evidence-20261017/`）。

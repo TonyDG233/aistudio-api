@@ -1,8 +1,17 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**待评估（P0 验证未执行）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P2 已完成；P3 进行中（WP4 服务内验收已通过、代码待提交；WP5 未开工）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
+>
+> **⚠️ 强制纪律（2026-10-18 起，用户指令）：任何"移植既有实现"动手前，必须先翻阅对方项目源码与移交参考文档，并先产出"文档对照"再实施；出现重复造轮子（文档已写明答案却重新试错）按事故追责。**
+> 必读位置：
+> - 对方源码（只读）：`D:\LLM\Ark_AIStudioToAPI`（`src/core/DirectSignerService.js`、`src/core/MakerSuiteCodec.js`、`src/atg/*`、`scripts/client/build.js`）
+> - 技术总参考：`docs/ark-reference/ARK-TECHNICAL-REFERENCE.md`（§6 Build 通道全程与坑位）
+> - Build 通道深读：`docs/ark-reference/build-channel/`（`direct-signer-pipeline-20261017.md`、`transport-decision-and-400-triage.md`、`makersuite-generate-content-bridge-20261016.md`、`archive-2026-10-16-build-channel-closure.md`、`evidence-20261017/`）
+> - app 侧客户端协议第一手：`docs/ark-reference/scripts/client/`（`build.js`）
+> - 本仓底层验证链：`docs/BOTGUARD_VERIFICATION_CHAIN.md`（403/快照语义）、`docs/WIRE_SPECIFICATION.md`、`docs/ARCHITECTURE.md`
+> - 反例对照表：`docs/dev/AUDIT-P2P3-20261018.md` 附二（"多少答案早已写好"，动手前先看）
 
 ---
 
@@ -217,8 +226,8 @@
 |---|---|---|
 | P0 | WP0 四 Spike | 全绿或设计修订；内存结论定 flag 基线 |
 | P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
-| P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测，pytest 352 全绿）；真机 prefer 非流式/流式成功、required 为 R8 500（无 200 落盘证据，见 `docs/AUDIT-P2P3-20261018.md` §3）；E5 白名单补偿已入库 |
-| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。（当前状态见 `docs/AUDIT-P2P3-20261018.md`：WP4 代码已落地未提交、门禁 394 全绿；服务内验收未过 TB_MISSING；本仓签名器 E2E 尚未跑通） |
+| P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测，pytest 352 全绿）；真机 prefer 非流式/流式成功、required 为 R8 500（无 200 落盘证据，见 `docs/dev/AUDIT-P2P3-20261018.md` §3）；E5 白名单补偿已入库 |
+| P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。（2026-10-18 晚更新：build 面服务内真流式验收 2/2 通过（200/正文正确/收割头 6 项），根因修复见 `docs/dev/AUDIT-P2P3-20261018.md` 文末"进展"；WP4 代码按门槛待提交、WP5 未开工） |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P5 | WP6 + WP7 | 统计/UI 增量（含 formatBreakdown）、文档、质量门全绿、致谢入库 |
 
@@ -259,7 +268,7 @@ git branch --set-upstream-to=origin/master master                        # maste
 ```
 现状：`origin/master` = `upstream/master` = `9bd5a20`（三端同步）。日常同步：`git fetch upstream && git merge upstream/master`（冲突隔离见 R3）。
 
-**本文档位置**：`docs/PLAN-ark-merge-20261017.md`（当前未跟踪；按约定随首个里程碑提交入库）。
+**本文档位置**：`docs/dev/PLAN-ark-merge-20261017.md`（已随 P1 里程碑入库；2026-10-18 迁入 `docs/dev/`）。
 
 **配套移交资料（2026-10-18）**：`docs/ark-reference/` —— Ark 技术总参考（`ARK-TECHNICAL-REFERENCE.md`）、
 Build 通道/直连签名器原始研究与 bundle 考古证据（`build-channel/`）、VPS 部署硬约束
