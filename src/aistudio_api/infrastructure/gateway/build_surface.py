@@ -77,14 +77,22 @@ BUILD_SURFACE_READY_TIMEOUT_S = 120.0
 # 宿主引导期间的过场弹窗点击器 + 可信输入过门（均逐字对齐 spikeP.py 实证做法）。
 INTERSTITIAL_CLICK_JS = """() => {
     const words = ["Continue to the app", "Skip", "Launch"];
+    const norm = (e) => (e.innerText || e.textContent || "").trim();
     const els = Array.from(document.querySelectorAll(
         'button, a, div[role="button"]'));
     for (const w of words) {
-        const el = els.find(e => {
-            const t = (e.innerText || e.textContent || "").trim();
-            return t === w;
+        const exact = els.find((e) => norm(e) === w);
+        if (exact) { exact.click(); return w; }
+    }
+    const clickable = Array.from(document.querySelectorAll(
+        'button, [role="button"]'));
+    for (const w of words) {
+        const wl = w.toLowerCase();
+        const hit = clickable.find((e) => {
+            const t = norm(e).toLowerCase();
+            return t && t.length <= 40 && t.includes(wl);
         });
-        if (el) { el.click(); return w; }
+        if (hit) { hit.click(); return w + "~"; }
     }
     return null;
 }"""
@@ -701,10 +709,32 @@ class BuildSurface:
     ) -> BuildSurfaceState:
         """Create/attach the host page and wait for the signer to capture token material."""
         state = self.state
+        same_auth = state.auth_file == auth_file
+        state.app_id = self.app_id
+
+        # 复用快路径（2026-10-18 通信优化）：页面存活 + 已就绪 + 账号未变时免去
+        # 重导航/重过门/重暖机；WS 断开则先试原地恢复（Ark 轻量重连思路），
+        # 恢复失败再走完整重建。旧实现每个请求全额重走 ensure_ready。
+        if (
+            same_auth
+            and state.page is not None
+            and not state.page.is_closed()
+            and state.ready
+            and not state.last_error
+            and (_APP_WS_CONNS or await self._recover_warmup(state.page))
+        ):
+            state.auth_user = auth_user
+            state.account_id = account_id
+            logger.info(
+                "[build] ensure_ready 复用已就绪页面（WS 连接=%d）",
+                len(_APP_WS_CONNS),
+            )
+            return state
+
         state.auth_file = auth_file
         state.auth_user = auth_user
         state.account_id = account_id
-        state.app_id = self.app_id
+        state.ready = False
 
         page = state.page
         created = False
@@ -754,9 +784,11 @@ class BuildSurface:
                 "Page.addScriptToEvaluateOnNewDocument", {"source": signer_js}
             )
 
-            with suppress(Exception):
+            try:
                 # 后台标签页会被浏览器节流并跳过 boot 期网络预热；宿主 warmup 需要前台可见性。
                 await page.cdp.send("Page.bringToFront")
+            except Exception as exc:
+                logger.warning("Page.bringToFront 失败（后台节流风险）: %s", exc)
             with suppress(Exception):
                 # headless/无窗口焦点时 document.hasFocus()=false，宿主助手 boot 会被
                 # focus 门挡下而不发 warmup（spikeP 实证复刻：Emulation.setFocusEmulationEnabled）。
@@ -765,7 +797,10 @@ class BuildSurface:
                 )
             url = BUILD_SURFACE_URL_TEMPLATE.format(app_id=state.app_id)
             try:
-                await page.goto(url, timeout_s=90.0, wait_until="domcontentloaded")
+                await page.goto(url, timeout_s=180.0, wait_until="domcontentloaded")
+                # Ark 对齐（BrowserManager.js:838）：domcontentloaded 后宿主仍在异步
+                # 挂载 preview iframe；先稳定 2s 再过门，显著降低首发唤醒落空的概率。
+                await asyncio.sleep(2.0)
             except Exception as exc:
                 raise BuildSurfaceError(
                     "ensure_ready",
@@ -775,14 +810,35 @@ class BuildSurface:
                 ) from exc
 
             await self._dismiss_interstitials(page)
-            # 双重过门（服务上下文实证）：gate#1 唤醒被后台节流的预览 iframe 使其 boot 并连上
-            # 9998；gate#2 落在 app 连接之后，作为"助手就绪后的首次可信交互"触发宿主 warmup。
-            await self._pass_human_gate(page)
-            app_connected = await self._wait_app_connect()
+            # 唤醒-连接重试环（2026-10-18 超时根因修复）：宿主 SPA 在 domcontentloaded 之后
+            # 才异步挂载 preview iframe；若只发一次过门而 iframe 尚未就绪，唤醒事件会丢失，
+            # 旧实现随即空等 100s（实测 22:29 案例：建页→100s 超时→第二发过门后才连接）。
+            # 现在改为每 ≤15s 重发一次可信输入，连接即退出，最坏耗时也被限制在同一量级。
+            app_connected = False
+            loop = asyncio.get_running_loop()
+            connect_deadline = loop.time() + 100.0
+            attempt = 0
+            while loop.time() < connect_deadline:
+                attempt += 1
+                await self._dismiss_interstitials(page, max_rounds=2)
+                await self._pass_human_gate(page)
+                remaining = max(1.0, connect_deadline - loop.time())
+                app_connected = await self._wait_app_connect(
+                    timeout_s=min(15.0, remaining)
+                )
+                if app_connected:
+                    logger.info("[build] app 内嵌客户端已连接（过门轮次=%d）", attempt)
+                    break
+                logger.info(
+                    "[build] 过门第 %d 轮未连接 9998，继续重试（signer=%s）",
+                    attempt,
+                    await self._probe_signer_state_safe(page),
+                )
             if not app_connected:
                 logger.warning(
-                    "app 内嵌客户端等待超时未连接 9998，仍继续过门与等待（诊断见 preview 域日志）"
+                    "app 内嵌客户端等待 100s 未连接 9998，仍继续过门与等待（诊断见 preview 域日志）"
                 )
+            # gate#2：落在 app 连接之后，作为"助手就绪后的首次可信交互"触发宿主 warmup 门。
             await self._pass_human_gate(page)
             # 主动 warmup（装置实证机制，spikeQ3/Q4）：经 9998 WS 向 app 内嵌客户端下发
             # __warmup__ 规格 → 宿主发起一次被吞没的 RPC → tb 捕获 + 收割头就位（零上游流量）。
@@ -824,6 +880,40 @@ class BuildSurface:
                 return True
             await asyncio.sleep(0.5)
         return False
+
+    async def _probe_signer_state_safe(self, page: CDPPage) -> str:
+        """Best-effort read of the page signer state for connect-wait diagnostics."""
+        with suppress(Exception):
+            snapshot = await page.evaluate(BUILD_SIGNER_STATE_JS)
+            if isinstance(snapshot, dict):
+                return str(snapshot.get("state") or "")
+        return "unknown"
+
+    async def _recover_warmup(self, page: CDPPage) -> bool:
+        """页面存活但 9998 断开时的原地恢复：重过门→等连接→重发 warmup→等就绪。
+
+        对齐 Ark 的"轻量重连"思路（不重导航）：仅当连接与暖机均恢复时复用页面，
+        否则返回 False，交由完整重建路径（重导航）处理。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60.0
+        while loop.time() < deadline and not _APP_WS_CONNS:
+            await self._dismiss_interstitials(page, max_rounds=2)
+            await self._pass_human_gate(page)
+            remaining = max(1.0, deadline - loop.time())
+            if await self._wait_app_connect(timeout_s=min(15.0, remaining)):
+                break
+        if not _APP_WS_CONNS:
+            logger.warning("[build] 原地恢复失败：9998 未在 60s 内重连，转完整重建")
+            return False
+        await self._trigger_warmup()
+        try:
+            await self._wait_for_ready(page, ready_timeout_s=60.0)
+        except BuildSurfaceError:
+            logger.warning("[build] 原地重暖机失败，转完整重建")
+            return False
+        logger.info("[build] 原地恢复成功：WS 重连 + 签名器重新就绪")
+        return True
 
     async def _pass_human_gate(self, page: CDPPage) -> None:
         """Best-effort trusted-input pass (mouse sweep + real click + Escape).
