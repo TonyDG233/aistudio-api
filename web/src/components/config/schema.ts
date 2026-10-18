@@ -437,6 +437,17 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     recommendedValue: true,
     tags: ['ATG', '兼容性'],
   },
+  'features.atg.max_response_bytes': {
+    key: 'features.atg.max_response_bytes',
+    title: '合成参数最大字节数',
+    category: 'features',
+    type: 'number',
+    description: '合成工具参数允许的最大字节数，范围 1024-104857600（1KB-100MB）（对应 Ark ATG_MAX_RESPONSE_BYTES）。',
+    explanation: '超过该上限的合成参数直接判失败，避免异常大载荷拖垮解析；默认 16777216（16MB）。何时调：遇到超大答案被误判失败时可上调（上限 100MB）。失败怎么办：超限即判失败并显式报错，不静默截断；非法值回退默认 16MB。',
+    defaultValue: 16777216,
+    recommendedValue: 16777216,
+    tags: ['ATG', '防截断'],
+  },
   'features.atg.text_model_pattern': {
     key: 'features.atg.text_model_pattern',
     title: '文本模型正则',

@@ -279,6 +279,14 @@ docker compose up -d
 - 并发：同一时间仅允许一次刷新（重复触发 → `409`）；工作池大小由 `features.account_refresh_concurrency`（默认 3）控制
 - 被标记 `expired` 的账号会被自动排除出账号调度，直至刷新成功或重新导入 cookies；Web 账号页提供 tier/过期徽章与单个、批量刷新按钮
 
+### ATG 防截断（synthetic transport）
+
+`features.atg.mode` 控制 ATG（Anti-Truncation Gateway）抗截断通道：`off`=零行为变化；`prefer`=尽力经合成工具回传完整正文，模型忽略指令时原样返回；`required`=必须经合成通道，上游缺失合成调用即**显式失败**（绝不静默）。请求侧自动注入合成工具声明与控制指令（客户端已自带同类机制时自动跳过，见 `client_synthetic_guard`）；响应侧自动解包——合成工具调用还原为正文（含参数修复与流式增量累积），思考链保留、真实工具调用不受影响。
+
+- 观测：运行日志 grep `[ATG]`（注入/跳过原因 + 解包 stats：`syntheticHit` / `syntheticCount` / `realToolCount` / `repaired` / `conflict`）
+- 合成参数修复上限：`features.atg.max_response_bytes`（默认 16MB，超限判失败）
+- 空/塌陷响应自动重发至多 `features.atg.empty_retries` 次（默认 2，不换号）
+
 ---
 
 ## API 调用示例

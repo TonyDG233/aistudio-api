@@ -23,6 +23,8 @@ from aistudio_api.application.account_orchestrator import (
     record_rotator_event,
     try_switch_account,
 )
+from aistudio_api.application.atg import create_atg_processor
+from aistudio_api.application.atg.extractor import SyntheticRequiredError
 from aistudio_api.application.chat_service import (
     normalize_gemini_request,
 )
@@ -36,10 +38,25 @@ from aistudio_api.domain.errors import (
     is_transient_rpc_error,
     parse_upstream_grpc_error,
 )
+from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
+
+# ATG: event types forwarded through the streaming unwrapper. usage /
+# finish_reason / response_id / thought_signature keep their dedicated branches.
+_ATG_STREAM_EVENT_TYPES = frozenset(
+    {"body", "thinking", "tool_calls", "images", "reasoning_images"}
+)
+
+
+def _output_is_empty(output: ModelOutput) -> bool:
+    """ATG emptiness test: no text, no thinking and no tool calls at all."""
+    if not output.candidates:
+        return True
+    candidate = output.candidates[0]
+    return not (candidate.text or candidate.thinking or candidate.function_calls)
 
 
 WIRE_TO_GEMINI_FINISH_REASON: dict[int, str] = {
@@ -86,6 +103,7 @@ def clean_upstream_error_message(raw_msg: str) -> str:
             break
     _, msg = parse_upstream_grpc_error(inner)
     return msg or inner
+
 
 def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
     """Extract standard Gemini HTTP status code, message, and status string from an exception."""
@@ -235,7 +253,11 @@ async def handle_attempt_exception(
 
     # 针对 Google 上游偶发且完全随机的 RPC 路由 404 (Ambiguous request for service '' and method '/GenerativeService.*')：
     # 此报错为上游端点偶发抖动，在未产生输出时当场立即重试（严禁切号以防浪费配额，其他 404 严格按原样报错抛出）
-    if is_transient_rpc_error(exc) and not has_yielded_data and attempt < MAX_RETRIES - 1:
+    if (
+        is_transient_rpc_error(exc)
+        and not has_yielded_data
+        and attempt < MAX_RETRIES - 1
+    ):
         logger.warning(
             "检测到 Google 上游偶发 404 (Ambiguous RPC method)，当场立即重试 (%d/%d): %s",
             attempt + 1,
@@ -306,6 +328,33 @@ async def handle_gemini_generate_content(
             client=client, req=req, model_path=model_path
         )
 
+    # ATG: inject the synthetic transport once, before normalization. The wrapped
+    # request is reused for every retry so the synthetic declaration and control
+    # turn never stack. The synthetic tool name lives only in this request scope.
+    atg = create_atg_processor()
+    tool_name = ""
+    if atg.enabled:
+        atg_body = req.model_dump(mode="json", exclude_none=True)
+        wrap = atg.wrap(atg_body, model_path)
+        if wrap.client_synthetic is not None:
+            logger.info(
+                "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
+                wrap.client_synthetic.name or "(instruction-only)",
+                wrap.client_synthetic.reason,
+            )
+        elif wrap.synthetic_hit:
+            logger.info(
+                "[ATG] 已注入合成通道: tool=%s, model=%s, contents=%d, tools=%d",
+                wrap.tool_name,
+                model_path,
+                len(atg_body.get("contents") or []),
+                len(atg_body.get("tools") or []),
+            )
+            req = GeminiGenerateContentRequest.model_validate(wrap.body)
+            tool_name = wrap.tool_name
+        else:
+            logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
+
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         await ensure_active_account(attempt, model=model_path)
@@ -318,22 +367,58 @@ async def handle_gemini_generate_content(
                 len(req.contents),
                 attempt + 1,
             )
-            output = await client.generate_content(
-                model=normalized.model,
-                capture_prompt=normalized.capture_prompt,
-                capture_images=normalized.capture_images,
-                contents=normalized.contents,
-                system_instruction_content=normalized.system_instruction,
-                tools=normalized.tools,
-                tool_config=normalized.tool_config,
-                safety_settings=normalized.safety_settings,
-                temperature=normalized.temperature,
-                top_p=normalized.top_p,
-                top_k=normalized.top_k,
-                max_tokens=normalized.max_tokens,
-                generation_config_overrides=normalized.generation_config_overrides,
-                sanitize_plain_text=False,
-            )
+
+            # ATG empty-response retry: a fully empty (collapsed) upstream result
+            # is re-sent up to cfg.empty_retries times. This layer never switches
+            # accounts; it only re-sends within the current attempt.
+            max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
+            output: ModelOutput | None = None
+            for empty_attempt in range(max_empty + 1):
+                output = await client.generate_content(
+                    model=normalized.model,
+                    capture_prompt=normalized.capture_prompt,
+                    capture_images=normalized.capture_images,
+                    contents=normalized.contents,
+                    system_instruction_content=normalized.system_instruction,
+                    tools=normalized.tools,
+                    tool_config=normalized.tool_config,
+                    safety_settings=normalized.safety_settings,
+                    temperature=normalized.temperature,
+                    top_p=normalized.top_p,
+                    top_k=normalized.top_k,
+                    max_tokens=normalized.max_tokens,
+                    generation_config_overrides=normalized.generation_config_overrides,
+                    sanitize_plain_text=False,
+                )
+                if not (atg.enabled and tool_name):
+                    break
+                if not _output_is_empty(output):
+                    break
+                if empty_attempt < max_empty:
+                    logger.warning(
+                        "[ATG] 空响应，重发 (%d/%d): model=%s",
+                        empty_attempt + 1,
+                        max_empty,
+                        model_path,
+                    )
+                    continue
+                logger.warning(
+                    "[ATG] empty response retries exhausted: model=%s", model_path
+                )
+                if atg.cfg.mode == "required":
+                    raise SyntheticRequiredError(
+                        "synthetic tool call required but not present in upstream response"
+                    )
+            assert output is not None
+
+            if atg.enabled and tool_name:
+                unwrap = atg.unwrap_response(output, tool_name)
+                output = unwrap.output
+                logger.info(
+                    "[ATG] 非流式解包: tool=%s, stats=%s",
+                    tool_name,
+                    json.dumps(unwrap.stats.to_dict(), ensure_ascii=False),
+                )
 
             record_rotator_event("success", model=normalized.model)
             runtime_state.record(normalized.model, "success", output.usage)
@@ -379,7 +464,6 @@ async def handle_gemini_generate_content(
             ):
                 continue
             raise
-
 
     raise HTTPException(
         429,
@@ -509,75 +593,190 @@ def _build_gemini_streaming_response(
     model_path: str,
 ) -> StreamingResponse:
     async def stream_response():
+        # ATG: inject the synthetic transport once, before normalization. The
+        # synthetic tool name lives only in this request scope.
+        atg = create_atg_processor()
+        tool_name = ""
+        unwrapper = None
+        effective_req = req
+        if atg.enabled:
+            atg_body = req.model_dump(mode="json", exclude_none=True)
+            wrap = atg.wrap(atg_body, model_path)
+            if wrap.client_synthetic is not None:
+                logger.info(
+                    "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
+                    wrap.client_synthetic.name or "(instruction-only)",
+                    wrap.client_synthetic.reason,
+                )
+            elif wrap.synthetic_hit:
+                logger.info(
+                    "[ATG] 已注入合成通道: tool=%s, model=%s, contents=%d, tools=%d",
+                    wrap.tool_name,
+                    model_path,
+                    len(atg_body.get("contents") or []),
+                    len(atg_body.get("tools") or []),
+                )
+                effective_req = GeminiGenerateContentRequest.model_validate(wrap.body)
+                tool_name = wrap.tool_name
+                unwrapper = atg.create_stream_unwrapper(tool_name)
+            else:
+                logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
+
         normalized = None
         try:
             logger.info(
                 "Gemini 流式请求: model=%s, 对话轮数=%s",
                 model_path,
-                len(req.contents),
+                len(effective_req.contents),
             )
             final_usage: dict[str, object] | None = None
             final_finish_reason: str = "STOP"
             latest_response_id: str | None = None
             buffered_thought_sig: str | None = None
+            max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
             for stream_attempt in range(MAX_RETRIES):
                 has_yielded_data = False
                 await ensure_active_account(stream_attempt, model=model_path)
-                normalized = normalize_gemini_request(req, model_path)
-                try:
-                    async for event_type, text in client.stream_generate_content(
-                        model=normalized.model,
-                        capture_prompt=normalized.capture_prompt,
-                        capture_images=normalized.capture_images,
-                        contents=normalized.contents,
-                        system_instruction_content=normalized.system_instruction,
-                        tools=normalized.tools,
-                        tool_config=normalized.tool_config,
-                        safety_settings=normalized.safety_settings,
-                        temperature=normalized.temperature,
-                        top_p=normalized.top_p,
-                        top_k=normalized.top_k,
-                        max_tokens=normalized.max_tokens,
-                        generation_config_overrides=normalized.generation_config_overrides,
-                        sanitize_plain_text=False,
-                        force_refresh_capture=stream_attempt > 0,
-                    ):
-                        if event_type == "usage":
-                            final_usage = text if isinstance(text, dict) else None
-                        elif event_type == "finish_reason":
-                            final_finish_reason = (
-                                to_gemini_finish_reason(text)
-                                if isinstance(text, int)
-                                else str(text)
+                normalized = normalize_gemini_request(effective_req, model_path)
+                # Fresh per-attempt unwrapper: a retry must not carry stale
+                # buffered/consumed state from the previous attempt.
+                if atg.enabled and tool_name:
+                    unwrapper = atg.create_stream_unwrapper(tool_name)
+                empty_attempt = 0
+                retry_outer = False
+                while True:
+                    produced_content = False
+                    try:
+                        async for event_type, text in client.stream_generate_content(
+                            model=normalized.model,
+                            capture_prompt=normalized.capture_prompt,
+                            capture_images=normalized.capture_images,
+                            contents=normalized.contents,
+                            system_instruction_content=normalized.system_instruction,
+                            tools=normalized.tools,
+                            tool_config=normalized.tool_config,
+                            safety_settings=normalized.safety_settings,
+                            temperature=normalized.temperature,
+                            top_p=normalized.top_p,
+                            top_k=normalized.top_k,
+                            max_tokens=normalized.max_tokens,
+                            generation_config_overrides=normalized.generation_config_overrides,
+                            sanitize_plain_text=False,
+                            force_refresh_capture=(
+                                stream_attempt > 0 or empty_attempt > 0
+                            ),
+                        ):
+                            if event_type == "usage":
+                                final_usage = text if isinstance(text, dict) else None
+                            elif event_type == "finish_reason":
+                                final_finish_reason = (
+                                    to_gemini_finish_reason(text)
+                                    if isinstance(text, int)
+                                    else str(text)
+                                )
+                                if (
+                                    unwrapper is not None
+                                    and final_finish_reason == "TOOL_CALLS"
+                                    and unwrapper.should_remap_finish_reason()
+                                ):
+                                    final_finish_reason = "STOP"
+                            elif event_type == "response_id":
+                                latest_response_id = str(text)
+                            elif event_type == "thought_signature":
+                                buffered_thought_sig = str(text)
+                            elif (
+                                unwrapper is not None
+                                and event_type in _ATG_STREAM_EVENT_TYPES
+                            ):
+                                if text:
+                                    produced_content = True
+                                out_events = unwrapper.process_event(event_type, text)
+                                for index, (out_type, out_text) in enumerate(
+                                    out_events
+                                ):
+                                    chunk = format_sse_event(
+                                        out_type,
+                                        out_text,
+                                        model_version=normalized.model,
+                                        response_id=latest_response_id,
+                                        thought_signature=(
+                                            buffered_thought_sig if index == 0 else None
+                                        ),
+                                    )
+                                    if chunk:
+                                        has_yielded_data = True
+                                        yield chunk
+                                buffered_thought_sig = None
+                            else:
+                                chunk = format_sse_event(
+                                    event_type,
+                                    text,
+                                    model_version=normalized.model,
+                                    response_id=latest_response_id,
+                                    thought_signature=buffered_thought_sig,
+                                )
+                                buffered_thought_sig = None
+                                if chunk:
+                                    has_yielded_data = True
+                                    yield chunk
+                    except Exception as exc:
+                        if await handle_attempt_exception(
+                            exc,
+                            attempt=stream_attempt,
+                            model_path=model_path,
+                            normalized_model=normalized.model if normalized else None,
+                            client=client,
+                            has_yielded_data=has_yielded_data,
+                        ):
+                            retry_outer = True
+                            break
+                        raise
+
+                    # ATG empty-response retry: an attempt that produced no content
+                    # event is re-sent up to cfg.empty_retries times (no account switch).
+                    if max_empty > 0 and not produced_content:
+                        if empty_attempt < max_empty:
+                            empty_attempt += 1
+                            logger.warning(
+                                "[ATG] 流式空响应，重发 (%d/%d): model=%s",
+                                empty_attempt,
+                                max_empty,
+                                model_path,
                             )
-                        elif event_type == "response_id":
-                            latest_response_id = str(text)
-                        elif event_type == "thought_signature":
-                            buffered_thought_sig = str(text)
-                        else:
-                            chunk = format_sse_event(
-                                event_type,
-                                text,
-                                model_version=normalized.model,
-                                response_id=latest_response_id,
-                                thought_signature=buffered_thought_sig,
+                            continue
+                        logger.warning(
+                            "[ATG] empty response retries exhausted: model=%s",
+                            model_path,
+                        )
+                        if atg.cfg.mode == "required":
+                            raise SyntheticRequiredError(
+                                "synthetic tool call required but not present in "
+                                "upstream response"
                             )
-                            buffered_thought_sig = None
-                            if chunk:
-                                has_yielded_data = True
-                                yield chunk
                     break
-                except Exception as exc:
-                    if await handle_attempt_exception(
-                        exc,
-                        attempt=stream_attempt,
-                        model_path=model_path,
-                        normalized_model=normalized.model if normalized else None,
-                        client=client,
-                        has_yielded_data=has_yielded_data,
-                    ):
-                        continue
-                    raise
+                if retry_outer:
+                    continue
+
+                # Flush buffered output and enforce required-mode validation.
+                if unwrapper is not None:
+                    for out_type, out_text in unwrapper.finalize():
+                        chunk = format_sse_event(
+                            out_type,
+                            out_text,
+                            model_version=normalized.model,
+                            response_id=latest_response_id,
+                            thought_signature=buffered_thought_sig,
+                        )
+                        buffered_thought_sig = None
+                        if chunk:
+                            has_yielded_data = True
+                            yield chunk
+                    logger.info(
+                        "[ATG] 流式解包: tool=%s, stats=%s",
+                        tool_name,
+                        json.dumps(unwrapper.stats.to_dict(), ensure_ascii=False),
+                    )
+                break
 
             target_model = normalized.model if normalized else model_path
             record_rotator_event("success", model=target_model)
@@ -597,7 +796,6 @@ def _build_gemini_streaming_response(
             )
         except Exception as exc:
             yield format_sse_error(exc)
-
 
     return StreamingResponse(
         stream_response(),
