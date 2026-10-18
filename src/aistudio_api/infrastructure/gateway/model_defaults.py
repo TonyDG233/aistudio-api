@@ -536,3 +536,186 @@ def update_configured_logging_settings(
     )
     invalidate_config_cache()
     return logging_dict
+
+
+# ========== 功能开关框架（WP1）==========
+# config.yaml 顶层 `features:` 段的内置默认值（全部保守：默认关闭，零行为变化）。
+# 字段名对齐 Ark (.env) 语义，落 YAML 时统一 snake_case。
+_ATG_MODES = ("off", "prefer", "required")
+_ATG_CONTROL_POSITIONS = ("tail", "head")
+_ATG_RECOVERY_STRATEGIES = ("repair", "fail")
+_DEFAULT_ATG_TOOL_PREFIX = "atg_emit_"
+_MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
+
+_FEATURES_DEFAULTS: dict[str, object] = {
+    "build_surface": False,
+    "route_by_tier": False,
+    "account_refresh_concurrency": 3,
+    "auto_switch": False,
+    "auto_switch_interval_hours": 3.0,
+    "atg": {
+        "mode": "off",
+        "tool_prefix": _DEFAULT_ATG_TOOL_PREFIX,
+        "control_position": "tail",
+        "strict": False,
+        "empty_retries": 2,
+        "recovery": "repair",
+        "side_buffer_bytes": 0,
+        "client_synthetic_guard": True,
+        "text_model_pattern": "",
+        "non_text_model_pattern": "",
+    },
+    "fallback": {
+        # 默认全 off：遵循「零自动回落」决策，任何改道必须显式开启且可 grep。
+        "on_quota": False,
+        "on_failure": False,
+        "cross_surface": False,
+    },
+}
+
+
+def _deep_merge(
+    base: dict[str, object], override: dict[str, object]
+) -> dict[str, object]:
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = _deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _coerce_feature_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _coerce_feature_int(
+    value: object, default: int, *, minimum: int, maximum: int
+) -> int:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return default
+    return min(maximum, max(minimum, parsed))
+
+
+def _coerce_feature_float(value: object, default: float, *, minimum: float) -> float:
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _coerce_feature_choice(
+    value: object, default: str, choices: tuple[str, ...]
+) -> str:
+    normalized = str(value).strip().lower()
+    return normalized if normalized in choices else default
+
+
+def _coerce_feature_str(value: object, default: str) -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _env_feature_baseline() -> dict[str, object]:
+    """进程启动时的环境变量基线，作为 config.yaml features 段缺省项的兜底。"""
+    from aistudio_api.config import settings
+
+    return {
+        "build_surface": settings.build_surface,
+        "route_by_tier": settings.route_by_tier,
+        "account_refresh_concurrency": settings.account_refresh_concurrency,
+        "auto_switch": settings.auto_switch,
+        "auto_switch_interval_hours": settings.auto_switch_interval_hours,
+        "atg": {"mode": settings.atg_mode},
+    }
+
+
+def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
+    raw_atg = raw.get("atg")
+    atg = raw_atg if isinstance(raw_atg, dict) else {}
+    raw_fallback = raw.get("fallback")
+    fallback = raw_fallback if isinstance(raw_fallback, dict) else {}
+    return {
+        "build_surface": _coerce_feature_bool(raw.get("build_surface"), False),
+        "route_by_tier": _coerce_feature_bool(raw.get("route_by_tier"), False),
+        "account_refresh_concurrency": _coerce_feature_int(
+            raw.get("account_refresh_concurrency"), 3, minimum=1, maximum=16
+        ),
+        "auto_switch": _coerce_feature_bool(raw.get("auto_switch"), False),
+        "auto_switch_interval_hours": _coerce_feature_float(
+            raw.get("auto_switch_interval_hours"), 3.0, minimum=0.1
+        ),
+        "atg": {
+            "mode": _coerce_feature_choice(atg.get("mode"), "off", _ATG_MODES),
+            "tool_prefix": _coerce_feature_str(
+                atg.get("tool_prefix"), _DEFAULT_ATG_TOOL_PREFIX
+            ),
+            "control_position": _coerce_feature_choice(
+                atg.get("control_position"), "tail", _ATG_CONTROL_POSITIONS
+            ),
+            "strict": _coerce_feature_bool(atg.get("strict"), False),
+            "empty_retries": _coerce_feature_int(
+                atg.get("empty_retries"), 2, minimum=0, maximum=5
+            ),
+            "recovery": _coerce_feature_choice(
+                atg.get("recovery"), "repair", _ATG_RECOVERY_STRATEGIES
+            ),
+            "side_buffer_bytes": _coerce_feature_int(
+                atg.get("side_buffer_bytes"),
+                0,
+                minimum=0,
+                maximum=_MAX_SIDE_BUFFER_BYTES,
+            ),
+            "client_synthetic_guard": _coerce_feature_bool(
+                atg.get("client_synthetic_guard"), True
+            ),
+            "text_model_pattern": _coerce_feature_str(
+                atg.get("text_model_pattern"), ""
+            ),
+            "non_text_model_pattern": _coerce_feature_str(
+                atg.get("non_text_model_pattern"), ""
+            ),
+        },
+        "fallback": {
+            "on_quota": _coerce_feature_bool(fallback.get("on_quota"), False),
+            "on_failure": _coerce_feature_bool(fallback.get("on_failure"), False),
+            "cross_surface": _coerce_feature_bool(fallback.get("cross_surface"), False),
+        },
+    }
+
+
+def get_features_config(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """解析 config.yaml 顶层 ``features`` 段并归一化返回。
+
+    优先级：``config.yaml features.*`` > ``AISTUDIO_*`` 环境变量基线 > 内置默认值。
+    编码未知/非法取值时静默回退到安全默认，保证既有 YAML 消费方不因新键报错。
+    结果依赖 ``_load_yaml_config`` 的 mtime 缓存，PUT /config/yaml 触发的
+    ``invalidate_config_cache()`` 会让下一次读取立即反映热重载后的内容。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    yaml_features = raw_features if isinstance(raw_features, dict) else {}
+    merged = _deep_merge(_FEATURES_DEFAULTS, _env_feature_baseline())
+    merged = _deep_merge(merged, yaml_features)
+    return _normalize_features(merged)

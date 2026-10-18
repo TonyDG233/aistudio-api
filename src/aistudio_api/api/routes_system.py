@@ -18,6 +18,7 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
     _resolve_config_path,
+    get_features_config,
     invalidate_config_cache,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -227,6 +228,7 @@ async def get_system_config() -> dict[str, object]:
         "debug_env_active": is_debug_env_active(),
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
+        "features": get_features_config(),
     }
 
 

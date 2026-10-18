@@ -41,7 +41,34 @@ def _load_int_env(*names: str, default: int) -> int:
     value = _load_env(*names)
     if value is None:
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_float_env(*names: str, default: float, minimum: float | None = None) -> float:
+    """读取浮点环境变量；解析失败回退默认值，可选下界钳制（对齐 Ark 语义）。"""
+    value = _load_env(*names)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def _load_choice_env(*names: str, default: str, choices: tuple[str, ...]) -> str:
+    """读取枚举环境变量；非法取值静默回退默认值（大小写不敏感）。"""
+    value = _load_env(*names)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    return normalized if normalized in choices else default
+
 
 def _load_web_password() -> str | None:
     return os.getenv("AISTUDIO_WEB_PASSWORD") or os.getenv("AISTUDIO_ADMIN_PASSWORD")
@@ -64,6 +91,7 @@ def _load_dump_to_file_env() -> bool:
     if val is None:
         return False
     return val.strip().lower() in ("1", "true", "yes", "on", "dump", "y", "t")
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
@@ -284,6 +312,21 @@ class Settings:
     dump_requests: bool = _load_dump_requests_env()
     dump_to_file: bool = _load_dump_to_file_env()
     dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", str(_PROJECT_ROOT / "dumps"))
+    # ===== 功能开关框架（WP1）=====
+    # 进程级基线，仅启动时读取一次；运行时可被 config.yaml 的 features 段热重载覆盖
+    # （优先级：config.yaml features.* > AISTUDIO_* 环境变量 > 内置默认值）。
+    build_surface: bool = _load_bool_env("AISTUDIO_BUILD_SURFACE", default=False)
+    atg_mode: str = _load_choice_env(
+        "AISTUDIO_ATG_MODE", default="off", choices=("off", "prefer", "required")
+    )
+    account_refresh_concurrency: int = _load_int_env(
+        "AISTUDIO_ACCOUNT_REFRESH_CONCURRENCY", default=3
+    )
+    route_by_tier: bool = _load_bool_env("AISTUDIO_ROUTE_BY_TIER", default=False)
+    auto_switch: bool = _load_bool_env("AISTUDIO_AUTO_SWITCH", default=False)
+    auto_switch_interval_hours: float = _load_float_env(
+        "AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS", default=3.0, minimum=0.1
+    )
     log_level: str = "INFO"
 
     @property

@@ -2,10 +2,11 @@
 import { ref, watch, computed } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import YAML from 'yaml'
-import type { ParsedConfigYaml, ModelProfileItem, ModelOverrideMap } from './types.ts'
+import type { ParsedConfigYaml, ModelProfileItem, ModelOverrideMap, FeaturesConfig } from './types.ts'
 import ProfileCard from './ProfileCard.vue'
 import ModelOverrideCard from './ModelOverrideCard.vue'
 import SchemaDictionaryModal from './SchemaDictionaryModal.vue'
+import FeaturesCard from './FeaturesCard.vue'
 import ConfigSwitch from './ConfigSwitch.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
 import Button from '@/components/ui/Button.vue'
@@ -196,6 +197,15 @@ function updateGlobalDropUnsupported(val: boolean) {
   }
 }
 
+const featuresConfig = computed<FeaturesConfig>(() => parsedConfig.value.features || {})
+
+function updateFeatures(val: FeaturesConfig) {
+  parsedConfig.value = {
+    ...parsedConfig.value,
+    features: val,
+  }
+}
+
 function handleResetDefaults() {
   if (confirm('确定要将所有模型规则重置为官方推荐默认预设吗？')) {
     const currentApiKeys = parsedConfig.value.api_keys || []
@@ -203,9 +213,11 @@ function handleResetDefaults() {
       level: 'INFO',
       dump_requests: false,
     }
+    const currentFeatures = parsedConfig.value.features || {}
     const doc: ParsedConfigYaml = {
       api_keys: currentApiKeys,
       logging: currentLogging,
+      ...(Object.keys(currentFeatures).length ? { features: currentFeatures } : {}),
       model_defaults: {
         drop_unsupported_params: false,
         profiles: [
@@ -446,6 +458,12 @@ onBeforeRouteLeave((_to, _from, next) => {
           />
         </div>
       </div>
+
+      <!-- Section 0: Feature Toggles -->
+      <FeaturesCard
+        :features="featuresConfig"
+        @update:features="updateFeatures"
+      />
 
       <!-- Section 1: Model Profiles -->
       <div class="space-y-4">
