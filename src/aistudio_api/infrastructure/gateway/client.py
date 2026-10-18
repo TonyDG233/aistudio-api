@@ -232,6 +232,109 @@ class AIStudioClient:
         except policy_error as exc:
             raise self._policy_to_request_error(exc) from exc
 
+    def surface_instance_snapshot(self) -> dict[str, object]:
+        """WP5 可见性：页面实例挂载快照（只读，永不抛异常）。
+
+        口径：单浏览器架构下同一时刻仅活跃账号持有页面实例；
+        chat 页 + build 页各计 1；切号过渡期旧页处于 drain（``retiring_contexts``）。
+        """
+        snapshot: dict[str, object] = {
+            "active_account": None,
+            "chat_page": {"alive": False, "url": None},
+            "build_page": {
+                "alive": False,
+                "ready": False,
+                "account_id": None,
+                "last_error": "",
+            },
+            "live_instances": 0,
+            "retiring_contexts": 0,
+            "group": None,
+            "max_page_instances": None,
+            "effective_max": None,
+        }
+        try:
+            account = None
+            try:
+                from aistudio_api.infrastructure.account.account_store import (
+                    AccountStore,
+                )
+
+                account = AccountStore().get_active_account()
+            except Exception:
+                account = None
+            if account is not None:
+                snapshot["active_account"] = {
+                    "id": account.id,
+                    "name": getattr(account, "name", None),
+                    "tier": getattr(account, "tier", None),
+                    "email": getattr(account, "email", None),
+                }
+
+            session = self._session
+            ctx = session.active_context if session is not None else None
+            chat_page = ctx.page if ctx is not None else None
+            if chat_page is not None:
+                with suppress(Exception):
+                    snapshot["chat_page"] = {
+                        "alive": not chat_page.is_closed(),
+                        "url": chat_page.url,
+                    }
+
+            surface = self._build_surface
+            if surface is not None:
+                state = getattr(surface, "state", None)
+                page = getattr(state, "page", None)
+                alive = False
+                if page is not None:
+                    try:
+                        alive = not page.is_closed()
+                    except Exception:
+                        alive = False
+                snapshot["build_page"] = {
+                    "alive": alive,
+                    "ready": bool(getattr(state, "ready", False)),
+                    "account_id": getattr(state, "account_id", None),
+                    "last_error": str(getattr(state, "last_error", "") or ""),
+                }
+
+            snapshot["live_instances"] = self._count_live_page_instances()
+            retiring = (
+                getattr(session, "_retiring_contexts", None)
+                if session is not None
+                else None
+            )
+            snapshot["retiring_contexts"] = (
+                len(retiring) if isinstance(retiring, list) else 0
+            )
+
+            tier = getattr(account, "tier", None) if account is not None else None
+            email = getattr(account, "email", None) if account is not None else None
+            max_instances: int | None = None
+            try:
+                from aistudio_api.application import surface_orchestrator as orch
+
+                groups = self._features_config().get("groups") or []
+                group = orch.match_group(tier, email, groups)
+                if isinstance(group, dict):
+                    snapshot["group"] = str(group.get("name") or "unnamed")
+                    raw_max = group.get("max_page_instances")
+                    if isinstance(raw_max, (int, float)):
+                        max_instances = int(raw_max)
+                else:
+                    snapshot["group"] = f"default:{tier or 'unknown'}"
+                snapshot["max_page_instances"] = max_instances
+                snapshot["effective_max"] = (
+                    orch.MAX_PAGE_INSTANCES_DEFAULT
+                    if max_instances is None
+                    else max_instances
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return snapshot
+
     async def close(self) -> None:
         """关闭浏览器后端。"""
         await self._close_build_surface()

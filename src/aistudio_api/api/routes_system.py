@@ -162,6 +162,17 @@ async def get_rotation_accounts(
     return rotator.get_all_stats()
 
 
+@protected_router.get("/surface/instances")
+async def get_surface_instances(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """页面实例挂载快照（单浏览器：活跃账号 chat 页 + build 页各计 1）。"""
+    client = runtime_state.client
+    if client is None:
+        raise HTTPException(503, detail="客户端未初始化")
+    return client.surface_instance_snapshot()
+
+
 @protected_router.post("/rotation/next")
 async def force_next_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),

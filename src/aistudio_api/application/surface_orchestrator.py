@@ -253,6 +253,10 @@ def resolve_surface(
     if not route_by_tier:
         surface = "build" if (build_enabled and tier_norm == "free") else "chat"
         default_allowed = ("build",) if build_enabled else ("chat",)
+        if is_chat_only_model(model_path):
+            # chat-only 模型（argon/Pro 系）在旧路由下也强制 chat，不派发到 build。
+            surface = "chat"
+            default_allowed = ("chat",)
         decision = SurfaceDecision(
             surface=surface,
             group_name=None,
@@ -316,11 +320,16 @@ def resolve_surface(
             ),
         )
 
-    if len(allowed) == 1:
+    if is_chat_only_model(model_path):
+        # chat-only 模型强制 chat（上方守卫已保证 chat ∈ allowed，否则已拒绝）。
+        surface = "chat"
+    elif len(allowed) == 1:
         surface = allowed[0]
+    elif "build" in allowed:
+        # 同凭证多面许可：非 chat-only 模型优先 build（把 chat 配额留给 Pro/argon 系）。
+        surface = "build"
     else:
-        preferred = "build" if tier_norm == "free" else "chat"
-        surface = preferred if preferred in allowed else allowed[0]
+        surface = "chat"
 
     decision = SurfaceDecision(
         surface=surface,
@@ -345,8 +354,9 @@ def check_instance_quota(
 ) -> None:
     """Raise :class:`SurfacePolicyError` when a new page instance would exceed quota.
 
-    No queueing, no silent surface switch: ``need_new`` with
-    ``live_instances >= max_instances`` is an explicit rejection.
+    语义（按账号校验）：仅当本次请求需要新建页面实例（``need_new=True``）时校验；
+    口径 = 该账号当前存活页面实例数（chat 页 + build 页各计 1）≥ 配额即显式拒绝。
+    配额 0 = 禁止新建（如禁止为该账号创建 build 页）。不排队、不静默换面。
     """
     if not need_new:
         return
@@ -355,11 +365,12 @@ def check_instance_quota(
         raise _deny(
             "surface_quota_exceeded",
             message=(
-                f"分组 '{group_name}' 的页面实例配额已满: 面={surface}, "
-                f"配额={quota}, 当前存活实例={live_instances}。"
+                f"页面实例配额已满（按账号校验）: 组='{group_name}', "
+                f"配额={quota}, 当前存活实例={live_instances}"
+                f"（chat/build 页各计 1）；需要新建 {surface} 页被拒。"
             ),
             advice=(
-                "请关闭该组内闲置的页面实例、调高 max_page_instances，"
+                "请调高该组 max_page_instances、关闭闲置实例，"
                 "或将账号移入其它分组；本次请求不排队、不静默换面。"
             ),
         )

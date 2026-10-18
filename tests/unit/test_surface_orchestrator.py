@@ -226,7 +226,7 @@ def test_resolve_explicit_group_by_email_regex() -> None:
     assert set(decision.allowed) == {"chat", "build"}
 
 
-def test_resolve_multi_surface_prefers_tier_default() -> None:
+def test_resolve_multi_surface_prefers_build_for_non_chat_only() -> None:
     groups = [
         {"name": "both", "match_tier": ["pro"], "allowed_surfaces": ["chat", "build"]}
     ]
@@ -236,12 +236,12 @@ def test_resolve_multi_surface_prefers_tier_default() -> None:
         None,
         {"route_by_tier": True, "build_surface": True, "groups": groups},
     )
-    assert decision.surface == "chat"
+    assert decision.surface == "build"
     assert decision.allowed == ("chat", "build")
 
 
-def test_resolve_multi_surface_unknown_tier_prefers_chat() -> None:
-    # unknown tier -> preferred "chat" is present -> chat (not allowed[0])
+def test_resolve_multi_surface_unknown_tier_prefers_build() -> None:
+    # 非 chat-only 模型在双面许可下优先 build（与 tier、allowed 顺序均无关）。
     groups = [
         {"name": "both", "match_tier": ["weird"], "allowed_surfaces": ["build", "chat"]}
     ]
@@ -251,8 +251,33 @@ def test_resolve_multi_surface_unknown_tier_prefers_chat() -> None:
         None,
         {"route_by_tier": True, "build_surface": True, "groups": groups},
     )
-    assert decision.surface == "chat"
+    assert decision.surface == "build"
     assert decision.allowed == ("build", "chat")
+
+
+def test_resolve_chat_only_model_forced_chat_in_multi_surface_group() -> None:
+    groups = [
+        {"name": "both", "match_tier": ["pro"], "allowed_surfaces": ["chat", "build"]}
+    ]
+    decision = resolve_surface(
+        "models/gemini-4-argon",
+        "pro",
+        None,
+        {"route_by_tier": True, "build_surface": True, "groups": groups},
+    )
+    assert decision.surface == "chat"
+
+
+def test_resolve_legacy_chat_only_model_stays_chat() -> None:
+    # 旧路由（route_by_tier=false）+ free + build_surface=true 下，argon 仍强制 chat。
+    decision = resolve_surface(
+        "models/gemini-4-argon",
+        "free",
+        None,
+        {"route_by_tier": False, "build_surface": True},
+    )
+    assert decision.surface == "chat"
+    assert decision.allowed == ("chat",)
 
 
 def test_resolve_filters_build_when_feature_disabled() -> None:

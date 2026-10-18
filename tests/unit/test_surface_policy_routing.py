@@ -131,7 +131,10 @@ def test_service_group_routing_by_normalized_email_regex(
         },
     )
     _patch_account(monkeypatch, "pro", "dev@corp")
-    assert _resolve_surface("models/gemini-3.8-flash") == "chat"
+    # 非 chat-only 模型在双面许可下优先 build（组命中即生效）
+    assert _resolve_surface("models/gemini-3.8-flash") == "build"
+    # chat-only 模型（argon 系）强制 chat
+    assert _resolve_surface("models/gemini-4-argon") == "chat"
 
     _patch_account(monkeypatch, "free", "dev@corp")
     assert _resolve_surface("models/gemini-3.8-flash") == "build"

@@ -12,6 +12,30 @@ import type {
   HealthCheckResponse,
 } from '@/types'
 
+export interface SurfacePageState {
+  alive: boolean
+  url?: string | null
+  ready?: boolean
+  account_id?: string | null
+  last_error?: string
+}
+
+export interface SurfaceInstancesResponse {
+  active_account: {
+    id: string
+    name?: string | null
+    tier?: string | null
+    email?: string | null
+  } | null
+  chat_page: SurfacePageState
+  build_page: SurfacePageState
+  live_instances: number
+  retiring_contexts: number
+  group: string | null
+  max_page_instances: number | null
+  effective_max: number | null
+}
+
 
 export const systemApi = {
   health(): Promise<HealthCheckResponse> {
@@ -24,6 +48,10 @@ export const systemApi = {
 
   getRotation(): Promise<RotationStatusResponse> {
     return request<RotationStatusResponse>('/rotation')
+  },
+
+  getSurfaceInstances(): Promise<SurfaceInstancesResponse> {
+    return request<SurfaceInstancesResponse>('/surface/instances')
   },
 
   clearCooldown(req: ClearCooldownRequest = {}): Promise<{ ok: boolean; accounts: Record<string, unknown> }> {
