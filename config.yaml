@@ -31,6 +31,23 @@ features:
   auto_switch_interval_hours: 3.0
 
   # --------------------------------------------------------------------------
+  # 账号分组与面编排 (groups，WP5) — 按账号档位 (tier) / 邮箱正则把账号分组，
+  # 为每组指定允许的面 (chat/build) 与页面上限。未显式分组的账号由编排器按
+  # tier 默认规则兜底 (free→build、pro/ultra/plus→chat)，本段留空即全部走默认。
+  # --------------------------------------------------------------------------
+  # 每个分组字段：
+  #   name:                 组名 (缺省按序号 group-N)
+  #   match_tier:           命中的账号档位列表 (小写，如 pro/free/ultra/plus)
+  #   match_emails_regex:   命中的邮箱正则 (可选，留空/null 表示不启用)
+  #   allowed_surfaces:     允许的面子集 [chat] / [build] / [chat, build]；空 [] 表示禁用该组
+  #   max_page_instances:   该组允许并存的页面实例上限 (0-16，默认 2)；超限对请求显式拒绝，不排队
+  # 示例 (两行)：
+  # groups:
+  #   - { name: pro,  match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  max_page_instances: 2 }
+  #   - { name: free, match_tier: [free],             allowed_surfaces: [build], max_page_instances: 3 }
+  groups: []
+
+  # --------------------------------------------------------------------------
   # ATG (Anti-Truncation Gateway) 防截断合成工具通道
   # 通过合成 function-call 通道承载模型答案，绕过文本通道截断/审核后再解包回正文。
   # 全部默认关闭；仅 mode 不为 off 时模块才启用。字段名对齐 Ark ATG_* 语义。

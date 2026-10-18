@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import ClassVar
 
@@ -14,6 +15,7 @@ from aistudio_api.config import (
 )
 from aistudio_api.domain.errors import RequestError, classify_error
 from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
 from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
     RequestCaptureService,
@@ -65,10 +67,13 @@ class AIStudioClient:
         self._replay_service = RequestReplayService(session=self._session)
 
         self._streaming_gateway = StreamingGateway(session=self._session)
+        self._build_surface: BuildSurface | None = None
+
     @property
     def session(self) -> BrowserSession:
         """Expose active browser session facade."""
         return self._session
+
     async def warmup(self) -> None:
         """预热浏览器后端并加载 AI Studio 页面及捕获 BotGuard 服务。"""
         if self._session is not None:
@@ -78,6 +83,7 @@ class AIStudioClient:
     async def switch_auth(self, auth_file: str | None) -> None:
         """切换账号的 auth 文件并清空模板缓存。"""
         self.clear_templates()
+        await self._close_build_surface()
         if self._session is not None:
             await self._session.switch_auth(auth_file)
 
@@ -86,8 +92,149 @@ class AIStudioClient:
         if getattr(self, "_capture_service", None) is not None:
             self._capture_service.clear_templates()
 
+    async def _ensure_build_surface(self) -> BuildSurface:
+        """Lazily create the Build surface bound to the current browser."""
+        if self._build_surface is None:
+            cdp = await self._session.ensure_browser_cdp_client()
+            self._build_surface = BuildSurface(cdp)
+        return self._build_surface
+
+    async def _close_build_surface(self) -> None:
+        """Close the Build surface page (best effort, never raises)."""
+        surface = self._build_surface
+        self._build_surface = None
+        if surface is None:
+            return
+        page = getattr(getattr(surface, "state", None), "page", None)
+        if page is not None and not page.is_closed():
+            with suppress(Exception):
+                await page.close()
+
+    def _build_surface_page_alive(self) -> bool:
+        """Whether the Build surface currently holds a live page (read-only)."""
+        surface = self._build_surface
+        if surface is None:
+            return False
+        page = getattr(getattr(surface, "state", None), "page", None)
+        if page is None:
+            return False
+        try:
+            return not page.is_closed()
+        except Exception:
+            return False
+
+    def _count_live_page_instances(self) -> int:
+        """Current live page-instance count: chat page (1) + build page (1) (read-only)."""
+        count = 0
+        ctx = self._session.active_context
+        chat_page = ctx.page if ctx is not None else None
+        if chat_page is not None:
+            try:
+                if not chat_page.is_closed():
+                    count += 1
+            except Exception:
+                pass
+        if self._build_surface_page_alive():
+            count += 1
+        return count
+
+    def _active_account_identity(self) -> tuple[str | None, str | None]:
+        """Return the active account's (tier, email), or (None, None) if unknown."""
+        try:
+            from aistudio_api.infrastructure.account.account_store import AccountStore
+
+            account = AccountStore().get_active_account()
+        except Exception:
+            account = None
+        if account is None:
+            return None, None
+        return getattr(account, "tier", None), getattr(account, "email", None)
+
+    @staticmethod
+    def _features_config() -> dict[str, object]:
+        try:
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_features_config,
+            )
+
+            return dict(get_features_config())
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _policy_to_request_error(exc: Exception) -> RequestError:
+        """Map a SurfacePolicyError into a request-level error carrying code/advice."""
+        status = (
+            getattr(exc, "http_status", None)
+            or getattr(exc, "status_code", None)
+            or getattr(exc, "status", None)
+            or 429
+        )
+        code = getattr(exc, "code", None)
+        message = getattr(exc, "message", None) or str(exc)
+        advice = getattr(exc, "advice", None)
+        detail = str(message)
+        if code:
+            detail = f"[{code}] {detail}"
+        if advice:
+            detail = f"{detail} | 处置建议: {advice}"
+        return RequestError(int(status), detail)
+
+    def _enforce_build_instance_quota(self) -> None:
+        """WP5: enforce the account group's page-instance quota before BuildSurface.ensure_ready.
+
+        Uses the ``application.surface_orchestrator`` policy module
+        (``match_group`` / ``check_instance_quota`` / ``SurfacePolicyError``):
+        the active account's tier/email + ``features.groups`` resolve the group,
+        and the live page-instance count (chat page + build page) decides whether a
+        new instance would exceed ``max_page_instances``. Over-quota is raised as a
+        request-level error carrying the policy ``code``/``message``/``advice`` —
+        never swallowed, never silently routed.
+        """
+        try:
+            from aistudio_api.application import surface_orchestrator as orchestrator
+        except Exception:
+            logger.warning("surface_orchestrator 尚未就绪，跳过 build 面实例配额检查")
+            return
+        match_group = getattr(orchestrator, "match_group", None)
+        check = getattr(orchestrator, "check_instance_quota", None)
+        policy_error = getattr(orchestrator, "SurfacePolicyError", None)
+        if match_group is None or check is None or policy_error is None:
+            logger.warning(
+                "surface_orchestrator 契约不完整(match_group/"
+                "check_instance_quota/SurfacePolicyError)，跳过 build 面配额检查"
+            )
+            return
+
+        tier, email = self._active_account_identity()
+        features = self._features_config()
+        groups = features.get("groups") or []
+        group = match_group(tier, email, groups)
+        if isinstance(group, dict):
+            group_name = str(group.get("name") or "unnamed")
+            max_instances = group.get("max_page_instances")
+        else:
+            group_name = f"default:{tier or 'unknown'}"
+            max_instances = None
+        live_instances = self._count_live_page_instances()
+        need_new = not self._build_surface_page_alive()
+        logger.info(
+            "[WP5] build 面配额检查: group=%s tier=%s max=%s live=%s need_new=%s",
+            group_name,
+            tier,
+            max_instances,
+            live_instances,
+            need_new,
+        )
+        try:
+            # check_instance_quota(group_name, max_instances, live_instances, surface, need_new)
+            check(group_name, max_instances, live_instances, "build", need_new)
+        except policy_error as exc:
+            raise self._policy_to_request_error(exc) from exc
+
     async def close(self) -> None:
         """关闭浏览器后端。"""
+        await self._close_build_surface()
         if self._session is not None:
             await self._session.close()
 
@@ -179,7 +326,26 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
         force_refresh_capture: bool = False,
+        surface: str = "chat",
+        rest_body: str | None = None,
     ):
+        if surface == "build":
+            if not rest_body:
+                raise RequestError(
+                    400, "build surface requires a REST body (rest_body)"
+                )
+            self._enforce_build_instance_quota()
+            ctx = self._session.active_context
+            if ctx is None:
+                ctx = await self._session.ensure_ready()
+            build_surface = await self._ensure_build_surface()
+            await build_surface.ensure_ready(ctx.auth_file, ctx.auth_user)
+            async for event in build_surface.stream_generate(
+                model=model, json_body=rest_body
+            ):
+                yield event
+            return
+
         async with self._session.request_scope():
             captured = await self.capture_request(
                 prompt=capture_prompt,

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -59,6 +60,58 @@ def normalize_model_key(model: str | None) -> str | None:
     if not model:
         return None
     return model.removeprefix("models/").lower()
+
+
+# WP5：冷却/限流维度从 (account, model) 扩展为 (account, surface, model)。
+DEFAULT_SURFACE = "chat"
+
+# 内部存储约定：chat 面沿用裸 model 键（"gemini-2.5-pro"），以保持
+# data/rotator_state.json 的持久化格式与既有消费方（含既有单测）完全兼容；
+# 其它面统一命名空间化为 "surface::model"。API 输出统一用 surface_model_key()
+# 给出的 "surface::model" 新格式。
+_SURFACE_SEP = "::"
+
+
+def surface_model_key(
+    surface: str = DEFAULT_SURFACE, model: str | None = None
+) -> str | None:
+    """构造对外/展示用的 "surface::model" 键（默认 surface 为 chat）。"""
+    normalized = normalize_model_key(model)
+    if normalized is None:
+        return None
+    surface_key = (surface or DEFAULT_SURFACE).strip().lower() or DEFAULT_SURFACE
+    return f"{surface_key}{_SURFACE_SEP}{normalized}"
+
+
+def _storage_key(surface: str, model: str | None) -> str | None:
+    """计算内部存储键：chat 面为裸 model（向后兼容），其它面为 "surface::model"。"""
+    normalized = normalize_model_key(model)
+    if normalized is None:
+        return None
+    surface_key = (surface or DEFAULT_SURFACE).strip().lower() or DEFAULT_SURFACE
+    if surface_key == DEFAULT_SURFACE:
+        return normalized
+    return f"{surface_key}{_SURFACE_SEP}{normalized}"
+
+
+def split_surface_key(key: str) -> tuple[str, str]:
+    """把内部存储键拆成 (surface, model)；裸键视为 chat 面。"""
+    if _SURFACE_SEP in key:
+        surface, _, model = key.partition(_SURFACE_SEP)
+        return surface, model
+    return DEFAULT_SURFACE, key
+
+
+def canonicalize_surface_key(key: str) -> str:
+    """把持久化键归一为内部存储键。
+
+    旧 state 里的裸 model 键一律视为 chat 面；"chat::model" 收敛回裸键以保持
+    chat 面内部表示的唯一性（既有的裸键单测与落盘格式因此仍然成立）。
+    """
+    surface, model = split_surface_key(key)
+    if surface == DEFAULT_SURFACE:
+        return model
+    return f"{surface}{_SURFACE_SEP}{model}"
 
 
 @dataclass
@@ -115,39 +168,39 @@ class AccountStats:
         if isinstance(raw_cd, dict):
             for k, v in raw_cd.items():
                 with contextlib.suppress(ValueError, TypeError):
-                    model_cooldowns[str(k)] = float(str(v))
+                    model_cooldowns[canonicalize_surface_key(str(k))] = float(str(v))
 
         raw_dates = data.get("model_rate_limited_dates")
         model_rate_limited_dates: dict[str, str] = {}
         if isinstance(raw_dates, dict):
             for k, v in raw_dates.items():
-                model_rate_limited_dates[str(k)] = str(v)
+                model_rate_limited_dates[canonicalize_surface_key(str(k))] = str(v)
 
         raw_reqs = data.get("model_requests")
         model_requests: dict[str, int] = {}
         if isinstance(raw_reqs, dict):
             for k, v in raw_reqs.items():
                 with contextlib.suppress(ValueError, TypeError):
-                    model_requests[str(k)] = int(str(v))
+                    model_requests[canonicalize_surface_key(str(k))] = int(str(v))
 
         raw_req_dates = data.get("model_requests_dates")
         model_requests_dates: dict[str, str] = {}
         if isinstance(raw_req_dates, dict):
             for k, v in raw_req_dates.items():
-                model_requests_dates[str(k)] = str(v)
+                model_requests_dates[canonicalize_surface_key(str(k))] = str(v)
 
         raw_limits = data.get("model_rate_limited")
         model_rate_limited: dict[str, int] = {}
         if isinstance(raw_limits, dict):
             for k, v in raw_limits.items():
                 with contextlib.suppress(ValueError, TypeError):
-                    model_rate_limited[str(k)] = int(str(v))
+                    model_rate_limited[canonicalize_surface_key(str(k))] = int(str(v))
 
         raw_drip = data.get("model_drip_mode")
         model_drip_mode: dict[str, bool] = {}
         if isinstance(raw_drip, dict):
             for k, v in raw_drip.items():
-                model_drip_mode[str(k)] = bool(v)
+                model_drip_mode[canonicalize_surface_key(str(k))] = bool(v)
 
         def _as_int(v: object) -> int:
             try:
@@ -205,102 +258,130 @@ class AccountStats:
                 self.model_drip_mode.pop(model, None)
 
     def is_available(
-        self, model: str | None = None, *, ignore_auth_cooldown: bool = False
+        self,
+        model: str | None = None,
+        *,
+        ignore_auth_cooldown: bool = False,
+        surface: str = DEFAULT_SURFACE,
     ) -> bool:
-        """检查账号在指定模型下是否可用（美西 0 点自动刷新）。"""
+        """检查账号在指定面/模型下是否可用（美西 0 点自动刷新）。"""
         now = time.time()
         if self.session_expired:
             return False
         if not ignore_auth_cooldown and self.auth_cooldown > now:
             return False
-        model = normalize_model_key(model)
+        key = _storage_key(surface, model)
         current_la = get_pacific_date_key(now)
-        self._check_date_reset(model, current_la)
+        self._check_date_reset(key, current_la)
 
         # 检查全局 429 标记
         if self.rate_limited_date_la:
             return False
 
-        if model:
-            cd = self.model_cooldowns.get(model, 0.0)
+        if key:
+            cd = self.model_cooldowns.get(key, 0.0)
             return now >= cd
 
         return True
 
-    def get_cooldown_remaining(self, model: str | None = None) -> float:
-        """获取距离配额刷新的剩余秒数。"""
-        model = normalize_model_key(model)
-        if self.is_available(model):
+    def get_cooldown_remaining(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> float:
+        """获取指定面/模型距离配额刷新的剩余秒数。"""
+        key = _storage_key(surface, model)
+        if self.is_available(model, surface=surface):
             return 0.0
         now = time.time()
         if self.auth_cooldown > now:
             return max(0.0, self.auth_cooldown - now)
-        if model:
-            cd = self.model_cooldowns.get(model, 0.0)
+        if key:
+            cd = self.model_cooldowns.get(key, 0.0)
             if cd > now:
                 return max(0.0, cd - now)
         return get_seconds_until_pacific_midnight()
 
-    def record_success(self, model: str | None = None) -> None:
+    def tracked_surface_models(self, current_la: str) -> list[tuple[str, str, str]]:
+        """枚举所有被跟踪的 (存储键, surface, model)，供 get_all_stats 汇总。"""
+        keys: set[str] = set(self.model_cooldowns.keys())
+        keys |= {
+            k for k, dt in self.model_rate_limited_dates.items() if dt == current_la
+        }
+        tracked: list[tuple[str, str, str]] = []
+        for storage_key in sorted(keys):
+            surface, model = split_surface_key(storage_key)
+            tracked.append((storage_key, surface, model))
+        return tracked
+
+    def record_success(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> None:
         now = time.time()
         self.requests += 1
         self.success += 1
         self.last_used = now
         self.auth_errors = 0
         self.auth_cooldown = 0.0
-        model = normalize_model_key(model)
-        if model:
+        key = _storage_key(surface, model)
+        if key:
             la_date = get_pacific_date_key(now)
-            self._check_date_reset(model, la_date)
-            self.model_requests[model] = self.model_requests.get(model, 0) + 1
-            self.model_requests_dates[model] = la_date
-            self.model_cooldowns.pop(model, None)
-            self.model_rate_limited_dates.pop(model, None)
-            if not self.model_drip_mode.get(model):
-                self.model_rate_limited.pop(model, None)
+            self._check_date_reset(key, la_date)
+            self.model_requests[key] = self.model_requests.get(key, 0) + 1
+            self.model_requests_dates[key] = la_date
+            self.model_cooldowns.pop(key, None)
+            self.model_rate_limited_dates.pop(key, None)
+            if not self.model_drip_mode.get(key):
+                self.model_rate_limited.pop(key, None)
 
-    def record_rate_limited(self, model: str | None = None) -> None:
+    def record_rate_limited(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> None:
         now = time.time()
         self.requests += 1
         self.rate_limited += 1
         self.last_rate_limited = now
         la_date = get_pacific_date_key(now)
         cooldown_seconds = get_seconds_until_pacific_midnight()
-        model = normalize_model_key(model)
+        key = _storage_key(surface, model)
 
-        if model:
-            self._check_date_reset(model, la_date)
+        if key:
+            self._check_date_reset(key, la_date)
 
-            is_drip = bool(self.model_drip_mode.get(model))
-            limit_count = self.model_rate_limited.get(model, 0) + 1
-            self.model_requests[model] = self.model_requests.get(model, 0) + 1
-            self.model_requests_dates[model] = la_date
-            self.model_rate_limited[model] = limit_count
+            is_drip = bool(self.model_drip_mode.get(key))
+            limit_count = self.model_rate_limited.get(key, 0) + 1
+            self.model_requests[key] = self.model_requests.get(key, 0) + 1
+            self.model_requests_dates[key] = la_date
+            self.model_rate_limited[key] = limit_count
 
             if is_drip:
                 cooldown_duration = 300.0 if limit_count <= 4 else 600.0
             elif limit_count <= 2:
                 cooldown_duration = 60.0
             else:
-                self.model_drip_mode[model] = True
+                self.model_drip_mode[key] = True
                 cooldown_duration = 300.0
 
             effective_cooldown = min(cooldown_duration, max(60.0, cooldown_seconds))
-            self.model_cooldowns[model] = now + effective_cooldown
-            self.model_rate_limited_dates[model] = la_date
+            self.model_cooldowns[key] = now + effective_cooldown
+            self.model_rate_limited_dates[key] = la_date
         else:
             self.rate_limited_date_la = la_date
 
-    def record_error(self, model: str | None = None) -> None:
+    def record_error(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> None:
         self.requests += 1
         self.errors += 1
         self.last_used = time.time()
-        model = normalize_model_key(model)
-        if model:
-            self.model_requests[model] = self.model_requests.get(model, 0) + 1
+        key = _storage_key(surface, model)
+        if key:
+            self.model_requests[key] = self.model_requests.get(key, 0) + 1
 
     def record_auth_error(
-        self, model: str | None = None, cooldown_seconds: float = 300.0
+        self,
+        model: str | None = None,
+        cooldown_seconds: float = 300.0,
+        *,
+        surface: str = DEFAULT_SURFACE,
     ) -> None:
         """记录鉴权/权限错误（403/401），立即冷却该账号以便快速故障转移。"""
         now = time.time()
@@ -310,11 +391,13 @@ class AccountStats:
         self.last_auth_error = now
         self.last_used = now
         self.auth_cooldown = now + cooldown_seconds
-        model = normalize_model_key(model)
-        if model:
-            self.model_requests[model] = self.model_requests.get(model, 0) + 1
+        key = _storage_key(surface, model)
+        if key:
+            self.model_requests[key] = self.model_requests.get(key, 0) + 1
 
-    def record_session_expired(self, model: str | None = None) -> None:
+    def record_session_expired(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> None:
         """记录账号登录态失效（被重定向到登录页），将该账号隔离并在未更新前禁止使用。"""
         now = time.time()
         self.requests += 1
@@ -326,24 +409,26 @@ class AccountStats:
         self.last_used = now
         # 隔离 24 小时或直至用户重新导入/手动重置
         self.auth_cooldown = now + 86400.0
-        model = normalize_model_key(model)
-        if model:
-            self.model_requests[model] = self.model_requests.get(model, 0) + 1
+        key = _storage_key(surface, model)
+        if key:
+            self.model_requests[key] = self.model_requests.get(key, 0) + 1
 
-    def clear_cooldown(self, model: str | None = None) -> None:
+    def clear_cooldown(
+        self, model: str | None = None, *, surface: str = DEFAULT_SURFACE
+    ) -> None:
         """手动清除冷却与 429/403/失效锁定。"""
         self.auth_cooldown = 0.0
         self.auth_errors = 0
         self.session_expired = False
         self.last_session_expired = 0.0
-        model = normalize_model_key(model)
-        if model:
-            self.model_cooldowns.pop(model, None)
-            self.model_rate_limited_dates.pop(model, None)
-            self.model_rate_limited.pop(model, None)
-            self.model_drip_mode.pop(model, None)
-            self.model_requests.pop(model, None)
-            self.model_requests_dates.pop(model, None)
+        key = _storage_key(surface, model)
+        if key:
+            self.model_cooldowns.pop(key, None)
+            self.model_rate_limited_dates.pop(key, None)
+            self.model_rate_limited.pop(key, None)
+            self.model_drip_mode.pop(key, None)
+            self.model_requests.pop(key, None)
+            self.model_requests_dates.pop(key, None)
         else:
             self.rate_limited_date_la = None
             self.model_cooldowns.clear()
@@ -367,11 +452,21 @@ class AccountRotator:
         self._lock = asyncio.Lock()
         self._last_saved_time: float = 0.0
         self._save_task: asyncio.Task | None = None
+        # WP5：调度排除钩子。orchestrator 会注入「allowed_surfaces 为空的组不参与调度」。
+        self._surface_eligibility: Callable[[AccountMeta], bool] | None = None
         self.load_state()
         self.cleanup_ghost_accounts()
         for account in self._store.list_accounts():
             if account.id not in self._stats:
                 self._stats[account.id] = AccountStats(account_id=account.id)
+
+    def set_surface_eligibility(self, fn: Callable[[AccountMeta], bool] | None) -> None:
+        """注入面策略调度排除钩子：fn(account) 返回 False 的账号跳过调度。
+
+        默认 None 表示不施加任何面策略过滤（保持旧调度行为）。主代理会把
+        orchestrator 的「allowed_surfaces 为空的组不参与调度」接上来。
+        """
+        self._surface_eligibility = fn
 
     def load_state(self) -> None:
         """从持久化文件恢复账号统计与 429 锁定状态。"""
@@ -431,11 +526,24 @@ class AccountRotator:
         self._save_task = loop.create_task(_delayed())
 
     def get_all_stats(self) -> dict[str, dict[str, object]]:
-        """获取所有账号的运行与配额状态。"""
+        """获取所有账号的运行与配额状态。
+
+        ``model_cooldowns`` 的键改为 ``"surface::model"`` 新格式（surface 内嵌），
+        并新增 ``surface_cooldowns`` 汇总（所有被跟踪的面/模型键 →剩余冷却秒）。
+        既有字段一律保留。
+        """
         result: dict[str, dict[str, object]] = {}
         current_la = get_pacific_date_key()
         for account in self._store.list_accounts():
             stats = self._stats.get(account.id, AccountStats(account_id=account.id))
+            model_cooldowns: dict[str, int] = {}
+            surface_cooldowns: dict[str, int] = {}
+            for _storage, surface, model in stats.tracked_surface_models(current_la):
+                remaining = int(stats.get_cooldown_remaining(model, surface=surface))
+                display_key = surface_model_key(surface, model) or _storage
+                surface_cooldowns[display_key] = remaining
+                if not stats.is_available(model, surface=surface) and remaining > 0:
+                    model_cooldowns[display_key] = remaining
             result[account.id] = {
                 "name": account.name,
                 "email": account.email,
@@ -460,19 +568,8 @@ class AccountRotator:
                 else 0,
                 "auth_errors": stats.auth_errors,
                 "cooldown_remaining": int(stats.get_cooldown_remaining()),
-                "model_cooldowns": {
-                    m: int(stats.get_cooldown_remaining(m))
-                    for m in (
-                        set(stats.model_cooldowns.keys())
-                        | {
-                            k
-                            for k, dt in stats.model_rate_limited_dates.items()
-                            if dt == current_la
-                        }
-                    )
-                    if not stats.is_available(m)
-                    and int(stats.get_cooldown_remaining(m)) > 0
-                },
+                "model_cooldowns": model_cooldowns,
+                "surface_cooldowns": surface_cooldowns,
                 "model_rate_limited_dates": dict(stats.model_rate_limited_dates),
                 "model_requests": dict(stats.model_requests),
                 "model_rate_limited": dict(stats.model_rate_limited),
@@ -484,13 +581,19 @@ class AccountRotator:
         """获取指定账号的统计对象。"""
         return self._stats.get(account_id)
 
-    def is_account_available(self, account_id: str, model: str | None = None) -> bool:
-        """检查指定账号在特定模型下是否健康可用（凭据过期账号一律不可用）。"""
+    def is_account_available(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> bool:
+        """检查指定账号在特定面/模型下是否健康可用（凭据过期账号一律不可用）。"""
         account = self._store.get_account(account_id)
         if account is not None and getattr(account, "expired", False):
             return False
         stats = self.get_account_stats(account_id)
-        return bool(stats and stats.is_available(model))
+        return bool(stats and stats.is_available(model, surface=surface))
 
     def _warn_if_all_expired(self) -> None:
         """当全部账号都因凭据过期而不可调度时，显式报错（不静默回落）。"""
@@ -502,11 +605,16 @@ class AccountRotator:
             )
 
     def _get_available_accounts(
-        self, model: str | None = None, *, ignore_auth_cooldown: bool = False
+        self,
+        model: str | None = None,
+        *,
+        ignore_auth_cooldown: bool = False,
+        surface: str = DEFAULT_SURFACE,
     ) -> list[tuple[AccountMeta, AccountStats]]:
-        """获取在指定模型下尚未耗尽当日额度且未被鉴权锁定的账号列表。
+        """获取在指定面/模型下尚未耗尽当日额度且未被鉴权锁定的账号列表。
 
-        凭据过期（``AccountMeta.expired``）的账号在此统一排除出所有调度选择。
+        凭据过期（``AccountMeta.expired``）的账号在此统一排除出所有调度选择；
+        若注入了 ``set_surface_eligibility`` 钩子，钩子返回 False 的账号同样跳过。
         """
         accounts = self._store.list_accounts()
         available: list[tuple[AccountMeta, AccountStats]] = []
@@ -518,8 +626,18 @@ class AccountRotator:
                     account.id,
                 )
                 continue
+            if self._surface_eligibility is not None and not self._surface_eligibility(
+                account
+            ):
+                logger.debug(
+                    "账号 %s 被面策略排除出调度(allowed_surfaces 为空)",
+                    account.id,
+                )
+                continue
             stats = self._stats.get(account.id, AccountStats(account_id=account.id))
-            if stats.is_available(model, ignore_auth_cooldown=ignore_auth_cooldown):
+            if stats.is_available(
+                model, ignore_auth_cooldown=ignore_auth_cooldown, surface=surface
+            ):
                 available.append((account, stats))
         return available
 
@@ -530,14 +648,15 @@ class AccountRotator:
         failed_account_id: str | None = None,
         *,
         is_session_expired: bool = False,
+        surface: str = DEFAULT_SURFACE,
     ) -> AccountMeta | None:
         """获取下一个可用账号（排除失败账号，优先平滑故障转移至健康账号）。"""
         async with self._lock:
-            available = self._get_available_accounts(model)
+            available = self._get_available_accounts(model, surface=surface)
             if not available:
                 # 保底：若所有账号都处于 auth_cooldown 中，允许 fallback 尝试恢复
                 available = self._get_available_accounts(
-                    model, ignore_auth_cooldown=True
+                    model, ignore_auth_cooldown=True, surface=surface
                 )
                 if not available:
                     self._warn_if_all_expired()
@@ -590,13 +709,14 @@ class AccountRotator:
         failed_account_id: str | None = None,
         *,
         is_session_expired: bool = False,
+        surface: str = DEFAULT_SURFACE,
     ) -> tuple[AccountMeta, AccountStats] | None:
         """获取下一个可用账号及其统计。"""
         async with self._lock:
-            available = self._get_available_accounts(model)
+            available = self._get_available_accounts(model, surface=surface)
             if not available:
                 available = self._get_available_accounts(
-                    model, ignore_auth_cooldown=True
+                    model, ignore_auth_cooldown=True, surface=surface
                 )
                 if not available:
                     self._warn_if_all_expired()
@@ -635,28 +755,47 @@ class AccountRotator:
 
             return available[0]
 
-    def record_success(self, account_id: str, model: str | None = None) -> None:
+    def record_success(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_success(model)
+        self._stats[account_id].record_success(model, surface=surface)
         self._schedule_debounced_save()
 
     def record_rate_limited(
         self,
         account_id: str,
         model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_rate_limited(model)
-        logger.warning("账号 %s 在模型 %s 触发当日限额", account_id, model or "all")
+        self._stats[account_id].record_rate_limited(model, surface=surface)
+        logger.warning(
+            "账号 %s 在面 %s 模型 %s 触发当日限额",
+            account_id,
+            surface,
+            model or "all",
+        )
 
         self.save_state()
 
-    def record_error(self, account_id: str, model: str | None = None) -> None:
+    def record_error(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_error(model)
+        self._stats[account_id].record_error(model, surface=surface)
         self.save_state()
 
     def record_auth_error(
@@ -664,11 +803,13 @@ class AccountRotator:
         account_id: str,
         model: str | None = None,
         cooldown_seconds: float = 300.0,
+        *,
+        surface: str = DEFAULT_SURFACE,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].record_auth_error(
-            model, cooldown_seconds=cooldown_seconds
+            model, cooldown_seconds=cooldown_seconds, surface=surface
         )
         logger.warning(
             "账号 %s 遇到 403 权限拒绝，暂停使用 %ds 并切换备用账号",
@@ -681,18 +822,31 @@ class AccountRotator:
         self,
         account_id: str,
         model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_session_expired(model)
+        self._stats[account_id].record_session_expired(model, surface=surface)
         logger.error("账号 %s 登录态失效，已被永久禁用直至重新导入凭据", account_id)
         self.save_state()
 
-    def clear_cooldown(self, account_id: str, model: str | None = None) -> None:
+    def clear_cooldown(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> None:
         """清除指定账号的 429 锁定。"""
         if account_id in self._stats:
-            self._stats[account_id].clear_cooldown(model)
-            logger.info("已手动清除账号 %s 锁定 (model=%s)", account_id, model)
+            self._stats[account_id].clear_cooldown(model, surface=surface)
+            logger.info(
+                "已手动清除账号 %s 锁定 (surface=%s, model=%s)",
+                account_id,
+                surface,
+                model,
+            )
 
         self.save_state()
 

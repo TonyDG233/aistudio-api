@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from aistudio_api.config import resolve_config_file
+from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
     AistudioImageOutputMode,
@@ -20,6 +21,7 @@ from .wire_types import (
 )
 
 _resolve_config_path = resolve_config_file
+_logger = get_logger("model_defaults")
 _SAFETY_CATEGORY_ORDER = (
     ("harassment", 7),
     ("hate", 8),
@@ -549,12 +551,20 @@ _DEFAULT_ATG_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
 _MAX_ATG_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 
+# WP5 分组编排：账号分组允许的面枚举与页面实例配额边界。
+_GROUP_SURFACE_CHOICES = ("chat", "build")
+_DEFAULT_GROUP_MAX_PAGE_INSTANCES = 2
+_MAX_GROUP_MAX_PAGE_INSTANCES = 16
+
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
     "route_by_tier": False,
     "account_refresh_concurrency": 3,
     "auto_switch": False,
     "auto_switch_interval_hours": 3.0,
+    # WP5：账号分组列表。空列表合法——未显式分组的账号由 orchestrator 按 tier
+    # 默认规则兜底（本模块只负责解析，不注入默认组）。
+    "groups": [],
     "atg": {
         "mode": "off",
         "tool_prefix": _DEFAULT_ATG_TOOL_PREFIX,
@@ -637,6 +647,73 @@ def _coerce_feature_str(value: object, default: str) -> str:
     return text if text else default
 
 
+def _coerce_feature_str_list(value: object) -> list[str]:
+    """归一字符串列表：小写、去空白、去重；非列表输入返回空列表。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = str(item).strip().lower()
+        if text and text not in items:
+            items.append(text)
+    return items
+
+
+def _coerce_feature_surfaces(value: object) -> list[str]:
+    """从 ("chat", "build") 中过滤出子集，保留输入顺序并去重。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    surfaces: list[str] = []
+    for item in value:
+        text = str(item).strip().lower()
+        if text in _GROUP_SURFACE_CHOICES and text not in surfaces:
+            surfaces.append(text)
+    return surfaces
+
+
+def _coerce_feature_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | None:
+    """归一单个分组项；非映射结构视为坏项丢弃并告警，不抛异常。"""
+    if not isinstance(raw, dict):
+        _logger.warning("features.groups[%d] 非映射结构，已丢弃: %r", index, raw)
+        return None
+    return {
+        "name": _coerce_feature_str(raw.get("name"), f"group-{index}"),
+        "match_tier": _coerce_feature_str_list(raw.get("match_tier")),
+        "match_emails_regex": _coerce_feature_optional_str(
+            raw.get("match_emails_regex")
+        ),
+        "allowed_surfaces": _coerce_feature_surfaces(raw.get("allowed_surfaces")),
+        "max_page_instances": _coerce_feature_int(
+            raw.get("max_page_instances"),
+            _DEFAULT_GROUP_MAX_PAGE_INSTANCES,
+            minimum=0,
+            maximum=_MAX_GROUP_MAX_PAGE_INSTANCES,
+        ),
+    }
+
+
+def _normalize_feature_groups(raw: object) -> list[dict[str, object]]:
+    """归一 features.groups 列表；逐项 coerce，坏项丢弃，缺省/空即空列表。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        _logger.warning("features.groups 非列表结构，已按空列表处理: %r", raw)
+        return []
+    groups: list[dict[str, object]] = []
+    for index, item in enumerate(raw):
+        normalized = _normalize_feature_group(item, index)
+        if normalized is not None:
+            groups.append(normalized)
+    return groups
+
+
 def _env_feature_baseline() -> dict[str, object]:
     """进程启动时的环境变量基线，作为 config.yaml features 段缺省项的兜底。"""
     from aistudio_api.config import settings
@@ -666,6 +743,7 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
         "auto_switch_interval_hours": _coerce_feature_float(
             raw.get("auto_switch_interval_hours"), 3.0, minimum=0.1
         ),
+        "groups": _normalize_feature_groups(raw.get("groups")),
         "atg": {
             "mode": _coerce_feature_choice(atg.get("mode"), "off", _ATG_MODES),
             "tool_prefix": _coerce_feature_str(

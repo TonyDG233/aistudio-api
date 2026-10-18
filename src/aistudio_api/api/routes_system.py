@@ -81,6 +81,7 @@ async def stats():
 class ClearCooldownRequest(BaseModel):
     account_id: str | None = None
     model: str | None = None
+    surface: str | None = None
 
 
 @protected_router.get("/rotation")
@@ -115,10 +116,18 @@ async def clear_cooldown(
         raise HTTPException(503, detail="调度器未初始化")
 
     if req.account_id:
-        rotator.clear_cooldown(req.account_id, model=req.model)
+        if req.surface:
+            rotator.clear_cooldown(req.account_id, model=req.model, surface=req.surface)
+        else:
+            rotator.clear_cooldown(req.account_id, model=req.model)
     else:
         rotator.clear_all_cooldowns()
-    logger.info("已清除冷却锁定: 账号=%s, 模型=%s", req.account_id, req.model)
+    logger.info(
+        "已清除冷却锁定: 账号=%s, 模型=%s, 面=%s",
+        req.account_id,
+        req.model,
+        req.surface,
+    )
 
     return {"ok": True, "accounts": rotator.get_all_stats()}
 
