@@ -1,0 +1,376 @@
+== MakerSuiteService METHODS ==
+AcceptCloudSqlTos
+AcceptTerms
+AcceptTermsOfService
+AddEvalSubmission
+AttachCustomDomain
+AutocompleteAppletPrompt
+BatchCheckCloudRunServices
+BatchGetCredits
+BatchGetProjectUsageLimits
+BulkDeleteSessionTurns
+CancelCodeAssistantOfflineGeneration
+CancelInteraction
+CheckCloudRunService
+CheckGitHubSyncStatus
+CheckImage
+CheckSharedAppletDeployment
+CheckUserStatus
+ClaimGdpCredits
+ClaimNextEvalTask
+ClearEvalActiveAttempt
+CodeAssistantOffline
+ComputeStagedGitHubDiff
+ContributeSessionTurn
+CountSessionTurns
+CountTokens
+CreateAgent
+CreateApplet
+CreateAppletAgent
+CreateAppletAgentInteractionStream
+CreateAppletAgentSchedule
+CreateCloudProject
+CreateCloudRunService
+CreateCredential
+CreateDataset
+CreateEnvironment
+CreateGdpProfile
+CreateGitHubRepository
+CreateInteraction
+CreateInteractionStream
+CreateOrGetHostedProjectOAuthClient
+CreatePrompt
+CreateSavedSystemInstruction
+CreateSharedAppletDeployment
+CreateSupportCaseComment
+CreateTrigger
+CreateVoice
+DeleteAgent
+DeleteApplet
+DeleteAppletAgentSchedule
+DeleteCloudApiKey
+DeleteCloudRunService
+DeleteCredential
+DeleteDataset
+DeleteDriveApplet
+DeleteEnvironment
+DeleteEvalAutorater
+DeleteEvalCampaign
+DeleteEvalFeedbackTemplate
+DeleteEvalSkill
+DeleteEvalTask
+DeletePrompt
+DeleteSavedSystemInstruction
+DeleteSharedAppletDeployment
+DeleteTrigger
+DeleteVoice
+DetachCustomDomain
+DisableTracesLogging
+DisconnectFigmaAccount
+DownloadBuildArtifacts
+EnableTracesLogging
+EnhancePrompt
+EvaluateTargeting
+ExchangeAndStoreOAuthCredential
+ExportDataset
+FetchApiKeyNames
+FetchChangelistContent
+FetchMetricTimeSeries
+FetchPiperFile
+ForgetRecentApplet
+GeminiSpeechToText
+GenerateAccessToken
+GenerateAppletLogo
+GenerateCloudApiKey
+GenerateCodeAssistantSuggestionChips
+GenerateContent
+GenerateDesignTheme
+GenerateDesignVariations
+GenerateFunctionCallAnswer
+GenerateGitHubCommitMessage
+GenerateImage
+GenerateTitle
+GenerateVideo
+GetAgent
+GetAgentBuilderTemplate
+GetAiStudioBenefitTier
+GetAppFolder
+GetApplet
+GetAppletAccess
+GetAppletAgentFiles
+GetAppletAgentSession
+GetAppletCloudRunServiceLogs
+GetAppletDeploymentInfo
+GetAppletGalleryConfig
+GetAppletSecret
+GetAppletTrajectory
+GetAutoraterResult
+GetCloudProjectQuotaTier
+GetCloudSqlTos
+GetCodeAssistantSnapshot
+GetComparison
+GetConversation
+GetCredential
+GetCustomDomainStatus
+GetDataset
+GetDefaultCloudProject
+GetDefaultDesignThemes
+GetEmbeddedPortalParameters
+GetEnvironment
+GetEnvironmentFileContent
+GetEnvironmentFiles
+GetEvalCampaign
+GetEvalUserScratch
+GetFigmaAuthStatus
+GetFigmaFileMetadata
+GetGdpProfileAndBenefits
+GetGenerateVideoOperation
+GetGetcodeTemplates
+GetGitHubAuthStatus
+GetGitHubCommitDelta
+GetHostedProject
+GetImFeelingLuckyOptions
+GetInteractionStream
+GetLoggingContext
+GetModel
+GetModelQuota
+GetPendingArenaInteraction
+GetPrepayEligibility
+GetProjectUsageLimit
+GetPrompt
+GetSample
+GetSavedSystemInstruction
+GetSession
+GetSessionTurn
+GetSupportCase
+GetTracesLoggingStatus
+GetTrigger
+GetUserPreferences
+GetUserRestrictions
+GetVersionedSystemInstruction
+GetVoice
+GetWorkspaceAppConfig
+ImportGitHubRepository
+ImportProjects
+ImprovePrompt
+LinkGitHubRepository
+ListAgentTemplates
+ListAgents
+ListAppletAgentSessions
+ListAppletAgents
+ListAppletSecrets
+ListAppletTrajectories
+ListApplets
+ListBillingAccounts
+ListBundledApplets
+ListCloudApiKeys
+ListCloudProjects
+ListCloudRunServices
+ListCodeAssistantConfigurations
+ListCodeAssistantFeatures
+ListCodeAssistantOfflineGenerations
+ListCodeGenSuggestionCards
+ListConnectorTemplates
+ListConversations
+ListCredentials
+ListDatasets
+ListEvalAutoraters
+ListEvalCampaigns
+ListEvalFeedbackTemplates
+ListEvalSkills
+ListEvalSubmissions
+ListEvalTasks
+ListFilesInScs
+ListFunctionNames
+ListGitHubBranches
+ListGitHubRepositories
+ListImportedProjects
+ListIncidentsHistory
+ListLinkedProjects
+ListModelRateLimits
+ListModels
+ListPromos
+ListPrompts
+ListProxyAtRiskApplets
+ListQuotaModels
+ListRecentApplets
+ListSavedSystemInstructions
+ListSessionTurns
+ListSharedApplets
+ListTriggerDeliveries
+ListTriggerExecutions
+ListTriggers
+ListUnsetAppletSecrets
+ListUserCustomDomains
+ListVoices
+LoadBundledApplet
+LoadCodeAssistantInteractionHistory
+LoadCodeAssistantSnapshots
+Log
+LogGdpInteractionEvents
+MigrateCloudRunRegion
+PrepareCustomDomains
+ProvisionAndInitializeApplet
+ProxyStreamedCall
+ProxyUnaryCall
+ProxyUnaryFileApiCall
+PullGitHubChanges
+PurchaseCustomDomain
+PushNewCommit
+QueryCodeSearch
+RecordSessionTurnFeedback
+RemoveProjects
+ResolveArenaInteraction
+ResolveDriveResource
+RetryArm
+RunAutorater
+RunTrigger
+SaveApplet
+SaveDriveApplet
+SaveEvalActiveAttempt
+SaveEvalAutorater
+SaveEvalCampaign
+SaveEvalFeedbackTemplate
+SaveEvalFreePlayDraft
+SaveEvalSkill
+SaveEvalTask
+SearchCustomDomains
+SetEvalCampaignStatus
+SeverAppletRedirect
+StartArenaInteraction
+StartComparisonGeneration
+StartInteractiveVideoWebRtcSession
+StoreRecentApplet
+StreamCodeAssistantOfflineGeneration
+StreamExtractVideoFrames
+ToggleExperimentsOptIn
+ToggleInteractionsLogging
+UpdateAgent
+UpdateAppletAccess
+UpdateAppletAgentSchedule
+UpdateAppletChatHistorySharing
+UpdateCloudApiKey
+UpdateCloudProject
+UpdateCloudRunService
+UpdateCredential
+UpdateDataset
+UpdateProjectUsageLimit
+UpdatePrompt
+UpdateSavedSystemInstruction
+UpdateTracesPreset
+UpdateTrigger
+UpdateUserPreferences
+UpgradeAndDisablePrepay
+UploadEnvironmentFile
+UploadScs
+UploadVoices
+ValidateCloudRunVanityUrl
+VerifyCloudProject
+
+== StreamGenerateContent ==
+
+== streamGenerateContent ==
+-- v4-match-1.js: count=1
+   | generate /files /openai/chat/completions /openai/embeddings /openai/images/generations :batchEmbedContents :chatCompletions :generateContent :generateContentPerUserQuota :predict :predictLongRunning :streamGenerateContent BidiGenerateContent BidiGenerateMusic".split(" ");_.Gyb=function(a,b){return _.y(function*(){var c=yield _.mFa(b,a.zd),d=new _.mab,e=_.m(c,1);d=_.l(d,1,e).setRequest(_.m(c,2));e=_.m(c,4);d=_.l(d,5,e);c=_.m(c,3);c=_.l(d,4,c);c=_.l(c,2,b.TE
+-- v4-match-4.js: count=3
+   | atch(c){return!1}}; cCd=function(a,b,c,d,e,f,g){return _.y(function*(){var k=aCd.some(u=>a.pathname.includes(u));k||c.set("x-goog-api-key",f);var p=(new TextDecoder).decode(d);p=a.pathname.includes(":streamGenerateContent")||kCd(a.pathname,p);var q=lCd.test(a.pathname)||a.pathname.includes("/environments/")&&a.pathname.includes("/files")&&b.toUpperCase()==="GET";q&&!k&&a.searchParams.set("key",f);try{let u=yield fetch(a,{method:b,headers:c,body:d});AV(e,u.
+   | ion*(){yield _.BXc(g,()=>_.y(function*(){return k()?{success:!0}:pCd(a,b,c,d,e,f,p)}))})}; pCd=function(a,b,c,d,e,f,g){return _.y(function*(){var k=(new TextDecoder).decode(d),p=a.pathname.includes(":streamGenerateContent")||a.pathname.includes("/openai/chat/completions")||kCd(a.pathname,k);try{return p?yield qCd(a,k,f,e,g,a.pathname.includes("/openai/")):yield rCd(a,b,k,f,e,c,d),{success:!0}}catch(q){return YBd(q)&&g(),CV(q,e),{success:!1}}finally{CBd(e)}
+   | J=function(a){return new (a||_.KV)}; _.KV.ta=_.id({token:_.KV,factory:_.KV.J,xa:"root"});var lCd,aCd,ZBd,hCd,BGd,EGd,DGd,fCd,FGd,eCd;lCd=/\/files\/[^/]+:download$/;aCd=["generateContentPerUserQuota","streamGenerateContentPerUserQuota"];ZBd=0;_.gCd=new Map;hCd=new Map;BGd=class{}; EGd=function(a){return _.y(function*(){if(a.closed)return{success:!0};a.isConnected=!0;yield a.A.connect();if(a.closed)return{success:!0};a.port.postMessage({type:"open"});a.port.
+-- v4-match-5.js: count=2
+   |  // Special handling for legacy path construction if url not provided let finalPath = pathSegment; if (requestSpec.streaming_mode === "fake" && finalPath.includes(":streamGenerateContent")) { finalPath = finalPath.replace(":streamGenerateContent", ":generateContent"); } const queryString = queryParams.toString(); pathAndQuery = `${finalPath}${queryString ? "?" + queryString : ""}`; 
+   | vided let finalPath = pathSegment; if (requestSpec.streaming_mode === "fake" && finalPath.includes(":streamGenerateContent")) { finalPath = finalPath.replace(":streamGenerateContent", ":generateContent"); } const queryString = queryParams.toString(); pathAndQuery = `${finalPath}${queryString ? "?" + queryString : ""}`; } // Rewriting absolute URLs (if provided) if (pathAndQue
+
+== ProxyUnaryCall ==
+-- v4-match-1.js: count=2
+   | le.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyStreamedCall",kFa,_.iab,a=>a.serialize(),jab);_.lab=new _.Us("/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyUnaryCall",kFa,_.iab,a=>a.serialize(),jab);_.mab=class extends _.h{constructor(a){super(a)}setRequest(a){return _.l(this,3,a)}};_.mab.prototype.bta=_.ba(323);var nab=new _.Us("/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyUnary
+   | =this.A();return a!==null?a:this.mh()})}uR(a){this.H.set(a)}};_.LD.J=function(a){return new (a||_.LD)};_.LD.ta=_.id({token:_.LD,factory:_.LD.J,xa:"root"});var zFa=new Set("GenerateContent CountTokens ProxyUnaryCall CodeAssistantOffline StreamRunAgentTask CancelAgentTask CancelInteraction CreateInteraction CreateInteractionStream GetInteractionStream GenerateVideo GetGenerateVideoOperation StreamExtractVideoFrames CreateVoice ListVoices DeleteVoice".split("
+-- v4-match-4.js: count=1
+   | _.h{constructor(a){super(a)}}; tCd=function(a,b){return _.y(function*(){var c=yield _.mFa(b,a.zd),d=a.A;c=yield _.Fw(d.A,d.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyUnaryCall",c,{},_.lab);return _.oFa(c)})};sCd=function(a,b){return _.y(function*(){var c=yield _.mFa(b,a.zd),d=JFd(a.A,c);return kBd(()=>d).pipe(_.Fe(_.oFa))})};OFd={productId:"5343322",bucket:"ais-build-design-variation-preference"}; PFd=function(a,b){va
+
+== ProxyStreamedCall ==
+-- v4-match-1.js: count=1
+   | _.cn(this,1,nFa)}fu(a){return _.Pl(this,1,nFa,a)}hasResponse(){return _.nr(this,1,nFa)}};jab=_.Ec(_.iab);nFa=[1,3];_.kab=new _.Us("/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyStreamedCall",kFa,_.iab,a=>a.serialize(),jab);_.lab=new _.Us("/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyUnaryCall",kFa,_.iab,a=>a.serialize(),jab);_.mab=class extends _.h{constructor(a){super(a)}setRequest(a){return _.l(thi
+-- v4-match-4.js: count=1
+   | .yk(this,1)});_.r3a.prototype.j_=_.da(256,function(){return _.yk(this,4)}); JFd=function(a,b){return a.A.serverStreaming(a.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyStreamedCall",b,{},_.kab)};KFd=class extends _.h{constructor(a){super(a)}};LFd=class extends _.h{constructor(a){super(a)}};MFd=class extends _.h{constructor(a){super(a)}};NFd=class extends _.h{constructor(a){super(a)}}; tCd=function(a,b){return _.y(functi
+
+== x-goog-api-key ==
+-- v4-match-1.js: count=2
+   | return`${a} ${c}`};_.Gl=function(a){a=a.zm();return a===30||a===40||a===50||a===60||a===70};_.Bya=function(a){return a.map(b=>{b=b.clone();b.bf()==="generativelanguage.googleapis.com"&&b.Jk().delete("x-goog-api-key");return b})}; Oya=function(a,b,c){a=(a==null?0:a.turns)?[...a.turns]:[];if(a.length>0&&a[a.length-1].speakerLabel===c.speakerLabel){let d=a[a.length-1],e,f=(e=d.startTimestamp)!=null?e:c.startTimestamp,g;c=(g=c.endTimestamp)!=null?g:d.endTimest
+   | Bytes=a}}; XFb=function(a,b){return _.y(function*(){if(a.F)return a.F;var c,d=(c=a.aa.hb())==null?void 0:_.ao(c);if(!d)throw Error("Qc");a.F=(()=>_.y(function*(){a.Ca.set(!0);try{let e=new Map;e.set("x-goog-api-key",d);let f=(yield _.Gyb(a.V,{method:a.X?`/v1beta/environments/${b}/files/?alt=media`:`/v1beta/files/environment-${b}:download`,request:"",httpMethod:"GET",headers:e})).VQa;if(!f)throw Error("Rc");let g=f.buffer;if(g.byteLength>209715200)throw new
+-- v4-match-4.js: count=1
+   | (!a.includes("/interactions"))return!1;try{return JSON.parse(b).stream===!0}catch(c){return!1}}; cCd=function(a,b,c,d,e,f,g){return _.y(function*(){var k=aCd.some(u=>a.pathname.includes(u));k||c.set("x-goog-api-key",f);var p=(new TextDecoder).decode(d);p=a.pathname.includes(":streamGenerateContent")||kCd(a.pathname,p);var q=lCd.test(a.pathname)||a.pathname.includes("/environments/")&&a.pathname.includes("/files")&&b.toUpperCase()==="GET";q&&!k&&a.searchPar
+-- v4-match-5.js: count=1
+   | h(h => delete sanitized[h]); if (this._isUploadRequestSpec(requestSpec)) { delete sanitized.authorization; delete sanitized["x-api-key"]; delete sanitized["x-goog-api-key"]; } return sanitized; } _isUploadRequestSpec(requestSpec = {}) { const path = String(requestSpec.url || requestSpec.path || "").toLowerCase(); return this._isUploadPathAndQuery(path); } _isUploadPathAndQuery(path) 
+
+== GenerateAccessToken ==
+-- v4-match-1.js: count=2
+   | GeminiSpeechToText",_.Gv,_.Q2a,a=>a.serialize(),_.Ec(_.Q2a));var S2a=class extends _.h{constructor(a){super(a)}};var T2a=new _.Us("/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateAccessToken",vTa,S2a,a=>a.serialize(),_.Ec(S2a));_.U2a=class extends _.h{constructor(a){super(a)}getPrompt(){return _.m(this,1)}setPrompt(a){return _.l(this,1,a)}Db(){return _.m(this,2)}};var V2a=class extends _.h{constructor(a){super(a)}Ub(){return _.
+   | .internal.alkali.applications.makersuite.v1.MakerSuiteService/ListPrompts",b,{},Z9a)};_.Iw=function(a,b){return _.Fw(a.A,a.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateAccessToken",b,{},T2a)};_.Hw.prototype.H=_.ba(342); var Web=function(a,b){return _.Fw(a.A,a.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListCloudProjects",b,{},u8a)},Xeb=function(a,b){return _.Fw(a.A,a.F+"/$rpc/google.i
+
+== candidateCount ==
+
+== responseFormat ==
+-- v4-match-5.js: count=6
+   | nfig || typeof generationConfig !== "object") { continue; } structuredOutputKeys.forEach(key => delete generationConfig[key]); for (const key of ["responseFormat", "response_format"]) { const responseFormat = generationConfig[key]; if (!preserveResponseFormat) { delete generationConfig[key]; } else if (responseFormat && typeof responseFormat === "object") {
+   |  continue; } structuredOutputKeys.forEach(key => delete generationConfig[key]); for (const key of ["responseFormat", "response_format"]) { const responseFormat = generationConfig[key]; if (!preserveResponseFormat) { delete generationConfig[key]; } else if (responseFormat && typeof responseFormat === "object") { // Preserve modality settings such as au
+   | e_format"]) { const responseFormat = generationConfig[key]; if (!preserveResponseFormat) { delete generationConfig[key]; } else if (responseFormat && typeof responseFormat === "object") { // Preserve modality settings such as audio, but remove text structured output. delete responseFormat.text; if (Object.keys(responseFormat).length === 0) { 
+
+== responseMimeType ==
+-- v4-match-1.js: count=22
+   | s:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.functionDeclarations!==void 0&&{functionDeclarations:a.functionDec
+   | ature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.functionDeclarations!==void 0&&{functionDeclarations:a.functionDeclarations},a.enableSearchAsA
+   | mperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.functionDeclarations!==void 0&&{functionDeclarations:a.functionDeclarations},a.enableSearchAsATool!==void 0&&{ena
+-- v4-match-5.js: count=1
+   | thAndQuery} -> ${finalUrl}`); return finalUrl; } _removeStructuredOutputConfig(bodyObj, { preserveResponseFormat = false } = {}) { const structuredOutputKeys = [ "responseMimeType", "response_mime_type", "responseSchema", "response_schema", "responseJsonSchema", "response_json_schema", "_responseJsonSchema", "_response_json_schema", ]; for 
+
+== maxOutputTokens ==
+-- v4-match-1.js: count=18
+   | y.length>0&&{customVocabulary:a.customVocabulary},{safetySettings:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.fu
+   | ry:a.customVocabulary},{safetySettings:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.functionDeclarations!==void 0
+   | ary},{safetySettings:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType},a.enableCodeExecution!==void 0&&{enableCodeExecution:a.enableCodeExecution}, a.bp!==void 0&&{bp:a.bp},a.Uf!==void 0&&{Uf:a.Uf},a.functionDeclarations!==void 0&&{functionDeclara
+
+== safetySettings ==
+-- v4-match-1.js: count=15
+   | e,hBa:g,set:k=>{c(k)},update:k=>{c(k(f()))}})}; aya=function(a){return Object.assign({},{model:a.model,wm:a.wm},a.customVocabulary&&a.customVocabulary.length>0&&{customVocabulary:a.customVocabulary},{safetySettings:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.
+   | (k)},update:k=>{c(k(f()))}})}; aya=function(a){return Object.assign({},{model:a.model,wm:a.wm},a.customVocabulary&&a.customVocabulary.length>0&&{customVocabulary:a.customVocabulary},{safetySettings:a.safetySettings},a.temperature!==void 0&&{temperature:a.temperature},a.topK!==void 0&&{topK:a.topK},a.topP!==void 0&&{topP:a.topP},a.maxOutputTokens!==void 0&&{maxOutputTokens:a.maxOutputTokens},a.responseMimeType!==void 0&&{responseMimeType:a.responseMimeType}
+   | a,43)?_.Wj(a,43):void 0,md=_.xk(a,48)?_.Wj(a,48):void 0,Uf=_.wk(a,45)?a.uj():void 0,gf=_.vj(a,47).length>0?[..._.vj(a,47)]:void 0;a=_.vj(a,46).length>0?[..._.vj(a,46)]:void 0;return aya({model:e,wm:k,safetySettings:u,temperature:d,topP:f,topK:g,maxOutputTokens:p,responseMimeType:q, enableCodeExecution:w,enableBrowseAsATool:B,responseModalities:L,seed:Q,mediaResolution:R,bp:S,Uf:T,functionDeclarations:b,enableSearchAsATool:X,enableImageSearch:E,enableGoogle
+
+== getMetadata ==
+-- v4-match-1.js: count=63
+   | row new _.wd(601,!1);}},Object.assign({},{equal:b==null?void 0:b.equal},void 0))};wAa=function(a=Object.is){return(b,c)=>b.kind===1&&c.kind===1&&a(b.value,c.value)};xAa=function(a){var b;return!((b=a.getMetadata())==null?0:_.Jm(b).get("parentAppId"))};yAa=function(a){var b;return((b=a.getMetadata())==null?void 0:b.Db())!==":::::::: Code Assistant history - Saved from AI Studio ::::::::"}; _.Km=function(a,b){return{type:7,name:a,definitions:b,options:{}}};_
+   | function(a=Object.is){return(b,c)=>b.kind===1&&c.kind===1&&a(b.value,c.value)};xAa=function(a){var b;return!((b=a.getMetadata())==null?0:_.Jm(b).get("parentAppId"))};yAa=function(a){var b;return((b=a.getMetadata())==null?void 0:b.Db())!==":::::::: Code Assistant history - Saved from AI Studio ::::::::"}; _.Km=function(a,b){return{type:7,name:a,definitions:b,options:{}}};_.Lm=function(a,b=null){return{type:4,styles:b,timings:a}};_.Mm=function(a){return{type
+   | ith("video/")?"VIDEO":a.startsWith("audio/")?"AUDIO":"FILE"};_.Sn=function(a){var b;return((b=Array.from(Object.values(PGa)))!=null?b:[]).some(c=>a.includes(c))}; _.QGa=function(a){if(!a)return!1;a=a.getMetadata();if(!a)return!1;if(_.Jm(a).get("agentId"))return!0;var b;return((b=_.Tn(a))==null?void 0:b.wr())===1};TGa=function(a={}){return RGa!=null?RGa:RGa=SGa(a)};UGa=function(){return new Promise((a,b)=>{window.gapi.load("client",{callback:a,onerror:b})})
+-- v4-match-3.js: count=7
+   |  this.I.jk(a)}get oa(){return"googledevai/en/"}};_.L6.J=function(a){return new (a||_.L6)};_.L6.ta=_.id({token:_.L6,factory:_.L6.J,xa:"root"}); var Ljf,Mjf,Njf;_.M6=function(a){var b,c,d;return(d=(b=a.getMetadata())==null?void 0:(c=b.Dw())==null?void 0:_.Wj(c,2))!=null?d:!1};Ljf=function(a){a:{if(a.F()&&(a=a.getMetadata(),_.yk(a,5)&&(a=_.xc(a,_.l0a,5),_.yk(a,1)))){a=_.xc(a,_.to,1).toDate();break a}a=null}return a?a.getTime():0};Mjf=function(a){switch(_.sv(a
+   | :_.L6,factory:_.L6.J,xa:"root"}); var Ljf,Mjf,Njf;_.M6=function(a){var b,c,d;return(d=(b=a.getMetadata())==null?void 0:(c=b.Dw())==null?void 0:_.Wj(c,2))!=null?d:!1};Ljf=function(a){a:{if(a.F()&&(a=a.getMetadata(),_.yk(a,5)&&(a=_.xc(a,_.l0a,5),_.yk(a,1)))){a=_.xc(a,_.to,1).toDate();break a}a=null}return a?a.getTime():0};Mjf=function(a){switch(_.sv(a)){case 2:return"Freeform prompt";case 14:case 7:return"Chat prompt";case 16:return"Imagen prompt";case 17:re
+   | urn"Unknown prompt"}}; Njf=function(a){switch(_.sv(a)){case 2:return"format_image_right";case 14:case 7:return"chat_bubble";case 16:return"dashboard";default:return"draft"}};_.Ojf=function(a){var b=a.getMetadata().Dw();if(_.Wj(b,2))a="me";else{let c,d,e;a=(e=(c=a.getMetadata())==null?void 0:(d=c.Dw())==null?void 0:d.getDisplayName())!=null?e:""}return a}; _.Pjf=class{constructor(a){this.prompt=a}getPrompt(){return this.prompt}getId(){return this.prompt.get
+-- v4-match-4.js: count=32
+   | =function(a,b){return _.l(a,1,b)};_.X0b=function(a,b){return _.ir(a,2,b)}; _.BI=class extends _.h{constructor(a){super(a)}getPath(){return _.m(this,1)}};_.CI=class extends _.h{constructor(a){super(a)}getMetadata(){return _.xc(this,_.Ju,1)}A(a){return _.yc(this,_.Ju,1,a)}F(){return _.yk(this,1)}Di(){return _.Uq(this,_.Ju,1)}Tr(a,b){return _.Wq(this,2,_.BI,a,b)}};Y0b=function(a,b){return _.l(a,1,b)};Z0b=function(a,b){return _.qo(a,2,b)};_.$0b=class extends _
+   | ==null?void 0:_.Wj(c,3))!=null?p:!1},lastModified:{z$:(q=b==null?void 0:(g=b.toDate())==null?void 0:g.toISOString())!=null?q:"",user:{JC:e}}}}; _.lic=function(a,b,c,d){if(!a)throw Error("Lb");var e=a.getMetadata(),f=a.Ab(),g=b;if(!g){var k;g=(k=a.rU())==null?void 0:k.getUrl()}var p;k=(p=_.xc(a,_.fZa,12))==null?void 0:p.getUrl();var q,u=(q=_.xc(a,_.gL,11))==null?void 0:q.Ew(),w,B,E,J,L,Q,R,S,T,X;q=new _.hL([]);e&&(p=_.eic(_.Cj(e,9)),_.iL(q,{name:e.getDispla
+   | sL),{path:_.m(a,1),generationType:3,description:`Moved to ${_.m(a,2)}`,moveToPath:_.m(a,2),isDone:!0}}; Hic=function(a,b,c){var d=_.qk(a,Fic,18,_.tL);a=d==null?void 0:_.xc(d,Gic,1);d=d==null?void 0:d.getMetadata();if(a&&d&&(a=Eic(a))){let e=a.path.replace("artifacts/brain/","artifacts/");qL(c,"model",{type:"planningArtifact",path:e,summary:_.m(d,1)||"",description:a.description||"",requestFeedback:_.Wj(d,3)||!1},b,f=>f.payload.type==="planningArtifact"&&f.
+
+== isSignedIn ==
+-- v4-match-1.js: count=13
+   | );this.Ml=Number(_.ap(_.gd("QrtxK"),"0"));this.F=_.ap(_.gd("CoJqbf"), "");this.A=_.ap(_.gd("KU8tnd"),"");this.I=_.ap(_.gd("Onibif"),"");this.Oa=ip(_.gd("MsAAre"));this.Hf=_.ap(_.gd("oPEP7c"),"");this.isSignedIn=ip(_.gd("kPYdqb"));CQa();this.cb=_.ap(_.gd("nPAWmd"),"");this.sqc=_.ap(_.gd("pm20lb"),"cloudconsole-pa.clients6.google.com");this.ab=kp(_.gd("NHyHAe"),0);this.ma=kp(_.gd("rU9UAf"),864E5);this.ea=kp(_.gd("zQKvjb"),25);this.aa=kp(_.gd("iRz4i"),4);this
+   | d({token:As,factory:As.J,xa:"root"});_.KTa=function(a){try{let b=new URL(a,window.location.origin);b.search="";b.hash="";return b.toString()}catch(b){return a}};_.LTa=function(a){return{signedIn:a.mb.isSignedIn?"true":"false"}};_.Bs=function(a,b,c,d){var e=`${b} - ${c}`;d&&(e+=` - ${d}`);a.A.gtag("event",e,Object.assign({},{category:b,action:c,label:d?d:void 0,nonInteraction:!1},_.LTa(a)))}; _.Cs=class{constructor(){this.A=_.n(As);this.mb=_.n(_.Yo);window.
+   | label:d?d:void 0,nonInteraction:!1},_.LTa(a)))}; _.Cs=class{constructor(){this.A=_.n(As);this.mb=_.n(_.Yo);window.dataLayer=window.dataLayer||[];window.dataLayer.push({event:"config",signedIn:this.mb.isSignedIn?"true":"false"})}trackPageView(a){a=(a!=null?a:window.location.pathname).split("?")[0];window.dataLayer=window.dataLayer||[];window.dataLayer.push({event:"page_view",page_location:_.KTa(Ara(a))})}};_.Cs.J=function(a){return new (a||_.Cs)};_.Cs.ta=_.
+-- v4-match-3.js: count=12
+   | anceof _.hl&&(e=_.mTa.has(f.code)?f:void 0),{success:!1}}}),6E4)}catch(f){return}if(!e&&!d)throw Error("Cc");}),5)}catch(d){}a.ma.set(c);_.PBb(a,c);a.aa.set(!0);a.us.resolve()})},Zof=function(a){a.mb.isSignedIn? Yof(a):(a.aa.set(!0),a.us.resolve())},$of=class extends _.h{constructor(a){super(a)}},apf=function(a,b){_.y(function*(){yield Rof(a.Sa,b.toString())})},bpf=["/build","/chat","/find","/key","/shortcuts"],cpf=function(a,b){a.commands.update(c=>{var d
+   | (_.FE);this.Fc=_.n(_.eF);this.A=_.n(_.ID); this.q$b=_.n(_.YM);this.R=_.n(_.Ox);this.tb=_.n(_.Yn);this.mb=_.n(_.Yo);this.S_a=_.Ph("buttonContainer");this.vEb=_.Ph("firstFocus");this.Hf=this.mb.Hf;this.isSignedIn=this.mb.isSignedIn;this.FUb=_.Z(()=>this.ej()&&this.mh()||!!this.hb());this.aMb=_.Z(()=>{var b,c;return((b=this.hb())==null?void 0:(c=_.ao(b))==null?void 0:c.slice(-4))||""});this.X=this.I.getFlag(_.Kuc);this.la=_.Z(()=>this.X?this.Fc.F()&&this.mh()
+   | _.eF);this.A=_.n(_.ID); this.q$b=_.n(_.YM);this.R=_.n(_.Ox);this.tb=_.n(_.Yn);this.mb=_.n(_.Yo);this.S_a=_.Ph("buttonContainer");this.vEb=_.Ph("firstFocus");this.Hf=this.mb.Hf;this.isSignedIn=this.mb.isSignedIn;this.FUb=_.Z(()=>this.ej()&&this.mh()||!!this.hb());this.aMb=_.Z(()=>{var b,c;return((b=this.hb())==null?void 0:(c=_.ao(b))==null?void 0:c.slice(-4))||""});this.X=this.I.getFlag(_.Kuc);this.la=_.Z(()=>this.X?this.Fc.F()&&this.mh()&&this.A.H()&&(this
+
+== generateContent ==
+-- v4-match-1.js: count=5
+   | te.v1.MakerSuiteService/ListModels",b,{},S9a)}; Reb=function(a,b){return _.Fw(a.A,a.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CountTokens",b,{},NYa)};_.Hw.prototype.generateContent=function(a,b){return this.A.serverStreaming(this.F+"/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",a,b||{},l3a)};_.Seb=function(a,b){return _.Fw(a.A,a.F+"/$rpc/google.internal.alkali.applications.make
+   | ot"});_.Fyb=class{};var iFa="/cachedContents /chat/completions /embeddings:generate /files /openai/chat/completions /openai/embeddings /openai/images/generations :batchEmbedContents :chatCompletions :generateContent :generateContentPerUserQuota :predict :predictLongRunning :streamGenerateContent BidiGenerateContent BidiGenerateMusic".split(" ");_.Gyb=function(a,b){return _.y(function*(){var c=yield _.mFa(b,a.zd),d=new _.mab,e=_.m(c,1);d=_.l(d,1,e).setReque
+   | {};var iFa="/cachedContents /chat/completions /embeddings:generate /files /openai/chat/completions /openai/embeddings /openai/images/generations :batchEmbedContents :chatCompletions :generateContent :generateContentPerUserQuota :predict :predictLongRunning :streamGenerateContent BidiGenerateContent BidiGenerateMusic".split(" ");_.Gyb=function(a,b){return _.y(function*(){var c=yield _.mFa(b,a.zd),d=new _.mab,e=_.m(c,1);d=_.l(d,1,e).setRequest(_.m(c,2));e=_.
+-- v4-match-3.js: count=3
+   | urn _.v(pqc(c))});_.Qg(5,9);_.H()}if(a&2){a=_.M();_.F("variant",a.RDc()?"primary":"borderless")("xapCopyToClipboard",`curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent" \\ -H 'Content-Type: application/json' \\ -H 'X-goog-api-key: ${a.ida()}' \\ -X POST \\ -d '{ "contents": [ { "parts": [ { "text": "Explain how AI works in a few words" } ] } ] }'`.trim
+   | .ju().entries||[];Jjf(a,e);return Kjf(a,e)}catch(c){return console.error(`Failed to fetch nav (${b}):`,c),[]}})};Jjf=function(a,b){for(let c of b)c.aisUrlPath&&c.path&&(a.F.set(c.aisUrlPath,c.path),c.generateContentPath&&a.R.set(c.aisUrlPath,c.generateContentPath),c.v1UrlPath&&a.V.set(c.aisUrlPath,c.v1UrlPath)),c.section&&Jjf(a,c.section)}; Kjf=function(a,b){var c=[];for(let d of b)d.heading?c.push(d):d.title&&(d.section?(b=Kjf(a,d.section),b.length>0&&c.p
+   | atch(c){return console.error(`Failed to fetch nav (${b}):`,c),[]}})};Jjf=function(a,b){for(let c of b)c.aisUrlPath&&c.path&&(a.F.set(c.aisUrlPath,c.path),c.generateContentPath&&a.R.set(c.aisUrlPath,c.generateContentPath),c.v1UrlPath&&a.V.set(c.aisUrlPath,c.v1UrlPath)),c.section&&Jjf(a,c.section)}; Kjf=function(a,b){var c=[];for(let d of b)d.heading?c.push(d):d.title&&(d.section?(b=Kjf(a,d.section),b.length>0&&c.push(Object.assign({},d,{section:b}))):c.push
+-- v4-match-4.js: count=3
+   | ch(d){b.A.delete(c)}})}};_.KV.J=function(a){return new (a||_.KV)}; _.KV.ta=_.id({token:_.KV,factory:_.KV.J,xa:"root"});var lCd,aCd,ZBd,hCd,BGd,EGd,DGd,fCd,FGd,eCd;lCd=/\/files\/[^/]+:download$/;aCd=["generateContentPerUserQuota","streamGenerateContentPerUserQuota"];ZBd=0;_.gCd=new Map;hCd=new Map;BGd=class{}; EGd=function(a){return _.y(function*(){if(a.closed)return{success:!0};a.isConnected=!0;yield a.A.connect();if(a.closed)return{success:!0};a.port.post
+   | GP.emit({selector:e,dataUrl:c})})},aId=function(a,b){return _.y(function*(){if(a.fb.pI){a.jU.set(void 0); a.VZ.set(void 0);a.Vd.set(!0);a.xfa.emit();try{let c=yield ZHd(a,b.prompt,b.imageUrl);a.A=a.F.generateContent(c);$Hd(a,a.A)}catch(c){a.handleError(c)}}})},YHd=function(a,b){return _.y(function*(){if(b.startsWith("data:")){var c=b.match(/^data:([^;]+);base64,(.+)$/);if(c)return{mimeType:c[1],base64:c[2]}}else{c=b;if(!b.startsWith("http://")&&!b.startsWi
+   | ."}`;c=_.yu(_.EYa((new _.zu).setModel("models/gemini-2.5-flash"),[_.rt(_.st(new _.tt,"user"),[(new _.qt).setText(c)])]),_.uUa(new _.Pj,[1]));d=yield _.SB(c);d=yield _.Cn(a.zd,d);_.l(c,5,d);var e=a.om.generateContent(c),f="";return new Promise((g,k)=>{e.on("data",p=>{if(p=_.Lv(p)[0])if(p=p.ub())for(let q of p.tg())(p=q.getText())&&(f+=p)});e.on("error",p=>{k(p)});e.on("end",()=>{var p,q=(p=f.split("\n").map(u=>u.trim()).find(u=>u.length> 0&&u.length<=80))!=
+-- v4-match-5.js: count=1
+   | lPath = pathSegment; if (requestSpec.streaming_mode === "fake" && finalPath.includes(":streamGenerateContent")) { finalPath = finalPath.replace(":streamGenerateContent", ":generateContent"); } const queryString = queryParams.toString(); pathAndQuery = `${finalPath}${queryString ? "?" + queryString : ""}`; } // Rewriting absolute URLs (if provided) if (pathAndQuery.match(/^https?:\/\//)) 
