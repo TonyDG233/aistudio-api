@@ -1,0 +1,1035 @@
+/**
+ * File: scripts/client/build.js
+ * Description: Client-side browser script that runs in the headless browser to proxy API requests through WebSocket
+ *
+ * Author: Ellinav, iBenzene, bbbugg
+ */
+
+/* eslint-env browser */
+
+const b64toBlob = (b64Data, contentType = "", sliceSize = 512) => {
+    const byteCharacters = atob(b64Data);
+    const byteArrays = [];
+    for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
+        const slice = byteCharacters.slice(offset, offset + sliceSize);
+        const byteNumbers = new Array(slice.length);
+        for (let i = 0; i < slice.length; i++) {
+            byteNumbers[i] = slice.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        byteArrays.push(byteArray);
+    }
+    return new Blob(byteArrays, { type: contentType });
+};
+
+const Logger = {
+    _log(level, levelName, ...messages) {
+        if (!this.enabled || level < this.currentLevel) return;
+
+        // BrowserManager will add timestamp via LoggingService when forwarding logs
+        // INFO level: keep original format without level tag for backward compatibility
+        // Other levels: show level tag for distinction
+        // Format: [ProxyClient] for INFO, [ProxyClient] Debug/Warn/Error: for others
+        let consolePrefix;
+        if (level === this.LEVELS.INFO) {
+            consolePrefix = `[ProxyClient]`;
+        } else {
+            // Capitalize first letter: DEBUG -> Debug, WARN -> Warn, ERROR -> Error
+            const levelLabel = levelName.charAt(0) + levelName.slice(1).toLowerCase();
+            consolePrefix = `[ProxyClient] ${levelLabel}:`;
+        }
+
+        switch (level) {
+            case this.LEVELS.ERROR:
+                console.error(consolePrefix, ...messages);
+                break;
+            case this.LEVELS.WARN:
+                console.warn(consolePrefix, ...messages);
+                break;
+            case this.LEVELS.DEBUG:
+                console.debug(consolePrefix, ...messages);
+                break;
+            default:
+                console.log(consolePrefix, ...messages);
+        }
+
+        // DOM output for debugging in browser page
+        const logElement = document.createElement("div");
+        if (level === this.LEVELS.INFO) {
+            logElement.textContent = messages.join(" ");
+        } else {
+            const levelLabel = levelName.charAt(0) + levelName.slice(1).toLowerCase();
+            logElement.textContent = `${levelLabel}: ${messages.join(" ")}`;
+        }
+        document.body.appendChild(logElement);
+    },
+
+    // [BrowserManager Injection Point] Do not modify the line below.
+    // This line is dynamically replaced by BrowserManager.js based on LOG_LEVEL environment variable.
+    currentLevel: 1,
+
+    debug(...messages) {
+        this._log(this.LEVELS.DEBUG, "DEBUG", ...messages);
+    },
+
+    // Default: INFO
+    enabled: true,
+
+    error(...messages) {
+        this._log(this.LEVELS.ERROR, "ERROR", ...messages);
+    },
+
+    info(...messages) {
+        this._log(this.LEVELS.INFO, "INFO", ...messages);
+    },
+
+    // Log levels: DEBUG < INFO < WARN < ERROR (consistent with LoggingService.js)
+    LEVELS: { DEBUG: 0, ERROR: 3, INFO: 1, WARN: 2 },
+
+    // Backward compatible method for existing code
+    output(...messages) {
+        this.info(...messages);
+    },
+
+    warn(...messages) {
+        this._log(this.LEVELS.WARN, "WARN", ...messages);
+    },
+};
+
+class ConnectionManager extends EventTarget {
+    // [BrowserManager Injection Point] Do not modify the line below.
+    // WebSocket endpoint is now fixed at ws://127.0.0.1:9998 and cannot be customized.
+    constructor(endpoint = "ws://127.0.0.1:9998") {
+        super();
+
+        // Defer authIndex reading until establish() is called
+        // This ensures window.chrome._contextId is available (set by postMessage from parent page)
+        this.authIndex = null; // Will be set in establish()
+
+        this.endpoint = endpoint;
+        this.socket = null;
+        this.isConnected = false;
+        this.reconnectDelay = 5000;
+        this.reconnectAttempts = 0;
+    }
+
+    _readAuthIndex() {
+        // Read from window.chrome._contextId (set by index.html via postMessage from parent page)
+        const contextId = window.chrome?._contextId;
+        const authIndex = contextId !== undefined ? contextId : -1;
+
+        // Validate authIndex: must be >= 0 and not NaN for multi-context architecture
+        if (Number.isNaN(authIndex) || !Number.isInteger(authIndex) || authIndex < 0) {
+            const errorMsg = `❌ FATAL: Invalid authIndex (${authIndex}). window.chrome._contextId not set.`;
+            console.error(errorMsg);
+            throw new Error(errorMsg);
+        }
+
+        Logger.debug(`✅ Read authIndex from window.chrome._contextId: ${authIndex}`);
+        return authIndex;
+    }
+
+    async establish() {
+        if (this.isConnected) return Promise.resolve();
+
+        // Read authIndex on first connection attempt (deferred from constructor)
+        if (this.authIndex === null) {
+            this.authIndex = this._readAuthIndex();
+            Logger.debug(`Detected authIndex: ${this.authIndex}`);
+        }
+
+        // Add authIndex to WebSocket URL for server-side identification
+        const wsUrl = this.authIndex >= 0 ? `${this.endpoint}?authIndex=${this.authIndex}` : this.endpoint;
+        Logger.output("Connecting to server:", wsUrl);
+        return new Promise((resolve, reject) => {
+            try {
+                this.socket = new WebSocket(wsUrl);
+                this.socket.addEventListener("open", () => {
+                    this.isConnected = true;
+                    this.reconnectAttempts = 0;
+                    Logger.output("✅ Connection successful!");
+                    this.dispatchEvent(new CustomEvent("connected"));
+                    resolve();
+                });
+                this.socket.addEventListener("close", () => {
+                    this.isConnected = false;
+                    Logger.output("❌ Connection disconnected, preparing to reconnect...");
+                    this.dispatchEvent(new CustomEvent("disconnected"));
+                    this._scheduleReconnect();
+                });
+                this.socket.addEventListener("error", error => {
+                    Logger.output(" WebSocket connection error:", error);
+                    this.dispatchEvent(new CustomEvent("error", { detail: error }));
+                    if (!this.isConnected) reject(error);
+                });
+                this.socket.addEventListener("message", event => {
+                    this.dispatchEvent(new CustomEvent("message", { detail: event.data }));
+                });
+            } catch (e) {
+                Logger.output(
+                    "WebSocket initialization failed. Please check address or browser security policy.",
+                    e.message
+                );
+                reject(e);
+            }
+        });
+    }
+
+    transmit(data) {
+        if (!this.isConnected || !this.socket) {
+            Logger.output("Cannot send data: Connection not established");
+            return false;
+        }
+        this.socket.send(JSON.stringify(data));
+        return true;
+    }
+
+    _scheduleReconnect() {
+        this.reconnectAttempts++;
+        setTimeout(() => {
+            Logger.output(`Attempting reconnection ${this.reconnectAttempts} attempt...`);
+            this.establish().catch(() => {});
+        }, this.reconnectDelay);
+    }
+}
+
+class RequestProcessor {
+    constructor() {
+        this.activeOperations = new Map();
+        this.cancelledAttempts = new Set();
+        // [BrowserManager Injection Point] Do not modify the line below.
+        // This line is dynamically replaced by BrowserManager.js based on TARGET_DOMAIN environment variable.
+        this.targetDomain = "generativelanguage.googleapis.com";
+    }
+
+    _normalizeAttemptId(operationId, requestAttemptId) {
+        return requestAttemptId || `${operationId}:attempt:legacy`;
+    }
+
+    _getAttemptKey(operationId, requestAttemptId) {
+        return `${operationId}::${this._normalizeAttemptId(operationId, requestAttemptId)}`;
+    }
+
+    execute(requestSpec, operationId) {
+        const requestAttemptId = this._normalizeAttemptId(operationId, requestSpec.request_attempt_id);
+        const attemptKey = this._getAttemptKey(operationId, requestAttemptId);
+
+        // Abort any existing operation with the same ID to prevent concurrent fetches
+        const existingOperation = this.activeOperations.get(operationId);
+        if (existingOperation) {
+            Logger.debug(`Aborting existing operation #${operationId} before starting new attempt`);
+            existingOperation.abortController.abort();
+            // Note: The old operation's finally block will try to delete this operationId,
+            // but we immediately overwrite it below, so the new controller reference is safe
+        }
+
+        // Clear any stale cancellation flag from previous attempts
+        // This prevents retries from being immediately aborted due to old cancellation state
+        if (this.cancelledAttempts.has(attemptKey)) {
+            Logger.debug(`Clearing stale cancellation flag for operation #${operationId} attempt ${requestAttemptId}`);
+            this.cancelledAttempts.delete(attemptKey);
+        }
+
+        // Browser-side safety cap. Server-side timeouts can be configured with env vars.
+        const IDLE_TIMEOUT_DURATION = 300000; // 300 seconds (5 minutes)
+        const abortController = new AbortController();
+        const activeOperation = { abortController, requestAttemptId };
+        this.activeOperations.set(operationId, activeOperation);
+
+        let timeoutId = null;
+
+        const startIdleTimeout = () =>
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    const error = new Error(
+                        `Timeout: ${IDLE_TIMEOUT_DURATION / 1000} seconds without receiving any data`
+                    );
+                    abortController.abort();
+                    reject(error);
+                }, IDLE_TIMEOUT_DURATION);
+            });
+
+        const cancelTimeout = () => {
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+                timeoutId = null; // Clear reference to prevent memory leaks
+                // Logger.output("Data chunk received, timeout restriction lifted.");
+            }
+        };
+
+        const attemptPromise = (async () => {
+            try {
+                Logger.debug(`Executing request:`, requestSpec.method, requestSpec.path);
+
+                const requestUrl = this._constructUrl(requestSpec);
+                const requestConfig = this._buildRequestConfig(requestSpec, abortController.signal);
+
+                const response = await fetch(requestUrl, requestConfig);
+
+                if (!response.ok) {
+                    const errorBody = await response.text();
+                    const error = new Error(
+                        `Google API returned error: ${response.status} ${response.statusText} ${errorBody}`
+                    );
+                    error.status = response.status;
+                    throw error;
+                }
+                // Clear timeout when fetch succeeds to prevent timer leak
+                cancelTimeout();
+                return response;
+            } catch (error) {
+                cancelTimeout();
+                throw error;
+            }
+        })();
+
+        // Attach a catch handler to prevent unhandled rejection if timeout wins the race
+        // and attemptPromise later rejects (e.g., due to abort)
+        attemptPromise.catch(() => {
+            // Silently ignore - the timeout error is already being handled
+        });
+
+        const responsePromise = Promise.race([attemptPromise, startIdleTimeout()]);
+
+        return { abortController, attemptKey, cancelTimeout, requestAttemptId, responsePromise };
+    }
+
+    cancelAllOperations() {
+        this.activeOperations.forEach(operation => operation.abortController.abort());
+        this.activeOperations.clear();
+    }
+
+    _constructUrl(requestSpec) {
+        let pathAndQuery = requestSpec.url;
+
+        if (!pathAndQuery) {
+            const pathSegment = requestSpec.path || "";
+            const queryParams = new URLSearchParams(requestSpec.query_params);
+
+            // Handle fake streaming mode adjustments
+            if (requestSpec.streaming_mode === "fake") {
+                if (queryParams.has("alt") && queryParams.get("alt") === "sse") {
+                    queryParams.delete("alt");
+                }
+            }
+
+            // Special handling for legacy path construction if url not provided
+            let finalPath = pathSegment;
+            if (requestSpec.streaming_mode === "fake" && finalPath.includes(":streamGenerateContent")) {
+                finalPath = finalPath.replace(":streamGenerateContent", ":generateContent");
+            }
+
+            const queryString = queryParams.toString();
+            pathAndQuery = `${finalPath}${queryString ? "?" + queryString : ""}`;
+        }
+
+        // Rewriting absolute URLs (if provided)
+        if (pathAndQuery.match(/^https?:\/\//)) {
+            try {
+                const urlObj = new URL(pathAndQuery);
+                const originalUrl = pathAndQuery;
+                pathAndQuery = urlObj.pathname + urlObj.search;
+                Logger.output(`Rewriting absolute URL: ${originalUrl} -> ${pathAndQuery}`);
+            } catch (e) {
+                Logger.output("URL parsing warning:", e.message);
+            }
+        }
+
+        let targetHost = this.targetDomain;
+        if (pathAndQuery.includes("__proxy_host__=")) {
+            try {
+                const tempUrl = new URL(pathAndQuery, "http://dummy");
+                const params = tempUrl.searchParams;
+                if (params.has("__proxy_host__")) {
+                    targetHost = params.get("__proxy_host__");
+                    params.delete("__proxy_host__");
+                    pathAndQuery = tempUrl.pathname + tempUrl.search;
+                    Logger.debug(`Dynamically switching target host: ${targetHost}`);
+                }
+            } catch (e) {
+                Logger.output("Failed to parse proxy host:", e.message);
+            }
+        }
+
+        if (this._isUploadPathAndQuery(pathAndQuery)) {
+            const tempUrl = new URL(pathAndQuery, "http://dummy");
+            tempUrl.searchParams.delete("key");
+            pathAndQuery = tempUrl.pathname + tempUrl.search;
+        }
+
+        let cleanPath = pathAndQuery.replace(/^\/+/, "");
+        const method = requestSpec.method ? requestSpec.method.toUpperCase() : "GET";
+
+        if (this.targetDomain.includes("generativelanguage")) {
+            const versionRegex = /v1[a-z0-9]*\/files/;
+            const uploadMatch = cleanPath.match(new RegExp(`upload/${versionRegex.source}`));
+
+            if (uploadMatch) {
+                // If path already contains upload/, just ensure it's correct
+                const index = cleanPath.indexOf("upload/");
+                if (index > 0) {
+                    const fixedPath = cleanPath.substring(index);
+                    Logger.output(`Corrected path: ${cleanPath} -> ${fixedPath}`);
+                    cleanPath = fixedPath;
+                }
+            } else if (method === "POST") {
+                // Detect if it starts with version and 'files', e.g. v1beta/files
+                const filesPathMatch = cleanPath.match(new RegExp(`^${versionRegex.source}`));
+                if (filesPathMatch) {
+                    cleanPath = "upload/" + cleanPath;
+                    Logger.output("Auto-completing upload path:", cleanPath);
+                }
+            }
+        }
+
+        const finalUrl = `https://${targetHost}/${cleanPath}`;
+        Logger.debug(`Constructed URL: ${pathAndQuery} -> ${finalUrl}`);
+        return finalUrl;
+    }
+
+    _removeStructuredOutputConfig(bodyObj, { preserveResponseFormat = false } = {}) {
+        const structuredOutputKeys = [
+            "responseMimeType",
+            "response_mime_type",
+            "responseSchema",
+            "response_schema",
+            "responseJsonSchema",
+            "response_json_schema",
+            "_responseJsonSchema",
+            "_response_json_schema",
+        ];
+
+        for (const generationConfig of [bodyObj.generationConfig, bodyObj.generation_config]) {
+            if (!generationConfig || typeof generationConfig !== "object") {
+                continue;
+            }
+
+            structuredOutputKeys.forEach(key => delete generationConfig[key]);
+            for (const key of ["responseFormat", "response_format"]) {
+                const responseFormat = generationConfig[key];
+                if (!preserveResponseFormat) {
+                    delete generationConfig[key];
+                } else if (responseFormat && typeof responseFormat === "object") {
+                    // Preserve modality settings such as audio, but remove text structured output.
+                    delete responseFormat.text;
+                    if (Object.keys(responseFormat).length === 0) {
+                        delete generationConfig[key];
+                    }
+                }
+            }
+        }
+    }
+
+    _buildRequestConfig(requestSpec, signal) {
+        const config = {
+            headers: this._sanitizeHeaders(requestSpec.headers, requestSpec),
+            method: requestSpec.method,
+            signal,
+        };
+
+        if (["POST", "PUT", "PATCH"].includes(requestSpec.method)) {
+            if (!requestSpec.is_generative && requestSpec.body_b64) {
+                const contentType = requestSpec.headers?.["content-type"] || "";
+                config.body = b64toBlob(requestSpec.body_b64, contentType);
+                Logger.output("Using binary body (Base64 decoded) for non-generative request");
+            } else if (requestSpec.body) {
+                try {
+                    const bodyObj = JSON.parse(requestSpec.body);
+
+                    // --- Module 0.5: [ATG] Preserve synthetic transport tool declarations ---
+                    // The synthetic transport tool (ATG_TOOL_PREFIX, default atg_emit_) is injected
+                    // server-side; downstream tool-filtering modules must not remove it, so we
+                    // snapshot its declarations here and restore them after filtering.
+                    const atgSyntheticDeclarations = [];
+                    if (Array.isArray(bodyObj.tools)) {
+                        for (const tool of bodyObj.tools) {
+                            if (tool && Array.isArray(tool.functionDeclarations)) {
+                                for (const decl of tool.functionDeclarations) {
+                                    if (decl && typeof decl.name === "string" && decl.name.startsWith("atg_emit_")) {
+                                        atgSyntheticDeclarations.push(decl);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Module 1: Embedding/TTS/Transcribe/Lyria Model Filtering ---
+                    const requestPath = String(requestSpec.path || "");
+                    const isImageModel = requestPath.includes("-image") || requestPath.includes("imagen");
+                    const isGemini25ImageModel = isImageModel && requestPath.includes("2.5");
+                    const isGemini31FlashLiteImageModel = requestPath.includes("gemini-3.1-flash-lite-image");
+                    const isGemini31FlashImageModel = requestPath.includes("gemini-3.1-flash-image");
+                    const isGemini3ProImageModel = requestPath.includes("gemini-3-pro-image");
+                    const isEmbeddingModel = requestPath.includes("embedding");
+                    const isTtsModel = requestPath.includes("tts");
+                    const isTranscribeModel = requestPath.includes("-transcribe");
+                    const isLyria3Model = requestPath.includes("lyria-3");
+                    const isGemini38TtsModel =
+                        requestPath.includes("gemini-3.8-flash-tts") ||
+                        requestPath.includes("gemini-3.8-flash-lite-tts");
+                    const toolRelatedKeys = ["tools", "toolConfig", "tool_config", "toolChoice", "tool_choice"];
+                    if (isEmbeddingModel || isTtsModel || isTranscribeModel || isLyria3Model) {
+                        // Remove tools
+                        toolRelatedKeys.forEach(key => {
+                            if (Object.prototype.hasOwnProperty.call(bodyObj, key)) delete bodyObj[key];
+                        });
+                        // Remove thinkingConfig
+                        if (bodyObj.generationConfig?.thinkingConfig) {
+                            delete bodyObj.generationConfig.thinkingConfig;
+                        }
+                        // Lyria 3 models support systemInstruction.
+                        if (!isLyria3Model && bodyObj.systemInstruction) {
+                            delete bodyObj.systemInstruction;
+                        }
+                        this._removeStructuredOutputConfig(bodyObj, {
+                            preserveResponseFormat: isGemini38TtsModel || isLyria3Model,
+                        });
+                    }
+
+                    // --- Module 1.5: responseModalities Handling ---
+                    // Image: keep as-is (needed for image generation)
+                    // Embedding/Transcribe: remove
+                    // Lyria 3: keep
+                    // TTS: force to ["AUDIO"]
+                    if (isTtsModel) {
+                        if (!bodyObj.generationConfig) {
+                            bodyObj.generationConfig = {};
+                        }
+                        bodyObj.generationConfig.responseModalities = ["AUDIO"];
+                        Logger.output("TTS model detected, setting responseModalities to AUDIO");
+                    } else if (isEmbeddingModel || isTranscribeModel) {
+                        if (bodyObj.generationConfig?.responseModalities) {
+                            delete bodyObj.generationConfig.responseModalities;
+                        }
+                    }
+
+                    // --- Module 2: Robotics Model Filtering ---
+                    const isRoboticsModel = requestSpec.path.includes("robotics");
+                    if (isGemini25ImageModel) {
+                        toolRelatedKeys.forEach(key => {
+                            if (Object.prototype.hasOwnProperty.call(bodyObj, key)) delete bodyObj[key];
+                        });
+                        if (bodyObj.generationConfig?.thinkingConfig) {
+                            delete bodyObj.generationConfig.thinkingConfig;
+                        }
+                    }
+                    if (isGemini31FlashLiteImageModel) {
+                        toolRelatedKeys.forEach(key => {
+                            if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
+                                delete bodyObj[key];
+                            }
+                        });
+                    }
+                    if (isGemini31FlashImageModel || isGemini3ProImageModel) {
+                        if (Array.isArray(bodyObj.tools)) {
+                            const searchToolKeys = ["googleSearch", "google_search"];
+                            bodyObj.tools = bodyObj.tools
+                                .map(tool => {
+                                    if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+                                        return null;
+                                    }
+
+                                    return Object.fromEntries(
+                                        searchToolKeys
+                                            .filter(key => Object.prototype.hasOwnProperty.call(tool, key))
+                                            .map(key => [key, tool[key]])
+                                    );
+                                })
+                                .filter(tool => tool && Object.keys(tool).length > 0);
+
+                            if (bodyObj.tools.length === 0) {
+                                delete bodyObj.tools;
+                            }
+                        } else {
+                            delete bodyObj.tools;
+                        }
+
+                        toolRelatedKeys
+                            .filter(key => key !== "tools")
+                            .forEach(key => {
+                                if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
+                                    delete bodyObj[key];
+                                }
+                            });
+                    }
+                    if (isImageModel) {
+                        this._removeStructuredOutputConfig(bodyObj);
+                    }
+                    if (isRoboticsModel) {
+                        if (bodyObj.generationConfig?.responseModalities) {
+                            delete bodyObj.generationConfig.responseModalities;
+                        }
+                    }
+
+                    // --- Module 4.5: [ATG] Restore synthetic transport tool declarations ---
+                    if (atgSyntheticDeclarations.length > 0) {
+                        if (!Array.isArray(bodyObj.tools) || bodyObj.tools.length === 0) {
+                            bodyObj.tools = [{ functionDeclarations: [] }];
+                        }
+                        const atgTarget = bodyObj.tools[0];
+                        if (!Array.isArray(atgTarget.functionDeclarations)) {
+                            atgTarget.functionDeclarations = [];
+                        }
+                        for (const decl of atgSyntheticDeclarations) {
+                            if (!atgTarget.functionDeclarations.some(d => d && d.name === decl.name)) {
+                                atgTarget.functionDeclarations.push(decl);
+                            }
+                        }
+                        Logger.debug(
+                            `[ATG] Restored ${atgSyntheticDeclarations.length} synthetic transport tool declaration(s) after filtering`
+                        );
+                    }
+
+                    // adapt gemini 3 pro preview
+                    // if raise `400 INVALID_ARGUMENT`, try to delete `thinkingLevel`
+                    // if (bodyObj.generationConfig?.thinkingConfig?.thinkingLevel) {
+                    //     delete bodyObj.generationConfig.thinkingConfig.thinkingLevel;
+                    // }
+
+                    // upper case `thinkingLevel`
+                    if (bodyObj.generationConfig?.thinkingConfig?.thinkingLevel) {
+                        bodyObj.generationConfig.thinkingConfig.thinkingLevel = String(
+                            bodyObj.generationConfig.thinkingConfig.thinkingLevel
+                        ).toUpperCase();
+                    }
+
+                    // upper case `responseModalities`
+                    if (bodyObj.generationConfig?.responseModalities) {
+                        if (Array.isArray(bodyObj.generationConfig.responseModalities)) {
+                            bodyObj.generationConfig.responseModalities =
+                                bodyObj.generationConfig.responseModalities.map(m =>
+                                    typeof m === "string" ? m.toUpperCase() : m
+                                );
+                        } else if (typeof bodyObj.generationConfig.responseModalities === "string") {
+                            bodyObj.generationConfig.responseModalities = [
+                                bodyObj.generationConfig.responseModalities.toUpperCase(),
+                            ];
+                        }
+                    }
+
+                    // if raise `400 INVALID_ARGUMENT`, try to delete `thoughtSignature`
+                    // if (Array.isArray(bodyObj.contents)) {
+                    //     bodyObj.contents.forEach(msg => {
+                    //         if (Array.isArray(msg.parts)) {
+                    //             msg.parts.forEach(part => {
+                    //                 if (part.thoughtSignature) {
+                    //                     delete part.thoughtSignature;
+                    //                 }
+                    //             });
+                    //         }
+                    //     });
+                    // }
+
+                    config.body = JSON.stringify(bodyObj);
+                } catch (e) {
+                    Logger.output("Error occurred while processing request body:", e.message);
+                    config.body = requestSpec.body;
+                }
+            }
+        }
+
+        return config;
+    }
+
+    _sanitizeHeaders(headers, requestSpec = {}) {
+        const sanitized = { ...headers };
+        // Follow BuildProxy's forbidden list exactly
+        const forbiddenHeaders = [
+            "host",
+            "connection",
+            "content-length",
+            "origin",
+            "referer",
+            "user-agent",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "sec-fetch-dest",
+        ];
+
+        forbiddenHeaders.forEach(h => delete sanitized[h]);
+        if (this._isUploadRequestSpec(requestSpec)) {
+            delete sanitized.authorization;
+            delete sanitized["x-api-key"];
+            delete sanitized["x-goog-api-key"];
+        }
+        return sanitized;
+    }
+
+    _isUploadRequestSpec(requestSpec = {}) {
+        const path = String(requestSpec.url || requestSpec.path || "").toLowerCase();
+        return this._isUploadPathAndQuery(path);
+    }
+
+    _isUploadPathAndQuery(path) {
+        return path.includes("/upload/");
+    }
+
+    cancelOperation(operationId, requestAttemptId) {
+        const normalizedAttemptId = this._normalizeAttemptId(operationId, requestAttemptId);
+        const attemptKey = this._getAttemptKey(operationId, normalizedAttemptId);
+        this.cancelledAttempts.add(attemptKey);
+        const activeOperation = this.activeOperations.get(operationId);
+        if (activeOperation && activeOperation.requestAttemptId === normalizedAttemptId) {
+            Logger.output(
+                `Received cancel instruction, aborting operation #${operationId} (attempt ${normalizedAttemptId})...`
+            );
+            activeOperation.abortController.abort();
+        } else if (activeOperation) {
+            Logger.debug(
+                `Ignoring stale cancel for operation #${operationId}: expected attempt ${activeOperation.requestAttemptId}, got ${normalizedAttemptId}`
+            );
+        }
+    }
+}
+
+class ProxySystem extends EventTarget {
+    constructor(websocketEndpoint) {
+        super();
+        this.connectionManager = new ConnectionManager(websocketEndpoint);
+        this.requestProcessor = new RequestProcessor();
+        this._setupEventHandlers();
+    }
+
+    async initialize() {
+        Logger.output("System initializing...");
+        try {
+            await this.connectionManager.establish();
+            Logger.output("System initialization complete, waiting for server instructions...");
+            this.dispatchEvent(new CustomEvent("ready"));
+        } catch (error) {
+            Logger.output("System initialization failed:", error.message);
+            this.dispatchEvent(new CustomEvent("error", { detail: error }));
+            throw error;
+        }
+    }
+
+    _setupEventHandlers() {
+        this.connectionManager.addEventListener("message", e => this._handleIncomingMessage(e.detail));
+        this.connectionManager.addEventListener("disconnected", () => this.requestProcessor.cancelAllOperations());
+    }
+
+    async _handleIncomingMessage(messageData) {
+        let requestSpec = {};
+        try {
+            requestSpec = JSON.parse(messageData);
+
+            // --- Core modification: Dispatch tasks based on event_type ---
+            switch (requestSpec.event_type) {
+                case "cancel_request":
+                    // If it's a cancel instruction, call the cancel method
+                    this.requestProcessor.cancelOperation(requestSpec.request_id, requestSpec.request_attempt_id);
+                    break;
+                case "set_log_level":
+                    // Dynamic log level adjustment at runtime
+                    if (Logger.LEVELS[requestSpec.level] !== undefined) {
+                        const oldLevel = Object.keys(Logger.LEVELS).find(k => Logger.LEVELS[k] === Logger.currentLevel);
+                        Logger.currentLevel = Logger.LEVELS[requestSpec.level];
+                        Logger.info(`Log level changed: ${oldLevel} -> ${requestSpec.level}`);
+                    } else {
+                        Logger.warn(`Invalid log level: ${requestSpec.level}`);
+                    }
+                    break;
+                default:
+                    // Default case, treat as proxy request
+                    // [Final Optimization] Display path directly, no longer display mode as path itself is clear enough
+                    Logger.output(`Received request: ${requestSpec.method} ${requestSpec.path}`);
+
+                    await this._processProxyRequest(requestSpec);
+                    break;
+            }
+        } catch (error) {
+            Logger.output("Message processing error:", error.message);
+            // Only send error response when an error occurs during proxy request processing
+            if (requestSpec.request_id && requestSpec.event_type !== "cancel_request") {
+                this._sendErrorResponse(error, requestSpec.request_id, requestSpec.request_attempt_id);
+            }
+        }
+    }
+
+    async _processProxyRequest(requestSpec) {
+        const operationId = requestSpec.request_id;
+        const requestAttemptId = this.requestProcessor._normalizeAttemptId(operationId, requestSpec.request_attempt_id);
+        const attemptKey = this.requestProcessor._getAttemptKey(operationId, requestAttemptId);
+        const mode = requestSpec.streaming_mode || "fake";
+        Logger.debug(`Browser received request`);
+        let cancelTimeout;
+        let reader;
+        let abortController;
+        const isOperationCancelled = () => this.requestProcessor.cancelledAttempts.has(attemptKey);
+
+        try {
+            if (isOperationCancelled()) {
+                throw new DOMException("The user aborted a request.", "AbortError");
+            }
+            const {
+                responsePromise,
+                cancelTimeout: ct,
+                abortController: ac,
+            } = this.requestProcessor.execute(requestSpec, operationId);
+            cancelTimeout = ct;
+            abortController = ac;
+            const response = await responsePromise;
+            if (isOperationCancelled()) {
+                throw new DOMException("The user aborted a request.", "AbortError");
+            }
+
+            this._transmitHeaders(response, operationId, requestAttemptId, requestSpec.headers?.host);
+            reader = response.body.getReader();
+            const textDecoder = new TextDecoder();
+
+            let fullBody = "";
+
+            // --- Core modification: Correctly dispatch streaming and non-streaming data inside the loop ---
+            // Browser-side safety cap for each chunk read.
+            const CHUNK_READ_TIMEOUT = 300000; // 300 seconds (5 minutes)
+            let processing = true;
+            while (processing) {
+                // Check if WebSocket is still connected
+                if (!this.connectionManager.isConnected) {
+                    Logger.debug(`WebSocket disconnected, stopping stream read for operation #${operationId}`);
+                    processing = false;
+                    break;
+                }
+
+                // Check if operation has been cancelled before creating timeout
+                if (isOperationCancelled()) {
+                    Logger.debug(`Operation #${operationId} cancelled, stopping stream read`);
+                    processing = false;
+                    break;
+                }
+
+                // Wrap reader.read() with timeout protection
+                let chunkTimeoutId;
+                let timeoutOccurred = false;
+
+                const timeoutPromise = new Promise((_, reject) => {
+                    chunkTimeoutId = setTimeout(() => {
+                        timeoutOccurred = true;
+                        reject(
+                            new Error(`Chunk read timeout: no data received for ${CHUNK_READ_TIMEOUT / 1000} seconds`)
+                        );
+                    }, CHUNK_READ_TIMEOUT);
+                });
+
+                try {
+                    // Start reading the chunk
+                    const readPromise = reader.read();
+                    // Attach a catch handler to prevent unhandled rejection if timeout wins the race
+                    // and readPromise later rejects (e.g., due to abort/cancel)
+                    readPromise.catch(() => {
+                        // Silently ignore - the timeout error is already being handled
+                    });
+                    const { done, value } = await Promise.race([readPromise, timeoutPromise]);
+                    clearTimeout(chunkTimeoutId);
+                    chunkTimeoutId = null;
+
+                    if (done) {
+                        processing = false;
+                        break;
+                    }
+
+                    cancelTimeout();
+
+                    const chunk = textDecoder.decode(value, { stream: true });
+                    if (mode === "real") {
+                        this._transmitChunk(chunk, operationId, requestAttemptId);
+                    } else {
+                        fullBody += chunk;
+                    }
+                } catch (error) {
+                    if (chunkTimeoutId) {
+                        clearTimeout(chunkTimeoutId);
+                        chunkTimeoutId = null;
+                    }
+
+                    if (isOperationCancelled()) {
+                        throw new DOMException("The user aborted a request.", "AbortError");
+                    }
+
+                    const errorMessage = String(error?.message ?? error);
+
+                    // If timeout occurred, cancel the reader to stop background processing
+                    if (timeoutOccurred || errorMessage.includes("Chunk read timeout")) {
+                        try {
+                            await reader.cancel();
+                        } catch (cancelError) {
+                            Logger.debug(`Failed to cancel reader: ${cancelError.message}`);
+                        }
+
+                        // Also abort the underlying request to prevent hanging network operations
+                        if (abortController && typeof abortController.abort === "function") {
+                            try {
+                                abortController.abort();
+                            } catch (abortError) {
+                                Logger.debug(`Failed to abort request: ${abortError.message}`);
+                            }
+                        }
+                    }
+                    throw error;
+                }
+            }
+
+            Logger.output("Data stream read complete.");
+
+            // Check if operation was cancelled during streaming
+            if (isOperationCancelled()) {
+                Logger.debug(`Operation #${operationId} was cancelled, skipping final transmission`);
+                return;
+            }
+
+            if (mode === "fake") {
+                // In non-streaming mode, after loop ends, forward the concatenated complete response body
+                this._transmitChunk(fullBody, operationId, requestAttemptId);
+            }
+
+            this._transmitStreamEnd(operationId, requestAttemptId);
+        } catch (error) {
+            const wasCancelled = isOperationCancelled();
+            if (wasCancelled) {
+                Logger.output(`[Diagnosis] Operation #${operationId} has been aborted by user.`);
+            } else if (error.name === "AbortError") {
+                Logger.output(`[Diagnosis] Operation #${operationId} aborted due to internal shutdown/disconnect.`);
+            } else {
+                Logger.output(`Request processing failed: ${error.message}`);
+            }
+            if (wasCancelled) {
+                return;
+            }
+            // Only send error if we still own this operationId (prevent stale errors from reaching server during retries)
+            const currentOperation = this.requestProcessor.activeOperations.get(operationId);
+            if (
+                currentOperation?.abortController === abortController &&
+                currentOperation?.requestAttemptId === requestAttemptId
+            ) {
+                this._sendErrorResponse(error, operationId, requestAttemptId);
+            } else {
+                Logger.debug(`[Diagnosis] Suppressing error for superseded operation #${operationId}`);
+            }
+        } finally {
+            // Clean up timeout - safe to call even if cancelTimeout is undefined
+            if (cancelTimeout && typeof cancelTimeout === "function") {
+                cancelTimeout();
+            }
+            // Always cancel reader to stop background stream processing
+            if (reader && typeof reader.cancel === "function") {
+                try {
+                    await reader.cancel();
+                } catch (e) {
+                    // Only log unexpected errors, ignore "already closed" errors
+                    if (e.name !== "TypeError" && !e.message.includes("closed")) {
+                        Logger.debug(`Reader cancel error: ${e.message}`);
+                    }
+                }
+            }
+            // Only delete if we still own this operationId (prevent race with retries)
+            const currentOperation = this.requestProcessor.activeOperations.get(operationId);
+            if (
+                currentOperation?.abortController === abortController &&
+                currentOperation?.requestAttemptId === requestAttemptId
+            ) {
+                this.requestProcessor.activeOperations.delete(operationId);
+                // Only delete from cancelledAttempts if we own the operation
+                this.requestProcessor.cancelledAttempts.delete(attemptKey);
+            }
+        }
+    }
+
+    _transmitHeaders(response, operationId, requestAttemptId, proxyHost) {
+        const headerMap = {};
+        response.headers.forEach((v, k) => {
+            const lowerKey = k.toLowerCase();
+            if (lowerKey === "x-goog-upload-url" && v.includes("googleapis.com")) {
+                try {
+                    const urlObj = new URL(v);
+                    const host = proxyHost || location.host;
+                    const separator = urlObj.search ? "&" : "?";
+                    const newSearch = `${urlObj.search}${separator}__proxy_host__=${urlObj.host}`;
+                    const newUrl = `${location.protocol}//${host}${urlObj.pathname}${newSearch}`;
+                    headerMap[k] = newUrl;
+                    Logger.debug(`Rewriting header ${k}: ${v} -> ${headerMap[k]}`);
+                } catch (e) {
+                    headerMap[k] = v;
+                }
+            } else {
+                headerMap[k] = v;
+            }
+        });
+        this.connectionManager.transmit({
+            event_type: "response_headers",
+            headers: headerMap,
+            request_attempt_id: requestAttemptId,
+            request_id: operationId,
+            status: response.status,
+        });
+    }
+
+    _transmitChunk(data, operationId, requestAttemptId) {
+        if (!data) return;
+        this.connectionManager.transmit({
+            data,
+            event_type: "chunk",
+            request_attempt_id: requestAttemptId,
+            request_id: operationId,
+        });
+    }
+
+    _transmitStreamEnd(operationId, requestAttemptId) {
+        this.connectionManager.transmit({
+            event_type: "stream_close",
+            request_attempt_id: requestAttemptId,
+            request_id: operationId,
+        });
+        Logger.output("Task completed, stream end signal sent");
+    }
+
+    _sendErrorResponse(error, operationId, requestAttemptId) {
+        if (!operationId) return;
+        this.connectionManager.transmit({
+            event_type: "error",
+            message: `Proxy browser error: ${error.message || "Unknown error"}`,
+            request_attempt_id: requestAttemptId,
+            request_id: operationId,
+            status: error.status || 504,
+        });
+        // --- Core modification: Use different log wording based on error type ---
+        if (error.name === "AbortError") {
+            Logger.output("Sent 'abort' status back to server");
+        } else {
+            Logger.output("Sent 'error' information back to server");
+        }
+    }
+}
+
+const initializeProxySystem = async () => {
+    // Clean up old logs
+    document.body.innerHTML = "";
+
+    // Wait for authIndex from parent via postMessage (promise set up in index.html)
+    // Timeout fallback: if parent doesn't respond within 10s, throw fatal error
+    if (window.__authIndexReady) {
+        const timeout = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("authIndex postMessage timeout (10s)")), 10000)
+        );
+        // Attach a catch handler to prevent unhandled rejection if timeout wins
+        window.__authIndexReady.catch(() => {
+            // Silently ignore - the timeout error is already being handled
+        });
+        try {
+            const authIndex = await Promise.race([window.__authIndexReady, timeout]);
+            Logger.output(`✅ authIndex received from parent: ${authIndex}`);
+        } catch (error) {
+            Logger.error(`❌ Failed to get authIndex: ${error.message}`);
+            throw error;
+        }
+    }
+
+    try {
+        const proxySystem = new ProxySystem();
+        await proxySystem.initialize();
+    } catch (error) {
+        console.error("Proxy system startup failed:", error);
+        Logger.output("Proxy system startup failed:", error.message);
+    }
+};
+
+initializeProxySystem();
