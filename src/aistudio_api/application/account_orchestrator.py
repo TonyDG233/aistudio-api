@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 from aistudio_api.api.state import runtime_state
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -34,10 +35,14 @@ async def try_switch_account(
     *,
     is_auth_error: bool = False,
     is_session_expired: bool = False,
+    surface: str = "chat",
 ) -> bool:
     """尝试切换到下一个对目标 model 可用的账号。防止并发级联切号。"""
     global _last_switch_time
     entry_time = time.time()
+    # 默认 chat 面不传 surface，保持调用形态与既有行为/断言完全一致；
+    # 非 chat 面才显式带上 surface 以启用面维度冷却隔离。
+    sk: dict[str, Any] = {"surface": surface} if surface != "chat" else {}
 
     # 乐观快速预检：若无需记录永久失效/短时隔离，且当前活跃账号已被并发请求切换至健康状态，直接免锁复用
     if failed_account_id and not is_session_expired and not is_auth_error:
@@ -51,7 +56,7 @@ async def try_switch_account(
                     cur_active.id != failed_account_id
                     or _last_switch_time >= entry_time
                 )
-                and rotator.is_account_available(cur_active.id, model=model)
+                and rotator.is_account_available(cur_active.id, model=model, **sk)
             ):
                 return True
 
@@ -76,7 +81,7 @@ async def try_switch_account(
             _last_switch_time >= entry_time
             and current_id
             and (not is_session_expired or current_id != failed_account_id)
-            and rotator.is_account_available(current_id, model=model)
+            and rotator.is_account_available(current_id, model=model, **sk)
         ):
             logger.info(
                 "已有并发请求完成切号或会话自愈，直接复用当前健康账号: %s (model=%s)",
@@ -87,16 +92,16 @@ async def try_switch_account(
 
         # 遇到登录态失效时，永久禁用该账号并拒绝原地重试
         if failed_account_id and is_session_expired:
-            rotator.record_session_expired(failed_account_id, model=model)
+            rotator.record_session_expired(failed_account_id, model=model, **sk)
         elif failed_account_id and is_auth_error:
-            rotator.record_auth_error(failed_account_id, model=model)
+            rotator.record_auth_error(failed_account_id, model=model, **sk)
 
         # 双重检查 2：如果已经由并发协程切换到了新账号，且新账号对当前 model 可用，则直接复用
         if (
             failed_account_id
             and current_id
             and current_id != failed_account_id
-            and rotator.is_account_available(current_id, model=model)
+            and rotator.is_account_available(current_id, model=model, **sk)
         ):
             logger.info(
                 "已有并发请求完成切号，直接复用当前健康账号: %s (model=%s)",
@@ -110,6 +115,7 @@ async def try_switch_account(
             current_account_id=current_id,
             failed_account_id=failed_account_id,
             is_session_expired=is_session_expired,
+            **sk,
         )
         if next_account is None:
             if is_session_expired:
@@ -125,7 +131,7 @@ async def try_switch_account(
                 client.session,
             )
             if result is not None:
-                rotator.clear_cooldown(next_account.id, model=model)
+                rotator.clear_cooldown(next_account.id, model=model, **sk)
                 _last_switch_time = time.time()
             return result is not None
         # 登录态失效严禁在原账号原地重试
@@ -147,48 +153,62 @@ async def try_switch_account(
                 client.session,
             )
             if result is not None:
-                rotator.clear_cooldown(current_id, model=model)
+                rotator.clear_cooldown(current_id, model=model, **sk)
                 _last_switch_time = time.time()
             return result is not None
         return bool(
-            current_id and rotator.is_account_available(current_id, model=model)
+            current_id and rotator.is_account_available(current_id, model=model, **sk)
         )
 
 
-async def ensure_active_account(attempt: int, model: str | None = None) -> None:
+async def ensure_active_account(
+    attempt: int, model: str | None = None, *, surface: str = "chat"
+) -> None:
     """确保在初次尝试时存在活跃账号，且该账号对目标模型可用。"""
     if attempt != 0:
         return
+    sk: dict[str, Any] = {"surface": surface} if surface != "chat" else {}
     account_svc = runtime_state.account_service
     rotator = runtime_state.rotator
     current = account_svc.get_active_account() if account_svc else None
     if not current:
-        await try_switch_account(model=model)
+        await try_switch_account(model=model, surface=surface)
     elif (
-        rotator and model and not rotator.is_account_available(current.id, model=model)
+        rotator
+        and model
+        and not rotator.is_account_available(current.id, model=model, **sk)
     ):
         # 当前账号对该模型已限流，提前切号
-        await try_switch_account(model=model, failed_account_id=current.id)
+        await try_switch_account(
+            model=model, failed_account_id=current.id, surface=surface
+        )
 
 
 def record_rotator_event(
     event: str,
     model: str | None = None,
+    *,
+    surface: str = "chat",
 ) -> None:
-    """记录调度器事件（成功、限流、错误、鉴权异常）。"""
+    """记录调度器事件（成功、限流、错误、鉴权异常）。
+
+    ``surface`` 用于面维度隔离的冷却键；build 面调用方应显式传 ``surface="build"``。
+    默认 chat 面不传 surface，保持既有调用形态不变。
+    """
     rotator = runtime_state.rotator
     account_service = runtime_state.account_service
     account = account_service.get_active_account() if account_service else None
     if not rotator or account is None:
         return
+    sk: dict[str, Any] = {"surface": surface} if surface != "chat" else {}
     if event == "success":
-        rotator.record_success(account.id, model=model)
+        rotator.record_success(account.id, model=model, **sk)
     elif event == "rate_limited":
-        rotator.record_rate_limited(account.id, model=model)
+        rotator.record_rate_limited(account.id, model=model, **sk)
     elif event == "auth_error":
-        rotator.record_auth_error(account.id, model=model)
+        rotator.record_auth_error(account.id, model=model, **sk)
     elif event == "error":
-        rotator.record_error(account.id, model=model)
+        rotator.record_error(account.id, model=model, **sk)
 
 
 __all__ = [

@@ -28,6 +28,7 @@ from aistudio_api.application.atg.extractor import SyntheticRequiredError
 from aistudio_api.application.chat_service import (
     normalize_gemini_request,
 )
+from aistudio_api.application.surface_orchestrator import SurfacePolicyError
 from aistudio_api.domain.errors import (
     AistudioError,
     AuthError,
@@ -170,6 +171,7 @@ async def handle_attempt_exception(
     normalized_model: str | None,
     client: AIStudioClient,
     has_yielded_data: bool = False,
+    surface: str = "chat",
 ) -> bool:
     """Handle per-attempt error classification and account switching.
 
@@ -193,6 +195,7 @@ async def handle_attempt_exception(
             failed_account_id=failed_id,
             is_auth_error=True,
             is_session_expired=True,
+            surface=surface,
         ):
             logger.info(
                 "已切换至其他可用健康账号重试 (%d/%d)", attempt + 1, MAX_RETRIES
@@ -209,9 +212,12 @@ async def handle_attempt_exception(
     if isinstance(exc, AuthError):
         logger.warning("账号 403 权限拒绝: %s", exc)
         client.clear_templates()
-        record_rotator_event("auth_error", model=target_model)
+        record_rotator_event("auth_error", model=target_model, surface=surface)
         if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id, is_auth_error=True
+            model=target_model,
+            failed_account_id=failed_id,
+            is_auth_error=True,
+            surface=surface,
         ):
             logger.info("切换至可用账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
             return True
@@ -221,9 +227,9 @@ async def handle_attempt_exception(
 
     if isinstance(exc, UsageLimitExceeded):
         runtime_state.record(target_model, "rate_limited")
-        record_rotator_event("rate_limited", model=target_model)
+        record_rotator_event("rate_limited", model=target_model, surface=surface)
         if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id
+            model=target_model, failed_account_id=failed_id, surface=surface
         ):
             logger.info(
                 "429 触发限额，切换账号 (%d/%d): model=%s",
@@ -276,7 +282,10 @@ async def handle_attempt_exception(
         )
         client.clear_templates()
         if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id, is_auth_error=False
+            model=target_model,
+            failed_account_id=failed_id,
+            is_auth_error=False,
+            surface=surface,
         ):
             logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
             return True
@@ -301,14 +310,14 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AistudioError):
         runtime_state.record(target_model, "errors")
-        record_rotator_event("error", model=target_model)
+        record_rotator_event("error", model=target_model, surface=surface)
         logger.warning("Gemini 服务端异常: %s", exc)
         raise HTTPException(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
     runtime_state.record(target_model, "errors")
-    record_rotator_event("error", model=target_model)
+    record_rotator_event("error", model=target_model, surface=surface)
     logger.error("Gemini 未知严重异常: %s", exc)
     logger.debug("Gemini 异常堆栈详情:", exc_info=True)
     raise HTTPException(
@@ -586,6 +595,49 @@ def format_sse_error(exc: Exception) -> str:
     )
 
 
+def _resolve_surface(model_path: str) -> str:
+    """Resolve the surface for streaming requests (WP5 surface orchestration).
+
+    Thin adapter over
+    :func:`aistudio_api.application.surface_orchestrator.resolve_surface`, which
+    owns the priority chain (``AISTUDIO_SURFACE_OVERRIDE`` > legacy tier routing
+    when ``features.route_by_tier`` is off > group/default-tier policy when on).
+    Reads the active account's tier/email and the hot-reloadable feature flags +
+    ``features.groups``. Raises ``SurfacePolicyError`` for policy denials; the
+    caller maps those to an explicit 4xx body (no silent surface switch).
+    """
+    from aistudio_api.application.surface_orchestrator import (
+        get_configured_groups,
+        resolve_surface,
+    )
+
+    try:
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_features_config,
+        )
+
+        features = dict(get_features_config())
+    except Exception:
+        features = {}
+    if "groups" not in features:
+        features["groups"] = get_configured_groups()
+
+    tier: str | None = None
+    email: str | None = None
+    try:
+        from aistudio_api.infrastructure.account.account_store import AccountStore
+
+        account = AccountStore().get_active_account()
+        if account is not None:
+            tier = account.tier
+            email = getattr(account, "email", None)
+    except Exception:
+        tier = None
+        email = None
+
+    return resolve_surface(model_path, tier, email, features).surface
+
+
 def _build_gemini_streaming_response(
     *,
     client: AIStudioClient,
@@ -622,6 +674,32 @@ def _build_gemini_streaming_response(
             else:
                 logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
 
+        try:
+            surface = _resolve_surface(model_path)
+        except SurfacePolicyError as exc:
+            # Explicit 4xx denial: never swallow, never silently switch surface.
+            logger.warning(
+                "[surface] 流式请求被策略拒绝: code=%s model=%s advice=%s",
+                exc.code,
+                model_path,
+                exc.advice,
+            )
+            yield (
+                "data: " + json.dumps(exc.to_error_body(), ensure_ascii=False) + "\n\n"
+            )
+            return
+        build_rest_body: str | None = None
+        if surface == "build":
+            build_rest_body = json.dumps(
+                effective_req.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+            )
+            logger.info(
+                "[build] 流式请求经 Build 面直连: model=%s, contents=%d",
+                model_path,
+                len(effective_req.contents),
+            )
+
         normalized = None
         try:
             logger.info(
@@ -636,7 +714,9 @@ def _build_gemini_streaming_response(
             max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
             for stream_attempt in range(MAX_RETRIES):
                 has_yielded_data = False
-                await ensure_active_account(stream_attempt, model=model_path)
+                await ensure_active_account(
+                    stream_attempt, model=model_path, surface=surface
+                )
                 normalized = normalize_gemini_request(effective_req, model_path)
                 # Fresh per-attempt unwrapper: a retry must not carry stale
                 # buffered/consumed state from the previous attempt.
@@ -647,25 +727,34 @@ def _build_gemini_streaming_response(
                 while True:
                     produced_content = False
                     try:
-                        async for event_type, text in client.stream_generate_content(
-                            model=normalized.model,
-                            capture_prompt=normalized.capture_prompt,
-                            capture_images=normalized.capture_images,
-                            contents=normalized.contents,
-                            system_instruction_content=normalized.system_instruction,
-                            tools=normalized.tools,
-                            tool_config=normalized.tool_config,
-                            safety_settings=normalized.safety_settings,
-                            temperature=normalized.temperature,
-                            top_p=normalized.top_p,
-                            top_k=normalized.top_k,
-                            max_tokens=normalized.max_tokens,
-                            generation_config_overrides=normalized.generation_config_overrides,
-                            sanitize_plain_text=False,
-                            force_refresh_capture=(
-                                stream_attempt > 0 or empty_attempt > 0
-                            ),
-                        ):
+                        if surface == "build":
+                            stream_iter = client.stream_generate_content(
+                                model=normalized.model,
+                                capture_prompt="",
+                                surface="build",
+                                rest_body=build_rest_body,
+                            )
+                        else:
+                            stream_iter = client.stream_generate_content(
+                                model=normalized.model,
+                                capture_prompt=normalized.capture_prompt,
+                                capture_images=normalized.capture_images,
+                                contents=normalized.contents,
+                                system_instruction_content=normalized.system_instruction,
+                                tools=normalized.tools,
+                                tool_config=normalized.tool_config,
+                                safety_settings=normalized.safety_settings,
+                                temperature=normalized.temperature,
+                                top_p=normalized.top_p,
+                                top_k=normalized.top_k,
+                                max_tokens=normalized.max_tokens,
+                                generation_config_overrides=normalized.generation_config_overrides,
+                                sanitize_plain_text=False,
+                                force_refresh_capture=(
+                                    stream_attempt > 0 or empty_attempt > 0
+                                ),
+                            )
+                        async for event_type, text in stream_iter:
                             if event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
                             elif event_type == "finish_reason":
@@ -727,6 +816,7 @@ def _build_gemini_streaming_response(
                             normalized_model=normalized.model if normalized else None,
                             client=client,
                             has_yielded_data=has_yielded_data,
+                            surface=surface,
                         ):
                             retry_outer = True
                             break
@@ -779,7 +869,7 @@ def _build_gemini_streaming_response(
                 break
 
             target_model = normalized.model if normalized else model_path
-            record_rotator_event("success", model=target_model)
+            record_rotator_event("success", model=target_model, surface=surface)
             if normalized is not None:
                 runtime_state.record(normalized.model, "success", final_usage)
             logger.info(

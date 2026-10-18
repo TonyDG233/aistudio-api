@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { FeaturesConfig } from './types.ts'
+import type { FeaturesConfig, AccountGroupItem } from './types.ts'
 import {
   ATG_MODE_OPTIONS,
   ATG_CONTROL_POSITION_OPTIONS,
@@ -9,6 +9,7 @@ import ConfigSwitch from './ConfigSwitch.vue'
 import ConfigSelect from './ConfigSelect.vue'
 import ConfigInput from './ConfigInput.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
+import FeatureGroupsEditor from './FeatureGroupsEditor.vue'
 import { LayoutDashboard, Route, ShieldOff, Zap } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -31,6 +32,10 @@ function updateAtg(key: string, val: unknown) {
 function updateFallback(key: string, val: unknown) {
   const fallback = { ...(props.features.fallback || {}), [key]: val }
   emit('update:features', { ...props.features, fallback })
+}
+
+function updateGroups(val: AccountGroupItem[]) {
+  emit('update:features', { ...props.features, groups: val })
 }
 
 function toNumber(val: string | number | null, fallback: number): number {
@@ -148,6 +153,18 @@ function toNumber(val: string | number | null, fallback: number): number {
               class="mt-4 shrink-0"
             />
           </div>
+        </div>
+      </div>
+
+      <!-- 账号分组与面编排 (WP5) -->
+      <div class="space-y-3 border-t border-gray-100 pt-4">
+        <FeatureGroupsEditor
+          :groups="features.groups || []"
+          @update:groups="updateGroups"
+        />
+        <div class="flex items-center gap-1.5">
+          <FieldHelpTip schema-key="features.groups" />
+          <span class="text-[11px] text-gray-400">分组策略字段说明与边界（配额/面枚举）</span>
         </div>
       </div>
 

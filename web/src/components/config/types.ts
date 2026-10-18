@@ -81,12 +81,24 @@ export interface FallbackConfig {
   [key: string]: unknown
 }
 
+export type SurfaceName = 'chat' | 'build'
+
+export interface AccountGroupItem {
+  name?: string
+  match_tier?: string[]
+  match_emails_regex?: string | null
+  allowed_surfaces?: string[]
+  max_page_instances?: number
+  [key: string]: unknown
+}
+
 export interface FeaturesConfig {
   build_surface?: boolean
   route_by_tier?: boolean
   account_refresh_concurrency?: number
   auto_switch?: boolean
   auto_switch_interval_hours?: number
+  groups?: AccountGroupItem[]
   atg?: AtgConfig
   fallback?: FallbackConfig
   [key: string]: unknown

@@ -71,6 +71,11 @@ export const ATG_RECOVERY_OPTIONS = [
   { value: 'fail', label: '直接失败 (fail)', description: '参数异常即显式报错' },
 ]
 
+export const SURFACE_OPTIONS = [
+  { value: 'chat', label: 'chat', description: '聊天面 (MakerSuite 原生会话)' },
+  { value: 'build', label: 'build', description: 'Build 宿主页直连面 (free 档额度)' },
+]
+
 export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
   'profile.name': {
     key: 'profile.name',
@@ -497,6 +502,16 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     explanation: '开=面内失败可跨面改道；关=面内失败不改道，显式报错（默认）。何时开：双面都已稳定且需要互补可用性时。失败怎么办：关时明确标注失败面，绝不静默换面。',
     defaultValue: false,
     tags: ['回落', '默认关闭'],
+  },
+  'features.groups': {
+    key: 'features.groups',
+    title: '账号分组与面编排',
+    category: 'features',
+    type: 'tags',
+    description: '按账号档位 (tier) 或邮箱正则把账号分组，为每组指定允许的面 (chat/build) 与页面实例配额。',
+    explanation: '每个分组含 name / match_tier / match_emails_regex / allowed_surfaces / max_page_instances。未显式分组的账号由编排器按 tier 默认规则兜底 (free→build、pro/ultra/plus→chat)。allowed_surfaces 为空 [] 表示禁用该组；max_page_instances 超限时对请求显式拒绝（不排队、不静默换面）。何时用：需要按档位差异化调度（如 free 走 build 面）时，通常与「按档位路由」同开。失败怎么办：坏项/非法值逐项丢弃归一，留空即全部走 tier 默认。',
+    defaultValue: [],
+    tags: ['编排', 'WP5', '分组'],
   },
 }
 
