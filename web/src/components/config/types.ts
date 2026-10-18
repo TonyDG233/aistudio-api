@@ -60,8 +60,41 @@ export interface ApiKeyConfigItem {
   created_at?: string
 }
 
+export interface AtgConfig {
+  mode?: 'off' | 'prefer' | 'required' | string
+  tool_prefix?: string
+  control_position?: 'tail' | 'head' | string
+  strict?: boolean
+  empty_retries?: number
+  recovery?: 'repair' | 'fail' | string
+  side_buffer_bytes?: number
+  client_synthetic_guard?: boolean
+  text_model_pattern?: string
+  non_text_model_pattern?: string
+  [key: string]: unknown
+}
+
+export interface FallbackConfig {
+  on_quota?: boolean
+  on_failure?: boolean
+  cross_surface?: boolean
+  [key: string]: unknown
+}
+
+export interface FeaturesConfig {
+  build_surface?: boolean
+  route_by_tier?: boolean
+  account_refresh_concurrency?: number
+  auto_switch?: boolean
+  auto_switch_interval_hours?: number
+  atg?: AtgConfig
+  fallback?: FallbackConfig
+  [key: string]: unknown
+}
+
 export interface ParsedConfigYaml {
   api_keys?: (ApiKeyConfigItem | string)[]
   model_defaults?: ModelDefaultsConfig
+  features?: FeaturesConfig
   [key: string]: unknown
 }

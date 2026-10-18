@@ -14,7 +14,7 @@ export interface FieldOption {
 export interface FieldDefinition {
   key: string
   title: string
-  category: 'profiles' | 'match' | 'tools' | 'generation' | 'safety' | 'overrides' | 'system'
+  category: 'profiles' | 'match' | 'tools' | 'generation' | 'safety' | 'overrides' | 'system' | 'features'
   type: 'string' | 'number' | 'boolean' | 'select' | 'tags' | 'safety_matrix' | 'indexes'
   description: string
   explanation: string
@@ -53,6 +53,22 @@ export const MEDIA_RESOLUTION_OPTIONS = [
   { value: 'MEDIUM', label: '标准清晰度 (MEDIUM)', description: '标准分辨率' },
   { value: 'LOW', label: '低画质缩略 (LOW)', description: '节省 Token' },
   { value: null, label: '遵循默认 (Null)', description: '遵循上游默认' },
+]
+
+export const ATG_MODE_OPTIONS = [
+  { value: 'off', label: '关闭 (off)', description: '完全禁用，零管线改动', recommended: true },
+  { value: 'prefer', label: '尽力合成 (prefer)', description: '模型忽略时回退纯文本通道' },
+  { value: 'required', label: '强制合成 (required)', description: '缺少合成调用即显式失败' },
+]
+
+export const ATG_CONTROL_POSITION_OPTIONS = [
+  { value: 'tail', label: '对话末尾 (tail)', description: '推荐，兼修话轮提前结束', recommended: true },
+  { value: 'head', label: '对话开头 (head)', description: '将控制提示置于开头' },
+]
+
+export const ATG_RECOVERY_OPTIONS = [
+  { value: 'repair', label: '确定性修复 (repair)', description: '先尝试修复再解包', recommended: true },
+  { value: 'fail', label: '直接失败 (fail)', description: '参数异常即显式报错' },
 ]
 
 export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
@@ -269,6 +285,208 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     defaultValue: {},
     tags: ['精确覆盖'],
   },
+  'features.build_surface': {
+    key: 'features.build_surface',
+    title: 'Build 直连面总开关',
+    category: 'features',
+    type: 'boolean',
+    description: '是否启用 Build 宿主页直连通道（对应 Ark MAKERSUITE_DIRECT）。',
+    explanation: '开=free 档账号经 Build 页面直连通道调用（对应 Build 专属额度）；关=仅使用现有聊天面，零行为变化。何时开：需要免费档账号走 Build 额度时。失败怎么办：面内失败一律显式报错并标注原因，绝不自动改道。',
+    defaultValue: false,
+    tags: ['Build 面', '核心开关'],
+  },
+  'features.route_by_tier': {
+    key: 'features.route_by_tier',
+    title: '按档位路由',
+    category: 'features',
+    type: 'boolean',
+    description: '是否按账号档位（tier）把请求路由到允许的面（对应 AISTUDIO_ROUTE_BY_TIER）。',
+    explanation: '开=按 features.groups/档位策略分发到 chat 或 build 面；关=始终使用聊天面默认路由。何时开：完成分组编排（WP5）后需要差异化调度时。失败怎么办：无匹配组时按默认策略并显式记录决策链。',
+    defaultValue: false,
+    tags: ['编排', 'WP5'],
+  },
+  'features.account_refresh_concurrency': {
+    key: 'features.account_refresh_concurrency',
+    title: '账号刷新并发数',
+    category: 'features',
+    type: 'number',
+    description: '批量账号信息刷新（email/tier/过期）的并发工作池大小（对应 Ark REFRESH_CONCURRENCY）。',
+    explanation: '数值越大刷新越快，但对上游的并发请求越多、越易触发限流；默认 3 为 Ark 实测的稳妥值。何时调：账号量大且网络稳定时可上调。失败怎么办：并发上限内单账号失败不影响其余账号刷新。',
+    defaultValue: 3,
+    recommendedValue: 3,
+    tags: ['账号刷新', 'WP3'],
+  },
+  'features.auto_switch': {
+    key: 'features.auto_switch',
+    title: '定时自动切换账号',
+    category: 'features',
+    type: 'boolean',
+    description: '是否按固定间隔周期性轮换账号（对应 Ark ENABLE_AUTO_SWITCH）。',
+    explanation: '开=每隔 auto_switch_interval_hours 小时自动切换账号；关=仅按用量/失败/429 冷却触发切换。何时开：希望账号额度均匀消耗时。失败怎么办：无可切换账号时保持当前账号并在日志告警。',
+    defaultValue: false,
+    tags: ['账号调度', 'WP5'],
+  },
+  'features.auto_switch_interval_hours': {
+    key: 'features.auto_switch_interval_hours',
+    title: '自动切换间隔（小时）',
+    category: 'features',
+    type: 'number',
+    description: '定时自动切换的周期间隔，支持小数，最小 0.1 小时（对应 Ark AUTO_SWITCH_INTERVAL_HOURS）。',
+    explanation: '仅在「定时自动切换账号」开启时生效；越小切换越频繁，默认 3 小时与 Ark 一致。何时调：额度消耗快可缩短、追求稳定会话可延长。失败怎么办：非法值回退默认 3.0。',
+    defaultValue: 3.0,
+    recommendedValue: 3.0,
+    tags: ['账号调度', 'interval'],
+  },
+  'features.atg.mode': {
+    key: 'features.atg.mode',
+    title: 'ATG 防截断模式',
+    category: 'features',
+    type: 'select',
+    description: 'ATG 合成工具通道运行模式（对应 Ark ATG_MODE / AISTUDIO_ATG_MODE）。',
+    explanation: 'off=完全禁用，零管线改动（默认）；prefer=尽力用合成 function-call 通道承载答案，模型忽略时回退纯文本通道；required=严格模式，缺少合成调用即显式失败而非静默回退。何时用：prefer 观察命中率，required 用于必须走工具通道的强约束。失败怎么办：required 下显式报错并标注缺失的合成调用。',
+    defaultValue: 'off',
+    recommendedValue: 'off',
+    options: [
+      { value: 'off', label: '关闭 (off)', description: '零管线改动', recommended: true },
+      { value: 'prefer', label: '尽力合成 (prefer)', description: '忽略则回退纯文本' },
+      { value: 'required', label: '强制合成 (required)', description: '缺失即显式失败' },
+    ],
+    tags: ['ATG', '核心开关', 'WP2'],
+  },
+  'features.atg.tool_prefix': {
+    key: 'features.atg.tool_prefix',
+    title: '合成工具名前缀',
+    category: 'features',
+    type: 'string',
+    description: '每次请求注入的合成工具名前缀（对应 Ark ATG_TOOL_PREFIX）。',
+    explanation: '需保持稳定以利于白名单过滤与历史清理（同前缀的合成调用会被历史清理剔除）。何时改：极少需要修改。失败怎么办：留空回退内置默认 atg_emit_。',
+    defaultValue: 'atg_emit_',
+    recommendedValue: 'atg_emit_',
+    tags: ['ATG'],
+  },
+  'features.atg.control_position': {
+    key: 'features.atg.control_position',
+    title: '控制提示注入位置',
+    category: 'features',
+    type: 'select',
+    description: 'ATG 控制提示词注入对话的位置（对应 Ark ATG_CONTROL_POSITION）。',
+    explanation: 'tail=置于对话末尾（推荐，同时修复“模型话轮提前结束”问题）；head=置于对话开头。何时改：末尾注入效果不佳时可尝试开头。失败怎么办：非法值回退 tail。',
+    defaultValue: 'tail',
+    recommendedValue: 'tail',
+    options: [
+      { value: 'tail', label: '对话末尾 (tail)', description: '推荐', recommended: true },
+      { value: 'head', label: '对话开头 (head)', description: '备用' },
+    ],
+    tags: ['ATG'],
+  },
+  'features.atg.strict': {
+    key: 'features.atg.strict',
+    title: '合成参数严格模式',
+    category: 'features',
+    type: 'boolean',
+    description: '合成工具参数结构不符合预期时是否立即判失败（对应 Ark ATG_TOOL_STRICT）。',
+    explanation: '开=参数异常即判失败（利于及早暴露问题）；关=允许宽松解析/修复（容错优先，默认）。何时开：调试 ATG 合成工具契约时。失败怎么办：关时走 recovery 策略恢复。',
+    defaultValue: false,
+    tags: ['ATG'],
+  },
+  'features.atg.empty_retries': {
+    key: 'features.atg.empty_retries',
+    title: '空响应重试次数',
+    category: 'features',
+    type: 'number',
+    description: '上游返回空/塌陷响应时 ATG 的最大重试次数，范围 0-5（对应 Ark ATG_EMPTY_RETRIES）。',
+    explanation: '数值越大防截断兜底越强，但消耗的额度也越多；默认 2。何时调：截断频发可上调至 3-5（上限 5）。失败怎么办：达到上限仍失败则按 recovery 策略处理或显式报错。',
+    defaultValue: 2,
+    recommendedValue: 2,
+    tags: ['ATG', '防截断'],
+  },
+  'features.atg.recovery': {
+    key: 'features.atg.recovery',
+    title: '参数恢复策略',
+    category: 'features',
+    type: 'select',
+    description: '合成参数解析失败时的恢复策略（对应 Ark ATG_RECOVERY）。',
+    explanation: 'repair=尝试确定性修复后再解包（默认，尽量不丢内容）；fail=直接显式失败，不尝试修复。何时用：需要及早暴露上游格式漂移时用 fail。失败怎么办：fail 下返回明确的解析错误信息。',
+    defaultValue: 'repair',
+    recommendedValue: 'repair',
+    options: [
+      { value: 'repair', label: '确定性修复 (repair)', description: '推荐', recommended: true },
+      { value: 'fail', label: '直接失败 (fail)', description: '严格' },
+    ],
+    tags: ['ATG'],
+  },
+  'features.atg.side_buffer_bytes': {
+    key: 'features.atg.side_buffer_bytes',
+    title: '流式旁路缓冲字节',
+    category: 'features',
+    type: 'number',
+    description: '流式输出中缓冲纯文本的字节上限，0-16MB（对应 Ark ATG_SIDE_BUFFER_BYTES）。',
+    explanation: '0=立即透传（默认）；大于 0=在合成调用到达前先缓冲纯文本，抑制前言泄漏。何时调：开启 ATG 后若观察到前言文字泄漏可设为正值。失败怎么办：超过字节上限即透传，不阻塞流。',
+    defaultValue: 0,
+    recommendedValue: 0,
+    tags: ['ATG', '流式'],
+  },
+  'features.atg.client_synthetic_guard': {
+    key: 'features.atg.client_synthetic_guard',
+    title: '客户端合成机制守卫',
+    category: 'features',
+    type: 'boolean',
+    description: '客户端已自带“经工具回正文”机制时跳过本地 ATG 包装（对应 Ark ATG_CLIENT_SYNTHETIC_GUARD，默认 on）。',
+    explanation: '开=检测到客户端已有类似合成通道时跳过本地包装，防止双通道叠加破坏输出（默认）；关=无条件本地包装。何时关：确定客户端无自带合成机制却误判时。失败怎么办：误判导致跳过时可在日志看到 guard 命中原因。',
+    defaultValue: true,
+    recommendedValue: true,
+    tags: ['ATG', '兼容性'],
+  },
+  'features.atg.text_model_pattern': {
+    key: 'features.atg.text_model_pattern',
+    title: '文本模型正则',
+    category: 'features',
+    type: 'string',
+    description: '识别文本模型的正则表达式（对应 Ark ATG_TEXT_MODEL_PATTERN）。',
+    explanation: '命中该正则的模型视为文本模型，才参与 ATG 合成。何时改：自有别名模型未被内置规则覆盖时。失败怎么办：留空即使用内置默认正则，非法正则亦自动回退。',
+    defaultValue: '',
+    tags: ['ATG', '模型过滤'],
+  },
+  'features.atg.non_text_model_pattern': {
+    key: 'features.atg.non_text_model_pattern',
+    title: '非文本模型正则',
+    category: 'features',
+    type: 'string',
+    description: '识别非文本模型（生图/音频/嵌入等）的正则表达式（对应 Ark ATG_NON_TEXT_MODEL_PATTERN）。',
+    explanation: '优先于文本正则判定：命中即视为非文本模型并跳过 ATG。何时改：有特殊命名的生图/音频模型需要排除时。失败怎么办：留空使用内置默认正则，非法正则自动回退。',
+    defaultValue: '',
+    tags: ['ATG', '模型过滤'],
+  },
+  'features.fallback.on_quota': {
+    key: 'features.fallback.on_quota',
+    title: '配额耗尽回落',
+    category: 'features',
+    type: 'boolean',
+    description: '配额（429/限额）耗尽时是否允许自动回落改道。',
+    explanation: '开=配额触顶后按策略回落至其它面/账号；关=显式报错（默认，遵循零自动回落决策）。何时开：明确接受改道副作用时。失败怎么办：关时返回明确的配额错误与处置建议，且不改道。',
+    defaultValue: false,
+    tags: ['回落', '默认关闭'],
+  },
+  'features.fallback.on_failure': {
+    key: 'features.fallback.on_failure',
+    title: '请求失败回落',
+    category: 'features',
+    type: 'boolean',
+    description: '非配额类请求失败时是否允许自动回落改道。',
+    explanation: '开=失败即自动改道重试；关=直接显式报错（默认）。何时开：需要更强可用性且能接受重试放大时。失败怎么办：关时错误信息标注具体失败面与原因。',
+    defaultValue: false,
+    tags: ['回落', '默认关闭'],
+  },
+  'features.fallback.cross_surface': {
+    key: 'features.fallback.cross_surface',
+    title: '跨面回落',
+    category: 'features',
+    type: 'boolean',
+    description: '是否允许在 chat 与 build 两个面之间跨面回落改道。',
+    explanation: '开=面内失败可跨面改道；关=面内失败不改道，显式报错（默认）。何时开：双面都已稳定且需要互补可用性时。失败怎么办：关时明确标注失败面，绝不静默换面。',
+    defaultValue: false,
+    tags: ['回落', '默认关闭'],
+  },
 }
 
 export const SCHEMA_CATEGORIES = [
@@ -277,4 +495,5 @@ export const SCHEMA_CATEGORIES = [
   { key: 'tools', label: '内置工具配置' },
   { key: 'generation', label: '生成与思考参数' },
   { key: 'safety', label: '安全拦截等级' },
+  { key: 'features', label: '功能开关' },
 ]

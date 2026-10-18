@@ -11,6 +11,7 @@
 - [3. 代码质量与类型规范](#3-代码质量与类型规范)
 - [4. 并发安全与多账号守则](#4-并发安全与多账号守则)
 - [5. 代码结构索引](#5-代码结构索引)
+- [6. 功能开关规范 (features)](#6-功能开关规范-features)
 
 ---
 
@@ -242,3 +243,14 @@ aistudio-api/
 │       ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
 │       └── test_wire_*           # Protobuf-over-JSON 编解码、流式解析与模型规则
 ```
+
+## 6. 功能开关规范 (features)
+
+本仓库的运行时功能开关统一收敛到 `config.yaml` 顶层 `features:` 段（`config.py` 的 `Settings` 提供同名 `AISTUDIO_*` 环境变量作为启动基线）。
+
+- **落点**：`config.py` 的 `Settings`（`_load_bool_env` / `_load_int_env` / `_load_float_env` / `_load_choice_env` 模式，`AISTUDIO_*` 前缀）；解析函数 `model_defaults.get_features_config()`（仿 `_load_yaml_config` 的 mtime 缓存 + `invalidate_config_cache()`）；对外经 `GET /config` 响应的 `features` 键暴露。
+- **优先级**：`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值。`features` 段是运行时权威配置，`PUT /config/yaml` 后**热重载立即生效**；环境变量仅在进程启动时读取一次，作为缺省兜底。
+- **命名对齐**：YAML 键统一 `snake_case`，语义对齐对面 Ark 的 `.env` 字段（如 `atg.mode`↔`ATG_MODE`、`atg.client_synthetic_guard`↔`ATG_CLIENT_SYNTHETIC_GUARD`、`account_refresh_concurrency`↔`REFRESH_CONCURRENCY`、`auto_switch_interval_hours`↔`AUTO_SWITCH_INTERVAL_HOURS`）。
+- **默认保守**：全部开关默认关闭（`features.fallback.*` 全 `off`，遵循「零自动回落」决策）；`client_synthetic_guard` 默认 `true`（兼容优先）。非法/未知取值一律静默回退安全默认，禁止让新增顶层键破坏既有 YAML 消费方。
+- **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
+- **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。

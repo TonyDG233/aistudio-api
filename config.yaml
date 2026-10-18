@@ -2,6 +2,96 @@
 # 留空 [] 表示对外 API 免 Key 开放调用；配置密钥后客户端必须携带对应 Key 访问。
 api_keys: []
 
+# ============================================================================
+# 功能开关 (features) — 所有开关默认保守关闭，保持零行为变化。
+# 本段可在 Web 管理控制台可视化编辑并热重载 (PUT /config/yaml -> 立即生效)，
+# 无需重启进程。同名环境变量 (AISTUDIO_*) 仅作为启动基线兜底：
+# 优先级为 本段 features.* > AISTUDIO_* 环境变量 > 内置默认值。
+# ============================================================================
+features:
+  # Build 页面直连面总开关 (对应 Ark MAKERSUITE_DIRECT / 环境变量 AISTUDIO_BUILD_SURFACE)。
+  # 开=free 档账号走 Build 宿主页直连通道；关=仅使用现有聊天面 (零行为变化)。
+  # 何时开：需要通过免费档账号调用 Build 专属额度时。失败怎么办：面内失败显式报错，不改道。
+  build_surface: false
+
+  # 是否按账号档位 (tier) 路由到不同面 (对应环境变量 AISTUDIO_ROUTE_BY_TIER)。
+  # 开=按 features.groups/档位策略把请求分发到允许的面；关=始终使用聊天面默认路由。
+  route_by_tier: false
+
+  # 批量账号信息刷新 (email/tier/过期) 的并发工作池大小 (对应 Ark REFRESH_CONCURRENCY)。
+  # 越大刷新越快但并发请求越多；默认 3 为 Ark 实测的稳妥值。失败怎么办：单账号失败不影响其余。
+  account_refresh_concurrency: 3
+
+  # 定时自动切换账号总开关 (对应 Ark ENABLE_AUTO_SWITCH / 环境变量 AISTUDIO_AUTO_SWITCH)。
+  # 开=按下方间隔周期性轮换账号；关=仅按用量/失败/冷却触发切换。默认关，避免打扰。
+  auto_switch: false
+
+  # 自动切换周期间隔 (小时，支持小数，最小 0.1；对应 Ark AUTO_SWITCH_INTERVAL_HOURS)。
+  # 仅在 auto_switch=true 时生效；默认 3 小时与 Ark 一致。
+  auto_switch_interval_hours: 3.0
+
+  # --------------------------------------------------------------------------
+  # ATG (Anti-Truncation Gateway) 防截断合成工具通道
+  # 通过合成 function-call 通道承载模型答案，绕过文本通道截断/审核后再解包回正文。
+  # 全部默认关闭；仅 mode 不为 off 时模块才启用。字段名对齐 Ark ATG_* 语义。
+  # --------------------------------------------------------------------------
+  atg:
+    # 运行模式 (对应 Ark ATG_MODE / 环境变量 AISTUDIO_ATG_MODE)。
+    # off=完全禁用 (零管线改动)；prefer=尽力合成，模型忽略合成工具时回退纯文本通道；
+    # required=严格模式，缺少合成工具调用时显式失败而非静默回退。
+    # 何时用：prefer 用于观察命中率；required 用于必须走工具通道的强约束场景。
+    mode: off
+
+    # 每次请求的合成工具名前缀 (对应 Ark ATG_TOOL_PREFIX)，须保持稳定以利于过滤与历史清理。
+    tool_prefix: atg_emit_
+
+    # 控制提示词的注入位置 (对应 Ark ATG_CONTROL_POSITION)。
+    # tail=置于对话末尾 (推荐，同时修复“模型话轮提前结束”问题)；head=置于对话开头。
+    control_position: tail
+
+    # 合成工具参数严格模式 (对应 Ark ATG_TOOL_STRICT)。
+    # 开=参数结构不符合预期即判失败；关=允许宽松解析。默认关，容错优先。
+    strict: false
+
+    # 上游返回空/塌陷响应时的最大重试次数 (对应 Ark ATG_EMPTY_RETRIES，范围 0-5)。
+    # 开大=更强的防截断兜底但增加额度消耗；默认 2。
+    empty_retries: 2
+
+    # 合成参数解析失败时的恢复策略 (对应 Ark ATG_RECOVERY)。
+    # repair=尝试确定性修复后再解包；fail=直接显式失败。默认 repair。
+    recovery: repair
+
+    # 流式旁路缓冲字节数 (对应 Ark ATG_SIDE_BUFFER_BYTES，0..16MB)。
+    # 0=立即透传 (默认)；大于 0=在合成调用到达前先缓冲纯文本，抑制前言泄漏。失败怎么办：超限即透传。
+    side_buffer_bytes: 0
+
+    # 客户端自带合成机制守卫 (对应 Ark ATG_CLIENT_SYNTHETIC_GUARD，默认 on)。
+    # 开=当客户端 (如酒馆类扩展) 已自带“经工具回正文”机制时跳过本地包装，防止双通道叠加；
+    # 关=无条件本地包装。默认开，兼容优先。
+    client_synthetic_guard: true
+
+    # 文本模型识别正则 (对应 Ark ATG_TEXT_MODEL_PATTERN)；留空使用内置默认正则。
+    # 命中的模型视为文本模型，才参与 ATG 合成。失败怎么办：留空即用内置规则。
+    text_model_pattern: ""
+
+    # 非文本模型识别正则 (对应 Ark ATG_NON_TEXT_MODEL_PATTERN)；留空使用内置默认正则。
+    # 优先于文本正则判定：命中即视为非文本模型 (生图/音频/嵌入等) 并跳过 ATG。
+    non_text_model_pattern: ""
+
+  # --------------------------------------------------------------------------
+  # 回落 (fallback) 开关组 — 默认全 off，遵循「零自动回落」决策。
+  # 任何改道行为都必须显式开启，并在日志与响应中可 grep；未开启时一律显式报错。
+  # --------------------------------------------------------------------------
+  fallback:
+    # 配额 (429/限额) 耗尽时是否允许跨面/跨账号回落。开=配额触顶后尝试回落改道；关=显式报错。默认关。
+    on_quota: false
+
+    # 请求失败 (非配额类错误) 时是否允许自动回落改道。开=失败即改道重试；关=显式报错。默认关。
+    on_failure: false
+
+    # 是否允许在 chat 与 build 两个面之间跨面回落。开=允许跨面改道；关=面内失败不改道。默认关。
+    cross_surface: false
+
 # 服务端日志与请求转储调试配置
 logging:
   # 日志输出级别: DEBUG / INFO / WARNING / ERROR

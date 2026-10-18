@@ -232,6 +232,42 @@ docker compose up -d
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
+| `AISTUDIO_BUILD_SURFACE` | bool | `false` | Build 页面直连面总开关（free 档账号走 Build 直连通道） |
+| `AISTUDIO_ATG_MODE` | string | `off` | ATG 防截断模式：`off` / `prefer` / `required` |
+| `AISTUDIO_ACCOUNT_REFRESH_CONCURRENCY` | int | `3` | 批量账号信息刷新并发工作池大小 |
+| `AISTUDIO_ROUTE_BY_TIER` | bool | `false` | 是否按账号档位（tier）路由到不同的面 |
+| `AISTUDIO_AUTO_SWITCH` | bool | `false` | 定时自动切换账号总开关 |
+| `AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS` | float | `3.0` | 定时自动切换周期间隔（小时，最小 `0.1`） |
+
+### 功能开关（features）
+
+> [!IMPORTANT]
+> **两处开关的关系与优先级**：`config.yaml` 顶层的 `features:` 段是**运行时权威配置**（可在 Web 控制台可视化编辑并经 `PUT /config/yaml` **热重载**，无需重启）；上表中的 `AISTUDIO_*` 环境变量仅是**启动时的基线兜底**（进程启动读取一次）。
+> 优先级为：**`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值**。即：`features` 段缺省某项时使用环境变量值，环境变量也未设置时使用内置默认。所有开关默认保守关闭（`fallback` 组默认全关，遵循「零自动回落」决策）。
+
+`config.yaml` `features:` 段字段一览（Web 控制台「模型规则与安全策略」页面提供自解释可视化编辑）：
+
+| 字段 | 类型 | 默认值 | 说明（开=什么 / 关=什么 / 何时用 / 失败怎么办） |
+|---|---|---|---|
+| `features.build_surface` | bool | `false` | 开=free 档账号走 Build 宿主页直连通道；关=仅聊天面（零行为变化）。何时开：需要免费档走 Build 额度。失败：面内失败显式报错，绝不改道。 |
+| `features.route_by_tier` | bool | `false` | 开=按账号档位分发到允许的面；关=始终聊天面默认路由。何时开：分组编排（WP5）落地后。失败：无匹配组按默认策略并记录决策链。 |
+| `features.account_refresh_concurrency` | int | `3` | 批量刷新 email/tier/过期的并发数（范围 1-16）。越大越快但越易限流。失败：单账号失败不影响其余。 |
+| `features.auto_switch` | bool | `false` | 开=按间隔周期轮换账号；关=仅按用量/失败/429 触发。失败：无可切换账号时保持当前账号并告警。 |
+| `features.auto_switch_interval_hours` | float | `3.0` | 自动切换间隔（小时，最小 0.1，与 Ark 一致）。非法值回退 3.0。 |
+| `features.atg.mode` | select | `off` | `off`=禁用（零改动）/ `prefer`=尽力合成、忽略则回退纯文本 / `required`=缺失合成调用即显式失败。 |
+| `features.atg.tool_prefix` | string | `atg_emit_` | 合成工具名前缀（须稳定以利过滤与历史清理）。留空回退默认。 |
+| `features.atg.control_position` | select | `tail` | 控制提示注入位置：`tail`=对话末尾（推荐）/ `head`=开头。非法值回退 `tail`。 |
+| `features.atg.strict` | bool | `false` | 开=合成参数异常即判失败；关=允许宽松解析（默认）。 |
+| `features.atg.empty_retries` | int | `2` | 空/塌陷响应最大重试（0-5）。越大兜底越强但耗额度。达上限仍失败则按 recovery 处理。 |
+| `features.atg.recovery` | select | `repair` | `repair`=确定性修复后解包（默认）/ `fail`=直接显式失败。 |
+| `features.atg.side_buffer_bytes` | int | `0` | 流式旁路缓冲字节（0=立即透传，最大 16MB）。超限即透传。 |
+| `features.atg.client_synthetic_guard` | bool | `true` | 开=客户端已自带「经工具回正文」机制时跳过本地包装，防双通道叠加（默认）；关=无条件包装。 |
+| `features.atg.text_model_pattern` | string | `""` | 文本模型识别正则；留空用内置默认，非法正则自动回退。 |
+| `features.atg.non_text_model_pattern` | string | `""` | 非文本模型识别正则（优先判定，命中即跳过 ATG）；留空用内置默认。 |
+| `features.fallback.on_quota` | bool | `false` | 开=配额耗尽允许自动回落改道；关=显式报错（默认）。 |
+| `features.fallback.on_failure` | bool | `false` | 开=请求失败允许自动回落；关=显式报错（默认）。 |
+| `features.fallback.cross_surface` | bool | `false` | 开=允许 chat↔build 跨面回落；关=面内失败不改道（默认）。 |
+
 ---
 
 ## API 调用示例
