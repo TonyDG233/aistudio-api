@@ -213,3 +213,14 @@ Node 层参照（本机现跑进程实测）：每个 Node/Playwright 进程 com
 - **内存预算**：321MB + Python 29MB ≈ **350MB ≤ 800MB 目标 ✓**（余量 ~450MB）；替换现役 Ark（2 context ≈758–771MB + node）可释放 ~400–500MB 物理内存，缓解其基线 1.2G/1.9G 的 swap 压力。
 - **磁盘预算**：CloakBrowser 536MB + 热 profile 36MB（+venv 数百 MB）→ 对 8.5GB 剩余充裕。
 - **模拟局限（诚实标注）**：无 cgroup 内存硬限、无慢盘 I/O、网络链路未模拟（真实 VPS 走 WARP）；纯 CPU 维度结论可信。
+
+## 16. P1 前置先行实验摘要（2026-10-18，详见 `PRE-P1-EXPERIMENTS-20261018.md`）
+
+七项全部完成（E1 适配回放 / E2+E7 长驻 / E3 tier 直连 / E4 BrowserContext 隔离 / E5 ATG 白名单 / E6 转换层评估 / E8 上游探测）。关键校准：
+
+- **E4（最重要）**：单浏览器多账号经 **BrowserContext** 隔离成立（SAPISID 逐字节证据、双 WS 齐连）；但独立 context 强制独立渲染进程，**成本 +180MB/账号 context**（比同 context 加页 +66–71MB 贵）。修正 §14：2 账号全栈 ≈ 385+29 ≈ **414MB**（1 服务 1 浏览器），仍比 Ark@2（771）省 ~46%。**WP5 配额基线：单页 ~70MB、跨账号备用 ~180MB/context。**
+- **E1**：holder 帧（REST chunk）→ wire 数组薄适配层（~60 行）验证通过，`wire_parser` 零改动。
+- **E3**：tier RPC 纯 Python 直连可行（odindicola5→free、tonygemini38→pro），零模型额度。
+- **E5**：`wire_codec` allowedFunctionNames 会剔除合成工具（坑复现）；修复=白名单并入合成工具名（已验证）。
+- **E8**：三段式探测（MAKERSUITE_MISSING / SIGNER_FUNCS_DRIFT / TB_MISSING）带处置建议；**nK/jK key 属性已漂移（本次均空），须以收割请求头为准**。
+- **E2+E7**：16.5 分钟静置后签名链/活动门/预览全存活、直连 200；内存 GC 锯齿无泄漏。

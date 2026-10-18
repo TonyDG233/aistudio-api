@@ -116,7 +116,7 @@
 - **注入点（已定位到行）**：
   - 请求 wrap：`application/api_service_gemini.py:314-321`（非流式）与 `:526-528`（流式），在 `normalize_gemini_request` 之后、执行之前。
   - 响应 unwrap：`:337-346`（非流式）、`:544-568`（流式 `event_type == "tool_calls"` 分支）。
-- **wire 层配合（关键坑）**：`infrastructure/gateway/wire_codec.py:329-343` 在 `allowedFunctionNames` 存在时会把声明按白名单过滤——移植时必须把本次请求的合成工具名**加入白名单**，否则合成工具被剔除。
+- **wire 层配合（关键坑）**：`infrastructure/gateway/wire_codec.py:329-343` 在 `allowedFunctionNames` 存在时会把声明按白名单过滤——移植时必须把本次请求的合成工具名**加入白名单**，否则合成工具被剔除。**（P0 前置实测已复现并验证修复：白名单并入合成工具名即可，PRE-P1 E5）**
 - **协议面**：ATG 的 per-format 结构（gemini/openai/claude）在 WP8 落地后直接启用；首期可先以单开关运行，后续切 per-format。
 - **功能开关**：`features.atg.*`；`client_synthetic_guard` 默认 on（防止与客户端（如酒馆类扩展）双合成通道叠加）。
 - **统计产出**（并入 WP6）：`syntheticHit / syntheticCount / realToolCount / repaired / conflict`。
@@ -124,7 +124,7 @@
 
 ### WP3 账号信息刷新（M）
 - **移植 Ark `AccountInfoRefresher`**（`src/core/AccountInfoRefresher.js`，513 行；纯 Node，无浏览器）：
-  - 探测 RPC：`POST alkalimakersuite-pa...MakerSuiteService/GetAiStudioBenefitTier`，body `"[]"`，`content-type: application/json+protobuf` + `x-goog-api-key`（公网 web key，可覆盖）+ `x-goog-authuser` + `Authorization: SAPISIDHASH ...`（**本仓库已有现成 `calculate_sapisid_hash`，直接复用**，`cookie_parser.py:171-189`）。
+  - 探测 RPC：`POST alkalimakersuite-pa...MakerSuiteService/GetAiStudioBenefitTier`，body `"[]"`，`content-type: application/json+protobuf` + `x-goog-api-key`（公网 web key，可覆盖）+ `x-goog-authuser` + `Authorization: SAPISIDHASH ...`（**本仓库已有现成 `calculate_sapisid_hash`，直接复用**，`cookie_parser.py:171-189`）。**（P0 前置实测：纯 Python 直连 200，free/pro 映射正确，PRE-P1 E3）**
   - tier 映射：`0 或 []` → free；`1` → pro；`2` → ultra；`3` → plus；其他 `unknown-N`。
   - 401 → 标记凭据过期（tier 徽章与过期徽章**必须并存显示**，遵循 Ark 约束）；非权威失败（5xx/代理故障）→ 不改状态。
   - 403 且疑为 key 被拒 → 从 apps 页 HTML 正则回收 key 一次重试。
@@ -145,7 +145,7 @@
 4.3 **请求执行协议**（Python 侧 `infrastructure/gateway/build_surface.py`）：
    - warmup 捕获（零额度）→ `session_state.py:SessionContext` 扩展 `build_context`（page+ready 态）→ 任务分发 `Runtime.evaluate` → 帧回流。
    - **Holder 解码**：响应为 2–3 层嵌套数组、叶子是转义 Gemini chunk JSON（区别于聊天页 envelope）。需先迁 `convChunk` 预处理，再喂现有 `wire_parser.py`（其字段索引兼容 `GenerateContent/ProxyStreamedCall` 信封，仅需 Holder 拆壳层）。
-4.4 **双面会话管理**：`session.py:transition_to_account` 支持双页（宿主 apps 页 + ais-pre 预览页）；蓝绿热切、drain、空闲回收覆盖两页；`client.py` 增加 `surface` 路由参数。
+4.4 **双面会话管理**：`session.py:transition_to_account` 支持双页（宿主 apps 页 + ais-pre 预览页）；蓝绿热切、drain、空闲回收覆盖两页；`client.py` 增加 `surface` 路由参数。**（P0 前置 E4 结论：多账号"瞬时切换"备用须由 `Target.createBrowserContext` 承载（独立 cookie jar，实测 +180MB/账号 context）；现有"cookie 交换式"蓝绿是单 context 内换号，需扩展为 context 池形态。）**
 4.5 **失败语义（已决）**：**默认零自动回落**——面内失败与跨面（build↔chat）失败均不改道，一律显式报错并标注具体问题（哪个面、哪类失败、处置建议；直连类失败不计账号故障的规则沿用）。预留 `features.fallback.*` 开关组（默认 off；显式开启才允许指定回退），任何改道行为必须在日志与响应中可 grep。
 - **验收**：free 账号经 build 面真流式 200（≥2 帧渐进）；pro 账号不受影响；崩溃后显式报错含原因与处置建议。
 
@@ -166,7 +166,7 @@
         max_page_instances: 3
   ```
   未显式分组的账号按 tier 落入自动默认组（free→`[build]`、pro/ultra/plus→`[chat]`），默认组策略可改。
-- **页面实例编排**：统一"页面实例"抽象——每实例承载一个面（`chat` 或 `build`），按需惰性创建；空闲回收沿用 900/1800s；组配额（`max_page_instances`）限定并存实例数，超限对请求**显式拒绝**（含配额与处置说明），不排队、不静默换面。内存参考基线 **~70MB/实例**（P0 已校准：`SPIKE-RESULTS-20261017.md` §14 实测增量页 +66–71MB、首页 +123MB；瞬时切换需的备用页同价）。
+- **页面实例编排**：统一"页面实例"抽象——每实例承载一个面（`chat` 或 `build`），按需惰性创建；空闲回收沿用 900/1800s；组配额（`max_page_instances`）限定并存实例数，超限对请求**显式拒绝**（含配额与处置说明），不排队、不静默换面。内存参考基线 **~70MB/实例**（P0 已校准：`SPIKE-RESULTS-20261017.md` §14 实测增量页 +66–71MB、首页 +123MB；瞬时切换需的备用页同价）。**跨账号备用须 `Target.createBrowserContext` 隔离**（独立 cookie jar + 独立渲染进程，实测 **+180MB/账号 context**；PRE-P1 E4）。
 - **模型守卫**：argon/Pro 系仅在 `chat` 面可用；目标组 `allowed_surfaces` 未含 chat 时，对 argon 请求显式 4xx（写明组策略与处置建议），绝不静默换面或换账号。
 - **rotator 扩展**：冷却/429 隔离键 `(account, model)` → `(account, surface, model)`；`/rotation` API 增 `surface` 维度；`allowed_surfaces=[]` 的组在调度器层面直接排除。
 - **管理面板（最小但完整，无 UI 完整复刻）**：分组管理（策略编辑、账号移入移出）、实例面板（各面实例数/配额/内存估算、手动开关实例）、组策略启停；文案遵循"开关自解释"。
@@ -195,7 +195,7 @@
   - OpenAI Chat Completions：`POST /v1/chat/completions`（流式 SSE delta + 非流式；工具调用双向；`usage` 映射）
   - Anthropic Messages：`POST /v1/messages`（含 system 字段、tool_use/tool_result、流式事件序列）
   - OpenAI Responses API：可选（Ark 已有完整实现可随迁）
-- **架构**：新增 `api/routes_openai.py`、`api/routes_claude.py` + `application/format_converters/`（Python 平移 Ark `FormatConverter` 模块族：ChatCompletionsConverter、ClaudeRequest/ResponseConverter、Responses 三件套、CommonConverter）。内部一律归一到 `NormalizedGeminiRequest`，响应在**格式边界**做逆变换；原生 `/v1beta` 路由完全不动。
+- **架构**：新增 `api/routes_openai.py`、`api/routes_claude.py` + `application/format_converters/`（Python 平移 Ark `FormatConverter` 模块族：ChatCompletionsConverter、ClaudeRequest/ResponseConverter、Responses 三件套、CommonConverter）。内部一律归一到 `NormalizedGeminiRequest`，响应在**格式边界**做逆变换；原生 `/v1beta` 路由完全不动。**（P0 前置 E6 结论：chat 面转换到内部归一模型；build 面直连本就是 REST 语义，可保持 REST dict 边界，避免无谓二次映射——两边界互不污染。）**
 - **移植基准（Ark 源）**：`src/core/FormatConverter/*`（Chat/Claude/Responses/Common 各模块）；行为验收以 Ark 现状为准（流式增量形状、工具调用参数分片、思维链/思考块的丢弃或映射策略）。
 - **与 ATG 的啮合（关键）**：ATG 包装/解包按**客户端格式**分别在 6+2 个边界生效——OpenAI 流/非流、Claude 流/非流、Responses 流/非流、Gemini 原生两处；`atgModeByFormat`（gemini/openai/claude）在此真正启用（见 WP2）。
 - **开关**：`features.formats.openai` / `features.formats.claude` / `features.formats.responses`（默认按需开启）；API Key 复用现有 `api_keys` 机制，可为各协议面独立配置。
