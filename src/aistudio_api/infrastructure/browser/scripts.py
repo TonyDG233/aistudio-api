@@ -22,6 +22,7 @@ CHECK_IDENTITY_JS = _load_js("check_identity.js")
 STOP_GENERATION_JS = _load_js("stop_generation.js")
 DOM_GC_CLEANUP_JS = _load_js("dom_gc_cleanup.js")
 EXTRACT_EMAIL_JS = _load_js("extract_email.js")
+BUILD_SIGNER_JS = _load_js("build_signer.js")
 
 
 def build_streaming_init_args(
@@ -47,6 +48,8 @@ def build_hooked_request_args(
         "body": body,
         "timeout": timeout_s,
     }
+
+
 def build_selector_match_js(selector: str) -> str:
     """Generate in-page element query snippet for standard CSS, text=, or :has-text() selector."""
     return f"""(() => {{

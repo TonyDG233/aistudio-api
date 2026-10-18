@@ -115,15 +115,26 @@ async def test_session_blue_green_transition_preserves_inflight():
 
     # Mock bootstrap functions
     from unittest.mock import patch
+
     with (
-        patch("aistudio_api.infrastructure.gateway.session.load_cookies_to_page", AsyncMock(return_value=True)),
-        patch("aistudio_api.infrastructure.gateway.session.navigate_to_aistudio", AsyncMock()),
+        patch(
+            "aistudio_api.infrastructure.gateway.session.load_cookies_to_page",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "aistudio_api.infrastructure.gateway.session.navigate_to_aistudio",
+            AsyncMock(),
+        ),
         patch(
             "aistudio_api.infrastructure.gateway.session.bootstrap_botguard_and_template",
-            AsyncMock(return_value=("snap_new", {"body": '["models/gemini-3.8-flash"]'})),
+            AsyncMock(
+                return_value=("snap_new", {"body": '["models/gemini-3.8-flash"]'})
+            ),
         ),
     ):
-        new_ctx = await session.transition_to_account("/data/acc2.json", force_refresh=True)
+        new_ctx = await session.transition_to_account(
+            "/data/acc2.json", force_refresh=True
+        )
 
     # 1. New page is created and becomes active context
     assert new_ctx.page == new_page

@@ -158,6 +158,12 @@ class BrowserSession:
         res = await self._ensure_browser_cdp()
         return res or (await self.ensure_ready()).page
 
+    async def ensure_browser_cdp_client(self) -> CDPClient:
+        """Ensure the CDP client is connected and return it (build surface entry)."""
+        await self._ensure_browser_cdp()
+        assert self._cdp_client is not None
+        return self._cdp_client
+
     async def is_alive(self, timeout_s: float = 1.5) -> bool:
         if self._proc is not None and not self._proc.is_alive():
             return False
@@ -298,6 +304,7 @@ class BrowserSession:
                 and context.page.target_id != active_target_id
             ):
                 await self._cdp_client.close_target(context.page.target_id)
+
     async def ensure_botguard_service(self, force_refresh: bool = False) -> CDPPage:
         page = self.page
         curr_url = page.url if page else ""

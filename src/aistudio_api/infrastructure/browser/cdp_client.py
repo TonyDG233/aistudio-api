@@ -21,6 +21,18 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("cdp")
 
+# 编辑器/公式库组：Build 应用宿主页需要 Monaco 等编辑器主包，故 chat 面拦截、
+# build 面放行（见 BUILD_SURFACE_BLOCKED_URL_PATTERNS）。
+EDITOR_LIBRARY_BLOCKED_URL_PATTERNS: list[str] = [
+    "*monaco-editor*",
+    "*codemirror*",
+    "*vs/editor*",
+    "*vs/base*",
+    "*mathjax*",
+    "*katex*",
+]
+
+# 全量清单（chat 面）：基础组 + 编辑器库组，内容与顺序保持既有行为不变。
 BLOCKED_URL_PATTERNS: list[str] = [
     "*.png",
     "*.jpg",
@@ -58,6 +70,13 @@ BLOCKED_URL_PATTERNS: list[str] = [
     "*google.com/recaptcha*",
     "*SavePrompt*",
     "*CreatePrompt*",
+]
+
+# Build 宿主页面：基础组（去掉编辑器库组），避免误伤 Monaco/vs 等应用主包。
+BUILD_SURFACE_BLOCKED_URL_PATTERNS: list[str] = [
+    pattern
+    for pattern in BLOCKED_URL_PATTERNS
+    if pattern not in EDITOR_LIBRARY_BLOCKED_URL_PATTERNS
 ]
 
 

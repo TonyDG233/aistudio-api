@@ -60,6 +60,7 @@ def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
     try:
         data = json.loads(normalized)
         if isinstance(data, list):
+
             def _find_grpc(obj: object) -> tuple[int | None, str] | None:
                 if isinstance(obj, list):
                     if (
@@ -77,7 +78,9 @@ def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
                     err = obj.get("error")
                     if isinstance(err, dict) and "message" in err:
                         code = err.get("code")
-                        return (int(code) if isinstance(code, (int, float)) else None), str(err["message"])
+                        return (
+                            int(code) if isinstance(code, (int, float)) else None
+                        ), str(err["message"])
                 return None
 
             found = _find_grpc(data)
@@ -100,6 +103,8 @@ def classify_error(status: int, body: str) -> AistudioError:
         return AuthError(f"禁止访问: {clean_msg}")
     effective_status = GRPC_CODE_TO_HTTP.get(grpc_code, status) if grpc_code else status
     return RequestError(effective_status, clean_msg)
+
+
 def is_transient_rpc_error(exc: Exception) -> bool:
     """识别 Google 上游偶发且完全随机的 RPC 路由 404 (Ambiguous request for service)。"""
     if isinstance(exc, RequestError) and exc.status == 404:

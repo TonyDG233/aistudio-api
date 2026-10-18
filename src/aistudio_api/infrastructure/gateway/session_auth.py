@@ -215,9 +215,7 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
         not is_verified
         and auth_user != "0"
         and f"/u/{auth_user}/" in curr_url
-        and (
-            not discovered_email or discovered_email.strip().lower() == expected_email
-        )
+        and (not discovered_email or discovered_email.strip().lower() == expected_email)
     ):
         is_verified = True
 

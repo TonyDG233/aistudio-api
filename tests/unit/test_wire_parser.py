@@ -43,6 +43,7 @@ def test_decode_wire_value_and_struct():
     decoded = _decode_wire_struct(pairs)
     assert decoded == {"key1": "val1", "key2": "val2"}
 
+
 def test_iter_response_chunks():
     assert _iter_response_chunks([]) == []
     assert _iter_response_chunks(None) == []
@@ -182,6 +183,7 @@ def test_decode_wire_struct_with_three_element_array():
     raw = [["city", "San Francisco", "extra_field"]]
     decoded = _decode_wire_struct(raw)
     assert decoded == {"city": "San Francisco"}
+
 
 def test_decode_wire_value_booleans_and_numbers():
     # Value booleans (JSPB boolean compression 0/1 and explicit bool)
