@@ -52,6 +52,24 @@ const todayRequests = computed(() => {
 const accountsStore = useAccountsStore()
 const detectingEmail = ref(false)
 
+const isExpired = computed(() =>
+  Boolean(props.account.expired || props.account.session_expired),
+)
+const refreshing = computed(() => Boolean(accountsStore.refreshingIds[props.account.id]))
+
+function tierVariant(tier?: string | null): 'green' | 'red' | 'amber' | 'blue' | 'gray' {
+  switch ((tier || '').toLowerCase()) {
+    case 'pro':
+      return 'blue'
+    case 'ultra':
+      return 'amber'
+    case 'plus':
+      return 'green'
+    default:
+      return 'gray'
+  }
+}
+
 async function handleDetectEmail() {
   detectingEmail.value = true
   try {
@@ -60,13 +78,17 @@ async function handleDetectEmail() {
     detectingEmail.value = false
   }
 }
+
+async function handleRefresh() {
+  await accountsStore.refreshAccount(props.account.id)
+}
 </script>
 
 <template>
   <div
     class="relative bg-white border rounded-xl p-3 shadow-2xs transition-all hover:shadow-xs"
     :class="[
-      account.session_expired
+      isExpired
         ? 'border-rose-300 bg-rose-50/20'
         : active
           ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
@@ -80,7 +102,7 @@ async function handleDetectEmail() {
         <span
           class="px-2 py-0.5 rounded-full text-xs font-mono font-bold shrink-0"
           :class="[
-            account.session_expired
+            isExpired
               ? 'bg-rose-100 text-rose-800 border border-rose-200'
               : active
                 ? 'bg-brand-500 text-white'
@@ -136,11 +158,28 @@ async function handleDetectEmail() {
           >
             429: {{ account.rate_limited || 0 }}
           </Badge>
+          <!-- 档位徽章：与过期徽章并存显示（tier 恒显，过期状态独立表达） -->
+          <Badge
+            v-if="account.tier"
+            :variant="tierVariant(account.tier)"
+            size="sm"
+            :title="`档位: ${account.tier}`"
+          >
+            {{ account.tier }}
+          </Badge>
         </div>
 
         <!-- Status Pill -->
         <div
-          v-if="account.session_expired"
+          v-if="account.expired"
+          class="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200"
+          title="档位探测返回 401，该账号凭据已过期并被排除出调度；请重新导入 cookies。"
+        >
+          <AlertCircle class="w-3 h-3 text-rose-600" />
+          <span>凭据过期</span>
+        </div>
+        <div
+          v-else-if="account.session_expired"
           class="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200"
           title="该账号登录态已失效，已被系统禁用。更新 Cookie 凭据后可点击恢复。"
         >
@@ -177,6 +216,21 @@ async function handleDetectEmail() {
 
         <!-- Action Buttons -->
         <div class="flex items-center gap-1.5 ml-1">
+          <!-- 刷新账号信息（档位/过期/邮箱） -->
+          <button
+            type="button"
+            class="p-1 text-gray-400 hover:text-brand-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
+            :class="{ 'opacity-50 cursor-not-allowed': refreshing }"
+            title="刷新账号信息（档位 tier / 过期 / 邮箱）"
+            :disabled="refreshing"
+            @click="handleRefresh"
+          >
+            <RefreshCw
+              class="w-3.5 h-3.5"
+              :class="{ 'animate-spin': refreshing }"
+            />
+          </button>
+
           <!-- 登录态失效状态下的快捷恢复按钮 -->
           <button
             v-if="account.session_expired"
@@ -190,7 +244,7 @@ async function handleDetectEmail() {
           </button>
 
           <Button
-            v-if="!active && !account.session_expired"
+            v-if="!active && !isExpired"
             variant="secondary"
             size="sm"
             :loading="activating"
@@ -211,7 +265,7 @@ async function handleDetectEmail() {
           </button>
 
           <button
-            v-if="(account.rate_limited || 0) > 0 && !account.session_expired"
+            v-if="(account.rate_limited || 0) > 0 && !isExpired"
             type="button"
             class="p-1 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer"
             title="清除该账号锁定"

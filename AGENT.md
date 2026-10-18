@@ -182,6 +182,7 @@ uv run python3 main.py server --port 8080
 4. **鉴权故障快速隔离与自愈**：当遇到 `The caller does not have permission` (403) 时，立即将当前账号置入 `auth_cooldown` 并快速故障转移至健康账号；单账号或备用号耗尽时自动触发在位强制刷新与 BotGuard 重握手自愈。
 5. **无全局 DOM 污染**：页面内 JavaScript 交互使用局部闭包 `Promise` 返回数据，不在 `window` 对象上遗留全局共享状态。
 6. **Cookie 智能精简与天然协商**：外部导入 Cookie 时自动过滤旧设备或跨 IP 绑定的易腐败凭据（`OSID`、`__Secure-OSID`、`SIDCC` 及 `_ga` 等追踪标记），保留核心认证项（`SID`、`SAPISID`、`1PSIDTS`）。浏览器访问 AI Studio 时自动协商出绑定当前网络/TLS 的全新有效 `OSID`，杜绝 403 权限拒绝。
+7. **过期凭据排除调度**：账号信息刷新（`POST /accounts/refresh`，直连 `GetAiStudioBenefitTier`）遇 401 即落 `expired=true` 并自动排除出调度池，直至刷新成功或重新导入 cookies；全部账号过期时显式报错（`credential expired, re-import cookies`），绝不静默跳过；5xx/网络等非权威失败不改动账号状态。
 7. **真实环境伪装与低内存协同**：保留 `--renderer-process-limit=1`、`--in-process-gpu` 与 128MB V8 内存限制以保障 Android 低 RAM 运行；移除 `--disable-software-rasterizer` 并启用 `--use-gl=angle --use-angle=swiftshader` 恢复软件 WebGL 上下文，保留 `--mute-audio` 并移除 `--disable-audio` 保护 AudioContext；统一注入 `--fingerprint-platform=windows` 伪装为 Windows 桌面环境，并通过原生 `--fingerprint-timezone` 与 Wire 协议层保持时区/位置严格一致。
 8. **账号接口解耦与 SPA 缓存隔离**：对外标准 REST 接口统一位于 `/api/accounts`（保持 `/accounts` 向下兼容），并在 SPA 单页应用与 API 响应中下发 `Vary: Accept` 与 `Cache-Control: no-store`，杜绝浏览器与代理网关发生缓存错乱。
 
@@ -229,7 +230,7 @@ aistudio-api/
 │   │   ├── errors.py              # 业务异常定义 (AuthError, UsageLimitExceeded 等)
 │   │   └── models.py              # 领域数据结构 (Candidate, ModelOutput 等)
 │   ├── infrastructure/            # 基础设施层
-│   │   ├── account/               # Cookie 解析、会话刷新与凭据持久化 (account_store, cookie_parser)
+│   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
 │   │   └── gateway/               # 会话状态机 (session_state)、蓝绿就绪门 (session)、鉴权凭据 (session_auth)、WAA探针 (botguard_bootstrap)、Wire编解码与流式管道
 ├── config.yaml                    # 模型规则与工具默认行为配置 (支持在线热重载)

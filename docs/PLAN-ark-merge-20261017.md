@@ -216,7 +216,7 @@
 | 阶段 | 内容 | 出口标准 |
 |---|---|---|
 | P0 | WP0 四 Spike | 全绿或设计修订；内存结论定 flag 基线 |
-| P1 | WP1 + WP3 | 开关框架可用；tier/email/expired 真实刷新 + 徽章 |
+| P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
 | P2 | WP2 | ATG 单测 + 真机 prefer/required 两态 |
 | P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |

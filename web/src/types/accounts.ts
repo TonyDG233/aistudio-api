@@ -8,6 +8,9 @@ export interface Account {
   last_used?: string | null
   auth_user: string
   cookie_id?: string | null
+  tier?: string | null
+  tier_checked_at?: string | null
+  expired?: boolean
 }
 
 export interface AccountWithStats extends Omit<Account, 'last_used'>, Partial<AccountRotationStats> {
@@ -57,4 +60,26 @@ export interface ImportBundleRequest {
 export interface ImportBundleResponse {
   imported_count: number
   accounts: Account[]
+}
+
+export interface RefreshAccountsRequest {
+  account_ids?: string[] | null
+  all?: boolean
+  refresh_email?: boolean
+}
+
+export interface RefreshAccountResult {
+  id: string
+  ok: boolean
+  tier?: string | null
+  expired?: boolean | null
+  email?: string | null
+  error?: string | null
+  checked_at?: string | null
+}
+
+export interface RefreshAccountsResponse {
+  results: RefreshAccountResult[]
+  refreshed_count: number
+  expired_count: number
 }

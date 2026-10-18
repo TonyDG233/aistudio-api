@@ -14,6 +14,9 @@ from os.path import abspath, basename, join
 from pathlib import Path
 from typing import ClassVar
 
+# 用于区分"未提供该字段"与"显式置为 None"的哨兵。
+_UNSET: object = object()
+
 
 def _atomic_write_json(path: Path, data: object) -> None:
     """原子写入 JSON 文件（写唯一临时文件后原子替换，防止写穿或损坏）。"""
@@ -40,6 +43,7 @@ _SEARCH_ROOTS: list[Path] = [
     .resolve()
     .parents[4],  # src/aistudio_api/infrastructure/account -> 项目根
 ]
+
 
 def _safe_account_dir(accounts_dir: Path, account_id: str) -> Path:
     """验证并返回安全的账号子目录路径，防止路径遍历攻击。"""
@@ -96,6 +100,10 @@ class AccountMeta:
     last_used: str | None = None
     auth_user: str = "0"
     cookie_id: str | None = None
+    # 账号信息刷新（tier/过期）落点；缺省兼容旧存档。
+    tier: str | None = None
+    tier_checked_at: str | None = None
+    expired: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -114,6 +122,11 @@ class AccountMeta:
             cookie_id=str(data["cookie_id"])
             if data.get("cookie_id") is not None
             else None,
+            tier=str(data["tier"]) if data.get("tier") is not None else None,
+            tier_checked_at=str(data["tier_checked_at"])
+            if data.get("tier_checked_at") is not None
+            else None,
+            expired=bool(data.get("expired", False)),
         )
 
 
@@ -357,6 +370,57 @@ class AccountStore:
         if acc.email == email:
             return False
         acc.email = email
+        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def update_account_refresh(
+        self,
+        account_id: str,
+        *,
+        tier: object = _UNSET,
+        tier_checked_at: object = _UNSET,
+        expired: object = _UNSET,
+        email: object = _UNSET,
+    ) -> bool:
+        """更新账号刷新字段（tier/tier_checked_at/expired/email），持久化并返回是否有改动。
+
+        未显式传入的字段保持不变；显式传入 ``None`` 则清空对应字段。全部同步到
+        ``meta.json`` 与 ``registry.json``。
+        """
+        registry = self._load_registry()
+        acc = registry.accounts.get(account_id)
+        if acc is None:
+            return False
+
+        changed = False
+        if tier is not _UNSET:
+            new_tier = None if tier is None else str(tier)
+            if acc.tier != new_tier:
+                acc.tier = new_tier
+                changed = True
+        if tier_checked_at is not _UNSET:
+            new_checked = None if tier_checked_at is None else str(tier_checked_at)
+            if acc.tier_checked_at != new_checked:
+                acc.tier_checked_at = new_checked
+                changed = True
+        if expired is not _UNSET:
+            new_expired = bool(expired)
+            if acc.expired != new_expired:
+                acc.expired = new_expired
+                changed = True
+        if email is not _UNSET:
+            new_email = None if email is None else str(email)
+            if acc.email != new_email:
+                acc.email = new_email
+                changed = True
+
+        if not changed:
+            return False
+
         account_dir = _safe_account_dir(self._accounts_dir, account_id)
         meta_path = account_dir / "meta.json"
         if meta_path.exists():

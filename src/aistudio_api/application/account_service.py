@@ -25,6 +25,11 @@ class AccountService:
     ) -> None:
         self._store = account_store
 
+    @property
+    def store(self) -> AccountStore:
+        """底层账号存储（供账号信息刷新器等复用同一注册表）。"""
+        return self._store
+
     def list_accounts(self) -> list[AccountMeta]:
         """列出所有账号。"""
         return self._store.list_accounts()

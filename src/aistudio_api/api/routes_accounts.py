@@ -11,6 +11,10 @@ from aistudio_api.api.dependencies import (
     get_account_service,
     get_runtime_state,
 )
+from aistudio_api.infrastructure.account.account_info_refresher import (
+    AccountInfoRefresher,
+    RefreshInProgressError,
+)
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.account.cookie_parser import parse_cookie_string
 from aistudio_api.infrastructure.utils.common import mask_email
@@ -24,6 +28,19 @@ log = get_logger("accounts")
 
 router = APIRouter(prefix="/accounts")
 
+# 账号信息刷新器单例（进程内互斥标志由刷新器自身持有）。
+_refresher_singleton: AccountInfoRefresher | None = None
+
+
+def get_account_info_refresher(
+    account_service: AccountService = Depends(get_account_service),
+) -> AccountInfoRefresher:
+    """惰性构建账号信息刷新器单例（可在测试中通过依赖覆盖替换）。"""
+    global _refresher_singleton
+    if _refresher_singleton is None:
+        _refresher_singleton = AccountInfoRefresher(account_service.store)
+    return _refresher_singleton
+
 
 class AccountResponse(BaseModel):
     id: str
@@ -33,6 +50,8 @@ class AccountResponse(BaseModel):
     last_used: str | None
     auth_user: str = "0"
     cookie_id: str | None = None
+    tier: str | None = None
+    expired: bool = False
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -49,6 +68,8 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         last_used=account.last_used,
         auth_user=getattr(account, "auth_user", "0") or "0",
         cookie_id=cid,
+        tier=getattr(account, "tier", None),
+        expired=bool(getattr(account, "expired", False)),
     )
 
 
@@ -101,6 +122,28 @@ class ImportBundleResponse(BaseModel):
     accounts: list[AccountResponse]
 
 
+class RefreshAccountsRequest(BaseModel):
+    account_ids: list[str] | None = None
+    all: bool = False
+    refresh_email: bool = True
+
+
+class RefreshAccountResult(BaseModel):
+    id: str
+    ok: bool
+    tier: str | None = None
+    expired: bool | None = None
+    email: str | None = None
+    error: str | None = None
+    checked_at: str | None = None
+
+
+class RefreshAccountsResponse(BaseModel):
+    results: list[RefreshAccountResult]
+    refreshed_count: int
+    expired_count: int
+
+
 @router.get("", response_model=list[AccountResponse])
 @router.get("/", response_model=list[AccountResponse])
 async def list_accounts(
@@ -120,6 +163,76 @@ async def get_active_account(
     if account is None:
         raise HTTPException(status_code=404, detail="没有活跃账号")
     return to_account_response(account)
+
+
+@router.post("/refresh", response_model=RefreshAccountsResponse)
+async def refresh_accounts(
+    req: RefreshAccountsRequest = Body(...),
+    account_service: AccountService = Depends(get_account_service),
+    refresher: AccountInfoRefresher = Depends(get_account_info_refresher),
+) -> RefreshAccountsResponse:
+    """刷新账号信息（tier/过期/邮箱）。
+
+    - ``all=true`` 刷新全部账号；否则须提供 ``account_ids``（否则 400）。
+    - ``refresh_email`` 控制是否强制回填邮箱（默认 true；未记录邮箱时无论如何都会尝试）。
+    - 已有刷新任务进行中时返回 409（进程内互斥，单实例并发语义）。
+    """
+    requested = [str(a) for a in (req.account_ids or []) if str(a).strip()]
+    if not req.all and not requested:
+        raise HTTPException(
+            status_code=400,
+            detail="必须提供 account_ids 或设置 all=true",
+        )
+
+    if req.all:
+        targets = account_service.list_accounts()
+        ordered_ids = [account.id for account in targets]
+    else:
+        ordered_ids = requested
+        targets = []
+        for account_id in ordered_ids:
+            account = account_service.get_account(account_id)
+            if account is not None:
+                targets.append(account)
+
+    try:
+        refreshed = await refresher.refresh_accounts(
+            targets, refresh_email=req.refresh_email
+        )
+    except RefreshInProgressError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"账号信息刷新正在进行中，请稍后再试: {e}",
+        ) from e
+
+    by_id = {result.account_id: result for result in refreshed}
+    results: list[RefreshAccountResult] = []
+    for account_id in ordered_ids:
+        result = by_id.get(account_id)
+        if result is None:
+            results.append(
+                RefreshAccountResult(id=account_id, ok=False, error="账号不存在")
+            )
+        else:
+            results.append(
+                RefreshAccountResult(
+                    id=result.account_id,
+                    ok=result.ok,
+                    tier=result.tier,
+                    expired=result.expired,
+                    email=result.email,
+                    error=result.error,
+                    checked_at=result.checked_at,
+                )
+            )
+
+    expired_count = sum(1 for r in results if r.expired is True)
+    log.info("账号信息刷新完成: 目标 %d 个, 过期 %d 个", len(results), expired_count)
+    return RefreshAccountsResponse(
+        results=results,
+        refreshed_count=len(results),
+        expired_count=expired_count,
+    )
 
 
 @router.post("/{account_id}/activate", response_model=AccountResponse)

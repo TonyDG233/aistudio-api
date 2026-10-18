@@ -268,6 +268,17 @@ docker compose up -d
 | `features.fallback.on_failure` | bool | `false` | 开=请求失败允许自动回落；关=显式报错（默认）。 |
 | `features.fallback.cross_surface` | bool | `false` | 开=允许 chat↔build 跨面回落；关=面内失败不改道（默认）。 |
 
+### 账号信息刷新
+
+`POST /api/accounts/refresh`（别名 `POST /accounts/refresh`，需管理端鉴权）：无浏览器直连探测账号档位（tier）与登录态，并回填邮箱（对齐上游 Ark 的 `AccountInfoRefresher`，零模型额度）。
+
+- 请求体：`{"account_ids": ["acc_xxx"], "all": false, "refresh_email": true}`；`account_ids` 与 `all=true` 二选一，均缺省 → `400`
+- 响应：`{results: [{id, ok, tier, expired, email, error, checked_at}], refreshed_count, expired_count}`
+  - `tier`：`free` / `pro` / `ultra` / `plus` / `unknown-N`
+  - `expired`：`true`（401 已标记过期）/ `false`（有效）/ `null`（非权威失败，如 5xx 或网络故障——账号状态未被改动）
+- 并发：同一时间仅允许一次刷新（重复触发 → `409`）；工作池大小由 `features.account_refresh_concurrency`（默认 3）控制
+- 被标记 `expired` 的账号会被自动排除出账号调度，直至刷新成功或重新导入 cookies；Web 账号页提供 tier/过期徽章与单个、批量刷新按钮
+
 ---
 
 ## API 调用示例
