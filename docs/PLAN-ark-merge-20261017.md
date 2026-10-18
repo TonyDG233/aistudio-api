@@ -12,7 +12,7 @@
    - 正常 Web 会话面（本仓库现架构，`/prompts/new_chat`）：**Pro/Ultra 档账号可调用 Pro 及 argon（gemini-4-argon）系列模型**。
    - Build 通道（Ark 侧 `MAKERSUITE_DIRECT` 页面直连，宿主 `aistudio.google.com/apps/<id>`）:对免费档可用，但 **argon / Pro 系模型在该通道不可用**（额度与模型范围受 Build 网关限制，证据见 Ark `docs/zh/build-channel/archive-2026-10-16-build-channel-closure.md:57-63`）。
    - 结论路线：**pro/ultra 账号走本仓库现有聊天面；free 账号走移植进来的 Build 面**。两个面在同一服务内按账号档位（tier）路由。
-2. **内存动机**：本仓库单浏览器进程 + 标签页热切，实测文档值 250–380MB（Linux/Docker），单标签页增量约 20–30MB；Ark 现方案每账号约 700MB（Firefox 上下文池）。小鸡（1GB）环境只有合并到本架构才能承载多账号。
+2. **内存动机**：本仓库单浏览器进程 + 标签页热切，实测文档值 250–380MB（Linux/Docker），单标签页增量（P0 实测校准：首页 +123MB、同浏览器增量页 **+66–71MB**，见 `SPIKE-RESULTS-20261017.md` §14，原 20–30MB 估计偏乐观）；Ark 现方案每账号约 700MB（Firefox 上下文池，本机实测 2 context ≈ 758–771MB）。小鸡（1GB）环境只有合并到本架构才能承载多账号。
 3. **策略**：**不重写、只增量移植**。以本仓库为基座，把 Ark 侧四项能力翻译为 Python/CDP 实现：① Build 页面直连面 ② ATG 防截断 ③ 账号信息刷新（email/tier/过期）④ 功能开关与统计融合。
 4. **非目标（首期不做）**：UI 完整复刻；MakerSuite 以外的上游通道扩展（第三面见 WP9，另行立项）。
 5. **多格式兼容层升级为必须项（WP8，2026-10-17 拍板）**：大量目标客户端（OpenAI SDK / Claude 生态）无 Gemini 协议兼容，属强需求；对方仓库当前仅 Gemini v1beta 原生协议、无跨厂商适配层（其 AGENT.md 架构原则），须移植 Ark 的格式转换层。
@@ -166,7 +166,7 @@
         max_page_instances: 3
   ```
   未显式分组的账号按 tier 落入自动默认组（free→`[build]`、pro/ultra/plus→`[chat]`），默认组策略可改。
-- **页面实例编排**：统一"页面实例"抽象——每实例承载一个面（`chat` 或 `build`），按需惰性创建；空闲回收沿用 900/1800s；组配额（`max_page_instances`）限定并存实例数，超限对请求**显式拒绝**（含配额与处置说明），不排队、不静默换面。内存参考基线 ~25MB/实例（P0 Spike D 校准后定默认值）。
+- **页面实例编排**：统一"页面实例"抽象——每实例承载一个面（`chat` 或 `build`），按需惰性创建；空闲回收沿用 900/1800s；组配额（`max_page_instances`）限定并存实例数，超限对请求**显式拒绝**（含配额与处置说明），不排队、不静默换面。内存参考基线 **~70MB/实例**（P0 已校准：`SPIKE-RESULTS-20261017.md` §14 实测增量页 +66–71MB、首页 +123MB；瞬时切换需的备用页同价）。
 - **模型守卫**：argon/Pro 系仅在 `chat` 面可用；目标组 `allowed_surfaces` 未含 chat 时，对 argon 请求显式 4xx（写明组策略与处置建议），绝不静默换面或换账号。
 - **rotator 扩展**：冷却/429 隔离键 `(account, model)` → `(account, surface, model)`；`/rotation` API 增 `surface` 维度；`allowed_surfaces=[]` 的组在调度器层面直接排除。
 - **管理面板（最小但完整，无 UI 完整复刻）**：分组管理（策略编辑、账号移入移出）、实例面板（各面实例数/配额/内存估算、手动开关实例）、组策略启停；文案遵循"开关自解释"。
@@ -259,6 +259,10 @@ git branch --set-upstream-to=origin/master master                        # maste
 现状：`origin/master` = `upstream/master` = `9bd5a20`（三端同步）。日常同步：`git fetch upstream && git merge upstream/master`（冲突隔离见 R3）。
 
 **本文档位置**：`docs/PLAN-ark-merge-20261017.md`（当前未跟踪；按约定随首个里程碑提交入库）。
+
+**配套移交资料（2026-10-18）**：`docs/ark-reference/` —— Ark 技术总参考（`ARK-TECHNICAL-REFERENCE.md`）、
+Build 通道/直连签名器原始研究与 bundle 考古证据（`build-channel/`）、VPS 部署硬约束
+（`VPS-DEPLOYMENT-NOTES.md`，脱敏版）、Build App 创建教程（`misc/`）。开工前先读参考文档，避免重复逆向。
 
 ---
 
