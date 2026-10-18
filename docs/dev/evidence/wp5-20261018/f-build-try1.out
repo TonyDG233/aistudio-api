@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "1\n2\n3"}]}, "index": 0}], "modelVersion": "models/gemini-3.8-flash", "responseId": "BcTUatusKsP6-8YPyJqWsQY"}
+data: {"candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "STOP", "index": 0}], "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 226, "thoughtsTokenCount": 221, "totalTokenCount": 237}, "modelVersion": "models/gemini-3.8-flash", "responseId": "BcTUatusKsP6-8YPyJqWsQY"}

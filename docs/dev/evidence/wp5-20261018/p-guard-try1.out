@@ -1,0 +1,1 @@
+data: {"error": {"code": 403, "message": "分组 'pro' 无可用面 (allowed_surfaces=['build'], build_surface=False)。", "status": "PERMISSION_DENIED", "advice": "请在该分组 allowed_surfaces 中至少保留 chat，或开启 features.build_surface 以启用 build 面；本次请求不换面、不换账号。"}}

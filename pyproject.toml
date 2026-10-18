@@ -97,6 +97,7 @@ exclude = [
     "src/aistudio_api/static",
     "build",
     "dist",
+    "docs/dev/evidence",
 ]
 
 [tool.ruff.lint]

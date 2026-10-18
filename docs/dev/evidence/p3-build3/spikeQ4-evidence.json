@@ -1,0 +1,79 @@
+{
+  "host_url": "https://aistudio.google.com/apps/3b85b4ed-f945-422c-ba25-395d1feef528?showAssistant=true&showPreview=true",
+  "spike": "Q4-carrier-signer-e2e",
+  "chat_tab_opened": true,
+  "blocked_patterns": 30,
+  "ws_connected_at_s": 34.01,
+  "signer_after_warmup": {
+    "warmup": "swallowed",
+    "hasToken": true,
+    "state": "ready",
+    "rpcHeaderNames": [
+      "authorization",
+      "content-type",
+      "x-goog-api-key",
+      "x-goog-authuser",
+      "x-goog-ext-519733851-bin",
+      "x-user-agent"
+    ]
+  },
+  "detect": {
+    "live": {
+      "ok": true,
+      "keyAttr": "",
+      "apiKeyPresent": false
+    },
+    "missing_M": {
+      "ok": false,
+      "code": "MAKERSUITE_MISSING",
+      "msg": "window.default_MakerSuite 不存在：页面未加载完成或上游结构变更；处置：等待页面就绪后重试，若持续缺失按上游变更处理"
+    },
+    "missing_tb": {
+      "ok": false,
+      "code": "TB_MISSING",
+      "msg": "tb 实例未捕获：warmup 未完成或 XHR hook 失效；处置：重跑 warmup / 检查 hook 注入"
+    }
+  },
+  "harvest": {
+    "headers": {
+      "authorization": "SAPISIDHASH 1792325210_353f868e45a0efc887b89f3a6216d6d377d470e5 SAPISID1PHASH 1792325210_353f868e45a0efc887b89f3a6216d6d377d470e5 SAPISID3PHASH 1792325210_353f868e45a0efc887b89f3a6216d6d377d470e5",
+      "content-type": "application/json+protobuf",
+      "x-goog-api-key": "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs",
+      "x-goog-authuser": "0",
+      "x-goog-ext-519733851-bin": "CAESAUwwATgEQABQBGICVVNwAHgBkAEAmAEB",
+      "x-user-agent": "grpc-web-javascript/0.1"
+    },
+    "tbPresent": true
+  },
+  "dispatch": {
+    "started": true,
+    "state": "ready"
+  },
+  "direct": {
+    "seconds": 3.01,
+    "result": {
+      "timedOut": false,
+      "seconds": 3.01,
+      "status": 200,
+      "frames": 2,
+      "done": true,
+      "error": null,
+      "eventTypes": [
+        "status",
+        "chunk",
+        "chunk",
+        "done"
+      ]
+    }
+  },
+  "frames_full": [
+    {
+      "i": 0,
+      "raw": "[\"{\\\"candidates\\\":[{\\\"content\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"OK\\\"}],\\\"role\\\":\\\"model\\\"},\\\"index\\\":0}],\\\"usageMetadata\\\":{\\\"promptTokenCount\\\":7,\\\"candidatesTokenCount\\\":1,\\\"totalTokenCount\\\":126,\\\"promptTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":7}],\\\"thoughtsTokenCount\\\":118,\\\"serviceTier\\\":\\\"SERVICE_TIER_STANDARD\\\",\\\"rawPromptTokenCount\\\":38},\\\"modelVersion\\\":\\\"gemini-3.8-flash\\\",\\\"responseId\\\":\\\"XrbUar3xFIaY_uMP9YS84AM\\\",\\\"turnToken\\\":\\\"v1_ChdYcmJVYXZqM0VMeU5fUFVQNjlQYnVBcxIXWHJiVWFyM3hGSWFZX3VNUDlZUzg0QU0\\\"}\"]"
+    },
+    {
+      "i": 1,
+      "raw": "[\"{\\\"candidates\\\":[{\\\"content\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"\\\",\\\"thoughtSignature\\\":\\\"Es0ECsoEAWkUfRPDWG9xkpy33W7+JL3KnRCi7m9kULg1sZkGgpGJRf5fRWFA0XVyktVpZ6JqxYqujHnesSoxk3aYQLWQUIeq5+JUs7obbQJtprVUCruGpM9VDv4VQvJIByg6k4EVYI5Xne5gWOhEP5pptqhz0SdlD2+ehZ2+m9ONNgzna6VrOSLLIWN5bdAbBRWEG7kNNGrAany4Y8qwZa4RZpbCC/2Sa3KGMPMesDS9mzzi3/cMatS13U9KypOGLMputj8+vGTqqWoJnXeLJGE3Duid69FG0xWKluJep52ME6rVoOpFiTHxoDPDnXdlvCL0XNKt/EruYB5S/HICJRxzDqlVfXk96cL/JPMSNaDPIyw6Nm1y4Y3ayZa46wgMHEY8dVvM5BK33nPKGo+dm5PPR4fIT5wRsmJAswh8/sC4p1exkoQ4AMIyOxc1GL2OpewtW9kHeWLov6cPGndsNMBzxUmSE+5iiZPImpvEHB1EF18uIPLyPZQ4dWJfd+9aiTSSCC1EJ1vpGPP3uIDOwlETwuEZAJ/O9sbUUSushcv6NuFftGClPYA2tsMwtQz5CHEUpaJRv8g8mOKF8WlAsv/YR3X8VKODltKCiXaYrJ8BmAhRmV5GLABaqQzAWvbuh1cLIgXWpzHohpEG6KJD7l/+PhZuAPl0JOH8+rrunXPJ4AKOdC3l4WBubNanRsA0EBVJOSmJIptR0QU8D1BqJa3D3BADS7nKtGRqcwEyhncMTk5lnGGegbAFITx3MDsqHgFkvoTYg8b1fvYIVtU3AQ==\\\"}],\\\"role\\\":\\\"model\\\"},\\\"finishReason\\\":\\\"STOP\\\",\\\"index\\\":0,\\\"detailedFinishReason\\\":{\\\"recipeRunnerFinishReason\\\":\\\"GRANULAR_FINISH_REASON_NATURAL_STOP\\\"}}],\\\"usageMetadata\\\":{\\\"promptTokenCount\\\":7,\\\"candidatesTokenCount\\\":1,\\\"totalTokenCount\\\":126,\\\"promptTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":7}],\\\"thoughtsTokenCount\\\":118,\\\"serviceTier\\\":\\\"SERVICE_TIER_STANDARD\\\",\\\"modelInvocationTokenCounts\\\":[{\\\"promptTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":38}],\\\"candidatesTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":5}],\\\"thoughtsTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":118}]}],\\\"rawPromptTokenCount\\\":38,\\\"nonGroundingModelInvocationTokenCounts\\\":[{\\\"promptTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":38}],\\\"candidatesTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":5}],\\\"thoughtsTokensDetails\\\":[{\\\"modality\\\":\\\"TEXT\\\",\\\"tokenCount\\\":118}]}]},\\\"modelVersion\\\":\\\"gemini-3.8-flash\\\",\\\"responseId\\\":\\\"XrbUar3xFIaY_uMP9YS84AM\\\",\\\"turnToken\\\":\\\"v1_ChdYcmJVYXZqM0VMeU5fUFVQNjlQYnVBcxIXWHJiVWFyM3hGSWFZX3VNUDlZUzg0QU0\\\"}\"]"
+    }
+  ]
+}
