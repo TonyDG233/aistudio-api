@@ -545,7 +545,9 @@ _ATG_MODES = ("off", "prefer", "required")
 _ATG_CONTROL_POSITIONS = ("tail", "head")
 _ATG_RECOVERY_STRATEGIES = ("repair", "fail")
 _DEFAULT_ATG_TOOL_PREFIX = "atg_emit_"
+_DEFAULT_ATG_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
+_MAX_ATG_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
@@ -562,6 +564,7 @@ _FEATURES_DEFAULTS: dict[str, object] = {
         "recovery": "repair",
         "side_buffer_bytes": 0,
         "client_synthetic_guard": True,
+        "max_response_bytes": _DEFAULT_ATG_MAX_RESPONSE_BYTES,
         "text_model_pattern": "",
         "non_text_model_pattern": "",
     },
@@ -686,6 +689,12 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
             ),
             "client_synthetic_guard": _coerce_feature_bool(
                 atg.get("client_synthetic_guard"), True
+            ),
+            "max_response_bytes": _coerce_feature_int(
+                atg.get("max_response_bytes"),
+                _DEFAULT_ATG_MAX_RESPONSE_BYTES,
+                minimum=1024,
+                maximum=_MAX_ATG_MAX_RESPONSE_BYTES,
             ),
             "text_model_pattern": _coerce_feature_str(
                 atg.get("text_model_pattern"), ""

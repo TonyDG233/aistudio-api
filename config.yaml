@@ -70,6 +70,11 @@ features:
     # 关=无条件本地包装。默认开，兼容优先。
     client_synthetic_guard: true
 
+    # 合成参数最大字节数 (对应 Ark ATG_MAX_RESPONSE_BYTES，范围 1KB..100MB)。
+    # 超过该上限的合成参数直接判失败，避免异常大载荷拖垮解析；默认 16MB。
+    # 失败怎么办：超限即判失败（不静默截断）。
+    max_response_bytes: 16777216
+
     # 文本模型识别正则 (对应 Ark ATG_TEXT_MODEL_PATTERN)；留空使用内置默认正则。
     # 命中的模型视为文本模型，才参与 ATG 合成。失败怎么办：留空即用内置规则。
     text_model_pattern: ""

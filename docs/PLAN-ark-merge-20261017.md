@@ -217,7 +217,7 @@
 |---|---|---|
 | P0 | WP0 四 Spike | 全绿或设计修订；内存结论定 flag 基线 |
 | P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
-| P2 | WP2 | ATG 单测 + 真机 prefer/required 两态 |
+| P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测）；真机 prefer 非流式/流式 syntheticHit=true、required 暖会话 200；E5 白名单补偿已入库 |
 | P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P5 | WP6 + WP7 | 统计/UI 增量（含 formatBreakdown）、文档、质量门全绿、致谢入库 |
@@ -235,6 +235,7 @@
 | R5 | functionCall 参数是否增量分片未知 | ATG 流式增量收益 | P2 实测；分片则启用增量解码器，整块则走整块路径（Ark 已有两态经验） |
 | R6 | 资源拦截误伤 Build 主包 | 面不可用 | Spike D 同步产出白名单 |
 | R7 | 多实例并存导致内存预算失控 | 小鸡环境 OOM | 组配额默认保守（Spike D 校准）；实例面板显示内存估算；超限显式拒绝 |
+| R8 | 冷启动窗口（预热/蓝绿热切进行中）首个请求 500：`list index out of range` @ `wire_codec.py:146 decode`（capture 模板 body 未就绪即被使用） | 服务启动后数秒内偶发首请求失败 | 既有问题，与 ATG 无关（mode off 冷启动可复现，暖会话重试即 200）；缓解：待预热完成再发首请求；后续可在 capture 层对空模板显式等待/重试（小修，未入本轮回合） |
 
 **决策记录（2026-10-17 拍板）**
 - **A1（已决）**：默认零自动回落；显式报错优先、标注具体问题；回落仅经显式开关开启（默认 off、可 grep）。

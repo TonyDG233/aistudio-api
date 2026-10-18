@@ -225,6 +225,7 @@ aistudio-api/
 │   │   ├── account_service.py     # 账号存储与激活上下文协调
 │   │   ├── api_service_gemini.py  # Gemini 请求生命周期与流式处理
 │   │   ├── account_orchestrator.py# _switch_lock 防雪崩切号与故障转移编排
+│   │   ├── atg/                   # ATG 防截断 (synthetic transport: injector/extractor/stream_extractor/repair/config 等)
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 纯净领域模型与异常体系
 │   │   ├── errors.py              # 业务异常定义 (AuthError, UsageLimitExceeded 等)
@@ -254,4 +255,5 @@ aistudio-api/
 - **命名对齐**：YAML 键统一 `snake_case`，语义对齐对面 Ark 的 `.env` 字段（如 `atg.mode`↔`ATG_MODE`、`atg.client_synthetic_guard`↔`ATG_CLIENT_SYNTHETIC_GUARD`、`account_refresh_concurrency`↔`REFRESH_CONCURRENCY`、`auto_switch_interval_hours`↔`AUTO_SWITCH_INTERVAL_HOURS`）。
 - **默认保守**：全部开关默认关闭（`features.fallback.*` 全 `off`，遵循「零自动回落」决策）；`client_synthetic_guard` 默认 `true`（兼容优先）。非法/未知取值一律静默回退安全默认，禁止让新增顶层键破坏既有 YAML 消费方。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
+- **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
