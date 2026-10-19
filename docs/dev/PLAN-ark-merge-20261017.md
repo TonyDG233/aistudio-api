@@ -271,11 +271,13 @@
 ### WP10 账号保活（最高优先，后端）
 > 目标：保护付费账号资产。**双保活并存，不是二选一**：
 > - **旧定时切号（用户原设计）**：长周期均衡负载 + 更高级的“真实账号活动”保活；
-> - **上游自动刷新**：日常保活（凭证/tier/过期，24h 回写）。
+> - **上游自动刷新**：日常保活（tier/email/过期元数据 + 凭证 cookies 回写）。
 
-- **范围**：`auto_switch` 接线（定时/间隔，仅在无在途流时触发；定位=长周期均衡 + 真实活动）；自动刷新调度化（周期刷新 email/tier/过期，与手动刷新 409 互斥）；24h 凭证回写；启动保活；周期健康巡检（维持账号在线）；最近一次刷新/保活结果可查。
-- **约束**：纯后端；**不加任何 UI**（UI 统一在 WP7）；所有开关可单独开关，开启前后行为可 grep；不得打断在途流。
-- **验收（真机、最小额度）**：两套保活分别可单独开关并生效；账号连续保持在线；刷新与切号有序/互斥；失败有明确日志；全关时零行为变化。
+- **范围**：`auto_switch` 接线（定时/间隔，仅在无在途流时触发；定位=长周期均衡 + 真实活动）；自动刷新调度化（周期刷新 email/tier/过期，与手动刷新 409 互斥）；24h 回写分两类——元数据写 `registry.json`/`meta.json`，凭证 cookies/origins 写 `auth.json`（复用 `session_auth.save_browser_cookies`，对齐 Ark `BrowserManager._updateAuthFile`）；启动保活（启动时预热 active 并回写 auth；非活跃账号由 `auto_switch` 轮转访问并回写）；周期健康巡检即 `auto_switch` 轮转本身（不新增独立巡游任务）；最近一次刷新/保活结果可查。
+- **术语对账（避免混淆）**：Ark 的 `ENABLE_AUTH_UPDATE` 是**凭证回写**（`BrowserManager._updateAuthFile` → `auth-*.json` 的 cookies/origins，默认 true），不是元数据；`AccountInfoRefresher` 才是元数据刷新（tier/email/expired → meta）。本仓 `keepalive_auth_update` 对应前者，`keepalive_metadata_refresh` 对应后者，必须同时保留、独立开关。
+- **约束**：纯后端；**不加任何 UI**（UI 统一在 WP7）；所有开关可单独开关，开启前后行为可 grep；不得打断在途流；全部保活参数必须经 features 配置读写，并提供后端结构化设置接口，供 WP7 UI 直接调用（本阶段不实现 UI）。
+- **配置双写**：本地根 `config.yaml` 是运行时实际配置、**不被 git 追踪**；分发默认配置是 `defaults/config.yaml`（tracked）。任何 features 变更必须两处同步；提交/证据以 `defaults/config.yaml` 为准，根配置仅用于本机验证。
+- **验收（真机、最小额度）**：两套保活分别可单独开关并生效；账号连续保持在线；刷新与切号有序/互斥；失败有明确日志；全关时零行为变化；参数可经后端接口读取/修改并即时生效。
 
 ---
 

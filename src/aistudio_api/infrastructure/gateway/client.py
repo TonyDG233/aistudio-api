@@ -74,6 +74,29 @@ class AIStudioClient:
         """Expose active browser session facade."""
         return self._session
 
+    @property
+    def build_in_flight_count(self) -> int:
+        """Build 面在途任务数（无 build surface 时为 0）。"""
+        surface = self._build_surface
+        state = getattr(surface, "state", None)
+        try:
+            return int(getattr(state, "in_flight_count", 0) or 0)
+        except Exception:
+            return 0
+
+    @property
+    def in_flight_count(self) -> int:
+        """Chat + Build 聚合在途数。"""
+        return self._session.in_flight_count + self.build_in_flight_count
+
+    @property
+    def is_busy(self) -> bool:
+        return self.in_flight_count > 0
+
+    async def save_current_cookies(self) -> bool:
+        """把当前账号 cookies 回写 auth.json。"""
+        return await self._session.save_current_cookies()
+
     async def warmup(self) -> None:
         """预热浏览器后端并加载 AI Studio 页面及捕获 BotGuard 服务。"""
         if self._session is not None:
@@ -82,6 +105,8 @@ class AIStudioClient:
 
     async def switch_auth(self, auth_file: str | None) -> None:
         """切换账号的 auth 文件并清空模板缓存。"""
+        with suppress(Exception):
+            await self._session.save_current_cookies()
         self.clear_templates()
         await self._close_build_surface()
         if self._session is not None:

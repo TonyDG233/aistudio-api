@@ -29,6 +29,42 @@ def _get_switch_lock() -> asyncio.Lock:
     return _switch_lock
 
 
+def get_switch_lock() -> asyncio.Lock:
+    """公开切号锁（保活/手动切号共用）。"""
+    return _get_switch_lock()
+
+
+async def switch_to_account(
+    account_id: str,
+    *,
+    model: str | None = None,
+    surface: str = "chat",
+    require_idle: bool = True,
+) -> bool:
+    """在共享锁内切换活跃账号；默认要求 chat/build 均无在途流。"""
+    global _last_switch_time
+    async with _get_switch_lock():
+        account_service = runtime_state.account_service
+        client = runtime_state.client
+        rotator = runtime_state.rotator
+        if account_service is None or client is None or client.session is None:
+            return False
+        if require_idle and client.in_flight_count > 0:
+            logger.info("切号跳过：仍有在途请求 chat+build=%d", client.in_flight_count)
+            return False
+        result = await account_service.activate_account(
+            account_id,
+            client.session,
+            client=client,
+        )
+        if result is not None:
+            _last_switch_time = time.time()
+            if rotator is not None:
+                sk: dict[str, Any] = {"surface": surface} if surface != "chat" else {}
+                rotator.clear_cooldown(account_id, model=model, **sk)
+        return result is not None
+
+
 async def try_switch_account(
     model: str | None = None,
     failed_account_id: str | None = None,
@@ -129,6 +165,7 @@ async def try_switch_account(
             result = await account_service.activate_account(
                 next_account.id,
                 client.session,
+                client=client,
             )
             if result is not None:
                 rotator.clear_cooldown(next_account.id, model=model, **sk)
@@ -151,6 +188,7 @@ async def try_switch_account(
             result = await account_service.activate_account(
                 current_id,
                 client.session,
+                client=client,
             )
             if result is not None:
                 rotator.clear_cooldown(current_id, model=model, **sk)
@@ -214,6 +252,8 @@ def record_rotator_event(
 __all__ = [
     "MAX_RETRIES",
     "ensure_active_account",
+    "get_switch_lock",
     "record_rotator_event",
+    "switch_to_account",
     "try_switch_account",
 ]

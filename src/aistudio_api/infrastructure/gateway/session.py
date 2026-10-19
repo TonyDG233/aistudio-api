@@ -94,6 +94,15 @@ class BrowserSession:
         return self._gate.active_context
 
     @property
+    def in_flight_count(self) -> int:
+        """当前活动请求数（只读，供保活/切号门槛使用）。"""
+        return self._in_flight
+
+    def touch_activity(self) -> None:
+        """刷新空闲计时器（保活活动/巡检使用）。"""
+        self._last_activity_time = time.time()
+
+    @property
     def page(self) -> CDPPage | None:
         return self._gate.active_context.page if self._gate.active_context else None
 
@@ -501,6 +510,16 @@ class BrowserSession:
         target = page or (self.active_context.page if self.active_context else None)
         return bool(target and await load_cookies_to_page(target, self._auth_file))
 
+    async def save_current_cookies(self) -> bool:
+        """把当前活跃页面的 cookies 回写到当前账号 auth.json。"""
+        target = self.page
+        if target is None or target.is_closed() or not self._auth_file:
+            return False
+        saved = await save_browser_cookies(target, auth_file=self._auth_file)
+        if saved:
+            self.touch_activity()
+        return saved
+
     async def _save_cookies(
         self,
         *,
@@ -533,6 +552,8 @@ class BrowserSession:
 
     async def close(self) -> None:
         async with self._transition_lock:
+            with suppress(Exception):
+                await self.save_current_cookies()
             await self._close_internal()
 
     async def _close_internal(self) -> None:

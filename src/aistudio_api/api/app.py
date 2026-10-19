@@ -29,6 +29,7 @@ from aistudio_api.infrastructure.utils.logger import (
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
 from .routes_gemini import router as gemini_router
+from .routes_keepalive import router as keepalive_router
 from .routes_models import router as models_router
 from .routes_system import (
     protected_router as system_protected_router,
@@ -43,9 +44,13 @@ logger = get_logger("server")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    from aistudio_api.application.account_keepalive import AccountKeepaliveService
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.config import settings
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        AccountInfoRefresher,
+    )
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.browser.browser_engine import (
         install_process_cleanup_handlers,
@@ -67,6 +72,9 @@ async def lifespan(_app: FastAPI):
     rotator = init_rotator(account_store)
     runtime_state.rotator = rotator
 
+    account_refresher = AccountInfoRefresher(account_store)
+    runtime_state.account_refresher = account_refresher
+
     logger.info(
         "Client initialized (port=%s, accounts=%d)",
         runtime_state.browser_port,
@@ -79,7 +87,15 @@ async def lifespan(_app: FastAPI):
     async def _warmup():
         for attempt in range(3):
             try:
-                await client.warmup()
+                active = account_service.get_active_account()
+                if active is not None:
+                    await account_service.activate_account(
+                        active.id,
+                        client.session,
+                        client=client,
+                    )
+                else:
+                    await client.warmup()
                 return
             except Exception as e:
                 if attempt < 2:
@@ -88,6 +104,16 @@ async def lifespan(_app: FastAPI):
                 logger.warning("浏览器预热失败: %s", e)
 
     warmup_task = asyncio.create_task(_warmup())
+
+    keepalive = AccountKeepaliveService(
+        account_store,
+        account_service,
+        rotator,
+        client,
+        account_refresher,
+    )
+    runtime_state.keepalive = keepalive
+    await keepalive.start()
 
     idle_task = None
     if settings.browser_idle_timeout > 0:
@@ -111,6 +137,8 @@ async def lifespan(_app: FastAPI):
         warmup_task.cancel()
     if idle_task and not idle_task.done():
         idle_task.cancel()
+    if runtime_state.keepalive is not None:
+        await runtime_state.keepalive.stop()
     if client:
         try:
             await client.close()
@@ -119,11 +147,18 @@ async def lifespan(_app: FastAPI):
     runtime_state.client = None
     runtime_state.account_service = None
     runtime_state.rotator = None
+    runtime_state.account_refresher = None
+    runtime_state.keepalive = None
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    keepalive_router,
+    prefix="/api",
+    dependencies=[Depends(require_web_auth)],
+)
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )

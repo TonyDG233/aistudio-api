@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,7 @@ if TYPE_CHECKING:
         AccountMeta,
         AccountStore,
     )
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
     from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -50,6 +52,8 @@ class AccountService:
         self,
         account_id: str,
         browser_session: BrowserSession,
+        *,
+        client: AIStudioClient | None = None,
     ) -> AccountMeta | None:
         """切换到指定账号（失败回滚活跃标记；模板缺失自动重试一次）。"""
         account = self._store.get_account(account_id)
@@ -64,10 +68,21 @@ class AccountService:
         previous = self._store.get_active_account()
         previous_id = previous.id if previous is not None else None
 
+        saved_previous = False
+        with suppress(Exception):
+            if client is not None:
+                saved_previous = await client.save_current_cookies()
+            else:
+                saved_previous = await browser_session.save_current_cookies()
+        if previous_id and saved_previous:
+            self._store.mark_auth_saved(previous_id)
+
         self._store.set_active_account(account_id)
         logger.info("已切换活跃账号持久化状态: %s", account_id)
         try:
-            await self._switch_with_template_retry(browser_session, str(auth_path))
+            await self._switch_with_template_retry(
+                browser_session, str(auth_path), client=client
+            )
         except Exception:
             if previous_id and self._store.get_account(previous_id) is not None:
                 self._store.set_active_account(previous_id)
@@ -75,6 +90,7 @@ class AccountService:
                     "账号切换失败，已回滚活跃账号持久化状态为: %s", previous_id
                 )
             raise
+        self._store.mark_auth_saved(account_id)
         logger.info("已切换到账号: %s (%s)", account_id, account.name)
         return account
 
@@ -83,11 +99,16 @@ class AccountService:
         browser_session: BrowserSession,
         auth_path: str,
         attempts: int = 2,
+        *,
+        client: AIStudioClient | None = None,
     ) -> None:
         """切换会话；BotGuard 模板缺失属偶发竞态，重试一次。"""
         for attempt in range(attempts):
             try:
-                await browser_session.switch_auth(auth_path)
+                if client is not None:
+                    await client.switch_auth(auth_path)
+                else:
+                    await browser_session.switch_auth(auth_path)
                 await browser_session.ensure_botguard_service()
                 return
             except RuntimeError as exc:

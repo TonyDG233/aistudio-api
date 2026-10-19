@@ -541,7 +541,8 @@ def update_configured_logging_settings(
 
 
 # ========== 功能开关框架（WP1）==========
-# config.yaml 顶层 `features:` 段的内置默认值（全部保守：默认关闭，零行为变化）。
+# config.yaml 顶层 `features:` 段的内置默认值。
+# 编排/fallback/活动类开关默认关闭；WP10 凭证与账号信息保活默认开启（对齐 Ark）。
 # 字段名对齐 Ark (.env) 语义，落 YAML 时统一 snake_case。
 _ATG_MODES = ("off", "prefer", "required")
 _ATG_CONTROL_POSITIONS = ("tail", "head")
@@ -562,6 +563,14 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     "account_refresh_concurrency": 3,
     "auto_switch": False,
     "auto_switch_interval_hours": 3.0,
+    # WP10：自动刷新 Auth（凭证回写 auth.json）与账号信息刷新（meta）。
+    "keepalive_auth_update": True,
+    "keepalive_auth_update_hours": 24.0,
+    "keepalive_metadata_refresh": True,
+    "keepalive_metadata_refresh_hours": 24.0,
+    "keepalive_metadata_refresh_on_startup": True,
+    "keepalive_active_activity": False,
+    "keepalive_active_activity_seconds": 60.0,
     # WP5：账号分组列表。空列表合法——未显式分组的账号由 orchestrator 按 tier
     # 默认规则兜底（本模块只负责解析，不注入默认组）。
     "groups": [],
@@ -724,6 +733,17 @@ def _env_feature_baseline() -> dict[str, object]:
         "account_refresh_concurrency": settings.account_refresh_concurrency,
         "auto_switch": settings.auto_switch,
         "auto_switch_interval_hours": settings.auto_switch_interval_hours,
+        "keepalive_auth_update": settings.keepalive_auth_update,
+        "keepalive_auth_update_hours": settings.keepalive_auth_update_hours,
+        "keepalive_metadata_refresh": settings.keepalive_metadata_refresh,
+        "keepalive_metadata_refresh_hours": settings.keepalive_metadata_refresh_hours,
+        "keepalive_metadata_refresh_on_startup": (
+            settings.keepalive_metadata_refresh_on_startup
+        ),
+        "keepalive_active_activity": settings.keepalive_active_activity,
+        "keepalive_active_activity_seconds": (
+            settings.keepalive_active_activity_seconds
+        ),
         "atg": {"mode": settings.atg_mode},
     }
 
@@ -742,6 +762,27 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
         "auto_switch": _coerce_feature_bool(raw.get("auto_switch"), False),
         "auto_switch_interval_hours": _coerce_feature_float(
             raw.get("auto_switch_interval_hours"), 3.0, minimum=0.1
+        ),
+        "keepalive_auth_update": _coerce_feature_bool(
+            raw.get("keepalive_auth_update"), True
+        ),
+        "keepalive_auth_update_hours": _coerce_feature_float(
+            raw.get("keepalive_auth_update_hours"), 24.0, minimum=0.1
+        ),
+        "keepalive_metadata_refresh": _coerce_feature_bool(
+            raw.get("keepalive_metadata_refresh"), True
+        ),
+        "keepalive_metadata_refresh_hours": _coerce_feature_float(
+            raw.get("keepalive_metadata_refresh_hours"), 24.0, minimum=0.1
+        ),
+        "keepalive_metadata_refresh_on_startup": _coerce_feature_bool(
+            raw.get("keepalive_metadata_refresh_on_startup"), True
+        ),
+        "keepalive_active_activity": _coerce_feature_bool(
+            raw.get("keepalive_active_activity"), False
+        ),
+        "keepalive_active_activity_seconds": _coerce_feature_float(
+            raw.get("keepalive_active_activity_seconds"), 60.0, minimum=10.0
         ),
         "groups": _normalize_feature_groups(raw.get("groups")),
         "atg": {
@@ -806,3 +847,39 @@ def get_features_config(
     merged = _deep_merge(_FEATURES_DEFAULTS, _env_feature_baseline())
     merged = _deep_merge(merged, yaml_features)
     return _normalize_features(merged)
+
+
+def update_configured_features(
+    updates: dict[str, object],
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """结构化更新 features 并原子写回 config.yaml，返回归一化后的 features。"""
+    unknown = sorted(set(updates) - set(_FEATURES_DEFAULTS))
+    if unknown:
+        raise ValueError(f"unknown feature keys: {', '.join(unknown)}")
+
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_features = parsed.get("features")
+    features = dict(raw_features) if isinstance(raw_features, dict) else {}
+    features.update(updates)
+    parsed["features"] = features
+
+    tmp_path = resolved_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        tmp_path.replace(resolved_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    invalidate_config_cache()
+    return get_features_config(config_path)

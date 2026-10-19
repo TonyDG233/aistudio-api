@@ -3,7 +3,7 @@
 api_keys: []
 
 # ============================================================================
-# 功能开关 (features) — 所有开关默认保守关闭，保持零行为变化。
+# 功能开关 (features) — 编排/fallback/活动类默认关闭；WP10 凭证与账号信息保活默认开启。
 # 本段可在 Web 管理控制台可视化编辑并热重载 (PUT /config/yaml -> 立即生效)，
 # 无需重启进程。同名环境变量 (AISTUDIO_*) 仅作为启动基线兜底：
 # 优先级为 本段 features.* > AISTUDIO_* 环境变量 > 内置默认值。
@@ -28,7 +28,35 @@ features:
 
   # 自动切换周期间隔 (小时，支持小数，最小 0.1；对应 Ark AUTO_SWITCH_INTERVAL_HOURS)。
   # 仅在 auto_switch=true 时生效；默认 3 小时与 Ark 一致。
+  # 选号规则：优先切到 auth_saved_at 最久未回写的可用账号，兼顾均衡与凭证保活。
   auto_switch_interval_hours: 3.0
+
+  # 自动刷新 Auth / 凭证回写 (对应 Ark ENABLE_AUTH_UPDATE，默认开)。
+  # 开=把浏览器当前 cookies/origins 原子合并写回 per-account auth.json；
+  # 触发：切号前、切号后、初始化/重连、下方 24h 周期、浏览器关闭前。
+  # 关=仅保留现有登录/切号时的自然回写。此开关不写 meta。
+  keepalive_auth_update: true
+
+  # 凭证回写周期 (小时，最小 0.1；默认 24h，对齐 Ark 健康巡检)。
+  # 仅作用于当前活跃账号；非活跃账号在 auto_switch 轮转到它时回写。
+  keepalive_auth_update_hours: 24.0
+
+  # 自动更新账号信息 (tier/email/expired，默认开；写 registry.json/meta.json)。
+  # 与手动 POST /accounts/refresh 共用同一刷新器与 409 互斥；失败不误杀账号。
+  keepalive_metadata_refresh: true
+
+  # 账号信息刷新周期 (小时，最小 0.1；默认 24h)。
+  keepalive_metadata_refresh_hours: 24.0
+
+  # 启动时是否补刷缺失/过期的账号信息 (默认开)；只刷到期账号，不阻塞启动。
+  keepalive_metadata_refresh_on_startup: true
+
+  # 活跃页轻量活动 (默认关)。开=周期滚动页面并刷新空闲计时器，保持当前会话活跃；
+  # 代价是浏览器不会被空闲回收。凭证保活本身不依赖此开关。
+  keepalive_active_activity: false
+
+  # 活跃页活动间隔 (秒，最小 10；默认 60)。
+  keepalive_active_activity_seconds: 60.0
 
   # --------------------------------------------------------------------------
   # 账号分组与面编排 (groups，WP5) — 按账号档位 (tier) / 邮箱正则把账号分组，

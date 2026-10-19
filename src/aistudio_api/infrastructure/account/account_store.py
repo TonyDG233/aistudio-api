@@ -36,6 +36,32 @@ def _atomic_write_json(path: Path, data: object) -> None:
         raise
 
 
+_AUTH_FILE_WRITE_LOCK = threading.Lock()
+
+
+def write_storage_state(
+    auth_file: str | Path,
+    *,
+    cookies: list[dict[str, object]],
+    origins: list[dict[str, object]] | None = None,
+) -> None:
+    """原子合并写入 auth.json，保留 cookies/origins 之外的字段。"""
+    target = Path(auth_file).resolve()
+    with _AUTH_FILE_WRITE_LOCK:
+        existing: dict[str, object] = {}
+        if target.is_file():
+            with contextlib.suppress(Exception):
+                loaded = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+        existing["cookies"] = list(cookies)
+        if origins is not None:
+            existing["origins"] = list(origins)
+        else:
+            existing.setdefault("origins", [])
+        _atomic_write_json(target, existing)
+
+
 # 默认搜索路径（与 config.py 保持一致）
 _SEARCH_ROOTS: list[Path] = [
     Path.cwd(),
@@ -104,6 +130,10 @@ class AccountMeta:
     tier: str | None = None
     tier_checked_at: str | None = None
     expired: bool = False
+    # 保活落点（WP10）：最近一次凭证回写/刷新尝试。
+    auth_saved_at: str | None = None
+    last_refresh_attempt_at: str | None = None
+    last_refresh_error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -127,6 +157,15 @@ class AccountMeta:
             if data.get("tier_checked_at") is not None
             else None,
             expired=bool(data.get("expired", False)),
+            auth_saved_at=str(data["auth_saved_at"])
+            if data.get("auth_saved_at") is not None
+            else None,
+            last_refresh_attempt_at=str(data["last_refresh_attempt_at"])
+            if data.get("last_refresh_attempt_at") is not None
+            else None,
+            last_refresh_error=str(data["last_refresh_error"])
+            if data.get("last_refresh_error") is not None
+            else None,
         )
 
 
@@ -318,6 +357,7 @@ class AccountStore:
             last_used=now,
             auth_user=auth_user,
             cookie_id=cookie_id,
+            auth_saved_at=now,
         )
         account_dir = _safe_account_dir(self._accounts_dir, account_id)
         account_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +467,68 @@ class AccountStore:
             _atomic_write_json(meta_path, acc.to_dict())
         self._save_registry(registry)
         return True
+
+    def update_account_keepalive(
+        self,
+        account_id: str,
+        *,
+        auth_saved_at: object = _UNSET,
+        last_refresh_attempt_at: object = _UNSET,
+        last_refresh_error: object = _UNSET,
+    ) -> bool:
+        """更新保活字段（auth 回写时间/刷新尝试/错误），持久化并返回是否有改动。"""
+        registry = self._load_registry()
+        acc = registry.accounts.get(account_id)
+        if acc is None:
+            return False
+
+        changed = False
+        if auth_saved_at is not _UNSET:
+            new_saved = None if auth_saved_at is None else str(auth_saved_at)
+            if acc.auth_saved_at != new_saved:
+                acc.auth_saved_at = new_saved
+                changed = True
+        if last_refresh_attempt_at is not _UNSET:
+            new_attempt = (
+                None
+                if last_refresh_attempt_at is None
+                else str(last_refresh_attempt_at)
+            )
+            if acc.last_refresh_attempt_at != new_attempt:
+                acc.last_refresh_attempt_at = new_attempt
+                changed = True
+        if last_refresh_error is not _UNSET:
+            new_error = None if last_refresh_error is None else str(last_refresh_error)
+            if acc.last_refresh_error != new_error:
+                acc.last_refresh_error = new_error
+                changed = True
+
+        if not changed:
+            return False
+
+        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def mark_auth_saved(self, account_id: str, *, at: str | None = None) -> bool:
+        """记录凭证回写成功时间。"""
+        return self.update_account_keepalive(
+            account_id,
+            auth_saved_at=at or datetime.now(UTC).isoformat(),
+        )
+
+    def mark_refresh_attempt(
+        self, account_id: str, *, error: str | None = None, at: str | None = None
+    ) -> bool:
+        """记录一次账号信息刷新尝试及其错误。"""
+        return self.update_account_keepalive(
+            account_id,
+            last_refresh_attempt_at=at or datetime.now(UTC).isoformat(),
+            last_refresh_error=error,
+        )
 
     def get_auth_path(self, account_id: str) -> Path | None:
         """获取指定账号的 auth.json 路径。"""
