@@ -311,6 +311,81 @@ async def test_account_service_activate_account_warms_up_browser():
 
 
 @pytest.mark.asyncio
+async def test_account_service_activate_retries_when_wire_template_missing():
+    """BotGuard 模板缺失属偶发竞态：自动重试一次并成功。"""
+    mock_store = MagicMock(spec=AccountStore)
+    mock_store.get_account.return_value = AccountMeta(
+        id="acc_1",
+        name="Test Account",
+        email="test@example.com",
+        created_at="2026-09-01T00:00:00Z",
+        last_used="2026-09-01T00:00:00Z",
+        auth_user="0",
+    )
+    mock_store.get_auth_path_optional.return_value = "/data/accounts/acc_1/auth.json"
+    mock_store.get_active_account.return_value = None
+
+    mock_session = MagicMock(spec=BrowserSession)
+    mock_session.switch_auth = AsyncMock(
+        side_effect=[
+            RuntimeError("BotGuard service captured but wire template missing"),
+            None,
+        ]
+    )
+    mock_session.ensure_botguard_service = AsyncMock()
+
+    service = AccountService(mock_store)
+    result = await service.activate_account(
+        account_id="acc_1",
+        browser_session=mock_session,
+    )
+
+    assert result is not None
+    assert mock_session.switch_auth.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_account_service_activate_rolls_back_active_on_failure():
+    """切换最终失败时回滚此前持久化的活跃账号。"""
+    previous = AccountMeta(
+        id="acc_prev",
+        name="Previous",
+        email="prev@example.com",
+        created_at="2026-09-01T00:00:00Z",
+        last_used="2026-09-01T00:00:00Z",
+        auth_user="0",
+    )
+    target = AccountMeta(
+        id="acc_1",
+        name="Test Account",
+        email="test@example.com",
+        created_at="2026-09-01T00:00:00Z",
+        last_used="2026-09-01T00:00:00Z",
+        auth_user="0",
+    )
+    mock_store = MagicMock(spec=AccountStore)
+    mock_store.get_account.side_effect = lambda account_id: (
+        target if account_id == "acc_1" else previous
+    )
+    mock_store.get_auth_path_optional.return_value = "/data/accounts/acc_1/auth.json"
+    mock_store.get_active_account.return_value = previous
+
+    mock_session = MagicMock(spec=BrowserSession)
+    mock_session.switch_auth = AsyncMock(side_effect=RuntimeError("capture failed"))
+    mock_session.ensure_botguard_service = AsyncMock()
+
+    service = AccountService(mock_store)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        await service.activate_account(
+            account_id="acc_1",
+            browser_session=mock_session,
+        )
+
+    assert mock_store.set_active_account.call_args_list[-1].args[0] == "acc_prev"
+
+
+@pytest.mark.asyncio
 async def test_capture_service_single_pass_full_payload():
     """Verify capture service builds full modified_body with system instruction and tools in one pass."""
     mock_session = MagicMock(spec=BrowserSession)

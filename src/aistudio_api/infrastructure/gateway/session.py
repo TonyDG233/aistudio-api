@@ -322,8 +322,16 @@ class BrowserSession:
         if self._proc is not None and not self._proc.is_alive():
             raise RuntimeError("Browser process died during template capture")
 
+        # 冷启动窗口 active_context 可能尚未就绪；此时必须等就绪门打开后再取模板，
+        # 否则会退回 DEFAULT_BOOTSTRAP_TEMPLATE（body 仅 1 个元素），
+        # 随后 wire_codec.decode 访问 contents 下标时抛 IndexError（R8）。
         ctx = self.active_context
-        base = dict(ctx.base_template if ctx else DEFAULT_BOOTSTRAP_TEMPLATE)
+        if ctx is None or not ctx.base_template:
+            ctx = await self.ensure_ready()
+        base = dict(ctx.base_template)
+        raw_body = base.get("body")
+        if not isinstance(raw_body, str) or not raw_body:
+            raise RuntimeError("template body missing from ready context")
         normalized_model = model if model.startswith("models/") else f"models/{model}"
         try:
             body_val = base.get("body")
