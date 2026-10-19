@@ -238,7 +238,11 @@ aistudio-api/
 │   │   ├── upstream_errors.py     # 上游错误分类与重试/切号处理
 │   │   ├── format_converters/     # OpenAI/Claude 请求响应转换、媒体下载、thoughtSignature 缓存
 │   │   ├── account_orchestrator.py# _switch_lock 防雪崩切号与故障转移编排
-│   │   ├── surface_orchestrator.py# 组策略/面路由/守卫与决策链
+│   │   ├── surface_orchestrator.py# 组策略/面能力/组身份与决策链原语
+│   │   ├── channel_registry.py    # 渠道注册表、pg/chat/build/official 前缀解析
+│   │   ├── account_routing.py     # 账号级 routing 覆盖归一化 (只收窄)
+│   │   ├── routing_safety.py      # 请求级切换/顺延预算 + 滚动熔断
+│   │   ├── routing_pipeline.py    # 唯一决策管线 ①能力→②候选→③组→④排序→⑤落地→⑥失败链
 │   │   ├── atg/                   # ATG 防截断 (synthetic transport: injector/extractor/stream_extractor/repair/config 等)
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 纯净领域模型与异常体系
@@ -248,6 +252,8 @@ aistudio-api/
 │   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
 │   │   └── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
+│   │       ├── instance_manager.py# 四层预算取最严、槽位计划数、级别 A 落地与 borrow
+│   │       └── realm_pool.py      # 跨账号 Realm 池 (独立 BrowserContext/cookie jar, LRU, 在途不回收)
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
@@ -275,5 +281,6 @@ aistudio-api/
 - **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
 - **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
+- **复杂策略组（WP5 二期，P4.5）**：唯一决策管线在 `application/routing_pipeline.py`，渠道在 ① 固定、链内不换面；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`（`meta.json`/`registry.json`），不新增文件。`features.channels` 控制渠道启用与渠道预算，`features.routing` 控制 `max_switches`（仅换号/换实例，独立于同账号 `MAX_RETRIES`）、global/Realm 预算、borrow、熔断；`features.slots` 为账号×渠道预留实例位。Realm 模式下一个存活 Realm 计一个全局实例槽；活跃账号优先用默认会话，非活跃账号走独立 BrowserContext（约 +180MB/Realm）。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
 - **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。

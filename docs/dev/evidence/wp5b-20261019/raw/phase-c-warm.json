@@ -1,0 +1,7 @@
+{
+  "tag": "phase-c-warm",
+  "model": "chat/gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 2.6,
+  "body": "{\"id\":\"chatcmpl-1792416229648_6e528625\",\"object\":\"chat.completion\",\"created\":1792416229,\"model\":\"chat/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Assessing Input Quickly**\\n\\nI've quickly assessed the user's input, recognizing the simple instruction \\\"只回复 OK\\\" (just reply OK). The implication is a straightforward validation or confirmation is required, likely in response to something just stated. I'm focusing on the brevity and the clear command embedded within the text.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":21,\"total_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}"
+}

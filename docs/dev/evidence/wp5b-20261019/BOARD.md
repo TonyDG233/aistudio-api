@@ -134,6 +134,14 @@ groups:
 | 2026-10-19 12:30 | 计划批准、看板建立 | 完成 | 本文件 |
 | 2026-10-19 12:38 | Phase 1 配置/纯策略 | 完成 | 新增 channel_registry/account_routing/AccountMeta.routing；单测 680 passed；pyright 0；ruff 通过 |
 | 2026-10-19 12:39 | Phase 2 管线/级别 A | 完成 | commit `ec35c8d`；721 passed；pyright 0；ruff/format 通过 |
-| 2026-10-19 12:53 | Phase 3 跨账号 Realm | 进行中 | cdp_client/rlm_pool/build WS 解复用/API |
-| | Phase 4 | 未开始 | |
+| 2026-10-19 12:53 | Phase 3 跨账号 Realm | 完成 | commit `28c981f`；731 passed；pyright 0 |
+| 2026-10-19 13:20 | Phase 4 真机 | 完成 | chat/official/group/quota/cross-account；argon 0；证据 README |
+| 2026-10-19 13:25 | 收尾 | 进行中 | 全量 732 passed；ruff/format/pyright 通过；待提交 |
+
+## 8. Phase 4 补充决策
+
+- 全局实例预算口径：**一个存活 Realm 计一个全局实例槽**；Realm 内部的 chat 引导页与 build 页不重复计入 global，
+  避免“pro chat + free build”在 global_max=2 时被误判为 3。渠道预算仍按目标渠道页面计数。
+- 活跃账号请求优先使用默认会话，非活跃账号才创建 Realm；单账号场景不会额外开 BrowserContext。
+- borrow 已实现“复用其它账号空闲且就绪的 Realm”，首字节前生效；当前真机只有 2 个账号，未构造出借入场景，保留单测证据。
 | | Phase 4 | 未开始 | |

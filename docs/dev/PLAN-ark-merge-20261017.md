@@ -1,6 +1,6 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成；WP10、WP8 已完成（2026-10-19）；下一站 P4.5 WP5 二期 复杂策略组后端 → P4.6 WP11 真实 Token 计数 → P5 WP6 统计 + WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成；WP10、WP8、P4.5 WP5 二期已完成（2026-10-19）；下一站 P4.6 WP11 真实 Token 计数 → P5 WP6 统计 + WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
 >
@@ -231,6 +231,8 @@
 - 槽位/Realm：pro chat + free build 跨账号同时在线（E4 口径），切号不打断在途流。
 - 渠道注册表/账号覆盖：开关与覆盖生效且可回退。
 - 全关时零行为变化；证据入 `docs/dev/evidence/wp5b-<date>/`。
+
+**完成状态（2026-10-19）**：后端已落地并通过 732 项单测；真机完成零配置 chat、`official/` 403、组约束、预算 429、pro chat + free build 跨账号并发（`live_instances=2`、`live_realms=1`）。证据 `docs/dev/evidence/wp5b-20261019/`。borrow 仅有单测证据（真机仅 2 账号，未构造出稳定借入场景）；失败链故障注入由单测覆盖。argon 真机调用 0 次。
 
 ### WP6 统计整合（M）
 **以本仓库现有统计为底座增量扩维**（不引入第二套存储）：

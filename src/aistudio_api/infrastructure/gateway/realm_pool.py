@@ -329,6 +329,47 @@ class RealmPool:
     def get(self, realm_id: str) -> Realm | None:
         return self._realms.get(realm_id)
 
+    def find_idle(
+        self,
+        *,
+        need_build: bool,
+        exclude_accounts: set[str],
+    ) -> Realm | None:
+        """Return an idle realm that can serve as a borrow target."""
+        candidates = sorted(self._realms.values(), key=lambda realm: realm.last_used)
+        for realm in candidates:
+            if realm.account_id in exclude_accounts or realm.in_flight > 0:
+                continue
+            if need_build:
+                surface = realm.build_surface
+                page = getattr(getattr(surface, "state", None), "page", None)
+                if page is None or page.is_closed():
+                    continue
+            elif realm.session.page.is_closed():
+                continue
+            return realm
+        return None
+
+    def active_realm_count(self) -> int:
+        """One live Realm counts as one global instance slot."""
+        count = 0
+        for realm in self._realms.values():
+            try:
+                if not realm.session.page.is_closed():
+                    count += 1
+                    continue
+            except Exception:
+                pass
+            surface = realm.build_surface
+            page = getattr(getattr(surface, "state", None), "page", None)
+            if page is not None:
+                try:
+                    if not page.is_closed():
+                        count += 1
+                except Exception:
+                    pass
+        return count
+
     def page_counts(self) -> dict[str, int]:
         """Live chat/build pages across realms (read-only budget input)."""
         counts = {"chat": 0, "build": 0}

@@ -1,0 +1,80 @@
+{
+  "active_account": {
+    "id": "acc_46223636",
+    "name": "Ark:auth-5",
+    "tier": "pro",
+    "email": "tonygemini38@gmail.com"
+  },
+  "chat_page": {
+    "alive": true,
+    "url": "https://aistudio.google.com/prompts/new_chat?model=gemini-3.7-flash&temporary=true"
+  },
+  "build_page": {
+    "alive": false,
+    "ready": false,
+    "account_id": null,
+    "last_error": ""
+  },
+  "live_instances": 1,
+  "retiring_contexts": 0,
+  "group": "default:pro",
+  "max_page_instances": null,
+  "effective_max": 2,
+  "routing": {
+    "circuit": {
+      "open": false,
+      "failures": 0,
+      "window_seconds": 600,
+      "failure_threshold": 5,
+      "cooldown_seconds": 300,
+      "open_until": null,
+      "retry_after_seconds": 0.0
+    },
+    "instances": {
+      "live_instances": 2,
+      "chat_page_alive": true,
+      "build_page_alive": false,
+      "realm_mode": true,
+      "live_realms": 1,
+      "in_flight": 0,
+      "limits": {
+        "global_max": 2,
+        "chat_max": 2,
+        "build_max": 2,
+        "max_realms": 2
+      },
+      "planned_instances": 2,
+      "realms": [
+        {
+          "realm_id": "realm-acc_b1a36ccf-1",
+          "account_id": "acc_b1a36ccf",
+          "context_id": "CB8D569867D198B0D536FA091262AC82",
+          "in_flight": 0,
+          "last_used": 33797.3718111,
+          "build_ready": true
+        }
+      ],
+      "slots": {
+        "acc_46223636:chat": 0,
+        "acc_b1a36ccf:build": 1
+      }
+    }
+  },
+  "realms": [
+    {
+      "realm_id": "realm-acc_b1a36ccf-1",
+      "account_id": "acc_b1a36ccf",
+      "context_id": "CB8D569867D198B0D536FA091262AC82",
+      "in_flight": 0,
+      "last_used": 33797.3718111,
+      "build_ready": true
+    }
+  ],
+  "budgets": {
+    "global_max": 2,
+    "chat_max": 2,
+    "build_max": 2,
+    "max_realms": 2
+  },
+  "planned_instances": 2
+}

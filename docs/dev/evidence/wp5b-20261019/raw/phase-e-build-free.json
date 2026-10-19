@@ -1,0 +1,8 @@
+{
+  "tag": "phase-e-build-free",
+  "model": "build/gemini-flash-latest",
+  "status": 200,
+  "started_at": 1792416239.586829,
+  "elapsed_s": 34.0,
+  "body": "{\"id\":\"chatcmpl-1792416273574_dafbb843\",\"object\":\"chat.completion\",\"created\":1792416273,\"model\":\"build/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":61,\"total_tokens\":65,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":61}}}"
+}

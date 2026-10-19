@@ -77,6 +77,8 @@ class RouteContext:
     breaker: CircuitBreaker
     multi_mode: bool
     started_at: float
+    borrow_enabled: bool = False
+    pending_borrow: InstanceLease | None = None
     attempted: set[str] = field(default_factory=set)
     failed: set[str] = field(default_factory=set)
     retry_same: bool = False
@@ -346,6 +348,7 @@ class RoutingPipeline:
             breaker=self._breaker,
             multi_mode=is_multi_mode(registry, slots_list),
             started_at=self._clock(),
+            borrow_enabled=bool(routing_cfg.get("borrow", False)),
         )
         logger.info(
             "[surface] request=%s model=%s format=%s channel=%s surface=%s "
@@ -383,6 +386,30 @@ class RoutingPipeline:
             allowed, reason = self.instances.can_land(ctx.channel, ctx.group)
             if allowed:
                 return candidate
+            if ctx.borrow_enabled:
+                lease = self.instances.borrow_lease(
+                    surface=ctx.surface,
+                    exclude_accounts=ctx.failed | ctx.attempted,
+                )
+                if lease is not None:
+                    ctx.pending_borrow = lease
+                    logger.info(
+                        "[surface:borrow] request=%s from=%s account=%s step=⑥",
+                        ctx.request_id,
+                        lease.realm_id,
+                        lease.account_id,
+                    )
+                    return Candidate(
+                        account_id=lease.account_id,
+                        name=lease.account_id,
+                        tier=None,
+                        email=None,
+                        channel=ctx.channel,
+                        surface=ctx.surface,
+                        weight=1.0,
+                        available=True,
+                        reason="borrow",
+                    )
             if not ctx.budget.can_defer():
                 _raise(
                     "surface_quota_exceeded",
@@ -401,6 +428,15 @@ class RoutingPipeline:
             )
             ctx.attempted.add(candidate.account_id)
             candidate = ctx.next_candidate(None)
+        if ctx.budget.snapshot()["defers"]:
+            _raise(
+                "surface_quota_exceeded",
+                message=(
+                    f"渠道 '{ctx.channel}' 的候选实例均无法落地，"
+                    f"顺延次数={ctx.budget.snapshot()['defers']}。"
+                ),
+                advice="请提高 global/channel/group 预算、关闭闲置实例，或稍后重试。",
+            )
         return None
 
     async def land(
@@ -411,6 +447,16 @@ class RoutingPipeline:
         require_idle: bool = True,
     ) -> InstanceLease | None:
         ctx.attempted.add(candidate.account_id)
+        if candidate.reason == "borrow" and ctx.pending_borrow is not None:
+            lease = ctx.pending_borrow
+            ctx.pending_borrow = None
+            logger.info(
+                "[surface:borrow] request=%s account=%s realm=%s step=⑤",
+                ctx.request_id,
+                lease.account_id,
+                lease.realm_id,
+            )
+            return lease
         lease = await self.instances.land(
             account_id=candidate.account_id,
             channel=ctx.channel,
