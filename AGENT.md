@@ -19,7 +19,7 @@
 
 `aistudio-api` 是 Google AI Studio 反向代理网关，提供原生 **Gemini API 兼容接口**（`/v1beta/...`）。
 
-- **原生 Gemini 协议专一性**：服务于 Gemini 官方 API 规范（包含 thinking、multimodal、image-generation、function calling 等），不引入额外的跨厂商协议转译层。
+- **协议面分层**：原生 Gemini API（`/v1beta/...`）是第一协议面；WP8 起同时提供 OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）与 Anthropic Messages（`/v1/messages`）兼容面。所有请求统一归一到 `GeminiGenerateContentRequest`，响应在格式边界逆变换；核心生成管线不得散落协议判断。
 - **轻量 CDP 驱动**：使用纯 Python 异步 WebSocket 直连 Chrome DevTools Protocol（CDP），不依赖 Node.js、Playwright 或 Selenium。
 - **浏览器内 XHR Replay**：在 MakerSuite 页面上下文中执行携带 `withCredentials = true` 的异步 XHR 请求，天然复用完整的 Cookie 会话、BotGuard 快照与环境指纹。
 - **代码即事实标准（Code as Ground Truth）**：通过全量测试验证的代码是系统的事实标准。当技术规范文档与真实代码逻辑出现分歧时以代码为准，并在重构过程中同步更新文档。
@@ -157,9 +157,9 @@ uv run python3 main.py server --port 8080
 | 工具 / 阶段 | 命令 | 判定标准 |
 |---|---|---|
 | **Python 代码风格与 Lint** | `uv run ruff check .` | 0 errors |
-| **Python 代码格式化** | `uv run ruff format --check .` | 135 files already formatted |
+| **Python 代码格式化** | `uv run ruff format --check .` | 155 files already formatted |
 | **Python 类型检查** | `bun x pyright src tests` | 0 errors |
-| **Python 单元测试** | `uv run pytest` | 全部通过 (487 passed) |
+| **Python 单元测试** | `uv run pytest` | 全部通过 (571 passed) |
 | **浏览器 JS 语法校验** | `for f in src/aistudio_api/infrastructure/browser/js/*.js; do bun build "$f" --no-bundle >/dev/null; done` | 0 errors |
 | **前端代码规范** | `cd web && bun run lint` | 0 errors, 0 warnings |
 | **前端类型检查** | `cd web && bun run type-check` | 0 errors |
@@ -217,19 +217,28 @@ aistudio-api/
 │   │   ├── dependencies.py        # API Key 与 Token 鉴权注入
 │   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent 路由
 │   │   ├── routes_models.py       # /v1beta/models 模型发现路由
+│   │   ├── routes_openai.py       # /v1/chat/completions 与 /v1/models (WP8)
+│   │   ├── routes_claude.py       # /v1/messages (WP8)
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
 │   │   ├── routes_keepalive.py    # 保活状态查询与手动触发路由
 │   │   ├── routes_system.py       # 监控指标、日志配置与 config.yaml 热重载路由
 │   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)
-│   │   ├── schemas.py             # API 请求与校验模型
+│   │   ├── schemas.py             # Gemini API 请求与校验模型
+│   │   ├── schemas_openai.py      # OpenAI Chat Completions 请求模型 (WP8)
+│   │   ├── schemas_claude.py      # Anthropic Messages 请求模型 (WP8)
+│   │   ├── format_errors.py       # 协议面错误形状、路径分流与格式开关 (WP8)
 │   │   ├── responses.py           # Gemini API 响应格式化辅助工具
 │   │   └── response_models.py     # API Pydantic 响应模型
 │   ├── application/               # 业务应用层
 │   │   ├── account_rotator.py     # 黏性账号调度器 (按模型记录 429 与太平洋午夜重置)
 │   │   ├── account_service.py     # 账号存储与激活上下文协调
 │   │   ├── account_keepalive.py   # 双保活调度器 (Auth 回写/元数据刷新/定时切号/轻量活动)
-│   │   ├── api_service_gemini.py  # Gemini 请求生命周期与流式处理
+│   │   ├── api_service_gemini.py  # Gemini 协议渲染层 (SSE/响应/错误格式)
+│   │   ├── generation_service.py  # 协议无关生成管线 (ATG/重试/切号/流式事件)
+│   │   ├── upstream_errors.py     # 上游错误分类与重试/切号处理
+│   │   ├── format_converters/     # OpenAI/Claude 请求响应转换、媒体下载、thoughtSignature 缓存
 │   │   ├── account_orchestrator.py# _switch_lock 防雪崩切号与故障转移编排
+│   │   ├── surface_orchestrator.py# 组策略/面路由/守卫与决策链
 │   │   ├── atg/                   # ATG 防截断 (synthetic transport: injector/extractor/stream_extractor/repair/config 等)
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 纯净领域模型与异常体系
@@ -238,18 +247,20 @@ aistudio-api/
 │   ├── infrastructure/            # 基础设施层
 │   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
-│   │   └── gateway/               # 会话状态机 (session_state)、蓝绿就绪门 (session)、鉴权凭据 (session_auth)、WAA探针 (botguard_bootstrap)、Wire编解码与流式管道
+│   │   └── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
-└── tests/                        # 单元测试套件 (模块化轻量架构，全量通过 <5s)
-│   ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
-│   ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
-│       └── unit/                     # 29 个按职责严格划分的单元测试模块
-│       ├── test_account_*        # 账号调度、并发轮换防雪崩与凭据导入
-│       ├── test_api_*            # API 鉴权、响应序列化与模型/系统路由
-│       ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
-│       └── test_wire_*           # Protobuf-over-JSON 编解码、流式解析与模型规则
+└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 20s)
+    ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
+    ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
+    └── unit/                     # 49 个按职责严格划分的单元测试模块
+        ├── test_account_*        # 账号调度、并发轮换防雪崩与凭据导入
+        ├── test_api_*            # API 鉴权、响应序列化与模型/系统路由
+        ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
+        ├── test_wire_*           # Protobuf-over-JSON 编解码、流式解析与模型规则
+        ├── test_format_*         # OpenAI/Claude 请求响应、流式事件与错误形状
+        └── test_signature_cache.py # thoughtSignature 缓存复用/持久化/淘汰
 ```
 
 ## 6. 功能开关规范 (features)
@@ -259,9 +270,10 @@ aistudio-api/
 - **落点**：`config.py` 的 `Settings`（`_load_bool_env` / `_load_int_env` / `_load_float_env` / `_load_choice_env` 模式，`AISTUDIO_*` 前缀）；解析函数 `model_defaults.get_features_config()`（仿 `_load_yaml_config` 的 mtime 缓存 + `invalidate_config_cache()`）；对外经 `GET /config` 响应的 `features` 键暴露。
 - **优先级**：`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值。`features` 段是运行时权威配置，`PUT /config/yaml` 后**热重载立即生效**；环境变量仅在进程启动时读取一次，作为缺省兜底。
 - **命名对齐**：YAML 键统一 `snake_case`，语义对齐对面 Ark 的 `.env` 字段（如 `atg.mode`↔`ATG_MODE`、`atg.client_synthetic_guard`↔`ATG_CLIENT_SYNTHETIC_GUARD`、`account_refresh_concurrency`↔`REFRESH_CONCURRENCY`、`auto_switch_interval_hours`↔`AUTO_SWITCH_INTERVAL_HOURS`）。
-- **默认值**：编排/fallback/活动类开关默认关闭（`features.fallback.*` 全 `off`，遵循「零自动回落」决策）；`client_synthetic_guard` 默认 `true`（兼容优先）；WP10 `keepalive_auth_update` / `keepalive_metadata_refresh` / `keepalive_metadata_refresh_on_startup` 默认 `true`（账号保活优先，对齐 Ark `ENABLE_AUTH_UPDATE`），`keepalive_active_activity` 默认 `false`。非法/未知取值一律静默回退安全默认，禁止让新增顶层键破坏既有 YAML 消费方。
+- **默认值**：编排/fallback/活动类开关默认关闭（`features.fallback.*` 全 `off`，遵循「零自动回落」决策）；`client_synthetic_guard` 默认 `true`（兼容优先）；WP10 `keepalive_auth_update` / `keepalive_metadata_refresh` / `keepalive_metadata_refresh_on_startup` 默认 `true`（账号保活优先，对齐 Ark `ENABLE_AUTH_UPDATE`），`keepalive_active_activity` 默认 `false`；WP8 `features.formats.openai` / `features.formats.claude` 默认 `true`（对齐 Ark 无条件端点注册），`features.formats.media.allow_private_urls` 默认 `false`，`features.atg.mode_by_format` 默认 `inherit`。非法/未知取值一律静默回退安全默认，禁止让新增顶层键破坏既有 YAML 消费方。
 - **保活开关（WP10）**：`auto_switch`（长周期切号 + 真实活动）、`keepalive_auth_update`（cookies/origins → `auth.json`）、`keepalive_metadata_refresh`（tier/email/expired → `meta.json`）三者独立；切号前/后、初始化、重连、关闭前均回写 Auth；自动/手动切号共用切号锁，门槛覆盖 chat+build 在途；元数据刷新与 `POST /api/accounts/refresh` 共用同一实例和 409 互斥。结构化读写接口：`GET /api/keepalive`、`POST /api/keepalive/run`、`PUT /config/features`。
 - **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
 - **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
+- **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。

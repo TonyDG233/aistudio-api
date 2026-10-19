@@ -1,6 +1,6 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成（P3 收尾加固待批）；下一站 WP10 账号保活（最高优先）→ WP8 格式层 → WP5 二期 复杂策略组后端（P4.5）→ WP6 统计 → WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成；WP10、WP8 已完成（2026-10-19）；下一站 P4.5 WP5 二期 复杂策略组后端 → P4.6 WP11 真实 Token 计数 → P5 WP6 统计 + WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
 >
@@ -70,6 +70,7 @@
 | WP8 | 多格式兼容层（OpenAI Chat Completions / Claude Messages；Responses 可选） | L | 5–8 | WP1, WP2 |
 | WP9 | （远期）第三面：Gemini App（合并 GeminiLocalAPI） | L | 待立 | WP5 |
 | WP10 | 账号保活（最高优先，后端）：旧定时切号 + 上游自动刷新双机制并存 | M | 2–3 | WP3, WP5 |
+| WP11 | 真实 Token 计数（上游 `:countTokens`，Claude `count_tokens` / Responses `input_tokens`） | M | 2–4 | WP8, WP3 |
 
 ---
 
@@ -257,10 +258,11 @@
 - **架构**：新增 `api/routes_openai.py`、`api/routes_claude.py` + `application/format_converters/`（Python 平移 Ark `FormatConverter` 模块族：ChatCompletionsConverter、ClaudeRequest/ResponseConverter、Responses 三件套、CommonConverter）。内部一律归一到 `NormalizedGeminiRequest`，响应在**格式边界**做逆变换；原生 `/v1beta` 路由完全不动。**（P0 前置 E6 结论：chat 面转换到内部归一模型；build 面直连本就是 REST 语义，可保持 REST dict 边界，避免无谓二次映射——两边界互不污染。）**
 - **移植基准（Ark 源）**：`src/core/FormatConverter/*`（Chat/Claude/Responses/Common 各模块）；行为验收以 Ark 现状为准（流式增量形状、工具调用参数分片、思维链/思考块的丢弃或映射策略）。
 - **与 ATG 的啮合（关键）**：ATG 包装/解包按**客户端格式**分别在 6+2 个边界生效——OpenAI 流/非流、Claude 流/非流、Responses 流/非流、Gemini 原生两处；`atgModeByFormat`（gemini/openai/claude）在此真正启用（见 WP2）。
-- **开关**：`features.formats.openai` / `features.formats.claude` / `features.formats.responses`（默认按需开启）；API Key 复用现有 `api_keys` 机制，可为各协议面独立配置。
+- **开关**：`features.formats.openai` / `features.formats.claude`，默认 `true`（对齐 Ark `ProxyServerSystem.js:675-702` 的无条件端点注册）；保留开关作运维临时关闭。Responses API 首期不交付，`features.formats.responses` 不落地。API Key 复用现有 `api_keys` 机制。
+- **thoughtSignature 兼容**：真实签名优先（响应侧按 tool call id 缓存、持久化、可多轮复用）；缓存缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`，不报错、不降级为正文；Claude thinking 回放不信任外部签名。
 - **统计**：请求记录增 `api_format` 维度（并入 WP6 `formatBreakdown`）。
 - **约束**：错误消息具体化（字段路径/收到值/处置建议）；零静默回落；不引入第二套上游传输。
-- **验收**：OpenAI 与 Claude 两协议面各过：非流式 + 真流式 + 工具调用（含多轮）+ usage 正确；ATG `prefer/required` 在两协议面各真机验证；原生 Gemini 面回归无变化。
+- **验收（已完成 2026-10-19）**：OpenAI 与 Claude 两协议面各过非流式 + 真流式 + 工具调用（含多轮）+ usage；ATG `prefer/required` 在两协议面各真机验证；原生 Gemini 面回归无变化；冷缓存/代理重启后工具多轮仍可续接。证据 `docs/dev/evidence/wp8-20261019/`。
 
 ### WP9（远期）第三面：Gemini App 消费者端（合并 GeminiLocalAPI）
 - **形态**：把 `D:\LLM\self_programming\GeminiLocalAPI\GeminiLocalAPI-source`（gemini-webapi 2.1.1.post2，gemini.google.com 消费者端）作为**第三个 surface 适配器**接入（认证/协议独立，不复用 MakerSuite 链路）。
@@ -279,6 +281,27 @@
 - **配置双写**：本地根 `config.yaml` 是运行时实际配置、**不被 git 追踪**；分发默认配置是 `defaults/config.yaml`（tracked）。任何 features 变更必须两处同步；提交/证据以 `defaults/config.yaml` 为准，根配置仅用于本机验证。
 - **验收（真机、最小额度）**：两套保活分别可单独开关并生效；账号连续保持在线；刷新与切号有序/互斥；失败有明确日志；全关时零行为变化；参数可经后端接口读取/修改并即时生效。
 
+### WP11 真实 Token 计数（P4.6，M）
+> 目标：agent / 工具接入反代时，无论使用 Claude、OpenAI 还是后续 Responses，向反代请求 token 计数都必须拿到**上游真实计数**，不得用本地 `字符数/4` 之类的估算冒充精确值。
+
+- **范围**：
+  - Claude `POST /v1/messages/count_tokens`：请求归一 → Gemini `:countTokens` → 返回 `{"input_tokens": totalTokens}`。
+  - OpenAI Responses `POST /v1/responses/input_tokens`：待 Responses 面交付后同样接入；若 Responses 仍未交付，则只保留路由占位与显式 404。
+  - Gemini 原生 `:countTokens` 语义复用，不新建第二套上游传输。
+- **架构**：
+  - 扩展浏览器传输层，支持非生成型 `:countTokens` 请求（与 `generateContent`/`streamGenerateContent` 模板分离，避免污染生成模板与 ATG）。
+  - 新增 `application/token_counter.py` 作为唯一计数入口；格式层只负责请求/响应映射。
+  - 不做本地 tokenizer 估算；上游失败显式报错，按协议面返回 4xx/5xx。
+  - 计数请求不写模型调用统计的 token 用量，只记录请求次数与格式维度。
+- **依赖**：WP8（格式层与请求归一）、WP3（账号/transport）；UI 归 WP7，不在本阶段。
+- **约束**：纯后端；不改 `web/`；不破坏 WP10 保活；不新增未验证的估算路径。
+- **验收（真机）**：
+  - Claude 文本 / 工具 / 图片 / thinking 请求的 `count_tokens` 与上游 `totalTokens` 一致。
+  - Responses `input_tokens` 与上游一致（若交付）。
+  - 上游失败返回显式错误，不静默 fallback。
+  - Gemini 原生与 WP8 生成链路无回归。
+- **证据**：`docs/dev/evidence/wp11-<date>/`。
+
 ---
 
 ## 5. 里程碑
@@ -292,6 +315,7 @@
 | P3.5 | WP10 | 账号保活双机制（旧定时切号 + 新自动刷新）闭环；纯后端，UI 不在本阶段 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P4.5 | WP5 二期 | 复杂策略组后端全部落地（管线/裸名矩阵/槽位/四层预算/borrow/失败链/渠道注册表/账号覆盖/Realm 落点）；UI 不在本阶段 |
+| P4.6 | WP11 | 真实上游 token 计数（Claude `count_tokens`、Responses `input_tokens`）；禁止本地估算；纯后端 |
 | P5 | WP6 + WP7 | 统计（后端，含 formatBreakdown）+ WP7（UI 统一修改）/文档/质量门全绿/致谢入库 |
 
 ---
