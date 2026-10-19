@@ -252,15 +252,15 @@ aistudio-api/
 │   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
 │   │   └── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
-│   │       ├── instance_manager.py# 四层预算取最严、槽位计划数、级别 A 落地与 borrow
-│   │       └── realm_pool.py      # 跨账号 Realm 池 (独立 BrowserContext/cookie jar, LRU, 在途不回收)
+│   │       ├── instance_pool.py   # 统一 Context 实例池：槽位/页面预算/换绑/冷启动/borrow
+│   │       └── pooled_session.py  # 单 Context 会话、页面与在途请求复用
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
 └── tests/                        # 单元测试套件 (模块化轻量架构，全量约 20s)
     ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
     ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
-    └── unit/                     # 49 个按职责严格划分的单元测试模块
+    └── unit/                     # 62 个按职责严格划分的单元测试模块
         ├── test_account_*        # 账号调度、并发轮换防雪崩与凭据导入
         ├── test_api_*            # API 鉴权、响应序列化与模型/系统路由
         ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
@@ -281,6 +281,6 @@ aistudio-api/
 - **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
 - **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
-- **复杂策略组（WP5 二期，P4.5）**：唯一决策管线在 `application/routing_pipeline.py`，渠道在 ① 固定、链内不换面；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`（`meta.json`/`registry.json`），不新增文件。`features.channels` 控制渠道启用与渠道预算，`features.routing` 控制 `max_switches`（仅换号/换实例，独立于同账号 `MAX_RETRIES`）、global/Realm 预算、borrow、熔断；`features.slots` 为账号×渠道预留实例位。Realm 模式下一个存活 Realm 计一个全局实例槽；活跃账号优先用默认会话，非活跃账号走独立 BrowserContext（约 +180MB/Realm）。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
+- **复杂策略组（WP5 v3，P4.5）**：唯一决策管线在 `application/routing_pipeline.py`，渠道在请求内固定、链内不换面；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`（`meta.json`/`registry.json`）。统一 Context 实例池在 `infrastructure/gateway/instance_pool.py`：一个槽位是一个独立 BrowserContext，chat/build 是同一 Context 内的 surface page；`features.routing.max_contexts` 控制 Context 数，`global_max_pages`、`channels.*.max_pages`、`groups.*.max_pages` 控制页面数。`max_pages` 不是并发上限：同一页面可承载多个在途请求，只有新增页面/Context 才受页面预算约束。`features.routing.max_switches` 仅约束换号/换实例，独立于同账号 `MAX_RETRIES`；borrow、熔断、冷启动重试（最多 3 次）均在池内处理。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
 - **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
