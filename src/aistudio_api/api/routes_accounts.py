@@ -546,6 +546,25 @@ async def import_bundle(
 
     items_to_import: list[dict[str, object]] = []
 
+    def _extract_items(raw_data: object) -> list[dict[str, object]]:
+        if isinstance(raw_data, list):
+            return [
+                item
+                for item in raw_data
+                if isinstance(item, dict) and item.get("cookies")
+            ]
+        if isinstance(raw_data, dict):
+            nested = raw_data.get("accounts") or raw_data.get("profiles")
+            if isinstance(nested, list):
+                return [
+                    item
+                    for item in nested
+                    if isinstance(item, dict) and item.get("cookies")
+                ]
+            if raw_data.get("cookies"):
+                return [raw_data]
+        return []
+
     if req.accounts:
         for a in req.accounts:
             items_to_import.append(
@@ -563,35 +582,25 @@ async def import_bundle(
             raise HTTPException(
                 status_code=400, detail=f"JSON 内容解析失败: {e}"
             ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+        items_to_import.extend(_extract_items(raw_data))
     elif req.file_path:
         fpath = Path(req.file_path).expanduser().resolve()
-        if not fpath.is_file():
+        if not fpath.exists():
             raise HTTPException(status_code=404, detail=f"文件不存在: {fpath}")
-        try:
-            raw_text = fpath.read_text(encoding="utf-8")
-            raw_data = json.loads(raw_text)
-        except Exception as e:
+        paths = sorted(fpath.glob("auth-*.json")) if fpath.is_dir() else [fpath]
+        if not paths:
             raise HTTPException(
-                status_code=400, detail=f"读取或解析文件失败: {e}"
-            ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+                status_code=400, detail=f"目录中没有 auth-*.json: {fpath}"
+            )
+        for path in paths:
+            try:
+                raw_text = path.read_text(encoding="utf-8")
+                raw_data = json.loads(raw_text)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"读取或解析文件失败: {path}: {e}"
+                ) from e
+            items_to_import.extend(_extract_items(raw_data))
     else:
         raise HTTPException(
             status_code=400,
@@ -605,16 +614,23 @@ async def import_bundle(
 
     imported_accounts: list[AccountResponse] = []
     for idx, item in enumerate(items_to_import):
-        raw_cookie_str = str(item.get("cookies") or "")
+        raw_cookie = item.get("cookies")
+        raw_cookie_str = (
+            raw_cookie
+            if isinstance(raw_cookie, str)
+            else json.dumps(raw_cookie, ensure_ascii=False)
+        )
         if not raw_cookie_str:
             continue
         storage_state = parse_cookie_string(raw_cookie_str)
         if not storage_state.get("cookies"):
             continue
 
-        acc_name = str(item.get("name") or f"Account {idx + 1}")
+        acc_name = str(
+            item.get("name") or item.get("accountName") or f"Account {idx + 1}"
+        )
         acc_email = str(item["email"]) if item.get("email") else None
-        acc_auth_user = str(item.get("auth_user") or "0")
+        acc_auth_user = str(item.get("auth_user") or item.get("authUser") or "0")
         cid = f"cookie_{secrets.token_hex(4)}"
 
         account = account_service.save_account_from_cookies(

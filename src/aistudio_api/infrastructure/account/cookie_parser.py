@@ -65,6 +65,53 @@ DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
 )
 
 
+_STUDIO_SCOPED_COOKIES = frozenset({"OSID", "__Secure-OSID", "__Secure-BUCKET"})
+_ACCOUNT_SCOPED_COOKIES = frozenset(
+    {
+        "OTZ",
+        "__Host-GAPS",
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+        "LSID",
+        "SMSV",
+        "LSOLH",
+        "ACCOUNT_CHOOSER",
+    }
+)
+
+
+def _cookie_domain_rank(name: str, domain: object) -> int:
+    """Prefer the canonical Google domain when exports contain regional copies.
+
+    Ark auth exports often contain the same cookie name for ``.google.com`` and
+    several regional domains such as ``.google.com.sg``. Older imports used a
+    last-wins flatten, which could replace the canonical value with a regional
+    copy and turn a valid credential into a 401.
+    """
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return 0
+    if name in _STUDIO_SCOPED_COOKIES:
+        order = {
+            "aistudio.google.com": 0,
+            ".google.com": 1,
+            "accounts.google.com": 2,
+        }
+    elif name in _ACCOUNT_SCOPED_COOKIES:
+        order = {
+            "accounts.google.com": 0,
+            ".google.com": 1,
+            "aistudio.google.com": 2,
+        }
+    else:
+        order = {
+            ".google.com": 0,
+            "aistudio.google.com": 1,
+            "accounts.google.com": 2,
+        }
+    return order.get(normalized, 3)
+
+
 def parse_raw_cookies(raw: object) -> dict[str, str]:
     """万能 Cookie 解析器，支持：
     1. JSON 数组（EditThisCookie / Cookie-Editor 导出：`[{"name": "...", "value": "..."}, ...]`）
@@ -73,8 +120,26 @@ def parse_raw_cookies(raw: object) -> dict[str, str]:
     4. HTTP 请求头格式（`Cookie: k1=v1; k2=v2` 或带换行的多行键值对）
     """
     parsed: dict[str, str] = {}
+    best_rank: dict[str, int] = {}
     if not raw:
         return parsed
+
+    def _take_json_cookie(item: object) -> bool:
+        if not (
+            isinstance(item, dict)
+            and item.get("name")
+            and item.get("value") is not None
+        ):
+            return False
+        name = str(item["name"]).strip()
+        value = str(item["value"]).strip()
+        if not name or not value:
+            return False
+        rank = _cookie_domain_rank(name, item.get("domain"))
+        if name not in parsed or rank <= best_rank[name]:
+            parsed[name] = value
+            best_rank[name] = rank
+        return True
 
     text = raw.strip() if isinstance(raw, str) else json.dumps(raw)
 
@@ -87,15 +152,7 @@ def parse_raw_cookies(raw: object) -> dict[str, str]:
             obj = json.loads(text)
             if isinstance(obj, list):
                 for item in obj:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("name")
-                        and item.get("value") is not None
-                    ):
-                        k = str(item["name"]).strip()
-                        v = str(item["value"]).strip()
-                        if k and v:
-                            parsed[k] = v
+                    _take_json_cookie(item)
                 if parsed:
                     return parsed
             elif isinstance(obj, dict):
@@ -105,15 +162,7 @@ def parse_raw_cookies(raw: object) -> dict[str, str]:
                     text = obj["cookies"]
                 elif isinstance(obj.get("cookies"), list):
                     for item in obj["cookies"]:
-                        if (
-                            isinstance(item, dict)
-                            and item.get("name")
-                            and item.get("value") is not None
-                        ):
-                            k = str(item["name"]).strip()
-                            v = str(item["value"]).strip()
-                            if k and v:
-                                parsed[k] = v
+                        _take_json_cookie(item)
                     if parsed:
                         return parsed
                 elif isinstance(obj.get("cookies"), dict):
