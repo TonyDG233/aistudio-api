@@ -260,7 +260,7 @@ docker compose up -d
 | 字段 | 类型 | 默认值 | 说明（开=什么 / 关=什么 / 何时用 / 失败怎么办） |
 |---|---|---|---|
 | `features.build_surface` | bool | `false` | 开=free 档账号走 Build 宿主页直连通道；关=仅聊天面（零行为变化）。何时开：需要免费档走 Build 额度。失败：面内失败显式报错，绝不改道。 |
-| `features.route_by_tier` | bool | `false` | 开=按账号档位分发到允许的面；关=始终聊天面默认路由。何时开：分组编排（WP5）落地后。失败：无匹配组按默认策略并记录决策链。 |
+| `features.route_by_tier` | bool | `false` | 开=按账号档位分发到允许的面；关=始终聊天面默认路由。何时开：WP5 v3 分组编排已落地，需要区分 pro/free 的面或额度池时。失败：无匹配组按默认策略并记录决策链。 |
 | `features.account_refresh_concurrency` | int | `3` | 批量刷新 email/tier/过期的并发数（范围 1-16）。越大越快但越易限流。失败：单账号失败不影响其余。 |
 | `features.auto_switch` | bool | `false` | 开=按间隔周期轮换账号；关=仅按用量/失败/429 触发。失败：无可切换账号时保持当前账号并告警。 |
 | `features.auto_switch_interval_hours` | float | `3.0` | 自动切换间隔（小时，最小 0.1，与 Ark 一致）。非法值回退 3.0。 |
