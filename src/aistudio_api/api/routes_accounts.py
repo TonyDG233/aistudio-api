@@ -287,6 +287,61 @@ async def detect_account_email(
     return to_account_response(acc)
 
 
+class AccountRoutingUpdate(BaseModel):
+    surfaces: list[str] | None = None
+    weight: float | None = None
+    model_surfaces: dict[str, str] | None = None
+
+
+class AccountRoutingResponse(BaseModel):
+    surfaces: list[str] = Field(default_factory=list)
+    weight: float = 1.0
+    model_surfaces: dict[str, str] = Field(default_factory=dict)
+
+
+@router.get("/{account_id}/routing", response_model=AccountRoutingResponse)
+async def get_account_routing(
+    account_id: str,
+    account_service: AccountService = Depends(get_account_service),
+) -> AccountRoutingResponse:
+    if account_service.store.get_account(account_id) is None:
+        raise HTTPException(404, detail="账号不存在")
+    raw = account_service.store.get_account_routing(account_id)
+    from aistudio_api.application.account_routing import normalize_account_routing
+
+    routing = normalize_account_routing(raw)
+    return AccountRoutingResponse.model_validate(routing.to_dict())
+
+
+@router.put("/{account_id}/routing", response_model=AccountRoutingResponse)
+async def update_account_routing(
+    account_id: str,
+    req: AccountRoutingUpdate,
+    account_service: AccountService = Depends(get_account_service),
+) -> AccountRoutingResponse:
+    if account_service.store.get_account(account_id) is None:
+        raise HTTPException(404, detail="账号不存在")
+    from aistudio_api.application.account_routing import normalize_account_routing
+
+    raw = req.model_dump(exclude_none=True)
+    normalized = normalize_account_routing(raw)
+    if not account_service.store.update_account_routing(
+        account_id, normalized.to_dict()
+    ):
+        raise HTTPException(404, detail="账号不存在")
+    return AccountRoutingResponse.model_validate(normalized.to_dict())
+
+
+@router.delete("/{account_id}/routing")
+async def clear_account_routing(
+    account_id: str,
+    account_service: AccountService = Depends(get_account_service),
+) -> dict[str, bool]:
+    if account_service.store.get_account(account_id) is None:
+        raise HTTPException(404, detail="账号不存在")
+    return {"ok": account_service.store.clear_account_routing(account_id)}
+
+
 @router.delete("/{account_id}")
 async def delete_account(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),

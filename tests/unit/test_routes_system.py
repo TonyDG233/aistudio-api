@@ -15,6 +15,32 @@ def _client() -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
+async def test_routing_state_endpoint(monkeypatch):
+    class FakePipeline:
+        def snapshot(self):
+            return {
+                "circuit": {"open": False, "failures": 0},
+                "instances": {
+                    "live_instances": 2,
+                    "realms": [{"realm_id": "realm-a"}],
+                    "limits": {"global_max": 2},
+                    "planned_instances": 1,
+                },
+            }
+
+    monkeypatch.setattr(
+        "aistudio_api.application.routing_pipeline.get_routing_pipeline",
+        lambda: FakePipeline(),
+    )
+    async with _client() as client:
+        resp = await client.get("/routing/state")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["circuit"]["open"] is False
+        assert payload["instances"]["planned_instances"] == 1
+
+
+@pytest.mark.asyncio
 async def test_health_endpoint():
     async with _client() as client:
         resp = await client.get("/health")

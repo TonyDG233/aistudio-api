@@ -827,6 +827,8 @@ class CDPClient:
         self.host = host
         self.base_url = f"http://{host}:{port}"
         self.page: CDPPage | None = None
+        self._browser_conn: CDPConnection | None = None
+        self._context_lock = asyncio.Lock()
 
     async def get_version(self) -> dict[str, object]:
         """Fetch /json/version info."""
@@ -936,6 +938,103 @@ class CDPClient:
             await self.close_target(target_id)
             raise
 
+    async def _browser_connection(self) -> CDPConnection:
+        """Lazy browser-level CDP connection (for Target.* browser commands)."""
+        conn = self._browser_conn
+        if conn is not None and conn.ws is not None and not conn._closed:
+            return conn
+        version = await self.get_version()
+        ws_url = str(version.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            raise RuntimeError("CDP /json/version did not expose webSocketDebuggerUrl")
+        conn = CDPConnection(ws_url)
+        await conn.connect()
+        self._browser_conn = conn
+        return conn
+
+    async def create_browser_context(self) -> str:
+        """Create an isolated BrowserContext (cookie jar) and return its id."""
+        async with self._context_lock:
+            conn = await self._browser_connection()
+            result = await conn.send(
+                "Target.createBrowserContext",
+                {"disposeOnDetach": True},
+                timeout_s=10.0,
+            )
+            context_id = str(result.get("browserContextId") or "")
+            if not context_id:
+                raise RuntimeError("Target.createBrowserContext returned no context id")
+            log.info("已创建 BrowserContext: %s", context_id)
+            return context_id
+
+    async def dispose_browser_context(self, context_id: str) -> None:
+        """Dispose one BrowserContext; missing contexts are ignored."""
+        if not context_id:
+            return
+        with contextlib.suppress(Exception):
+            conn = await self._browser_connection()
+            await conn.send(
+                "Target.disposeBrowserContext",
+                {"browserContextId": context_id},
+                timeout_s=10.0,
+            )
+            log.info("已释放 BrowserContext: %s", context_id)
+
+    async def create_page_in_context(
+        self,
+        context_id: str,
+        *,
+        block_assets: bool = True,
+        timeout_s: float = 10.0,
+    ) -> CDPPage:
+        """Create and connect a page inside the given BrowserContext."""
+        await self.wait_until_ready()
+        conn = await self._browser_connection()
+        result = await conn.send(
+            "Target.createTarget",
+            {"url": "about:blank", "browserContextId": context_id},
+            timeout_s=timeout_s,
+        )
+        target_id = str(result.get("targetId") or "")
+        if not target_id:
+            raise RuntimeError("Target.createTarget returned no targetId")
+
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        target: dict[str, object] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            for item in await self.get_targets():
+                if str(item.get("id") or "") == target_id:
+                    target = item
+                    break
+            if target is not None:
+                break
+            await asyncio.sleep(0.1)
+        if target is None:
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
+            raise TimeoutError(
+                f"BrowserContext page target {target_id} did not appear in /json/list"
+            )
+
+        ws_url = str(target.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            raise RuntimeError(f"Target {target_id} has no webSocketDebuggerUrl")
+        page_conn = CDPConnection(ws_url)
+        try:
+            await page_conn.connect()
+            page = CDPPage(page_conn, target_id)
+            await page.init_domains(block_assets=block_assets)
+            return page
+        except Exception:
+            await page_conn.close()
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
+            raise
+
     async def close_target(self, target_id: str) -> None:
         """Close a specific target ID via /json/close/{target_id}."""
         with contextlib.suppress(Exception):
@@ -947,3 +1046,6 @@ class CDPClient:
         if self.page:
             await self.page.close()
             self.page = None
+        if self._browser_conn is not None:
+            await self._browser_conn.close()
+            self._browser_conn = None

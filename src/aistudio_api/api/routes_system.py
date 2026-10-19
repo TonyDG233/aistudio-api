@@ -167,11 +167,34 @@ async def get_rotation_accounts(
 async def get_surface_instances(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> dict[str, object]:
-    """页面实例挂载快照（单浏览器：活跃账号 chat 页 + build 页各计 1）。"""
+    """页面/Realm 实例挂载与四层预算快照（只读）。"""
     client = runtime_state.client
     if client is None:
         raise HTTPException(503, detail="客户端未初始化")
-    return client.surface_instance_snapshot()
+    snapshot = client.surface_instance_snapshot()
+    from aistudio_api.application.routing_pipeline import get_routing_pipeline
+
+    pipeline = get_routing_pipeline()
+    if pipeline is not None:
+        routing = pipeline.snapshot()
+        snapshot["routing"] = routing
+        raw_instances = routing.get("instances")
+        instances = raw_instances if isinstance(raw_instances, dict) else {}
+        snapshot["realms"] = instances.get("realms", [])
+        snapshot["budgets"] = instances.get("limits", {})
+        snapshot["planned_instances"] = instances.get("planned_instances", 0)
+    return snapshot
+
+
+@protected_router.get("/routing/state")
+async def get_routing_state() -> dict[str, object]:
+    """路由熔断/预算/Realm 只读快照。"""
+    from aistudio_api.application.routing_pipeline import get_routing_pipeline
+
+    pipeline = get_routing_pipeline()
+    if pipeline is None:
+        raise HTTPException(503, detail="路由管线未初始化")
+    return pipeline.snapshot()
 
 
 @protected_router.post("/rotation/next")

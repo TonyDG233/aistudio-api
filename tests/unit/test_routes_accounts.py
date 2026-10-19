@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
 
 import httpx
@@ -27,6 +28,14 @@ def setup_mock_account_service():
     )
     mock_svc.list_accounts.return_value = [sample_acc]
     mock_svc.get_active_account.return_value = sample_acc
+    mock_svc.store.get_account.return_value = sample_acc
+    mock_svc.store.get_account_routing.return_value = {
+        "surfaces": ["chat"],
+        "weight": 2.5,
+        "model_surfaces": {"gemini-3.8-flash": "chat"},
+    }
+    mock_svc.store.update_account_routing.return_value = True
+    mock_svc.store.clear_account_routing.return_value = True
 
     orig = runtime_state.account_service
     runtime_state.account_service = mock_svc
@@ -138,3 +147,56 @@ async def test_api_accounts_active_endpoint():
         assert "no-store" in resp.headers.get("Cache-Control", "")
         data = resp.json()
         assert data["id"] == "acc_1"
+
+
+@pytest.mark.asyncio
+async def test_account_routing_get_put_delete():
+    """Account-level routing stays in AccountMeta and is normalized on write."""
+    async with _client() as client:
+        resp = await client.get(
+            "/api/accounts/acc_1/routing", headers={"Accept": "application/json"}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "surfaces": ["chat"],
+            "weight": 2.5,
+            "model_surfaces": {"gemini-3.8-flash": "chat"},
+        }
+
+        resp = await client.put(
+            "/api/accounts/acc_1/routing",
+            json={
+                "surfaces": ["build", "build", "bogus"],
+                "weight": 500,
+                "model_surfaces": {"models/gemini-3.8-flash": "build"},
+            },
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["surfaces"] == ["build"]
+        assert payload["weight"] == 100.0
+        assert payload["model_surfaces"] == {"gemini-3.8-flash": "build"}
+
+        resp = await client.delete(
+            "/api/accounts/acc_1/routing", headers={"Accept": "application/json"}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_account_routing_unknown_account_is_404():
+    async with _client() as client:
+        # Fixture returns an account; force the route's lookup to miss.
+        from aistudio_api.api.state import runtime_state
+
+        store = cast(
+            MagicMock,
+            runtime_state.account_service.store,  # type: ignore[union-attr]
+        )
+        store.get_account.return_value = None
+        resp = await client.get(
+            "/api/accounts/missing/routing", headers={"Accept": "application/json"}
+        )
+        assert resp.status_code == 404
