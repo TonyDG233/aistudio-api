@@ -439,6 +439,15 @@ class AccountStats:
             self.model_requests_dates.clear()
 
 
+def _parse_iso_ts(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 class AccountRotator:
     """黏性账号调度管理器。
 
@@ -701,6 +710,38 @@ class AccountRotator:
                         return a
 
             return available[0][0]
+
+    async def get_keepalive_candidate(
+        self, current_account_id: str | None = None
+    ) -> AccountMeta | None:
+        """选“最久未回写 auth”的可用账号，供定时切号保活使用。"""
+        async with self._lock:
+            available = self._get_available_accounts(None)
+            if not available:
+                available = self._get_available_accounts(
+                    None, ignore_auth_cooldown=True
+                )
+            candidates = [
+                account
+                for account, _stats in available
+                if account.id != current_account_id
+            ]
+            if not candidates:
+                return None
+            chosen = min(
+                candidates,
+                key=lambda account: (
+                    _parse_iso_ts(account.auth_saved_at),
+                    _parse_iso_ts(account.last_used),
+                    account.id,
+                ),
+            )
+            logger.info(
+                "保活切号候选: %s (auth_saved_at=%s)",
+                chosen.name,
+                chosen.auth_saved_at,
+            )
+            return chosen
 
     async def get_next_account_with_stats(
         self,

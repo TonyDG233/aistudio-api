@@ -12,8 +12,12 @@ from aistudio_api.config import resolve_stats_file, settings
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 
 if TYPE_CHECKING:
+    from aistudio_api.application.account_keepalive import AccountKeepaliveService
     from aistudio_api.application.account_rotator import AccountRotator
     from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        AccountInfoRefresher,
+    )
     from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -39,6 +43,8 @@ class RuntimeState:
     browser_port: int = 9222
     account_service: AccountService | None = None
     rotator: AccountRotator | None = None
+    account_refresher: AccountInfoRefresher | None = None
+    keepalive: AccountKeepaliveService | None = None
     model_stats: dict[str, ModelStatsItem] = field(
         default_factory=lambda: defaultdict(ModelStatsItem)
     )

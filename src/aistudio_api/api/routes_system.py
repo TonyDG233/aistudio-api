@@ -20,6 +20,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     _resolve_config_path,
     get_features_config,
     invalidate_config_cache,
+    update_configured_features,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -192,11 +193,11 @@ async def force_next_account(
     if account_service is None or client is None or client._session is None:
         raise HTTPException(503, detail="服务未就绪")
 
-    result = await account_service.activate_account(
-        next_account.id,
-        client._session,
-    )
+    from aistudio_api.application.account_orchestrator import switch_to_account
 
+    if not await switch_to_account(next_account.id, require_idle=False):
+        raise HTTPException(500, detail="切换失败")
+    result = account_service.get_account(next_account.id)
     if result is None:
         raise HTTPException(500, detail="切换失败")
 
@@ -216,6 +217,10 @@ async def force_next_account(
 
 class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
+
+
+class FeaturesUpdateRequest(BaseModel):
+    features: dict[str, object]
 
 
 @protected_router.get("/config")
@@ -250,6 +255,19 @@ async def get_system_config() -> dict[str, object]:
         "dump_dir": str(get_dump_dir()),
         "features": get_features_config(),
     }
+
+
+@protected_router.put("/config/features")
+async def update_features(req: FeaturesUpdateRequest) -> dict[str, object]:
+    """结构化更新 features（供 WP7 UI 使用），原子落盘并热重载。"""
+    try:
+        features = update_configured_features(req.features)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(500, detail=f"写入 features 失败: {e}") from e
+    logger.info("features 已更新: %s", sorted(req.features))
+    return {"ok": True, "features": features}
 
 
 @protected_router.put("/config/yaml")

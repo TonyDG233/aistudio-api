@@ -34,9 +34,12 @@ _refresher_singleton: AccountInfoRefresher | None = None
 
 def get_account_info_refresher(
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountInfoRefresher:
-    """惰性构建账号信息刷新器单例（可在测试中通过依赖覆盖替换）。"""
+    """优先复用 lifespan 创建的共享刷新器，测试可继续依赖覆盖。"""
     global _refresher_singleton
+    if runtime_state.account_refresher is not None:
+        return runtime_state.account_refresher
     if _refresher_singleton is None:
         _refresher_singleton = AccountInfoRefresher(account_service.store)
     return _refresher_singleton
@@ -242,13 +245,14 @@ async def activate_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
     """切换到指定账号。"""
-    browser_session = runtime_state.client._session if runtime_state.client else None
-
-    if browser_session is None:
+    if runtime_state.client is None:
         raise HTTPException(status_code=503, detail="服务未就绪")
 
-    account = await account_service.activate_account(account_id, browser_session)
-    if account is None:
+    from aistudio_api.application.account_orchestrator import switch_to_account
+
+    ok = await switch_to_account(account_id, require_idle=False)
+    account = account_service.get_account(account_id)
+    if not ok or account is None:
         raise HTTPException(status_code=404, detail="账号不存在或切换失败")
     log.info("手动激活账号: %s (%s)", account.id, account.name)
     return to_account_response(account)

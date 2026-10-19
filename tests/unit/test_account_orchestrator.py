@@ -192,6 +192,7 @@ async def test_try_switch_account_single_account_recovery():
         mock_service.activate_account.assert_called_once_with(
             "acc_1",
             mock_client.session,
+            client=mock_client,
         )
     finally:
         runtime_state.rotator = orig_rotator
@@ -293,6 +294,7 @@ async def test_try_switch_account_session_expired_switches_to_healthy_account():
         mock_service.activate_account.assert_called_once_with(
             "acc_2",
             mock_client.session,
+            client=mock_client,
         )
     finally:
         runtime_state.rotator = orig_rotator

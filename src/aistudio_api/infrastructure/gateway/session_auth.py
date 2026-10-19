@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aistudio_api.domain.errors import SessionExpiredError
+from aistudio_api.infrastructure.account.account_store import write_storage_state
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     CHECK_IDENTITY_JS,
@@ -226,32 +227,24 @@ async def save_browser_cookies(
     page: CDPPage,
     auth_file: str | None,
     cookies: list[dict[str, object]] | None = None,
-) -> None:
+) -> bool:
     """Save browser cookies back to auth_file JSON atomically."""
     if not auth_file:
-        return
+        return False
     try:
         current_cookies = cookies
         if current_cookies is None:
             if page.is_closed():
-                return
+                return False
             current_cookies = await page.get_cookies()
         if not current_cookies:
-            return
-        auth_path = Path(auth_file)
-        origins = []
-        if auth_path.exists():
-            with suppress(Exception):
-                existing = json.loads(auth_path.read_text(encoding="utf-8"))
-                origins = existing.get("origins", [])
-        auth_path.parent.mkdir(parents=True, exist_ok=True)
-        auth_path.write_text(
-            json.dumps({"cookies": current_cookies, "origins": origins}, indent=2),
-            encoding="utf-8",
-        )
+            return False
+        write_storage_state(auth_file, cookies=current_cookies)
         log.info("已保存 %d 个 Cookie 至 %s", len(current_cookies), auth_file)
+        return True
     except Exception as e:
         log.debug("保存 Cookie 失败: %s", e)
+        return False
 
 
 async def bootstrap_google_session(page: CDPPage) -> None:

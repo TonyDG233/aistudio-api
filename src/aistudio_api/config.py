@@ -327,6 +327,27 @@ class Settings:
     auto_switch_interval_hours: float = _load_float_env(
         "AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS", default=3.0, minimum=0.1
     )
+    keepalive_auth_update: bool = _load_bool_env(
+        "AISTUDIO_KEEPALIVE_AUTH_UPDATE", default=True
+    )
+    keepalive_auth_update_hours: float = _load_float_env(
+        "AISTUDIO_KEEPALIVE_AUTH_UPDATE_HOURS", default=24.0, minimum=0.1
+    )
+    keepalive_metadata_refresh: bool = _load_bool_env(
+        "AISTUDIO_KEEPALIVE_METADATA_REFRESH", default=True
+    )
+    keepalive_metadata_refresh_hours: float = _load_float_env(
+        "AISTUDIO_KEEPALIVE_METADATA_REFRESH_HOURS", default=24.0, minimum=0.1
+    )
+    keepalive_metadata_refresh_on_startup: bool = _load_bool_env(
+        "AISTUDIO_KEEPALIVE_METADATA_REFRESH_ON_STARTUP", default=True
+    )
+    keepalive_active_activity: bool = _load_bool_env(
+        "AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY", default=False
+    )
+    keepalive_active_activity_seconds: float = _load_float_env(
+        "AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY_SECONDS", default=60.0, minimum=10.0
+    )
     log_level: str = "INFO"
 
     @property
