@@ -50,9 +50,6 @@ def test_channels_routing_defaults(tmp_path: Path) -> None:
         "max_switches": 2,
         "global_max_pages": 2,
         "max_contexts": 2,
-        "global_max_instances": 2,
-        "max_realms": 2,
-        "realm_mode": True,
         "borrow": False,
         "prewarm": False,
         "circuit_breaker": {
@@ -134,7 +131,6 @@ features:
     max_switches: 99
     global_max_pages: 0
     max_contexts: 99
-    realm_mode: false
     borrow: true
     prewarm: yes
     circuit_breaker:
@@ -147,9 +143,6 @@ features:
     assert routing["max_switches"] == 10
     assert routing["global_max_pages"] == 1
     assert routing["max_contexts"] == 16
-    assert routing["global_max_instances"] == 1
-    assert routing["max_realms"] == 16
-    assert routing["realm_mode"] is False
     assert routing["borrow"] is True
     assert routing["prewarm"] is True
     assert routing["circuit_breaker"] == {
@@ -208,14 +201,14 @@ def test_routing_config_hot_reload(tmp_path: Path) -> None:
     config_path = tmp_path / "hot_routing.yaml"
     _write(
         config_path,
-        "features:\n  routing:\n    max_switches: 1\n    realm_mode: false\n",
+        "features:\n  routing:\n    max_switches: 1\n    max_contexts: 1\n",
     )
     assert _features(config_path)["routing"]["max_switches"] == 1
-    assert _features(config_path)["routing"]["realm_mode"] is False
+    assert _features(config_path)["routing"]["max_contexts"] == 1
 
     first_mtime = config_path.stat().st_mtime
     config_path.write_text(
-        "features:\n  routing:\n    max_switches: 4\n    realm_mode: true\n",
+        "features:\n  routing:\n    max_switches: 4\n    max_contexts: 2\n",
         encoding="utf-8",
     )
     os.utime(config_path, (first_mtime + 30, first_mtime + 30))
@@ -223,4 +216,4 @@ def test_routing_config_hot_reload(tmp_path: Path) -> None:
 
     routing = _features(config_path)["routing"]
     assert routing["max_switches"] == 4
-    assert routing["realm_mode"] is True
+    assert routing["max_contexts"] == 2

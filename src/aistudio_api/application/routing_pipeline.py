@@ -414,6 +414,8 @@ class RoutingPipeline:
                 channel=ctx.channel,
                 surface=ctx.surface,
                 timeout_s=timeout_s,
+                group_name=candidate.group.name or candidate.group.source,
+                group_max_pages=candidate.group.max_pages,
             )
         except InstanceCapacityError as exc:
             if not ctx.borrow_enabled:
@@ -446,6 +448,8 @@ class RoutingPipeline:
                     surface=ctx.surface,
                     timeout_s=0.0,
                     borrow_accounts=borrow_ids,
+                    group_name=candidate.group.name or candidate.group.source,
+                    group_max_pages=candidate.group.max_pages,
                 )
             except InstanceCapacityError as borrow_exc:
                 _raise(

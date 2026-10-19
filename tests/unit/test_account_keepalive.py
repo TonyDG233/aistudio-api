@@ -315,6 +315,93 @@ async def test_auto_switch_single_account_does_not_switch(tmp_path):
     assert switched == []
 
 
+class FakePoolSlot:
+    def __init__(self, account_id: str, *, ready: bool = True) -> None:
+        self.current_account_id = account_id
+        self._ready = ready
+
+    def chat_ready(self) -> bool:
+        return self._ready
+
+
+class FakePoolClient(FakeClient):
+    def __init__(self, slots: list[FakePoolSlot], *, saved: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.instance_pool = SimpleNamespace(
+            slots=lambda: slots,
+            snapshot=list,
+        )
+        self._pool_saved = saved
+
+    async def save_pool_cookies(self) -> int:
+        return self._pool_saved
+
+
+@pytest.mark.asyncio
+async def test_auth_update_writes_all_pool_slots(tmp_path):
+    store = AccountStore(tmp_path)
+    first = store.save_account("A", "a@example.com", {"cookies": []}, account_id="a")
+    second = store.save_account("B", "b@example.com", {"cookies": []}, account_id="b")
+    store.update_account_keepalive(first.id, auth_saved_at=None)
+    store.update_account_keepalive(second.id, auth_saved_at=None)
+
+    service = _service(
+        store,
+        first.id,
+        client=FakePoolClient(
+            [FakePoolSlot("a"), FakePoolSlot("b", ready=False)],
+            saved=2,
+        ),
+        rotator=FakeRotator(None),
+        refresher=FakeRefresher(),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    saved_a = store.get_account("a")
+    saved_b = store.get_account("b")
+    assert saved_a is not None and saved_a.auth_saved_at is not None
+    assert saved_b is not None and saved_b.auth_saved_at is None
+
+
+@pytest.mark.asyncio
+async def test_auto_switch_uses_pool_rebalance_even_with_in_flight(
+    monkeypatch, tmp_path
+):
+    store = AccountStore(tmp_path)
+    account = store.save_account("A", "a@example.com", {"cookies": []}, account_id="a")
+    store.set_active_account(account.id)
+    called: list[bool] = []
+
+    async def fake_rebalance(self):
+        called.append(True)
+        return {
+            "ok": True,
+            "reason": "rebalanced",
+            "moves": [{"slot_id": "slot-1", "to": "b"}],
+            "idle_slots": 1,
+        }
+
+    monkeypatch.setattr(
+        "aistudio_api.application.instance_switch.InstanceSwitcher.rebalance",
+        fake_rebalance,
+    )
+    service = _service(
+        store,
+        account.id,
+        client=FakePoolClient([FakePoolSlot("a")], in_flight_count=3),
+        rotator=FakeRotator(None),
+        refresher=FakeRefresher(),
+    )
+
+    result = await service.run_now("auto_switch", settings=_settings())
+
+    assert result["reason"] == "rebalanced"
+    assert called == [True]
+
+
 @pytest.mark.asyncio
 async def test_auth_update_without_open_page_does_not_mark_saved(tmp_path):
     store = AccountStore(tmp_path)

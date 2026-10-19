@@ -75,13 +75,21 @@ class FakeCDP:
 
 
 def _features(max_contexts: int = 2) -> dict[str, object]:
-    return {"routing": {"max_contexts": max_contexts}}
+    return {
+        "routing": {"max_contexts": max_contexts, "global_max_pages": 4},
+        "channels": {
+            "chat": {"enabled": True, "max_pages": 2},
+            "build": {"enabled": True, "max_pages": 2},
+            "official": {"enabled": False, "max_pages": 0},
+        },
+    }
 
 
 def _pool(
     cdp: FakeCDP,
     *,
     max_contexts: int = 2,
+    features: dict[str, object] | None = None,
     on_slot_retired=None,
 ) -> InstancePool:
     async def factory(_cdp, **kwargs):
@@ -89,9 +97,10 @@ def _pool(
         session.active_context.auth_user = str(kwargs.get("auth_user") or "0")
         return session
 
+    configured = features or _features(max_contexts)
     return InstancePool(
         lambda: _ready(cdp),
-        features_provider=lambda: _features(max_contexts),
+        features_provider=lambda: configured,
         session_factory=cast("SessionFactory", factory),
         on_slot_retired=on_slot_retired,
         wait_timeout_s=0.0,
@@ -252,5 +261,114 @@ async def test_snapshot_does_not_expose_credentials() -> None:
     assert "auth_file" not in snapshot
     assert "secret" not in str(snapshot)
     assert snapshot["state"] == SlotState.BUSY.value
+    await pool.release(lease)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_page_budget_is_enforced() -> None:
+    cdp = FakeCDP()
+    pool = _pool(
+        cdp,
+        features={
+            "routing": {"max_contexts": 2, "global_max_pages": 4},
+            "channels": {
+                "chat": {"enabled": True, "max_pages": 1},
+                "build": {"enabled": True, "max_pages": 1},
+            },
+        },
+    )
+    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
+    await pool.release(first)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_global_page_budget_is_enforced() -> None:
+    cdp = FakeCDP()
+    pool = _pool(
+        cdp,
+        features={
+            "routing": {"max_contexts": 2, "global_max_pages": 1},
+            "channels": {
+                "chat": {"enabled": True, "max_pages": 2},
+                "build": {"enabled": True, "max_pages": 2},
+            },
+        },
+    )
+    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
+    await pool.release(first)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_group_page_budget_is_enforced() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp)
+    first = await pool.acquire(
+        account_id="a",
+        auth_file="a.json",
+        group_name="pro",
+        group_max_pages=1,
+    )
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(
+            account_id="b",
+            auth_file="b.json",
+            group_name="pro",
+            group_max_pages=1,
+        )
+    other = await pool.acquire(
+        account_id="c",
+        auth_file="c.json",
+        group_name="free",
+        group_max_pages=1,
+    )
+    await pool.release(first)
+    await pool.release(other)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_rebind_idle_slot_changes_account_without_new_context() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp)
+    lease = await pool.acquire(account_id="a", auth_file="a.json", group_name="pro")
+    await pool.release(lease)
+
+    await pool.rebind(
+        lease.slot_id,
+        account_id="b",
+        auth_file="b.json",
+        auth_user="0",
+        channel="chat",
+        group_name="free",
+    )
+    slot = pool.get(lease.slot_id)
+    assert slot is not None
+    assert slot.current_account_id == "b"
+    assert slot.group_name == "free"
+    assert slot.generation == 2
+    assert len(cdp.disposed) == 1
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_rebind_busy_slot_is_rejected() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+    with pytest.raises(InstanceCapacityError):
+        await pool.rebind(
+            lease.slot_id,
+            account_id="b",
+            auth_file="b.json",
+            auth_user="0",
+            channel="chat",
+        )
     await pool.release(lease)
     await pool.close()
