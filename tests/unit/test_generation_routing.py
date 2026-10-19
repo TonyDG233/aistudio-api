@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, cast
@@ -88,7 +89,7 @@ class FakeClient:
     async def generate_content(self, **kwargs):
         self.surface_log.append(str(kwargs.get("surface")))
         outcome = self.outcomes.pop(0)
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
@@ -130,6 +131,12 @@ async def test_generate_uses_pipeline_surface_and_marks_success(monkeypatch) -> 
     pipe = FakePipe(ctx)
     client = FakeClient([_output()], surface_log=[])
     _install(monkeypatch, pipe, ctx)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        generation_service,
+        "record_rotator_event",
+        lambda *_args, **kwargs: events.append(kwargs),
+    )
 
     outcome = await generation_service.generate(
         model_path="gemini-3.8-flash",
@@ -144,6 +151,7 @@ async def test_generate_uses_pipeline_surface_and_marks_success(monkeypatch) -> 
     assert pipe.land_calls == 1
     assert pipe.success is True
     assert pipe.released == ["slot-acc_a"]
+    assert events[-1]["account_id"] == "acc_a"
 
 
 async def test_generate_retries_same_candidate_without_new_switch(monkeypatch) -> None:
@@ -197,6 +205,51 @@ async def test_generate_raises_when_switch_budget_exhausted(monkeypatch) -> None
             atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
         )
     assert caught.value.code == "surface_switch_exhausted"
+    assert pipe.released == ["slot-acc_a"]
+
+
+async def test_generate_cancel_releases_lease(monkeypatch) -> None:
+    ctx = RouteCtx()
+    pipe = FakePipe(ctx)
+    client = FakeClient([asyncio.CancelledError()])
+    _install(monkeypatch, pipe, ctx)
+
+    with pytest.raises(asyncio.CancelledError):
+        await generation_service.generate(
+            model_path="gemini-3.8-flash",
+            req=_request(),
+            client=cast("AIStudioClient", client),
+            atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+        )
+
+    assert pipe.released == ["slot-acc_a"]
+
+
+async def test_generate_skips_capacity_denied_candidate(monkeypatch) -> None:
+    ctx = RouteCtx()
+    pipe = FakePipe(ctx, candidates=["acc_a", "acc_b", "acc_c"])
+
+    async def acquire(ctx, candidate, require_idle=True):
+        if candidate.account_id == "acc_b":
+            raise SurfacePolicyError(
+                "surface_quota_exceeded", message="capacity", advice="wait"
+            )
+        return await FakePipe.acquire(pipe, ctx, candidate, require_idle=require_idle)
+
+    monkeypatch.setattr(pipe, "acquire", acquire)
+    client = FakeClient([AuthError("403"), _output()])
+    _install(monkeypatch, pipe, ctx)
+
+    await generation_service.generate(
+        model_path="gemini-3.8-flash",
+        req=_request(),
+        client=cast("AIStudioClient", client),
+        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+    )
+
+    assert pipe.next_calls == 3
+    assert pipe.land_calls == 2
+    assert pipe.success is True
 
 
 async def test_stream_cancel_releases_lease(monkeypatch) -> None:

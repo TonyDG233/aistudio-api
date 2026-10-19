@@ -166,6 +166,17 @@ async def test_get_all_stats_surface_fields(no_persist: None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_fresh_account_without_stats_is_available(no_persist: None) -> None:
+    store = MagicMock(spec=AccountStore)
+    store.get_account.return_value = _acc("acc_new")
+    rotator = AccountRotator(store)
+
+    assert rotator.get_account_stats("acc_new") is None
+    assert rotator.is_account_available(
+        "acc_new", model="gemini-2.5-pro", surface="chat"
+    )
+
+
 @pytest.mark.asyncio
 async def test_surface_eligibility_hook_excludes_accounts(no_persist: None) -> None:
     store = MagicMock(spec=AccountStore)

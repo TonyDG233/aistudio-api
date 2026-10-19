@@ -58,6 +58,11 @@ class InstanceSlot:
     generation: int = 0
     reservations: int = 0
     pending_pages: int = 0
+    chat_counted: bool = False
+    build_counted: bool = False
+    build_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
     group_name: str = ""
     channel_role: str = ""
     last_used: float = field(default_factory=time.monotonic)
@@ -104,19 +109,22 @@ class InstanceSlot:
     async def ensure_build_surface(self, cdp: CDPClient) -> BuildSurface:
         from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
 
-        if self.build_surface is None:
-            self.build_surface = BuildSurface(
-                cdp,
-                context_id=self.context_id,
-                realm_id=self.realm_id,
+        async with self.build_lock:
+            if self.build_surface is None:
+                self.build_surface = BuildSurface(
+                    cdp,
+                    context_id=self.context_id,
+                    realm_id=self.realm_id,
+                )
+            surface = self.build_surface
+            await surface.ensure_ready(
+                self.auth_file, self.auth_user, account_id=self.current_account_id
             )
-        surface = self.build_surface
-        await surface.ensure_ready(
-            self.auth_file, self.auth_user, account_id=self.current_account_id
-        )
-        return surface
+            return surface
 
     async def close_pages(self) -> None:
+        self.chat_counted = False
+        self.build_counted = False
         surface = self.build_surface
         self.build_surface = None
         if surface is not None:
@@ -205,12 +213,28 @@ class InstancePool:
         return self._page_counts_locked()
 
     def _slot_page_counts(self, slot: InstanceSlot) -> dict[str, int]:
-        return {
-            "chat": (1 if slot.chat_ready() else 0)
-            + (slot.pending_pages if slot.channel_role == "chat" else 0),
-            "build": (1 if slot.build_ready() else 0)
-            + (slot.pending_pages if slot.channel_role == "build" else 0),
-        }
+        # Count acquired surface pages, not the bootstrap chat page that a
+        # build-only context creates for BotGuard. ``pending_pages`` is the
+        # reservation for a surface currently being created; it must not be
+        # added to an already-counted page (that would double-count a build
+        # page during ensure_build_surface).
+        if (
+            slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
+            and slot.in_flight == 0
+            and slot.pending_pages == 0
+        ):
+            if slot.chat_counted and not slot.chat_ready():
+                slot.chat_counted = False
+            if slot.build_counted and not slot.build_ready():
+                slot.build_counted = False
+        chat = 1 if slot.chat_counted else 0
+        build = 1 if slot.build_counted else 0
+        if slot.pending_pages:
+            if slot.channel_role == "chat":
+                chat = max(chat, 1)
+            elif slot.channel_role == "build":
+                build = max(build, 1)
+        return {"chat": chat, "build": build}
 
     def _page_counts_locked(
         self, *, exclude_slot_id: str | None = None
@@ -322,6 +346,10 @@ class InstancePool:
                 "reservations": slot.reservations,
                 "chat_ready": slot.chat_ready(),
                 "build_ready": slot.build_ready(),
+                "chat_counted": slot.chat_counted,
+                "build_counted": slot.build_counted,
+                "pending_pages": slot.pending_pages,
+                "pages": self._slot_page_counts(slot),
                 "last_used": slot.last_used,
                 "slot_rows": list(slot.assigned_slot_rows),
             }
@@ -376,7 +404,13 @@ class InstancePool:
                     break
 
                 if borrow_accounts:
-                    lease = self._lease_borrow_locked(borrow_accounts, channel, surface)
+                    lease = self._lease_borrow_locked(
+                        borrow_accounts,
+                        channel,
+                        surface,
+                        group_name,
+                        group_max_pages,
+                    )
                     if lease is not None:
                         self._touch_locked(lease.adapter)
                         return lease
@@ -419,12 +453,10 @@ class InstancePool:
             )
             if not self._page_ready(slot, surface):
                 await self._ensure_surface(slot, surface)
-        except Exception:
+        except BaseException:
             if lease is None:
-                async with self._condition:
-                    if slot is not None:
-                        self._drop_slot_locked(slot)
-                    self._condition.notify_all()
+                if slot is not None:
+                    await self._discard_slot(slot)
             else:
                 await self.release(lease)
             raise
@@ -432,6 +464,7 @@ class InstancePool:
         async with self._condition:
             slot.reservations = max(1, slot.reservations)
             self._touch_locked(slot)
+            self._condition.notify_all()
             return self._lease_for_slot(slot, channel, surface, is_borrow=False)
 
     async def rebind(
@@ -443,6 +476,7 @@ class InstancePool:
         auth_user: str | None,
         channel: str,
         group_name: str = "",
+        group_max_pages: int | None = None,
     ) -> None:
         """Rebind an idle slot to another account (background switch)."""
         async with self._condition:
@@ -451,10 +485,26 @@ class InstancePool:
                 raise InstanceCapacityError(f"unknown slot: {slot_id}")
             if slot.in_flight > 0:
                 raise InstanceCapacityError(f"slot busy: {slot_id}")
+            if slot.state not in (
+                SlotState.READY,
+                SlotState.COOLDOWN,
+                SlotState.EMPTY,
+            ):
+                raise InstanceCapacityError(
+                    f"slot not idle: {slot_id} state={slot.state.value}"
+                )
+            self._check_page_budget_locked(
+                channel=channel,
+                group_name=group_name or None,
+                group_max_pages=group_max_pages,
+                exclude_slot_id=slot.slot_id,
+            )
             slot.state = SlotState.LOADING
             slot.current_account_id = account_id
             slot.group_name = group_name
             slot.channel_role = channel
+            slot.chat_counted = False
+            slot.build_counted = False
             slot.pending_pages = 1
             slot.reservations = 0
         try:
@@ -464,10 +514,12 @@ class InstancePool:
                 auth_file=auth_file,
                 auth_user=auth_user,
             )
-        except Exception:
-            async with self._condition:
-                self._slots.pop(slot_id, None)
-                self._condition.notify_all()
+            if channel == "build":
+                async with self._condition:
+                    slot.state = SlotState.LOADING
+                await self._ensure_surface(slot, "build")
+        except BaseException:
+            await self._discard_slot(slot)
             raise
         async with self._condition:
             slot.reservations = 0
@@ -477,7 +529,6 @@ class InstancePool:
     async def release(self, lease: InstanceLease) -> None:
         if lease.released:
             return
-        lease.released = True
         async with self._condition:
             slot = self._slots.get(lease.slot_id)
             if slot is not None:
@@ -485,8 +536,13 @@ class InstancePool:
                 slot.last_used = self._clock()
                 if slot.reservations == 0:
                     slot.pending_pages = 0
+                    if not slot.chat_ready():
+                        slot.chat_counted = False
+                    if not slot.build_ready():
+                        slot.build_counted = False
                     if slot.state is SlotState.BUSY:
                         slot.state = SlotState.READY
+            lease.released = True
             self._condition.notify_all()
 
     # -------------------------------------------------------------- slot loading
@@ -499,47 +555,61 @@ class InstancePool:
         group_name: str | None,
         group_max_pages: int | None,
     ) -> InstanceSlot | None:
-        if len(self._slots) < self._max_contexts():
-            self._check_page_budget_locked(
-                channel=channel,
-                group_name=group_name,
-                group_max_pages=group_max_pages,
-            )
-            slot = InstanceSlot(
-                slot_id=f"slot-{next(self._counter)}",
-                state=SlotState.LOADING,
-                current_account_id=account_id,
-                reservations=1,
-                pending_pages=1,
-                group_name=group_name or "",
-                channel_role=channel,
-                last_used=self._clock(),
-            )
-            self._slots[slot.slot_id] = slot
-            return slot
-
         idle = [
             slot
             for slot in self._slots.values()
             if slot.in_flight == 0
             and slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
         ]
+
+        if len(self._slots) < self._max_contexts():
+            try:
+                self._check_page_budget_locked(
+                    channel=channel,
+                    group_name=group_name,
+                    group_max_pages=group_max_pages,
+                )
+            except InstanceCapacityError:
+                # Page budget is full. Wait for an existing slot to become idle or
+                # ready; an in-flight same-page request may satisfy this one.
+                if not idle:
+                    return None
+            else:
+                slot = InstanceSlot(
+                    slot_id=f"slot-{next(self._counter)}",
+                    state=SlotState.LOADING,
+                    current_account_id=account_id,
+                    reservations=1,
+                    pending_pages=1,
+                    group_name=group_name or "",
+                    channel_role=channel,
+                    last_used=self._clock(),
+                )
+                self._slots[slot.slot_id] = slot
+                return slot
+
         if not idle:
             return None
-        slot = min(idle, key=lambda item: item.last_used)
-        self._check_page_budget_locked(
-            channel=channel,
-            group_name=group_name,
-            group_max_pages=group_max_pages,
-            exclude_slot_id=slot.slot_id,
-        )
-        slot.state = SlotState.LOADING
-        slot.current_account_id = account_id
-        slot.reservations = 1
-        slot.pending_pages = 1
-        slot.group_name = group_name or ""
-        slot.channel_role = channel
-        return slot
+        for slot in sorted(idle, key=lambda item: item.last_used):
+            try:
+                self._check_page_budget_locked(
+                    channel=channel,
+                    group_name=group_name,
+                    group_max_pages=group_max_pages,
+                    exclude_slot_id=slot.slot_id,
+                )
+            except InstanceCapacityError:
+                continue
+            slot.state = SlotState.LOADING
+            slot.current_account_id = account_id
+            slot.reservations = 1
+            slot.chat_counted = False
+            slot.build_counted = False
+            slot.pending_pages = 1
+            slot.group_name = group_name or ""
+            slot.channel_role = channel
+            return slot
+        return None
 
     async def _load_slot(
         self,
@@ -552,6 +622,8 @@ class InstancePool:
         cdp = await self._cdp_provider()
         old_context_id = slot.context_id
         old_realm_id = slot.realm_id
+        slot.chat_counted = False
+        slot.build_counted = False
         if old_context_id:
             await slot.close_pages()
             with suppress(Exception):
@@ -562,20 +634,38 @@ class InstancePool:
                 with suppress(Exception):
                     self._on_slot_retired(old_realm_id)
 
-        context_id = await cdp.create_browser_context()
         realm_id = f"{slot.slot_id}-g{slot.generation + 1}"
-        try:
-            session = await self._session_factory(
-                cdp,
-                context_id=context_id,
-                auth_file=auth_file,
-                auth_user=auth_user,
-                realm_id=realm_id,
-            )
-        except Exception:
-            with suppress(Exception):
-                await cdp.dispose_browser_context(context_id)
-            raise
+        context_id = ""
+        session = None
+        last_error: Exception | None = None
+        # Cold-start BotGuard capture occasionally misses the wire template on a
+        # fresh context. Recreate the context once before failing the request.
+        for attempt in range(3):
+            context_id = await cdp.create_browser_context()
+            slot.context_id = context_id
+            try:
+                session = await self._session_factory(
+                    cdp,
+                    context_id=context_id,
+                    auth_file=auth_file,
+                    auth_user=auth_user,
+                    realm_id=realm_id,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                with suppress(Exception):
+                    await cdp.dispose_browser_context(context_id)
+                slot.context_id = ""
+                if attempt < 2:
+                    await asyncio.sleep(2.0)
+            except BaseException:
+                with suppress(Exception):
+                    await cdp.dispose_browser_context(context_id)
+                slot.context_id = ""
+                raise
+        if session is None:
+            raise last_error or RuntimeError("pooled session bootstrap failed")
 
         slot.context_id = context_id
         slot.session = session
@@ -585,6 +675,10 @@ class InstancePool:
         slot.current_account_id = account_id
         slot.state = SlotState.READY
         slot.pending_pages = 0
+        if slot.channel_role == "build":
+            slot.build_counted = True
+        elif slot.channel_role == "chat":
+            slot.chat_counted = True
         slot.last_used = self._clock()
         log.info(
             "[pool] slot loaded: slot=%s account=%s context=%s live=%d/%d",
@@ -614,22 +708,31 @@ class InstancePool:
                 continue
             if surface == "chat" and not slot.chat_ready():
                 continue
-            adding = 1 if surface == "build" and not slot.build_ready() else 0
-            if adding:
-                self._check_page_budget_locked(
-                    channel="build",
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                )
+            counted = slot.chat_counted if surface == "chat" else slot.build_counted
+            pending = slot.pending_pages > 0 and slot.channel_role == surface
+            needs_accounting = not counted and not pending
+            if needs_accounting:
+                try:
+                    self._check_page_budget_locked(
+                        channel=surface,
+                        group_name=group_name,
+                        group_max_pages=group_max_pages,
+                    )
+                except InstanceCapacityError:
+                    continue
             if slot.state is SlotState.READY:
                 slot.state = SlotState.BUSY
             slot.auth_file = auth_file or slot.auth_file
             slot.auth_user = auth_user or slot.auth_user
             slot.group_name = group_name or slot.group_name
             slot.channel_role = surface
+            if surface == "chat":
+                slot.chat_counted = True
+            else:
+                slot.build_counted = True
+                if needs_accounting and not slot.build_ready():
+                    slot.pending_pages += 1
             slot.reservations += 1
-            if adding:
-                slot.pending_pages += 1
             return self._lease_for_slot(slot, channel, surface, is_borrow=False)
         return None
 
@@ -638,6 +741,8 @@ class InstancePool:
         borrow_accounts: set[str],
         channel: str,
         surface: str,
+        group_name: str | None = None,
+        group_max_pages: int | None = None,
     ) -> InstanceLease | None:
         for slot in sorted(self._slots.values(), key=lambda item: item.last_used):
             if slot.current_account_id not in borrow_accounts:
@@ -649,6 +754,20 @@ class InstancePool:
                 continue
             if not self._page_ready(slot, surface):
                 continue
+            counted = slot.chat_counted if surface == "chat" else slot.build_counted
+            if not counted:
+                try:
+                    self._check_page_budget_locked(
+                        channel=surface,
+                        group_name=group_name,
+                        group_max_pages=group_max_pages,
+                    )
+                except InstanceCapacityError:
+                    continue
+                if surface == "chat":
+                    slot.chat_counted = True
+                else:
+                    slot.build_counted = True
             slot.state = SlotState.BUSY
             slot.reservations += 1
             return self._lease_for_slot(slot, channel, surface, is_borrow=True)
@@ -688,6 +807,7 @@ class InstancePool:
         cdp = await self._cdp_provider()
         await slot.ensure_build_surface(cdp)
         slot.pending_pages = 0
+        slot.build_counted = True
 
     def _touch_locked(self, slot: InstanceSlot) -> None:
         slot.last_used = self._clock()
@@ -713,11 +833,13 @@ class InstancePool:
                 slot.state = SlotState.RETIRING
         if not candidates:
             return 0
-        await self._close_slots(candidates)
-        async with self._condition:
-            for slot in candidates:
-                self._slots.pop(slot.slot_id, None)
-            self._condition.notify_all()
+        try:
+            await self._close_slots(candidates)
+        finally:
+            async with self._condition:
+                for slot in candidates:
+                    self._slots.pop(slot.slot_id, None)
+                self._condition.notify_all()
         return len(candidates)
 
     async def close(self) -> None:
@@ -745,6 +867,15 @@ class InstancePool:
                 slot.slot_id,
                 slot.current_account_id,
             )
+
+    async def _discard_slot(self, slot: InstanceSlot) -> None:
+        if slot.context_id:
+            await self._close_slots([slot])
+        else:
+            await slot.close_pages()
+        async with self._condition:
+            self._slots.pop(slot.slot_id, None)
+            self._condition.notify_all()
 
     def _drop_slot_locked(self, slot: InstanceSlot) -> None:
         self._slots.pop(slot.slot_id, None)

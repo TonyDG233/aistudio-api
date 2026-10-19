@@ -1,0 +1,7 @@
+{
+  "tag": "phase-chat-pro-retry",
+  "model": "pg/gemini-flash-latest",
+  "status": 500,
+  "elapsed_s": 18.2,
+  "body": "{\"error\":{\"message\":\"BotGuard service captured but wire template missing\",\"type\":\"api_error\",\"code\":null,\"param\":null}}"
+}

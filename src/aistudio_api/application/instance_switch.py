@@ -17,7 +17,11 @@ from aistudio_api.application.routing_eligibility import (
     EligibleAccount,
     eligible_accounts,
 )
-from aistudio_api.infrastructure.gateway.instance_pool import InstancePool, InstanceSlot
+from aistudio_api.infrastructure.gateway.instance_pool import (
+    InstancePool,
+    InstanceSlot,
+    SlotState,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("instance-switch")
@@ -30,6 +34,7 @@ class SlotView:
     group_name: str
     current_account_id: str
     in_flight: int
+    state: str = SlotState.READY.value
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,7 @@ class RebalanceMove:
     from_account_id: str
     to_account_id: str
     reason: str = "rebalance"
+    group_max_pages: int | None = None
 
 
 def slot_view(slot: InstanceSlot) -> SlotView | None:
@@ -51,12 +57,14 @@ def slot_view(slot: InstanceSlot) -> SlotView | None:
             channel = "chat"
     if not channel:
         return None
+    state = getattr(slot, "state", SlotState.READY)
     return SlotView(
         slot_id=slot.slot_id,
         channel=channel,
         group_name=slot.group_name,
         current_account_id=slot.current_account_id,
         in_flight=slot.in_flight,
+        state=state.value if isinstance(state, SlotState) else str(state),
     )
 
 
@@ -70,7 +78,13 @@ def plan_rebalance(
     """Plan account assignments for idle slots, most constrained slot first."""
     registry = build_registry(features)
     groups = features.get("groups") or []
-    pending = [slot for slot in slots if slot.in_flight == 0 and slot.channel]
+    pending = [
+        slot
+        for slot in slots
+        if slot.in_flight == 0
+        and slot.channel
+        and slot.state in ("ready", "cooldown", "empty")
+    ]
     candidates_by_slot: dict[str, list[EligibleAccount]] = {}
     for slot in pending:
         candidates_by_slot[slot.slot_id] = eligible_accounts(
@@ -117,6 +131,7 @@ def plan_rebalance(
                 group_name=choice.group.name or choice.group.source,
                 from_account_id=slot.current_account_id,
                 to_account_id=choice.account_id,
+                group_max_pages=choice.group.max_pages,
             )
         )
     return moves
@@ -175,6 +190,7 @@ class InstanceSwitcher:
                     auth_user=auth_user,
                     channel=move.channel,
                     group_name=move.group_name,
+                    group_max_pages=move.group_max_pages,
                 )
             except Exception as exc:
                 log.warning(

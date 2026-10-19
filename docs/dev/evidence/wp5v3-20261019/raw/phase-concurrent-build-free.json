@@ -1,0 +1,8 @@
+{
+  "tag": "phase-concurrent-build-free",
+  "model": "build/gemini-flash-latest",
+  "status": 429,
+  "started_at": 1792426291.5352123,
+  "elapsed_s": 0.1,
+  "body": "{\"error\":{\"message\":\"渠道 'build' 实例预算已满，无法为账号 'acc_48cfea06' 装载/切换实例。\",\"type\":\"rate_limit_error\",\"code\":null,\"param\":null}}"
+}
