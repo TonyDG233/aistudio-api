@@ -47,6 +47,7 @@
 | **Gemini API Compatibility** | Supports `/v1beta/...` endpoints including Thinking, multimodal inputs, function calling, and image generation |
 | **Dynamic Model Discovery** | Automatically synchronizes and discovers available models from upstream Google AI Studio |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
+| **Dual Account Keepalive (WP10)** | Scheduled account rotation (long-cycle balancing + real page activity) and automatic Auth refresh (cookies/origins written back to `auth.json`) coexist; a separate 24h tier/email/expiry metadata refresh runs on its own switch |
 | **Runtime State Persistence** | Model usage statistics (`stats.json`) and account 429 cooldown & quota status (`rotator_state.json`) are automatically persisted to disk across restarts |
 | **Downstream Parameter Fault Tolerance** | `drop_unsupported_params` automatically drops unsupported safety categories (e.g. `HARM_CATEGORY_CIVIC_INTEGRITY`) and tools to prevent 400 errors |
 | **Multi-Account Probing** | Extracts and verifies sub-accounts (`u/0`, `u/1`...) automatically when importing a multi-session Cookie |
@@ -231,6 +232,31 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | Dump request/response exchanges to individual disk files |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | Target directory for dumped exchange files |
+| `AISTUDIO_AUTO_SWITCH` | bool | `false` | Enable scheduled account rotation |
+| `AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS` | float | `3.0` | Rotation interval in hours (minimum `0.1`) |
+| `AISTUDIO_KEEPALIVE_AUTH_UPDATE` | bool | `true` | Refresh Auth: write cookies/origins back to `auth.json` |
+| `AISTUDIO_KEEPALIVE_AUTH_UPDATE_HOURS` | float | `24.0` | Credential write-back interval in hours (minimum `0.1`) |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH` | bool | `true` | Refresh tier/email/expiry metadata into `meta.json` |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH_HOURS` | float | `24.0` | Metadata refresh interval in hours (minimum `0.1`) |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH_ON_STARTUP` | bool | `true` | Refresh missing/stale metadata on startup |
+| `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY` | bool | `false` | Light active-page activity (prevents idle browser reclamation) |
+| `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY_SECONDS` | float | `60.0` | Active-page activity interval in seconds (minimum `10`) |
+
+### Account Keepalive (WP10, backend only)
+
+Three independent mechanisms:
+
+1. **Scheduled rotation** (`features.auto_switch`): rotates the active account to the eligible account with the oldest `auth_saved_at`; saves the previous account's Auth before switching and the new account's Auth after; only runs when both chat and build have zero in-flight requests.
+2. **Automatic Auth refresh** (`features.keepalive_auth_update`, equivalent to Ark `ENABLE_AUTH_UPDATE`): atomically merges browser cookies/origins into `auth.json` before switching, after initialization/reconnect, on the 24h interval, and before shutdown. It never writes meta.
+3. **Automatic account-info refresh** (`features.keepalive_metadata_refresh`): periodically writes tier/email/expired/tier_checked_at into `registry.json`/`meta.json`; shares the same refresher and 409 mutex as `POST /api/accounts/refresh`.
+
+Operational endpoints (management auth required):
+
+- `GET /api/keepalive`: switches, intervals, next due times, latest refresh/auth-update/rotation results, and chat/build in-flight counts.
+- `POST /api/keepalive/run`: manually run `metadata_refresh` / `auth_update` / `auto_switch` / `active_activity` for validation or troubleshooting; still subject to mutex and in-flight checks.
+- `PUT /config/features`: structured feature update with atomic persistence and hot reload, ready for the future WP7 UI.
+
+> Config dual-write: the local runtime config is the root `config.yaml` (git-ignored); the distributed default is `defaults/config.yaml` (tracked). Update both, and treat `defaults/config.yaml` as the committed source of truth.
 
 ---
 

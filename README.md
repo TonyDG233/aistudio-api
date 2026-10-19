@@ -47,6 +47,7 @@
 | **Gemini 协议兼容** | 支持 `/v1beta/...` 接口规范，包括 Thinking 思维链、多模态、Function Calling 工具调用及图片生成 |
 | **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
+| **账号双保活（WP10）** | 定时切号（长周期均衡 + 真实页面活动）与自动刷新 Auth（cookies/origins 回写 `auth.json`）并存；另有 24h tier/email/过期元数据刷新，三者独立开关 |
 | **运行状态持久化** | 模型调用量、Token 消耗统计 (`stats.json`) 以及账号 429 限额与冷却状态 (`rotator_state.json`) 自动落盘，容器/服务重启不丢失状态 |
 | **下游参数容错与丢弃** | 支持配置 `drop_unsupported_params` 自动过滤下游传入的非标准安全分类（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）与不兼容工具，避免 400 阻断 |
 | **批量子账号探活** | 导入单个包含多个 Google 身份的 Cookie 后，自动递归探活子账号（`u/0`, `u/1`...）并分别建档 |
@@ -238,12 +239,19 @@ docker compose up -d
 | `AISTUDIO_ROUTE_BY_TIER` | bool | `false` | 是否按账号档位（tier）路由到不同的面 |
 | `AISTUDIO_AUTO_SWITCH` | bool | `false` | 定时自动切换账号总开关 |
 | `AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS` | float | `3.0` | 定时自动切换周期间隔（小时，最小 `0.1`） |
+| `AISTUDIO_KEEPALIVE_AUTH_UPDATE` | bool | `true` | 自动刷新 Auth：把 cookies/origins 回写 `auth.json` |
+| `AISTUDIO_KEEPALIVE_AUTH_UPDATE_HOURS` | float | `24.0` | 凭证回写周期（小时，最小 `0.1`） |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH` | bool | `true` | 自动刷新 tier/email/过期元数据到 `meta.json` |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH_HOURS` | float | `24.0` | 元数据刷新周期（小时，最小 `0.1`） |
+| `AISTUDIO_KEEPALIVE_METADATA_REFRESH_ON_STARTUP` | bool | `true` | 启动时补刷缺失/过期元数据 |
+| `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY` | bool | `false` | 活跃页轻量活动（开启后浏览器不会被空闲回收） |
+| `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY_SECONDS` | float | `60.0` | 活跃页活动间隔（秒，最小 `10`） |
 
 ### 功能开关（features）
 
 > [!IMPORTANT]
 > **两处开关的关系与优先级**：`config.yaml` 顶层的 `features:` 段是**运行时权威配置**（可在 Web 控制台可视化编辑并经 `PUT /config/yaml` **热重载**，无需重启）；上表中的 `AISTUDIO_*` 环境变量仅是**启动时的基线兜底**（进程启动读取一次）。
-> 优先级为：**`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值**。即：`features` 段缺省某项时使用环境变量值，环境变量也未设置时使用内置默认。所有开关默认保守关闭（`fallback` 组默认全关，遵循「零自动回落」决策）。
+> 优先级为：**`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值**。即：`features` 段缺省某项时使用环境变量值，环境变量也未设置时使用内置默认。编排/fallback/活动类开关默认关闭（`fallback` 组默认全关，遵循「零自动回落」决策）；WP10 凭证与账号信息保活默认开启，与 Ark 的 `ENABLE_AUTH_UPDATE` 对齐。
 
 `config.yaml` `features:` 段字段一览（Web 控制台「模型规则与安全策略」页面提供自解释可视化编辑）：
 
@@ -254,6 +262,13 @@ docker compose up -d
 | `features.account_refresh_concurrency` | int | `3` | 批量刷新 email/tier/过期的并发数（范围 1-16）。越大越快但越易限流。失败：单账号失败不影响其余。 |
 | `features.auto_switch` | bool | `false` | 开=按间隔周期轮换账号；关=仅按用量/失败/429 触发。失败：无可切换账号时保持当前账号并告警。 |
 | `features.auto_switch_interval_hours` | float | `3.0` | 自动切换间隔（小时，最小 0.1，与 Ark 一致）。非法值回退 3.0。 |
+| `features.keepalive_auth_update` | bool | `true` | 开=按周期/切号/初始化/重连/关闭前把浏览器 cookies/origins 原子合并写回 `auth.json`；关=仅保留自然回写。此开关不写 meta。 |
+| `features.keepalive_auth_update_hours` | float | `24.0` | 凭证回写周期（小时，最小 0.1）。仅作用于当前活跃账号；非活跃账号在 `auto_switch` 轮转到它时回写。 |
+| `features.keepalive_metadata_refresh` | bool | `true` | 开=自动刷新 tier/email/expired 到 `registry.json`/`meta.json`；与手动刷新共用同一刷新器和 409 互斥。 |
+| `features.keepalive_metadata_refresh_hours` | float | `24.0` | 账号信息刷新周期（小时，最小 0.1）。 |
+| `features.keepalive_metadata_refresh_on_startup` | bool | `true` | 启动时只补刷缺失/过期账号，不阻塞启动。 |
+| `features.keepalive_active_activity` | bool | `false` | 开=周期滚动页面并刷新空闲计时器；代价是浏览器不会被空闲回收。凭证保活不依赖此开关。 |
+| `features.keepalive_active_activity_seconds` | float | `60.0` | 活跃页活动间隔（秒，最小 10）。 |
 | `features.atg.mode` | select | `off` | `off`=禁用（零改动）/ `prefer`=尽力合成、忽略则回退纯文本 / `required`=缺失合成调用即显式失败。 |
 | `features.atg.tool_prefix` | string | `atg_emit_` | 合成工具名前缀（须稳定以利过滤与历史清理）。留空回退默认。 |
 | `features.atg.control_position` | select | `tail` | 控制提示注入位置：`tail`=对话末尾（推荐）/ `head`=开头。非法值回退 `tail`。 |
@@ -278,6 +293,22 @@ docker compose up -d
   - `expired`：`true`（401 已标记过期）/ `false`（有效）/ `null`（非权威失败，如 5xx 或网络故障——账号状态未被改动）
 - 并发：同一时间仅允许一次刷新（重复触发 → `409`）；工作池大小由 `features.account_refresh_concurrency`（默认 3）控制
 - 被标记 `expired` 的账号会被自动排除出账号调度，直至刷新成功或重新导入 cookies；Web 账号页提供 tier/过期徽章与单个、批量刷新按钮
+
+### 账号保活（WP10，纯后端）
+
+三条独立机制，可分别开关：
+
+1. **定时切号** `features.auto_switch`：按间隔把 active 账号轮换到 `auth_saved_at` 最久未回写的可用账号；切号前保存旧账号 Auth，切后保存新账号 Auth；仅 chat + build 均无在途请求时触发。
+2. **自动刷新 Auth** `features.keepalive_auth_update`：等价于 Ark `ENABLE_AUTH_UPDATE`；在切号前、初始化、重连、周期到期、关闭前，把浏览器 cookies/origins 原子合并写回 `auth.json`。**不写 meta**。
+3. **自动更新账号信息** `features.keepalive_metadata_refresh`：周期把 tier/email/expired/tier_checked_at 写回 `registry.json`/`meta.json`；与 `POST /api/accounts/refresh` 共用同一刷新器，重叠时返回 `409`。
+
+运维接口（需管理端鉴权）：
+
+- `GET /api/keepalive`：返回开关、间隔、下次运行、最近一次 refresh/auth_update/auto_switch 结果、chat/build 在途数。
+- `POST /api/keepalive/run`：手动触发 `metadata_refresh` / `auth_update` / `auto_switch` / `active_activity`，用于验收与排障；仍受互斥和在途检查约束。
+- `PUT /config/features`：结构化更新 `features` 并原子落盘、热重载，供后续 WP7 UI 使用。
+
+> 配置双写：本地运行配置是根 `config.yaml`（不被 git 追踪）；分发默认配置是 `defaults/config.yaml`。修改 features 时必须两处同步，提交以 `defaults/config.yaml` 为准。
 
 ### ATG 防截断（synthetic transport）
 
