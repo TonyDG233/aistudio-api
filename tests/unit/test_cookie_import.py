@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from aistudio_api.infrastructure.account.cookie_parser import (
@@ -73,6 +75,40 @@ def test_load_cookies_from_string_keeps_accounts_cookies_from_raw_string(monkeyp
     assert by_name["LSID"]["domain"] == ".google.com"
     assert by_name["ACCOUNT_CHOOSER"]["domain"] == ".google.com"
     assert "__Host-1PLSID" not in by_name
+
+
+def test_parse_cookie_string_prefers_canonical_google_domains():
+    raw = json.dumps(
+        {
+            "cookies": [
+                {"name": "SID", "value": "sid_regional", "domain": ".google.com.sg"},
+                {"name": "SID", "value": "sid_canonical", "domain": ".google.com"},
+                {
+                    "name": "OSID",
+                    "value": "osid_studio",
+                    "domain": "aistudio.google.com",
+                },
+                {"name": "OSID", "value": "osid_regional", "domain": ".google.com"},
+                {
+                    "name": "LSID",
+                    "value": "lsid_accounts",
+                    "domain": "accounts.google.com",
+                },
+                {"name": "LSID", "value": "lsid_regional", "domain": ".google.com.mx"},
+            ]
+        }
+    )
+    state = parse_cookie_string(raw, discard_transient=False)
+    cookies = state.get("cookies")
+    assert isinstance(cookies, list)
+    by_name = {cookie["name"]: cookie for cookie in cookies if isinstance(cookie, dict)}
+
+    assert by_name["SID"]["value"] == "sid_canonical"
+    assert by_name["SID"]["domain"] == ".google.com"
+    assert by_name["OSID"]["value"] == "osid_studio"
+    assert by_name["OSID"]["domain"] == "aistudio.google.com"
+    assert by_name["LSID"]["value"] == "lsid_accounts"
+    assert by_name["LSID"]["domain"] == "accounts.google.com"
 
 
 def test_parse_raw_cookies_json_array_and_netscape():
@@ -200,6 +236,41 @@ async def test_import_bundle_flow(tmp_path):
     persisted = svc.list_accounts()
     assert len(persisted) == 2
     assert svc.get_active_account() is not None
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_accepts_single_old_project_auth_json(tmp_path):
+    from aistudio_api.api.routes_accounts import ImportBundleRequest, import_bundle
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    svc = AccountService(store)
+    raw = json.dumps(
+        {
+            "accountName": "Old Profile",
+            "cookies": [
+                {"name": "SID", "value": "sid_regional", "domain": ".google.com.sg"},
+                {"name": "SID", "value": "sid_canonical", "domain": ".google.com"},
+                {"name": "SAPISID", "value": "sapisid_ok", "domain": ".google.com"},
+            ],
+            "origins": [],
+        }
+    )
+
+    res = await import_bundle(ImportBundleRequest(content=raw), account_service=svc)
+
+    assert res.imported_count == 1
+    assert res.accounts[0].name == "Old Profile"
+    auth_path = svc.get_account_auth_path(res.accounts[0].id)
+    assert auth_path is not None
+    stored = json.loads(auth_path.read_text(encoding="utf-8"))
+    by_name = {
+        cookie["name"]: cookie["value"]
+        for cookie in stored["cookies"]
+        if isinstance(cookie, dict)
+    }
+    assert by_name["SID"] == "sid_canonical"
 
 
 def test_mask_email():
