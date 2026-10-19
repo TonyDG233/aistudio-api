@@ -521,14 +521,14 @@ features:
 ```yaml
 features:
   formats:
-    openai: false
-    claude: false
+    openai: true
+    claude: true
     media:
       allow_private_urls: false
 ```
 
-- 默认关闭：升级后不自动暴露新协议面。
-- 关闭时访问对应路由 → 403 `permission_error`，message 明确提示开启的配置键。
+- 默认开启：对齐 Ark `ProxyServerSystem.js:675-702` 的无条件端点注册，不新增隐藏面。
+- 开关保留作运维手段；关闭时访问对应路由 → 403 `permission_error`，message 明确提示配置键。
 - 开启后 `/v1/models` 对 OpenAI 面可见；Claude 无模型列表端点。
 
 ### 12.2 双写
@@ -665,7 +665,7 @@ class GenerationOutcome:
 
 ## 16. 真机最小验证
 
-前置：本地临时开启 `features.formats.openai/claude`，代理 `http://127.0.0.1:10809` 生效。
+前置：`features.formats.openai/claude` 默认开启；若被运维关闭需先打开。代理 `http://127.0.0.1:10809` 生效。
 
 1. OpenAI 非流式最小 prompt：校验 `object/id/choices/usage`。
 2. OpenAI 流式 `curl -N`：校验 chunk、finish、usage、`[DONE]`。

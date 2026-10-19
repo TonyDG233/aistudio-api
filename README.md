@@ -45,6 +45,8 @@
 | 功能模块 | 说明 |
 |---|---|
 | **Gemini 协议兼容** | 支持 `/v1beta/...` 接口规范，包括 Thinking 思维链、多模态、Function Calling 工具调用及图片生成 |
+| **OpenAI Chat Completions 兼容** | 提供 `/v1/chat/completions` 与 `/v1/models`，支持流式、工具调用、图片与 `reasoning_content`；默认开启 |
+| **Anthropic Messages 兼容** | 提供 `/v1/messages`，支持流式事件、工具调用、thinking 与图片；`count_tokens` 暂未实现 |
 | **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
 | **账号双保活（WP10）** | 定时切号（长周期均衡 + 真实页面活动）与自动刷新 Auth（cookies/origins 回写 `auth.json`）并存；另有 24h tier/email/过期元数据刷新，三者独立开关 |
@@ -269,6 +271,10 @@ docker compose up -d
 | `features.keepalive_metadata_refresh_on_startup` | bool | `true` | 启动时只补刷缺失/过期账号，不阻塞启动。 |
 | `features.keepalive_active_activity` | bool | `false` | 开=周期滚动页面并刷新空闲计时器；代价是浏览器不会被空闲回收。凭证保活不依赖此开关。 |
 | `features.keepalive_active_activity_seconds` | float | `60.0` | 活跃页活动间隔（秒，最小 10）。 |
+| `features.formats.openai` | bool | `true` | 开=提供 `/v1/chat/completions` 与 `/v1/models`；关=对应路由显式 403。默认开启（对齐 Ark 无条件端点注册）。 |
+| `features.formats.claude` | bool | `true` | 开=提供 `/v1/messages`；关=对应路由显式 403。`count_tokens` 仍显式 404。 |
+| `features.formats.media.allow_private_urls` | bool | `false` | 开=允许代理下载私网/回环图片 URL；关=拒绝，防 SSRF。`data:` URL 不受影响。 |
+| `features.atg.mode_by_format` | map | `inherit` | 按协议面覆盖 ATG：`gemini/openai/claude` 分别取 `inherit`（跟随 `features.atg.mode`）或 `off/prefer/required`。 |
 | `features.atg.mode` | select | `off` | `off`=禁用（零改动）/ `prefer`=尽力合成、忽略则回退纯文本 / `required`=缺失合成调用即显式失败。 |
 | `features.atg.tool_prefix` | string | `atg_emit_` | 合成工具名前缀（须稳定以利过滤与历史清理）。留空回退默认。 |
 | `features.atg.control_position` | select | `tail` | 控制提示注入位置：`tail`=对话末尾（推荐）/ `head`=开头。非法值回退 `tail`。 |
@@ -372,6 +378,72 @@ curl http://localhost:8080/v1beta/models/gemini-3.7-flash:streamGenerateContent?
   }'
 ```
 </details>
+
+### OpenAI Chat Completions
+
+Base URL 使用 `http://localhost:8080/v1`，模型名从 `GET /v1/models` 获取。
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "messages": [{"role": "user", "content": "用一句话介绍量子计算。"}],
+    "max_tokens": 256
+  }'
+```
+
+OpenAI Python SDK：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="your-api-key",
+)
+resp = client.chat.completions.create(
+    model="gemini-3.7-flash",
+    messages=[{"role": "user", "content": "用一句话介绍量子计算。"}],
+    max_tokens=256,
+)
+```
+
+### Anthropic Messages
+
+Base URL 使用 `http://localhost:8080`（Anthropic SDK 会自行拼接 `/v1/messages`）。
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "用一句话介绍量子计算。"}]
+  }'
+```
+
+Anthropic Python SDK：
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8080",
+    api_key="your-api-key",
+)
+msg = client.messages.create(
+    model="gemini-3.7-flash",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "用一句话介绍量子计算。"}],
+)
+```
+
+> [!NOTE]
+> 两种格式默认开启；如被运维关闭，会返回 403 并在错误信息中提示对应 `features.formats.*` 配置键。`/v1/messages/count_tokens` 暂未实现，返回显式 404。
 
 ---
 
