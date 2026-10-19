@@ -38,6 +38,7 @@ def _features() -> dict[str, object]:
                 "name": "pro",
                 "match_tier": ["pro"],
                 "allowed_surfaces": ["chat"],
+                "max_pages": 7,
             },
             {
                 "name": "free",
@@ -81,11 +82,25 @@ def test_most_constrained_slot_gets_scarce_account_first() -> None:
     }
 
 
+def test_plan_rebalance_skips_loading_and_retiring_slots() -> None:
+    slots = [
+        SlotView("slot-loading", "chat", "pro", "free-1", 0, "loading"),
+        SlotView("slot-retiring", "chat", "pro", "free-1", 0, "retiring"),
+        SlotView("slot-ready", "chat", "pro", "free-1", 0, "ready"),
+    ]
+    moves = plan_rebalance(
+        slots,
+        [_account("free-1", "free"), _account("pro-1", "pro")],
+        _features(),
+    )
+    assert [move.slot_id for move in moves] == ["slot-ready"]
+
+
 @pytest.mark.asyncio
 async def test_switcher_applies_only_planned_idle_moves() -> None:
     class FakePool:
         def __init__(self) -> None:
-            self.rebound: list[tuple[str, str]] = []
+            self.rebound: list[tuple[str, str, int | None]] = []
 
         def slots(self):
             return [
@@ -110,7 +125,9 @@ async def test_switcher_applies_only_planned_idle_moves() -> None:
             ]
 
         async def rebind(self, slot_id, **kwargs) -> None:
-            self.rebound.append((slot_id, kwargs["account_id"]))
+            self.rebound.append(
+                (slot_id, kwargs["account_id"], kwargs.get("group_max_pages"))
+            )
 
     class FakeStore:
         def list_accounts(self):
@@ -151,4 +168,4 @@ async def test_switcher_applies_only_planned_idle_moves() -> None:
     assert result["moves"] == [
         {"slot_id": "slot-1", "from": "free-1", "to": "pro-1", "channel": "chat"}
     ]
-    assert pool.rebound == [("slot-1", "pro-1")]
+    assert pool.rebound == [("slot-1", "pro-1", 7)]

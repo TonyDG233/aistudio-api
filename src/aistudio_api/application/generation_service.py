@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import Any, NoReturn, cast
 
 from fastapi import HTTPException
 
@@ -33,11 +33,17 @@ from aistudio_api.application.routing_pipeline import (
     RoutingPipeline,
     get_routing_pipeline,
 )
-from aistudio_api.application.surface_orchestrator import SurfacePolicyError
+from aistudio_api.application.surface_orchestrator import (
+    SurfacePolicyError,
+    get_configured_groups,
+    resolve_surface,
+)
+from aistudio_api.application.testing_hooks import forced_429
 from aistudio_api.application.upstream_errors import (
     handle_attempt_exception,
     to_gemini_finish_reason,
 )
+from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.instance_pool import InstanceLease
@@ -125,11 +131,6 @@ def _resolve_surface(model_path: str) -> str:
     ``features.groups``. Raises ``SurfacePolicyError`` for policy denials; the
     caller maps those to an explicit 4xx body (no silent surface switch).
     """
-    from aistudio_api.application.surface_orchestrator import (
-        get_configured_groups,
-        resolve_surface,
-    )
-
     try:
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_features_config,
@@ -188,6 +189,32 @@ def _raise_switch_exhausted(ctx: RouteContext) -> NoReturn:
         ),
         advice="请稍后重试、检查账号健康度，或调整 features.routing 预算。",
     )
+
+
+async def _acquire_candidate_lease(
+    pipe: RoutingPipeline,
+    ctx: RouteContext,
+    candidate: Any,
+) -> tuple[Any, InstanceLease]:
+    """Acquire a candidate, advancing past per-candidate capacity denials."""
+    last_capacity: SurfacePolicyError | None = None
+    skipped = 0
+    skip_limit = max(1, int(cast("int", ctx.budget.snapshot()["max_switches"])) + 1)
+    while True:
+        try:
+            return candidate, await pipe.acquire(ctx, candidate)
+        except SurfacePolicyError as exc:
+            if exc.code != "surface_quota_exceeded":
+                raise
+            last_capacity = exc
+            skipped += 1
+            if skipped > skip_limit:
+                raise last_capacity from None
+            candidate = pipe.next_candidate(ctx, candidate.account_id)
+            if candidate is None:
+                if last_capacity is not None:
+                    raise last_capacity from None
+                _raise_switch_exhausted(ctx)
 
 
 async def generate(
@@ -249,7 +276,7 @@ async def generate(
                 candidate = pipe.next_candidate(ctx, previous)
                 if candidate is None:
                     _raise_switch_exhausted(ctx)
-                lease = await pipe.acquire(ctx, candidate)
+                candidate, lease = await _acquire_candidate_lease(pipe, ctx, candidate)
             else:
                 ctx.retry_same = False
         else:
@@ -271,6 +298,12 @@ async def generate(
             max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
             output: ModelOutput | None = None
             for empty_attempt in range(max_empty + 1):
+                if forced_429(
+                    account_id=lease.account_id if lease is not None else None,
+                    model=normalized.model,
+                    surface=surface,
+                ):
+                    raise UsageLimitExceeded("forced 429 by AISTUDIO_TEST_FORCE_429")
                 output = await client.generate_content(
                     model=normalized.model,
                     capture_prompt=normalized.capture_prompt,
@@ -320,11 +353,17 @@ async def generate(
                     json.dumps(unwrap.stats.to_dict(), ensure_ascii=False),
                 )
 
+            success_account_id = lease.account_id if lease is not None else None
             if pipe is not None and ctx is not None:
                 pipe.record_success(ctx)
                 await pipe.release(ctx, lease)
                 lease = None
-            record_rotator_event("success", model=normalized.model, surface=surface)
+            record_rotator_event(
+                "success",
+                model=normalized.model,
+                surface=surface,
+                account_id=success_account_id,
+            )
             runtime_state.record(
                 normalized.model, "success", output.usage, api_format=api_format
             )
@@ -346,22 +385,34 @@ async def generate(
             )
         except Exception as exc:
             last_error = exc
-            if await handle_attempt_exception(
-                exc,
-                attempt=attempt,
-                model_path=model_path,
-                normalized_model=normalized.model if normalized else None,
-                client=client,
-                api_format=api_format,
-                surface=surface,
-                routing=pipe,
-                route_ctx=ctx,
-                lease=lease,
-            ):
+            try:
+                retry = await handle_attempt_exception(
+                    exc,
+                    attempt=attempt,
+                    model_path=model_path,
+                    normalized_model=normalized.model if normalized else None,
+                    client=client,
+                    api_format=api_format,
+                    surface=surface,
+                    routing=pipe,
+                    route_ctx=ctx,
+                    lease=lease,
+                )
+            except BaseException:
+                if pipe is not None and ctx is not None:
+                    await pipe.release(ctx, lease)
+                    lease = None
+                raise
+            if retry:
                 if pipe is not None and ctx is not None and not ctx.retry_same:
                     await pipe.release(ctx, lease)
                     lease = None
                 continue
+            if pipe is not None and ctx is not None:
+                await pipe.release(ctx, lease)
+                lease = None
+            raise
+        except BaseException:
             if pipe is not None and ctx is not None:
                 await pipe.release(ctx, lease)
                 lease = None
@@ -466,7 +517,7 @@ async def _stream_generation_impl(
                     payload="resolving-instance",
                     model=effective_model_path,
                 )
-                lease = await pipe.acquire(ctx, candidate)
+                candidate, lease = await _acquire_candidate_lease(pipe, ctx, candidate)
                 lease_holder.lease = lease
             else:
                 ctx.retry_same = False
@@ -484,6 +535,12 @@ async def _stream_generation_impl(
         while True:
             produced_content = False
             try:
+                if forced_429(
+                    account_id=lease.account_id if lease is not None else None,
+                    model=normalized.model,
+                    surface=surface,
+                ):
+                    raise UsageLimitExceeded("forced 429 by AISTUDIO_TEST_FORCE_429")
                 if surface == "build":
                     stream_iter = client.stream_generate_content(
                         model=normalized.model,
@@ -561,19 +618,27 @@ async def _stream_generation_impl(
                         )
                         buffered_thought_sig = None
             except Exception as exc:
-                if await handle_attempt_exception(
-                    exc,
-                    attempt=stream_attempt,
-                    model_path=model_path,
-                    normalized_model=normalized.model if normalized else None,
-                    client=client,
-                    has_yielded_data=has_yielded_data,
-                    surface=surface,
-                    api_format=api_format,
-                    routing=pipe,
-                    route_ctx=ctx,
-                    lease=lease,
-                ):
+                try:
+                    retry = await handle_attempt_exception(
+                        exc,
+                        attempt=stream_attempt,
+                        model_path=model_path,
+                        normalized_model=normalized.model if normalized else None,
+                        client=client,
+                        has_yielded_data=has_yielded_data,
+                        surface=surface,
+                        api_format=api_format,
+                        routing=pipe,
+                        route_ctx=ctx,
+                        lease=lease,
+                    )
+                except Exception:
+                    if pipe is not None and ctx is not None:
+                        await pipe.release(ctx, lease)
+                        lease = None
+                        lease_holder.lease = None
+                    raise
+                if retry:
                     if pipe is not None and ctx is not None and not ctx.retry_same:
                         await pipe.release(ctx, lease)
                         lease = None
@@ -632,12 +697,18 @@ async def _stream_generation_impl(
         break
 
     target_model = normalized.model if normalized else model_path
+    success_account_id = lease.account_id if lease is not None else None
     if pipe is not None and ctx is not None:
         pipe.record_success(ctx)
         await pipe.release(ctx, lease)
         lease = None
         lease_holder.lease = None
-    record_rotator_event("success", model=target_model, surface=surface)
+    record_rotator_event(
+        "success",
+        model=target_model,
+        surface=surface,
+        account_id=success_account_id,
+    )
     if normalized is not None:
         runtime_state.record(
             normalized.model, "success", final_usage, api_format=api_format

@@ -326,11 +326,13 @@ class RoutingPipeline:
         candidates.sort(
             key=lambda candidate: (
                 0 if candidate.available else 1,
-                0 if candidate.slot_index is not None else 1,
-                0 if candidate.account_id in ready_accounts else 1,
                 candidate.affinity,
                 -candidate.weight,
                 self._score(candidate, rotator),
+                # Slot/ready reuse is a tie-breaker, not a starvation switch:
+                # an already-warm account must not pin all future requests.
+                0 if candidate.slot_index is not None else 1,
+                0 if candidate.account_id in ready_accounts else 1,
                 candidate.account_id,
             )
         )
@@ -386,7 +388,11 @@ class RoutingPipeline:
                 stats = None
         requests = float(getattr(stats, "requests", 0) or 0)
         last_used = float(getattr(stats, "last_used", 0) or 0)
-        return (requests / candidate.weight, last_used, candidate.account_id)
+        # Last-used is the primary fairness signal. Lifetime request totals must
+        # not starve an older account behind newer accounts forever. Keep a
+        # candidate-identity tie-break in the outer sort so a warm slot can
+        # break an exact fairness tie.
+        return (last_used, requests / candidate.weight)
 
     def next_candidate(
         self, ctx: RouteContext, failed_account_id: str | None = None
@@ -405,7 +411,7 @@ class RoutingPipeline:
         ctx.attempted.add(candidate.account_id)
         auth_file, auth_user = self._auth_for(candidate.account_id)
         first_attempt = not ctx.failed and not ctx.attempted - {candidate.account_id}
-        timeout_s = 5.0 if first_attempt else 0.0
+        timeout_s = 30.0 if first_attempt else 15.0
         try:
             lease = await self.pool.acquire(
                 account_id=candidate.account_id,

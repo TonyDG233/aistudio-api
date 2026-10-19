@@ -602,7 +602,9 @@ class AccountRotator:
         if account is not None and getattr(account, "expired", False):
             return False
         stats = self.get_account_stats(account_id)
-        return bool(stats and stats.is_available(model, surface=surface))
+        if stats is None:
+            return True
+        return stats.is_available(model, surface=surface)
 
     def _warn_if_all_expired(self) -> None:
         """当全部账号都因凭据过期而不可调度时，显式报错（不静默回落）。"""
