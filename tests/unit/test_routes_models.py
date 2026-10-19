@@ -42,11 +42,17 @@ async def test_get_single_model_returns_model_object(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_v1_models_endpoint_is_removed(monkeypatch):
+async def test_v1_models_can_be_disabled(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(
+        "aistudio_api.api.format_errors.format_enabled", lambda _fmt: False
+    )
     async with _build_client() as client:
         response = await client.get("/v1/models")
-        assert response.status_code == 404
+        assert response.status_code == 403
+        error = response.json()["error"]
+        assert error["type"] == "permission_error"
+        assert "features.formats.openai" in error["message"]
 
 
 @pytest.mark.asyncio
