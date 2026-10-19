@@ -1,6 +1,6 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成；WP10、WP8、P4.5 WP5 二期已完成（2026-10-19）；下一站 P4.6 WP11 真实 Token 计数 → P5 WP6 统计 + WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3、WP10、WP8 已完成；WP5 二期已实现但功能审计不通过（default/realm 分立），2026-10-19 转入 WP5 v3（统一 Context 实例池）；下一站 P4.5 v3 实现 → P4.6 WP11 真实 Token 计数 → P5 WP6 统计 + WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
 >
@@ -188,6 +188,8 @@
 - **二期（复杂策略组）另立 WP：见下文「WP5 二期 复杂策略组（仅后端）」；纯后端，UI 归 WP7。**
 
 ### WP5 二期 复杂策略组（仅后端，P4.5）
+> **2026-10-19 v3 重定向**：WP5 二期已按 v2 落地 4 个本地提交（未 push），但功能审计发现结构性缺陷：默认会话/Realm 分立、Realm 按账号硬绑定、`max_realms` 与 `global_max_instances` 重叠、`pro-only` 账号能力未校验、跨组选账号缺失、页面数/环境数计数不一致。v2 实现仅作为中间态，**不视为完成**。WP5 v3 以统一 Context 实例池取代 default/realm 分立；设计稿见 `docs/dev/WP5-V3-DESIGN-20261019.md`，本文件与 UI 稿冲突处以 v3 设计稿为准。以下 v2 范围保留作历史基线，v3 增量见「WP5 v3 修订」。
+>
 > 与 WP5 v1 的分界：v1 已交付「组配置 + 首中匹配 + 面守卫 + 按账号页配额 + surface 冷却键 + 实例快照」；本 WP 交付 UI 稿定义的全部**策略组后端逻辑**。**本 WP 不含任何前端改动**；所有 UI 在 WP7。
 
 **参考文档（执行前必读，按序）**：
@@ -232,7 +234,32 @@
 - 渠道注册表/账号覆盖：开关与覆盖生效且可回退。
 - 全关时零行为变化；证据入 `docs/dev/evidence/wp5b-<date>/`。
 
-**完成状态（2026-10-19）**：后端已落地并通过 732 项单测；真机完成零配置 chat、`official/` 403、组约束、预算 429、pro chat + free build 跨账号并发（`live_instances=2`、`live_realms=1`）。证据 `docs/dev/evidence/wp5b-20261019/`。borrow 仅有单测证据（真机仅 2 账号，未构造出稳定借入场景）；失败链故障注入由单测覆盖。argon 真机调用 0 次。
+**v2 中间态（2026-10-19，未 push）**：4 个本地提交（`cdb9e15`、`ec35c8d`、`28c981f`、`4035d36`）；732 项单测通过；真机完成零配置 chat、`official/` 403、组约束、预算 429、pro chat + free build 跨账号并发。证据 `docs/dev/evidence/wp5b-20261019/`。但 v2 的实例所有权模型不通过功能审计，不能作为最终交付。
+
+### WP5 v3 修订（2026-10-19，取代 v2 实例层）
+
+**设计稿**：`docs/dev/WP5-V3-DESIGN-20261019.md`
+
+**必须修正**：
+1. **取消 default/realm 分立**：所有 Context 是统一实例池中的平等槽位；`BrowserSession` 只是槽位实现，不是特权默认实例。
+2. **取消 Realm 按账号硬绑定**：槽位空闲时可卸载旧账号、装载目标账号；账号→最近槽位仅作软亲和。
+3. **实例切换方向**：先按紧急度选槽位，再筛合格账号；最受限槽位优先；渠道亲和（free→build、pro→pg；pro→build 回退）；黏性/占用惩罚/权重/last_used 排序；在途槽位不换绑。
+4. **请求期派发前切换**：当前实例账号能力不足但列表有合格账号时，保留请求、切换/装载合格实例后再发上游；不得先发给不支持实例再报错。
+5. **pro-only 账号能力**：argon/Pro 系模型必须落 pro/paid 账号；当前仅有 chat-only 面守卫，必须补 tier/额度池资格。
+6. **额度池（QuotaPool）**：free/pro 额度是资格；渠道声明 `quota_pool`，账号声明可用池；避免 pro 占用 build、free 进入 pg。
+7. **预算口径**：页面数（global/channel/group）与 Context 数（`max_contexts`）分开；取消 `max_realms`/`global_max_instances` 重叠和“一 Realm=一实例”补丁。默认建议 `global_max_pages=2`、`pg.max_pages=1`、`build.max_pages=1`、`max_contexts=2`。
+8. **槽位语义**：`(账号×渠道)` 行是预留/优先级，不是永久 Context；计划数=启用行数，当前数=活页面数。
+9. **模型列表**：单模式裸 ID；多模式只列启用且已实现渠道的规范前缀（`pg/`、`build/`）；`chat/`、`playground/` 仅输入别名；`official/` 未实现不列；禁止按别名重复完整列表。
+
+**v3 验收**：
+- 2 个 Context、50 个账号轮换：Context 数不增长，请求成功。
+- free 组只进 build，pro 可进 pg/build；pro 不抢 build，pg 不因 pro 被 build 占用而空缺。
+- pro-only 模型在列表有 pro 时自动切换/装载 pro 再发送；无 pro 时显式 403。
+- 页面预算与 Context 预算分别生效；渠道默认 1/1 + 全局 2 时第三个页面请求显式 429。
+- 在途槽位不被切换；borrow 仅首字节前；失败链预算/熔断生效。
+- 真机：pro chat + free build 并发、3 账号轮换、Context 数稳定；argon ≤2 次。
+
+**保留复用**：渠道注册表、组 `allowed_surfaces`、账号级 `AccountMeta.routing`、失败链/切换预算/熔断、borrow、槽位计划数、`/surface/instances` 快照。
 
 ### WP6 统计整合（M）
 **以本仓库现有统计为底座增量扩维**（不引入第二套存储）：
@@ -316,7 +343,7 @@
 | P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。✅ 完成（2026-10-18 晚）：WP4 服务内验收 2/2（`docs/dev/evidence/p3-build3/`）；WP5 实现完毕并经真机五相位验收全绿——组路由 build 200 / argon chat 200 / 守卫 403×2 / 配额 429，决策链可 grep（`docs/dev/evidence/wp5-20261018/`）；根因与结论见 `docs/dev/AUDIT-P2P3-20261018.md` 附、附三与附四；2026-10-18 深夜追加 Build 通信加固（复用快路径实测 3.9s、过门重试环、原地恢复） |
 | P3.5 | WP10 | 账号保活双机制（旧定时切号 + 新自动刷新）闭环；纯后端，UI 不在本阶段 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
-| P4.5 | WP5 二期 | 复杂策略组后端全部落地（管线/裸名矩阵/槽位/四层预算/borrow/失败链/渠道注册表/账号覆盖/Realm 落点）；UI 不在本阶段 |
+| P4.5 | WP5 v3 | 统一 Context 实例池（取消 default/realm 分立）；请求期派发前切换 + 实例切换方向；额度池/组约束/槽位/页面与环境预算/borrow/失败链/渠道注册表/账号覆盖；模型列表规范前缀；UI 不在本阶段 |
 | P4.6 | WP11 | 真实上游 token 计数（Claude `count_tokens`、Responses `input_tokens`）；禁止本地估算；纯后端 |
 | P5 | WP6 + WP7 | 统计（后端，含 formatBreakdown）+ WP7（UI 统一修改）/文档/质量门全绿/致谢入库 |
 

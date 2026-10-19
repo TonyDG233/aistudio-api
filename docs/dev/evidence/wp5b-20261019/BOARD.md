@@ -135,13 +135,22 @@ groups:
 | 2026-10-19 12:38 | Phase 1 配置/纯策略 | 完成 | 新增 channel_registry/account_routing/AccountMeta.routing；单测 680 passed；pyright 0；ruff 通过 |
 | 2026-10-19 12:39 | Phase 2 管线/级别 A | 完成 | commit `ec35c8d`；721 passed；pyright 0；ruff/format 通过 |
 | 2026-10-19 12:53 | Phase 3 跨账号 Realm | 完成 | commit `28c981f`；731 passed；pyright 0 |
-| 2026-10-19 13:20 | Phase 4 真机 | 完成 | chat/official/group/quota/cross-account；argon 0；证据 README |
-| 2026-10-19 13:25 | 收尾 | 进行中 | 全量 732 passed；ruff/format/pyright 通过；待提交 |
+| 2026-10-19 13:20 | Phase 4 真机（v2） | 完成 | chat/official/group/quota/cross-account；argon 0；证据 README |
+| 2026-10-19 13:25 | v2 收尾 | 完成 | commit `4035d36`；全量 732 passed；ruff/format/pyright 通过 |
+| 2026-10-19 14:35 | v3 设计重定向 | 完成 | `docs/dev/WP5-V3-DESIGN-20261019.md`；UI 稿与 PLAN 已更新；v2 实例层不视为最终交付 |
 
-## 8. Phase 4 补充决策
+## 8. Phase 4 补充决策（v2 中间态，已被 v3 取代）
 
-- 全局实例预算口径：**一个存活 Realm 计一个全局实例槽**；Realm 内部的 chat 引导页与 build 页不重复计入 global，
-  避免“pro chat + free build”在 global_max=2 时被误判为 3。渠道预算仍按目标渠道页面计数。
-- 活跃账号请求优先使用默认会话，非活跃账号才创建 Realm；单账号场景不会额外开 BrowserContext。
-- borrow 已实现“复用其它账号空闲且就绪的 Realm”，首字节前生效；当前真机只有 2 个账号，未构造出借入场景，保留单测证据。
-| | Phase 4 | 未开始 | |
+> 以下为 v2 实现的临时口径，保留作历史证据；**最终执行以 `docs/dev/WP5-V3-DESIGN-20261019.md` 为准**。
+
+- v2 曾把“一个存活 Realm 计一个全局实例槽”；v3 改为页面数与环境数分开计数，取消该补丁。
+- v2 曾让活跃账号使用默认会话、非活跃账号创建 Realm；v3 取消默认/Realm 分立，改为统一 Context 实例池。
+- v2 的 borrow 复用“其它账号空闲且就绪的 Realm”；v3 保留 borrow 语义，但挂到统一实例池上。
+
+## 9. v3 重定向（2026-10-19）
+
+- **v2 功能审计不通过**：default/realm 分立、Realm 按账号硬绑定、`max_realms`/`global_max_instances` 重叠、pro-only 账号能力缺失、跨组选账号缺失、页面/环境计数不一致。
+- **v3 目标**：统一 Context 实例池；请求期派发前切换/装载；实例切换方向（最受限槽位优先 + 渠道亲和）；额度池；页面/环境预算分开；模型列表规范前缀。
+- **唯一执行口径**：`docs/dev/WP5-V3-DESIGN-20261019.md`。
+- **v2 提交**：`cdb9e15`、`ec35c8d`、`28c981f`、`4035d36` 保留为中间态，未 push；v3 实现可复用渠道注册表、组约束、账号 routing、失败链、borrow、槽位计划数。
+- **下一步**：按 v3 出逐文件实现计划 → 实现 → 单测/真机 → 提交（不 push）。
