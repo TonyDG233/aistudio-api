@@ -51,7 +51,7 @@ class AccountService:
         account_id: str,
         browser_session: BrowserSession,
     ) -> AccountMeta | None:
-        """切换到指定账号。"""
+        """切换到指定账号（失败回滚活跃标记；模板缺失自动重试一次）。"""
         account = self._store.get_account(account_id)
         if account is None:
             return None
@@ -61,12 +61,45 @@ class AccountService:
             logger.error("账号 %s 的账号目录不存在", account_id)
             return None
 
+        previous = self._store.get_active_account()
+        previous_id = previous.id if previous is not None else None
+
         self._store.set_active_account(account_id)
         logger.info("已切换活跃账号持久化状态: %s", account_id)
-        await browser_session.switch_auth(str(auth_path))
-        await browser_session.ensure_botguard_service()
+        try:
+            await self._switch_with_template_retry(browser_session, str(auth_path))
+        except Exception:
+            if previous_id and self._store.get_account(previous_id) is not None:
+                self._store.set_active_account(previous_id)
+                logger.warning(
+                    "账号切换失败，已回滚活跃账号持久化状态为: %s", previous_id
+                )
+            raise
         logger.info("已切换到账号: %s (%s)", account_id, account.name)
         return account
+
+    async def _switch_with_template_retry(
+        self,
+        browser_session: BrowserSession,
+        auth_path: str,
+        attempts: int = 2,
+    ) -> None:
+        """切换会话；BotGuard 模板缺失属偶发竞态，重试一次。"""
+        for attempt in range(attempts):
+            try:
+                await browser_session.switch_auth(auth_path)
+                await browser_session.ensure_botguard_service()
+                return
+            except RuntimeError as exc:
+                retryable = "wire template missing" in str(exc).lower()
+                if not retryable or attempt >= attempts - 1:
+                    raise
+                logger.warning(
+                    "BotGuard 模板缺失，重试账号切换 (%d/%d): %s",
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
 
     def delete_account(self, account_id: str) -> bool:
         """删除账号。"""
