@@ -1,0 +1,510 @@
+"""Protocol-neutral generation pipeline.
+
+Both the Gemini-compatible handler and the OpenAI / Claude format faces use
+this module. It owns ATG wrapping/unwrapping, surface resolution, retries,
+account switching, empty-response retries and usage accounting. Rendering to a
+specific wire protocol happens outside, in the API layer.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+
+from fastapi import HTTPException
+
+from aistudio_api.api.schemas import GeminiGenerateContentRequest
+from aistudio_api.api.state import runtime_state
+from aistudio_api.application.account_orchestrator import (
+    MAX_RETRIES,
+    ensure_active_account,
+    record_rotator_event,
+)
+from aistudio_api.application.atg import AtgProcessor, create_atg_processor
+from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.chat_service import (
+    NormalizedGeminiRequest,
+    normalize_gemini_request,
+)
+from aistudio_api.application.upstream_errors import (
+    handle_attempt_exception,
+    to_gemini_finish_reason,
+)
+from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("generation")
+
+# ATG event types forwarded through the streaming unwrapper. usage /
+# finish_reason / response_id / thought_signature keep their dedicated branches.
+_ATG_STREAM_EVENT_TYPES = frozenset(
+    {"body", "thinking", "tool_calls", "images", "reasoning_images"}
+)
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """One protocol-neutral streaming event.
+
+    ``kind`` uses the existing gateway event vocabulary:
+    body / thinking / tool_calls / images / reasoning_images / usage.
+    The terminal ``usage`` event carries the finish reason and response id.
+    """
+
+    kind: str
+    payload: object
+    model: str | None = None
+    response_id: str | None = None
+    thought_signature: str | None = None
+    finish_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class GenerationOutcome:
+    output: ModelOutput
+    model: str
+    finish_reason: str
+    response_id: str | None
+    surface: str
+
+
+def _output_is_empty(output: ModelOutput) -> bool:
+    """ATG emptiness test: no text, no thinking and no tool calls at all."""
+    if not output.candidates:
+        return True
+    candidate = output.candidates[0]
+    return not (candidate.text or candidate.thinking or candidate.function_calls)
+
+
+def _create_atg(
+    api_format: str,
+    atg_factory: Callable[[], AtgProcessor] | None,
+) -> AtgProcessor:
+    if atg_factory is not None:
+        return atg_factory()
+    if api_format == "gemini":
+        return create_atg_processor()
+    from aistudio_api.application.atg.config import resolve_atg_mode
+
+    return create_atg_processor({"mode": resolve_atg_mode(api_format)})
+
+
+def _resolve_surface(model_path: str) -> str:
+    """Resolve the surface for streaming requests (WP5 surface orchestration).
+
+    Thin adapter over
+    :func:`aistudio_api.application.surface_orchestrator.resolve_surface`, which
+    owns the priority chain (``AISTUDIO_SURFACE_OVERRIDE`` > legacy tier routing
+    when ``features.route_by_tier`` is off > group/default-tier policy when on).
+    Reads the active account's tier/email and the hot-reloadable feature flags +
+    ``features.groups``. Raises ``SurfacePolicyError`` for policy denials; the
+    caller maps those to an explicit 4xx body (no silent surface switch).
+    """
+    from aistudio_api.application.surface_orchestrator import (
+        get_configured_groups,
+        resolve_surface,
+    )
+
+    try:
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_features_config,
+        )
+
+        features = dict(get_features_config())
+    except Exception:
+        features = {}
+    if "groups" not in features:
+        features["groups"] = get_configured_groups()
+
+    tier: str | None = None
+    email: str | None = None
+    try:
+        from aistudio_api.infrastructure.account.account_store import AccountStore
+
+        account = AccountStore().get_active_account()
+        if account is not None:
+            tier = account.tier
+            email = getattr(account, "email", None)
+    except Exception:
+        tier = None
+        email = None
+
+    return resolve_surface(model_path, tier, email, features).surface
+
+
+async def generate(
+    *,
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+    api_format: str = "gemini",
+    atg_factory: Callable[[], AtgProcessor] | None = None,
+) -> GenerationOutcome:
+    """Run a non-streaming generation, returning a protocol-neutral outcome."""
+    # ATG: inject the synthetic transport once, before normalization. The wrapped
+    # request is reused for every retry so the synthetic declaration and control
+    # turn never stack. The synthetic tool name lives only in this request scope.
+    atg = _create_atg(api_format, atg_factory)
+    tool_name = ""
+    if atg.enabled:
+        atg_body = req.model_dump(mode="json", exclude_none=True)
+        wrap = atg.wrap(atg_body, model_path)
+        if wrap.client_synthetic is not None:
+            logger.info(
+                "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
+                wrap.client_synthetic.name or "(instruction-only)",
+                wrap.client_synthetic.reason,
+            )
+        elif wrap.synthetic_hit:
+            logger.info(
+                "[ATG] 已注入合成通道: tool=%s, model=%s, contents=%d, tools=%d",
+                wrap.tool_name,
+                model_path,
+                len(atg_body.get("contents") or []),
+                len(atg_body.get("tools") or []),
+            )
+            req = GeminiGenerateContentRequest.model_validate(wrap.body)
+            tool_name = wrap.tool_name
+        else:
+            logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
+
+    last_error: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        await ensure_active_account(attempt, model=model_path)
+        normalized: NormalizedGeminiRequest | None = None
+        try:
+            normalized = normalize_gemini_request(req, model_path)
+            logger.info(
+                "生成请求: format=%s, model=%s, 对话轮数=%s, 流式=否, 尝试第 %d 次",
+                api_format,
+                normalized.model,
+                len(req.contents),
+                attempt + 1,
+            )
+
+            # ATG empty-response retry: a fully empty (collapsed) upstream result
+            # is re-sent up to cfg.empty_retries times. This layer never switches
+            # accounts; it only re-sends within the current attempt.
+            max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
+            output: ModelOutput | None = None
+            for empty_attempt in range(max_empty + 1):
+                output = await client.generate_content(
+                    model=normalized.model,
+                    capture_prompt=normalized.capture_prompt,
+                    capture_images=normalized.capture_images,
+                    contents=normalized.contents,
+                    system_instruction_content=normalized.system_instruction,
+                    tools=normalized.tools,
+                    tool_config=normalized.tool_config,
+                    safety_settings=normalized.safety_settings,
+                    temperature=normalized.temperature,
+                    top_p=normalized.top_p,
+                    top_k=normalized.top_k,
+                    max_tokens=normalized.max_tokens,
+                    generation_config_overrides=normalized.generation_config_overrides,
+                    sanitize_plain_text=False,
+                )
+                if not (atg.enabled and tool_name):
+                    break
+                if not _output_is_empty(output):
+                    break
+                if empty_attempt < max_empty:
+                    logger.warning(
+                        "[ATG] 空响应，重发 (%d/%d): model=%s",
+                        empty_attempt + 1,
+                        max_empty,
+                        model_path,
+                    )
+                    continue
+                logger.warning(
+                    "[ATG] empty response retries exhausted: model=%s", model_path
+                )
+                if atg.cfg.mode == "required":
+                    raise SyntheticRequiredError(
+                        "synthetic tool call required but not present in upstream response"
+                    )
+            assert output is not None
+
+            if atg.enabled and tool_name:
+                unwrap = atg.unwrap_response(output, tool_name)
+                output = unwrap.output
+                logger.info(
+                    "[ATG] 非流式解包: tool=%s, stats=%s",
+                    tool_name,
+                    json.dumps(unwrap.stats.to_dict(), ensure_ascii=False),
+                )
+
+            record_rotator_event("success", model=normalized.model)
+            runtime_state.record(
+                normalized.model, "success", output.usage, api_format=api_format
+            )
+            logger.info(
+                "生成完成: format=%s, model=%s, 输入Tokens=%s, 输出Tokens=%s",
+                api_format,
+                normalized.model,
+                output.usage.get("prompt_tokens") if output.usage else 0,
+                output.usage.get("completion_tokens") if output.usage else 0,
+            )
+            return GenerationOutcome(
+                output=output,
+                model=normalized.model,
+                finish_reason=to_gemini_finish_reason(
+                    output.candidates[0].finish_reason if output.candidates else None
+                ),
+                response_id=output.response_id or None,
+                surface="chat",
+            )
+        except Exception as exc:
+            last_error = exc
+            if await handle_attempt_exception(
+                exc,
+                attempt=attempt,
+                model_path=model_path,
+                normalized_model=normalized.model if normalized else None,
+                client=client,
+                api_format=api_format,
+            ):
+                continue
+            raise
+
+    raise HTTPException(
+        429,
+        detail={
+            "message": f"All accounts reached daily quota for model '{model_path}'. Quota resets at 00:00 PST.",
+            "type": "rate_limit_exceeded",
+        },
+    ) from last_error
+
+
+async def stream_generation(
+    *,
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+    api_format: str = "gemini",
+    atg_factory: Callable[[], AtgProcessor] | None = None,
+) -> AsyncIterator[StreamEvent]:
+    """Run a streaming generation, yielding protocol-neutral events."""
+    # ATG: inject the synthetic transport once, before normalization. The
+    # synthetic tool name lives only in this request scope.
+    atg = _create_atg(api_format, atg_factory)
+    tool_name = ""
+    unwrapper = None
+    effective_req = req
+    if atg.enabled:
+        atg_body = req.model_dump(mode="json", exclude_none=True)
+        wrap = atg.wrap(atg_body, model_path)
+        if wrap.client_synthetic is not None:
+            logger.info(
+                "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
+                wrap.client_synthetic.name or "(instruction-only)",
+                wrap.client_synthetic.reason,
+            )
+        elif wrap.synthetic_hit:
+            logger.info(
+                "[ATG] 已注入合成通道: tool=%s, model=%s, contents=%d, tools=%d",
+                wrap.tool_name,
+                model_path,
+                len(atg_body.get("contents") or []),
+                len(atg_body.get("tools") or []),
+            )
+            effective_req = GeminiGenerateContentRequest.model_validate(wrap.body)
+            tool_name = wrap.tool_name
+            unwrapper = atg.create_stream_unwrapper(tool_name)
+        else:
+            logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
+
+    surface = _resolve_surface(model_path)
+    build_rest_body: str | None = None
+    if surface == "build":
+        build_rest_body = json.dumps(
+            effective_req.model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+        )
+        logger.info(
+            "[build] 流式请求经 Build 面直连: model=%s, contents=%d",
+            model_path,
+            len(effective_req.contents),
+        )
+
+    normalized: NormalizedGeminiRequest | None = None
+    logger.info(
+        "流式请求: format=%s, model=%s, 对话轮数=%s",
+        api_format,
+        model_path,
+        len(effective_req.contents),
+    )
+    final_usage: dict[str, object] | None = None
+    final_finish_reason: str = "STOP"
+    latest_response_id: str | None = None
+    buffered_thought_sig: str | None = None
+    max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
+    for stream_attempt in range(MAX_RETRIES):
+        has_yielded_data = False
+        await ensure_active_account(stream_attempt, model=model_path, surface=surface)
+        normalized = normalize_gemini_request(effective_req, model_path)
+        # Fresh per-attempt unwrapper: a retry must not carry stale
+        # buffered/consumed state from the previous attempt.
+        if atg.enabled and tool_name:
+            unwrapper = atg.create_stream_unwrapper(tool_name)
+        empty_attempt = 0
+        retry_outer = False
+        while True:
+            produced_content = False
+            try:
+                if surface == "build":
+                    stream_iter = client.stream_generate_content(
+                        model=normalized.model,
+                        capture_prompt="",
+                        surface="build",
+                        rest_body=build_rest_body,
+                    )
+                else:
+                    stream_iter = client.stream_generate_content(
+                        model=normalized.model,
+                        capture_prompt=normalized.capture_prompt,
+                        capture_images=normalized.capture_images,
+                        contents=normalized.contents,
+                        system_instruction_content=normalized.system_instruction,
+                        tools=normalized.tools,
+                        tool_config=normalized.tool_config,
+                        safety_settings=normalized.safety_settings,
+                        temperature=normalized.temperature,
+                        top_p=normalized.top_p,
+                        top_k=normalized.top_k,
+                        max_tokens=normalized.max_tokens,
+                        generation_config_overrides=normalized.generation_config_overrides,
+                        sanitize_plain_text=False,
+                        force_refresh_capture=(stream_attempt > 0 or empty_attempt > 0),
+                    )
+                async for event_type, text in stream_iter:
+                    if event_type == "usage":
+                        final_usage = text if isinstance(text, dict) else None
+                    elif event_type == "finish_reason":
+                        final_finish_reason = (
+                            to_gemini_finish_reason(text)
+                            if isinstance(text, int)
+                            else str(text)
+                        )
+                        if (
+                            unwrapper is not None
+                            and final_finish_reason == "TOOL_CALLS"
+                            and unwrapper.should_remap_finish_reason()
+                        ):
+                            final_finish_reason = "STOP"
+                    elif event_type == "response_id":
+                        latest_response_id = str(text)
+                    elif event_type == "thought_signature":
+                        buffered_thought_sig = str(text)
+                    elif (
+                        unwrapper is not None and event_type in _ATG_STREAM_EVENT_TYPES
+                    ):
+                        if text:
+                            produced_content = True
+                        out_events = unwrapper.process_event(event_type, text)
+                        for index, (out_type, out_text) in enumerate(out_events):
+                            if out_text:
+                                has_yielded_data = True
+                            yield StreamEvent(
+                                kind=out_type,
+                                payload=out_text,
+                                model=normalized.model,
+                                response_id=latest_response_id,
+                                thought_signature=(
+                                    buffered_thought_sig if index == 0 else None
+                                ),
+                            )
+                        buffered_thought_sig = None
+                    else:
+                        if text:
+                            has_yielded_data = True
+                        yield StreamEvent(
+                            kind=event_type,
+                            payload=text,
+                            model=normalized.model,
+                            response_id=latest_response_id,
+                            thought_signature=buffered_thought_sig,
+                        )
+                        buffered_thought_sig = None
+            except Exception as exc:
+                if await handle_attempt_exception(
+                    exc,
+                    attempt=stream_attempt,
+                    model_path=model_path,
+                    normalized_model=normalized.model if normalized else None,
+                    client=client,
+                    has_yielded_data=has_yielded_data,
+                    surface=surface,
+                    api_format=api_format,
+                ):
+                    retry_outer = True
+                    break
+                raise
+
+            # ATG empty-response retry: an attempt that produced no content
+            # event is re-sent up to cfg.empty_retries times (no account switch).
+            if max_empty > 0 and not produced_content:
+                if empty_attempt < max_empty:
+                    empty_attempt += 1
+                    logger.warning(
+                        "[ATG] 流式空响应，重发 (%d/%d): model=%s",
+                        empty_attempt,
+                        max_empty,
+                        model_path,
+                    )
+                    continue
+                logger.warning(
+                    "[ATG] empty response retries exhausted: model=%s",
+                    model_path,
+                )
+                if atg.cfg.mode == "required":
+                    raise SyntheticRequiredError(
+                        "synthetic tool call required but not present in "
+                        "upstream response"
+                    )
+            break
+        if retry_outer:
+            continue
+
+        # Flush buffered output and enforce required-mode validation.
+        if unwrapper is not None:
+            for out_type, out_text in unwrapper.finalize():
+                if out_text:
+                    has_yielded_data = True
+                yield StreamEvent(
+                    kind=out_type,
+                    payload=out_text,
+                    model=normalized.model,
+                    response_id=latest_response_id,
+                    thought_signature=buffered_thought_sig,
+                )
+                buffered_thought_sig = None
+            logger.info(
+                "[ATG] 流式解包: tool=%s, stats=%s",
+                tool_name,
+                json.dumps(unwrapper.stats.to_dict(), ensure_ascii=False),
+            )
+        break
+
+    target_model = normalized.model if normalized else model_path
+    record_rotator_event("success", model=target_model, surface=surface)
+    if normalized is not None:
+        runtime_state.record(
+            normalized.model, "success", final_usage, api_format=api_format
+        )
+    logger.info(
+        "流式完成: format=%s, model=%s, 输入Tokens=%s, 输出Tokens=%s",
+        api_format,
+        target_model,
+        final_usage.get("prompt_tokens") if final_usage else 0,
+        final_usage.get("completion_tokens") if final_usage else 0,
+    )
+    yield StreamEvent(
+        kind="usage",
+        payload=final_usage,
+        model=target_model,
+        response_id=latest_response_id,
+        finish_reason=final_finish_reason,
+    )

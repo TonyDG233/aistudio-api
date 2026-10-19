@@ -25,6 +25,16 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("state")
 
 
+def _coerce_formats(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, count in value.items():
+        if isinstance(count, int):
+            result[str(key)] = count
+    return result
+
+
 @dataclass
 class ModelStatsItem:
     requests: int = 0
@@ -35,6 +45,7 @@ class ModelStatsItem:
     completion_tokens: int = 0
     total_tokens: int = 0
     last_used: str | None = None
+    formats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -78,6 +89,7 @@ class RuntimeState:
                             last_used=str(item["last_used"])
                             if item.get("last_used")
                             else None,
+                            formats=_coerce_formats(item.get("formats")),
                         )
         except Exception as e:
             logger.warning("从 %s 读取模型统计失败: %s", stats_path, e)
@@ -128,9 +140,11 @@ class RuntimeState:
         model: str,
         result: str,
         usage: dict[str, object] | None = None,
+        api_format: str = "gemini",
     ) -> None:
         stats = self.model_stats[model]
         stats.requests += 1
+        stats.formats[api_format] = stats.formats.get(api_format, 0) + 1
         tz = timezone(timedelta(hours=8))
         stats.last_used = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
