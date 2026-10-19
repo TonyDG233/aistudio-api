@@ -14,7 +14,7 @@ from aistudio_api.config import (
     settings,
 )
 from aistudio_api.domain.errors import RequestError, classify_error
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
 from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
@@ -500,6 +500,44 @@ class AIStudioClient:
             ):
                 yield event
 
+    async def _collect_build_output(
+        self,
+        *,
+        model: str,
+        json_body: str,
+        build_surface: BuildSurface,
+    ) -> ModelOutput:
+        """Collect the build event stream into a non-streaming ModelOutput."""
+        candidate = Candidate()
+        output = ModelOutput(model=model)
+        async for event_type, payload in build_surface.stream_generate(
+            model=model, json_body=json_body
+        ):
+            if event_type == "status":
+                status = int(str(payload or 0))
+                if status >= 400:
+                    raise RequestError(status, f"build surface status {status}")
+            elif event_type == "body" and payload:
+                candidate.text += str(payload)
+            elif event_type == "thinking" and payload:
+                candidate.thinking += str(payload)
+            elif event_type == "tool_calls" and isinstance(payload, list):
+                candidate.function_calls.extend(payload)
+            elif event_type == "images" and isinstance(payload, list):
+                candidate.images.extend(payload)
+            elif event_type == "reasoning_images" and isinstance(payload, list):
+                candidate.reasoning_images.extend(payload)
+            elif event_type == "thought_signature" and payload:
+                candidate.thought_signature = str(payload)
+            elif event_type == "response_id" and payload:
+                output.response_id = str(payload)
+            elif event_type == "finish_reason" and isinstance(payload, int):
+                candidate.finish_reason = payload
+            elif event_type == "usage" and isinstance(payload, dict):
+                output.usage = payload
+        output.candidates = [candidate]
+        return output
+
     async def generate_content(
         self,
         *,
@@ -517,7 +555,26 @@ class AIStudioClient:
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
+        surface: str = "chat",
+        rest_body: str | None = None,
     ) -> ModelOutput:
+        if surface == "build":
+            if not rest_body:
+                raise RequestError(
+                    400, "build surface requires a REST body (rest_body)"
+                )
+            self._enforce_build_instance_quota()
+            ctx = self._session.active_context
+            if ctx is None:
+                ctx = await self._session.ensure_ready()
+            build_surface = await self._ensure_build_surface()
+            await build_surface.ensure_ready(ctx.auth_file, ctx.auth_user)
+            return await self._collect_build_output(
+                model=model,
+                json_body=rest_body,
+                build_surface=build_surface,
+            )
+
         async with self._session.request_scope():
             logger.info("拦截请求: %r", f"{capture_prompt[:20]}...")
             captured = await self.capture_request(

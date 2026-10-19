@@ -165,6 +165,8 @@ def format_sse_error(exc: Exception) -> str:
 
 
 def _render_stream_event(event: StreamEvent) -> str | None:
+    if event.kind == "routing_wait":
+        return ": resolving-instance\n\n"
     if event.kind == "usage":
         usage = event.payload if isinstance(event.payload, dict) else None
         return format_sse_usage(

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from typing import NoReturn
 
 from fastapi import HTTPException
 
@@ -27,6 +28,12 @@ from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     normalize_gemini_request,
 )
+from aistudio_api.application.routing_pipeline import (
+    RouteContext,
+    RoutingPipeline,
+    get_routing_pipeline,
+)
+from aistudio_api.application.surface_orchestrator import SurfacePolicyError
 from aistudio_api.application.upstream_errors import (
     handle_attempt_exception,
     to_gemini_finish_reason,
@@ -134,6 +141,39 @@ def _resolve_surface(model_path: str) -> str:
     return resolve_surface(model_path, tier, email, features).surface
 
 
+def _begin_route(
+    model_path: str, api_format: str
+) -> tuple[RoutingPipeline | None, RouteContext | None]:
+    """Start the WP5 phase-2 pipeline; degrade to the legacy path only on bugs."""
+    try:
+        pipe = get_routing_pipeline()
+    except Exception as exc:
+        logger.warning("路由管线不可用，回退旧路径: %s", exc, exc_info=True)
+        return None, None
+    if pipe is None:
+        return None, None
+    try:
+        return pipe, pipe.begin(model_path=model_path, api_format=api_format)
+    except SurfacePolicyError:
+        raise
+    except Exception as exc:
+        logger.warning("路由管线初始化失败，回退旧路径: %s", exc, exc_info=True)
+        return None, None
+
+
+def _raise_switch_exhausted(ctx: RouteContext) -> NoReturn:
+    snapshot = ctx.budget.snapshot()
+    raise SurfacePolicyError(
+        "surface_switch_exhausted",
+        message=(
+            "没有更多可尝试的账号/实例："
+            f"switches={snapshot['switches']}/{snapshot['max_switches']}, "
+            f"defers={snapshot['defers']}/{snapshot['max_defers']}。"
+        ),
+        advice="请稍后重试、检查账号健康度，或调整 features.routing 预算。",
+    )
+
+
 async def generate(
     *,
     model_path: str,
@@ -143,6 +183,12 @@ async def generate(
     atg_factory: Callable[[], AtgProcessor] | None = None,
 ) -> GenerationOutcome:
     """Run a non-streaming generation, returning a protocol-neutral outcome."""
+    pipe, ctx = _begin_route(model_path, api_format)
+    effective_model_path = ctx.clean_model if ctx is not None else model_path
+    surface = ctx.surface if ctx is not None else "chat"
+    candidate = None
+    lease = None
+
     # ATG: inject the synthetic transport once, before normalization. The wrapped
     # request is reused for every retry so the synthetic declaration and control
     # turn never stack. The synthetic tool name lives only in this request scope.
@@ -150,7 +196,7 @@ async def generate(
     tool_name = ""
     if atg.enabled:
         atg_body = req.model_dump(mode="json", exclude_none=True)
-        wrap = atg.wrap(atg_body, model_path)
+        wrap = atg.wrap(atg_body, effective_model_path)
         if wrap.client_synthetic is not None:
             logger.info(
                 "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
@@ -170,12 +216,30 @@ async def generate(
         else:
             logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
 
+    build_rest_body: str | None = None
+    if surface == "build":
+        build_rest_body = json.dumps(
+            req.model_dump(mode="json", exclude_none=True), ensure_ascii=False
+        )
+
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
-        await ensure_active_account(attempt, model=model_path)
+        if pipe is not None and ctx is not None:
+            if not (ctx.retry_same and candidate is not None):
+                previous = candidate.account_id if candidate is not None else None
+                candidate = pipe.next_candidate(ctx, previous)
+                if candidate is None:
+                    _raise_switch_exhausted(ctx)
+                lease = await pipe.land(ctx, candidate, require_idle=True)
+                if lease is None:
+                    continue
+            else:
+                ctx.retry_same = False
+        else:
+            await ensure_active_account(attempt, model=model_path, surface=surface)
         normalized: NormalizedGeminiRequest | None = None
         try:
-            normalized = normalize_gemini_request(req, model_path)
+            normalized = normalize_gemini_request(req, effective_model_path)
             logger.info(
                 "生成请求: format=%s, model=%s, 对话轮数=%s, 流式=否, 尝试第 %d 次",
                 api_format,
@@ -205,6 +269,8 @@ async def generate(
                     max_tokens=normalized.max_tokens,
                     generation_config_overrides=normalized.generation_config_overrides,
                     sanitize_plain_text=False,
+                    surface=surface,
+                    rest_body=build_rest_body,
                 )
                 if not (atg.enabled and tool_name):
                     break
@@ -236,7 +302,9 @@ async def generate(
                     json.dumps(unwrap.stats.to_dict(), ensure_ascii=False),
                 )
 
-            record_rotator_event("success", model=normalized.model)
+            if pipe is not None and ctx is not None:
+                pipe.record_success(ctx)
+            record_rotator_event("success", model=normalized.model, surface=surface)
             runtime_state.record(
                 normalized.model, "success", output.usage, api_format=api_format
             )
@@ -254,7 +322,7 @@ async def generate(
                     output.candidates[0].finish_reason if output.candidates else None
                 ),
                 response_id=output.response_id or None,
-                surface="chat",
+                surface=surface,
             )
         except Exception as exc:
             last_error = exc
@@ -265,6 +333,10 @@ async def generate(
                 normalized_model=normalized.model if normalized else None,
                 client=client,
                 api_format=api_format,
+                surface=surface,
+                routing=pipe,
+                route_ctx=ctx,
+                lease=lease,
             ):
                 continue
             raise
@@ -287,6 +359,12 @@ async def stream_generation(
     atg_factory: Callable[[], AtgProcessor] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Run a streaming generation, yielding protocol-neutral events."""
+    pipe, ctx = _begin_route(model_path, api_format)
+    effective_model_path = ctx.clean_model if ctx is not None else model_path
+    surface = ctx.surface if ctx is not None else _resolve_surface(effective_model_path)
+    candidate = None
+    lease = None
+
     # ATG: inject the synthetic transport once, before normalization. The
     # synthetic tool name lives only in this request scope.
     atg = _create_atg(api_format, atg_factory)
@@ -295,7 +373,7 @@ async def stream_generation(
     effective_req = req
     if atg.enabled:
         atg_body = req.model_dump(mode="json", exclude_none=True)
-        wrap = atg.wrap(atg_body, model_path)
+        wrap = atg.wrap(atg_body, effective_model_path)
         if wrap.client_synthetic is not None:
             logger.info(
                 "[ATG] 客户端已自带合成通道，跳过本地包装: tool=%s, reason=%s",
@@ -316,7 +394,6 @@ async def stream_generation(
         else:
             logger.info("[ATG] 跳过包装: model=%s (非文本模型)", model_path)
 
-    surface = _resolve_surface(model_path)
     build_rest_body: str | None = None
     if surface == "build":
         build_rest_body = json.dumps(
@@ -343,8 +420,27 @@ async def stream_generation(
     max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
     for stream_attempt in range(MAX_RETRIES):
         has_yielded_data = False
-        await ensure_active_account(stream_attempt, model=model_path, surface=surface)
-        normalized = normalize_gemini_request(effective_req, model_path)
+        if pipe is not None and ctx is not None:
+            if not (ctx.retry_same and candidate is not None):
+                previous = candidate.account_id if candidate is not None else None
+                candidate = pipe.next_candidate(ctx, previous)
+                if candidate is None:
+                    _raise_switch_exhausted(ctx)
+                yield StreamEvent(
+                    kind="routing_wait",
+                    payload="resolving-instance",
+                    model=effective_model_path,
+                )
+                lease = await pipe.land(ctx, candidate, require_idle=True)
+                if lease is None:
+                    continue
+            else:
+                ctx.retry_same = False
+        else:
+            await ensure_active_account(
+                stream_attempt, model=model_path, surface=surface
+            )
+        normalized = normalize_gemini_request(effective_req, effective_model_path)
         # Fresh per-attempt unwrapper: a retry must not carry stale
         # buffered/consumed state from the previous attempt.
         if atg.enabled and tool_name:
@@ -438,6 +534,9 @@ async def stream_generation(
                     has_yielded_data=has_yielded_data,
                     surface=surface,
                     api_format=api_format,
+                    routing=pipe,
+                    route_ctx=ctx,
+                    lease=lease,
                 ):
                     retry_outer = True
                     break
@@ -489,6 +588,8 @@ async def stream_generation(
         break
 
     target_model = normalized.model if normalized else model_path
+    if pipe is not None and ctx is not None:
+        pipe.record_success(ctx)
     record_rotator_event("success", model=target_model, surface=surface)
     if normalized is not None:
         runtime_state.record(

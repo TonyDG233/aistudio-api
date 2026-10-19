@@ -159,6 +159,9 @@ class OpenAIStreamRenderer:
         if self._done:
             return ""
 
+        if event.kind == "routing_wait":
+            return ": resolving-instance\n\n"
+
         if event.kind == "usage":
             finish_reason = (
                 "tool_calls"

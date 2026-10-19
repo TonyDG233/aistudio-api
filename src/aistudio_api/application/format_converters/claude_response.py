@@ -173,6 +173,8 @@ class ClaudeStreamRenderer:
         if self._closed:
             return ""
         kind = event.kind
+        if kind == "routing_wait":
+            return ": resolving-instance\n\n"
         if kind == "usage":
             if isinstance(event.payload, dict):
                 self._usage = cast("dict[str, object]", event.payload)

@@ -227,15 +227,23 @@ def record_rotator_event(
     model: str | None = None,
     *,
     surface: str = "chat",
+    account_id: str | None = None,
 ) -> None:
     """记录调度器事件（成功、限流、错误、鉴权异常）。
 
     ``surface`` 用于面维度隔离的冷却键；build 面调用方应显式传 ``surface="build"``。
+    ``account_id`` 用于按租约/失败账号记账（Realm 模式下活跃账号可能已切换）。
     默认 chat 面不传 surface，保持既有调用形态不变。
     """
     rotator = runtime_state.rotator
     account_service = runtime_state.account_service
-    account = account_service.get_active_account() if account_service else None
+    account = (
+        account_service.get_account(account_id)
+        if account_service and account_id
+        else account_service.get_active_account()
+        if account_service
+        else None
+    )
     if not rotator or account is None:
         return
     sk: dict[str, Any] = {"surface": surface} if surface != "chat" else {}
