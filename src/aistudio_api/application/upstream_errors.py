@@ -7,6 +7,7 @@ This module is protocol-agnostic: callers render the resulting
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -29,6 +30,12 @@ from aistudio_api.domain.errors import (
 )
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from aistudio_api.application.routing_pipeline import (
+        RouteContext,
+        RoutingPipeline,
+    )
 
 logger = get_logger("upstream.errors")
 
@@ -141,15 +148,34 @@ async def handle_attempt_exception(
     has_yielded_data: bool = False,
     surface: str = "chat",
     api_format: str = "gemini",
+    routing: RoutingPipeline | None = None,
+    route_ctx: RouteContext | None = None,
+    lease=None,
 ) -> bool:
     """Handle per-attempt error classification and account switching.
+
+    Without ``routing`` this keeps the v1 behavior. With ``routing`` account
+    switches are decided by the routing pipeline: switch actions consume
+    ``max_switches``, while same-account retries only consume ``MAX_RETRIES``.
 
     Returns True if the operation should be retried, or raises HTTPException / re-raises.
     """
     target_model = normalized_model or model_path
     account_svc = runtime_state.account_service
     active_acc = account_svc.get_active_account() if account_svc else None
-    failed_id = active_acc.id if active_acc else None
+    failed_id = getattr(lease, "account_id", None) or (
+        active_acc.id if active_acc else None
+    )
+
+    def switch(reason: str) -> bool:
+        if routing is None or route_ctx is None:
+            return False
+        routing.record_switch(route_ctx, reason)
+        return True
+
+    def retry(reason: str) -> None:
+        if routing is not None and route_ctx is not None:
+            routing.record_retry(route_ctx, reason)
 
     if isinstance(exc, ValueError):
         raise HTTPException(
@@ -159,17 +185,30 @@ async def handle_attempt_exception(
     if isinstance(exc, SessionExpiredError):
         logger.warning("账号会话失效，已被重定向到登录页: %s", exc)
         client.clear_templates()
-        if not has_yielded_data and await try_switch_account(
+        record_rotator_event(
+            "auth_error",
             model=target_model,
-            failed_account_id=failed_id,
-            is_auth_error=True,
-            is_session_expired=True,
             surface=surface,
-        ):
-            logger.info(
-                "已切换至其他可用健康账号重试 (%d/%d)", attempt + 1, MAX_RETRIES
-            )
-            return True
+            account_id=failed_id,
+        )
+        if not has_yielded_data:
+            if routing is not None:
+                switch("session_expired")
+                logger.info("路由管线切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                return True
+            if await try_switch_account(
+                model=target_model,
+                failed_account_id=failed_id,
+                is_auth_error=True,
+                is_session_expired=True,
+                surface=surface,
+            ):
+                logger.info(
+                    "已切换至其他可用健康账号重试 (%d/%d)",
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+                return True
         raise HTTPException(
             401,
             detail={
@@ -181,32 +220,57 @@ async def handle_attempt_exception(
     if isinstance(exc, AuthError):
         logger.warning("账号 403 权限拒绝: %s", exc)
         client.clear_templates()
-        record_rotator_event("auth_error", model=target_model, surface=surface)
-        if not has_yielded_data and await try_switch_account(
+        record_rotator_event(
+            "auth_error",
             model=target_model,
-            failed_account_id=failed_id,
-            is_auth_error=True,
             surface=surface,
-        ):
-            logger.info("切换至可用账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
-            return True
+            account_id=failed_id,
+        )
+        if not has_yielded_data:
+            if routing is not None:
+                switch("auth_error")
+                logger.info("路由管线切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                return True
+            if await try_switch_account(
+                model=target_model,
+                failed_account_id=failed_id,
+                is_auth_error=True,
+                surface=surface,
+            ):
+                logger.info("切换至可用账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                return True
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
         ) from exc
 
     if isinstance(exc, UsageLimitExceeded):
         runtime_state.record(target_model, "rate_limited", api_format=api_format)
-        record_rotator_event("rate_limited", model=target_model, surface=surface)
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id, surface=surface
-        ):
-            logger.info(
-                "429 触发限额，切换账号 (%d/%d): model=%s",
-                attempt + 1,
-                MAX_RETRIES,
-                target_model,
-            )
-            return True
+        record_rotator_event(
+            "rate_limited",
+            model=target_model,
+            surface=surface,
+            account_id=failed_id,
+        )
+        if not has_yielded_data:
+            if routing is not None:
+                switch("rate_limited")
+                logger.info(
+                    "429 触发限额，路由管线切换账号 (%d/%d): model=%s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    target_model,
+                )
+                return True
+            if await try_switch_account(
+                model=target_model, failed_account_id=failed_id, surface=surface
+            ):
+                logger.info(
+                    "429 触发限额，切换账号 (%d/%d): model=%s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    target_model,
+                )
+                return True
         logger.warning("全部账号在模型 %s 上均处于冷却状态", target_model)
         raise HTTPException(
             429,
@@ -224,6 +288,7 @@ async def handle_attempt_exception(
     ):
         logger.warning("上游收到 204，清理模板缓存后重试一次")
         client.clear_templates()
+        retry("empty_response_204")
         return True
 
     # Google 上游偶发随机 RPC 路由 404；未产生输出时立即重试，严禁切号。
@@ -239,6 +304,7 @@ async def handle_attempt_exception(
             clean_upstream_error_message(str(exc)),
         )
         client.clear_templates()
+        retry("transient_rpc_404")
         return True
 
     if is_browser_session_hang_error(exc):
@@ -249,6 +315,16 @@ async def handle_attempt_exception(
             exc,
         )
         client.clear_templates()
+        if routing is not None and route_ctx is not None:
+            if not has_yielded_data and route_ctx.budget.can_switch():
+                switch("browser_hang")
+                logger.info("路由管线切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                return True
+            if attempt < 2 and not has_yielded_data:
+                retry("browser_hang")
+                if client._session is not None:
+                    await client._session._close_internal()
+                return True
         if not has_yielded_data and await try_switch_account(
             model=target_model,
             failed_account_id=failed_id,
@@ -278,14 +354,18 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AistudioError):
         runtime_state.record(target_model, "errors", api_format=api_format)
-        record_rotator_event("error", model=target_model, surface=surface)
+        record_rotator_event(
+            "error", model=target_model, surface=surface, account_id=failed_id
+        )
         logger.warning("上游服务端异常: %s", exc)
         raise HTTPException(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
     runtime_state.record(target_model, "errors", api_format=api_format)
-    record_rotator_event("error", model=target_model, surface=surface)
+    record_rotator_event(
+        "error", model=target_model, surface=surface, account_id=failed_id
+    )
     logger.error("未知严重异常: %s", exc)
     logger.debug("异常堆栈详情:", exc_info=True)
     raise HTTPException(
