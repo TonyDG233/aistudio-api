@@ -48,12 +48,17 @@ _VALID_SURFACES = ("chat", "build")
 # 面策略错误 code -> HTTP 状态；未列出者统一 403（策略拒绝语义）。
 _HTTP_STATUS_BY_CODE = {
     "surface_quota_exceeded": 429,
+    "surface_switch_exhausted": 503,
+    "surface_instance_not_ready": 503,
+    "surface_no_capable_account": 403,
+    "surface_channel_disabled": 403,
 }
 _HTTP_STATUS_DEFAULT = 403
 _STATUS_STRING_BY_HTTP = {
     400: "INVALID_ARGUMENT",
     403: "PERMISSION_DENIED",
     429: "RESOURCE_EXHAUSTED",
+    503: "UNAVAILABLE",
 }
 
 _PRO_MODEL_RE = re.compile(r"-pro($|-)")
@@ -118,6 +123,24 @@ class SurfaceDecision:
     group_source: str  # "explicit" | "default-tier" | "override"
     allowed: tuple[str, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class GroupPolicy:
+    """Constraint layer for one request/account (WP5 phase 2).
+
+    A group only narrows the candidate pool: account set (tier/email match),
+    allowed surfaces, page-instance budget and sort weight. It never widens the
+    system-derived model/channel capability.
+    """
+
+    name: str | None
+    source: str  # "explicit" | "default-tier" | "implicit-global"
+    allowed_surfaces: tuple[str, ...]
+    max_page_instances: int
+    weight: float
+    enabled: bool
+    tier_key: str | None = None
 
 
 def _normalize_tier(tier: object) -> str | None:
@@ -192,6 +215,157 @@ def _surface_available(surface: str, build_enabled: bool) -> bool:
     if surface == "build":
         return build_enabled
     return False
+
+
+def _group_max_instances(group: dict) -> int:
+    try:
+        value = int(group.get("max_page_instances", MAX_PAGE_INSTANCES_DEFAULT))
+    except (TypeError, ValueError):
+        value = MAX_PAGE_INSTANCES_DEFAULT
+    return min(16, max(0, value))
+
+
+def _group_weight(group: dict) -> float:
+    try:
+        value = float(group.get("weight", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return min(100.0, max(0.1, value))
+
+
+def select_group(
+    tier: object,
+    email: object,
+    groups: object,
+    *,
+    route_by_tier: bool,
+    build_enabled: bool,
+) -> GroupPolicy:
+    """Resolve the constraint group for one account.
+
+    - ``route_by_tier`` off -> implicit global group (all accounts; enabled
+      surfaces only). This reproduces the zero-config candidate pool.
+    - ``route_by_tier`` on -> first enabled, non-empty explicit group whose
+      tier/email matches; otherwise the tier default group.
+    - Disabled or empty groups are treated as non-existent and skipped.
+    """
+    tier_norm = _normalize_tier(tier)
+    enabled_surfaces = tuple(
+        surface
+        for surface in _VALID_SURFACES
+        if _surface_available(surface, build_enabled)
+    )
+    if not route_by_tier:
+        return GroupPolicy(
+            name=None,
+            source="implicit-global",
+            allowed_surfaces=enabled_surfaces,
+            max_page_instances=MAX_PAGE_INSTANCES_DEFAULT,
+            weight=1.0,
+            enabled=True,
+            tier_key=None,
+        )
+
+    if isinstance(groups, (list, tuple)):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            if not bool(group.get("enabled", True)):
+                continue
+            if match_group(tier_norm, email, [group]) is None:
+                continue
+            allowed = tuple(
+                surface
+                for surface in _as_str_list(group.get("allowed_surfaces"))
+                if surface in _VALID_SURFACES
+                and _surface_available(surface, build_enabled)
+            )
+            if not allowed:
+                # 空组/停用组视同不存在：继续尝试后续分组或 tier 自动组。
+                continue
+            return GroupPolicy(
+                name=str(group.get("name") or "unnamed"),
+                source="explicit",
+                allowed_surfaces=allowed,
+                max_page_instances=_group_max_instances(group),
+                weight=_group_weight(group),
+                enabled=True,
+                tier_key=None,
+            )
+
+    allowed_default = tuple(
+        surface
+        for surface in DEFAULT_ALLOWED_BY_TIER.get(
+            tier_norm or "", UNKNOWN_TIER_ALLOWED
+        )
+        if _surface_available(surface, build_enabled)
+    )
+    return GroupPolicy(
+        name=None,
+        source="default-tier",
+        allowed_surfaces=allowed_default,
+        max_page_instances=MAX_PAGE_INSTANCES_DEFAULT,
+        weight=1.0,
+        enabled=bool(allowed_default),
+        tier_key=tier_norm,
+    )
+
+
+def group_identity(policy: GroupPolicy) -> tuple[str | None, str, str | None]:
+    """Stable identity used to compare per-account group membership."""
+    return (policy.name, policy.source, policy.tier_key)
+
+
+def account_matches_group(
+    policy: GroupPolicy,
+    tier: object,
+    email: object,
+    groups: object,
+) -> bool:
+    """Whether an account belongs to the request's effective group."""
+    if policy.source == "implicit-global":
+        return True
+    if policy.source == "default-tier":
+        return _normalize_tier(tier) == policy.tier_key
+    if policy.source == "explicit":
+        if not isinstance(groups, (list, tuple)):
+            return False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            if not bool(group.get("enabled", True)):
+                continue
+            name = str(group.get("name") or "unnamed")
+            if name != policy.name:
+                continue
+            return match_group(_normalize_tier(tier), email, [group]) is not None
+        return False
+    return False
+
+
+def surface_capability(
+    model_path: str,
+    enabled_surfaces: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """System-derived capability: chat-only models are restricted to chat."""
+    enabled = tuple(
+        surface for surface in enabled_surfaces if surface in _VALID_SURFACES
+    )
+    if is_chat_only_model(model_path):
+        return ("chat",) if "chat" in enabled else ()
+    return enabled
+
+
+def intersect_surfaces(
+    capability: tuple[str, ...],
+    policy: GroupPolicy,
+    account_surfaces: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    """Apply group and account-level narrowing; never widens capability."""
+    allowed = set(capability) & set(policy.allowed_surfaces)
+    if account_surfaces is not None:
+        allowed &= set(account_surfaces)
+    return tuple(surface for surface in capability if surface in allowed)
 
 
 def _log_decision(
@@ -410,11 +584,17 @@ __all__ = [
     "DEFAULT_ALLOWED_BY_TIER",
     "MAX_PAGE_INSTANCES_DEFAULT",
     "SURFACE_OVERRIDE_ENV",
+    "GroupPolicy",
     "SurfaceDecision",
     "SurfacePolicyError",
+    "account_matches_group",
     "check_instance_quota",
     "get_configured_groups",
+    "group_identity",
+    "intersect_surfaces",
     "is_chat_only_model",
     "match_group",
     "resolve_surface",
+    "select_group",
+    "surface_capability",
 ]

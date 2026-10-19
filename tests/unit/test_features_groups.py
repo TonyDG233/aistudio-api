@@ -69,6 +69,8 @@ features:
     assert groups == [
         {
             "name": "pro",
+            "enabled": True,
+            "weight": 1.0,
             "match_tier": ["pro", "ultra"],
             "match_emails_regex": "^pro@example[.]com$",
             "allowed_surfaces": ["chat", "build"],
@@ -76,6 +78,8 @@ features:
         },
         {
             "name": "free",
+            "enabled": True,
+            "weight": 1.0,
             "match_tier": ["free"],
             "match_emails_regex": None,
             "allowed_surfaces": ["build"],
@@ -98,6 +102,8 @@ features:
     assert groups == [
         {
             "name": "group-0",
+            "enabled": True,
+            "weight": 1.0,
             "match_tier": [],
             "match_emails_regex": None,
             "allowed_surfaces": [],
@@ -283,6 +289,8 @@ features:
     assert after == [
         {
             "name": "free",
+            "enabled": True,
+            "weight": 1.0,
             "match_tier": ["free", "plus"],
             "match_emails_regex": None,
             "allowed_surfaces": ["build"],

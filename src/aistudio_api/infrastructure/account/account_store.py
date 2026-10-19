@@ -8,7 +8,8 @@ import os
 import shutil
 import threading
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from os.path import abspath, basename, join
 from pathlib import Path
@@ -134,12 +135,20 @@ class AccountMeta:
     auth_saved_at: str | None = None
     last_refresh_attempt_at: str | None = None
     last_refresh_error: str | None = None
+    # 账号级路由覆盖；空表示跟随组，随 meta.json/registry.json 持久化。
+    routing: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> AccountMeta:
+        raw_routing = data.get("routing")
+        routing = (
+            {str(key): value for key, value in raw_routing.items()}
+            if isinstance(raw_routing, dict)
+            else {}
+        )
         return cls(
             id=str(data.get("id") or ""),
             name=str(data.get("name") or ""),
@@ -166,6 +175,7 @@ class AccountMeta:
             last_refresh_error=str(data["last_refresh_error"])
             if data.get("last_refresh_error") is not None
             else None,
+            routing=routing,
         )
 
 
@@ -512,6 +522,34 @@ class AccountStore:
             _atomic_write_json(meta_path, acc.to_dict())
         self._save_registry(registry)
         return True
+
+    def get_account_routing(self, account_id: str) -> dict[str, object]:
+        """获取账号级路由覆盖的浅拷贝；未知账号返回空覆盖。"""
+        registry = self._load_registry()
+        acc = registry.accounts.get(account_id)
+        if acc is None:
+            return {}
+        return dict(acc.routing)
+
+    def update_account_routing(
+        self, account_id: str, routing: Mapping[str, object] | None
+    ) -> bool:
+        """整体替换账号级路由覆盖，并持久化 meta.json 与 registry.json。"""
+        registry = self._load_registry()
+        acc = registry.accounts.get(account_id)
+        if acc is None:
+            return False
+        acc.routing = dict(routing or {})
+        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def clear_account_routing(self, account_id: str) -> bool:
+        """清除账号级路由覆盖（恢复跟随组）。"""
+        return self.update_account_routing(account_id, None)
 
     def mark_auth_saved(self, account_id: str, *, at: str | None = None) -> bool:
         """记录凭证回写成功时间。"""

@@ -12,6 +12,7 @@ features:
   # Build 页面直连面总开关 (对应 Ark MAKERSUITE_DIRECT / 环境变量 AISTUDIO_BUILD_SURFACE)。
   # 开=free 档账号走 Build 宿主页直连通道；关=仅使用现有聊天面 (零行为变化)。
   # 何时开：需要通过免费档账号调用 Build 专属额度时。失败怎么办：面内失败显式报错，不改道。
+  # 兼容说明：这是 legacy alias；若下方 channels.build.enabled 显式配置，则以 channels 为准。
   build_surface: false
 
   # 是否按账号档位 (tier) 路由到不同面 (对应环境变量 AISTUDIO_ROUTE_BY_TIER)。
@@ -72,20 +73,78 @@ features:
       allow_private_urls: false
 
   # --------------------------------------------------------------------------
+  # 渠道注册表 (channels，WP5 二期)
+  # chat=聊天/Playground 面 (别名 pg/playground)；build=Build 宿主页；
+  # official=官网消费者端，WP9 前仅注册、不实现 (请求会显式 403)。
+  # enabled: 渠道是否参与路由；关=该渠道请求显式拒绝，不静默换面。
+  # max_instances: 渠道同时存活的页面实例上限 (0-16)，参与四层预算取最严。
+  # 裸名在多渠道启用时按策略推导，系统不硬编码默认渠道。
+  # --------------------------------------------------------------------------
+  channels:
+    chat:
+      enabled: true
+      max_instances: 2
+    build:
+      # 未显式配置时继承上方 build_surface；此处显式值优先。
+      enabled: false
+      max_instances: 2
+    official:
+      enabled: false
+      max_instances: 0
+
+  # --------------------------------------------------------------------------
+  # 路由安全与预算 (routing，WP5 二期)
+  # max_switches: 单请求内“换账号/换实例”动作上限；同账号重试仍由
+  #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
+  # global_max_instances: 全局页面实例硬顶 (所有渠道/Realm 合计)。
+  # max_realms: 跨账号隔离浏览器上下文上限；realm_mode=false 时固定单 Realm。
+  # realm_mode: 开=允许跨账号同时在线 (惰性创建，每个 Realm 约 +180MB)；
+  #   关=单 Realm 现行为。默认开，单账号场景不会额外创建。
+  # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
+  # prewarm: 备用实例预热；默认关 (黄金模板可开)。
+  # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
+  # --------------------------------------------------------------------------
+  routing:
+    max_switches: 2
+    global_max_instances: 2
+    max_realms: 2
+    realm_mode: true
+    borrow: false
+    prewarm: false
+    circuit_breaker:
+      window_seconds: 600
+      failure_threshold: 5
+      cooldown_seconds: 300
+
+  # --------------------------------------------------------------------------
+  # 槽位表 (slots，WP5 二期)
+  # 每行 = 为 (账号 × 渠道) 预留的页面实例位；同一账号可占多行。
+  # “实例数（当前/计划）”的计划值 = 启用槽位行数；槽位不绕过四层预算。
+  # 示例：
+  # slots:
+  #   - { account_id: acc_xxxx, channel: chat, enabled: true, note: pro-chat }
+  #   - { account_id: acc_yyyy, channel: build, enabled: true, note: free-build }
+  # --------------------------------------------------------------------------
+  slots: []
+
+  # --------------------------------------------------------------------------
   # 账号分组与面编排 (groups，WP5) — 按账号档位 (tier) / 邮箱正则把账号分组，
   # 为每组指定允许的面 (chat/build) 与页面上限。未显式分组的账号由编排器按
   # tier 默认规则兜底 (free→build、pro/ultra/plus→chat)，本段留空即全部走默认。
   # --------------------------------------------------------------------------
   # 每个分组字段：
   #   name:                 组名 (缺省按序号 group-N)
+  #   enabled:              是否启用 (默认 true)；停用/空组视同不存在，继续匹配后续组或 tier 默认组
+  #   weight:               排序权重 (0.1-100，默认 1.0)；越高获得越多新请求
   #   match_tier:           命中的账号档位列表 (小写，如 pro/free/ultra/plus)
   #   match_emails_regex:   命中的邮箱正则 (可选，留空/null 表示不启用)
   #   allowed_surfaces:     允许的面子集 [chat] / [build] / [chat, build]；空 [] 表示禁用该组
   #   max_page_instances:   该组允许并存的页面实例上限 (0-16，默认 2)；超限对请求显式拒绝，不排队
+  # 组只收窄候选账号/渠道/预算/权重，不能放宽系统推导的模型与渠道能力。
   # 示例 (两行)：
   # groups:
-  #   - { name: pro,  match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  max_page_instances: 2 }
-  #   - { name: free, match_tier: [free],             allowed_surfaces: [build], max_page_instances: 3 }
+  #   - { name: pro,  enabled: true, weight: 1.0, match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  max_page_instances: 2 }
+  #   - { name: free, enabled: true, weight: 1.0, match_tier: [free],             allowed_surfaces: [build], max_page_instances: 3 }
   groups: []
 
   # --------------------------------------------------------------------------

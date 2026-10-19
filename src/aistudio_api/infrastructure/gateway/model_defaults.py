@@ -558,6 +558,21 @@ _MAX_ATG_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 _GROUP_SURFACE_CHOICES = ("chat", "build")
 _DEFAULT_GROUP_MAX_PAGE_INSTANCES = 2
 _MAX_GROUP_MAX_PAGE_INSTANCES = 16
+_DEFAULT_GROUP_WEIGHT = 1.0
+_MAX_GROUP_WEIGHT = 100.0
+
+# WP5 二期：渠道注册表、路由预算与槽位。
+_CHANNEL_CHOICES = ("chat", "build", "official")
+_CHANNEL_ALIASES = {
+    "chat": "chat",
+    "pg": "chat",
+    "playground": "chat",
+    "build": "build",
+    "official": "official",
+    "gemini_app": "official",
+}
+_DEFAULT_CHANNEL_MAX_INSTANCES = 2
+_MAX_CHANNEL_MAX_INSTANCES = 16
 
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
@@ -580,6 +595,30 @@ _FEATURES_DEFAULTS: dict[str, object] = {
         "claude": True,
         "media": {"allow_private_urls": False},
     },
+    # WP5 二期：渠道注册表。chat=pg/playground；official 仅注册（WP9 前不实现）。
+    # build 的 enabled 在 YAML 未显式给出时继承 legacy build_surface。
+    "channels": {
+        "chat": {"enabled": True, "max_instances": 2},
+        "build": {"enabled": False, "max_instances": 2},
+        "official": {"enabled": False, "max_instances": 0},
+    },
+    # WP5 二期：路由预算/失败链/Realm。默认值与零配置单账号行为对齐；
+    # Realm 惰性创建，只有需要第二个账号同时在线时才额外占内存。
+    "routing": {
+        "max_switches": 2,
+        "global_max_instances": 2,
+        "max_realms": 2,
+        "realm_mode": True,
+        "borrow": False,
+        "prewarm": False,
+        "circuit_breaker": {
+            "window_seconds": 600,
+            "failure_threshold": 5,
+            "cooldown_seconds": 300,
+        },
+    },
+    # WP5 二期：槽位行（账号×渠道预留实例位）。
+    "slots": [],
     # WP5：账号分组列表。空列表合法——未显式分组的账号由 orchestrator 按 tier
     # 默认规则兜底（本模块只负责解析，不注入默认组）。
     "groups": [],
@@ -648,12 +687,21 @@ def _coerce_feature_int(
     return min(maximum, max(minimum, parsed))
 
 
-def _coerce_feature_float(value: object, default: float, *, minimum: float) -> float:
+def _coerce_feature_float(
+    value: object,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
     try:
         parsed = float(str(value))
     except (TypeError, ValueError):
         return default
-    return max(minimum, parsed)
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
 
 
 def _coerce_feature_choice(
@@ -701,6 +749,126 @@ def _coerce_feature_optional_str(value: object) -> str | None:
     return text or None
 
 
+def _normalize_channel_key(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    return _CHANNEL_ALIASES.get(text)
+
+
+def _normalize_channels(
+    raw: object,
+    *,
+    build_surface: bool,
+    build_explicit: bool,
+) -> dict[str, dict[str, object]]:
+    """归一 features.channels；build 未显式配置时继承 legacy build_surface。"""
+    data = raw if isinstance(raw, dict) else {}
+    by_channel: dict[str, dict[str, object]] = {}
+    for key, value in data.items():
+        channel = _normalize_channel_key(key)
+        if channel is None:
+            _logger.warning("features.channels 未知渠道 %r，已忽略", key)
+            continue
+        if isinstance(value, dict):
+            by_channel[channel] = value
+        else:
+            _logger.warning("features.channels.%s 非映射结构，已忽略", channel)
+
+    build_enabled = (
+        _coerce_feature_bool(by_channel["build"].get("enabled"), build_surface)
+        if build_explicit and "build" in by_channel
+        else build_surface
+    )
+    return {
+        "chat": {
+            "enabled": _coerce_feature_bool(
+                (by_channel.get("chat") or {}).get("enabled"), True
+            ),
+            "max_instances": _coerce_feature_int(
+                (by_channel.get("chat") or {}).get("max_instances"),
+                _DEFAULT_CHANNEL_MAX_INSTANCES,
+                minimum=0,
+                maximum=_MAX_CHANNEL_MAX_INSTANCES,
+            ),
+        },
+        "build": {
+            "enabled": build_enabled,
+            "max_instances": _coerce_feature_int(
+                (by_channel.get("build") or {}).get("max_instances"),
+                _DEFAULT_CHANNEL_MAX_INSTANCES,
+                minimum=0,
+                maximum=_MAX_CHANNEL_MAX_INSTANCES,
+            ),
+        },
+        # WP9 前官网渠道只注册不实现：无论配置如何都保持关闭。
+        "official": {"enabled": False, "max_instances": 0},
+    }
+
+
+def _normalize_routing(raw: object) -> dict[str, object]:
+    data = raw if isinstance(raw, dict) else {}
+    raw_breaker = data.get("circuit_breaker")
+    breaker = raw_breaker if isinstance(raw_breaker, dict) else {}
+    return {
+        "max_switches": _coerce_feature_int(
+            data.get("max_switches"), 2, minimum=0, maximum=10
+        ),
+        "global_max_instances": _coerce_feature_int(
+            data.get("global_max_instances"), 2, minimum=1, maximum=32
+        ),
+        "max_realms": _coerce_feature_int(
+            data.get("max_realms"), 2, minimum=1, maximum=16
+        ),
+        "realm_mode": _coerce_feature_bool(data.get("realm_mode"), True),
+        "borrow": _coerce_feature_bool(data.get("borrow"), False),
+        "prewarm": _coerce_feature_bool(data.get("prewarm"), False),
+        "circuit_breaker": {
+            "window_seconds": _coerce_feature_int(
+                breaker.get("window_seconds"), 600, minimum=60, maximum=3600
+            ),
+            "failure_threshold": _coerce_feature_int(
+                breaker.get("failure_threshold"), 5, minimum=1, maximum=100
+            ),
+            "cooldown_seconds": _coerce_feature_int(
+                breaker.get("cooldown_seconds"), 300, minimum=30, maximum=3600
+            ),
+        },
+    }
+
+
+def _normalize_slots(raw: object) -> list[dict[str, object]]:
+    """归一 features.slots；坏项丢弃，按 (account_id, channel) 去重。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        _logger.warning("features.slots 非列表结构，已按空列表处理: %r", raw)
+        return []
+    slots: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            _logger.warning("features.slots[%d] 非映射结构，已丢弃", index)
+            continue
+        account_id = str(item.get("account_id") or "").strip()
+        channel = _normalize_channel_key(item.get("channel"))
+        if not account_id or channel is None:
+            _logger.warning("features.slots[%d] 缺少 account_id/channel，已丢弃", index)
+            continue
+        key = (account_id, channel)
+        if key in seen:
+            _logger.warning("features.slots[%d] 重复槽位 %s，已丢弃", index, key)
+            continue
+        seen.add(key)
+        slots.append(
+            {
+                "account_id": account_id,
+                "channel": channel,
+                "enabled": _coerce_feature_bool(item.get("enabled"), True),
+                "note": str(item.get("note") or "").strip(),
+            }
+        )
+    return slots
+
+
 def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | None:
     """归一单个分组项；非映射结构视为坏项丢弃并告警，不抛异常。"""
     if not isinstance(raw, dict):
@@ -708,6 +876,13 @@ def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | Non
         return None
     return {
         "name": _coerce_feature_str(raw.get("name"), f"group-{index}"),
+        "enabled": _coerce_feature_bool(raw.get("enabled"), True),
+        "weight": _coerce_feature_float(
+            raw.get("weight"),
+            _DEFAULT_GROUP_WEIGHT,
+            minimum=0.1,
+            maximum=_MAX_GROUP_WEIGHT,
+        ),
         "match_tier": _coerce_feature_str_list(raw.get("match_tier")),
         "match_emails_regex": _coerce_feature_optional_str(
             raw.get("match_emails_regex")
@@ -772,7 +947,11 @@ def _env_feature_baseline() -> dict[str, object]:
     }
 
 
-def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
+def _normalize_features(
+    raw: dict[str, object],
+    *,
+    channels_build_explicit: bool = False,
+) -> dict[str, object]:
     raw_atg = raw.get("atg")
     atg = raw_atg if isinstance(raw_atg, dict) else {}
     raw_fallback = raw.get("fallback")
@@ -781,8 +960,14 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
     formats = raw_formats if isinstance(raw_formats, dict) else {}
     raw_media = formats.get("media")
     media = raw_media if isinstance(raw_media, dict) else {}
+    legacy_build_surface = _coerce_feature_bool(raw.get("build_surface"), False)
+    channels = _normalize_channels(
+        raw.get("channels"),
+        build_surface=legacy_build_surface,
+        build_explicit=channels_build_explicit,
+    )
     return {
-        "build_surface": _coerce_feature_bool(raw.get("build_surface"), False),
+        "build_surface": bool(channels["build"]["enabled"]),
         "route_by_tier": _coerce_feature_bool(raw.get("route_by_tier"), False),
         "account_refresh_concurrency": _coerce_feature_int(
             raw.get("account_refresh_concurrency"), 3, minimum=1, maximum=16
@@ -821,6 +1006,9 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
                 )
             },
         },
+        "channels": channels,
+        "routing": _normalize_routing(raw.get("routing")),
+        "slots": _normalize_slots(raw.get("slots")),
         "groups": _normalize_feature_groups(raw.get("groups")),
         "atg": {
             "mode": _coerce_feature_choice(atg.get("mode"), "off", _ATG_MODES),
@@ -884,7 +1072,13 @@ def get_features_config(
     yaml_features = raw_features if isinstance(raw_features, dict) else {}
     merged = _deep_merge(_FEATURES_DEFAULTS, _env_feature_baseline())
     merged = _deep_merge(merged, yaml_features)
-    return _normalize_features(merged)
+    raw_channels = yaml_features.get("channels")
+    channels_build_explicit = (
+        isinstance(raw_channels, dict)
+        and isinstance(raw_channels.get("build"), dict)
+        and "enabled" in raw_channels["build"]
+    )
+    return _normalize_features(merged, channels_build_explicit=channels_build_explicit)
 
 
 def update_configured_features(
