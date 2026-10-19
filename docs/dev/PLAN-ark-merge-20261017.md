@@ -1,6 +1,6 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P2 已完成；P3 进行中（WP4 服务内验收已通过、代码待提交；WP5 未开工）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成（P3 收尾加固待批）；下一站 WP10 账号保活（最高优先）→ WP8 格式层 → WP6 统计 → WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
 >
@@ -64,9 +64,10 @@
 | WP4 | Build 页面直连面（cookie 保真 + 注入脚本 + warmup + 传输 + 双面会话） | L | 5–10 | WP0 通过 |
 | WP5 | 分组与面编排（组策略/实例配额/实例-面绑定/管理面板） | L | 4–6 | WP3, WP4 |
 | WP6 | 统计整合与 UI 增量 | M | 2–4 | WP2, WP3, WP5 |
-| WP7 | 部署/文档/质量门/致谢 | S | 1–2 | 全部 |
+| WP7 | 部署 / UI 统一修改 / 文档 / 质量门 / 致谢（所有前端与使用体验改动只在此阶段） | S | 1–2 | 全部 |
 | WP8 | 多格式兼容层（OpenAI Chat Completions / Claude Messages；Responses 可选） | L | 5–8 | WP1, WP2 |
 | WP9 | （远期）第三面：Gemini App（合并 GeminiLocalAPI） | L | 待立 | WP5 |
+| WP10 | 账号保活（最高优先，后端）：旧定时切号 + 上游自动刷新双机制并存 | M | 2–3 | WP3, WP5 |
 
 ---
 
@@ -181,6 +182,7 @@
 - **管理面板（最小但完整，无 UI 完整复刻）**：分组管理（策略编辑、账号移入移出）、实例面板（各面实例数/配额/内存估算、手动开关实例）、组策略启停；文案遵循"开关自解释"。
 - **可选并入**：Ark 的定时自动切换开关（`ENABLE_AUTO_SWITCH`/间隔）。
 - **验收**：策略改 yaml/面板即时生效；配额超限显式拒绝；chat-disabled 组上 argon 请求返回具体 4xx；日志可见 surface 决策链（可 grep）。
+- **二期（复杂策略组，仅后端；UI 归 WP7）**：槽位表语义、四层实例预算、组序/排序、borrow 与 Realm 落点（UI 稿 §5.4/§5.6）全部在本期后端实现。**后端与 UI 严格分离**：本 WP 不包含任何前端改动；对应 UI 在 WP7 一次性完成，避免一次做太多又丢三落四。
 
 ### WP6 统计整合（M）
 **以本仓库现有统计为底座增量扩维**（不引入第二套存储）：
@@ -191,7 +193,8 @@
 - 可选吸收 Ark UsageStats 的记录级 JSONL 明细（序列号、耗时、尝试链）作为高级面板数据源——**列为二期**，首期只做聚合字段。
 - **验收**：一次 free 请求在 Dashboard 可见 surface=build 与 ATG 命中；一次 pro 请求可见 surface=chat。
 
-### WP7 部署 / 文档 / 致谢（S）
+### WP7 部署 / UI 统一修改 / 文档 / 致谢（S）
+- **UI 归口**：本项目所有前端与使用体验修改（P1/P2/P3/P5、槽位表/策略组/渠道注册表/日志页等）**统一在本阶段执行**；其余阶段只做后端，用测试脚本调特定渠道验收，前后端不混做。
 - Dockerfile 与 `setup-browser` 不需变更（同一 CloakBrowser）；仅新增 features 文档与 `.env` 说明对应物。
 - AGENT.md 增补：双面约定、开关命名规范、ATG 模块边界。
 - **致谢（强制）**：合并/发布提交文本写明上游出处与授权——`chrysoljq/aistudio-api`（原仓，MIT）与 `DeconstructedCube/aistudio-api`（重构 fork）；README 谱系一节；遵循 Ark `merge_commit_attribution_required` 约束。
@@ -218,6 +221,15 @@
 - **集成口径**：**不做融合重构**；WP5 的 `allowed_surfaces` 枚举扩展为 `[chat, build, gemini_app]`；同一账号体系（`__Secure-1PSID/1PSIDTS` 通常已在 auth 内）、同一统计口径与配额规则。
 - **触发条件**：P0–P4 稳定且 WP5 编排落地后单独立项评估。
 
+### WP10 账号保活（最高优先，后端）
+> 目标：保护付费账号资产。**双保活并存，不是二选一**：
+> - **旧定时切号（用户原设计）**：长周期均衡负载 + 更高级的“真实账号活动”保活；
+> - **上游自动刷新**：日常保活（凭证/tier/过期，24h 回写）。
+
+- **范围**：`auto_switch` 接线（定时/间隔，仅在无在途流时触发；定位=长周期均衡 + 真实活动）；自动刷新调度化（周期刷新 email/tier/过期，与手动刷新 409 互斥）；24h 凭证回写；启动保活；周期健康巡检（维持账号在线）；最近一次刷新/保活结果可查。
+- **约束**：纯后端；**不加任何 UI**（UI 统一在 WP7）；所有开关可单独开关，开启前后行为可 grep；不得打断在途流。
+- **验收（真机、最小额度）**：两套保活分别可单独开关并生效；账号连续保持在线；刷新与切号有序/互斥；失败有明确日志；全关时零行为变化。
+
 ---
 
 ## 5. 里程碑
@@ -228,8 +240,9 @@
 | P1 | WP1 + WP3 | ✅ 完成（2026-10-18）：开关框架可用；tier/email/expired 真实刷新 + 徽章。真机验收全绿（auth-1→free、auth-5→pro、401 样本→expired 落库，零模型额度） |
 | P2 | WP2 | ✅ 完成（2026-10-18）：ATG 全套移植（10 模块 + 90 单测，pytest 352 全绿）；真机 prefer 非流式/流式成功、required 为 R8 500（无 200 落盘证据，见 `docs/dev/AUDIT-P2P3-20261018.md` §3）；E5 白名单补偿已入库。（2026-10-18 晨复验通过：off/prefer/required 3/3——prefer/required 日志直证 `syntheticHit=true`；pro 账号 argon 经 chat 路径首调 200；证据 `docs/dev/evidence/p2-verify/`） |
 | P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。✅ 完成（2026-10-18 晚）：WP4 服务内验收 2/2（`docs/dev/evidence/p3-build3/`）；WP5 实现完毕并经真机五相位验收全绿——组路由 build 200 / argon chat 200 / 守卫 403×2 / 配额 429，决策链可 grep（`docs/dev/evidence/wp5-20261018/`）；根因与结论见 `docs/dev/AUDIT-P2P3-20261018.md` 附、附三与附四；2026-10-18 深夜追加 Build 通信加固（复用快路径实测 3.9s、过门重试环、原地恢复） |
+| P3.5 | WP10 | 账号保活双机制（旧定时切号 + 新自动刷新）闭环；纯后端，UI 不在本阶段 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
-| P5 | WP6 + WP7 | 统计/UI 增量（含 formatBreakdown）、文档、质量门全绿、致谢入库 |
+| P5 | WP6 + WP7 | 统计（后端，含 formatBreakdown）+ WP7（UI 统一修改）/文档/质量门全绿/致谢入库 |
 
 ---
 
@@ -280,9 +293,9 @@ Build 通道/直连签名器原始研究与 bundle 考古证据（`build-channel
 
 | Ark 近期功能（提交） | 去向 |
 |---|---|
-| AccountInfoRefresher（tier/email/过期，并行 3 工作池；`d9f6a1a` 等） | WP3 |
+| AccountInfoRefresher（tier/email/过期，并行 3 工作池；`d9f6a1a` 等） | WP3（手动探活）；调度化/24h 回写归 WP10 |
 | 账号刷新 API/UI 徽章与批量分片（5/批） | WP3（徽章与按钮为最小 UI） |
-| `ENABLE_AUTO_SWITCH` / 间隔开关（`a0211e5`） | WP5（可选并入） |
+| `ENABLE_AUTO_SWITCH` / 间隔开关（`a0211e5`） | WP10（保留并接线，最高优先） |
 | DirectSigner / `ProxyStreamedCall` 零编译直连（`dcdea40` 等） | WP4 |
 | ATG 模块群 + 6+2 注入/解包点 + per-format 模式（`8484466` 等） | WP2 |
 | UsageStatsService（JSONL 明细） | WP6（一期聚合；二期明细可选） |
