@@ -41,6 +41,16 @@ DEFAULT_ALLOWED_BY_TIER: dict[str, list[str]] = {
 UNKNOWN_TIER_ALLOWED: list[str] = ["chat"]
 # 页面实例配额缺省值（组未显式给出 max_page_instances 时）。
 MAX_PAGE_INSTANCES_DEFAULT = 2
+MAX_PAGES_DEFAULT = MAX_PAGE_INSTANCES_DEFAULT
+DEFAULT_QUOTA_POOLS_BY_TIER: dict[str, tuple[str, ...]] = {
+    "free": ("free",),
+    "pro": ("pro", "free"),
+    "ultra": ("pro", "free"),
+    "plus": ("pro", "free"),
+    "paid": ("pro", "free"),
+}
+UNKNOWN_TIER_QUOTA_POOLS: tuple[str, ...] = ("free", "pro")
+PAID_TIERS = frozenset({"pro", "ultra", "plus", "paid"})
 
 SURFACE_OVERRIDE_ENV = "AISTUDIO_SURFACE_OVERRIDE"
 _VALID_SURFACES = ("chat", "build")
@@ -137,10 +147,16 @@ class GroupPolicy:
     name: str | None
     source: str  # "explicit" | "default-tier" | "implicit-global"
     allowed_surfaces: tuple[str, ...]
-    max_page_instances: int
+    max_pages: int
     weight: float
     enabled: bool
+    allowed_quota_pools: tuple[str, ...] = ()
     tier_key: str | None = None
+
+    @property
+    def max_page_instances(self) -> int:
+        """v2 compatibility alias; v3 budgets use ``max_pages``."""
+        return self.max_pages
 
 
 def _normalize_tier(tier: object) -> str | None:
@@ -209,6 +225,27 @@ def is_chat_only_model(model_path: str) -> bool:
     return bool(_PRO_MODEL_RE.search(name))
 
 
+def is_pro_only_model(model_path: str) -> bool:
+    """True when the model requires a paid/pro account (argon or Pro family)."""
+    return is_chat_only_model(model_path)
+
+
+def model_account_requirement(model_path: str) -> str:
+    """Return ``paid`` for pro-only models, otherwise ``any``."""
+    return "paid" if is_pro_only_model(model_path) else "any"
+
+
+def account_is_paid(tier: object) -> bool:
+    return _normalize_tier(tier) in PAID_TIERS
+
+
+def account_tier_quota_pools(tier: object) -> tuple[str, ...]:
+    """Tier-derived pool ceiling; account overrides may only narrow it."""
+    return DEFAULT_QUOTA_POOLS_BY_TIER.get(
+        _normalize_tier(tier) or "", UNKNOWN_TIER_QUOTA_POOLS
+    )
+
+
 def _surface_available(surface: str, build_enabled: bool) -> bool:
     if surface == "chat":
         return True
@@ -218,11 +255,24 @@ def _surface_available(surface: str, build_enabled: bool) -> bool:
 
 
 def _group_max_instances(group: dict) -> int:
+    raw = group.get("max_pages", group.get("max_page_instances", MAX_PAGES_DEFAULT))
     try:
-        value = int(group.get("max_page_instances", MAX_PAGE_INSTANCES_DEFAULT))
+        value = int(raw)
     except (TypeError, ValueError):
-        value = MAX_PAGE_INSTANCES_DEFAULT
+        value = MAX_PAGES_DEFAULT
     return min(16, max(0, value))
+
+
+def _group_quota_pools(group: dict) -> tuple[str, ...]:
+    raw = group.get("allowed_quota_pools")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    pools: list[str] = []
+    for item in raw:
+        text = str(item).strip().lower()
+        if text in ("free", "pro", "official") and text not in pools:
+            pools.append(text)
+    return tuple(pools)
 
 
 def _group_weight(group: dict) -> float:
@@ -260,9 +310,10 @@ def select_group(
             name=None,
             source="implicit-global",
             allowed_surfaces=enabled_surfaces,
-            max_page_instances=MAX_PAGE_INSTANCES_DEFAULT,
+            max_pages=MAX_PAGES_DEFAULT,
             weight=1.0,
             enabled=True,
+            allowed_quota_pools=(),
             tier_key=None,
         )
 
@@ -287,9 +338,10 @@ def select_group(
                 name=str(group.get("name") or "unnamed"),
                 source="explicit",
                 allowed_surfaces=allowed,
-                max_page_instances=_group_max_instances(group),
+                max_pages=_group_max_instances(group),
                 weight=_group_weight(group),
                 enabled=True,
+                allowed_quota_pools=_group_quota_pools(group),
                 tier_key=None,
             )
 
@@ -304,9 +356,10 @@ def select_group(
         name=None,
         source="default-tier",
         allowed_surfaces=allowed_default,
-        max_page_instances=MAX_PAGE_INSTANCES_DEFAULT,
+        max_pages=MAX_PAGES_DEFAULT,
         weight=1.0,
         enabled=bool(allowed_default),
+        allowed_quota_pools=(),
         tier_key=tier_norm,
     )
 

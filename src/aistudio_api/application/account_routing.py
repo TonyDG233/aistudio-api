@@ -10,6 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 _ALLOWED_SURFACES = frozenset({"chat", "build"})
+_ALLOWED_QUOTA_POOLS = frozenset({"free", "pro", "official"})
 _DEFAULT_WEIGHT = 1.0
 _MIN_WEIGHT = 0.1
 _MAX_WEIGHT = 100.0
@@ -35,6 +36,22 @@ def _normalize_surfaces(raw: object) -> tuple[str, ...]:
         seen.add(surface)
         surfaces.append(surface)
     return tuple(surfaces)
+
+
+def _normalize_quota_pools(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        return ()
+    seen: set[str] = set()
+    pools: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        pool = item.strip().lower()
+        if pool not in _ALLOWED_QUOTA_POOLS or pool in seen:
+            continue
+        seen.add(pool)
+        pools.append(pool)
+    return tuple(pools)
 
 
 def _normalize_weight(raw: object) -> float:
@@ -75,12 +92,14 @@ class AccountRouting:
     surfaces: tuple[str, ...] = ()
     weight: float = 1.0
     model_surfaces: dict[str, str] = field(default_factory=dict)
+    quota_pools: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
             "surfaces": list(self.surfaces),
             "weight": self.weight,
             "model_surfaces": dict(self.model_surfaces),
+            "quota_pools": list(self.quota_pools),
         }
 
     @classmethod
@@ -93,6 +112,7 @@ class AccountRouting:
             surfaces=_normalize_surfaces(raw.get("surfaces")),
             weight=_normalize_weight(raw.get("weight")),
             model_surfaces=_normalize_model_surfaces(raw.get("model_surfaces")),
+            quota_pools=_normalize_quota_pools(raw.get("quota_pools")),
         )
 
 
@@ -121,3 +141,18 @@ def apply_account_routing(
     if pin is not None:
         selected = tuple(surface for surface in selected if surface == pin)
     return selected
+
+
+def apply_account_quota_pools(
+    allowed_pools: Iterable[str],
+    routing: AccountRouting | None,
+) -> tuple[str, ...]:
+    """Apply account-level quota-pool narrowing without widening the group set."""
+    pools = tuple(allowed_pools)
+    if routing is None:
+        return pools
+    normalized = AccountRouting.from_dict(routing)
+    if not normalized.quota_pools:
+        return pools
+    allowed = set(normalized.quota_pools)
+    return tuple(pool for pool in pools if pool in allowed)

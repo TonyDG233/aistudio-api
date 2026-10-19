@@ -41,17 +41,33 @@ _SURFACE_BY_CHANNEL: dict[str, str | None] = {
 }
 _DEFAULT_MAX_INSTANCES = 2
 _MAX_INSTANCES_LIMIT = 16
+_DEFAULT_MAX_PAGES = {"chat": 1, "build": 1, "official": 0}
+_QUOTA_POOL_CHOICES = frozenset({"free", "pro", "official"})
+_DISPLAY_PREFIX = {"chat": "pg", "build": "build", "official": "official"}
 
 
 @dataclass(frozen=True)
 class ChannelSpec:
-    """Effective configuration for one channel."""
+    """Effective configuration for one channel.
+
+    ``max_instances`` is the v2 compatibility alias; v3 budgets use
+    ``max_pages``. ``quota_pool`` is ``None`` when the channel accepts any
+    account pool (zero-config compatibility).
+    """
 
     key: str
     label: str
     enabled: bool
     max_instances: int
     implemented: bool
+    max_pages: int = 1
+    quota_pool: str | None = None
+    display_prefix: str = ""
+
+    @property
+    def prefix(self) -> str:
+        """Canonical model-list/UI prefix (``pg`` for the chat channel)."""
+        return self.display_prefix or _DISPLAY_PREFIX.get(self.key, self.key)
 
 
 @dataclass(frozen=True)
@@ -110,6 +126,15 @@ def _coerce_max_instances(value: object, default: int) -> int:
     return min(_MAX_INSTANCES_LIMIT, max(0, parsed))
 
 
+def _coerce_quota_pool(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "any":
+        return None
+    return text if text in _QUOTA_POOL_CHOICES else None
+
+
 def _channel_specs(
     raw_channels: Mapping[object, object] | None,
 ) -> dict[str, Mapping[str, object]]:
@@ -146,22 +171,35 @@ def build_registry(features: Mapping[str, object]) -> dict[str, ChannelSpec]:
                 enabled=False,
                 max_instances=0,
                 implemented=False,
+                max_pages=0,
+                quota_pool=None,
+                display_prefix=_DISPLAY_PREFIX[key],
             )
             continue
         if raw is None:
             enabled = True if key == "chat" else build_legacy_enabled
             max_instances = _DEFAULT_MAX_INSTANCES
+            max_pages = _DEFAULT_MAX_PAGES[key]
+            quota_pool = None
         else:
             enabled = _coerce_bool(raw.get("enabled"), True)
             max_instances = _coerce_max_instances(
                 raw.get("max_instances"), _DEFAULT_MAX_INSTANCES
             )
+            max_pages = _coerce_max_instances(
+                raw.get("max_pages", raw.get("max_instances")),
+                _DEFAULT_MAX_PAGES[key],
+            )
+            quota_pool = _coerce_quota_pool(raw.get("quota_pool"))
         registry[key] = ChannelSpec(
             key=key,
             label=_CHANNEL_LABELS[key],
             enabled=enabled,
             max_instances=max_instances,
             implemented=key in _IMPLEMENTED_CHANNELS,
+            max_pages=max_pages,
+            quota_pool=quota_pool,
+            display_prefix=_DISPLAY_PREFIX[key],
         )
     return registry
 
@@ -175,6 +213,18 @@ def enabled_channels(
         for key in KNOWN_CHANNELS
         if key in registry and registry[key].enabled and registry[key].implemented
     )
+
+
+def channel_prefix(channel: str) -> str:
+    """Return the external model-list prefix for a canonical channel."""
+    return _DISPLAY_PREFIX.get(normalize_channel(channel) or "", "")
+
+
+def model_list_prefixes(
+    registry: Mapping[str, ChannelSpec],
+) -> tuple[tuple[str, str], ...]:
+    """(canonical channel, external prefix) for enabled+implemented channels."""
+    return tuple((spec.key, spec.prefix) for spec in enabled_channels(registry))
 
 
 def is_multi_mode(
@@ -347,8 +397,10 @@ __all__ = [
     "ChannelSelection",
     "ChannelSpec",
     "build_registry",
+    "channel_prefix",
     "enabled_channels",
     "is_multi_mode",
+    "model_list_prefixes",
     "normalize_channel",
     "parse_model_target",
     "select_channel",

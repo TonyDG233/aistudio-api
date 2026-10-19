@@ -27,12 +27,29 @@ def test_channels_routing_defaults(tmp_path: Path) -> None:
     features = _features(config_path)
 
     assert features["channels"] == {
-        "chat": {"enabled": True, "max_instances": 2},
-        "build": {"enabled": False, "max_instances": 2},
-        "official": {"enabled": False, "max_instances": 0},
+        "chat": {
+            "enabled": True,
+            "max_instances": 2,
+            "max_pages": 1,
+            "quota_pool": None,
+        },
+        "build": {
+            "enabled": False,
+            "max_instances": 2,
+            "max_pages": 1,
+            "quota_pool": None,
+        },
+        "official": {
+            "enabled": False,
+            "max_instances": 0,
+            "max_pages": 0,
+            "quota_pool": None,
+        },
     }
     assert features["routing"] == {
         "max_switches": 2,
+        "global_max_pages": 2,
+        "max_contexts": 2,
         "global_max_instances": 2,
         "max_realms": 2,
         "realm_mode": True,
@@ -70,7 +87,12 @@ features:
 """,
     )
     features = _features(config_path)
-    assert features["channels"]["build"] == {"enabled": False, "max_instances": 4}
+    assert features["channels"]["build"] == {
+        "enabled": False,
+        "max_instances": 4,
+        "max_pages": 4,
+        "quota_pool": None,
+    }
     assert features["build_surface"] is False
 
 
@@ -87,8 +109,18 @@ features:
 """,
     )
     channels = _features(config_path)["channels"]
-    assert channels["chat"] == {"enabled": False, "max_instances": 5}
-    assert channels["official"] == {"enabled": False, "max_instances": 0}
+    assert channels["chat"] == {
+        "enabled": False,
+        "max_instances": 5,
+        "max_pages": 5,
+        "quota_pool": None,
+    }
+    assert channels["official"] == {
+        "enabled": False,
+        "max_instances": 0,
+        "max_pages": 0,
+        "quota_pool": None,
+    }
     assert "bogus" not in channels
 
 
@@ -100,8 +132,8 @@ def test_routing_values_are_clamped(tmp_path: Path) -> None:
 features:
   routing:
     max_switches: 99
-    global_max_instances: 0
-    max_realms: 99
+    global_max_pages: 0
+    max_contexts: 99
     realm_mode: false
     borrow: true
     prewarm: yes
@@ -113,6 +145,8 @@ features:
     )
     routing = _features(config_path)["routing"]
     assert routing["max_switches"] == 10
+    assert routing["global_max_pages"] == 1
+    assert routing["max_contexts"] == 16
     assert routing["global_max_instances"] == 1
     assert routing["max_realms"] == 16
     assert routing["realm_mode"] is False

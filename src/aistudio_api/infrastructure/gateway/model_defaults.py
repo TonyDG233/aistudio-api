@@ -557,9 +557,11 @@ _MAX_ATG_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 # WP5 分组编排：账号分组允许的面枚举与页面实例配额边界。
 _GROUP_SURFACE_CHOICES = ("chat", "build")
 _DEFAULT_GROUP_MAX_PAGE_INSTANCES = 2
+_DEFAULT_GROUP_MAX_PAGES = _DEFAULT_GROUP_MAX_PAGE_INSTANCES
 _MAX_GROUP_MAX_PAGE_INSTANCES = 16
 _DEFAULT_GROUP_WEIGHT = 1.0
 _MAX_GROUP_WEIGHT = 100.0
+_QUOTA_POOL_CHOICES = ("free", "pro", "official")
 
 # WP5 二期：渠道注册表、路由预算与槽位。
 _CHANNEL_CHOICES = ("chat", "build", "official")
@@ -573,6 +575,9 @@ _CHANNEL_ALIASES = {
 }
 _DEFAULT_CHANNEL_MAX_INSTANCES = 2
 _MAX_CHANNEL_MAX_INSTANCES = 16
+_DEFAULT_CHANNEL_MAX_PAGES = {"chat": 1, "build": 1, "official": 0}
+_DEFAULT_GLOBAL_MAX_PAGES = 2
+_DEFAULT_MAX_CONTEXTS = 2
 
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
@@ -598,14 +603,15 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     # WP5 二期：渠道注册表。chat=pg/playground；official 仅注册（WP9 前不实现）。
     # build 的 enabled 在 YAML 未显式给出时继承 legacy build_surface。
     "channels": {
-        "chat": {"enabled": True, "max_instances": 2},
-        "build": {"enabled": False, "max_instances": 2},
-        "official": {"enabled": False, "max_instances": 0},
+        "chat": {"enabled": True, "max_instances": 2, "max_pages": 1},
+        "build": {"enabled": False, "max_instances": 2, "max_pages": 1},
+        "official": {"enabled": False, "max_instances": 0, "max_pages": 0},
     },
-    # WP5 二期：路由预算/失败链/Realm。默认值与零配置单账号行为对齐；
-    # Realm 惰性创建，只有需要第二个账号同时在线时才额外占内存。
+    # WP5 v3：页面数与 Context 数分开；旧 routing 键保留到 Phase 3 迁移完成。
     "routing": {
         "max_switches": 2,
+        "global_max_pages": 2,
+        "max_contexts": 2,
         "global_max_instances": 2,
         "max_realms": 2,
         "realm_mode": True,
@@ -754,6 +760,26 @@ def _normalize_channel_key(value: object) -> str | None:
     return _CHANNEL_ALIASES.get(text)
 
 
+def _coerce_feature_quota_pool(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "any":
+        return None
+    return text if text in _QUOTA_POOL_CHOICES else None
+
+
+def _coerce_feature_quota_pools(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    pools: list[str] = []
+    for item in value:
+        text = str(item).strip().lower()
+        if text in _QUOTA_POOL_CHOICES and text not in pools:
+            pools.append(text)
+    return pools
+
+
 def _normalize_channels(
     raw: object,
     *,
@@ -778,29 +804,50 @@ def _normalize_channels(
         if build_explicit and "build" in by_channel
         else build_surface
     )
+    chat_raw = by_channel.get("chat") or {}
+    build_raw = by_channel.get("build") or {}
+    chat_max_pages = _coerce_feature_int(
+        chat_raw.get("max_pages", chat_raw.get("max_instances")),
+        _DEFAULT_CHANNEL_MAX_PAGES["chat"],
+        minimum=0,
+        maximum=_MAX_CHANNEL_MAX_INSTANCES,
+    )
+    build_max_pages = _coerce_feature_int(
+        build_raw.get("max_pages", build_raw.get("max_instances")),
+        _DEFAULT_CHANNEL_MAX_PAGES["build"],
+        minimum=0,
+        maximum=_MAX_CHANNEL_MAX_INSTANCES,
+    )
     return {
         "chat": {
-            "enabled": _coerce_feature_bool(
-                (by_channel.get("chat") or {}).get("enabled"), True
-            ),
+            "enabled": _coerce_feature_bool(chat_raw.get("enabled"), True),
             "max_instances": _coerce_feature_int(
-                (by_channel.get("chat") or {}).get("max_instances"),
+                chat_raw.get("max_instances"),
                 _DEFAULT_CHANNEL_MAX_INSTANCES,
                 minimum=0,
                 maximum=_MAX_CHANNEL_MAX_INSTANCES,
             ),
+            "max_pages": chat_max_pages,
+            "quota_pool": _coerce_feature_quota_pool(chat_raw.get("quota_pool")),
         },
         "build": {
             "enabled": build_enabled,
             "max_instances": _coerce_feature_int(
-                (by_channel.get("build") or {}).get("max_instances"),
+                build_raw.get("max_instances"),
                 _DEFAULT_CHANNEL_MAX_INSTANCES,
                 minimum=0,
                 maximum=_MAX_CHANNEL_MAX_INSTANCES,
             ),
+            "max_pages": build_max_pages,
+            "quota_pool": _coerce_feature_quota_pool(build_raw.get("quota_pool")),
         },
         # WP9 前官网渠道只注册不实现：无论配置如何都保持关闭。
-        "official": {"enabled": False, "max_instances": 0},
+        "official": {
+            "enabled": False,
+            "max_instances": 0,
+            "max_pages": 0,
+            "quota_pool": None,
+        },
     }
 
 
@@ -808,16 +855,27 @@ def _normalize_routing(raw: object) -> dict[str, object]:
     data = raw if isinstance(raw, dict) else {}
     raw_breaker = data.get("circuit_breaker")
     breaker = raw_breaker if isinstance(raw_breaker, dict) else {}
+    global_max_pages = _coerce_feature_int(
+        data.get("global_max_pages", data.get("global_max_instances")),
+        _DEFAULT_GLOBAL_MAX_PAGES,
+        minimum=1,
+        maximum=32,
+    )
+    max_contexts = _coerce_feature_int(
+        data.get("max_contexts", data.get("max_realms")),
+        _DEFAULT_MAX_CONTEXTS,
+        minimum=1,
+        maximum=16,
+    )
     return {
         "max_switches": _coerce_feature_int(
             data.get("max_switches"), 2, minimum=0, maximum=10
         ),
-        "global_max_instances": _coerce_feature_int(
-            data.get("global_max_instances"), 2, minimum=1, maximum=32
-        ),
-        "max_realms": _coerce_feature_int(
-            data.get("max_realms"), 2, minimum=1, maximum=16
-        ),
+        "global_max_pages": global_max_pages,
+        "max_contexts": max_contexts,
+        # Phase 3 前兼容旧消费方；值与 v3 口径保持同步。
+        "global_max_instances": global_max_pages,
+        "max_realms": max_contexts,
         "realm_mode": _coerce_feature_bool(data.get("realm_mode"), True),
         "borrow": _coerce_feature_bool(data.get("borrow"), False),
         "prewarm": _coerce_feature_bool(data.get("prewarm"), False),
@@ -874,6 +932,12 @@ def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | Non
     if not isinstance(raw, dict):
         _logger.warning("features.groups[%d] 非映射结构，已丢弃: %r", index, raw)
         return None
+    max_pages = _coerce_feature_int(
+        raw.get("max_pages", raw.get("max_page_instances")),
+        _DEFAULT_GROUP_MAX_PAGES,
+        minimum=0,
+        maximum=_MAX_GROUP_MAX_PAGE_INSTANCES,
+    )
     return {
         "name": _coerce_feature_str(raw.get("name"), f"group-{index}"),
         "enabled": _coerce_feature_bool(raw.get("enabled"), True),
@@ -888,12 +952,12 @@ def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | Non
             raw.get("match_emails_regex")
         ),
         "allowed_surfaces": _coerce_feature_surfaces(raw.get("allowed_surfaces")),
-        "max_page_instances": _coerce_feature_int(
-            raw.get("max_page_instances"),
-            _DEFAULT_GROUP_MAX_PAGE_INSTANCES,
-            minimum=0,
-            maximum=_MAX_GROUP_MAX_PAGE_INSTANCES,
+        "allowed_quota_pools": _coerce_feature_quota_pools(
+            raw.get("allowed_quota_pools")
         ),
+        "max_pages": max_pages,
+        # Phase 3 前兼容旧消费方。
+        "max_page_instances": max_pages,
     }
 
 
@@ -1056,6 +1120,53 @@ def _normalize_features(
     }
 
 
+def _migrate_legacy_feature_keys(features: dict[str, object]) -> dict[str, object]:
+    """Map v2 keys to v3 before deep-merging defaults.
+
+    Deep merge would otherwise hide whether the user wrote ``max_instances`` or
+    ``max_pages`` (the defaults already contain both). Migration is done on the
+    raw YAML object so explicit legacy values still take effect.
+    """
+    migrated = dict(features)
+    raw_channels = features.get("channels")
+    if isinstance(raw_channels, dict):
+        channels: dict[str, object] = {}
+        for key, value in raw_channels.items():
+            item = dict(value) if isinstance(value, dict) else value
+            if (
+                isinstance(item, dict)
+                and "max_pages" not in item
+                and "max_instances" in item
+            ):
+                item["max_pages"] = item["max_instances"]
+            channels[key] = item
+        migrated["channels"] = channels
+
+    raw_routing = features.get("routing")
+    if isinstance(raw_routing, dict):
+        routing = dict(raw_routing)
+        if "global_max_pages" not in routing and "global_max_instances" in routing:
+            routing["global_max_pages"] = routing["global_max_instances"]
+        if "max_contexts" not in routing and "max_realms" in routing:
+            routing["max_contexts"] = routing["max_realms"]
+        migrated["routing"] = routing
+
+    raw_groups = features.get("groups")
+    if isinstance(raw_groups, list):
+        groups: list[object] = []
+        for value in raw_groups:
+            group = dict(value) if isinstance(value, dict) else value
+            if (
+                isinstance(group, dict)
+                and "max_pages" not in group
+                and "max_page_instances" in group
+            ):
+                group["max_pages"] = group["max_page_instances"]
+            groups.append(group)
+        migrated["groups"] = groups
+    return migrated
+
+
 def get_features_config(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
@@ -1070,8 +1181,9 @@ def get_features_config(
     config = _load_yaml_config(resolved_path)
     raw_features = config.get("features")
     yaml_features = raw_features if isinstance(raw_features, dict) else {}
+    migrated_features = _migrate_legacy_feature_keys(yaml_features)
     merged = _deep_merge(_FEATURES_DEFAULTS, _env_feature_baseline())
-    merged = _deep_merge(merged, yaml_features)
+    merged = _deep_merge(merged, migrated_features)
     raw_channels = yaml_features.get("channels")
     channels_build_explicit = (
         isinstance(raw_channels, dict)

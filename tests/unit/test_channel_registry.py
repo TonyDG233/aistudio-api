@@ -107,10 +107,24 @@ def test_build_registry_defaults_match_single_account_behavior() -> None:
 
     assert list(registry) == ["chat", "build", "official"]
     assert registry["chat"] == ChannelSpec(
-        key="chat", label="pg", enabled=True, max_instances=2, implemented=True
+        key="chat",
+        label="pg",
+        enabled=True,
+        max_instances=2,
+        implemented=True,
+        max_pages=1,
+        quota_pool=None,
+        display_prefix="pg",
     )
     assert registry["build"] == ChannelSpec(
-        key="build", label="build", enabled=False, max_instances=2, implemented=True
+        key="build",
+        label="build",
+        enabled=False,
+        max_instances=2,
+        implemented=True,
+        max_pages=1,
+        quota_pool=None,
+        display_prefix="build",
     )
     assert registry["official"] == ChannelSpec(
         key="official",
@@ -118,6 +132,9 @@ def test_build_registry_defaults_match_single_account_behavior() -> None:
         enabled=False,
         max_instances=0,
         implemented=False,
+        max_pages=0,
+        quota_pool=None,
+        display_prefix="official",
     )
 
 
@@ -136,6 +153,24 @@ def test_explicit_channels_build_overrides_build_surface_alias() -> None:
     )
     assert registry["build"].enabled is False
     assert registry["build"].max_instances == 3
+    assert registry["build"].max_pages == 3
+
+
+def test_channel_max_pages_and_quota_pool_are_normalized() -> None:
+    registry = build_registry(
+        {
+            "channels": {
+                "chat": {"max_pages": 2, "quota_pool": "PRO"},
+                "build": {"max_pages": 99, "quota_pool": "any"},
+            }
+        }
+    )
+    assert registry["chat"].max_pages == 2
+    assert registry["chat"].quota_pool == "pro"
+    assert registry["chat"].prefix == "pg"
+    assert registry["build"].max_pages == 16
+    assert registry["build"].quota_pool is None
+    assert registry["build"].prefix == "build"
 
 
 @pytest.mark.parametrize(
