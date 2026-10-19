@@ -271,6 +271,7 @@ async def generate(
                     sanitize_plain_text=False,
                     surface=surface,
                     rest_body=build_rest_body,
+                    lease=lease,
                 )
                 if not (atg.enabled and tool_name):
                     break
@@ -456,6 +457,7 @@ async def stream_generation(
                         capture_prompt="",
                         surface="build",
                         rest_body=build_rest_body,
+                        lease=lease,
                     )
                 else:
                     stream_iter = client.stream_generate_content(
@@ -474,6 +476,7 @@ async def stream_generation(
                         generation_config_overrides=normalized.generation_config_overrides,
                         sanitize_plain_text=False,
                         force_refresh_capture=(stream_attempt > 0 or empty_attempt > 0),
+                        lease=lease,
                     )
                 async for event_type, text in stream_iter:
                     if event_type == "usage":

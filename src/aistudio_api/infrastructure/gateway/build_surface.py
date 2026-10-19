@@ -128,11 +128,41 @@ AUTH_RESPONDER_JS_TEMPLATE = """(() => {
 # 让 app 的启动链完整跑完（宿主 warmup 触发的前置条件）。
 _app_ws_sink_state: object | None = None
 _APP_WS_CONNS: list[object] = []
+_APP_WS_CONNS_BY_REALM: dict[str, list[object]] = {}
+
+
+def _ws_realm_id(websocket: object) -> str:
+    """Extract ``?realm=`` from the 9998 handshake path (default realm = "")."""
+    try:
+        request = getattr(websocket, "request", None)
+        path = str(getattr(request, "path", "") or "")
+    except Exception:
+        return ""
+    from urllib.parse import parse_qs, urlsplit
+
+    query = parse_qs(urlsplit(path).query)
+    values = query.get("realm") or []
+    return str(values[0]) if values else ""
+
+
+def _realm_connections(realm_id: str | None) -> list[object]:
+    key = realm_id or ""
+    if key:
+        return _APP_WS_CONNS_BY_REALM.setdefault(key, [])
+    return _APP_WS_CONNS
 
 
 async def _app_ws_sink_handler(websocket: object, *_args: object) -> None:
-    _APP_WS_CONNS.append(websocket)
-    logger.info("app 内嵌客户端已连接 9998（第 %d 个）", len(_APP_WS_CONNS))
+    realm_id = _ws_realm_id(websocket)
+    connections = _realm_connections(realm_id)
+    connections.append(websocket)
+    if realm_id:
+        _APP_WS_CONNS.append(websocket)
+    logger.info(
+        "app 内嵌客户端已连接 9998（realm=%s, 第 %d 个）",
+        realm_id or "default",
+        len(connections),
+    )
     try:
         async for _ in websocket:  # type: ignore[attr-defined]
             pass
@@ -140,8 +170,15 @@ async def _app_ws_sink_handler(websocket: object, *_args: object) -> None:
         pass
     finally:
         with suppress(Exception):
-            _APP_WS_CONNS.remove(websocket)
-        logger.info("app 内嵌客户端断开 9998（余 %d 个）", len(_APP_WS_CONNS))
+            connections.remove(websocket)
+        if realm_id:
+            with suppress(Exception):
+                _APP_WS_CONNS.remove(websocket)
+        logger.info(
+            "app 内嵌客户端断开 9998（realm=%s, 余 %d 个）",
+            realm_id or "default",
+            len(connections),
+        )
 
 
 async def _ensure_app_ws_sink() -> None:
@@ -655,10 +692,46 @@ class BuildSurface:
         cdp_client: CDPClient,
         *,
         resolve_app_id: Callable[[], object] | None = None,
+        context_id: str | None = None,
+        realm_id: str | None = None,
     ) -> None:
         self._cdp = cdp_client
         self._resolve_app_id: Callable[[], object] | None = resolve_app_id
+        self._context_id = context_id
+        self._realm_id = realm_id
         self.state = BuildSurfaceState()
+
+    def _connections(self) -> list[object]:
+        return _realm_connections(self._realm_id)
+
+    async def _install_realm_ws_tag(self, page: CDPPage) -> None:
+        """Tag the app's 9998 WebSocket with ``?realm=`` so the sink can demux it."""
+        if not self._realm_id or getattr(page, "has_realm_ws_tag", False):
+            return
+        setattr(page, "has_realm_ws_tag", True)  # noqa: B010 - duck-typed flag
+        realm_json = json.dumps(self._realm_id)
+        source = f"""(() => {{
+  const RealWS = window.WebSocket;
+  if (!RealWS || RealWS.__realmTagged) return;
+  function Wrapped(url, protocols) {{
+    try {{
+      if (typeof url === "string" && url.indexOf(":9998") !== -1 && url.indexOf("realm=") === -1) {{
+        url += (url.indexOf("?") === -1 ? "?" : "&") + "realm=" + encodeURIComponent({realm_json});
+      }}
+    }} catch (e) {{}}
+    return protocols === undefined ? new RealWS(url) : new RealWS(url, protocols);
+  }}
+  Wrapped.prototype = RealWS.prototype;
+  Object.assign(Wrapped, RealWS);
+  Wrapped.__realmTagged = true;
+  window.WebSocket = Wrapped;
+}})();"""
+        try:
+            await page.cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": source}
+            )
+        except Exception as exc:
+            logger.warning("[build] realm WS 标记注入失败: %s", exc)
 
     @property
     def app_id(self) -> str:
@@ -715,19 +788,21 @@ class BuildSurface:
         # 复用快路径（2026-10-18 通信优化）：页面存活 + 已就绪 + 账号未变时免去
         # 重导航/重过门/重暖机；WS 断开则先试原地恢复（Ark 轻量重连思路），
         # 恢复失败再走完整重建。旧实现每个请求全额重走 ensure_ready。
+        connections = self._connections()
         if (
             same_auth
             and state.page is not None
             and not state.page.is_closed()
             and state.ready
             and not state.last_error
-            and (_APP_WS_CONNS or await self._recover_warmup(state.page))
+            and (connections or await self._recover_warmup(state.page))
         ):
             state.auth_user = auth_user
             state.account_id = account_id
             logger.info(
-                "[build] ensure_ready 复用已就绪页面（WS 连接=%d）",
-                len(_APP_WS_CONNS),
+                "[build] ensure_ready 复用已就绪页面（realm=%s, WS 连接=%d）",
+                self._realm_id or "default",
+                len(connections),
             )
             return state
 
@@ -740,7 +815,13 @@ class BuildSurface:
         created = False
         if page is None or page.is_closed():
             await _ensure_app_ws_sink()
-            page = await self._cdp.create_new_page(block_assets=True)
+            if self._context_id:
+                page = await self._cdp.create_page_in_context(
+                    self._context_id, block_assets=True
+                )
+            else:
+                page = await self._cdp.create_new_page(block_assets=True)
+            await self._install_realm_ws_tag(page)
             state.page = page
             created = True
 
@@ -875,8 +956,9 @@ class BuildSurface:
         """Wait until the app's embedded client completes its 9998 handshake."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
+        connections = self._connections()
         while loop.time() < deadline:
-            if _APP_WS_CONNS:
+            if connections:
                 return True
             await asyncio.sleep(0.5)
         return False
@@ -897,14 +979,18 @@ class BuildSurface:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 60.0
-        while loop.time() < deadline and not _APP_WS_CONNS:
+        connections = self._connections()
+        while loop.time() < deadline and not connections:
             await self._dismiss_interstitials(page, max_rounds=2)
             await self._pass_human_gate(page)
             remaining = max(1.0, deadline - loop.time())
             if await self._wait_app_connect(timeout_s=min(15.0, remaining)):
                 break
-        if not _APP_WS_CONNS:
-            logger.warning("[build] 原地恢复失败：9998 未在 60s 内重连，转完整重建")
+        if not connections:
+            logger.warning(
+                "[build] 原地恢复失败：realm=%s 的 9998 未在 60s 内重连，转完整重建",
+                self._realm_id or "default",
+            )
             return False
         await self._trigger_warmup()
         try:
@@ -986,7 +1072,8 @@ class BuildSurface:
         and the credential headers. A passive sink captures nothing — that is
         exactly why every pre-fix service attempt stalled at ``harvesting``.
         """
-        if not _APP_WS_CONNS:
+        connections = self._connections()
+        if not connections:
             return False
         spec = {
             "method": "POST",
@@ -997,7 +1084,7 @@ class BuildSurface:
             "streaming_mode": "real",
         }
         try:
-            await _APP_WS_CONNS[-1].send(json.dumps(spec))  # type: ignore[attr-defined]
+            await connections[-1].send(json.dumps(spec))  # type: ignore[attr-defined]
         except Exception as exc:
             logger.warning("warmup 规格下发失败: %s", exc)
             return False

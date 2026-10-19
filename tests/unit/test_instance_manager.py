@@ -63,7 +63,7 @@ def _features(**overrides):
         "routing": {
             "global_max_instances": 2,
             "max_realms": 2,
-            "realm_mode": True,
+            "realm_mode": False,
         },
         "slots": [],
     }
@@ -122,7 +122,7 @@ def test_snapshot_reports_planned_slots_and_limits() -> None:
         "global_max": 2,
         "chat_max": 2,
         "build_max": 2,
-        "max_realms": 2,
+        "max_realms": 1,
     }
     assert snapshot["slots"] == {"acc_a:chat": 0, "acc_a:build": 1}
 

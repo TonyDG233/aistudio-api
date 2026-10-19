@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import suppress
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from aistudio_api.config import (
     DEFAULT_BROWSER_PORT,
@@ -68,6 +68,9 @@ class AIStudioClient:
 
         self._streaming_gateway = StreamingGateway(session=self._session)
         self._build_surface: BuildSurface | None = None
+        self._realm_capture: dict[str, RequestCaptureService] = {}
+        self._realm_streaming: dict[str, StreamingGateway] = {}
+        self._realm_replay: dict[str, RequestReplayService] = {}
 
     @property
     def session(self) -> BrowserSession:
@@ -86,8 +89,54 @@ class AIStudioClient:
 
     @property
     def in_flight_count(self) -> int:
-        """Chat + Build 聚合在途数。"""
-        return self._session.in_flight_count + self.build_in_flight_count
+        """Chat + Build + Realm 聚合在途数。"""
+        realm_in_flight = 0
+        for capture in self._realm_capture.values():
+            session = getattr(capture, "_session", None)
+            try:
+                realm_in_flight += int(getattr(session, "in_flight_count", 0) or 0)
+            except Exception:
+                continue
+        return (
+            self._session.in_flight_count + self.build_in_flight_count + realm_in_flight
+        )
+
+    def _ensure_realm_services(
+        self, lease
+    ) -> tuple[RequestCaptureService, StreamingGateway]:
+        adapter: Any = getattr(lease, "adapter", None)
+        session = getattr(adapter, "session", None)
+        if session is None:
+            return self._capture_service, self._streaming_gateway
+        realm_id = str(getattr(adapter, "realm_id", ""))
+        capture = self._realm_capture.get(realm_id)
+        if capture is None:
+            capture = RequestCaptureService(session)
+            self._realm_capture[realm_id] = capture
+        stream = self._realm_streaming.get(realm_id)
+        if stream is None:
+            stream = StreamingGateway(session=session)
+            self._realm_streaming[realm_id] = stream
+        return capture, stream
+
+    def _replay_for(self, lease) -> RequestReplayService:
+        adapter = getattr(lease, "adapter", None)
+        session = getattr(adapter, "session", None)
+        if session is None:
+            return self._replay_service
+        realm_id = str(getattr(adapter, "realm_id", ""))
+        service = self._realm_replay.get(realm_id)
+        if service is None:
+            service = RequestReplayService(session=session)
+            self._realm_replay[realm_id] = service
+        return service
+
+    async def _ensure_lease_build_surface(self, lease) -> BuildSurface:
+        adapter = getattr(lease, "adapter", None)
+        if adapter is None:
+            return await self._ensure_build_surface()
+        cdp = await self._session.ensure_browser_cdp_client()
+        return await adapter.ensure_build_surface(cdp)
 
     @property
     def is_busy(self) -> bool:
@@ -411,8 +460,10 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
         force_refresh: bool = False,
+        lease=None,
     ) -> CapturedRequest | None:
-        return await self._capture_service.capture(
+        capture, _ = self._ensure_realm_services(lease)
+        return await capture.capture(
             prompt=prompt,
             model=model,
             images=images,
@@ -456,25 +507,33 @@ class AIStudioClient:
         force_refresh_capture: bool = False,
         surface: str = "chat",
         rest_body: str | None = None,
+        lease=None,
     ):
+        adapter = getattr(lease, "adapter", None)
+        session = getattr(adapter, "session", None) or self._session
         if surface == "build":
             if not rest_body:
                 raise RequestError(
                     400, "build surface requires a REST body (rest_body)"
                 )
             self._enforce_build_instance_quota()
-            ctx = self._session.active_context
+            ctx = session.active_context
             if ctx is None:
-                ctx = await self._session.ensure_ready()
-            build_surface = await self._ensure_build_surface()
-            await build_surface.ensure_ready(ctx.auth_file, ctx.auth_user)
+                ctx = await session.ensure_ready()
+            build_surface = await self._ensure_lease_build_surface(lease)
+            await build_surface.ensure_ready(
+                ctx.auth_file,
+                ctx.auth_user,
+                account_id=getattr(lease, "account_id", None),
+            )
             async for event in build_surface.stream_generate(
                 model=model, json_body=rest_body
             ):
                 yield event
             return
 
-        async with self._session.request_scope():
+        _, stream_gateway = self._ensure_realm_services(lease)
+        async with session.request_scope():
             captured = await self.capture_request(
                 prompt=capture_prompt,
                 model=model,
@@ -491,10 +550,11 @@ class AIStudioClient:
                 generation_config_overrides=generation_config_overrides,
                 sanitize_plain_text=sanitize_plain_text,
                 force_refresh=force_refresh_capture,
+                lease=lease,
             )
             if not captured:
                 raise RequestError(0, "无法拦截请求")
-            async for event in self._streaming_gateway.stream_chat(
+            async for event in stream_gateway.stream_chat(
                 captured=captured,
                 model=model,
             ):
@@ -557,25 +617,33 @@ class AIStudioClient:
         sanitize_plain_text: bool = True,
         surface: str = "chat",
         rest_body: str | None = None,
+        lease=None,
     ) -> ModelOutput:
+        adapter = getattr(lease, "adapter", None)
+        session = getattr(adapter, "session", None) or self._session
         if surface == "build":
             if not rest_body:
                 raise RequestError(
                     400, "build surface requires a REST body (rest_body)"
                 )
             self._enforce_build_instance_quota()
-            ctx = self._session.active_context
+            ctx = session.active_context
             if ctx is None:
-                ctx = await self._session.ensure_ready()
-            build_surface = await self._ensure_build_surface()
-            await build_surface.ensure_ready(ctx.auth_file, ctx.auth_user)
+                ctx = await session.ensure_ready()
+            build_surface = await self._ensure_lease_build_surface(lease)
+            await build_surface.ensure_ready(
+                ctx.auth_file,
+                ctx.auth_user,
+                account_id=getattr(lease, "account_id", None),
+            )
             return await self._collect_build_output(
                 model=model,
                 json_body=rest_body,
                 build_surface=build_surface,
             )
 
-        async with self._session.request_scope():
+        replay = self._replay_for(lease)
+        async with session.request_scope():
             logger.info("拦截请求: %r", f"{capture_prompt[:20]}...")
             captured = await self.capture_request(
                 prompt=capture_prompt,
@@ -592,15 +660,14 @@ class AIStudioClient:
                 max_tokens=max_tokens,
                 generation_config_overrides=generation_config_overrides,
                 sanitize_plain_text=sanitize_plain_text,
+                lease=lease,
             )
             if not captured:
                 raise RequestError(0, "无法拦截请求")
 
             modified_body = captured.body
 
-            status, raw = await self._replay_service.replay(
-                captured, body=modified_body
-            )
+            status, raw = await replay.replay(captured, body=modified_body)
             raw_text = raw.decode("utf-8", errors="replace")
             self._dump_raw_exchange(
                 kind="generate_content",

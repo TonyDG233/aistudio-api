@@ -133,6 +133,7 @@ groups:
 |---|---|---|---|
 | 2026-10-19 12:30 | 计划批准、看板建立 | 完成 | 本文件 |
 | 2026-10-19 12:38 | Phase 1 配置/纯策略 | 完成 | 新增 channel_registry/account_routing/AccountMeta.routing；单测 680 passed；pyright 0；ruff 通过 |
-| 2026-10-19 12:39 | Phase 2 管线/级别 A | 进行中 | routing_safety 并行分派；主 agent 写 routing_pipeline/instance_manager |
-| | Phase 3 | 未开始 | |
+| 2026-10-19 12:39 | Phase 2 管线/级别 A | 完成 | commit `ec35c8d`；721 passed；pyright 0；ruff/format 通过 |
+| 2026-10-19 12:53 | Phase 3 跨账号 Realm | 进行中 | cdp_client/rlm_pool/build WS 解复用/API |
+| | Phase 4 | 未开始 | |
 | | Phase 4 | 未开始 | |

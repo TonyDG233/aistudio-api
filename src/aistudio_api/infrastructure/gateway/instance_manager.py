@@ -33,6 +33,7 @@ class InstanceLease:
     realm_id: str = "default"
     slot_index: int | None = None
     is_borrow: bool = False
+    adapter: object | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ class InstanceManager:
         self._client = client
         self._features_provider = features_provider
         self._account_store = account_store
+        self._realm_pool_obj = None
 
     def _features(self) -> dict[str, object]:
         if self._features_provider is not None:
@@ -107,6 +109,37 @@ class InstanceManager:
         from aistudio_api.infrastructure.account.account_store import AccountStore
 
         return AccountStore()
+
+    def _realm_mode(self) -> bool:
+        raw = self._features().get("routing")
+        routing = raw if isinstance(raw, dict) else {}
+        return bool(routing.get("realm_mode", True))
+
+    def _realm_pool(self):
+        if self._realm_pool_obj is None:
+            from aistudio_api.infrastructure.gateway.realm_pool import RealmPool
+
+            self._realm_pool_obj = RealmPool(
+                lambda: self._client.session.ensure_browser_cdp_client(),
+                features_provider=self._features,
+            )
+        return self._realm_pool_obj
+
+    def _auth_for(self, account_id: str) -> tuple[str | None, str | None]:
+        try:
+            from aistudio_api.api.state import runtime_state
+
+            service = runtime_state.account_service
+            if service is not None:
+                path = service.get_account_auth_path(account_id)
+                account = service.get_account(account_id)
+                return (
+                    str(path) if path is not None else None,
+                    getattr(account, "auth_user", None),
+                )
+        except Exception:
+            pass
+        return None, None
 
     def _page_alive(self, channel: str) -> bool:
         if channel == "build":
@@ -133,8 +166,15 @@ class InstanceManager:
             channel for channel in ("chat", "build") if self._page_alive(channel)
         )
 
+    def _realm_page_counts(self) -> dict[str, int]:
+        if self._realm_pool_obj is None:
+            return {"chat": 0, "build": 0}
+        return self._realm_pool_obj.page_counts()
+
     def live_page_count(self) -> int:
-        return sum(1 for channel in ("chat", "build") if self._page_alive(channel))
+        default = sum(1 for channel in ("chat", "build") if self._page_alive(channel))
+        realm = self._realm_page_counts()
+        return default + realm.get("chat", 0) + realm.get("build", 0)
 
     @property
     def in_flight_count(self) -> int:
@@ -191,11 +231,17 @@ class InstanceManager:
         return 0
 
     def _usage(self, channel: str, group: GroupPolicy | None) -> BudgetUsage:
+        realm = self._realm_page_counts()
+        default_channel = 1 if self._page_alive(channel) else 0
         return BudgetUsage(
             global_live=self.live_page_count(),
-            channel_live=1 if self._page_alive(channel) else 0,
+            channel_live=default_channel + realm.get(channel, 0),
             group_live=self._group_live(group),
-            realm_live=1 if self.live_page_count() > 0 else 0,
+            realm_live=(
+                len(self._realm_pool_obj.snapshot())
+                if self._realm_pool_obj is not None
+                else (1 if self.live_page_count() > 0 else 0)
+            ),
         )
 
     def limits_for(self, group: GroupPolicy | None) -> BudgetLimits:
@@ -254,7 +300,34 @@ class InstanceManager:
         model: str,
         require_idle: bool = True,
     ) -> InstanceLease | None:
-        """Activate the candidate account (level A) and return an instance lease."""
+        """Activate the candidate account and return an instance lease."""
+        if self._realm_mode():
+            from aistudio_api.infrastructure.gateway.realm_pool import (
+                RealmCapacityError,
+            )
+
+            auth_file, auth_user = self._auth_for(account_id)
+            try:
+                realm = await self._realm_pool().acquire(
+                    account_id=account_id,
+                    auth_file=auth_file,
+                    auth_user=auth_user,
+                )
+            except RealmCapacityError as exc:
+                logger.info(
+                    "[surface:budget] realm capacity exhausted account=%s: %s",
+                    account_id,
+                    exc,
+                )
+                return None
+            return InstanceLease(
+                account_id=account_id,
+                channel=channel,
+                surface=surface,
+                realm_id=realm.realm_id,
+                adapter=realm,
+            )
+
         from aistudio_api.application.account_orchestrator import switch_to_account
 
         try:
@@ -319,6 +392,11 @@ class InstanceManager:
                 "max_realms": self._realm_limit(features),
             },
             "planned_instances": len(self.slot_indexes()),
+            "realms": (
+                self._realm_pool_obj.snapshot()
+                if self._realm_pool_obj is not None
+                else []
+            ),
             "slots": {
                 f"{account_id}:{channel}": index
                 for (account_id, channel), index in self.slot_indexes().items()
