@@ -29,6 +29,7 @@ from aistudio_api.infrastructure.utils.logger import (
 from .dependencies import require_api_key, require_web_auth
 from .format_errors import format_error_response, format_for_path
 from .routes_accounts import router as accounts_router
+from .routes_claude import router as claude_router
 from .routes_gemini import router as gemini_router
 from .routes_keepalive import router as keepalive_router
 from .routes_models import router as models_router
@@ -168,6 +169,7 @@ app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(openai_router, dependencies=[Depends(require_api_key)])
+app.include_router(claude_router, dependencies=[Depends(require_api_key)])
 
 
 @app.exception_handler(HTTPException)
