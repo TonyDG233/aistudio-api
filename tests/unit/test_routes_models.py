@@ -42,6 +42,44 @@ async def test_get_single_model_returns_model_object(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_multi_channel_model_list_uses_canonical_prefixes(monkeypatch):
+    from aistudio_api.infrastructure.gateway import model_defaults, model_discovery
+
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(
+        model_discovery.model_discovery,
+        "get_models",
+        _discovered_models,
+    )
+    monkeypatch.setattr(
+        model_defaults,
+        "get_features_config",
+        lambda: {
+            "channels": {
+                "chat": {"enabled": True, "max_pages": 1},
+                "build": {"enabled": True, "max_pages": 1},
+                "official": {"enabled": False, "max_pages": 0},
+            }
+        },
+    )
+
+    async with _build_client() as client:
+        response = await client.get("/v1beta/models")
+        names = [item["name"] for item in response.json()["models"]]
+        assert names == ["models/pg/flash", "models/build/flash"]
+
+
+async def _discovered_models(**kwargs):
+    return [
+        {
+            "id": "models/flash",
+            "displayName": "Flash",
+            "supportedGenerationMethods": ["generateContent"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_v1_models_can_be_disabled(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset())
     monkeypatch.setattr(

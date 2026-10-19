@@ -762,6 +762,46 @@ async def test_route_models_list_and_single_model(monkeypatch):
     assert error["type"] == "not_found_error"
 
 
+@pytest.mark.asyncio
+async def test_route_models_list_uses_canonical_prefixes(monkeypatch):
+    async def fake_models(**_kwargs: Any) -> list[dict[str, object]]:
+        return [{"id": "models/gemini-x"}]
+
+    calls: list[str] = []
+
+    async def fake_model(model_id: str, **_kwargs: Any) -> dict[str, object] | None:
+        calls.append(model_id)
+        if model_id == "gemini-x":
+            return {"id": "models/gemini-x"}
+        return None
+
+    monkeypatch.setattr(model_discovery, "get_models", fake_models)
+    monkeypatch.setattr(model_discovery, "get_model_by_id", fake_model)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults.get_features_config",
+        lambda: {
+            "channels": {
+                "chat": {"enabled": True, "max_pages": 1},
+                "build": {"enabled": True, "max_pages": 1},
+                "official": {"enabled": False, "max_pages": 0},
+            }
+        },
+    )
+    app = _app(with_client=False)
+
+    listing = await _get(app, "/v1/models")
+    body = _as_dict(listing.json())
+    assert [item["id"] for item in body["data"]] == [
+        "pg/gemini-x",
+        "build/gemini-x",
+    ]
+
+    single = await _get(app, "/v1/models/pg/gemini-x")
+    assert single.status_code == 200
+    assert single.json()["id"] == "pg/gemini-x"
+    assert calls == ["gemini-x"]
+
+
 def test_require_openai_raises_http_exception_when_disabled(monkeypatch):
     monkeypatch.setattr(
         "aistudio_api.api.format_errors.format_enabled", lambda _fmt: False

@@ -152,16 +152,16 @@ async def list_models(
     state: RuntimeState = Depends(get_runtime_state),
 ) -> JSONResponse:
     session = state.client._session if state.client is not None else None
+    from aistudio_api.application.model_catalog import project_model_ids
+    from aistudio_api.infrastructure.gateway.model_defaults import get_features_config
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     discovered = await model_discovery.get_models(session=session)
+    projected = project_model_ids(discovered, get_features_config())
     return JSONResponse(
         {
             "object": "list",
-            "data": [
-                _model_object(str(item.get("id") or item.get("name") or ""))
-                for item in discovered
-            ],
+            "data": [_model_object(model_id) for model_id in projected],
         }
     )
 
@@ -172,10 +172,14 @@ async def get_model(
     state: RuntimeState = Depends(get_runtime_state),
 ) -> JSONResponse:
     session = state.client._session if state.client is not None else None
+    from aistudio_api.application.model_catalog import resolve_model_request
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    model = await model_discovery.get_model_by_id(model_id, session=session)
+    clean_id, _channel = resolve_model_request(model_id)
+    model = await model_discovery.get_model_by_id(clean_id, session=session)
     if model is None:
         return format_error_response(HTTPException(404, "Model not found"), "openai")
-    raw_id = str(model.get("id") or model.get("name") or model_id)
+    raw_id = model_id.removeprefix("models/") or str(
+        model.get("id") or model.get("name") or model_id
+    )
     return JSONResponse(_model_object(raw_id))
