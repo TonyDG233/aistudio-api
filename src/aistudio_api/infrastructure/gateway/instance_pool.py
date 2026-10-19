@@ -290,6 +290,26 @@ class InstancePool:
                     f"page budget exhausted: group {group_name}>{group_max_pages}"
                 )
 
+    def budget_snapshot(self) -> dict[str, object]:
+        features = self._features()
+        raw_channels = features.get("channels")
+        channels = raw_channels if isinstance(raw_channels, dict) else {}
+        channel_limits: dict[str, int] = {}
+        for channel in ("chat", "build", "official"):
+            raw = channels.get(channel)
+            spec = raw if isinstance(raw, dict) else {}
+            try:
+                channel_limits[channel] = max(0, int(spec.get("max_pages", 0)))
+            except (TypeError, ValueError):
+                channel_limits[channel] = 0
+        return {
+            "global_max_pages": self._global_max_pages(),
+            "channel_max_pages": channel_limits,
+            "max_contexts": self.max_contexts,
+            "pages": self.page_counts(),
+            "contexts": self.live_contexts,
+        }
+
     def snapshot(self) -> list[dict[str, object]]:
         return [
             {

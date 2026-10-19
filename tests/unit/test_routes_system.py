@@ -40,6 +40,54 @@ async def test_routing_state_endpoint(monkeypatch):
         assert payload["instances"]["planned_instances"] == 1
 
 
+def test_surface_instance_snapshot_uses_unified_pool() -> None:
+    from typing import Any, cast
+
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+    class FakePool:
+        def snapshot(self):
+            return [
+                {
+                    "slot_id": "slot-1",
+                    "account_id": "a",
+                    "state": "busy",
+                    "chat_ready": True,
+                    "build_ready": False,
+                }
+            ]
+
+        def page_counts(self):
+            return {"chat": 1, "build": 0}
+
+        @property
+        def live_contexts(self):
+            return 1
+
+        @property
+        def max_contexts(self):
+            return 2
+
+        def budget_snapshot(self):
+            return {"global_max_pages": 2, "max_contexts": 2}
+
+    client: Any = AIStudioClient.__new__(AIStudioClient)
+    client._session = None
+    client._instance_pool = FakePool()
+    client._features_config = lambda: {
+        "slots": [{"account_id": "a", "channel": "pg", "enabled": True}]
+    }
+
+    snapshot = cast("dict[str, object]", client.surface_instance_snapshot())
+    contexts = cast("list[dict[str, object]]", snapshot["contexts"])
+    assert contexts[0]["slot_id"] == "slot-1"
+    assert snapshot["pages"] == {"chat": 1, "build": 0}
+    assert snapshot["context_count"] == 1
+    assert snapshot["planned_instances"] == 1
+    assert "realms" not in snapshot
+    assert snapshot["control_session"] == {"alive": False, "url": None}
+
+
 @pytest.mark.asyncio
 async def test_health_endpoint():
     async with _client() as client:

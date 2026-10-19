@@ -537,12 +537,22 @@ class RoutingPipeline:
         )
 
     def snapshot(self) -> dict[str, object]:
+        features = self._features()
+        raw_slots = features.get("slots")
+        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
+        planned = sum(
+            1
+            for slot in slots
+            if isinstance(slot, dict) and bool(slot.get("enabled", True))
+        )
         return {
             "circuit": self._breaker.snapshot(),
             "instances": {
                 "contexts": self.pool.snapshot(),
                 "max_contexts": self.pool.max_contexts,
                 "pages": self.pool.page_counts(),
+                "budgets": self.pool.budget_snapshot(),
+                "planned_instances": planned,
             },
         }
 
