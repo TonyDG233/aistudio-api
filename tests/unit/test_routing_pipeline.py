@@ -1,15 +1,19 @@
-"""Behavior contracts for the WP5 phase-2 routing pipeline."""
+"""Behavior contracts for the WP5 v3 request routing pipeline."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from aistudio_api.application.routing_pipeline import RoutingPipeline
-from aistudio_api.application.routing_safety import CircuitBreaker
 from aistudio_api.application.surface_orchestrator import SurfacePolicyError
-from aistudio_api.infrastructure.gateway.instance_manager import InstanceLease
+from aistudio_api.infrastructure.gateway.instance_pool import (
+    InstanceCapacityError,
+    InstanceLease,
+)
 
 
 @dataclass
@@ -19,13 +23,13 @@ class Account:
     tier: str | None = "free"
     email: str | None = None
     expired: bool = False
+    routing: dict[str, object] = field(default_factory=dict)
 
 
 class FakeStore:
     def __init__(self, accounts: list[Account], active_id: str | None = None):
         self.accounts = accounts
         self.active_id = active_id or accounts[0].id
-        self.routing: dict[str, dict[str, object]] = {}
 
     def list_accounts(self) -> list[Account]:
         return list(self.accounts)
@@ -33,339 +37,259 @@ class FakeStore:
     def get_active_account(self) -> Account | None:
         return next((a for a in self.accounts if a.id == self.active_id), None)
 
-    def get_account(self, account_id: str) -> Account | None:
-        return next((a for a in self.accounts if a.id == account_id), None)
-
     def get_account_routing(self, account_id: str) -> dict[str, object]:
-        return dict(self.routing.get(account_id, {}))
-
-
-class _Stats:
-    def __init__(self, requests: int = 0, last_used: float = 0.0):
-        self.requests = requests
-        self.last_used = last_used
+        account = next((a for a in self.accounts if a.id == account_id), None)
+        return dict(account.routing) if account is not None else {}
 
 
 class FakeRotator:
-    def __init__(self):
+    def __init__(self) -> None:
         self.unavailable: set[str] = set()
-        self.stats: dict[str, _Stats] = {}
 
     def is_account_available(self, account_id, model=None, *, surface="chat"):
+        del model, surface
         return account_id not in self.unavailable
 
     def get_account_stats(self, account_id):
-        return self.stats.get(account_id)
+        del account_id
+        return
 
 
-class _Page:
-    def is_closed(self) -> bool:
-        return False
+class FakePool:
+    def __init__(
+        self,
+        *,
+        capacity_error: bool = False,
+        capacity_until_borrow: bool = False,
+    ) -> None:
+        self.capacity_error = capacity_error
+        self.capacity_until_borrow = capacity_until_borrow
+        self.acquired: list[dict[str, object]] = []
+        self.released: list[str] = []
+
+    def slots(self):
+        return ()
+
+    def page_counts(self):
+        return {"chat": 0, "build": 0}
+
+    @property
+    def max_contexts(self) -> int:
+        return 2
+
+    def snapshot(self):
+        return []
+
+    async def acquire(self, **kwargs) -> InstanceLease:
+        self.acquired.append(dict(kwargs))
+        borrow_accounts = kwargs.get("borrow_accounts")
+        if self.capacity_error or (self.capacity_until_borrow and not borrow_accounts):
+            raise InstanceCapacityError("pool full")
+        account_id = str(kwargs["account_id"])
+        if borrow_accounts:
+            account_id = sorted(borrow_accounts)[0]
+        return InstanceLease(
+            account_id=account_id,
+            channel=str(kwargs.get("channel") or "chat"),
+            surface=str(kwargs.get("surface") or "chat"),
+            slot_id="slot-1",
+            realm_id="slot-1-g1",
+            context_id="ctx-1",
+            adapter=cast("Any", SimpleNamespace()),
+            is_borrow=bool(borrow_accounts),
+            slot_index=0,
+        )
+
+    async def release(self, lease: InstanceLease) -> None:
+        self.released.append(lease.realm_id)
 
 
-class _Context:
-    page = _Page()
-
-
-class _Session:
-    active_context = _Context()
-    in_flight_count = 0
-
-
-class FakeClient:
-    session = _Session()
-    in_flight_count = 0
-
-    def _build_surface_page_alive(self) -> bool:
-        return False
-
-
-class _EmptySession:
-    active_context = None
-    in_flight_count = 0
-
-
-class FakeClientNoPage(FakeClient):
-    session = _EmptySession()
-
-
-def features(**overrides):
-    base: dict[str, object] = {
-        "build_surface": False,
+def _features(
+    *,
+    groups: list[dict[str, object]] | None = None,
+    borrow: bool = False,
+) -> dict[str, object]:
+    return {
+        "build_surface": True,
         "route_by_tier": False,
         "channels": {
-            "chat": {"enabled": True, "max_instances": 2},
-            "build": {"enabled": False, "max_instances": 2},
-            "official": {"enabled": False, "max_instances": 0},
+            "chat": {"enabled": True, "max_pages": 1, "quota_pool": None},
+            "build": {"enabled": True, "max_pages": 1, "quota_pool": None},
+            "official": {"enabled": False, "max_pages": 0},
         },
-        "routing": {
-            "max_switches": 2,
-            "global_max_instances": 2,
-            "max_realms": 2,
-            "realm_mode": True,
-            "borrow": False,
-            "prewarm": False,
-            "circuit_breaker": {
-                "window_seconds": 600,
-                "failure_threshold": 5,
-                "cooldown_seconds": 300,
-            },
-        },
+        "routing": {"max_switches": 2, "borrow": borrow},
         "slots": [],
-        "groups": [],
+        "groups": groups or [],
     }
-    base.update(overrides)
-    return base
 
 
-def pipeline(
-    store: FakeStore,
-    cfg: dict[str, object],
-    rotator=None,
-    client=None,
-):
-    return RoutingPipeline(
-        client or FakeClient(),
-        account_store=store,
-        features_provider=lambda: cfg,
-        rotator=rotator or FakeRotator(),
-        breaker=CircuitBreaker(clock=lambda: 1000.0),
-        clock=lambda: 1000.0,
+def _pipeline(
+    monkeypatch,
+    accounts: list[Account],
+    *,
+    features: dict[str, object],
+    active_id: str | None = None,
+    pool: FakePool | None = None,
+) -> tuple[RoutingPipeline, FakePool]:
+    fake_pool = pool or FakePool()
+    client = SimpleNamespace(instance_pool=fake_pool)
+    pipe = RoutingPipeline(
+        client,
+        account_store=FakeStore(accounts, active_id=active_id),
+        features_provider=lambda: features,
+        rotator=FakeRotator(),
     )
 
+    def auth_for(account_id: str) -> tuple[str, str]:
+        return f"{account_id}.json", "0"
 
-def test_zero_config_single_account_routes_chat() -> None:
-    store = FakeStore([Account("acc_a")])
-    ctx = pipeline(store, features()).begin(
-        model_path="gemini-3.8-flash", api_format="gemini"
-    )
-    assert ctx.channel == "chat"
-    assert ctx.surface == "chat"
-    assert ctx.group.source == "implicit-global"
-    assert [c.account_id for c in ctx.candidates] == ["acc_a"]
-    assert ctx.multi_mode is False
+    monkeypatch.setattr(pipe, "_auth_for", auth_for)
+    return pipe, fake_pool
 
 
-def test_explicit_group_limits_candidate_pool() -> None:
-    groups = [
+def _native_groups() -> list[dict[str, object]]:
+    return [
         {
             "name": "pro",
-            "enabled": True,
-            "match_tier": ["pro"],
+            "match_tier": ["pro", "ultra", "plus"],
             "allowed_surfaces": ["chat"],
-            "max_page_instances": 2,
         },
         {
             "name": "free",
-            "enabled": True,
             "match_tier": ["free"],
             "allowed_surfaces": ["build"],
-            "max_page_instances": 2,
         },
     ]
-    store = FakeStore(
-        [Account("acc_pro", "pro", tier="pro"), Account("acc_free", "free")],
-        active_id="acc_pro",
+
+
+def test_pro_request_finds_pro_account_even_when_active_is_free(monkeypatch) -> None:
+    accounts = [
+        Account("free-1", tier="free"),
+        Account("pro-1", tier="pro"),
+    ]
+    pipe, _ = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=_native_groups()),
+        active_id="free-1",
     )
-    cfg = features(
-        route_by_tier=True,
-        build_surface=True,
-        groups=groups,
-        channels={
-            "chat": {"enabled": True, "max_instances": 2},
-            "build": {"enabled": True, "max_instances": 2},
-            "official": {"enabled": False, "max_instances": 0},
+
+    ctx = pipe.begin(model_path="pg/argon", api_format="gemini")
+    assert ctx.channel == "chat"
+    assert [candidate.account_id for candidate in ctx.candidates] == ["pro-1"]
+    assert ctx.candidates[0].group.name == "pro"
+
+
+def test_bare_model_channel_is_not_decided_by_active_account(monkeypatch) -> None:
+    accounts = [
+        Account("free-1", tier="free"),
+        Account("pro-1", tier="pro"),
+    ]
+    pipe, _ = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=_native_groups()),
+        active_id="pro-1",
+    )
+
+    ctx = pipe.begin(model_path="models/flash", api_format="gemini")
+    assert ctx.channel == "build"
+    assert [candidate.account_id for candidate in ctx.candidates] == ["free-1"]
+
+
+def test_no_pro_account_raises_explicit_403(monkeypatch) -> None:
+    pipe, _ = _pipeline(
+        monkeypatch,
+        [Account("free-1", tier="free")],
+        features=_features(groups=_native_groups()),
+    )
+
+    with pytest.raises(SurfacePolicyError) as exc:
+        pipe.begin(model_path="pg/argon", api_format="gemini")
+    assert exc.value.code == "surface_no_capable_account"
+
+
+def test_groups_are_per_candidate_in_snapshot(monkeypatch) -> None:
+    accounts = [
+        Account("free-1", tier="free"),
+        Account("pro-1", tier="pro"),
+    ]
+    groups = [
+        {
+            "name": "pro",
+            "match_tier": ["pro"],
+            "allowed_surfaces": ["chat", "build"],
         },
-    )
-    ctx = pipeline(store, cfg).begin(model_path="gemini-3.8-flash", api_format="gemini")
-    assert ctx.surface == "chat"
-    assert ctx.group.name == "pro"
-    assert [c.account_id for c in ctx.candidates] == ["acc_pro"]
-
-
-def test_chat_only_prefix_to_build_is_explicit_model_guard() -> None:
-    store = FakeStore([Account("acc_a")])
-    cfg = features(
-        build_surface=True,
-        channels={
-            "chat": {"enabled": True, "max_instances": 2},
-            "build": {"enabled": True, "max_instances": 2},
-            "official": {"enabled": False, "max_instances": 0},
+        {
+            "name": "free",
+            "match_tier": ["free"],
+            "allowed_surfaces": ["chat", "build"],
         },
+    ]
+    pipe, _ = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=groups),
     )
-    with pytest.raises(SurfacePolicyError) as caught:
-        pipeline(store, cfg).begin(
-            model_path="build/gemini-4-argon", api_format="gemini"
-        )
-    assert caught.value.code == "surface_model_guard"
-    assert caught.value.http_status == 403
+
+    ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
+    snapshot = ctx.snapshot()
+    assert snapshot["groups"] == ["free", "pro"]
+    candidates = cast("list[dict[str, object]]", snapshot["candidates"])
+    assert {candidate["group"] for candidate in candidates} == {"free", "pro"}
 
 
-def test_account_routing_narrows_candidate_pool() -> None:
-    store = FakeStore([Account("acc_a", "a"), Account("acc_b", "b")], active_id="acc_a")
-    store.routing["acc_b"] = {"surfaces": ["build"]}
-    ctx = pipeline(store, features()).begin(
-        model_path="chat/gemini-3.8-flash", api_format="openai"
+@pytest.mark.asyncio
+async def test_acquire_loads_candidate_account_and_releases(monkeypatch) -> None:
+    accounts = [Account("pro-1", tier="pro"), Account("pro-2", tier="pro")]
+    pipe, pool = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=_native_groups()),
     )
-    assert [c.account_id for c in ctx.candidates] == ["acc_a"]
-
-
-def test_slot_rows_are_preferred_after_active_account() -> None:
-    store = FakeStore(
-        [Account("acc_a", "a"), Account("acc_b", "b"), Account("acc_c", "c")],
-        active_id="acc_a",
-    )
-    cfg = features(
-        slots=[
-            {"account_id": "acc_b", "channel": "chat", "enabled": True},
-            {"account_id": "acc_c", "channel": "chat", "enabled": True},
-        ]
-    )
-    ctx = pipeline(store, cfg).begin(model_path="gemini-3.8-flash", api_format="gemini")
-    assert [c.account_id for c in ctx.candidates] == ["acc_a", "acc_b", "acc_c"]
-    assert ctx.candidates[1].slot_index == 0
-
-
-def test_slot_rows_trigger_multi_mode() -> None:
-    store = FakeStore([Account("acc_a")])
-    cfg = features(
-        slots=[
-            {"account_id": "acc_a", "channel": "chat", "enabled": True},
-            {"account_id": "acc_a", "channel": "build", "enabled": True},
-        ]
-    )
-    ctx = pipeline(store, cfg).begin(model_path="gemini-3.8-flash", api_format="gemini")
-    assert ctx.multi_mode is True
-
-
-def test_budget_exhaustion_raises_quota_after_two_defers() -> None:
-    store = FakeStore(
-        [Account("acc_a", "a"), Account("acc_b", "b"), Account("acc_c", "c")],
-        active_id="acc_a",
-    )
-    cfg = features(
-        channels={
-            "chat": {"enabled": True, "max_instances": 0},
-            "build": {"enabled": False, "max_instances": 2},
-            "official": {"enabled": False, "max_instances": 0},
-        }
-    )
-    pipe = pipeline(store, cfg, client=FakeClientNoPage())
-    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
-    with pytest.raises(SurfacePolicyError) as caught:
-        pipe.next_candidate(ctx)
-    assert caught.value.code == "surface_quota_exceeded"
-    assert ctx.budget.snapshot()["defers"] == 2
-
-
-async def test_borrow_uses_idle_realm_when_primary_budget_is_full() -> None:
-    store = FakeStore([Account("acc_a", "a")], active_id="acc_a")
-    cfg = features(
-        channels={
-            "chat": {"enabled": True, "max_instances": 0},
-            "build": {"enabled": False, "max_instances": 2},
-            "official": {"enabled": False, "max_instances": 0},
-        },
-        routing={
-            "max_switches": 2,
-            "global_max_instances": 2,
-            "max_realms": 2,
-            "realm_mode": True,
-            "borrow": True,
-            "prewarm": False,
-            "circuit_breaker": {
-                "window_seconds": 600,
-                "failure_threshold": 5,
-                "cooldown_seconds": 300,
-            },
-        },
-    )
-    pipe = pipeline(store, cfg, client=FakeClientNoPage())
-
-    def fake_borrow(*, surface: str, exclude_accounts: set[str]):
-        return InstanceLease(
-            account_id="acc_b",
-            channel=surface,
-            surface=surface,
-            realm_id="realm-acc_b-1",
-            is_borrow=True,
-        )
-
-    pipe.instances.borrow_lease = fake_borrow  # type: ignore[method-assign]
-    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
-    candidate = pipe.next_candidate(ctx)
+    ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
+    candidate = ctx.next_candidate()
     assert candidate is not None
-    assert candidate.reason == "borrow"
-    lease = await pipe.land(ctx, candidate)
-    assert lease is not None
+
+    lease = await pipe.acquire(ctx, candidate)
+    assert pool.acquired[0]["account_id"] == candidate.account_id
+    assert lease.account_id == candidate.account_id
+    await pipe.release(ctx, lease)
+    assert pool.released == [lease.realm_id]
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_maps_to_explicit_429(monkeypatch) -> None:
+    pipe, _ = _pipeline(
+        monkeypatch,
+        [Account("pro-1", tier="pro")],
+        features=_features(groups=_native_groups()),
+        pool=FakePool(capacity_error=True),
+    )
+    ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
+    candidate = ctx.next_candidate()
+    assert candidate is not None
+
+    with pytest.raises(SurfacePolicyError) as exc:
+        await pipe.acquire(ctx, candidate)
+    assert exc.value.code == "surface_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_borrow_runs_only_after_primary_capacity_failure(monkeypatch) -> None:
+    accounts = [Account("pro-1", tier="pro"), Account("pro-2", tier="pro")]
+    groups = [{"name": "pro", "match_tier": ["pro"], "allowed_surfaces": ["chat"]}]
+    pipe, pool = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=groups, borrow=True),
+        pool=FakePool(capacity_until_borrow=True),
+    )
+    ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
+    candidate = ctx.next_candidate()
+    assert candidate is not None
+
+    lease = await pipe.acquire(ctx, candidate)
     assert lease.is_borrow is True
-    assert lease.account_id == "acc_b"
-
-
-def test_switch_budget_caps_account_switches() -> None:
-    store = FakeStore([Account("acc_a")])
-    pipe = pipeline(store, features())
-    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
-    pipe.record_switch(ctx, "auth")
-    pipe.record_switch(ctx, "rate_limited")
-    with pytest.raises(SurfacePolicyError) as caught:
-        pipe.record_switch(ctx, "again")
-    assert caught.value.code == "surface_switch_exhausted"
-    assert caught.value.http_status == 503
-
-
-def test_retry_does_not_consume_switch_budget() -> None:
-    store = FakeStore([Account("acc_a")])
-    pipe = pipeline(store, features())
-    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
-    pipe.record_retry(ctx, "transient")
-    pipe.record_retry(ctx, "empty")
-    snapshot = ctx.budget.snapshot()
-    assert snapshot["switches"] == 0
-    assert snapshot["retries"] == 2
-
-
-def test_open_circuit_rejects_switch_before_budget() -> None:
-    breaker = CircuitBreaker(
-        failure_threshold=2, cooldown_seconds=300, clock=lambda: 1000.0
-    )
-    store = FakeStore([Account("acc_a")])
-    pipe = RoutingPipeline(
-        FakeClient(),
-        account_store=store,
-        features_provider=lambda: features(),
-        rotator=FakeRotator(),
-        breaker=breaker,
-        clock=lambda: 1000.0,
-    )
-    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
-    pipe.record_switch_failure(ctx)
-    pipe.record_switch_failure(ctx)
-    with pytest.raises(SurfacePolicyError) as caught:
-        pipe.record_switch(ctx, "auth")
-    assert caught.value.code == "surface_switch_exhausted"
-
-
-def test_no_capable_account_is_explicit_403() -> None:
-    store = FakeStore([Account("acc_a", "a", tier="free")])
-    cfg = features(route_by_tier=True, build_surface=False)
-    # free default-tier group only allows build, but build channel is disabled.
-    with pytest.raises(SurfacePolicyError) as caught:
-        pipeline(store, cfg).begin(model_path="gemini-3.8-flash", api_format="gemini")
-    assert caught.value.code == "surface_group_disabled"
-    assert caught.value.http_status == 403
-
-
-def test_active_account_is_first_and_cooldown_accounts_sort_last() -> None:
-    rotator = FakeRotator()
-    rotator.unavailable.add("acc_b")
-    rotator.stats["acc_b"] = _Stats(requests=0)
-    rotator.stats["acc_c"] = _Stats(requests=100)
-    store = FakeStore(
-        [Account("acc_a", "a"), Account("acc_b", "b"), Account("acc_c", "c")],
-        active_id="acc_a",
-    )
-    ctx = pipeline(store, features(), rotator).begin(
-        model_path="gemini-3.8-flash", api_format="gemini"
-    )
-    assert [c.account_id for c in ctx.candidates] == ["acc_a", "acc_c", "acc_b"]
+    assert len(pool.acquired) == 2
+    assert pool.acquired[1]["borrow_accounts"]

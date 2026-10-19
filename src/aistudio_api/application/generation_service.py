@@ -40,6 +40,7 @@ from aistudio_api.application.upstream_errors import (
 )
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.gateway.instance_pool import InstanceLease
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("generation")
@@ -66,6 +67,21 @@ class StreamEvent:
     response_id: str | None = None
     thought_signature: str | None = None
     finish_reason: str | None = None
+
+
+class _LeaseHolder:
+    """Tracks the current streaming lease so cancellation still releases it."""
+
+    def __init__(self) -> None:
+        self.pipe: RoutingPipeline | None = None
+        self.ctx: RouteContext | None = None
+        self.lease: InstanceLease | None = None
+
+    async def release(self) -> None:
+        lease = self.lease
+        self.lease = None
+        if lease is not None and self.pipe is not None and self.ctx is not None:
+            await self.pipe.release(self.ctx, lease)
 
 
 @dataclass(frozen=True)
@@ -226,13 +242,14 @@ async def generate(
     for attempt in range(MAX_RETRIES):
         if pipe is not None and ctx is not None:
             if not (ctx.retry_same and candidate is not None):
+                if lease is not None:
+                    await pipe.release(ctx, lease)
+                    lease = None
                 previous = candidate.account_id if candidate is not None else None
                 candidate = pipe.next_candidate(ctx, previous)
                 if candidate is None:
                     _raise_switch_exhausted(ctx)
-                lease = await pipe.land(ctx, candidate, require_idle=True)
-                if lease is None:
-                    continue
+                lease = await pipe.acquire(ctx, candidate)
             else:
                 ctx.retry_same = False
         else:
@@ -305,6 +322,8 @@ async def generate(
 
             if pipe is not None and ctx is not None:
                 pipe.record_success(ctx)
+                await pipe.release(ctx, lease)
+                lease = None
             record_rotator_event("success", model=normalized.model, surface=surface)
             runtime_state.record(
                 normalized.model, "success", output.usage, api_format=api_format
@@ -339,9 +358,17 @@ async def generate(
                 route_ctx=ctx,
                 lease=lease,
             ):
+                if pipe is not None and ctx is not None and not ctx.retry_same:
+                    await pipe.release(ctx, lease)
+                    lease = None
                 continue
+            if pipe is not None and ctx is not None:
+                await pipe.release(ctx, lease)
+                lease = None
             raise
 
+    if pipe is not None and ctx is not None:
+        await pipe.release(ctx, lease)
     raise HTTPException(
         429,
         detail={
@@ -351,16 +378,19 @@ async def generate(
     ) from last_error
 
 
-async def stream_generation(
+async def _stream_generation_impl(
     *,
     model_path: str,
     req: GeminiGenerateContentRequest,
     client: AIStudioClient,
     api_format: str = "gemini",
     atg_factory: Callable[[], AtgProcessor] | None = None,
+    lease_holder: _LeaseHolder,
 ) -> AsyncIterator[StreamEvent]:
     """Run a streaming generation, yielding protocol-neutral events."""
     pipe, ctx = _begin_route(model_path, api_format)
+    lease_holder.pipe = pipe
+    lease_holder.ctx = ctx
     effective_model_path = ctx.clean_model if ctx is not None else model_path
     surface = ctx.surface if ctx is not None else _resolve_surface(effective_model_path)
     candidate = None
@@ -423,6 +453,10 @@ async def stream_generation(
         has_yielded_data = False
         if pipe is not None and ctx is not None:
             if not (ctx.retry_same and candidate is not None):
+                if lease is not None:
+                    await pipe.release(ctx, lease)
+                    lease = None
+                    lease_holder.lease = None
                 previous = candidate.account_id if candidate is not None else None
                 candidate = pipe.next_candidate(ctx, previous)
                 if candidate is None:
@@ -432,9 +466,8 @@ async def stream_generation(
                     payload="resolving-instance",
                     model=effective_model_path,
                 )
-                lease = await pipe.land(ctx, candidate, require_idle=True)
-                if lease is None:
-                    continue
+                lease = await pipe.acquire(ctx, candidate)
+                lease_holder.lease = lease
             else:
                 ctx.retry_same = False
         else:
@@ -541,8 +574,16 @@ async def stream_generation(
                     route_ctx=ctx,
                     lease=lease,
                 ):
+                    if pipe is not None and ctx is not None and not ctx.retry_same:
+                        await pipe.release(ctx, lease)
+                        lease = None
+                        lease_holder.lease = None
                     retry_outer = True
                     break
+                if pipe is not None and ctx is not None:
+                    await pipe.release(ctx, lease)
+                    lease = None
+                    lease_holder.lease = None
                 raise
 
             # ATG empty-response retry: an attempt that produced no content
@@ -593,6 +634,9 @@ async def stream_generation(
     target_model = normalized.model if normalized else model_path
     if pipe is not None and ctx is not None:
         pipe.record_success(ctx)
+        await pipe.release(ctx, lease)
+        lease = None
+        lease_holder.lease = None
     record_rotator_event("success", model=target_model, surface=surface)
     if normalized is not None:
         runtime_state.record(
@@ -612,3 +656,27 @@ async def stream_generation(
         response_id=latest_response_id,
         finish_reason=final_finish_reason,
     )
+
+
+async def stream_generation(
+    *,
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+    api_format: str = "gemini",
+    atg_factory: Callable[[], AtgProcessor] | None = None,
+) -> AsyncIterator[StreamEvent]:
+    """Run streaming generation; release the lease even if the client cancels."""
+    holder = _LeaseHolder()
+    try:
+        async for event in _stream_generation_impl(
+            model_path=model_path,
+            req=req,
+            client=client,
+            api_format=api_format,
+            atg_factory=atg_factory,
+            lease_holder=holder,
+        ):
+            yield event
+    finally:
+        await holder.release()

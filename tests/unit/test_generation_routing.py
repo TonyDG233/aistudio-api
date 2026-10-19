@@ -38,15 +38,27 @@ class FakePipe:
         self.switches: list[str] = []
         self.retries: list[str] = []
         self.success = False
+        self.released: list[str] = []
 
     def next_candidate(self, ctx, failed_account_id=None):
         self.next_calls += 1
         index = min(self.next_calls - 1, len(self.ids) - 1)
         return SimpleNamespace(account_id=self.ids[index])
 
-    async def land(self, ctx, candidate, require_idle=True):
+    async def acquire(self, ctx, candidate, require_idle=True):
         self.land_calls += 1
-        return SimpleNamespace(account_id=candidate.account_id)
+        return SimpleNamespace(
+            account_id=candidate.account_id,
+            realm_id=f"slot-{candidate.account_id}",
+            is_borrow=False,
+        )
+
+    async def land(self, ctx, candidate, require_idle=True):
+        return await self.acquire(ctx, candidate, require_idle=require_idle)
+
+    async def release(self, ctx, lease):
+        if lease is not None:
+            self.released.append(lease.realm_id)
 
     def record_retry(self, ctx, reason):
         self.retries.append(reason)
@@ -79,6 +91,12 @@ class FakeClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class FakeStreamClient(FakeClient):
+    async def stream_generate_content(self, **kwargs):
+        self.surface_log.append(str(kwargs.get("surface")))
+        yield ("body", "hello")
 
 
 def _request() -> GeminiGenerateContentRequest:
@@ -125,6 +143,7 @@ async def test_generate_uses_pipeline_surface_and_marks_success(monkeypatch) -> 
     assert pipe.next_calls == 1
     assert pipe.land_calls == 1
     assert pipe.success is True
+    assert pipe.released == ["slot-acc_a"]
 
 
 async def test_generate_retries_same_candidate_without_new_switch(monkeypatch) -> None:
@@ -178,6 +197,28 @@ async def test_generate_raises_when_switch_budget_exhausted(monkeypatch) -> None
             atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
         )
     assert caught.value.code == "surface_switch_exhausted"
+
+
+async def test_stream_cancel_releases_lease(monkeypatch) -> None:
+    ctx = RouteCtx()
+    pipe = FakePipe(ctx)
+    client = FakeStreamClient([])
+    _install(monkeypatch, pipe, ctx)
+
+    stream = generation_service.stream_generation(
+        model_path="gemini-3.8-flash",
+        req=_request(),
+        client=cast("AIStudioClient", client),
+        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+    )
+    first = await anext(stream)
+    assert first.kind == "routing_wait"
+    second = await anext(stream)
+    assert second.kind == "body"
+    assert pipe.released == []
+
+    await cast("Any", stream).aclose()
+    assert pipe.released == ["slot-acc_a"]
 
 
 def test_routing_wait_renders_as_sse_comment() -> None:
