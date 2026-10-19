@@ -1,0 +1,6 @@
+data: {"id": "chatcmpl-1792400753838_6830ad75", "object": "chat.completion.chunk", "created": 1792400753, "model": "gemini-flash-latest", "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "**Defining the Core Elements**\n\nI've broken down the request into its fundamental components. First, the user's intent is clear: they want a simple numerical sequence. I've defined the output as a list from 1 to 5. The constraints are minimal, just a basic, numbered list. I have considered this for formatting purposes.\n\n\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-1792400753838_6830ad75", "object": "chat.completion.chunk", "created": 1792400753, "model": "gemini-flash-latest", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "usage": {"prompt_tokens": 14, "completion_tokens": 60, "total_tokens": 74, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 60}}}
+
+data: [DONE]
+

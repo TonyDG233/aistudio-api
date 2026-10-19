@@ -45,6 +45,8 @@
 | Feature | Description |
 |---|---|
 | **Gemini API Compatibility** | Supports `/v1beta/...` endpoints including Thinking, multimodal inputs, function calling, and image generation |
+| **OpenAI Chat Completions Compatibility** | Exposes `/v1/chat/completions` and `/v1/models` with streaming, tool calls, images, and `reasoning_content`; enabled by default |
+| **Anthropic Messages Compatibility** | Exposes `/v1/messages` with streaming events, tool calls, thinking, and images; `count_tokens` is not implemented yet |
 | **Dynamic Model Discovery** | Automatically synchronizes and discovers available models from upstream Google AI Studio |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
 | **Dual Account Keepalive (WP10)** | Scheduled account rotation (long-cycle balancing + real page activity) and automatic Auth refresh (cookies/origins written back to `auth.json`) coexist; a separate 24h tier/email/expiry metadata refresh runs on its own switch |
@@ -242,6 +244,15 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY` | bool | `false` | Light active-page activity (prevents idle browser reclamation) |
 | `AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY_SECONDS` | float | `60.0` | Active-page activity interval in seconds (minimum `10`) |
 
+### Protocol Format Faces (WP8)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `features.formats.openai` | bool | `true` | Enables `/v1/chat/completions` and `/v1/models`; when disabled the routes return an explicit 403. Default enabled to match Ark's unconditional endpoint registration. |
+| `features.formats.claude` | bool | `true` | Enables `/v1/messages`; when disabled the route returns an explicit 403. `count_tokens` still returns an explicit 404. |
+| `features.formats.media.allow_private_urls` | bool | `false` | Allow the proxy to download private/loopback image URLs; keep disabled for SSRF safety. `data:` URLs are unaffected. |
+| `features.atg.mode_by_format` | map | `inherit` | Per-face ATG override: `gemini` / `openai` / `claude` each accept `inherit` (follow `features.atg.mode`) or `off` / `prefer` / `required`. |
+
 ### Account Keepalive (WP10, backend only)
 
 Three independent mechanisms:
@@ -312,6 +323,76 @@ curl http://localhost:8080/v1beta/models/gemini-3.7-flash:streamGenerateContent?
   }'
 ```
 </details>
+
+### OpenAI Chat Completions
+
+Use `http://localhost:8080/v1` as the base URL; get model IDs from `GET /v1/models`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "messages": [{"role": "user", "content": "Explain quantum computing in one sentence."}],
+    "max_tokens": 256
+  }'
+```
+
+OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="your-api-key",
+)
+resp = client.chat.completions.create(
+    model="gemini-3.7-flash",
+    messages=[
+        {"role": "user", "content": "Explain quantum computing in one sentence."}
+    ],
+    max_tokens=256,
+)
+```
+
+### Anthropic Messages
+
+Use `http://localhost:8080` as the base URL (the Anthropic SDK appends `/v1/messages`).
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Explain quantum computing in one sentence."}]
+  }'
+```
+
+Anthropic Python SDK:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8080",
+    api_key="your-api-key",
+)
+msg = client.messages.create(
+    model="gemini-3.7-flash",
+    max_tokens=256,
+    messages=[
+        {"role": "user", "content": "Explain quantum computing in one sentence."}
+    ],
+)
+```
+
+> [!NOTE]
+> Both format faces are enabled by default. If disabled operationally, requests return 403 with the relevant `features.formats.*` key in the error message. `/v1/messages/count_tokens` is not implemented and returns an explicit 404.
 
 ---
 
