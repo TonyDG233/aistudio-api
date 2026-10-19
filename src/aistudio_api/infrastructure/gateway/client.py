@@ -20,7 +20,11 @@ from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
     RequestCaptureService,
 )
-from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
+from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    get_features_config,
+    resolve_model_defaults,
+)
 from aistudio_api.infrastructure.gateway.replay import RequestReplayService
 from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
@@ -71,11 +75,29 @@ class AIStudioClient:
         self._realm_capture: dict[str, RequestCaptureService] = {}
         self._realm_streaming: dict[str, StreamingGateway] = {}
         self._realm_replay: dict[str, RequestReplayService] = {}
+        self._instance_pool = InstancePool(
+            self._ensure_browser_cdp_client,
+            features_provider=get_features_config,
+            on_slot_retired=self._forget_slot_services,
+        )
 
     @property
     def session(self) -> BrowserSession:
         """Expose active browser session facade."""
         return self._session
+
+    @property
+    def instance_pool(self) -> InstancePool:
+        """Unified request-context pool (v3); control session is not a slot."""
+        return self._instance_pool
+
+    async def _ensure_browser_cdp_client(self):
+        return await self._session.ensure_browser_cdp_client()
+
+    def _forget_slot_services(self, realm_id: str) -> None:
+        self._realm_capture.pop(realm_id, None)
+        self._realm_streaming.pop(realm_id, None)
+        self._realm_replay.pop(realm_id, None)
 
     @property
     def build_in_flight_count(self) -> int:
@@ -89,7 +111,7 @@ class AIStudioClient:
 
     @property
     def in_flight_count(self) -> int:
-        """Chat + Build + Realm 聚合在途数。"""
+        """Control session + request pool aggregate in-flight count."""
         realm_in_flight = 0
         for capture in self._realm_capture.values():
             session = getattr(capture, "_session", None)
@@ -97,6 +119,8 @@ class AIStudioClient:
                 realm_in_flight += int(getattr(session, "in_flight_count", 0) or 0)
             except Exception:
                 continue
+        pool_in_flight = sum(slot.in_flight for slot in self._instance_pool.slots())
+        realm_in_flight = max(realm_in_flight, pool_in_flight)
         return (
             self._session.in_flight_count + self.build_in_flight_count + realm_in_flight
         )
@@ -145,6 +169,18 @@ class AIStudioClient:
     async def save_current_cookies(self) -> bool:
         """把当前账号 cookies 回写 auth.json。"""
         return await self._session.save_current_cookies()
+
+    async def save_pool_cookies(self) -> int:
+        """Write cookies for every live request slot to its account auth file."""
+        saved = 0
+        for slot in self._instance_pool.slots():
+            session = slot.session
+            if session is None or not slot.chat_ready():
+                continue
+            with suppress(Exception):
+                if await session.save_current_cookies():
+                    saved += 1
+        return saved
 
     async def warmup(self) -> None:
         """预热浏览器后端并加载 AI Studio 页面及捕获 BotGuard 服务。"""
@@ -411,6 +447,7 @@ class AIStudioClient:
 
     async def close(self) -> None:
         """关闭浏览器后端。"""
+        await self._instance_pool.close()
         await self._close_build_surface()
         if self._session is not None:
             await self._session.close()
