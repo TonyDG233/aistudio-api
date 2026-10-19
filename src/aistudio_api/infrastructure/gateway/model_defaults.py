@@ -612,9 +612,6 @@ _FEATURES_DEFAULTS: dict[str, object] = {
         "max_switches": 2,
         "global_max_pages": 2,
         "max_contexts": 2,
-        "global_max_instances": 2,
-        "max_realms": 2,
-        "realm_mode": True,
         "borrow": False,
         "prewarm": False,
         "circuit_breaker": {
@@ -873,10 +870,6 @@ def _normalize_routing(raw: object) -> dict[str, object]:
         ),
         "global_max_pages": global_max_pages,
         "max_contexts": max_contexts,
-        # Phase 3 前兼容旧消费方；值与 v3 口径保持同步。
-        "global_max_instances": global_max_pages,
-        "max_realms": max_contexts,
-        "realm_mode": _coerce_feature_bool(data.get("realm_mode"), True),
         "borrow": _coerce_feature_bool(data.get("borrow"), False),
         "prewarm": _coerce_feature_bool(data.get("prewarm"), False),
         "circuit_breaker": {

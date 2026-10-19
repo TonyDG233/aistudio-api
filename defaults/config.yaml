@@ -107,7 +107,6 @@ features:
   #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
   # global_max_pages: 全局页面数硬顶 (所有渠道/Context 合计)。
   # max_contexts: 统一实例池的 Context 上限；页面数与 Context 数分开计数。
-  # global_max_instances/max_realms/realm_mode: WP5 v2 兼容键，Phase 3 后移除。
   # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
   # prewarm: 备用实例预热；默认关 (黄金模板可开)。
   # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
@@ -116,9 +115,6 @@ features:
     max_switches: 2
     global_max_pages: 2
     max_contexts: 2
-    global_max_instances: 2
-    max_realms: 2
-    realm_mode: true
     borrow: false
     prewarm: false
     circuit_breaker:

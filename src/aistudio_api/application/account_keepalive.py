@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshInProgressError,
@@ -309,6 +309,34 @@ class AccountKeepaliveService:
         }
 
     async def _auth_update(self, trigger: str) -> dict[str, object]:
+        pool = getattr(self._client, "instance_pool", None)
+        if pool is not None:
+            save_pool = cast(
+                "Callable[[], Awaitable[int]] | None",
+                getattr(self._client, "save_pool_cookies", None),
+            )
+            saved = int(await save_pool()) if save_pool is not None else 0
+            saved_accounts: list[str] = []
+            for slot in pool.slots():
+                account_id = slot.current_account_id
+                if not account_id or not slot.chat_ready():
+                    continue
+                self._store.mark_auth_saved(account_id)
+                saved_accounts.append(account_id)
+            if saved_accounts:
+                log.info(
+                    "[Keepalive] auth update trigger=%s slots=%s saved=%d",
+                    trigger,
+                    saved_accounts,
+                    saved,
+                )
+                return {
+                    "ok": True,
+                    "reason": "saved",
+                    "count": len(saved_accounts),
+                    "accounts": saved_accounts,
+                }
+
         account = self._account_service.get_active_account()
         if account is None:
             return {"ok": False, "reason": "no_active_account"}
@@ -327,6 +355,24 @@ class AccountKeepaliveService:
         return {"ok": True, "reason": "saved", "account": account.id}
 
     async def _auto_switch(self, trigger: str) -> dict[str, object]:
+        pool = getattr(self._client, "instance_pool", None)
+        if pool is not None:
+            from aistudio_api.application.instance_switch import InstanceSwitcher
+
+            switcher = InstanceSwitcher(
+                pool,
+                self._store,
+                self._account_service,
+                features_provider=get_features_config,
+            )
+            result = await switcher.rebalance()
+            log.info(
+                "[Keepalive] auto switch trigger=%s pool=%s",
+                trigger,
+                result,
+            )
+            return result
+
         if self._client.in_flight_count > 0:
             log.info(
                 "[Keepalive] auto switch skipped: in_flight=%d",
@@ -381,6 +427,8 @@ class AccountKeepaliveService:
         settings = self._settings()
         chat = self._client.session.in_flight_count
         build = self._client.build_in_flight_count
+        pool = getattr(self._client, "instance_pool", None)
+        pool_in_flight = sum(slot.in_flight for slot in pool.slots()) if pool else 0
         return {
             "enabled": {
                 "auto_switch": settings.auto_switch,
@@ -400,5 +448,11 @@ class AccountKeepaliveService:
             "running": self._running,
             "last_results": dict(self._last_results),
             "last_error": self._last_error,
-            "in_flight": {"chat": chat, "build": build, "total": chat + build},
+            "in_flight": {
+                "chat": chat,
+                "build": build,
+                "pool": pool_in_flight,
+                "total": chat + build + pool_in_flight,
+            },
+            "pool_slots": pool.snapshot() if pool is not None else [],
         }
