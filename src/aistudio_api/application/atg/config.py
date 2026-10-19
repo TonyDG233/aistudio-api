@@ -40,6 +40,24 @@ def _parse_mode(value: object) -> str:
     return "off"
 
 
+def resolve_atg_mode(api_format: str) -> str:
+    """Resolve the effective ATG mode for a protocol face.
+
+    ``features.atg.mode_by_format.<format>`` inherits ``features.atg.mode``
+    unless it explicitly names ``off`` / ``prefer`` / ``required``.
+    """
+    features = get_features_config()
+    atg = features.get("atg")
+    if isinstance(atg, dict):
+        by_format = atg.get("mode_by_format")
+        if isinstance(by_format, dict):
+            value = str(by_format.get(api_format, "inherit")).strip().lower()
+            if value in _VALID_MODES:
+                return value
+        return _parse_mode(atg.get("mode", DEFAULT_MODE))
+    return DEFAULT_MODE
+
+
 def _parse_bounded_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
     """Align with Ark ``parseBoundedInt`` (parseInt base 10 then clamp)."""
     if isinstance(value, bool):
@@ -157,4 +175,5 @@ __all__ = [
     "DEFAULT_TOOL_PREFIX",
     "AtgConfig",
     "load_atg_config",
+    "resolve_atg_mode",
 ]

@@ -105,7 +105,15 @@ def test_features_config_defaults_without_section(tmp_path):
     assert features["account_refresh_concurrency"] == 3
     assert features["auto_switch"] is False
     assert features["auto_switch_interval_hours"] == 3.0
+    assert features["formats"]["openai"] is True
+    assert features["formats"]["claude"] is True
+    assert features["formats"]["media"]["allow_private_urls"] is False
     assert features["atg"]["mode"] == "off"
+    assert features["atg"]["mode_by_format"] == {
+        "gemini": "inherit",
+        "openai": "inherit",
+        "claude": "inherit",
+    }
     assert features["atg"]["tool_prefix"] == "atg_emit_"
     assert features["atg"]["control_position"] == "tail"
     assert features["atg"]["strict"] is False

@@ -547,6 +547,8 @@ def update_configured_logging_settings(
 _ATG_MODES = ("off", "prefer", "required")
 _ATG_CONTROL_POSITIONS = ("tail", "head")
 _ATG_RECOVERY_STRATEGIES = ("repair", "fail")
+_ATG_FORMAT_MODES = ("inherit", "off", "prefer", "required")
+_ATG_FORMATS = ("gemini", "openai", "claude")
 _DEFAULT_ATG_TOOL_PREFIX = "atg_emit_"
 _DEFAULT_ATG_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
@@ -571,11 +573,23 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     "keepalive_metadata_refresh_on_startup": True,
     "keepalive_active_activity": False,
     "keepalive_active_activity_seconds": 60.0,
+    # WP8：协议面开关。默认开启（对齐 Ark 的无条件端点注册）；
+    # 仍保留开关用于运维临时关闭。
+    "formats": {
+        "openai": True,
+        "claude": True,
+        "media": {"allow_private_urls": False},
+    },
     # WP5：账号分组列表。空列表合法——未显式分组的账号由 orchestrator 按 tier
     # 默认规则兜底（本模块只负责解析，不注入默认组）。
     "groups": [],
     "atg": {
         "mode": "off",
+        "mode_by_format": {
+            "gemini": "inherit",
+            "openai": "inherit",
+            "claude": "inherit",
+        },
         "tool_prefix": _DEFAULT_ATG_TOOL_PREFIX,
         "control_position": "tail",
         "strict": False,
@@ -723,6 +737,16 @@ def _normalize_feature_groups(raw: object) -> list[dict[str, object]]:
     return groups
 
 
+def _normalize_atg_mode_by_format(raw: object) -> dict[str, str]:
+    """归一 features.atg.mode_by_format；缺省/非法值回退 inherit。"""
+    data = raw if isinstance(raw, dict) else {}
+    result: dict[str, str] = {}
+    for api_format in _ATG_FORMATS:
+        value = str(data.get(api_format, "inherit")).strip().lower()
+        result[api_format] = value if value in _ATG_FORMAT_MODES else "inherit"
+    return result
+
+
 def _env_feature_baseline() -> dict[str, object]:
     """进程启动时的环境变量基线，作为 config.yaml features 段缺省项的兜底。"""
     from aistudio_api.config import settings
@@ -753,6 +777,10 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
     atg = raw_atg if isinstance(raw_atg, dict) else {}
     raw_fallback = raw.get("fallback")
     fallback = raw_fallback if isinstance(raw_fallback, dict) else {}
+    raw_formats = raw.get("formats")
+    formats = raw_formats if isinstance(raw_formats, dict) else {}
+    raw_media = formats.get("media")
+    media = raw_media if isinstance(raw_media, dict) else {}
     return {
         "build_surface": _coerce_feature_bool(raw.get("build_surface"), False),
         "route_by_tier": _coerce_feature_bool(raw.get("route_by_tier"), False),
@@ -784,9 +812,19 @@ def _normalize_features(raw: dict[str, object]) -> dict[str, object]:
         "keepalive_active_activity_seconds": _coerce_feature_float(
             raw.get("keepalive_active_activity_seconds"), 60.0, minimum=10.0
         ),
+        "formats": {
+            "openai": _coerce_feature_bool(formats.get("openai"), False),
+            "claude": _coerce_feature_bool(formats.get("claude"), False),
+            "media": {
+                "allow_private_urls": _coerce_feature_bool(
+                    media.get("allow_private_urls"), False
+                )
+            },
+        },
         "groups": _normalize_feature_groups(raw.get("groups")),
         "atg": {
             "mode": _coerce_feature_choice(atg.get("mode"), "off", _ATG_MODES),
+            "mode_by_format": _normalize_atg_mode_by_format(atg.get("mode_by_format")),
             "tool_prefix": _coerce_feature_str(
                 atg.get("tool_prefix"), _DEFAULT_ATG_TOOL_PREFIX
             ),

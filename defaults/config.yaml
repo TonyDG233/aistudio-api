@@ -59,6 +59,19 @@ features:
   keepalive_active_activity_seconds: 60.0
 
   # --------------------------------------------------------------------------
+  # OpenAI / Claude 协议面 (WP8)。默认开启（对齐 Ark 无条件端点注册）；
+# 仍保留开关用于运维临时关闭。
+  # openai: 控制 /v1/chat/completions 与 /v1/models。
+  # claude: 控制 /v1/messages（count_tokens 仍显式 404，不伪造估算）。
+  # media.allow_private_urls: 允许代理下载私网/回环图片 URL；默认 false 防 SSRF。
+  # --------------------------------------------------------------------------
+  formats:
+    openai: true
+    claude: true
+    media:
+      allow_private_urls: false
+
+  # --------------------------------------------------------------------------
   # 账号分组与面编排 (groups，WP5) — 按账号档位 (tier) / 邮箱正则把账号分组，
   # 为每组指定允许的面 (chat/build) 与页面上限。未显式分组的账号由编排器按
   # tier 默认规则兜底 (free→build、pro/ultra/plus→chat)，本段留空即全部走默认。
@@ -86,6 +99,13 @@ features:
     # required=严格模式，缺少合成工具调用时显式失败而非静默回退。
     # 何时用：prefer 用于观察命中率；required 用于必须走工具通道的强约束场景。
     mode: off
+
+    # 分协议面覆盖 (WP8)：inherit 使用上方 mode；off/prefer/required 单独覆盖。
+    # 仅在对应协议面 (openai/claude) 开启后生效。
+    mode_by_format:
+      gemini: inherit
+      openai: inherit
+      claude: inherit
 
     # 每次请求的合成工具名前缀 (对应 Ark ATG_TOOL_PREFIX)，须保持稳定以利于过滤与历史清理。
     tool_prefix: atg_emit_
