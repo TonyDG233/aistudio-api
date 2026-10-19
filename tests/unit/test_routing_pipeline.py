@@ -9,6 +9,7 @@ import pytest
 from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.application.routing_safety import CircuitBreaker
 from aistudio_api.application.surface_orchestrator import SurfacePolicyError
+from aistudio_api.infrastructure.gateway.instance_manager import InstanceLease
 
 
 @dataclass
@@ -255,6 +256,50 @@ def test_budget_exhaustion_raises_quota_after_two_defers() -> None:
         pipe.next_candidate(ctx)
     assert caught.value.code == "surface_quota_exceeded"
     assert ctx.budget.snapshot()["defers"] == 2
+
+
+async def test_borrow_uses_idle_realm_when_primary_budget_is_full() -> None:
+    store = FakeStore([Account("acc_a", "a")], active_id="acc_a")
+    cfg = features(
+        channels={
+            "chat": {"enabled": True, "max_instances": 0},
+            "build": {"enabled": False, "max_instances": 2},
+            "official": {"enabled": False, "max_instances": 0},
+        },
+        routing={
+            "max_switches": 2,
+            "global_max_instances": 2,
+            "max_realms": 2,
+            "realm_mode": True,
+            "borrow": True,
+            "prewarm": False,
+            "circuit_breaker": {
+                "window_seconds": 600,
+                "failure_threshold": 5,
+                "cooldown_seconds": 300,
+            },
+        },
+    )
+    pipe = pipeline(store, cfg, client=FakeClientNoPage())
+
+    def fake_borrow(*, surface: str, exclude_accounts: set[str]):
+        return InstanceLease(
+            account_id="acc_b",
+            channel=surface,
+            surface=surface,
+            realm_id="realm-acc_b-1",
+            is_borrow=True,
+        )
+
+    pipe.instances.borrow_lease = fake_borrow  # type: ignore[method-assign]
+    ctx = pipe.begin(model_path="gemini-3.8-flash", api_format="gemini")
+    candidate = pipe.next_candidate(ctx)
+    assert candidate is not None
+    assert candidate.reason == "borrow"
+    lease = await pipe.land(ctx, candidate)
+    assert lease is not None
+    assert lease.is_borrow is True
+    assert lease.account_id == "acc_b"
 
 
 def test_switch_budget_caps_account_switches() -> None:

@@ -173,8 +173,12 @@ class InstanceManager:
 
     def live_page_count(self) -> int:
         default = sum(1 for channel in ("chat", "build") if self._page_alive(channel))
-        realm = self._realm_page_counts()
-        return default + realm.get("chat", 0) + realm.get("build", 0)
+        realm = (
+            self._realm_pool_obj.active_realm_count()
+            if self._realm_pool_obj is not None
+            else 0
+        )
+        return default + realm
 
     @property
     def in_flight_count(self) -> int:
@@ -301,6 +305,18 @@ class InstanceManager:
         require_idle: bool = True,
     ) -> InstanceLease | None:
         """Activate the candidate account and return an instance lease."""
+        try:
+            active = self._store().get_active_account()
+        except Exception:
+            active = None
+        if active is not None and active.id == account_id:
+            # 默认账号继续使用现有会话/页面，避免为单账号请求额外开 Realm。
+            return InstanceLease(
+                account_id=account_id,
+                channel=channel,
+                surface=surface,
+            )
+
         if self._realm_mode():
             from aistudio_api.infrastructure.gateway.realm_pool import (
                 RealmCapacityError,
@@ -352,6 +368,36 @@ class InstanceManager:
             account_id=account_id,
             channel=channel,
             surface=surface,
+        )
+
+    def borrow_lease(
+        self,
+        *,
+        surface: str,
+        exclude_accounts: set[str],
+    ) -> InstanceLease | None:
+        """Borrow an idle ready Realm without switching the default account."""
+        if self._realm_pool_obj is None:
+            return None
+        realm = self._realm_pool_obj.find_idle(
+            need_build=surface == "build",
+            exclude_accounts=exclude_accounts,
+        )
+        if realm is None:
+            return None
+        logger.info(
+            "[surface:borrow] from=%s account=%s surface=%s",
+            realm.realm_id,
+            realm.account_id,
+            surface,
+        )
+        return InstanceLease(
+            account_id=realm.account_id,
+            channel=surface,
+            surface=surface,
+            realm_id=realm.realm_id,
+            is_borrow=True,
+            adapter=realm,
         )
 
     def slot_indexes(self) -> dict[tuple[str, str], int]:

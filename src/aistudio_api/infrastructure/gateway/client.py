@@ -516,7 +516,8 @@ class AIStudioClient:
                 raise RequestError(
                     400, "build surface requires a REST body (rest_body)"
                 )
-            self._enforce_build_instance_quota()
+            if lease is None:
+                self._enforce_build_instance_quota()
             ctx = session.active_context
             if ctx is None:
                 ctx = await session.ensure_ready()
@@ -626,7 +627,8 @@ class AIStudioClient:
                 raise RequestError(
                     400, "build surface requires a REST body (rest_body)"
                 )
-            self._enforce_build_instance_quota()
+            if lease is None:
+                self._enforce_build_instance_quota()
             ctx = session.active_context
             if ctx is None:
                 ctx = await session.ensure_ready()
