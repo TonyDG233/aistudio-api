@@ -1,6 +1,6 @@
 # 计划书：Ark 能力合并入 aistudio-api（Build 通道 + ATG + 账号刷新 + 开关/统计）
 
-> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成（P3 收尾加固待批）；下一站 WP10 账号保活（最高优先）→ WP8 格式层 → WP6 统计 → WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
+> 日期：2026-10-17（含当日决策修订 v3）· 状态：**P0–P3 已完成（P3 收尾加固待批）；下一站 WP10 账号保活（最高优先）→ WP8 格式层 → WP5 二期 复杂策略组后端（P4.5）→ WP6 统计 → WP7（UI 统一修改 + 收尾）** · 作者：Ark_AIStudioToAPI 侧
 > 目标仓库：`TonyDG233/aistudio-api`（fork of `DeconstructedCube/aistudio-api`，谱系见 §7）
 > 定位：本文是可行性方案与实施蓝图；P0 门禁通过后按里程碑推进。
 >
@@ -11,6 +11,7 @@
 > - Build 通道深读：`docs/ark-reference/build-channel/`（`direct-signer-pipeline-20261017.md`、`transport-decision-and-400-triage.md`、`makersuite-generate-content-bridge-20261016.md`、`archive-2026-10-16-build-channel-closure.md`、`evidence-20261017/`）
 > - app 侧客户端协议第一手：`docs/ark-reference/scripts/client/`（`build.js`）
 > - 本仓底层验证链：`docs/BOTGUARD_VERIFICATION_CHAIN.md`（403/快照语义）、`docs/WIRE_SPECIFICATION.md`、`docs/ARCHITECTURE.md`
+> - UI 与策略组子规范：`docs/dev/UI-CHANNEL-DESIGN-20261018.md`（**策略组后端语义与 WP7 UI 的唯一口径**，§3 裁定 + §5 核心逻辑）
 > - 反例对照表：`docs/dev/AUDIT-P2P3-20261018.md` 附二（"多少答案早已写好"，动手前先看）
 
 ---
@@ -63,6 +64,7 @@
 | WP3 | 账号信息刷新（tier/email/过期 + 批量并行 + 徽章） | M | 1–2 | WP1 |
 | WP4 | Build 页面直连面（cookie 保真 + 注入脚本 + warmup + 传输 + 双面会话） | L | 5–10 | WP0 通过 |
 | WP5 | 分组与面编排（组策略/实例配额/实例-面绑定/管理面板） | L | 4–6 | WP3, WP4 |
+| WP5 二期 | 复杂策略组后端（决策管线/裸名矩阵/槽位/四层预算/borrow/失败链/渠道注册表/账号级覆盖/Realm 落点；无 UI） | L | 4–8 | WP4, WP5 v1 |
 | WP6 | 统计整合与 UI 增量 | M | 2–4 | WP2, WP3, WP5 |
 | WP7 | 部署 / UI 统一修改 / 文档 / 质量门 / 致谢（所有前端与使用体验改动只在此阶段） | S | 1–2 | 全部 |
 | WP8 | 多格式兼容层（OpenAI Chat Completions / Claude Messages；Responses 可选） | L | 5–8 | WP1, WP2 |
@@ -180,9 +182,54 @@
 - **模型守卫**：argon/Pro 系仅在 `chat` 面可用；目标组 `allowed_surfaces` 未含 chat 时，对 argon 请求显式 4xx（写明组策略与处置建议），绝不静默换面或换账号。
 - **rotator 扩展**：冷却/429 隔离键 `(account, model)` → `(account, surface, model)`；`/rotation` API 增 `surface` 维度；`allowed_surfaces=[]` 的组在调度器层面直接排除。
 - **管理面板（最小但完整，无 UI 完整复刻）**：分组管理（策略编辑、账号移入移出）、实例面板（各面实例数/配额/内存估算、手动开关实例）、组策略启停；文案遵循"开关自解释"。
-- **可选并入**：Ark 的定时自动切换开关（`ENABLE_AUTO_SWITCH`/间隔）。
+- **auto_switch 保留并接线（不是可选、不得摘除）**：见 WP10；触发仅影响后续请求的默认排序，不触碰在役实例（UI 稿 §5.5）。
 - **验收**：策略改 yaml/面板即时生效；配额超限显式拒绝；chat-disabled 组上 argon 请求返回具体 4xx；日志可见 surface 决策链（可 grep）。
-- **二期（复杂策略组，仅后端；UI 归 WP7）**：槽位表语义、四层实例预算、组序/排序、borrow 与 Realm 落点（UI 稿 §5.4/§5.6）全部在本期后端实现。**后端与 UI 严格分离**：本 WP 不包含任何前端改动；对应 UI 在 WP7 一次性完成，避免一次做太多又丢三落四。
+- **二期（复杂策略组）另立 WP：见下文「WP5 二期 复杂策略组（仅后端）」；纯后端，UI 归 WP7。**
+
+### WP5 二期 复杂策略组（仅后端，P4.5）
+> 与 WP5 v1 的分界：v1 已交付「组配置 + 首中匹配 + 面守卫 + 按账号页配额 + surface 冷却键 + 实例快照」；本 WP 交付 UI 稿定义的全部**策略组后端逻辑**。**本 WP 不含任何前端改动**；所有 UI 在 WP7。
+
+**参考文档（执行前必读，按序）**：
+- `docs/dev/UI-CHANNEL-DESIGN-20261018.md`（**主规范**）：
+  - §3.1–§3.8：业务裁定（策略组可选、有界 fallback、能力路由、borrow、三渠道无默认、覆写三层、模式触发、防封禁）
+  - §5.1 唯一决策管线；§5.2 裸名决策矩阵；§5.3 用户侧使用逻辑
+  - §5.4 多实例 × 策略组默认分配（组=约束层、隐式全局组、成员解析、实例分配序、槽位、黄金模板、四层预算）
+  - §5.5 主动维护（预热/auto_switch 只影响新会话排序）；§5.6 Realm 落点
+  - §6 阶段划分；§7 开放参数
+- `docs/dev/PLAN-ark-merge-20261017.md` §4 WP5（v1 基线）、§4 WP10（保活边界）
+- `docs/dev/AUDIT-P2P3-20261018.md`（v1 实现与验收口径）
+- `docs/dev/evidence/wp5-20261018/`（v1 五相位证据）
+- `docs/dev/SPIKE-RESULTS-20261017.md` §14/§16（页 +66–71MB、环境 +180MB 基线）
+- `docs/dev/PRE-P1-EXPERIMENTS-20261018.md` §E4（多 context 隔离可行、双 WS 证据）
+- `docs/dev/FRONTEND-MERGE-20261018.md`（前后端分工；本 WP 只做后端）
+- `docs/ark-reference/ARK-TECHNICAL-REFERENCE.md` §浏览器/Context 池（对照参考，只读）
+
+**范围（纯后端）**：
+1. 决策管线落地：能力解析 → 候选池 → 组约束 → 排序 → 实例落地 → 失败链（UI 稿 §5.1）。
+2. 裸名矩阵：单渠道 / 多渠道无组 / 有组 / 前缀名 / 第三渠道（§5.2）。
+3. 组语义：有序首中、空组/停用组视为不存在、未命中按 tier 自动组、组=约束层（§5.4-1/3）。
+4. 排序与分配序：黏性 → 冷却健康 → 轮转/权重；预算满/冷却/未就绪统一顺延（§5.4-4）。
+5. 槽位表：账号×渠道预留实例位；同账号可多行（级别 A）；“实例数（当前/计划）”的计划=槽位行（§5.4-5）。
+6. 四层预算：全局硬顶 / 渠道预算 / 组预算 / 环境预算，取最严；超限显式拒绝（§5.4-7）。
+7. borrow：仅首字节前、计入预算、默认关（§3.4）。
+8. 失败链：`max_switches=2`、滚动熔断（10min ≥5 次→冷却 5min）、SSE `: resolving-instance`、不打断在途流（§3.2）。
+9. 渠道注册表后端语义：pg/build/官网 enabled 与模式触发判据（§3.7）。
+10. 账号级渠道覆盖：跟随组/仅 chat/仅 build/双面；账号级唯一存储（§3.6）。
+11. Realm 落点：槽位行→Realm（级别 B，独立 cookie jar，+180MB/环境，§5.6）；跨账号并存按 §5.4-6。
+12. 黄金模板后端语义：pro@pg + free@build + borrow 开 + 备用预热开（UI 在 WP7）。
+13. 错误码与文案：`surface_no_capable_account` 403、`surface_switch_exhausted` 503、`surface_quota_exceeded` 429、混合组报错携带命中组名。
+
+**不做**：任何前端/UI 组件、图表、面板、日志页、tooltip（全部 WP7）；keepalive（WP10）；格式层（WP8）。
+
+**验收（真机，后端脚本）**：
+- 零配置：行为与 v1 一致（回归不破坏）。
+- 组语义：组序首中、空组排除、未命中 tier 自动组。
+- 裸名矩阵：单/多/前缀/第三渠道各路径决策日志正确。
+- 预算：四层各超限均显式拒绝；顺延计数 ≤2；熔断生效。
+- borrow：默认关；开启后仅首字节前借入并计预算。
+- 槽位/Realm：pro chat + free build 跨账号同时在线（E4 口径），切号不打断在途流。
+- 渠道注册表/账号覆盖：开关与覆盖生效且可回退。
+- 全关时零行为变化；证据入 `docs/dev/evidence/wp5b-<date>/`。
 
 ### WP6 统计整合（M）
 **以本仓库现有统计为底座增量扩维**（不引入第二套存储）：
@@ -242,6 +289,7 @@
 | P3 | WP4 + WP5 | free 走 build 真流式、pro 走 chat；分组编排（策略/配额/实例绑定/面板）与零回落错误语义闭环。✅ 完成（2026-10-18 晚）：WP4 服务内验收 2/2（`docs/dev/evidence/p3-build3/`）；WP5 实现完毕并经真机五相位验收全绿——组路由 build 200 / argon chat 200 / 守卫 403×2 / 配额 429，决策链可 grep（`docs/dev/evidence/wp5-20261018/`）；根因与结论见 `docs/dev/AUDIT-P2P3-20261018.md` 附、附三与附四；2026-10-18 深夜追加 Build 通信加固（复用快路径实测 3.9s、过门重试环、原地恢复） |
 | P3.5 | WP10 | 账号保活双机制（旧定时切号 + 新自动刷新）闭环；纯后端，UI 不在本阶段 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
+| P4.5 | WP5 二期 | 复杂策略组后端全部落地（管线/裸名矩阵/槽位/四层预算/borrow/失败链/渠道注册表/账号覆盖/Realm 落点）；UI 不在本阶段 |
 | P5 | WP6 + WP7 | 统计（后端，含 formatBreakdown）+ WP7（UI 统一修改）/文档/质量门全绿/致谢入库 |
 
 ---
