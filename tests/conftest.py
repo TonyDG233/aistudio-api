@@ -82,3 +82,17 @@ def isolate_test_config(monkeypatch, _shared_test_env):
         stats_file.unlink()
     if rotator_file.exists():
         rotator_file.unlink()
+
+
+@pytest.fixture(autouse=True)
+def isolate_signature_cache(tmp_path):
+    """Keep tool-call thought signatures out of the repository data directory."""
+    from aistudio_api.application.format_converters.signature_cache import (
+        signature_cache,
+    )
+
+    signature_cache.configure_path(tmp_path / "signature_cache.json")
+    signature_cache.clear()
+    yield
+    signature_cache.configure_path(None)
+    signature_cache.clear()
