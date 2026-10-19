@@ -1,8 +1,11 @@
-"""Single routing pipeline for WP5 phase 2.
+"""Single routing pipeline for WP5 v3.
 
-Resolution order: capability/channel -> candidate pool -> group constraints ->
-sort -> instance landing -> failure chain. The channel is fixed in step 1 and
-never changes inside a request; every denial is explicit (no silent fallback).
+Resolution order: channel/capability -> per-account eligibility -> candidate
+sort -> pre-dispatch slot acquire -> failure chain. The channel is fixed in step
+1 and never changes inside a request; every denial is explicit.
+
+Groups are per-account constraints, not a request-level singleton. The active
+account is only a weak preference; it never decides the group or the channel.
 """
 
 from __future__ import annotations
@@ -12,42 +15,34 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NoReturn
 
-from aistudio_api.application.account_routing import (
-    apply_account_routing,
-    normalize_account_routing,
-)
 from aistudio_api.application.channel_registry import (
     build_registry,
-    enabled_channels,
     is_multi_mode,
-    parse_model_target,
-    select_channel,
+    normalize_channel,
+)
+from aistudio_api.application.routing_eligibility import (
+    AccountView,
+    choose_channel,
+    eligible_accounts,
 )
 from aistudio_api.application.routing_safety import CircuitBreaker, RoutingBudget
 from aistudio_api.application.surface_orchestrator import (
     GroupPolicy,
     SurfacePolicyError,
-    account_matches_group,
-    intersect_surfaces,
-    is_chat_only_model,
-    resolve_surface,
-    select_group,
-    surface_capability,
 )
-from aistudio_api.infrastructure.gateway.instance_manager import (
+from aistudio_api.infrastructure.gateway.instance_pool import (
+    InstanceCapacityError,
     InstanceLease,
-    InstanceManager,
+    InstancePool,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("application.routing")
 
-_CHANNEL_SURFACES = {"chat": "chat", "build": "build"}
-
 
 @dataclass
 class Candidate:
-    """One eligible account/channel pair, before instance landing."""
+    """One eligible account/channel pair, before instance acquisition."""
 
     account_id: str
     name: str
@@ -55,6 +50,9 @@ class Candidate:
     email: str | None
     channel: str
     surface: str
+    group: GroupPolicy
+    quota_pools: tuple[str, ...]
+    affinity: int
     weight: float
     available: bool
     slot_index: int | None = None
@@ -63,7 +61,7 @@ class Candidate:
 
 @dataclass
 class RouteContext:
-    """Request-scoped routing state (candidates frozen at step 4)."""
+    """Request-scoped routing state; candidates are frozen at begin()."""
 
     request_id: str
     model_path: str
@@ -71,14 +69,12 @@ class RouteContext:
     api_format: str
     channel: str
     surface: str
-    group: GroupPolicy
     candidates: list[Candidate]
     budget: RoutingBudget
     breaker: CircuitBreaker
     multi_mode: bool
     started_at: float
     borrow_enabled: bool = False
-    pending_borrow: InstanceLease | None = None
     attempted: set[str] = field(default_factory=set)
     failed: set[str] = field(default_factory=set)
     retry_same: bool = False
@@ -102,8 +98,21 @@ class RouteContext:
             "api_format": self.api_format,
             "channel": self.channel,
             "surface": self.surface,
-            "group": self.group.name or self.group.source,
-            "candidates": [candidate.account_id for candidate in self.candidates],
+            "groups": sorted(
+                {
+                    candidate.group.name or candidate.group.source
+                    for candidate in self.candidates
+                }
+            ),
+            "candidates": [
+                {
+                    "account_id": candidate.account_id,
+                    "group": candidate.group.name or candidate.group.source,
+                    "quota_pools": list(candidate.quota_pools),
+                    "affinity": candidate.affinity,
+                }
+                for candidate in self.candidates
+            ],
             "attempted": sorted(self.attempted),
             "failed": sorted(self.failed),
             "budget": self.budget.snapshot(),
@@ -140,11 +149,13 @@ class RoutingPipeline:
         self._breaker = breaker or CircuitBreaker(clock=clock)
         self._rotator_override = rotator
         self._clock = clock
-        self.instances = InstanceManager(
-            client,
-            features_provider=features_provider,
-            account_store=account_store,
-        )
+        pool = getattr(client, "instance_pool", None)
+        if pool is None:
+            pool = InstancePool(
+                client._ensure_browser_cdp_client,
+                features_provider=self._features,
+            )
+        self.pool: InstancePool = pool
 
     def _store_or_default(self):
         if self._store is not None:
@@ -178,163 +189,158 @@ class RoutingPipeline:
         except Exception:
             return None
 
-    def _select(
-        self,
-        model_path: str,
-        features: dict[str, object],
-        active,
-    ) -> tuple[str, str, str]:
-        """Return ``(channel, surface, clean_model)`` for the request."""
-        explicit_channel, clean_model = parse_model_target(model_path)
-        registry = build_registry(features)
-        channels = enabled_channels(registry)
-        route_by_tier = bool(features.get("route_by_tier"))
-        if (
-            explicit_channel is None
-            and not route_by_tier
-            and len(channels) > 1
-            and active is not None
-        ):
-            surface = resolve_surface(
-                model_path, active.tier, active.email, features
-            ).surface
-            return surface, surface, clean_model
-        selection = select_channel(
-            model_path,
-            features,
-            mounted_channels=self.instances.mounted_channels(),
-            model_is_chat_only=is_chat_only_model(clean_model),
+    def _auth_for(self, account_id: str) -> tuple[str | None, str | None]:
+        try:
+            from aistudio_api.api.state import runtime_state
+
+            service = runtime_state.account_service
+            if service is not None:
+                path = service.get_account_auth_path(account_id)
+                account = service.get_account(account_id)
+                return (
+                    str(path) if path is not None else None,
+                    getattr(account, "auth_user", None),
+                )
+        except Exception:
+            pass
+        return None, None
+
+    def _mounted_channels(self) -> tuple[str, ...]:
+        counts = self.pool.page_counts()
+        mounted = tuple(
+            channel for channel in ("chat", "build") if counts.get(channel, 0) > 0
         )
-        if selection.surface is None:
-            _raise(
-                "surface_channel_disabled",
-                message=f"渠道 '{selection.channel}' 尚未实现，无法处理模型 '{model_path}'。",
-                advice="WP9 前官网渠道不可用；请改用 chat/build 渠道或裸模型名。",
-            )
-        return selection.channel, selection.surface, selection.clean_model
+        if mounted:
+            return mounted
+        # Control-plane fallback is only a display hint; it never authorizes a
+        # request instance.
+        return ()
+
+    def _slot_indexes(self, features: dict[str, object]) -> dict[tuple[str, str], int]:
+        raw_slots = features.get("slots")
+        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
+        indexes: dict[tuple[str, str], int] = {}
+        for index, slot in enumerate(slots):
+            if not isinstance(slot, dict) or not bool(slot.get("enabled", True)):
+                continue
+            account_id = str(slot.get("account_id") or "").strip()
+            channel = normalize_channel(slot.get("channel"))
+            if not account_id or channel is None:
+                continue
+            indexes[(account_id, channel)] = index
+        return indexes
 
     def begin(self, *, model_path: str, api_format: str) -> RouteContext:
         features = self._features()
         store = self._store_or_default()
-        active = store.get_active_account()
-        channel, surface, clean_model = self._select(model_path, features, active)
-
-        groups = features.get("groups") or []
-        raw_channels = features.get("channels")
-        channels_cfg = raw_channels if isinstance(raw_channels, dict) else {}
-        raw_build = channels_cfg.get("build")
-        build_cfg = raw_build if isinstance(raw_build, dict) else {}
-        build_enabled = bool(
-            build_cfg.get("enabled", features.get("build_surface", False))
-        )
-        group = select_group(
-            getattr(active, "tier", None),
-            getattr(active, "email", None),
-            groups,
-            route_by_tier=bool(features.get("route_by_tier")),
-            build_enabled=build_enabled,
-        )
-        if surface not in group.allowed_surfaces:
-            _raise(
-                "surface_group_disabled",
-                message=(
-                    f"分组 '{group.name or group.source}' 不允许 {surface} 面"
-                    f"（allowed={list(group.allowed_surfaces)}）。"
-                ),
-                advice="请调整该组 allowed_surfaces 或账号分组；本次请求不换面、不换渠道。",
-            )
-
+        accounts = list(store.list_accounts())
+        raw_groups = features.get("groups")
+        groups: list[object] = raw_groups if isinstance(raw_groups, list) else []
         registry = build_registry(features)
-        enabled_surfaces = tuple(
-            spec.key
-            for spec in enabled_channels(registry)
-            if spec.key in _CHANNEL_SURFACES
+        raw_slots = features.get("slots")
+        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
+        views = [AccountView.from_account(account) for account in accounts]
+        selection = choose_channel(
+            model_path,
+            views,
+            features,
+            groups=groups,
+            mounted_channels=self._mounted_channels(),
         )
-        capability = surface_capability(clean_model, enabled_surfaces)
-        if surface not in capability:
+        channel = selection.channel
+        surface = selection.surface
+        clean_model = selection.clean_model
+        if surface is None:
             _raise(
-                "surface_model_guard",
-                message=(
-                    f"模型 '{clean_model}' 的能力集为 {list(capability)}，"
-                    f"不包含已解析的 {surface} 面。"
-                ),
-                advice="请改用 chat 面或支持该面的模型；本次请求不静默换面。",
+                "surface_channel_disabled",
+                message=f"渠道 '{channel}' 尚未实现，无法处理模型 '{model_path}'。",
+                advice="WP9 前官网渠道不可用；请改用 chat/build 渠道或裸模型名。",
             )
 
-        slots = self.instances.slot_indexes()
-        rotator = self._rotator()
-        candidates: list[Candidate] = []
-        for account in store.list_accounts():
-            if getattr(account, "expired", False):
-                continue
-            if group.source != "implicit-global" and not account_matches_group(
-                group, account.tier, account.email, groups
-            ):
-                continue
-            routing = normalize_account_routing(store.get_account_routing(account.id))
-            narrowed = intersect_surfaces(
-                capability,
-                group,
-                apply_account_routing(enabled_surfaces, routing, clean_model),
+        eligible = eligible_accounts(
+            views,
+            channel,
+            clean_model,
+            features=features,
+            registry=registry,
+            groups=groups,
+        )
+        if not eligible:
+            group_names = [
+                str(group.get("name") or f"group-{index}")
+                for index, group in enumerate(groups)
+                if isinstance(group, dict)
+            ]
+            _raise(
+                "surface_no_capable_account",
+                message=(
+                    f"模型 '{clean_model}' / 渠道 '{channel}' 没有合格账号。"
+                    f"已配置组={group_names or ['implicit-global']}。"
+                ),
+                advice=(
+                    "请检查账号 tier/额度池、组 allowed_surfaces/"
+                    "allowed_quota_pools、渠道 quota_pool，或为请求显式指定可用渠道前缀。"
+                ),
             )
-            if surface not in narrowed:
-                continue
+
+        slot_indexes = self._slot_indexes(features)
+        rotator = self._rotator()
+        ready_accounts = {
+            slot.current_account_id
+            for slot in self.pool.slots()
+            if slot.current_account_id
+            and slot.in_flight == 0
+            and (slot.chat_ready() or slot.build_ready())
+        }
+        candidates: list[Candidate] = []
+        for view in eligible:
+            account = view.account
             available = True
             if rotator is not None:
                 try:
                     available = bool(
                         rotator.is_account_available(
-                            account.id, model=clean_model, surface=surface
+                            account.account_id, model=clean_model, surface=surface
                         )
                     )
                 except Exception:
                     available = True
             candidates.append(
                 Candidate(
-                    account_id=account.id,
+                    account_id=account.account_id,
                     name=account.name,
                     tier=account.tier,
                     email=account.email,
                     channel=channel,
                     surface=surface,
-                    weight=max(0.1, group.weight * routing.weight),
+                    group=view.group,
+                    quota_pools=view.quota_pools,
+                    affinity=view.affinity,
+                    weight=max(0.1, view.group.weight * account.routing.weight),
                     available=available,
-                    slot_index=slots.get((account.id, channel)),
+                    slot_index=slot_indexes.get((account.account_id, channel)),
+                    reason="eligible",
                 )
             )
 
-        if not candidates:
-            _raise(
-                "surface_no_capable_account",
-                message=(
-                    f"模型 '{clean_model}' 在组 '{group.name or group.source}' / "
-                    f"渠道 '{channel}' 下没有可用账号。"
-                ),
-                advice=(
-                    "请检查账号 tier/邮箱分组、账号 routing 覆盖、凭据是否过期，"
-                    "或调整该组 allowed_surfaces；本次请求不静默换组。"
-                ),
-            )
-
-        active_id = getattr(active, "id", None)
         candidates.sort(
             key=lambda candidate: (
                 0 if candidate.available else 1,
-                0 if candidate.account_id == active_id else 1,
                 0 if candidate.slot_index is not None else 1,
+                0 if candidate.account_id in ready_accounts else 1,
+                candidate.affinity,
+                -candidate.weight,
                 self._score(candidate, rotator),
                 candidate.account_id,
             )
         )
+
         raw_routing = features.get("routing")
         routing_cfg = raw_routing if isinstance(raw_routing, dict) else {}
-        raw_slots = features.get("slots")
-        slots_list = raw_slots if isinstance(raw_slots, list) else []
         try:
             max_switches = max(0, int(routing_cfg.get("max_switches", 2)))
         except (TypeError, ValueError):
             max_switches = 2
-        budget = RoutingBudget(max_switches=max_switches)
         ctx = RouteContext(
             request_id=f"route-{int(self._clock() * 1000)}",
             model_path=model_path,
@@ -342,24 +348,29 @@ class RoutingPipeline:
             api_format=api_format,
             channel=channel,
             surface=surface,
-            group=group,
             candidates=candidates,
-            budget=budget,
+            budget=RoutingBudget(max_switches=max_switches),
             breaker=self._breaker,
-            multi_mode=is_multi_mode(registry, slots_list),
+            multi_mode=is_multi_mode(registry, slots),
             started_at=self._clock(),
             borrow_enabled=bool(routing_cfg.get("borrow", False)),
         )
         logger.info(
             "[surface] request=%s model=%s format=%s channel=%s surface=%s "
-            "group=%s source=%s candidates=%s multi_mode=%s step=①->④",
+            "groups=%s candidates=%s multi_mode=%s step=①->④",
             ctx.request_id,
             clean_model,
             api_format,
             channel,
             surface,
-            group.name or "-",
-            group.source,
+            ",".join(
+                sorted(
+                    {
+                        candidate.group.name or candidate.group.source
+                        for candidate in candidates
+                    }
+                )
+            ),
             ",".join(candidate.account_id for candidate in candidates),
             ctx.multi_mode,
         )
@@ -380,64 +391,78 @@ class RoutingPipeline:
     def next_candidate(
         self, ctx: RouteContext, failed_account_id: str | None = None
     ) -> Candidate | None:
-        """Pick the next candidate that can land within budget."""
-        candidate = ctx.next_candidate(failed_account_id)
-        while candidate is not None:
-            allowed, reason = self.instances.can_land(ctx.channel, ctx.group)
-            if allowed:
-                return candidate
-            if ctx.borrow_enabled:
-                lease = self.instances.borrow_lease(
-                    surface=ctx.surface,
-                    exclude_accounts=ctx.failed | ctx.attempted,
-                )
-                if lease is not None:
-                    ctx.pending_borrow = lease
-                    logger.info(
-                        "[surface:borrow] request=%s from=%s account=%s step=⑥",
-                        ctx.request_id,
-                        lease.realm_id,
-                        lease.account_id,
-                    )
-                    return Candidate(
-                        account_id=lease.account_id,
-                        name=lease.account_id,
-                        tier=None,
-                        email=None,
-                        channel=ctx.channel,
-                        surface=ctx.surface,
-                        weight=1.0,
-                        available=True,
-                        reason="borrow",
-                    )
-            if not ctx.budget.can_defer():
+        return ctx.next_candidate(failed_account_id)
+
+    async def acquire(
+        self,
+        ctx: RouteContext,
+        candidate: Candidate,
+        *,
+        require_idle: bool = True,
+    ) -> InstanceLease:
+        """Acquire a ready slot, switching/loading an eligible account first."""
+        del require_idle
+        ctx.attempted.add(candidate.account_id)
+        auth_file, auth_user = self._auth_for(candidate.account_id)
+        first_attempt = not ctx.failed and not ctx.attempted - {candidate.account_id}
+        timeout_s = 5.0 if first_attempt else 0.0
+        try:
+            lease = await self.pool.acquire(
+                account_id=candidate.account_id,
+                auth_file=auth_file,
+                auth_user=auth_user,
+                channel=ctx.channel,
+                surface=ctx.surface,
+                timeout_s=timeout_s,
+            )
+        except InstanceCapacityError as exc:
+            if not ctx.borrow_enabled:
                 _raise(
                     "surface_quota_exceeded",
                     message=(
-                        f"渠道 '{ctx.channel}' 实例预算已满（{reason}），"
-                        "且顺延预算已耗尽。"
+                        f"渠道 '{ctx.channel}' 实例预算已满，无法为账号 "
+                        f"'{candidate.account_id}' 装载/切换实例。"
                     ),
-                    advice="请提高 global/channel/group 预算、关闭闲置实例，或稍后重试。",
+                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
                 )
-            ctx.budget.record_defer(reason or "budget")
-            logger.info(
-                "[surface:budget] request=%s account=%s defer=%s step=⑤",
-                ctx.request_id,
-                candidate.account_id,
-                reason,
-            )
-            ctx.attempted.add(candidate.account_id)
-            candidate = ctx.next_candidate(None)
-        if ctx.budget.snapshot()["defers"]:
-            _raise(
-                "surface_quota_exceeded",
-                message=(
-                    f"渠道 '{ctx.channel}' 的候选实例均无法落地，"
-                    f"顺延次数={ctx.budget.snapshot()['defers']}。"
-                ),
-                advice="请提高 global/channel/group 预算、关闭闲置实例，或稍后重试。",
-            )
-        return None
+            borrow_ids = {
+                item.account_id
+                for item in ctx.candidates
+                if item.account_id not in ctx.failed
+                and item.account_id not in ctx.attempted
+            }
+            if not borrow_ids:
+                _raise(
+                    "surface_quota_exceeded",
+                    message=f"渠道 '{ctx.channel}' 无空闲可借实例：{exc}",
+                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
+                )
+            try:
+                lease = await self.pool.acquire(
+                    account_id=candidate.account_id,
+                    auth_file=auth_file,
+                    auth_user=auth_user,
+                    channel=ctx.channel,
+                    surface=ctx.surface,
+                    timeout_s=0.0,
+                    borrow_accounts=borrow_ids,
+                )
+            except InstanceCapacityError as borrow_exc:
+                _raise(
+                    "surface_quota_exceeded",
+                    message=(f"渠道 '{ctx.channel}' 无可用/可借实例：{borrow_exc}"),
+                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
+                )
+        logger.info(
+            "[surface] request=%s account=%s channel=%s realm=%s slot=%s borrow=%s step=⑤",
+            ctx.request_id,
+            lease.account_id,
+            lease.channel,
+            lease.realm_id,
+            lease.slot_index,
+            lease.is_borrow,
+        )
+        return lease
 
     async def land(
         self,
@@ -445,37 +470,14 @@ class RoutingPipeline:
         candidate: Candidate,
         *,
         require_idle: bool = True,
-    ) -> InstanceLease | None:
-        ctx.attempted.add(candidate.account_id)
-        if candidate.reason == "borrow" and ctx.pending_borrow is not None:
-            lease = ctx.pending_borrow
-            ctx.pending_borrow = None
-            logger.info(
-                "[surface:borrow] request=%s account=%s realm=%s step=⑤",
-                ctx.request_id,
-                lease.account_id,
-                lease.realm_id,
-            )
-            return lease
-        lease = await self.instances.land(
-            account_id=candidate.account_id,
-            channel=ctx.channel,
-            surface=ctx.surface,
-            model=ctx.clean_model,
-            require_idle=require_idle,
-        )
-        if lease is None:
-            ctx.failed.add(candidate.account_id)
-            return None
-        logger.info(
-            "[surface] request=%s account=%s channel=%s realm=%s slot=%s step=⑤",
-            ctx.request_id,
-            lease.account_id,
-            lease.channel,
-            lease.realm_id,
-            lease.slot_index,
-        )
-        return lease
+    ) -> InstanceLease:
+        """Compatibility alias for v3 acquire."""
+        return await self.acquire(ctx, candidate, require_idle=require_idle)
+
+    async def release(self, ctx: RouteContext, lease: InstanceLease | None) -> None:
+        del ctx
+        if lease is not None:
+            await self.pool.release(lease)
 
     def record_retry(self, ctx: RouteContext, reason: str) -> None:
         ctx.budget.record_retry()
@@ -533,7 +535,11 @@ class RoutingPipeline:
     def snapshot(self) -> dict[str, object]:
         return {
             "circuit": self._breaker.snapshot(),
-            "instances": self.instances.snapshot(),
+            "instances": {
+                "contexts": self.pool.snapshot(),
+                "max_contexts": self.pool.max_contexts,
+                "pages": self.pool.page_counts(),
+            },
         }
 
 
