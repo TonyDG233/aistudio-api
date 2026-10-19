@@ -77,35 +77,45 @@ features:
   # chat=聊天/Playground 面 (别名 pg/playground)；build=Build 宿主页；
   # official=官网消费者端，WP9 前仅注册、不实现 (请求会显式 403)。
   # enabled: 渠道是否参与路由；关=该渠道请求显式拒绝，不静默换面。
-  # max_instances: 渠道同时存活的页面实例上限 (0-16)，参与四层预算取最严。
-  # 裸名在多渠道启用时按策略推导，系统不硬编码默认渠道。
+  # max_pages: 渠道同时存活的页面数上限 (0-16)，参与页面预算取最严。
+  # max_instances: WP5 v2 兼容别名；Phase 3 后移除。
+  # quota_pool: 该渠道要求的额度池 (free/pro/official)；null/any=不限制。
+  #   零配置保持 null，确保 free 账号仍可 chat；黄金模板显式配 chat=pro/build=free。
+  # 裸名在多渠道启用时按候选资格推导，系统不硬编码默认渠道。
   # --------------------------------------------------------------------------
   channels:
     chat:
       enabled: true
+      max_pages: 1
       max_instances: 2
+      quota_pool: null
     build:
       # 未显式配置时继承上方 build_surface；此处显式值优先。
       enabled: false
+      max_pages: 1
       max_instances: 2
+      quota_pool: null
     official:
       enabled: false
+      max_pages: 0
       max_instances: 0
+      quota_pool: null
 
   # --------------------------------------------------------------------------
   # 路由安全与预算 (routing，WP5 二期)
   # max_switches: 单请求内“换账号/换实例”动作上限；同账号重试仍由
   #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
-  # global_max_instances: 全局页面实例硬顶 (所有渠道/Realm 合计)。
-  # max_realms: 跨账号隔离浏览器上下文上限；realm_mode=false 时固定单 Realm。
-  # realm_mode: 开=允许跨账号同时在线 (惰性创建，每个 Realm 约 +180MB)；
-  #   关=单 Realm 现行为。默认开，单账号场景不会额外创建。
+  # global_max_pages: 全局页面数硬顶 (所有渠道/Context 合计)。
+  # max_contexts: 统一实例池的 Context 上限；页面数与 Context 数分开计数。
+  # global_max_instances/max_realms/realm_mode: WP5 v2 兼容键，Phase 3 后移除。
   # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
   # prewarm: 备用实例预热；默认关 (黄金模板可开)。
   # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
   # --------------------------------------------------------------------------
   routing:
     max_switches: 2
+    global_max_pages: 2
+    max_contexts: 2
     global_max_instances: 2
     max_realms: 2
     realm_mode: true
@@ -139,12 +149,14 @@ features:
   #   match_tier:           命中的账号档位列表 (小写，如 pro/free/ultra/plus)
   #   match_emails_regex:   命中的邮箱正则 (可选，留空/null 表示不启用)
   #   allowed_surfaces:     允许的面子集 [chat] / [build] / [chat, build]；空 [] 表示禁用该组
-  #   max_page_instances:   该组允许并存的页面实例上限 (0-16，默认 2)；超限对请求显式拒绝，不排队
+  #   allowed_quota_pools:  允许的额度池子集 [free, pro]；空 [] 表示不限制
+  #   max_pages:            该组允许并存的页面数上限 (0-16，默认 2)；超限显式拒绝，不排队
+  #   max_page_instances:   WP5 v2 兼容别名；Phase 3 后移除
   # 组只收窄候选账号/渠道/预算/权重，不能放宽系统推导的模型与渠道能力。
   # 示例 (两行)：
   # groups:
-  #   - { name: pro,  enabled: true, weight: 1.0, match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  max_page_instances: 2 }
-  #   - { name: free, enabled: true, weight: 1.0, match_tier: [free],             allowed_surfaces: [build], max_page_instances: 3 }
+  #   - { name: pro,  enabled: true, weight: 1.0, match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  allowed_quota_pools: [pro],  max_pages: 2 }
+  #   - { name: free, enabled: true, weight: 1.0, match_tier: [free],             allowed_surfaces: [build], allowed_quota_pools: [free], max_pages: 3 }
   groups: []
 
   # --------------------------------------------------------------------------

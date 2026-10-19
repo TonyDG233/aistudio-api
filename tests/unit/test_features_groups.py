@@ -74,6 +74,8 @@ features:
             "match_tier": ["pro", "ultra"],
             "match_emails_regex": "^pro@example[.]com$",
             "allowed_surfaces": ["chat", "build"],
+            "allowed_quota_pools": [],
+            "max_pages": 2,
             "max_page_instances": 2,
         },
         {
@@ -83,6 +85,8 @@ features:
             "match_tier": ["free"],
             "match_emails_regex": None,
             "allowed_surfaces": ["build"],
+            "allowed_quota_pools": [],
+            "max_pages": 3,
             "max_page_instances": 3,
         },
     ]
@@ -107,6 +111,8 @@ features:
             "match_tier": [],
             "match_emails_regex": None,
             "allowed_surfaces": [],
+            "allowed_quota_pools": [],
+            "max_pages": 2,
             "max_page_instances": 2,
         }
     ]
@@ -294,6 +300,8 @@ features:
             "match_tier": ["free", "plus"],
             "match_emails_regex": None,
             "allowed_surfaces": ["build"],
+            "allowed_quota_pools": [],
+            "max_pages": 3,
             "max_page_instances": 3,
         }
     ]

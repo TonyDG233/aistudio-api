@@ -112,7 +112,7 @@ def test_intersect_surfaces_never_widens() -> None:
         name="pro",
         source="explicit",
         allowed_surfaces=("chat",),
-        max_page_instances=2,
+        max_pages=2,
         weight=1.0,
         enabled=True,
     )
