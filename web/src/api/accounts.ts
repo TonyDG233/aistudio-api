@@ -1,6 +1,7 @@
 import { request } from './client.ts'
 import type {
   Account,
+  AccountRouting,
   ImportCookiesRequest,
   ImportCookiesResponse,
   ProbeAndImportRequest,
@@ -73,6 +74,23 @@ export const accountsApi = {
     return request<RefreshAccountsResponse>('/api/accounts/refresh', {
       method: 'POST',
       body: JSON.stringify(req),
+    })
+  },
+
+  getRouting(id: string): Promise<AccountRouting> {
+    return request<AccountRouting>(`/api/accounts/${id}/routing`)
+  },
+
+  updateRouting(id: string, routing: AccountRouting): Promise<AccountRouting> {
+    return request<AccountRouting>(`/api/accounts/${id}/routing`, {
+      method: 'PUT',
+      body: JSON.stringify(routing),
+    })
+  },
+
+  clearRouting(id: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(`/api/accounts/${id}/routing`, {
+      method: 'DELETE',
     })
   },
 }

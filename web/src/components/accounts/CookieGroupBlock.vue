@@ -23,13 +23,13 @@ const emit = defineEmits<{
   <div class="transition-colors">
     <!-- Level 1: Cookie Credential Parent Node -->
     <div
-      class="px-5 py-3.5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
+      class="px-5 py-3.5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 cursor-pointer select-none transition-colors"
       :class="[
         group.hasActive ? 'bg-brand-50/30 hover:bg-brand-50/50' : 'bg-white hover:bg-gray-50/80',
       ]"
       @click="emit('toggle')"
     >
-      <div class="flex items-center gap-3 min-w-0">
+      <div class="flex items-center gap-3 min-w-0 flex-1">
         <!-- Expand Chevron -->
         <button
           type="button"
@@ -54,12 +54,12 @@ const emit = defineEmits<{
         </div>
 
         <!-- Group Info -->
-        <div class="truncate">
-          <div class="flex items-center gap-2">
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span class="font-bold text-gray-900 text-xs tracking-tight">
               {{ group.name }}
             </span>
-            <span class="text-[11px] font-mono text-gray-400">
+            <span class="text-[11px] font-mono text-gray-400 shrink-0">
               ({{ group.accounts.length }} 个子账号)
             </span>
             <span
@@ -69,7 +69,7 @@ const emit = defineEmits<{
               当前激活
             </span>
           </div>
-          <div class="text-[11px] text-gray-400 font-mono flex items-center gap-2 mt-0.5">
+          <div class="text-[11px] text-gray-400 font-mono flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
             <span>导入时间: {{ formatDate(group.createdAt) }}</span>
             <span>·</span>
             <span
@@ -82,7 +82,7 @@ const emit = defineEmits<{
 
       <!-- Group Summary & Group Actions -->
       <div
-        class="flex items-center gap-3 shrink-0"
+        class="flex items-center gap-3 shrink-0 self-end sm:self-auto"
         @click.stop
       >
         <div class="hidden sm:flex items-center gap-2 text-xs font-mono">
