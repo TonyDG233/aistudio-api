@@ -78,8 +78,15 @@ async def lifespan(_app: FastAPI):
     # WP5 v4：用户可见实例（一个同时登录账号会话）由独立 manager 管理。
     from aistudio_api.application.instance_manager import InstanceManager
 
+    async def _switch_instance_account(account_id: str) -> bool:
+        from aistudio_api.application.account_orchestrator import switch_to_account
+
+        return await switch_to_account(account_id, require_idle=False)
+
     runtime_state.instance_manager = InstanceManager(
-        client.instance_pool, account_store
+        client.instance_pool,
+        account_store,
+        switch_account=_switch_instance_account,
     )
 
     # 初始化黏性账号调度器
@@ -118,6 +125,22 @@ async def lifespan(_app: FastAPI):
                 logger.warning("浏览器预热失败: %s", e)
 
     warmup_task = asyncio.create_task(_warmup())
+
+    async def _startup_instances():
+        if warmup_task is not None:
+            try:
+                await warmup_task
+            except Exception as exc:
+                logger.debug("实例预启动前预热失败: %s", exc)
+        manager = runtime_state.instance_manager
+        if manager is None:
+            return
+        try:
+            await manager.startup()
+        except Exception as exc:
+            logger.warning("实例预启动失败: %s", exc)
+
+    startup_task = asyncio.create_task(_startup_instances())
 
     async def _model_warmup():
         from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
@@ -163,6 +186,8 @@ async def lifespan(_app: FastAPI):
     logger.info("服务正在关闭")
     if warmup_task and not warmup_task.done():
         warmup_task.cancel()
+    if startup_task and not startup_task.done():
+        startup_task.cancel()
     if model_warmup_task and not model_warmup_task.done():
         model_warmup_task.cancel()
     if idle_task and not idle_task.done():

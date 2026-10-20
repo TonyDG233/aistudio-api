@@ -383,6 +383,32 @@ async def test_cancelled_slot_load_disposes_context_and_removes_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_channel_times_out_without_leaking_page(
+    monkeypatch,
+) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp)
+
+    async def slow_ensure(self: InstanceSlot, cdp_client):
+        await asyncio.sleep(5)
+        return FakeBuildSurface(context_id=self.context_id, realm_id=self.realm_id)
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", slow_ensure)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.instance_pool.BUILD_CHANNEL_READY_TIMEOUT_S",
+        0.01,
+    )
+    chat = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
+    await pool.release(chat)
+
+    with pytest.raises(InstanceCapacityError, match="渠道启动超时"):
+        await pool.ensure_channel(chat.slot_id, "build")
+
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    await pool.close()
+
+
+@pytest.mark.asyncio
 async def test_rebind_to_build_reserves_page_while_surface_loads(
     monkeypatch,
 ) -> None:
@@ -553,7 +579,7 @@ async def test_snapshot_does_not_expose_credentials() -> None:
 
 
 @pytest.mark.asyncio
-async def test_channel_page_budget_is_enforced() -> None:
+async def test_channel_page_budget_scales_with_instance_capacity() -> None:
     cdp = FakeCDP()
     pool = _pool(
         cdp,
@@ -566,9 +592,13 @@ async def test_channel_page_budget_is_enforced() -> None:
         },
     )
     first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
+    second = await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
+    assert first.slot_id != second.slot_id
+    assert pool.live_contexts == 2
+    channel_budget = cast("dict[str, int]", pool.budget_snapshot()["channel_max_pages"])
+    assert channel_budget["chat"] == 2
     await pool.release(first)
+    await pool.release(second)
     await pool.close()
 
 
@@ -578,7 +608,7 @@ async def test_full_page_budget_rebinds_idle_slot_instead_of_failing() -> None:
     pool = _pool(
         cdp,
         features={
-            "routing": {"max_contexts": 2, "global_max_pages": 4},
+            "routing": {"max_contexts": 1, "global_max_pages": 1},
             "channels": {
                 "chat": {"enabled": True, "max_pages": 1},
                 "build": {"enabled": True, "max_pages": 1},
@@ -597,7 +627,7 @@ async def test_full_page_budget_rebinds_idle_slot_instead_of_failing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_global_page_budget_is_enforced() -> None:
+async def test_global_page_budget_is_at_least_instance_capacity() -> None:
     cdp = FakeCDP()
     pool = _pool(
         cdp,
@@ -609,10 +639,7 @@ async def test_global_page_budget_is_enforced() -> None:
             },
         },
     )
-    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
-    await pool.release(first)
+    assert pool.budget_snapshot()["global_max_pages"] == 2
     await pool.close()
 
 

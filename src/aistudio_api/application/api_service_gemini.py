@@ -18,7 +18,6 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.application.atg import create_atg_processor
 from aistudio_api.application.generation_service import (
     StreamEvent,
     _resolve_surface,
@@ -201,7 +200,6 @@ async def handle_gemini_generate_content(
         req=req,
         client=client,
         api_format="gemini",
-        atg_factory=create_atg_processor,
     )
     output = outcome.output
     return GeminiGenerateContentResponse(
@@ -240,7 +238,6 @@ def _build_gemini_streaming_response(
                 req=req,
                 client=client,
                 api_format="gemini",
-                atg_factory=create_atg_processor,
             ):
                 chunk = _render_stream_event(event)
                 if chunk:

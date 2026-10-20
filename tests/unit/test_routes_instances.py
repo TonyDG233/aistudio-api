@@ -28,7 +28,7 @@ EXPECTED_KEYS = {
 
 class FakeManager:
     def __init__(self) -> None:
-        self.created: list[str] = []
+        self.created: list[tuple[str, str | None]] = []
         self.closed: list[str] = []
         self.reassigned: list[tuple[str, str]] = []
         self.fail: Exception | None = None
@@ -37,6 +37,7 @@ class FakeManager:
         return InstanceList(
             max_instances=2,
             latest_instance_id="inst-1",
+            current_instance_id="inst-1",
             instances=(
                 Instance(
                     id="inst-1",
@@ -50,10 +51,10 @@ class FakeManager:
             ),
         )
 
-    async def create(self, account_id: str) -> Instance:
+    async def create(self, account_id: str, channel: str | None = None) -> Instance:
         if self.fail:
             raise self.fail
-        self.created.append(account_id)
+        self.created.append((account_id, channel))
         return Instance(
             id="inst-2",
             number=2,
@@ -70,6 +71,17 @@ class FakeManager:
             number=2,
             account_id="b",
             state=InstanceState.RECLAIMING,
+        )
+
+    async def switch_to(self, instance_id: str, channel: str | None = None) -> Instance:
+        if self.fail:
+            raise self.fail
+        return Instance(
+            id=instance_id,
+            number=2,
+            account_id="b",
+            state=InstanceState.ACTIVE,
+            channels=("pg",),
         )
 
     async def reassign(self, instance_id: str, account_id: str) -> Instance:
@@ -109,6 +121,7 @@ async def test_list_instances_has_strict_user_fields(manager) -> None:
     payload = resp.json()
     assert payload["max_instances"] == 2
     assert payload["latest_instance_id"] == "inst-1"
+    assert payload["current_instance_id"] == "inst-1"
     item = payload["instances"][0]
     assert set(item) == EXPECTED_KEYS
     assert "context" not in str(payload).lower()
@@ -118,14 +131,25 @@ async def test_list_instances_has_strict_user_fields(manager) -> None:
 @pytest.mark.asyncio
 async def test_create_and_close_instance(manager) -> None:
     async with _client() as client:
-        created = await client.post("/api/instances", json={"account_id": "a"})
+        created = await client.post(
+            "/api/instances", json={"account_id": "a", "channel": "build"}
+        )
         closed = await client.delete("/api/instances/inst-2")
     assert created.status_code == 201
     assert set(created.json()) == EXPECTED_KEYS
-    assert manager.created == ["a"]
+    assert manager.created == [("a", "build")]
     assert closed.status_code == 202
     assert closed.json()["state"] == "reclaiming"
     assert manager.closed == ["inst-2"]
+
+
+@pytest.mark.asyncio
+async def test_switch_instance(manager) -> None:
+    async with _client() as client:
+        resp = await client.post("/api/instances/inst-1/switch")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "inst-1"
+    assert "current" not in resp.json()
 
 
 @pytest.mark.asyncio

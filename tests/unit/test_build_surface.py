@@ -351,7 +351,36 @@ def test_resolve_app_id_from_env(monkeypatch: pytest.MonkeyPatch):
 
 def test_resolve_app_id_defaults_to_ark(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AISTUDIO_APP_URL", raising=False)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults.get_features_config",
+        lambda: {"channels": {"build": {"app_url": ""}}},
+    )
     assert bs.resolve_build_app_id() == bs.DEFAULT_BUILD_APP_ID
+
+
+def test_resolve_app_id_from_config(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("AISTUDIO_APP_URL", raising=False)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults.get_features_config",
+        lambda: {
+            "channels": {
+                "build": {
+                    "app_url": "https://aistudio.google.com/apps/"
+                    "3b85b4ed-f945-422c-ba25-395d1feef528"
+                }
+            }
+        },
+    )
+    assert bs.resolve_build_app_id() == "3b85b4ed-f945-422c-ba25-395d1feef528"
+
+
+def test_resolve_app_id_accepts_raw_id(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AISTUDIO_APP_URL", "3b85b4ed-f945-422c-ba25-395d1feef528")
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults.get_features_config",
+        lambda: {"channels": {"build": {"app_url": ""}}},
+    )
+    assert bs.resolve_build_app_id() == "3b85b4ed-f945-422c-ba25-395d1feef528"
 
 
 # --------------------------------------------------------------------------- #

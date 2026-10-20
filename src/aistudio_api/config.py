@@ -298,6 +298,7 @@ class Settings:
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())
     proxy_url: str | None = discover_proxy_url()
+    aistudio_app_url: str = os.getenv("AISTUDIO_APP_URL", "")
     web_password: str | None = _load_web_password()
     api_keys: frozenset[str] = frozenset()
     timeout_replay: int = int(os.getenv("AISTUDIO_TIMEOUT_REPLAY", "120"))

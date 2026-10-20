@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 logger = get_logger("build_surface")
 
 # Ark同款默认 app id（docs/ark-reference/build-channel/evidence-20261017/）。
-DEFAULT_BUILD_APP_ID = "56128c84-c8e6-4d52-bf94-934c836720d9"
+DEFAULT_BUILD_APP_ID = "3b85b4ed-f945-422c-ba25-395d1feef528"
 # spikeP 实证配方：必须带 showAssistant/showPreview 查询串，宿主助手才会 boot 并发出
 # __warmup__ 引导 RPC（被页面签名器吞没捕获），否则 tb/收割头永远不会出现。
 BUILD_SURFACE_URL_TEMPLATE = (
@@ -327,8 +327,19 @@ class BuildSurfaceState:
 
 
 def resolve_build_app_id() -> str:
-    """Resolve the Build app id: AISTUDIO_APP_URL ``/apps/<id>`` → config → Ark default."""
-    candidates = [os.getenv("AISTUDIO_APP_URL") or ""]
+    """Resolve the Build app id: config ``channels.build.app_url`` → env → Ark default."""
+    candidates: list[str] = []
+    with suppress(Exception):
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_features_config,
+        )
+
+        channels = get_features_config().get("channels")
+        if isinstance(channels, dict):
+            build = channels.get("build")
+            if isinstance(build, dict):
+                candidates.append(str(build.get("app_url") or ""))
+    candidates.append(os.getenv("AISTUDIO_APP_URL") or "")
     with suppress(Exception):
         from aistudio_api.config import settings
 
@@ -337,6 +348,9 @@ def resolve_build_app_id() -> str:
         match = _APP_ID_RE.search(raw)
         if match:
             return match.group(1)
+        text = raw.strip()
+        if text and re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,}", text):
+            return text
     return DEFAULT_BUILD_APP_ID
 
 
@@ -897,7 +911,8 @@ class BuildSurface:
             # 现在改为每 ≤15s 重发一次可信输入，连接即退出，最坏耗时也被限制在同一量级。
             app_connected = False
             loop = asyncio.get_running_loop()
-            connect_deadline = loop.time() + 100.0
+            connect_timeout = min(100.0, max(15.0, ready_timeout_s))
+            connect_deadline = loop.time() + connect_timeout
             attempt = 0
             while loop.time() < connect_deadline:
                 attempt += 1
@@ -916,8 +931,11 @@ class BuildSurface:
                     await self._probe_signer_state_safe(page),
                 )
             if not app_connected:
-                logger.warning(
-                    "app 内嵌客户端等待 100s 未连接 9998，仍继续过门与等待（诊断见 preview 域日志）"
+                raise BuildSurfaceError(
+                    "ensure_ready",
+                    "APP_NOT_CONNECTED",
+                    f"app 内嵌客户端未在 {connect_timeout:.0f}s 内连接 9998",
+                    "检查 Build 应用是否可打开、账号是否可访问，以及代理/网络是否拦截 9998",
                 )
             # gate#2：落在 app 连接之后，作为"助手就绪后的首次可信交互"触发宿主 warmup 门。
             await self._pass_human_gate(page)
@@ -925,7 +943,7 @@ class BuildSurface:
             # __warmup__ 规格 → 宿主发起一次被吞没的 RPC → tb 捕获 + 收割头就位（零上游流量）。
             await self._trigger_warmup()
             await self._wait_for_ready(page, ready_timeout_s=ready_timeout_s)
-        except Exception:
+        except BaseException:
             if created and state.page is page:
                 # A freshly created page that never became ready is not reusable.
                 with suppress(Exception):

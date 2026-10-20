@@ -605,7 +605,12 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     # build 的 enabled 在 YAML 未显式给出时继承 legacy build_surface。
     "channels": {
         "chat": {"enabled": True, "max_instances": 2, "max_pages": 1},
-        "build": {"enabled": False, "max_instances": 2, "max_pages": 1},
+        "build": {
+            "enabled": False,
+            "max_instances": 2,
+            "max_pages": 1,
+            "app_url": "",
+        },
         "official": {"enabled": False, "max_instances": 0, "max_pages": 0},
     },
     # WP5 v3：页面数与 Context 数分开；旧 routing 键保留到 Phase 3 迁移完成。
@@ -839,6 +844,7 @@ def _normalize_channels(
             ),
             "max_pages": build_max_pages,
             "quota_pool": _coerce_feature_quota_pool(build_raw.get("quota_pool")),
+            "app_url": str(build_raw.get("app_url") or "").strip(),
         },
         # WP9 前官网渠道只注册不实现：无论配置如何都保持关闭。
         "official": {
@@ -976,7 +982,12 @@ def _normalize_atg_mode_by_format(raw: object) -> dict[str, str]:
     data = raw if isinstance(raw, dict) else {}
     result: dict[str, str] = {}
     for api_format in _ATG_FORMATS:
-        value = str(data.get(api_format, "inherit")).strip().lower()
+        raw_value = data.get(api_format, "inherit")
+        # PyYAML 1.1 parses unquoted ``off`` as boolean false; keep old YAML usable.
+        if raw_value is False:
+            result[api_format] = "off"
+            continue
+        value = str(raw_value).strip().lower()
         result[api_format] = value if value in _ATG_FORMAT_MODES else "inherit"
     return result
 

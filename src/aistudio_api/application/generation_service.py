@@ -114,8 +114,6 @@ def _create_atg(
 ) -> AtgProcessor:
     if atg_factory is not None:
         return atg_factory()
-    if api_format == "gemini":
-        return create_atg_processor()
     from aistudio_api.application.atg.config import resolve_atg_mode
 
     return create_atg_processor({"mode": resolve_atg_mode(api_format)})

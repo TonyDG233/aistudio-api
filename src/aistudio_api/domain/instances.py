@@ -30,6 +30,7 @@ class Instance:
 class InstanceList:
     max_instances: int
     latest_instance_id: str | None
+    current_instance_id: str | None
     instances: tuple[Instance, ...]
 
 

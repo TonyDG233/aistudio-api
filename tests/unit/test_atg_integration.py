@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.application import api_service_gemini
+from aistudio_api.application import generation_service
 from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
 from aistudio_api.application.atg import create_atg_processor
 from aistudio_api.domain.models import Candidate, ModelOutput
@@ -34,10 +34,10 @@ def _detail(exc: HTTPException) -> dict[str, Any]:
 
 
 def _enable_atg(monkeypatch, mode="prefer", **overrides):
-    def factory():
-        return create_atg_processor({"mode": mode, **overrides})
+    def factory(base=None):
+        return create_atg_processor({**(base or {}), "mode": mode, **overrides})
 
-    monkeypatch.setattr(api_service_gemini, "create_atg_processor", factory)
+    monkeypatch.setattr(generation_service, "create_atg_processor", factory)
 
 
 def _req(*, tools=None, tool_config=None):
