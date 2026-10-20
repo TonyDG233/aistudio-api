@@ -199,7 +199,8 @@ aistudio-api/
 │   │   ├── types/                 # TypeScript 类型契约
 │   │   ├── stores/                # Pinia 状态管理
 │   │   ├── components/            # UI 与业务解耦组件
-│   │   ├── views/                 # 页面路由视图 (Dashboard, Accounts, Settings, Login)
+│   │   ├── views/                 # 页面路由视图 (Dashboard, Stats, Accounts, Settings, Login)
+│   │   ├── components/stats/      # 统计页组件 (概览/趋势/模型表/账号状态/count)
 │   │   └── router/                # Vue Router 路由与守卫
 │   └── vite.config.ts             # 构建配置 (输出至 src/aistudio_api/static)
 ├── android/                       # Android 伴侣端：多资料凭据提取器 (Jetpack Compose + Material 3)
@@ -222,8 +223,8 @@ aistudio-api/
 │   │   ├── routes_claude.py       # /v1/messages 与 count_tokens (WP8/WP11)
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
 │   │   ├── routes_keepalive.py    # 保活状态查询与手动触发路由
-│   │   ├── routes_system.py       # 监控指标、日志配置与 config.yaml 热重载路由
-│   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)
+│   │   ├── routes_system.py       # 监控指标、/api/stats、日志配置与 config.yaml 热重载路由
+│   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)；stats schema v2 与日聚合
 │   │   ├── schemas.py             # Gemini API 请求与校验模型
 │   │   ├── schemas_openai.py      # OpenAI Chat Completions 请求模型 (WP8)
 │   │   ├── schemas_claude.py      # Anthropic Messages 请求模型 (WP8)
@@ -232,6 +233,7 @@ aistudio-api/
 │   │   └── response_models.py     # API Pydantic 响应模型
 │   ├── application/               # 业务应用层
 │   │   ├── account_rotator.py     # 黏性账号调度器 (按模型记录 429 与太平洋午夜重置)
+│   │   ├── model_access.py        # Paid 模型缓存与快照更新 (账号 pro 与模型 Paid 分离)
 │   │   ├── account_service.py     # 账号存储与激活上下文协调
 │   │   ├── account_keepalive.py   # 双保活调度器 (Auth 回写/元数据刷新/定时切号/轻量活动)
 │   │   ├── api_service_gemini.py  # Gemini 协议渲染层 (SSE/响应/错误格式)
@@ -244,6 +246,7 @@ aistudio-api/
 │   │   ├── account_routing.py     # 账号级 routing 覆盖归一化 (只收窄)
 │   │   ├── routing_safety.py      # 请求级切换/顺延预算 + 滚动熔断
 │   │   ├── routing_pipeline.py    # 唯一决策管线 ①能力→②候选→③组→④排序→⑤落地→⑥失败链
+│   │   ├── routing_eligibility.py # 账号资格/渠道选择；Paid 模型要求 pro 凭证 + chat
 │   │   ├── atg/                   # ATG 防截断 (synthetic transport: injector/extractor/stream_extractor/repair/config 等)
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 纯净领域模型与异常体系
@@ -258,10 +261,10 @@ aistudio-api/
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
-└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 20s)
+└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 20s；当前 800+ 用例)
     ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
     ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
-    └── unit/                     # 62 个按职责严格划分的单元测试模块
+    └── unit/                     # 按职责严格划分的单元测试模块
         ├── test_account_*        # 账号调度、并发轮换防雪崩与凭据导入
         ├── test_api_*            # API 鉴权、响应序列化与模型/系统路由
         ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
@@ -285,3 +288,9 @@ aistudio-api/
 - **复杂策略组（WP5 v3，P4.5）**：唯一决策管线在 `application/routing_pipeline.py`，渠道在请求内固定、链内不换面；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`（`meta.json`/`registry.json`）。统一 Context 实例池在 `infrastructure/gateway/instance_pool.py`：一个槽位是一个独立 BrowserContext，chat/build 是同一 Context 内的 surface page；`features.routing.max_contexts` 控制 Context 数，`global_max_pages`、`channels.*.max_pages`、`groups.*.max_pages` 控制页面数。`max_pages` 不是并发上限：同一页面可承载多个在途请求，只有新增页面/Context 才受页面预算约束。`features.routing.max_switches` 仅约束换号/换实例，独立于同账号 `MAX_RETRIES`；borrow、熔断、冷启动重试（最多 3 次）均在池内处理。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
 - **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
+
+## 7. 统计与 Paid 模型访问
+
+- **统计**：`state.py` 使用 stats schema v2（`models` + `daily`），记录 client/attempt 两层请求、输入/输出/推理/缓存读写、count_tokens 与 `usage_missing`；模型名统一去掉 `models/` 前缀并合并历史重复键。`/api/stats`、`/api/stats/timeseries` 只读取服务端状态，不使用本地 tokenizer 估算。
+- **Paid 模型**：`model_access.py` 维护 Paid 模型集合；`model_discovery` 成功拉取 ListModels 后按模型更新（`paid: true` 加入、`paid: false` 移除、缺失保留上次状态），并写入 `data/models_cache.json`。启动时加载快照并后台预热，刷新失败保留旧快照与默认兜底。
+- **语义边界**：`account_is_paid(tier)` 判断凭证档位（pro/ultra/plus/paid）；`model_requires_paid_account(model)` 只看模型 Paid 元数据；`is_chat_only_model(model)` 只表示 surface 只能 chat。模型名中的 `pro` 不再影响账号资格或 surface 判定。
