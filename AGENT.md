@@ -19,7 +19,7 @@
 
 `aistudio-api` 是 Google AI Studio 反向代理网关，提供原生 **Gemini API 兼容接口**（`/v1beta/...`）。
 
-- **协议面分层**：原生 Gemini API（`/v1beta/...`）是第一协议面；WP8 起同时提供 OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）与 Anthropic Messages（`/v1/messages`）兼容面。所有请求统一归一到 `GeminiGenerateContentRequest`，响应在格式边界逆变换；核心生成管线不得散落协议判断。
+- **协议面分层**：原生 Gemini API（`/v1beta/...`）是第一协议面；WP8 起提供 OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）与 Anthropic Messages（`/v1/messages`），WP11 增加 OpenAI Responses（`/v1/responses`）与三类真实计数端点。所有请求统一归一到 `GeminiGenerateContentRequest`，响应在格式边界逆变换；核心生成管线不得散落协议判断。
 - **轻量 CDP 驱动**：使用纯 Python 异步 WebSocket 直连 Chrome DevTools Protocol（CDP），不依赖 Node.js、Playwright 或 Selenium。
 - **浏览器内 XHR Replay**：在 MakerSuite 页面上下文中执行携带 `withCredentials = true` 的异步 XHR 请求，天然复用完整的 Cookie 会话、BotGuard 快照与环境指纹。
 - **代码即事实标准（Code as Ground Truth）**：通过全量测试验证的代码是系统的事实标准。当技术规范文档与真实代码逻辑出现分歧时以代码为准，并在重构过程中同步更新文档。
@@ -218,7 +218,8 @@ aistudio-api/
 │   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent 路由
 │   │   ├── routes_models.py       # /v1beta/models 模型发现路由
 │   │   ├── routes_openai.py       # /v1/chat/completions 与 /v1/models (WP8)
-│   │   ├── routes_claude.py       # /v1/messages (WP8)
+│   │   ├── routes_responses.py    # /v1/responses 与 input_tokens (WP11)
+│   │   ├── routes_claude.py       # /v1/messages 与 count_tokens (WP8/WP11)
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
 │   │   ├── routes_keepalive.py    # 保活状态查询与手动触发路由
 │   │   ├── routes_system.py       # 监控指标、日志配置与 config.yaml 热重载路由

@@ -548,7 +548,7 @@ _ATG_MODES = ("off", "prefer", "required")
 _ATG_CONTROL_POSITIONS = ("tail", "head")
 _ATG_RECOVERY_STRATEGIES = ("repair", "fail")
 _ATG_FORMAT_MODES = ("inherit", "off", "prefer", "required")
-_ATG_FORMATS = ("gemini", "openai", "claude")
+_ATG_FORMATS = ("gemini", "openai", "claude", "responses")
 _DEFAULT_ATG_TOOL_PREFIX = "atg_emit_"
 _DEFAULT_ATG_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
@@ -632,6 +632,7 @@ _FEATURES_DEFAULTS: dict[str, object] = {
             "gemini": "inherit",
             "openai": "inherit",
             "claude": "inherit",
+            "responses": "inherit",
         },
         "tool_prefix": _DEFAULT_ATG_TOOL_PREFIX,
         "control_position": "tail",

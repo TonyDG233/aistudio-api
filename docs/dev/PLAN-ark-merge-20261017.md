@@ -339,7 +339,7 @@
 - usage 必须透出：`input_tokens`、`input_tokens_details.cached_tokens`、`output_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`；
 - 同时校准 Chat Completions / Claude / Gemini 的 cache 与 reasoning 映射，保证 Kilo Code / Codex / Cline 这类**从响应 usage 取上下文**的客户端显示真实值；
 - 本提交不包含 preflight 计数端点（`/v1/responses/input_tokens` 仍显式 404 或后续接入）。
-- **ATG per-format 已知缺口（记号，不在本提交修）**：现有 `_ATG_FORMATS` 仍为 `gemini/openai/claude`（`model_defaults.py:551`），`features.atg.mode_by_format` 归一化也只覆盖这三项；Responses 目前只能继承全局 `features.atg.mode`，不能单独设置 `mode_by_format.responses`。后续需扩展 `_ATG_FORMATS`、`_FEATURES_DEFAULTS.atg.mode_by_format` 与 `defaults/config.yaml`，并补对应单测；在此之前 Responses 的 ATG 行为按全局模式处理，必须在证据中注明。
+- **ATG per-format（已补齐）**：`_ATG_FORMATS`、`_FEATURES_DEFAULTS.atg.mode_by_format`、`defaults/config.yaml` 与根 `config.yaml` 均已加入 `responses`，支持 `mode_by_format.responses` 单独设置 `inherit/off/prefer/required`；`test_features_config.py` 覆盖默认值与覆盖值。
 
 #### WP11.2 提交二：真实上游 token 计数补齐
 - Claude `POST /v1/messages/count_tokens`：完整请求归一（system/tools/images/thinking 历史）→ 上游真实计数 → `{"input_tokens": totalTokens}`；

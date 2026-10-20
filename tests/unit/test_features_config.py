@@ -107,12 +107,14 @@ def test_features_config_defaults_without_section(tmp_path):
     assert features["auto_switch_interval_hours"] == 3.0
     assert features["formats"]["openai"] is True
     assert features["formats"]["claude"] is True
+    assert features["formats"]["responses"] is True
     assert features["formats"]["media"]["allow_private_urls"] is False
     assert features["atg"]["mode"] == "off"
     assert features["atg"]["mode_by_format"] == {
         "gemini": "inherit",
         "openai": "inherit",
         "claude": "inherit",
+        "responses": "inherit",
     }
     assert features["atg"]["tool_prefix"] == "atg_emit_"
     assert features["atg"]["control_position"] == "tail"
@@ -141,6 +143,8 @@ features:
   auto_switch_interval_hours: 1.5
   atg:
     mode: prefer
+    mode_by_format:
+      responses: required
     strict: true
     empty_retries: 4
     side_buffer_bytes: 4096
@@ -157,6 +161,7 @@ features:
     assert features["auto_switch"] is True
     assert features["auto_switch_interval_hours"] == 1.5
     assert features["atg"]["mode"] == "prefer"
+    assert features["atg"]["mode_by_format"]["responses"] == "required"
     assert features["atg"]["strict"] is True
     assert features["atg"]["empty_retries"] == 4
     assert features["atg"]["side_buffer_bytes"] == 4096
