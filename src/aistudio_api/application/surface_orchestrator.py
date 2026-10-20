@@ -26,6 +26,7 @@ import os
 import re
 from dataclasses import dataclass
 
+from aistudio_api.application.model_access import is_paid_model
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("application.surface")
@@ -71,7 +72,6 @@ _STATUS_STRING_BY_HTTP = {
     503: "UNAVAILABLE",
 }
 
-_PRO_MODEL_RE = re.compile(r"-pro($|-)")
 _EMAIL_RE_CACHE: dict[str, re.Pattern[str] | None] = {}
 
 
@@ -211,28 +211,27 @@ def match_group(tier: object, email: object, groups: object) -> dict | None:
 
 
 def is_chat_only_model(model_path: str) -> bool:
-    """True for argon / Pro-family models that may only run on the ``chat`` surface.
+    """True only for Paid models, which may only run on the ``chat`` surface.
 
-    Covers ``models/argon`` (and any name containing ``argon``) plus Pro-name
-    models matched by ``-pro($|-)`` (e.g. ``gemini-2.5-pro``,
-    ``gemini-3.1-pro-preview``). Flash/other names return False.
+    Model names do not imply a surface or account tier. A model must be marked
+    Paid by discovery; account tier requirements are expressed separately by
+    :func:`model_requires_paid_account`.
     """
-    name = str(model_path or "").removeprefix("models/").lower()
-    if not name:
-        return False
-    if "argon" in name:
-        return True
-    return bool(_PRO_MODEL_RE.search(name))
+    return is_paid_model(model_path)
 
 
-def is_pro_only_model(model_path: str) -> bool:
-    """True when the model requires a paid/pro account (argon or Pro family)."""
-    return is_chat_only_model(model_path)
+def model_requires_paid_account(model_path: str) -> bool:
+    """True only when discovery marks the model as Paid.
+
+    Model names containing ``pro`` are deliberately not enough: ``pro`` is an
+    account tier, while a Paid model is a model-access property.
+    """
+    return is_paid_model(model_path)
 
 
 def model_account_requirement(model_path: str) -> str:
-    """Return ``paid`` for pro-only models, otherwise ``any``."""
-    return "paid" if is_pro_only_model(model_path) else "any"
+    """Return ``paid`` for Paid models, otherwise ``any``."""
+    return "paid" if model_requires_paid_account(model_path) else "any"
 
 
 def account_is_paid(tier: object) -> bool:

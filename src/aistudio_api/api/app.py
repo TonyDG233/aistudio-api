@@ -109,6 +109,20 @@ async def lifespan(_app: FastAPI):
 
     warmup_task = asyncio.create_task(_warmup())
 
+    async def _model_warmup():
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        while True:
+            try:
+                await model_discovery.get_models(
+                    session=client.session, force_refresh=True
+                )
+            except Exception as e:
+                logger.warning("模型发现预热失败: %s", e)
+            await asyncio.sleep(model_discovery.cache_ttl)
+
+    model_warmup_task = asyncio.create_task(_model_warmup())
+
     keepalive = AccountKeepaliveService(
         account_store,
         account_service,
@@ -139,6 +153,8 @@ async def lifespan(_app: FastAPI):
     logger.info("服务正在关闭")
     if warmup_task and not warmup_task.done():
         warmup_task.cancel()
+    if model_warmup_task and not model_warmup_task.done():
+        model_warmup_task.cancel()
     if idle_task and not idle_task.done():
         idle_task.cancel()
     if runtime_state.keepalive is not None:

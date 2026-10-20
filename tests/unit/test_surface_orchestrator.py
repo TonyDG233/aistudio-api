@@ -119,9 +119,9 @@ def test_match_group_accepts_normalized_single_string_regex() -> None:
         "models/argon",
         "models/argon-2-preview",
         "argon",
-        "models/gemini-2.5-pro",
-        "models/gemini-3.1-pro",
-        "models/gemini-3.1-pro-preview",
+        "models/gemini-4-argon",
+        "models/gemini-3-flash-preview",
+        "models/gemini-3.6-flash",
     ],
 )
 def test_is_chat_only_model_true_samples(model: str) -> None:
@@ -135,6 +135,9 @@ def test_is_chat_only_model_true_samples(model: str) -> None:
         "models/gemini-2.0-flash",
         "models/gemini-2.5-flash",
         "models/gemini-3.8-flash",
+        "models/gemini-2.5-pro",
+        "models/gemini-3.1-pro",
+        "models/gemini-3.1-pro-preview",
         "models/gemini-2.5-proxy",
         "models/gemini-3.1-professional",
     ],

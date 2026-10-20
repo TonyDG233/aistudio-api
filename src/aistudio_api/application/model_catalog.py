@@ -68,10 +68,13 @@ def project_model_ids(
     registry = build_registry(features)
     channels = _catalog_channels(registry)
     seen_models: list[str] = []
+    paid_models: set[str] = set()
     for item in models:
         clean = clean_model_id(item.get("id") or item.get("name"))
         if clean and clean not in seen_models:
             seen_models.append(clean)
+        if clean and item.get("paid") is True:
+            paid_models.add(clean)
 
     if len(channels) <= 1:
         return seen_models
@@ -79,7 +82,9 @@ def project_model_ids(
     projected: list[str] = []
     for clean in seen_models:
         for spec in channels:
-            if spec.key == "build" and is_chat_only_model(clean):
+            if spec.key == "build" and (
+                clean in paid_models or is_chat_only_model(clean)
+            ):
                 continue
             candidate = f"{spec.prefix}/{clean}"
             if candidate not in projected:
