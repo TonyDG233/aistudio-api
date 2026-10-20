@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from aistudio_api.api.schemas_claude import ClaudeMessagesRequest
+from aistudio_api.api.schemas_claude import (
+    ClaudeCountTokensRequest,
+    ClaudeMessagesRequest,
+)
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,
@@ -417,4 +420,27 @@ async def convert_claude_request(
         generation_config["responseSchema"] = schema
     body["generationConfig"] = generation_config
 
+    return body
+
+
+async def convert_claude_count_request(
+    req: ClaudeCountTokensRequest, media: MediaFetcher
+) -> dict[str, object]:
+    """Convert a Claude count_tokens payload into a prompt-only Gemini body.
+
+    Generation config and tool-choice config do not contribute tokens, so they
+    are stripped before the request reaches the upstream counter.
+    """
+    messages_request = ClaudeMessagesRequest(
+        model=req.model,
+        messages=req.messages,
+        system=req.system,
+        max_tokens=req.max_tokens if req.max_tokens is not None else 1,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        thinking=req.thinking,
+    )
+    body = await convert_claude_request(messages_request, media)
+    body.pop("generationConfig", None)
+    body.pop("toolConfig", None)
     return body

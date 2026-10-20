@@ -849,14 +849,13 @@ async def test_route_stream_success_emits_claude_event_sequence(monkeypatch):
     assert names[-2:] == ["message_delta", "message_stop"]
 
 
-async def test_route_count_tokens_returns_explicit_404(monkeypatch):
+async def test_route_count_tokens_requires_valid_payload(monkeypatch):
     _enable_claude(monkeypatch)
     response = await _post("/v1/messages/count_tokens", {})
-    assert response.status_code == 404
+    assert response.status_code == 400
     body = response.json()
     assert body["type"] == "error"
-    assert body["error"]["type"] == "not_found_error"
-    assert "count_tokens" in body["error"]["message"]
+    assert body["error"]["type"] == "invalid_request_error"
 
 
 @pytest.mark.asyncio
