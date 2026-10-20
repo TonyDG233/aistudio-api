@@ -225,6 +225,7 @@ aistudio-api/
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
 │   │   ├── routes_keepalive.py    # 保活状态查询与手动触发路由
 │   │   ├── routes_system.py       # 监控指标、/api/stats、日志配置与 config.yaml 热重载路由
+│   │   ├── routes_logs.py         # P5 SSE 日志流 (/logs/stream) 与按天归档导出 (/logs/export)
 │   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)；stats schema v2 与日聚合
 │   │   ├── schemas.py             # Gemini API 请求与校验模型
 │   │   ├── schemas_openai.py      # OpenAI Chat Completions 请求模型 (WP8)
@@ -256,9 +257,10 @@ aistudio-api/
 │   ├── infrastructure/            # 基础设施层
 │   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
-│   │   └── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
+│   │   ├── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
 │   │       ├── instance_pool.py   # 统一 Context 实例池：槽位/页面预算/换绑/冷启动/borrow
 │   │       └── pooled_session.py  # 单 Context 会话、页面与在途请求复用
+│   │   └── utils/                 # 统一日志 (logger)、线程安全日志广播 ring buffer/SSE 与按天归档 (log_broadcast)
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
@@ -271,6 +273,8 @@ aistudio-api/
         ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
         ├── test_wire_*           # Protobuf-over-JSON 编解码、流式解析与模型规则
         ├── test_format_*         # OpenAI/Claude 请求响应、流式事件与错误形状
+        ├── test_log_*            # 日志 ring buffer、脱敏、按天归档/清理
+        ├── test_logs_routes.py   # SSE 事件/心跳/订阅上限与 /logs/export 单日/跨天/鉴权
         └── test_signature_cache.py # thoughtSignature 缓存复用/持久化/淘汰
 ```
 

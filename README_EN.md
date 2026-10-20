@@ -236,6 +236,7 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | Dump request/response exchanges to individual disk files |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | Target directory for dumped exchange files |
+| `AISTUDIO_LOG_DIR` | string | `data/logs/` | Daily archive directory (`aistudio-YYYYMMDD.log`, 7-day retention) |
 | `AISTUDIO_AUTO_SWITCH` | bool | `false` | Enable scheduled account rotation |
 | `AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS` | float | `3.0` | Rotation interval in hours (minimum `0.1`) |
 | `AISTUDIO_KEEPALIVE_AUTH_UPDATE` | bool | `true` | Refresh Auth: write cookies/origins back to `auth.json` |
@@ -269,6 +270,8 @@ Operational endpoints (management auth required):
 - `GET /api/keepalive`: switches, intervals, next due times, latest refresh/auth-update/rotation results, and chat/build in-flight counts.
 - `POST /api/keepalive/run`: manually run `metadata_refresh` / `auth_update` / `auto_switch` / `active_activity` for validation or troubleshooting; still subject to mutex and in-flight checks.
 - `PUT /config/features`: structured feature update with atomic persistence and hot reload, ready for the future WP7 UI.
+- `GET /logs/stream`: SSE log stream (`level`, `last_id` / `Last-Event-ID`; replays the newest 100 entries, 15s heartbeat, max 8 subscribers).
+- `GET /logs/export`: export the last 7 days of archives; `start`/`end` (ISO8601) or `days`; single day returns `.log`, multiple days return `.zip`.
 
 > Config dual-write: the local runtime config is the root `config.yaml` (git-ignored); the distributed default is `defaults/config.yaml` (tracked). Update both, and treat `defaults/config.yaml` as the committed source of truth.
 

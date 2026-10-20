@@ -7,6 +7,7 @@ variable or web configuration.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -15,6 +16,12 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+
+from aistudio_api.infrastructure.utils.log_broadcast import (
+    BroadcastHandler,
+    DailyLogFileHandler,
+    cleanup_old_logs,
+)
 
 _UNIFIED_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 _UNIFIED_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -54,6 +61,8 @@ class UnifiedFormatter(logging.Formatter):
 
 
 _root_handler: logging.Handler | None = None
+_broadcast_handler: BroadcastHandler | None = None
+_file_handler: DailyLogFileHandler | None = None
 _current_level: str = "INFO"
 _dump_requests_override: bool | None = None
 _dump_to_file_override: bool | None = None
@@ -234,7 +243,8 @@ def set_log_level(level: str | int) -> None:
     _current_level = level_name
 
     root = logging.getLogger()
-    root.setLevel(numeric_level)
+    # root 保持 DEBUG，让广播/归档 sink 捕获完整日志；stderr 仍按配置级别过滤。
+    root.setLevel(logging.DEBUG)
 
     aistudio_logger = logging.getLogger("aistudio")
     aistudio_logger.setLevel(numeric_level)
@@ -242,6 +252,10 @@ def set_log_level(level: str | int) -> None:
     # 同步更新已挂载的 handler 级别
     if _root_handler:
         _root_handler.setLevel(numeric_level)
+    if _broadcast_handler:
+        _broadcast_handler.setLevel(logging.DEBUG)
+    if _file_handler:
+        _file_handler.setLevel(logging.DEBUG)
 
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(logger_name).setLevel(numeric_level)
@@ -249,17 +263,28 @@ def set_log_level(level: str | int) -> None:
 
 def setup_logging(level: str | int = "INFO") -> None:
     """初始化全局日志系统并统一所有子系统的格式与输出。"""
-    global _root_handler
+    global _root_handler, _broadcast_handler, _file_handler
     formatter = UnifiedFormatter()
 
     if _root_handler is None:
         _root_handler = logging.StreamHandler(sys.stderr)
-        _root_handler.setFormatter(formatter)
-        root = logging.getLogger()
-        root.handlers.clear()
-        root.addHandler(_root_handler)
-    else:
-        _root_handler.setFormatter(formatter)
+    _root_handler.setFormatter(formatter)
+
+    if _broadcast_handler is None:
+        _broadcast_handler = BroadcastHandler()
+    if _file_handler is None:
+        _file_handler = DailyLogFileHandler()
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(_root_handler)
+    root.addHandler(_broadcast_handler)
+    root.addHandler(_file_handler)
+    root.setLevel(logging.DEBUG)
+
+    # 启动时清理超过 7 天的归档文件；跨天切换时由文件 handler 再次清理。
+    with contextlib.suppress(OSError):
+        cleanup_old_logs()
 
     # 将 uvicorn 的日志器也接入统一格式
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
