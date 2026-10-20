@@ -189,7 +189,7 @@ async def test_count_tokens_maps_upstream_total_and_skips_usage_stats(
         token_counter,
         "runtime_state",
         SimpleNamespace(
-            record_token_count=lambda model, api_format: recorded.append(
+            record_token_count=lambda model, api_format, **kwargs: recorded.append(
                 (model, api_format)
             )
         ),
@@ -307,8 +307,11 @@ def test_record_token_count_does_not_touch_generation_stats(monkeypatch):
     state.record_token_count(MODEL, "claude")
 
     stats = state.model_stats[MODEL]
-    assert stats.requests == 1
-    assert stats.formats == {"claude": 1}
+    assert stats.requests == 0
+    assert stats.count_requests == 1
+    assert stats.count_success == 1
+    assert stats.count_input_tokens == 0
+    assert stats.formats["claude"].count_requests == 1
     assert stats.success == 0
     assert stats.errors == 0
     assert stats.prompt_tokens == 0

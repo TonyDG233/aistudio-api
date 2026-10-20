@@ -151,6 +151,7 @@ async def handle_attempt_exception(
     routing: RoutingPipeline | None = None,
     route_ctx: RouteContext | None = None,
     lease=None,
+    record_stats: bool = True,
 ) -> bool:
     """Handle per-attempt error classification and account switching.
 
@@ -244,7 +245,13 @@ async def handle_attempt_exception(
         ) from exc
 
     if isinstance(exc, UsageLimitExceeded):
-        runtime_state.record(target_model, "rate_limited", api_format=api_format)
+        if record_stats:
+            runtime_state.record(
+                target_model,
+                "rate_limited",
+                api_format=api_format,
+                surface=surface,
+            )
         record_rotator_event(
             "rate_limited",
             model=target_model,
@@ -353,7 +360,13 @@ async def handle_attempt_exception(
         ) from exc
 
     if isinstance(exc, AistudioError):
-        runtime_state.record(target_model, "errors", api_format=api_format)
+        if record_stats:
+            runtime_state.record(
+                target_model,
+                "errors",
+                api_format=api_format,
+                surface=surface,
+            )
         record_rotator_event(
             "error", model=target_model, surface=surface, account_id=failed_id
         )
@@ -362,7 +375,13 @@ async def handle_attempt_exception(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
-    runtime_state.record(target_model, "errors", api_format=api_format)
+    if record_stats:
+        runtime_state.record(
+            target_model,
+            "errors",
+            api_format=api_format,
+            surface=surface,
+        )
     record_rotator_event(
         "error", model=target_model, surface=surface, account_id=failed_id
     )

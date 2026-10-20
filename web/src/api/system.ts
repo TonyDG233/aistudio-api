@@ -1,6 +1,8 @@
 import { request } from './client.ts'
 import type {
   StatsResponse,
+  StatsTimeseriesResponse,
+  StatsRangeKey,
   RotationStatusResponse,
   ClearCooldownRequest,
   SystemConfig,
@@ -20,6 +22,26 @@ export interface SurfacePageState {
   last_error?: string
 }
 
+export interface SurfaceContext {
+  account_id?: string | null
+  surface?: string | null
+  chat_ready?: boolean
+  build_ready?: boolean
+  state?: string | null
+  in_flight?: number
+}
+
+export interface SurfaceInstancesRaw extends Partial<SurfaceInstancesResponse> {
+  pages?: { chat?: number; build?: number }
+  control_session?: { alive?: boolean; url?: string | null; account_id?: string | null }
+  budgets?: {
+    global_max_pages?: number | null
+    pages?: { chat?: number; build?: number }
+    [key: string]: unknown
+  }
+  context_count?: number
+}
+
 export interface SurfaceInstancesResponse {
   active_account: {
     id: string
@@ -34,6 +56,9 @@ export interface SurfaceInstancesResponse {
   group: string | null
   max_page_instances: number | null
   effective_max: number | null
+  contexts?: SurfaceContext[]
+  budgets?: Record<string, unknown>
+  planned_instances?: number
 }
 
 
@@ -42,16 +67,61 @@ export const systemApi = {
     return request<HealthCheckResponse>('/health')
   },
 
-  getStats(): Promise<StatsResponse> {
-    return request<StatsResponse>('/stats')
+  getStats(
+    params: { range?: StatsRangeKey; start?: string; end?: string } = {},
+  ): Promise<StatsResponse> {
+    const query = new URLSearchParams()
+    if (params.range) query.set('range', params.range)
+    if (params.start) query.set('start', params.start)
+    if (params.end) query.set('end', params.end)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<StatsResponse>(`/api/stats${suffix}`)
+  },
+
+  getStatsTimeseries(
+    params: { range?: StatsRangeKey; start?: string; end?: string } = {},
+  ): Promise<StatsTimeseriesResponse> {
+    const query = new URLSearchParams()
+    if (params.range) query.set('range', params.range)
+    if (params.start) query.set('start', params.start)
+    if (params.end) query.set('end', params.end)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<StatsTimeseriesResponse>(`/api/stats/timeseries${suffix}`)
   },
 
   getRotation(): Promise<RotationStatusResponse> {
     return request<RotationStatusResponse>('/rotation')
   },
 
-  getSurfaceInstances(): Promise<SurfaceInstancesResponse> {
-    return request<SurfaceInstancesResponse>('/surface/instances')
+  async getSurfaceInstances(): Promise<SurfaceInstancesResponse> {
+    const raw = await request<SurfaceInstancesRaw>('/surface/instances')
+    const chatPages = raw.pages?.chat ?? 0
+    const buildPages = raw.pages?.build ?? 0
+    const maxPages = raw.budgets?.global_max_pages ?? null
+    const activeId = raw.active_account?.id ?? null
+    return {
+      ...raw,
+      active_account: raw.active_account ?? null,
+      chat_page: raw.chat_page ?? {
+        alive: raw.control_session?.alive ?? chatPages > 0,
+        ready: chatPages > 0,
+        url: raw.control_session?.url ?? null,
+        account_id: raw.control_session?.account_id ?? activeId,
+      },
+      build_page: raw.build_page ?? {
+        alive: buildPages > 0,
+        ready: buildPages > 0,
+        account_id: activeId,
+      },
+      live_instances: raw.live_instances ?? 0,
+      retiring_contexts: raw.retiring_contexts ?? 0,
+      group: raw.group ?? null,
+      max_page_instances: raw.max_page_instances ?? maxPages,
+      effective_max: raw.effective_max ?? maxPages,
+      contexts: raw.contexts ?? [],
+      budgets: raw.budgets,
+      planned_instances: raw.planned_instances ?? 0,
+    }
   },
 
   clearCooldown(req: ClearCooldownRequest = {}): Promise<{ ok: boolean; accounts: Record<string, unknown> }> {

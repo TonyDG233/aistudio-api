@@ -379,7 +379,7 @@ async def test_runtime_state_record_model_stats():
     )
     state.record("models/gemini-3.8-flash", "rate_limited")
 
-    item = state.model_stats["models/gemini-3.8-flash"]
+    item = state.model_stats["gemini-3.8-flash"]
     assert item.requests == 3
     assert item.errors == 1
     assert item.success == 1

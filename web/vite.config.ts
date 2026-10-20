@@ -16,7 +16,6 @@ export default defineConfig({
     proxy: {
       '/api': 'http://localhost:8080',
       '/auth': 'http://localhost:8080',
-      '/stats': 'http://localhost:8080',
       '/accounts': 'http://localhost:8080',
       '/rotation': 'http://localhost:8080',
       '/config': 'http://localhost:8080',
