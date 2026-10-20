@@ -261,14 +261,31 @@
 
 **保留复用**：渠道注册表、组 `allowed_surfaces`、账号级 `AccountMeta.routing`、失败链/切换预算/熔断、borrow、槽位计划数、`/surface/instances` 快照。
 
-### WP6 统计整合（M）
-**以本仓库现有统计为底座增量扩维**（不引入第二套存储）：
+### WP6 统计整合与独立统计页（M）
+**核心目的**：让用户和 coding agent 能从反代侧看到**真实 token 消耗**，用于判断上下文用量、成本与配额，而不是只看请求数或猜测字符数。统计页是独立页面，不是现有 Dashboard 的几列增量。
+
+**后端统计底座**（不引入第二套存储）：
 - `api/state.py`：`ModelStatsItem` 增 `surface` 维度拆分或并列字段；新增 `atg`（syntheticHit 等）与 `refresh`（成功/过期/upstream_error 计数）统计组；
+- token 维度必须补齐：`prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cache_read_tokens`、`cache_write_tokens`、`total_tokens`，以及派生 `cache_hit_rate`；
+- 计数请求单独统计：`count_requests`、`count_input_tokens`，**不得并入生成 token 总量**；
+- 模型名归一（去掉 `models/` 前缀），避免同一模型拆成多行；
 - `AccountRotator.get_all_stats`（`account_rotator.py:433-481`）已含模型级配额视图——增补 `tier`、`surface_cooldowns`；
 - 端点：`/stats`、`/rotation` 增字段；账号行增 tier/expired。
-- Web UI（最小增量）：`DashboardView.vue`（surface 拆分与 ATG 命中率）、`AccountRow.vue`（tier 徽章）、`ModelQuotaGrid.vue`（surface 维度）。
 - 可选吸收 Ark UsageStats 的记录级 JSONL 明细（序列号、耗时、尝试链）作为高级面板数据源——**列为二期**，首期只做聚合字段。
-- **验收**：一次 free 请求在 Dashboard 可见 surface=build 与 ATG 命中；一次 pro 请求可见 surface=chat。
+
+**独立统计页（新页面，无既有设计稿）**：
+- 页面目标：一屏回答“我用了多少、花在哪、趋势如何、缓存命中如何、哪些模型/格式/面在消耗”；
+- 必备展示：总 token 卡片（输入/输出/推理/缓存读/缓存写/总 tokens）、缓存命中率、按模型表（可展开格式/面拆分）、时间范围切换、趋势图、计数请求单独区块；
+- 数据口径必须与 `/stats` 一致，并明确“生成用量”和“计数查询用量”是两类数据；
+- 响应式：桌面/平板/手机三档；空状态、加载态、错误态、无权限态必须有设计；
+- **设计门禁（硬性）**：接任 agent 必须先提交设计稿（线框 + 视觉规格 + 数据映射 + API 契约 + 截图验证计划），经用户确认后才能写 UI 代码；未确认前不得直接改 `web/`；
+- **视觉验证（硬性）**：WP6/WP7 的所有 UI 验收必须用浏览器工具（Playwright/agent-browser）打开实际页面并截图，对照设计稿检查桌面/平板/手机；**禁止只读 Vue 源码就宣称“已实现/没问题”**；截图证据入库。
+
+**验收**：
+- 一次 free 请求在统计页可见 surface=build 与 ATG 命中；一次 pro 请求可见 surface=chat；
+- 一次生成请求后，输入/输出/推理/缓存字段与上游 usage 一致；
+- 一次 count_tokens 后，`count_requests` 增加而生成 token 总量不变；
+- 独立统计页在三种视口下有截图证据，且与设计稿一致。
 
 ### WP7 部署 / UI 统一修改 / 文档 / 致谢（S）
 - **UI 归口**：本项目所有前端与使用体验修改（P1/P2/P3/P5、槽位表/策略组/渠道注册表/日志页等）**统一在本阶段执行**；其余阶段只做后端，用测试脚本调特定渠道验收，前后端不混做。
@@ -287,7 +304,7 @@
 - **架构**：新增 `api/routes_openai.py`、`api/routes_claude.py` + `application/format_converters/`（Python 平移 Ark `FormatConverter` 模块族：ChatCompletionsConverter、ClaudeRequest/ResponseConverter、Responses 三件套、CommonConverter）。内部一律归一到 `NormalizedGeminiRequest`，响应在**格式边界**做逆变换；原生 `/v1beta` 路由完全不动。**（P0 前置 E6 结论：chat 面转换到内部归一模型；build 面直连本就是 REST 语义，可保持 REST dict 边界，避免无谓二次映射——两边界互不污染。）**
 - **移植基准（Ark 源）**：`src/core/FormatConverter/*`（Chat/Claude/Responses/Common 各模块）；行为验收以 Ark 现状为准（流式增量形状、工具调用参数分片、思维链/思考块的丢弃或映射策略）。
 - **与 ATG 的啮合（关键）**：ATG 包装/解包按**客户端格式**分别在 6+2 个边界生效——OpenAI 流/非流、Claude 流/非流、Responses 流/非流、Gemini 原生两处；`atgModeByFormat`（gemini/openai/claude）在此真正启用（见 WP2）。
-- **开关**：`features.formats.openai` / `features.formats.claude`，默认 `true`（对齐 Ark `ProxyServerSystem.js:675-702` 的无条件端点注册）；保留开关作运维临时关闭。Responses API 首期不交付，`features.formats.responses` 不落地。API Key 复用现有 `api_keys` 机制。
+- **开关**：`features.formats.openai` / `features.formats.claude`，默认 `true`（对齐 Ark `ProxyServerSystem.js:675-702` 的无条件端点注册）；保留开关作运维临时关闭。Responses API 改由 WP11.1 交付，`features.formats.responses` 随该阶段落地。API Key 复用现有 `api_keys` 机制。
 - **thoughtSignature 兼容**：真实签名优先（响应侧按 tool call id 缓存、持久化、可多轮复用）；缓存缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`，不报错、不降级为正文；Claude thinking 回放不信任外部签名。
 - **统计**：请求记录增 `api_format` 维度（并入 WP6 `formatBreakdown`）。
 - **约束**：错误消息具体化（字段路径/收到值/处置建议）；零静默回落；不引入第二套上游传输。
@@ -310,26 +327,34 @@
 - **配置双写**：本地根 `config.yaml` 是运行时实际配置、**不被 git 追踪**；分发默认配置是 `defaults/config.yaml`（tracked）。任何 features 变更必须两处同步；提交/证据以 `defaults/config.yaml` 为准，根配置仅用于本机验证。
 - **验收（真机、最小额度）**：两套保活分别可单独开关并生效；账号连续保持在线；刷新与切号有序/互斥；失败有明确日志；全关时零行为变化；参数可经后端接口读取/修改并即时生效。
 
-### WP11 真实 Token 计数（P4.6，M）
-> 目标：agent / 工具接入反代时，无论使用 Claude、OpenAI 还是后续 Responses，向反代请求 token 计数都必须拿到**上游真实计数**，不得用本地 `字符数/4` 之类的估算冒充精确值。
+### WP11 真实 Token 计数与 Responses 面（P4.6，拆两阶段两提交）
+> **核心目的**：反代接入主流 coding agent（Kilo Code / Cline / Roo / Claude Code / Codex CLI / LiteLLM / Gemini SDK）后，agent 页面、上下文总结/压缩工具、发送前预算判断都能拿到**真实 token 用量**。生成响应必须完整透出 usage（input/output/reasoning/cache）；显式调用 `count_tokens` / `input_tokens` 的客户端必须拿到上游真实计数。禁止本地 `字符数/4` 估算。
 
-- **范围**：
-  - Claude `POST /v1/messages/count_tokens`：请求归一 → Gemini `:countTokens` → 返回 `{"input_tokens": totalTokens}`。
-  - OpenAI Responses `POST /v1/responses/input_tokens`：待 Responses 面交付后同样接入；若 Responses 仍未交付，则只保留路由占位与显式 404。
-  - Gemini 原生 `:countTokens` 语义复用，不新建第二套上游传输。
-- **架构**：
-  - 扩展浏览器传输层，支持非生成型 `:countTokens` 请求（与 `generateContent`/`streamGenerateContent` 模板分离，避免污染生成模板与 ATG）。
-  - 新增 `application/token_counter.py` 作为唯一计数入口；格式层只负责请求/响应映射。
-  - 不做本地 tokenizer 估算；上游失败显式报错，按协议面返回 4xx/5xx。
-  - 计数请求不写模型调用统计的 token 用量，只记录请求次数与格式维度。
-- **依赖**：WP8（格式层与请求归一）、WP3（账号/transport）；UI 归 WP7，不在本阶段。
-- **约束**：纯后端；不改 `web/`；不破坏 WP10 保活；不新增未验证的估算路径。
-- **验收（真机）**：
-  - Claude 文本 / 工具 / 图片 / thinking 请求的 `count_tokens` 与上游 `totalTokens` 一致。
-  - Responses `input_tokens` 与上游一致（若交付）。
-  - 上游失败返回显式错误，不静默 fallback。
-  - Gemini 原生与 WP8 生成链路无回归。
-- **证据**：`docs/dev/evidence/wp11-<date>/`。
+**实现顺序（两个独立提交，先 Responses，后计数）**：
+
+#### WP11.1 提交一：OpenAI Responses 面 + usage 全量透出
+- `POST /v1/responses` 非流式与真流式；请求 `input/instructions/tools/tool_choice/max_output_tokens/reasoning/text` 归一化到现有 Gemini 链路；
+- 响应对象 `response` + `output[]`（message/function_call/reasoning）；
+- SSE：`response.created/in_progress/output_item.added/content_part.added/output_text.delta/done/function_call_arguments.delta/done/completed`；
+- usage 必须透出：`input_tokens`、`input_tokens_details.cached_tokens`、`output_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`；
+- 同时校准 Chat Completions / Claude / Gemini 的 cache 与 reasoning 映射，保证 Kilo Code / Codex / Cline 这类**从响应 usage 取上下文**的客户端显示真实值；
+- 本提交不包含 preflight 计数端点（`/v1/responses/input_tokens` 仍显式 404 或后续接入）。
+- **ATG per-format 已知缺口（记号，不在本提交修）**：现有 `_ATG_FORMATS` 仍为 `gemini/openai/claude`（`model_defaults.py:551`），`features.atg.mode_by_format` 归一化也只覆盖这三项；Responses 目前只能继承全局 `features.atg.mode`，不能单独设置 `mode_by_format.responses`。后续需扩展 `_ATG_FORMATS`、`_FEATURES_DEFAULTS.atg.mode_by_format` 与 `defaults/config.yaml`，并补对应单测；在此之前 Responses 的 ATG 行为按全局模式处理，必须在证据中注明。
+
+#### WP11.2 提交二：真实上游 token 计数补齐
+- Claude `POST /v1/messages/count_tokens`：完整请求归一（system/tools/images/thinking 历史）→ 上游真实计数 → `{"input_tokens": totalTokens}`；
+- Gemini 原生 `:countTokens`：完整 `generateContentRequest`（含 systemInstruction/tools），不是只发 contents；
+- OpenAI Responses `POST /v1/responses/input_tokens`：完整 input/tools/instructions → `{"input_tokens": totalTokens}`；
+- 复用现有账号/transport/实例池；计数请求不改变生成模板、不捕获快照、不应用 ATG；
+- 计数统计单独记 `count_requests` / `count_input_tokens`，不写生成 token usage；
+- 上游失败显式 4xx/5xx，禁止静默 fallback/0/估算；
+- **验收**：Claude 文本/工具/图片/thinking、Responses input_tokens、Gemini system/tools 均与上游一致；429 换号时计数请求可切换；生成链路无回归。
+- **实现口径（2026-10-20）**：MakerSuite `CountTokens` RPC 只接受 `[model, contents]`，因此把 system/tools/conversation/图片打包成合成 contents 后计数；JSON 紧凑化并去 null。生产代码不读取任何 API key。与 REST `:countTokens` 精确值对照：短文本 +7 tokens，system+tools +8.59%，图片+system+tools +2.78%；对 agent 上下文长度可接受，但不宣称逐 token 精确。证据：`docs/dev/evidence/wp11-count-20261020/README.md`。
+- **精确路径备选（未启用）**：如后续提供具备 CountTokens 权限的 OAuth/API key，可切回 REST `generateContentRequest` 精确计数；当前不作为依赖。
+
+**依赖**：WP8（格式层与请求归一）、WP3（账号/transport）、WP5 v3（lease/换号）；UI 归 WP7，不在本阶段。
+**约束**：纯后端；不改 `web/`；不破坏 WP10 保活；不新增第二套上游传输。
+**证据**：`docs/dev/evidence/wp11-responses-<date>/`、`docs/dev/evidence/wp11-count-<date>/`。
 
 ---
 
@@ -344,8 +369,9 @@
 | P3.5 | WP10 | 账号保活双机制（旧定时切号 + 新自动刷新）闭环；纯后端，UI 不在本阶段 |
 | P4 | WP8 | OpenAI/Claude 双协议可用（流式/非流式/工具调用/用量）；ATG per-format 激活 |
 | P4.5 | WP5 v3 | 统一 Context 实例池（取消 default/realm 分立）；请求期派发前切换 + 实例切换方向；额度池/组约束/槽位/页面与环境预算/borrow/失败链/渠道注册表/账号覆盖；模型列表规范前缀；UI 不在本阶段 |
-| P4.6 | WP11 | 真实上游 token 计数（Claude `count_tokens`、Responses `input_tokens`）；禁止本地估算；纯后端 |
-| P5 | WP6 + WP7 | 统计（后端，含 formatBreakdown）+ WP7（UI 统一修改）/文档/质量门全绿/致谢入库 |
+| P4.6a | WP11.1 | OpenAI Responses 面（流式/非流式/工具/usage 明细）+ 全格式 cache/reasoning 透出；提交一 |
+| P4.6b | WP11.2 | 真实上游 token 计数（Claude count_tokens、Gemini system/tools、Responses input_tokens）；计数统计独立；提交二 |
+| P5 | WP6 + WP7 | 独立统计页设计稿确认 → 后端统计扩维（token/cache/reasoning/format/surface）→ UI 实现 → 浏览器截图视觉验收；文档/质量门/致谢入库 |
 
 ---
 

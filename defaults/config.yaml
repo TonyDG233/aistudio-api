@@ -63,12 +63,13 @@ features:
   # OpenAI / Claude 协议面 (WP8)。默认开启（对齐 Ark 无条件端点注册）；
 # 仍保留开关用于运维临时关闭。
   # openai: 控制 /v1/chat/completions 与 /v1/models。
-  # claude: 控制 /v1/messages（count_tokens 仍显式 404，不伪造估算）。
+  # claude: 控制 /v1/messages 与 /v1/messages/count_tokens（上游真实计数）。
   # media.allow_private_urls: 允许代理下载私网/回环图片 URL；默认 false 防 SSRF。
   # --------------------------------------------------------------------------
   formats:
     openai: true
     claude: true
+    responses: true
     media:
       allow_private_urls: false
 
