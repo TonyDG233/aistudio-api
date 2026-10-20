@@ -49,7 +49,7 @@ TIER_BY_CODE: dict[int, str] = {1: "pro", 2: "ultra", 3: "plus"}
 # 与 Ark 同款的公网 AI Studio web API key（可用 MAKERSUITE_WEB_API_KEY 覆盖）。
 DEFAULT_WEB_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
 # Ark ConfigLoader 默认 app id，用于 apps 页取 HTML（邮箱回填 / key 回收）。
-DEFAULT_APP_ID = "56128c84-c8e6-4d52-bf94-934c836720d9"
+DEFAULT_APP_ID = "3b85b4ed-f945-422c-ba25-395d1feef528"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 

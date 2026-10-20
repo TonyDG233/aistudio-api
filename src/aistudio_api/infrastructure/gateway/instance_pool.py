@@ -25,6 +25,8 @@ from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
 from aistudio_api.infrastructure.utils.logger import get_logger
 
+BUILD_CHANNEL_READY_TIMEOUT_S = 60.0
+
 if TYPE_CHECKING:
     from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
 
@@ -276,18 +278,24 @@ class InstancePool:
         raw = channels.get(channel)
         spec = raw if isinstance(raw, dict) else {}
         try:
-            return max(0, int(spec.get("max_pages", 1)))
+            configured = max(0, int(spec.get("max_pages", 1)))
         except (TypeError, ValueError):
-            return 1
+            configured = 1
+        if channel in ("chat", "build"):
+            # Every simultaneously logged-in account needs one page for the
+            # channel; page budgets are internal memory guards, not a user cap.
+            return max(configured, self._max_contexts())
+        return configured
 
     def _global_max_pages(self) -> int:
         features = self._features()
         raw = features.get("routing")
         routing = raw if isinstance(raw, dict) else {}
         try:
-            return max(1, int(routing.get("global_max_pages", 2)))
+            configured = max(1, int(routing.get("global_max_pages", 2)))
         except (TypeError, ValueError):
-            return 2
+            configured = 2
+        return max(configured, self._max_contexts())
 
     def _check_page_budget_locked(
         self,
@@ -317,17 +325,9 @@ class InstancePool:
                 )
 
     def budget_snapshot(self) -> dict[str, object]:
-        features = self._features()
-        raw_channels = features.get("channels")
-        channels = raw_channels if isinstance(raw_channels, dict) else {}
         channel_limits: dict[str, int] = {}
         for channel in ("chat", "build", "official"):
-            raw = channels.get(channel)
-            spec = raw if isinstance(raw, dict) else {}
-            try:
-                channel_limits[channel] = max(0, int(spec.get("max_pages", 0)))
-            except (TypeError, ValueError):
-                channel_limits[channel] = 0
+            channel_limits[channel] = self._channel_max_pages(channel)
         return {
             "global_max_pages": self._global_max_pages(),
             "channel_max_pages": channel_limits,
@@ -533,6 +533,65 @@ class InstancePool:
             slot.pending_pages = 0
             self._condition.notify_all()
         return slot
+
+    async def check_create_budget(
+        self,
+        channel: str,
+        *,
+        group_name: str | None = None,
+        group_max_pages: int | None = None,
+    ) -> None:
+        """Preflight an explicit instance creation without allocating anything."""
+        async with self._condition:
+            if len(self._slots) >= self._max_contexts():
+                raise InstanceCapacityError(
+                    f"instance capacity exhausted: live={len(self._slots)} "
+                    f"limit={self._max_contexts()}"
+                )
+            self._check_page_budget_locked(
+                channel=channel,
+                group_name=group_name,
+                group_max_pages=group_max_pages,
+            )
+
+    async def ensure_channel(self, slot_id: str, channel: str) -> None:
+        """Activate an additional channel page on an existing explicit instance."""
+        surface = "build" if channel == "build" else "chat"
+        async with self._condition:
+            slot = self._slots.get(slot_id)
+            if slot is None:
+                raise InstanceCapacityError(f"slot missing: {slot_id}")
+            if slot.state is SlotState.RETIRING:
+                raise InstanceCapacityError(f"slot retiring: {slot_id}")
+            if surface == "chat" and slot.chat_ready():
+                return
+            if surface == "build" and slot.build_ready():
+                return
+            self._check_page_budget_locked(
+                channel=surface,
+                group_name=slot.group_name or None,
+                group_max_pages=None,
+            )
+            slot.pending_pages = max(1, slot.pending_pages + 1)
+        try:
+            if surface == "build":
+                await asyncio.wait_for(
+                    self._ensure_surface(slot, "build"),
+                    timeout=BUILD_CHANNEL_READY_TIMEOUT_S,
+                )
+        except TimeoutError as exc:
+            async with self._condition:
+                slot.pending_pages = max(0, slot.pending_pages - 1)
+            raise InstanceCapacityError(
+                f"渠道启动超时（{BUILD_CHANNEL_READY_TIMEOUT_S:.0f}s）"
+            ) from exc
+        except BaseException:
+            async with self._condition:
+                slot.pending_pages = max(0, slot.pending_pages - 1)
+            raise
+        async with self._condition:
+            slot.pending_pages = max(0, slot.pending_pages - 1)
+            self._condition.notify_all()
 
     async def close_instance(self, slot_id: str) -> None:
         """Close one explicit instance; refuse while it still has requests."""

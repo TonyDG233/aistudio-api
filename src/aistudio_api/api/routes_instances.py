@@ -30,15 +30,21 @@ class InstanceResponse(BaseModel):
 class InstanceListResponse(BaseModel):
     max_instances: int
     latest_instance_id: str | None
+    current_instance_id: str | None
     instances: list[InstanceResponse]
 
 
 class CreateInstanceRequest(BaseModel):
     account_id: str = Field(min_length=1)
+    channel: str | None = None
 
 
 class ReassignInstanceRequest(BaseModel):
     account_id: str = Field(min_length=1)
+
+
+class SwitchInstanceRequest(BaseModel):
+    channel: str | None = None
 
 
 def to_instance_response(instance: Instance) -> InstanceResponse:
@@ -70,6 +76,7 @@ async def list_instances(
     return InstanceListResponse(
         max_instances=result.max_instances,
         latest_instance_id=result.latest_instance_id,
+        current_instance_id=result.current_instance_id,
         instances=[to_instance_response(item) for item in result.instances],
     )
 
@@ -79,7 +86,7 @@ async def create_instance(
     payload: CreateInstanceRequest,
     manager: InstanceManager = Depends(get_instance_manager),
 ) -> InstanceResponse:
-    instance = await manager.create(payload.account_id)
+    instance = await manager.create(payload.account_id, payload.channel)
     return to_instance_response(instance)
 
 
@@ -89,6 +96,18 @@ async def close_instance(
     manager: InstanceManager = Depends(get_instance_manager),
 ) -> InstanceResponse:
     instance = await manager.close(instance_id)
+    return to_instance_response(instance)
+
+
+@router.post("/{instance_id}/switch", response_model=InstanceResponse)
+async def switch_instance(
+    instance_id: str,
+    payload: SwitchInstanceRequest | None = None,
+    manager: InstanceManager = Depends(get_instance_manager),
+) -> InstanceResponse:
+    instance = await manager.switch_to(
+        instance_id, payload.channel if payload is not None else None
+    )
     return to_instance_response(instance)
 
 

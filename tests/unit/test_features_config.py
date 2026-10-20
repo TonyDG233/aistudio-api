@@ -174,6 +174,31 @@ features:
     assert features["fallback"]["on_quota"] is False
 
 
+def test_features_config_treats_yaml_off_as_off_for_atg_formats(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+features:
+  atg:
+    mode: false
+    mode_by_format:
+      gemini: false
+      openai: off
+      claude: inherit
+      responses: required
+""",
+        encoding="utf-8",
+    )
+    features = _features(config_path)
+    assert features["atg"]["mode"] == "off"
+    assert features["atg"]["mode_by_format"] == {
+        "gemini": "off",
+        "openai": "off",
+        "claude": "inherit",
+        "responses": "required",
+    }
+
+
 def test_features_config_normalizes_invalid_values(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

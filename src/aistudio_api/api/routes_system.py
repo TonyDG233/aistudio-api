@@ -33,6 +33,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     invalidate_config_cache,
     update_configured_features,
 )
+from aistudio_api.infrastructure.system_resources import sample_process_resources
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("routes.system")
@@ -305,6 +306,20 @@ async def get_rotation_accounts(
         raise HTTPException(503, detail="调度器未初始化")
 
     return rotator.get_all_stats()
+
+
+@protected_router.get("/system/resources")
+async def get_system_resources(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, float | bool | int | None]:
+    resources = sample_process_resources()
+    manager = runtime_state.instance_manager
+    instances = 0
+    if manager is not None:
+        result = await manager.list_instances()
+        instances = sum(1 for item in result.instances if item.state.value == "active")
+    resources["instances"] = instances
+    return resources
 
 
 @protected_router.get("/surface/instances")

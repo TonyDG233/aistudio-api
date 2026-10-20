@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 from typing import Any, cast
 
-from aistudio_api.application.atg.config import AtgConfig, load_atg_config
+from aistudio_api.application.atg.config import (
+    AtgConfig,
+    load_atg_config,
+    resolve_atg_mode,
+)
 from aistudio_api.application.atg.model_filter import create_model_filter
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_features_config,
@@ -48,6 +52,53 @@ def test_enabled_derived_from_mode():
     assert load_atg_config({"mode": "prefer"}).enabled is True
     assert load_atg_config({"mode": "required"}).enabled is True
     assert load_atg_config({"mode": "off"}).enabled is False
+
+
+def test_resolve_atg_mode_by_format(monkeypatch):
+    features = {
+        "atg": {
+            "mode": "prefer",
+            "mode_by_format": {
+                "gemini": "off",
+                "openai": "inherit",
+                "claude": "required",
+                "responses": "bogus",
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "aistudio_api.application.atg.config.get_features_config",
+        lambda: features,
+    )
+    assert resolve_atg_mode("gemini") == "off"
+    assert resolve_atg_mode("openai") == "prefer"
+    assert resolve_atg_mode("claude") == "required"
+    assert resolve_atg_mode("responses") == "prefer"
+
+
+def test_resolve_atg_mode_global_fallback(monkeypatch):
+    features = {"atg": {"mode": "required"}}
+    monkeypatch.setattr(
+        "aistudio_api.application.atg.config.get_features_config",
+        lambda: features,
+    )
+    assert resolve_atg_mode("gemini") == "required"
+
+
+def test_create_atg_uses_format_mode_for_gemini(monkeypatch):
+    from aistudio_api.application.generation_service import _create_atg
+
+    features = {
+        "atg": {
+            "mode": "off",
+            "mode_by_format": {"gemini": "prefer"},
+        }
+    }
+    monkeypatch.setattr(
+        "aistudio_api.application.atg.config.get_features_config",
+        lambda: features,
+    )
+    assert _create_atg("gemini", None).cfg.mode == "prefer"
 
 
 # ========== Normalization / clamping semantics (aligned with Ark config.js) ==========

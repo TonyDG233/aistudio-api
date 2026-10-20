@@ -172,3 +172,21 @@ async def test_rotation_status_and_clear_cooldown():
         )
         assert resp_clear.status_code == 200
         mock_rotator.clear_cooldown.assert_called_once_with("acc_1", model=None)
+
+
+@pytest.mark.asyncio
+async def test_system_resources_endpoint(monkeypatch):
+    from aistudio_api.api.state import runtime_state
+
+    previous = runtime_state.instance_manager
+    runtime_state.instance_manager = None
+    try:
+        async with _client() as client:
+            resp = await client.get("/system/resources")
+    finally:
+        runtime_state.instance_manager = previous
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert "cpu_percent" in payload
+    assert "memory_mb" in payload
+    assert "instances" in payload
