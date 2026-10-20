@@ -1,11 +1,17 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import type { AccountWithStats } from '@/types/accounts.ts'
+import type { AccountRouting, AccountWithStats } from '@/types/accounts.ts'
+import type { FeatureSlotRow } from '@/types/system.ts'
+import type { SurfaceContext } from '@/api/system.ts'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
 import ModelQuotaGrid from './ModelQuotaGrid.vue'
+import AccountChannelMatrix from './AccountChannelMatrix.vue'
+import SlotBindPopover from './SlotBindPopover.vue'
+import { channelLabel, slotsForAccount, type ChannelOption } from './accountModes.ts'
 import {
   CheckCircle2,
+  ChevronDown,
   Clock,
   Trash2,
   Edit2,
@@ -14,6 +20,7 @@ import {
   AlertCircle,
   RefreshCw,
   Mail,
+  Network,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
 
@@ -22,6 +29,13 @@ const props = defineProps<{
   active: boolean
   activating?: boolean
   forceExpanded?: boolean
+  multiMode?: boolean
+  contexts?: SurfaceContext[]
+  activeContextAccountId?: string | null
+  channels?: ChannelOption[]
+  slots?: FeatureSlotRow[]
+  routing?: AccountRouting | null
+  refreshState?: 'pending' | 'failed' | null
 }>()
 
 const emit = defineEmits<{
@@ -33,6 +47,7 @@ const emit = defineEmits<{
 }>()
 
 const modelsExpanded = ref(false)
+const matrixExpanded = ref(false)
 
 watch(
   () => props.forceExpanded,
@@ -56,6 +71,39 @@ const isExpired = computed(() =>
   Boolean(props.account.expired || props.account.session_expired),
 )
 const refreshing = computed(() => Boolean(accountsStore.refreshingIds[props.account.id]))
+
+const channelOptions = computed<ChannelOption[]>(() => props.channels || [])
+const slotRows = computed<FeatureSlotRow[]>(() => props.slots || [])
+const contextList = computed<SurfaceContext[]>(() => props.contexts || [])
+
+const accountSlots = computed(() => slotsForAccount(slotRows.value, props.account.id))
+
+const accountContexts = computed(() =>
+  contextList.value.filter((context) => context.account_id === props.account.id),
+)
+const isActiveContext = computed(
+  () => Boolean(props.activeContextAccountId && props.activeContextAccountId === props.account.id),
+)
+const mountedChat = computed(() =>
+  accountContexts.value.some((context) => Boolean(context.chat_ready)),
+)
+const mountedBuild = computed(() =>
+  accountContexts.value.some((context) => Boolean(context.build_ready)),
+)
+const hasMount = computed(() => mountedChat.value || mountedBuild.value)
+const inFlight = computed(() =>
+  accountContexts.value.reduce((sum, context) => sum + (context.in_flight || 0), 0),
+)
+const hit = computed(() => props.active || inFlight.value > 0)
+
+const allowedSurfaces = computed(() => {
+  const all = channelOptions.value.map((channel) => channel.surface)
+  const explicit = props.routing?.surfaces || []
+  return explicit.length ? all.filter((surface) => explicit.includes(surface)) : all
+})
+const qualified = computed(
+  () => Boolean(props.routing) && !isExpired.value && allowedSurfaces.value.length > 0,
+)
 
 function tierVariant(tier?: string | null): 'green' | 'red' | 'amber' | 'blue' | 'gray' {
   switch ((tier || '').toLowerCase()) {
@@ -96,8 +144,11 @@ async function handleRefresh() {
     ]"
   >
     <!-- Sub-Account Header Bar -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-      <div class="flex items-center gap-2.5 min-w-0">
+    <div
+      class="flex flex-col gap-2"
+      :class="multiMode ? '' : 'xl:flex-row xl:items-center xl:justify-between'"
+    >
+      <div class="flex items-center gap-2.5 min-w-0 flex-1">
         <!-- User Index Badge: u/0, u/1... -->
         <span
           class="px-2 py-0.5 rounded-full text-xs font-mono font-bold shrink-0"
@@ -113,7 +164,7 @@ async function handleRefresh() {
         </span>
 
         <!-- Account Name & Memo -->
-        <div class="truncate">
+        <div class="truncate min-w-0">
           <div class="flex items-center gap-1.5">
             <span class="font-semibold text-gray-900 text-xs truncate">
               {{ account.email || account.name || 'Google Account' }}
@@ -167,6 +218,24 @@ async function handleRefresh() {
           >
             {{ account.tier }}
           </Badge>
+          <Badge
+            v-if="refreshState === 'pending'"
+            variant="amber"
+            size="sm"
+            title="账号信息刷新进行中或尚未返回；tier 以刷新结果为准，可点击行内刷新图标重试"
+          >
+            待刷新
+          </Badge>
+          <button
+            v-else-if="refreshState === 'failed'"
+            type="button"
+            class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-full hover:bg-amber-100 transition-colors cursor-pointer"
+            title="tier 刷新失败，点击重试"
+            :disabled="refreshing"
+            @click="handleRefresh"
+          >
+            <span>tier — · 重试</span>
+          </button>
         </div>
 
         <!-- Status Pill -->
@@ -248,9 +317,10 @@ async function handleRefresh() {
             variant="secondary"
             size="sm"
             :loading="activating"
+            title="将该账号设为默认活跃账号"
             @click="emit('activate')"
           >
-            <span>激活</span>
+            <span>设为默认活跃</span>
           </Button>
 
           <button
@@ -295,6 +365,130 @@ async function handleRefresh() {
         </div>
       </div>
     </div>
+
+    <!-- Mode status: slot + three-state badges (multi) / mount line (single) -->
+    <div
+      v-if="multiMode"
+      class="mt-2.5 pt-2.5 border-t border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+    >
+      <div class="flex items-center gap-1.5 flex-wrap text-[11px] min-w-0">
+        <span
+          v-for="entry in accountSlots"
+          :key="`${entry.slot.account_id}-${entry.slot.channel}-${entry.index}`"
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border font-mono"
+          :class="entry.slot.enabled === false
+            ? 'bg-gray-100 text-gray-500 border-gray-200'
+            : 'bg-blue-50 text-blue-700 border-blue-200/70'"
+          :title="`槽位数组第 ${entry.index + 1} 行 · ${channelLabel(entry.slot.channel)}${entry.slot.note ? ` · ${entry.slot.note}` : ''}`"
+        >
+          <span>@槽{{ entry.index + 1 }}</span>
+          <span class="text-[10px] opacity-80">{{ channelLabel(entry.slot.channel) }}</span>
+          <span
+            v-if="entry.slot.enabled === false"
+            class="text-[10px]"
+          >停用</span>
+        </span>
+        <span
+          v-if="!accountSlots.length"
+          class="text-gray-400"
+        >未绑定槽位</span>
+
+        <span class="w-px h-3 bg-gray-200 mx-0.5 hidden sm:inline-block" />
+
+        <span
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
+          :class="qualified
+            ? 'bg-emerald-50 text-emerald-700 border-emerald-200/60'
+            : isExpired
+              ? 'bg-rose-50 text-rose-700 border-rose-200/60'
+              : 'bg-gray-100 text-gray-500 border-gray-200'"
+          title="账号级资格：未过期 + routing surfaces 允许该渠道 + 渠道 enabled；不含策略组运行时收窄。读取中或读取失败时显示 —。"
+        >
+          <span>资格</span>
+          <span class="font-semibold">{{ qualified ? '✓' : isExpired ? '过期' : '—' }}</span>
+        </span>
+
+        <span
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
+          :class="hasMount
+            ? 'bg-sky-50 text-sky-700 border-sky-200/60'
+            : 'bg-gray-100 text-gray-500 border-gray-200'"
+          title="挂载来自 Context 的 chat_ready/build_ready；未挂载不代表账号不可用。"
+        >
+          <span>挂载</span>
+          <span class="font-semibold">{{ hasMount ? '✓' : '—' }}</span>
+        </span>
+
+        <span
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
+          :class="hit
+            ? 'bg-brand-50 text-brand-700 border-brand-200/60'
+            : 'bg-gray-100 text-gray-500 border-gray-200'"
+          title="当前调度快照：该账号当前为活跃 Context，或该 Context 在途请求 > 0；不是策略组命中。"
+        >
+          <span>命中</span>
+          <span class="font-semibold">{{ hit ? `✓${inFlight > 0 ? ` 在途${inFlight}` : ''}` : '—' }}</span>
+        </span>
+      </div>
+
+      <div class="flex items-center gap-1.5 flex-wrap shrink-0">
+        <SlotBindPopover
+          :account="account"
+          :channels="channelOptions"
+          :slots="slotRows"
+        />
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border border-gray-200 bg-white text-gray-600 hover:text-gray-900 hover:bg-gray-50 transition-colors cursor-pointer"
+          :aria-expanded="matrixExpanded"
+          title="展开账号 × 渠道矩阵：逐格开关 routing surfaces"
+          @click="matrixExpanded = !matrixExpanded"
+        >
+          <Network class="w-3.5 h-3.5" />
+          <span>渠道矩阵</span>
+          <ChevronDown
+            class="w-3 h-3 transition-transform"
+            :class="{ 'rotate-180': matrixExpanded }"
+          />
+        </button>
+      </div>
+    </div>
+
+    <div
+      v-else
+      class="mt-2 pt-2 border-t border-gray-100 text-[11px] flex items-center gap-1.5 flex-wrap"
+    >
+      <span class="text-gray-500">挂载：</span>
+      <template v-if="isActiveContext">
+        <span class="inline-flex items-center gap-1 text-gray-600">
+          PG 页
+          <span :class="mountedChat ? 'text-emerald-600 font-semibold' : 'text-gray-300 font-semibold'">
+            {{ mountedChat ? '✓' : '—' }}
+          </span>
+        </span>
+        <span class="text-gray-300">/</span>
+        <span class="inline-flex items-center gap-1 text-gray-600">
+          BUILD 页
+          <span :class="mountedBuild ? 'text-emerald-600 font-semibold' : 'text-gray-300 font-semibold'">
+            {{ mountedBuild ? '✓' : '—' }}
+          </span>
+        </span>
+      </template>
+      <span
+        v-else
+        class="text-gray-400"
+        title="仅当前活跃 Context 会持有页面；未挂载不代表账号不可用"
+      >—</span>
+    </div>
+
+    <AccountChannelMatrix
+      v-if="multiMode && matrixExpanded"
+      :account="account"
+      :channels="channelOptions"
+      :slots="slotRows"
+      :contexts="contextList"
+      :active="active"
+    />
 
     <!-- Level 3: Per-Model Independent Quota/Rate Limits -->
     <ModelQuotaGrid

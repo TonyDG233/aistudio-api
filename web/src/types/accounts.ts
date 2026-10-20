@@ -83,3 +83,9 @@ export interface RefreshAccountsResponse {
   refreshed_count: number
   expired_count: number
 }
+
+export interface AccountRouting {
+  surfaces: string[]
+  weight: number
+  model_surfaces: Record<string, string>
+}
