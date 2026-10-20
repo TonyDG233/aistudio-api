@@ -48,15 +48,15 @@
 | **OpenAI Chat Completions 兼容** | 提供 `/v1/chat/completions` 与 `/v1/models`，支持流式、工具调用、图片与 `reasoning_content`；默认开启 |
 | **OpenAI Responses 兼容** | 提供 `/v1/responses`，支持流式事件、工具调用、reasoning 与图片；usage 透出 input/output/reasoning/cache 明细；默认开启 |
 | **Anthropic Messages 兼容** | 提供 `/v1/messages` 与 `/v1/messages/count_tokens`，支持流式事件、工具调用、thinking、图片与真实上游计数 |
-| **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
+| **动态模型发现** | 自动向上游同步可用模型列表与 Paid/Pro-only 元数据，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型；快照持久化 + 启动预热，刷新失败回退上次快照 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
 | **账号双保活（WP10）** | 定时切号（长周期均衡 + 真实页面活动）与自动刷新 Auth（cookies/origins 回写 `auth.json`）并存；另有 24h tier/email/过期元数据刷新，三者独立开关 |
-| **运行状态持久化** | 模型调用量、Token 消耗统计 (`stats.json`) 以及账号 429 限额与冷却状态 (`rotator_state.json`) 自动落盘，容器/服务重启不丢失状态 |
+| **运行状态持久化** | Token 统计 v2 (`stats.json`：按模型/日聚合，client/attempt 两层计数，cache/reasoning/count_tokens 分离，保留 90 天日桶) 与账号 429 冷却 (`rotator_state.json`) 自动落盘，重启不丢状态 |
 | **下游参数容错与丢弃** | 支持配置 `drop_unsupported_params` 自动过滤下游传入的非标准安全分类（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）与不兼容工具，避免 400 阻断 |
 | **批量子账号探活** | 导入单个包含多个 Google 身份的 Cookie 后，自动递归探活子账号（`u/0`, `u/1`...）并分别建档 |
 | **内置搜索与工具** | 支持 Google Search 联网搜索、Google Maps、代码执行沙箱等官方扩展能力 |
 | **轻量 CDP 驱动** | 基于纯 Python 异步 WebSocket 直连 Chrome DevTools Protocol，无需 Node.js、Playwright 或 Selenium |
-| **Web 管理面板** | 提供 Web 管理控制台，支持账号管理（文本与 JSON 批量导入）、调用量监控、在线编辑与热重载 `config.yaml` |
+| **Web 管理面板** | 提供 Web 管理控制台，支持账号管理（文本与 JSON 批量导入）、独立用量统计页 `/stats`（Token/缓存/趋势/账号调度状态）、在线编辑与热重载 `config.yaml` |
 | **Android 伴侣端** | 配套 Android 原生应用（`android/`），采用 Jetpack Compose 构建，支持多 Profile 隔离登录、Bitwarden 自动填充与一键导出凭据包 |
 > [!NOTE]
 > **内存占用参考**：纯 Python 后端服务常驻内存约 35 - 45 MB；拉起单实例受控 Chromium 后总物理内存 (PSS) 约 350 - 450 MB（宿主 Linux 下约 250 - 350 MB）。Android Termux 环境建议空闲 RAM ≥ 1 GB。
@@ -219,7 +219,8 @@ docker compose up -d
 | `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://` 或 `socks5://` |
 | `AISTUDIO_DATA_DIR` | string | `data/` | 主数据持久化根目录（Docker 下为 `/app/data`） |
 | `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | 账号持久化凭据目录 |
-| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | 模型调用与 Token 使用量统计持久化文件 |
+| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | 模型调用与 Token 使用量统计持久化文件（schema v2） |
+| `AISTUDIO_MODEL_CACHE_FILE` | string | `data/models_cache.json` | 模型发现快照（含 Paid 元数据与 fetched_at），用于启动恢复和预热失败兜底 |
 | `AISTUDIO_ROTATOR_STATE_FILE` | string | `data/rotator_state.json` | 账号调度与 429 冷却状态持久化文件 |
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | 模型规则与默认工具配置文件路径 |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | 是否持久化模型调用与 Token 统计（1=开启，0=关闭） |
@@ -579,6 +580,7 @@ if response.function_calls:
 系统内置静态打包的 Web 前端管理控制台（访问 `http://localhost:8080`）：
 
 - **仪表盘 (Dashboard)**：实时展示服务健康状况、各模型请求量、成功率及 429 冷却指标。
+- **用量统计 (Stats, `/stats`)**：独立 Token 用量页，按时间/模型查看输入、输出、推理、缓存读写与命中率；区分客户端请求/上游尝试与 count_tokens 预检；展示账号当前调度状态与 Paid/Pro-only 标记。数据接口为 `GET /api/stats`、`GET /api/stats/timeseries`。
 - **账号管理 (Accounts)**：支持 Cookie 单条与凭据包批量导入、自动探测多账号、手动切换当前活跃账号或重置冷却状态。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
 - **访问鉴权**：设置环境变量 `AISTUDIO_WEB_PASSWORD` 后自动开启登录鉴权守卫。
