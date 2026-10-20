@@ -34,6 +34,7 @@ from .routes_gemini import router as gemini_router
 from .routes_keepalive import router as keepalive_router
 from .routes_models import router as models_router
 from .routes_openai import router as openai_router
+from .routes_responses import router as responses_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -169,6 +170,7 @@ app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(openai_router, dependencies=[Depends(require_api_key)])
+app.include_router(responses_router, dependencies=[Depends(require_api_key)])
 app.include_router(claude_router, dependencies=[Depends(require_api_key)])
 
 

@@ -26,7 +26,7 @@
 | P1 | 控制面板 `/` | DashboardView.vue |
 | P2 | 账号管理 `/accounts` | AccountsView.vue（P2-O1 账号行、P2-O2 激活按钮、P2-O3 Cookie 凭据组） |
 | P3 | 系统与模型配置 `/settings` | SettingsView.vue（P3-O1 运行与调度卡、P3-O2 功能开关卡、P3-O3 分组编排、P3-O4 Model Profiles） |
-| P4 | ~~实例与路由页~~ | **已撤回，不建**（避免双页同管一份配置） |
+| P4 | 统计页 `/stats`（新增） | 独立统计页；设计稿与验收要求见 `docs/dev/WP6-STATS-PAGE-DESIGN-BRIEF-20261020.md`（原“实例与路由页”仍不建，编号改用于统计页） |
 | P5 | 日志 `/logs`（新增） | 新建 LogsView.vue |
 
 ---
@@ -39,7 +39,28 @@
    - 右区上排＝`可用账号 x/y` ＋ `实例数（当前/计划）`（"计划"=槽位表行数；实况明细=点击展开 `/surface/instances` 数据，**"实时实例"视图归此处，不再放 P3**）；
    - 右区下排＝`总请求数`，**429 计数并入其下作子指标**。
 2. 错误/429 数字加 tooltip（分类：策略拒绝/冷启动/上游错误）。
-3. **P1-O2 快速调用示例**：顶部加**格式选项卡**（Gemini / OpenAI / Claude，随兼容接入启用），每个格式给对应示例。
+3. **实例数卡微调（2026-10-20 定）**：
+   - 卡面只保留大数字 `当前 / 计划`；下方用与「成功 98」一致的灰色小字（`text-xs text-gray-400`）列**计划值 > 0** 的渠道，格式 `chat 实际/计划 · build 实际/计划`；
+   - 计划为 0 的渠道不显示；全部为 0 时显示 `—` 或“无计划”，不显示 `0/0`；
+   - 渠道多时最多显示 2 个，其余折叠为 `+N`，hover/点击出 tooltip 或小浮层列全部；
+   - 超预算只让对应比值变琥珀色，不加整句警告；
+   - 卡右下提供很小的“详情”或 chevron，展开 `/surface/instances`；不整卡可点，避免误触。
+4. **P1-O2 快速调用示例**：顶部加**格式选项卡**，顺序：`Gemini 原生 / OpenAI Chat / OpenAI Responses / Claude Messages / Token 计数`。
+   - OpenAI Chat 与 OpenAI Responses 必须分开；Token 计数 tab 只放 `count_tokens` / `input_tokens` / `countTokens`；
+   - 每个 tab 给：完整 endpoint path、Base URL、鉴权头、curl + SDK 示例、复制按钮、适用客户端（Kilo Code / Codex CLI / Claude Code / SillyTavern / LiteLLM）；
+   - **地址必须用 `window.location.origin` 动态生成**，不写死 localhost；这样用户从 LAN IP 或反向代理域名打开控制台时，复制到酒馆的就是当前实际地址；
+   - 酒馆填法单独给一行灰色说明 + 可复制值：
+     - OpenAI Chat：Base URL `http://<origin>/v1`，完整端点 `/v1/chat/completions`
+     - OpenAI Responses：Base URL `http://<origin>/v1`，完整端点 `/v1/responses`
+     - Claude：Proxy/Base URL `http://<origin>`，完整端点 `/v1/messages`
+     - Gemini：Base URL `http://<origin>`，完整端点 `/v1beta/models/{model}:generateContent`
+   - 未启用的格式 tab 隐藏或置灰；不得展示不存在的端点；API key 只用占位符；
+   - 代码块高度按内容自适应，禁止桌面端出现大块空白；移动端代码块横向滚动，tab 独立横向滚动。
+5. **现有页面的硬约束（设计稿必须处理）**：
+   - 移动端模型统计表不得把表头/模型名拆成竖排多行；改为横向滚动或卡片化；
+   - 模型名统一去掉 `models/` 前缀，避免统计表出现同名两行；
+   - 激活账号长邮箱需要明确截断/换行/tooltip 规则。
+6. **Token 明细不在 P1 展开**：P1 只保留摘要或“查看统计”入口；token 用量明细归 WP6 独立统计页（见 `WP6-STATS-PAGE-DESIGN-BRIEF-20261020.md`）。
 
 ### P2 账号管理
 1. **P2-O3 "Cookie 凭据组"语义确认不变**：一个凭据文件=一个浏览器会话，可含多个 Google 账号（u/0、u/1…），故呈现"凭据组 → 子账号"结构；组级操作（导入时间/会话指纹/删除整组）保留。
@@ -55,6 +76,14 @@
 2. **"实时实例"块从 P3-O3 移出**（迁至 P1 实例数列，见 §2-P1）。
 3. P3 结构重组目标：基础区一眼干净、深度区按需展开。
 4. 既有文案修正随实施走（如 P3-O1「Build 直连总开关」描述与新路由语义对齐）。
+
+### P4 统计页（新增，占位与导引）
+1. **本文件只做占位与导引，不重复设计正文**；完整设计任务书见 `docs/dev/WP6-STATS-PAGE-DESIGN-BRIEF-20261020.md`。
+2. 独立页面 `/stats`，从 Sidebar 进入；不与 P1 控制面板合并。
+3. 范围：token 用量（输入/输出/推理/缓存读/缓存写/总量/命中率）、按模型/API 格式/surface 拆分、时间趋势、计数请求单独区块。
+4. **设计门禁**：接任 agent 必须先按上述 brief 提交设计稿（信息架构、三端线框、视觉规格、数据映射、API 契约、截图计划），经用户确认后才能写 UI 代码。
+5. **视觉验收**：用 Playwright/agent-browser 打开实际页面，桌面/平板/手机三档截图对照设计稿；禁止只读 Vue 源码宣称完成。
+6. 原 P4「实例与路由页」仍不建；实时实例视图继续归 P1。
 
 ### P5 日志（新增页面）
 1. `GET /logs/stream`（SSE）：级别过滤（debug/info/warn/error）、暂停/继续/清屏/下载 `.log`；后端从 logging 队列广播（不做文件 tail）。
@@ -175,7 +204,7 @@
 | 阶段 | 内容 |
 |---|---|
 | 阶段一（WP5 收尾可做） | `auto_switch` 保留并接线（语义见 §5.5）；"实时实例"块迁至 P1；错误计数 tooltip；P3 基础文案对齐（tooltip 遮挡修复=已完成） |
-| 阶段二（UI 主体，WP6 扩编） | P3 深度开关+结构重组；P1 布局重排+格式选项卡；P5 日志页；P2 挂载细标/徽章 |
+| 阶段二（UI 主体，WP6 扩编） | P3 深度开关+结构重组；P1 布局重排+格式选项卡；P4 统计页（先设计稿确认，再实现）；P5 日志页；P2 挂载细标/徽章 |
 | 阶段三（统一 Context 池集成后） | 槽位表/策略组/渠道注册表/路由安全全量上线；E4 矩阵；级别 B 兑现（§5.6） |
 
 ---

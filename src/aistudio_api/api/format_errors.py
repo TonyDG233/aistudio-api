@@ -13,7 +13,7 @@ from aistudio_api.application.format_converters import ConversionError
 from aistudio_api.application.surface_orchestrator import SurfacePolicyError
 from aistudio_api.application.upstream_errors import classify_gemini_error_payload
 
-ApiFormat = Literal["gemini", "openai", "claude"]
+ApiFormat = Literal["gemini", "openai", "claude", "responses"]
 
 _OPENAI_TYPE_BY_STATUS: dict[int, str] = {
     400: "invalid_request_error",
@@ -55,6 +55,8 @@ _GEMINI_STATUS_BY_HTTP: dict[int, str] = {
 
 
 def format_for_path(path: str) -> ApiFormat:
+    if path.startswith("/v1/responses"):
+        return "responses"
     if path.startswith("/v1/chat/completions") or path == "/v1/models":
         return "openai"
     if path.startswith("/v1/models/"):
@@ -122,7 +124,7 @@ def _validation_message(exc: RequestValidationError) -> str:
 
 
 def _type_for_status(status: int, api_format: ApiFormat) -> str:
-    if api_format == "openai":
+    if api_format in {"openai", "responses"}:
         return _OPENAI_TYPE_BY_STATUS.get(status, "api_error")
     if api_format == "claude":
         return _CLAUDE_TYPE_BY_STATUS.get(status, "api_error")
@@ -189,7 +191,7 @@ def format_error_response(
     api_format: ApiFormat,
 ) -> JSONResponse:
     status, error_type, message, param = classify_format_error(exc, api_format)
-    if api_format == "openai":
+    if api_format in {"openai", "responses"}:
         body = openai_error_body(status, message, error_type=error_type, param=param)
     elif api_format == "claude":
         body = claude_error_body(status, message, error_type=error_type)

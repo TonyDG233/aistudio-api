@@ -598,6 +598,7 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     "formats": {
         "openai": True,
         "claude": True,
+        "responses": True,
         "media": {"allow_private_urls": False},
     },
     # WP5 二期：渠道注册表。chat=pg/playground；official 仅注册（WP9 前不实现）。
@@ -1057,6 +1058,7 @@ def _normalize_features(
         "formats": {
             "openai": _coerce_feature_bool(formats.get("openai"), False),
             "claude": _coerce_feature_bool(formats.get("claude"), False),
+            "responses": _coerce_feature_bool(formats.get("responses"), False),
             "media": {
                 "allow_private_urls": _coerce_feature_bool(
                     media.get("allow_private_urls"), False
