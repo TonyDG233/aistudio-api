@@ -77,7 +77,7 @@ function fmt(value: number | null | undefined): string {
           @click="emit('goLogs', 'levels=warn,error&q=429')"
         >
           <AlertTriangle class="w-3 h-3" />
-          429 尝试 <b class="font-mono">{{ fmt(rateLimited) }}</b>
+          429 限额 <b class="font-mono">{{ fmt(rateLimited) }}</b>
         </button>
       </div>
       <button

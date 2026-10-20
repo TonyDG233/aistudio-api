@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { Account, RotationStatusResponse } from '@/types'
-import type { SurfaceContext } from '@/api/system.ts'
 import Badge from '@/components/ui/Badge.vue'
 import { formatDate } from '@/utils/format.ts'
 import { formatInt } from '@/utils/stats.ts'
@@ -9,8 +8,6 @@ import { formatInt } from '@/utils/stats.ts'
 const props = defineProps<{
   accounts: Account[]
   rotation: RotationStatusResponse | null
-  contexts: SurfaceContext[]
-  activeId: string
   paidModels: Set<string>
 }>()
 
@@ -24,8 +21,6 @@ interface AccountRow {
   rotation: Record<string, unknown>
   status: string
   statusClass: BadgeVariant
-  chatPages: number
-  buildPages: number
   anomalies: string[]
   modelChips: Array<{ label: string; count: number; paid: boolean; invalid: boolean }>
 }
@@ -52,9 +47,6 @@ const rows = computed<AccountRow[]>(() => {
     const rotation = (props.rotation?.accounts?.[account.id] || {}) as Record<string, unknown>
     const tier = (account.tier || '').toLowerCase()
     const isProTier = !!tier && tier !== 'free'
-    const contexts = props.contexts.filter((ctx) => ctx.account_id === account.id)
-    const chatPages = contexts.filter((ctx) => ctx.chat_ready).length
-    const buildPages = contexts.filter((ctx) => ctx.build_ready).length
     const rateLimited = Number(rotation.rate_limited || 0)
     const errors = Number(rotation.errors || 0)
     const authCooldown = Number(rotation.auth_cooldown || 0)
@@ -104,9 +96,6 @@ const rows = computed<AccountRow[]>(() => {
     } else if (!available) {
       status = '不可用'
       statusClass = 'red'
-    } else if (account.id === props.activeId) {
-      status = '当前'
-      statusClass = 'blue'
     }
 
     return {
@@ -114,8 +103,6 @@ const rows = computed<AccountRow[]>(() => {
       rotation,
       status,
       statusClass,
-      chatPages,
-      buildPages,
       anomalies,
       modelChips,
     }
@@ -184,12 +171,6 @@ const anomalyCount = computed(() => rows.value.filter((row) => row.anomalies.len
             <th class="px-3 py-3 text-left">
               状态
             </th>
-            <th class="px-3 py-3 text-center">
-              chat
-            </th>
-            <th class="px-3 py-3 text-center">
-              build
-            </th>
             <th class="px-3 py-3 text-right">
               429 / 错误
             </th>
@@ -224,13 +205,6 @@ const anomalyCount = computed(() => rows.value.filter((row) => row.anomalies.len
                   </div>
                 </div>
                 <Badge
-                  v-if="row.account.id === activeId"
-                  variant="blue"
-                  size="sm"
-                >
-                  当前
-                </Badge>
-                <Badge
                   v-if="row.account.tier"
                   :variant="row.account.tier.toLowerCase() === 'free' ? 'gray' : 'green'"
                   size="sm"
@@ -246,12 +220,6 @@ const anomalyCount = computed(() => rows.value.filter((row) => row.anomalies.len
               >
                 {{ row.status }}
               </Badge>
-            </td>
-            <td class="px-3 py-3.5 text-center text-xs text-gray-600">
-              {{ row.chatPages > 0 ? `${row.chatPages}页` : '—' }}
-            </td>
-            <td class="px-3 py-3.5 text-center text-xs text-gray-600">
-              {{ row.buildPages > 0 ? `${row.buildPages}页` : '—' }}
             </td>
             <td class="px-3 py-3.5 text-right">
               <span class="font-mono tabular-nums text-amber-600">{{ formatInt(Number(row.rotation.rate_limited || 0)) }}</span>
@@ -307,13 +275,6 @@ const anomalyCount = computed(() => rows.value.filter((row) => row.anomalies.len
             </div>
             <div class="mt-1 flex items-center gap-1.5 flex-wrap">
               <Badge
-                v-if="row.account.id === activeId"
-                variant="blue"
-                size="sm"
-              >
-                当前
-              </Badge>
-              <Badge
                 v-if="row.account.tier"
                 :variant="row.account.tier.toLowerCase() === 'free' ? 'gray' : 'green'"
                 size="sm"
@@ -329,7 +290,6 @@ const anomalyCount = computed(() => rows.value.filter((row) => row.anomalies.len
             </div>
           </div>
           <div class="text-[11px] text-gray-400 text-right">
-            <div>chat {{ row.chatPages > 0 ? `${row.chatPages}页` : '—' }} · build {{ row.buildPages > 0 ? `${row.buildPages}页` : '—' }}</div>
             <div class="font-mono tabular-nums">
               429 {{ formatInt(Number(row.rotation.rate_limited || 0)) }} / 错误 {{ formatInt(Number(row.rotation.errors || 0)) }}
             </div>

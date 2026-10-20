@@ -60,8 +60,12 @@ export interface ApiKeyConfigItem {
   created_at?: string
 }
 
+export type AtgRequestFormat = 'gemini' | 'openai' | 'claude' | 'responses'
+export type AtgFormatMode = 'inherit' | 'off' | 'prefer' | 'required'
+
 export interface AtgConfig {
   mode?: 'off' | 'prefer' | 'required' | string
+  mode_by_format?: Partial<Record<AtgRequestFormat, AtgFormatMode>>
   tool_prefix?: string
   control_position?: 'tail' | 'head' | string
   strict?: boolean
@@ -89,6 +93,7 @@ export interface ChannelConfigItem {
   enabled?: boolean
   max_pages?: number
   quota_pool?: QuotaPool | string | null
+  app_url?: string
   [key: string]: unknown
 }
 

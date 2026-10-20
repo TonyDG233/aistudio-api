@@ -1,12 +1,14 @@
 export class ApiError extends Error {
   status: number
   detail: string
+  code: string | null
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, code: string | null = null) {
     super(detail)
     this.name = 'ApiError'
     this.status = status
     this.detail = detail
+    this.code = code
   }
 }
 
@@ -68,17 +70,22 @@ export async function request<T>(url: string, options: RequestInit = {}): Promis
     }
 
     let errorDetail = `请求失败 (${response.status})`
+    let errorCode: string | null = null
     try {
       const errJson = await response.json()
       if (errJson && typeof errJson.detail === 'string') {
         errorDetail = errJson.detail
+      } else if (errJson && typeof errJson.detail?.message === 'string') {
+        errorDetail = errJson.detail.message
+        errorCode = typeof errJson.detail.code === 'string' ? errJson.detail.code : null
       } else if (errJson && typeof errJson.error?.message === 'string') {
         errorDetail = errJson.error.message
+        errorCode = typeof errJson.error.code === 'string' ? errJson.error.code : null
       }
     } catch {
       // ignore json parse error
     }
-    throw new ApiError(response.status, errorDetail)
+    throw new ApiError(response.status, errorDetail, errorCode)
   }
 
   // 204 No Content

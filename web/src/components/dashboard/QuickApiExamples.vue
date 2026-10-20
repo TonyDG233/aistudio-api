@@ -335,8 +335,8 @@ function copyText(code: string, key: string) {
     </div>
 
     <template v-else>
-      <div class="px-5 sm:px-6 pt-1 overflow-x-auto border-b border-gray-100">
-        <div class="flex min-w-max">
+      <div class="px-5 sm:px-6 pt-1 border-b border-gray-100">
+        <div class="flex flex-wrap">
           <button
             v-for="tab in tabs"
             :key="tab.id"

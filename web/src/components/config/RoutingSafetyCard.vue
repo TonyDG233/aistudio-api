@@ -40,11 +40,15 @@ const breaker = () => props.routing.circuit_breaker || {}
       <ShieldCheck class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
-          <span>路由安全 (routing)</span>
-          <FieldHelpTip schema-key="features.routing.circuit_breaker" />
+          <span>路由安全</span>
+          <FieldHelpTip
+            title="路由安全"
+            content="控制失败换号次数、额度借用与熔断；不改变实例身份。"
+            explanation="排序：可用 → 亲和度 → 组权重 → 最久未用 → 请求数 → 编号。"
+          />
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          max_pages 是页面数上限，不是并发数；Context 与 Page 分开计数。耗尽一律显式报错，不无限重试。
+          组权重、公平性与熔断在这里；实例创建/关闭/换账号不在这里。
         </p>
       </div>
     </div>
@@ -56,7 +60,7 @@ const breaker = () => props.routing.circuit_breaker || {}
             <ConfigInput
               :model-value="routing.max_switches ?? 2"
               type="number"
-              label="换账号/换实例上限"
+              label="单请求换号上限"
               description="max_switches"
               placeholder="2"
               @update:model-value="update('max_switches', nonNegative($event, 2))"
@@ -68,51 +72,11 @@ const breaker = () => props.routing.circuit_breaker || {}
           />
         </div>
 
-        <div class="flex items-end gap-1.5">
-          <div class="flex-1">
-            <ConfigInput
-              :model-value="routing.global_max_pages ?? 2"
-              type="number"
-              label="全局页面硬顶"
-              description="global_max_pages"
-              placeholder="2"
-              @update:model-value="update('global_max_pages', nonNegative($event, 2))"
-            />
-          </div>
-          <FieldHelpTip
-            schema-key="features.routing.global_max_pages"
-            class="mb-2 shrink-0"
-          />
-        </div>
-
-        <div class="flex items-end gap-1.5">
-          <div class="flex-1">
-            <ConfigInput
-              :model-value="routing.max_contexts ?? 2"
-              type="number"
-              label="Context 上限"
-              description="max_contexts"
-              placeholder="2"
-              @update:model-value="update('max_contexts', nonNegative($event, 2))"
-            />
-          </div>
-          <FieldHelpTip
-            schema-key="features.routing.max_contexts"
-            class="mb-2 shrink-0"
-          />
-        </div>
-
-        <div class="rounded-xl border border-gray-200/80 bg-gray-50/60 px-3.5 py-3 text-[11px] text-gray-400 leading-relaxed">
-          页面 = 可复用的浏览器页面；Context = 独立会话隔离域。二者独立计数，互不替代。
-        </div>
-      </div>
-
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div class="flex items-center gap-1.5">
           <div class="flex-1">
             <ConfigSwitch
               :model-value="Boolean(routing.borrow)"
-              label="临时借入就绪槽"
+              label="临时借入就绪实例"
               description="仅首字节前；默认关闭"
               @update:model-value="update('borrow', $event)"
             />
@@ -122,24 +86,13 @@ const breaker = () => props.routing.circuit_breaker || {}
             class="shrink-0"
           />
         </div>
-
-        <div class="flex items-center gap-1.5">
-          <div class="flex-1">
-            <ConfigSwitch
-              :model-value="Boolean(routing.prewarm)"
-              label="备用实例预热"
-              description="增加常驻内存成本；默认关闭"
-              @update:model-value="update('prewarm', $event)"
-            />
-          </div>
-          <FieldHelpTip
-            schema-key="features.routing.prewarm"
-            class="shrink-0"
-          />
-        </div>
       </div>
 
-      <!-- Circuit breaker -->
+      <div class="rounded-xl border border-gray-200/80 bg-gray-50/60 px-3.5 py-3 text-[11px] text-gray-500 leading-relaxed">
+        排序固定为：可用 → 渠道亲和度 → 自定义策略组权重 → 最久未用 → 请求数 → 实例编号。
+        没有“当前实例/优先实例”排序项；最新实例只是最近启动的展示。
+      </div>
+
       <div class="p-4 bg-gray-50/80 border border-gray-200/80 rounded-xl space-y-3">
         <div class="flex items-center gap-2 text-xs font-bold text-gray-800">
           <Activity class="w-4 h-4 text-rose-500" />

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import type { FeaturesConfig } from './types.ts'
+import type { AtgRequestFormat, FeaturesConfig } from './types.ts'
 import {
+  ATG_MODE_BY_FORMAT_OPTIONS,
   ATG_MODE_OPTIONS,
   ATG_CONTROL_POSITION_OPTIONS,
   ATG_RECOVERY_OPTIONS,
@@ -22,6 +23,13 @@ const emit = defineEmits<{
 
 const expanded = ref(false)
 
+const atgFormats: Array<{ value: AtgRequestFormat; label: string }> = [
+  { value: 'gemini', label: 'Gemini 原生' },
+  { value: 'openai', label: 'OpenAI Chat' },
+  { value: 'claude', label: 'Claude Messages' },
+  { value: 'responses', label: 'OpenAI Responses' },
+]
+
 function atgMode(): string {
   const mode = props.features.atg?.mode
   return typeof mode === 'string' ? mode : 'off'
@@ -30,6 +38,18 @@ function atgMode(): string {
 function updateAtg(key: string, val: unknown) {
   const atg = { ...(props.features.atg || {}), [key]: val }
   emit('update:features', { ...props.features, atg })
+}
+
+function atgFormatMode(format: AtgRequestFormat): string {
+  const value = props.features.atg?.mode_by_format?.[format]
+  return typeof value === 'string' ? value : 'inherit'
+}
+
+function updateAtgFormat(format: AtgRequestFormat, val: unknown) {
+  updateAtg('mode_by_format', {
+    ...(props.features.atg?.mode_by_format || {}),
+    [format]: String(val ?? 'inherit'),
+  })
 }
 
 function updateFallback(key: string, val: unknown) {
@@ -117,6 +137,23 @@ function toNumber(val: string | number | null, fallback: number): number {
               schema-key="features.atg.control_position"
               class="mt-4 shrink-0"
             />
+          </div>
+
+          <div class="sm:col-span-2 rounded-xl border border-gray-200/80 bg-gray-50/60 p-3.5 space-y-2.5">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[11px] font-semibold text-gray-700">按请求格式覆盖</span>
+              <span class="text-[10px] text-gray-400">inherit = 跟随全局模式</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+              <ConfigSelect
+                v-for="format in atgFormats"
+                :key="format.value"
+                :model-value="atgFormatMode(format.value)"
+                :label="format.label"
+                :options="ATG_MODE_BY_FORMAT_OPTIONS"
+                @update:model-value="updateAtgFormat(format.value, $event)"
+              />
+            </div>
           </div>
 
           <div class="flex items-center gap-1.5">

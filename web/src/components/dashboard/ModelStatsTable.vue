@@ -79,7 +79,7 @@ function fmt(value: number | null | undefined): string {
 
     <template v-else>
       <div class="hidden md:block overflow-x-auto">
-        <table class="w-full text-left border-collapse text-sm min-w-[760px]">
+        <table class="w-full text-left border-collapse text-sm min-w-[600px] xl:min-w-[760px]">
           <thead>
             <tr class="bg-gray-50/70 border-b border-gray-100 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
               <th class="py-3 px-5 xl:px-6">
@@ -100,7 +100,7 @@ function fmt(value: number | null | undefined): string {
               <th class="py-3 px-3 text-center">
                 Token
               </th>
-              <th class="py-3 px-5 xl:px-6 text-right">
+              <th class="hidden xl:table-cell py-3 px-5 xl:px-6 text-right">
                 最后调用
               </th>
             </tr>
@@ -149,7 +149,7 @@ function fmt(value: number | null | undefined): string {
                   {{ fmt(item.total_tokens) }}
                 </span>
               </td>
-              <td class="py-3.5 px-5 xl:px-6 text-right text-xs text-gray-500 font-mono">
+              <td class="hidden xl:table-cell py-3.5 px-5 xl:px-6 text-right text-xs text-gray-500 font-mono">
                 {{ formatDate(item.last_used, { withSeconds: true }) }}
               </td>
             </tr>

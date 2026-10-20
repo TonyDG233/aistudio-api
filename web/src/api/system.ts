@@ -13,6 +13,7 @@ import type {
   UpdateLoggingConfigRequest,
   UpdateLoggingConfigResponse,
   HealthCheckResponse,
+  ResourceUsage,
 } from '@/types'
 
 export interface SurfacePageState {
@@ -187,6 +188,10 @@ export const systemApi = {
     return request('/rotation/next', {
       method: 'POST',
     })
+  },
+
+  getResources(): Promise<ResourceUsage> {
+    return request<ResourceUsage>('/api/system/resources')
   },
 
   getConfig(): Promise<SystemConfig> {

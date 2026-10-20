@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, ref } from 'vue'
 import { systemApi } from '@/api/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { SystemConfig } from '@/types/system.ts'
@@ -15,28 +15,12 @@ import {
   Lock,
 } from 'lucide-vue-next'
 
-const ADVANCED_STORAGE_KEY = 'settings.showAdvanced'
-
 const toast = useToastStore()
 
 const config = ref<SystemConfig | null>(null)
 const loading = ref(false)
 const loadError = ref<string | null>(null)
-const showAdvanced = ref(localStorage.getItem(ADVANCED_STORAGE_KEY) === 'true')
 const hasUnsavedChanges = ref(false)
-const advancedDirty = ref(false)
-
-watch(showAdvanced, (value) => {
-  localStorage.setItem(ADVANCED_STORAGE_KEY, String(value))
-})
-
-function toggleAdvanced() {
-  showAdvanced.value = !showAdvanced.value
-}
-
-function resetAdvanced() {
-  showAdvanced.value = false
-}
 
 async function loadConfig() {
   loading.value = true
@@ -59,50 +43,17 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6">
-    <!-- Top Title + Deep Mode Switch -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-      <div class="flex items-center gap-2 min-w-0">
-        <h2 class="text-xl font-bold text-gray-900 tracking-tight">
-          系统与模型规则配置
-        </h2>
-        <span
-          v-if="hasUnsavedChanges"
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-500" />
-          未保存
-        </span>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2">
-        <span
-          v-if="!showAdvanced && advancedDirty"
-          class="text-[11px] text-amber-600"
-        >深度区有未保存修改</span>
-        <span class="text-xs font-medium text-gray-500">显示深度功能</span>
-        <button
-          type="button"
-          role="switch"
-          :aria-checked="showAdvanced"
-          aria-label="显示深度功能"
-          class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-          :class="showAdvanced ? 'bg-brand-500' : 'bg-gray-300'"
-          @click="toggleAdvanced"
-        >
-          <span
-            class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out"
-            :class="showAdvanced ? 'translate-x-4' : 'translate-x-0'"
-          />
-        </button>
-        <button
-          type="button"
-          class="text-[11px] text-gray-500 hover:text-gray-800 underline underline-offset-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-          :disabled="!showAdvanced"
-          @click="resetAdvanced"
-        >
-          恢复默认（关闭）
-        </button>
-      </div>
+    <div class="flex items-center gap-2 min-w-0">
+      <h2 class="text-xl font-bold text-gray-900 tracking-tight">
+        系统与模型规则配置
+      </h2>
+      <span
+        v-if="hasUnsavedChanges"
+        class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200"
+      >
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-500" />
+        未保存
+      </span>
     </div>
 
     <!-- Loading skeleton -->
@@ -240,10 +191,8 @@ onMounted(() => {
       <!-- Unified YAML config editor: basic features + logs/keys + deep zone + model rules -->
       <VisualConfigEditor
         :initial-yaml="config.yaml_content"
-        :show-advanced="showAdvanced"
         @saved="loadConfig"
         @update:dirty="hasUnsavedChanges = $event"
-        @update:advanced-dirty="advancedDirty = $event"
       >
         <template #after-basic>
           <LogConfigCard
