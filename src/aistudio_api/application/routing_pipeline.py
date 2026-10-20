@@ -157,6 +157,14 @@ class RoutingPipeline:
             )
         self.pool: InstancePool = pool
 
+    def _instance_manager(self):
+        try:
+            from aistudio_api.api.state import runtime_state
+
+            return runtime_state.instance_manager
+        except Exception:
+            return None
+
     def _store_or_default(self):
         if self._store is not None:
             return self._store
@@ -240,6 +248,10 @@ class RoutingPipeline:
         raw_slots = features.get("slots")
         slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
         views = [AccountView.from_account(account) for account in accounts]
+        manager = self._instance_manager()
+        if manager is not None and manager.has_instances():
+            allowed_accounts = manager.active_account_ids()
+            views = [view for view in views if view.account_id in allowed_accounts]
         selection = choose_channel(
             model_path,
             views,

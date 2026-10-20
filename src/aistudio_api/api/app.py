@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.application.instance_manager import InstanceError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
@@ -31,6 +32,7 @@ from .format_errors import format_error_response, format_for_path
 from .routes_accounts import router as accounts_router
 from .routes_claude import router as claude_router
 from .routes_gemini import router as gemini_router
+from .routes_instances import router as instances_router
 from .routes_keepalive import router as keepalive_router
 from .routes_logs import protected_router as logs_protected_router
 from .routes_models import router as models_router
@@ -72,6 +74,13 @@ async def lifespan(_app: FastAPI):
     account_store = AccountStore()
     account_service = AccountService(account_store)
     runtime_state.account_service = account_service
+
+    # WP5 v4：用户可见实例（一个同时登录账号会话）由独立 manager 管理。
+    from aistudio_api.application.instance_manager import InstanceManager
+
+    runtime_state.instance_manager = InstanceManager(
+        client.instance_pool, account_store
+    )
 
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
@@ -165,6 +174,7 @@ async def lifespan(_app: FastAPI):
             await client.close()
         except Exception as e:
             logger.debug("关闭客户端失败: %s", e)
+    runtime_state.instance_manager = None
     runtime_state.client = None
     runtime_state.account_service = None
     runtime_state.rotator = None
@@ -184,12 +194,25 @@ app.include_router(
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
+app.include_router(
+    instances_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(openai_router, dependencies=[Depends(require_api_key)])
 app.include_router(responses_router, dependencies=[Depends(require_api_key)])
 app.include_router(claude_router, dependencies=[Depends(require_api_key)])
+
+
+@app.exception_handler(InstanceError)
+async def instance_exception_handler(
+    _request: Request, exc: InstanceError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": {"code": exc.code, "message": str(exc)}},
+    )
 
 
 @app.exception_handler(HTTPException)

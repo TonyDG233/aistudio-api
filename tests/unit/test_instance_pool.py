@@ -683,3 +683,66 @@ async def test_rebind_busy_slot_is_rejected() -> None:
         )
     await pool.release(lease)
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_instance_is_pinned_and_not_rebound() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.create_instance(account_id="a", auth_file="a.json", auth_user="1")
+    assert slot.pinned is True
+    assert pool.live_contexts == 1
+    assert slot.state is SlotState.READY
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(account_id="b", auth_file="b.json", timeout_s=0.0)
+
+    await pool.close_instance(slot.slot_id)
+    assert pool.live_contexts == 0
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_close_explicit_instance_refuses_in_flight() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.create_instance(account_id="a", auth_file="a.json")
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.close_instance(slot.slot_id)
+
+    await pool.release(lease)
+    await pool.close_instance(slot.slot_id)
+    assert pool.slots() == ()
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_reassign_explicit_instance_keeps_identity_and_pin() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.create_instance(account_id="a", auth_file="a.json")
+    await pool.reassign_instance(
+        slot.slot_id,
+        account_id="c",
+        auth_file="c.json",
+        auth_user="0",
+        channel="chat",
+    )
+    rebound = pool.get(slot.slot_id)
+    assert rebound is not None
+    assert rebound.current_account_id == "c"
+    assert rebound.pinned is True
+    assert rebound.state is SlotState.READY
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_instance_duplicate_account_is_rejected() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+    await pool.create_instance(account_id="a", auth_file="a.json")
+    with pytest.raises(InstanceCapacityError, match="already bound"):
+        await pool.create_instance(account_id="a", auth_file="a.json")
+    await pool.close()

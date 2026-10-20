@@ -49,7 +49,7 @@ def test_channels_routing_defaults(tmp_path: Path) -> None:
     assert features["routing"] == {
         "max_switches": 2,
         "global_max_pages": 2,
-        "max_contexts": 2,
+        "max_contexts": 1,
         "borrow": False,
         "prewarm": False,
         "circuit_breaker": {
