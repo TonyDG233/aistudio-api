@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
     from aistudio_api.infrastructure.gateway.session import BrowserSession
 
+from aistudio_api.application.model_access import set_paid_models
 from aistudio_api.infrastructure.account.cookie_parser import (
     DEFAULT_API_KEY,
     DEFAULT_EXT_BIN,
@@ -124,6 +125,8 @@ _FALLBACK_MODELS = [
     },
 ]
 
+set_paid_models(_FALLBACK_MODELS)
+
 
 class ModelDiscoveryService:
     """动态获取 Google AI Studio 支持的模型列表（带缓存与保底）。"""
@@ -133,6 +136,55 @@ class ModelDiscoveryService:
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
         self._lock = asyncio.Lock()
+        self._load_snapshot()
+
+    @property
+    def cache_ttl(self) -> int:
+        return self._cache_ttl
+
+    def _snapshot_path(self) -> Path:
+        from aistudio_api.config import settings
+
+        return Path(settings.model_cache_file)
+
+    def _load_snapshot(self) -> None:
+        try:
+            path = self._snapshot_path()
+            if not path.is_file():
+                return
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            models = payload.get("models") if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                return
+            loaded = [dict(item) for item in models if isinstance(item, dict)]
+            if not loaded:
+                return
+            self._cached_models = loaded
+            fetched_at = payload.get("fetched_at")
+            self._last_fetched_at = (
+                float(fetched_at) if isinstance(fetched_at, (int, float)) else 0.0
+            )
+            set_paid_models(loaded)
+            logger.info("从快照加载了 %d 个模型", len(loaded))
+        except Exception as e:
+            logger.warning("读取模型快照失败: %s", e)
+
+    def _save_snapshot(self, models: list[dict[str, object]]) -> None:
+        if not models:
+            return
+        try:
+            from aistudio_api.infrastructure.utils.common import atomic_write_json
+
+            atomic_write_json(
+                self._snapshot_path(),
+                {
+                    "version": 1,
+                    "fetched_at": time.time(),
+                    "models": models,
+                },
+            )
+        except Exception as e:
+            logger.warning("保存模型快照失败: %s", e)
 
     async def get_models(
         self,
@@ -168,6 +220,8 @@ class ModelDiscoveryService:
                         models = await self._fetch_via_page(page)
                         if models:
                             self._cached_models = models
+                            set_paid_models(models)
+                            self._save_snapshot(models)
                             self._last_fetched_at = time.time()
                             logger.info(
                                 "通过 Page XHR 动态更新了 %d 个模型", len(models)
@@ -224,6 +278,8 @@ class ModelDiscoveryService:
                     )
                     if models:
                         self._cached_models = models
+                        set_paid_models(models)
+                        self._save_snapshot(models)
                         self._last_fetched_at = time.time()
                         logger.info("通过 HTTP RPC 动态更新了 %d 个模型", len(models))
                         return models
@@ -233,6 +289,7 @@ class ModelDiscoveryService:
             # 3. 保底返回本地默认模型列表
             if not self._cached_models:
                 self._cached_models = [dict(m) for m in _FALLBACK_MODELS]
+                set_paid_models(self._cached_models)
                 self._last_fetched_at = time.time()
 
             return self._cached_models

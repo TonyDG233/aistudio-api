@@ -151,6 +151,16 @@ def resolve_stats_file() -> Path:
     return resolve_data_dir() / "stats.json"
 
 
+def resolve_model_cache_file() -> Path:
+    """解析最后一次模型发现快照路径（优先使用 AISTUDIO_MODEL_CACHE_FILE）。"""
+    override = os.getenv("AISTUDIO_MODEL_CACHE_FILE")
+    if override:
+        path = Path(override).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    return resolve_data_dir() / "models_cache.json"
+
+
 def resolve_rotator_state_file() -> Path:
     """解析账号调度与 429 冷却状态持久化文件路径（优先使用 AISTUDIO_ROTATOR_STATE_FILE）。"""
     override = os.getenv("AISTUDIO_ROTATOR_STATE_FILE")
@@ -306,6 +316,7 @@ class Settings:
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
     stats_file: str = str(resolve_stats_file())
     rotator_state_file: str = str(resolve_rotator_state_file())
+    model_cache_file: str = str(resolve_model_cache_file())
     config_file: str = str(resolve_config_file())
     persist_stats: bool = _load_bool_env("AISTUDIO_PERSIST_STATS", default=True)
     persist_rotator: bool = _load_bool_env("AISTUDIO_PERSIST_ROTATOR", default=True)

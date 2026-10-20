@@ -37,7 +37,8 @@ from aistudio_api.application.surface_orchestrator import (
     SurfacePolicyError,
     account_is_paid,
     account_tier_quota_pools,
-    is_pro_only_model,
+    is_chat_only_model,
+    model_requires_paid_account,
     select_group,
 )
 
@@ -198,7 +199,7 @@ def eligible_account(
         return None
     if account.expired:
         return None
-    if is_pro_only_model(model) and (
+    if model_requires_paid_account(model) and (
         canonical != "chat" or not account_is_paid(account.tier)
     ):
         return None
@@ -295,7 +296,7 @@ def choose_channel(
         model_path,
         features,
         mounted_channels=mounted_channels,
-        model_is_chat_only=is_pro_only_model(model_path),
+        model_is_chat_only=is_chat_only_model(model_path),
     )
     preview = eligible_accounts(
         accounts,
@@ -309,7 +310,7 @@ def choose_channel(
         return selection
 
     enabled = enabled_channels(registry)
-    if selection.explicit or len(enabled) <= 1 or is_pro_only_model(model_path):
+    if selection.explicit or len(enabled) <= 1 or is_chat_only_model(model_path):
         raise _no_capable_account(model_path, selection.channel, "资格图为空")
 
     for preferred in ("build", "chat"):
