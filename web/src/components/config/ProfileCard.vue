@@ -137,6 +137,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
           <div class="flex items-center gap-1.5">
             <div class="flex-1">
               <ConfigInput
+                :model-value="profile.name"
                 label="规则分组名称"
                 description="唯一标识"
                 placeholder="例如: image_models"
