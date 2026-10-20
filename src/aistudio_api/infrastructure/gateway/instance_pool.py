@@ -66,6 +66,8 @@ class InstanceSlot:
     group_name: str = ""
     channel_role: str = ""
     last_used: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.monotonic)
+    pinned: bool = False
     build_surface: Any = None
     assigned_slot_rows: tuple[dict[str, object], ...] = ()
 
@@ -184,14 +186,14 @@ class InstancePool:
 
     def _max_contexts(self) -> int:
         if self._features_provider is None:
-            return 2
+            return 1
         try:
             features = self._features_provider()
             routing = features.get("routing")
             raw = routing if isinstance(routing, dict) else {}
-            return max(1, int(raw.get("max_contexts", 2)))
+            return max(1, int(raw.get("max_contexts", 1)))
         except (TypeError, ValueError, AttributeError):
-            return 2
+            return 1
 
     # --------------------------------------------------------------- inspection
 
@@ -351,6 +353,8 @@ class InstancePool:
                 "pending_pages": slot.pending_pages,
                 "pages": self._slot_page_counts(slot),
                 "last_used": slot.last_used,
+                "created_at": slot.created_at,
+                "pinned": slot.pinned,
                 "slot_rows": list(slot.assigned_slot_rows),
             }
             for slot in sorted(self._slots.values(), key=lambda item: item.slot_id)
@@ -467,6 +471,103 @@ class InstancePool:
             self._condition.notify_all()
             return self._lease_for_slot(slot, channel, surface, is_borrow=False)
 
+    async def create_instance(
+        self,
+        *,
+        account_id: str,
+        auth_file: str | None,
+        auth_user: str = "0",
+        channel: str = "chat",
+    ) -> InstanceSlot:
+        """Create one explicit, pinned instance for a user-selected account.
+
+        Unlike request-driven ``acquire`` this never rebinds an existing slot:
+        the returned slot is a stable instance identity until the user closes or
+        reassigns it.
+        """
+        async with self._condition:
+            if any(
+                slot.current_account_id == account_id
+                and slot.state is not SlotState.RETIRING
+                for slot in self._slots.values()
+            ):
+                raise InstanceCapacityError(f"account already bound: {account_id}")
+            if len(self._slots) >= self._max_contexts():
+                raise InstanceCapacityError(
+                    f"instance capacity exhausted: live={len(self._slots)} "
+                    f"limit={self._max_contexts()}"
+                )
+            self._check_page_budget_locked(
+                channel=channel,
+                group_name=None,
+                group_max_pages=None,
+            )
+            slot = InstanceSlot(
+                slot_id=f"slot-{next(self._counter)}",
+                state=SlotState.LOADING,
+                current_account_id=account_id,
+                auth_file=auth_file,
+                auth_user=auth_user or "0",
+                channel_role=channel,
+                pending_pages=1,
+                pinned=True,
+                last_used=self._clock(),
+            )
+            self._slots[slot.slot_id] = slot
+            self._condition.notify_all()
+        try:
+            await self._load_slot(
+                slot,
+                account_id=account_id,
+                auth_file=auth_file,
+                auth_user=auth_user,
+            )
+            if channel == "build":
+                await self._ensure_surface(slot, "build")
+        except BaseException:
+            await self._discard_slot(slot)
+            raise
+        async with self._condition:
+            slot.state = SlotState.READY
+            slot.reservations = 0
+            slot.pending_pages = 0
+            self._condition.notify_all()
+        return slot
+
+    async def close_instance(self, slot_id: str) -> None:
+        """Close one explicit instance; refuse while it still has requests."""
+        async with self._condition:
+            slot = self._slots.get(slot_id)
+            if slot is None:
+                return
+            if slot.in_flight > 0:
+                raise InstanceCapacityError(f"slot busy: {slot_id}")
+            slot.state = SlotState.RETIRING
+            self._slots.pop(slot_id, None)
+            self._condition.notify_all()
+        await self._close_slots([slot])
+
+    async def reassign_instance(
+        self,
+        slot_id: str,
+        *,
+        account_id: str,
+        auth_file: str | None,
+        auth_user: str | None,
+        channel: str = "chat",
+    ) -> None:
+        """Rebind an explicit instance to another account, keeping its identity."""
+        await self.rebind(
+            slot_id,
+            account_id=account_id,
+            auth_file=auth_file,
+            auth_user=auth_user,
+            channel=channel,
+        )
+        slot = self._slots.get(slot_id)
+        if slot is not None:
+            slot.pinned = True
+
     async def rebind(
         self,
         slot_id: str,
@@ -559,6 +660,7 @@ class InstancePool:
             slot
             for slot in self._slots.values()
             if slot.in_flight == 0
+            and not slot.pinned
             and slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
         ]
 
@@ -824,6 +926,7 @@ class InstancePool:
                 slot
                 for slot in self._slots.values()
                 if slot.in_flight == 0
+                and not slot.pinned
                 and slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
                 and (
                     max_idle_seconds is None or now - slot.last_used >= max_idle_seconds

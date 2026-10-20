@@ -577,7 +577,7 @@ _DEFAULT_CHANNEL_MAX_INSTANCES = 2
 _MAX_CHANNEL_MAX_INSTANCES = 16
 _DEFAULT_CHANNEL_MAX_PAGES = {"chat": 1, "build": 1, "official": 0}
 _DEFAULT_GLOBAL_MAX_PAGES = 2
-_DEFAULT_MAX_CONTEXTS = 2
+_DEFAULT_MAX_CONTEXTS = 1
 
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
@@ -612,7 +612,7 @@ _FEATURES_DEFAULTS: dict[str, object] = {
     "routing": {
         "max_switches": 2,
         "global_max_pages": 2,
-        "max_contexts": 2,
+        "max_contexts": 1,
         "borrow": False,
         "prewarm": False,
         "circuit_breaker": {

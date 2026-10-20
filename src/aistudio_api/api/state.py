@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from aistudio_api.application.account_keepalive import AccountKeepaliveService
     from aistudio_api.application.account_rotator import AccountRotator
     from aistudio_api.application.account_service import AccountService
+    from aistudio_api.application.instance_manager import InstanceManager
     from aistudio_api.infrastructure.account.account_info_refresher import (
         AccountInfoRefresher,
     )
@@ -306,6 +307,7 @@ class RuntimeState:
     rotator: AccountRotator | None = None
     account_refresher: AccountInfoRefresher | None = None
     keepalive: AccountKeepaliveService | None = None
+    instance_manager: InstanceManager | None = None
     model_stats: dict[str, ModelStatsItem] = field(
         default_factory=lambda: defaultdict(ModelStatsItem)
     )

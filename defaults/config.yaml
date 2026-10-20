@@ -107,7 +107,7 @@ features:
   # max_switches: 单请求内“换账号/换实例”动作上限；同账号重试仍由
   #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
   # global_max_pages: 全局页面数硬顶 (所有渠道/Context 合计)。
-  # max_contexts: 统一实例池的 Context 上限；页面数与 Context 数分开计数。
+  # max_contexts: 用户可见实例上限（同时登录账号数）；默认 1。
   # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
   # prewarm: 备用实例预热；默认关 (黄金模板可开)。
   # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
@@ -115,7 +115,7 @@ features:
   routing:
     max_switches: 2
     global_max_pages: 2
-    max_contexts: 2
+    max_contexts: 1
     borrow: false
     prewarm: false
     circuit_breaker:
