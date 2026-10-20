@@ -325,6 +325,10 @@ class ModelDiscoveryService:
                 item[6] if len(item) > 6 and isinstance(item[6], (int, float)) else 0
             )
             methods = item[7] if len(item) > 7 and isinstance(item[7], list) else []
+            # ListModels item[77] maps to protobuf field 78: 2 = Paid (Pro-only).
+            access_tier = (
+                item[77] if len(item) > 77 and isinstance(item[77], int) else None
+            )
 
             # 过滤支持内容生成的模型
             if not any("generateContent" in str(m) for m in methods) and not any(
@@ -361,6 +365,8 @@ class ModelDiscoveryService:
                     "is_image_model": is_image,
                     "is_video_model": is_video,
                     "is_audio_model": is_audio,
+                    "paid": access_tier == 2,
+                    "access_tier": access_tier,
                 }
             )
 
