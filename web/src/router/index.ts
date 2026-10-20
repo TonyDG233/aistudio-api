@@ -5,6 +5,7 @@ const DashboardView = () => import('@/views/DashboardView.vue')
 const StatsView = () => import('@/views/StatsView.vue')
 const AccountsView = () => import('@/views/AccountsView.vue')
 const SettingsView = () => import('@/views/SettingsView.vue')
+const LogsView = () => import('@/views/LogsView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -36,6 +37,12 @@ const routes: RouteRecordRaw[] = [
     name: 'settings',
     component: SettingsView,
     meta: { title: '系统配置' },
+  },
+  {
+    path: '/logs',
+    name: 'logs',
+    component: LogsView,
+    meta: { title: '日志' },
   },
   {
     path: '/:pathMatch(.*)*',
