@@ -25,11 +25,6 @@ const navItems = [
     icon: LayoutDashboard,
   },
   {
-    name: '用量统计',
-    path: '/stats',
-    icon: BarChart3,
-  },
-  {
     name: '账号管理',
     path: '/accounts',
     icon: Users,
@@ -38,6 +33,11 @@ const navItems = [
     name: '系统与模型配置',
     path: '/settings',
     icon: Sliders,
+  },
+  {
+    name: '用量统计',
+    path: '/stats',
+    icon: BarChart3,
   },
   {
     name: '日志',

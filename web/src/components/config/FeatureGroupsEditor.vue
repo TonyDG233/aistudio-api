@@ -5,16 +5,23 @@ import { SURFACE_OPTIONS } from './schema.ts'
 import ConfigInput from './ConfigInput.vue'
 import ConfigSwitch from './ConfigSwitch.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
-import { ArrowDown, ArrowUp, Plus, Trash2, Users } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ChevronDown, Plus, Trash2, Users } from 'lucide-vue-next'
 
-const props = withDefaults(defineProps<{ groups?: AccountGroupItem[] }>(), {
+const props = withDefaults(defineProps<{
+  groups?: AccountGroupItem[]
+  collapsible?: boolean
+  defaultOpen?: boolean
+}>(), {
   groups: () => [],
+  collapsible: true,
+  defaultOpen: false,
 })
 
 const emit = defineEmits<{
   'update:groups': [val: AccountGroupItem[]]
 }>()
 
+const expanded = ref(props.defaultOpen)
 const tierDrafts = ref<Record<number, string>>({})
 
 function clearTierDrafts() {
@@ -128,10 +135,6 @@ function toggleQuotaPool(index: number, pool: string, checked: boolean) {
   updateGroup(index, { allowed_quota_pools: next })
 }
 
-function groupMaxPages(group: AccountGroupItem): number {
-  return typeof group.max_pages === 'number' ? group.max_pages : 2
-}
-
 function isEnabled(group: AccountGroupItem): boolean {
   return group.enabled !== false
 }
@@ -144,35 +147,54 @@ function isEnabled(group: AccountGroupItem): boolean {
         <Users class="w-4 h-4 text-brand-600" />
         <div>
           <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
-            <span>策略组 (groups)</span>
+            <span>自定义策略组</span>
             <FieldHelpTip schema-key="features.groups" />
           </h4>
           <p class="text-[11px] text-gray-400 mt-0.5">
-            按顺序匹配，首个命中生效；空组/停用组视同不存在，继续匹配后续组或 tier 默认组。
+            默认按 tier 规则路由；组用于收窄账号、渠道、额度池并调整权重，未配置时不需要关心。
           </p>
         </div>
       </div>
-      <button
-        type="button"
-        class="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium bg-brand-50 text-brand-700 hover:bg-brand-100 rounded-lg cursor-pointer"
-        @click="addGroup"
-      >
-        <Plus class="w-3 h-3" />
-        <span>添加策略组</span>
-      </button>
+      <div class="flex items-center gap-2">
+        <button
+          v-if="collapsible"
+          type="button"
+          class="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-gray-500 hover:text-gray-900 hover:bg-white rounded-lg cursor-pointer"
+          :aria-expanded="expanded"
+          @click="expanded = !expanded"
+        >
+          <span>{{ expanded ? '收起配置' : '展开配置' }}</span>
+          <ChevronDown
+            class="w-3.5 h-3.5 transition-transform"
+            :class="{ 'rotate-180': expanded }"
+          />
+        </button>
+        <button
+          v-if="!collapsible || expanded"
+          type="button"
+          class="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium bg-brand-50 text-brand-700 hover:bg-brand-100 rounded-lg cursor-pointer"
+          @click="addGroup"
+        >
+          <Plus class="w-3 h-3" />
+          <span>添加策略组</span>
+        </button>
+      </div>
     </div>
 
-    <div class="p-5 space-y-3">
+    <div
+      v-show="!collapsible || expanded"
+      class="p-5 space-y-3"
+    >
       <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-gray-400">
         <span>策略组是约束层，不是独立实例池。</span>
-        <span>只收窄候选账号/渠道/预算/权重，不能放宽系统推导的模型与渠道能力。</span>
+        <span>只收窄候选账号/渠道/额度池/权重，不能放宽系统推导的模型与渠道能力。</span>
       </div>
 
       <div
         v-if="!groups.length"
         class="p-6 text-center text-gray-400 text-xs border border-dashed border-gray-200 rounded-xl"
       >
-        未配置策略组；按 tier 默认规则分发（free→build，pro/ultra/plus→chat）
+        未配置自定义策略组；按 tier 默认规则分发（free→build，pro/ultra/plus→chat）
       </div>
 
       <div
@@ -195,7 +217,7 @@ function isEnabled(group: AccountGroupItem): boolean {
                 : 'text-gray-500 bg-gray-100 border-gray-200'"
             >{{ isEnabled(group) ? '已启用' : '已停用' }}</span>
             <span class="text-[11px] text-gray-400 truncate">
-              {{ group.name || '未命名' }} · 页面上限 {{ groupMaxPages(group) }} · {{ surfacesText(group) }}
+              {{ group.name || '未命名' }} · {{ surfacesText(group) }}
             </span>
           </div>
           <div class="flex items-center gap-1">
@@ -256,22 +278,6 @@ function isEnabled(group: AccountGroupItem): boolean {
             placeholder="留空则不启用"
             @update:model-value="updateGroup(index, { match_emails_regex: $event === null || String($event).trim() === '' ? null : String($event) })"
           />
-          <div class="sm:col-span-2 flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigInput
-                :model-value="groupMaxPages(group)"
-                type="number"
-                label="页面上限 (max_pages)"
-                description="0-16"
-                placeholder="2"
-                @update:model-value="updateGroup(index, { max_pages: clamp(toNumber($event, 2), 0, 16) })"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="features.groups.max_pages"
-              class="mt-4 shrink-0"
-            />
-          </div>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">

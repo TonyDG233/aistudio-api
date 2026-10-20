@@ -68,3 +68,12 @@ export interface CreateApiKeyRequest {
 export interface UpdateApiKeyRequest {
   name: string
 }
+
+
+export interface ResourceUsage {
+  available: boolean
+  cpu_percent: number | null
+  memory_mb: number | null
+  memory_total_mb: number | null
+  instances: number
+}

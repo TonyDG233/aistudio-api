@@ -230,7 +230,8 @@ function highlightClass(entry: LogEvent): string {
   if (/429/.test(message)) return 'border-amber-400/70 bg-amber-500/5'
   if (/切号|switch|account=/.test(message)) return 'border-amber-400/70 bg-amber-500/5'
   if (/borrow|借入/.test(message)) return 'border-violet-400/70 bg-violet-500/5'
-  if (/\[surface\]|surface=|channel=/.test(message)) return 'border-emerald-400/70 bg-emerald-500/5'
+  if (/\[instances\]|实例|instance|capacity|容量/.test(message)) return 'border-sky-400/70 bg-sky-500/5'
+  if (/\[surface\]|surface=|channel=|渠道|路由/.test(message)) return 'border-emerald-400/70 bg-emerald-500/5'
   if (entry.level === 'ERROR' || entry.level === 'CRITICAL') return 'border-rose-500/70 bg-rose-500/5'
   return 'border-transparent'
 }
@@ -576,7 +577,7 @@ onBeforeUnmount(() => {
           <input
             v-model="search"
             type="search"
-            placeholder="搜索日志、surface、账号、429…"
+            placeholder="搜索日志、实例、账号、429…"
             class="w-full rounded-xl border border-gray-200 bg-white py-2 pl-8 pr-8 text-xs text-gray-700 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-400/30"
           >
           <button
@@ -844,7 +845,7 @@ onBeforeUnmount(() => {
             {{ search || activeLevelCount < 4 ? '没有匹配当前过滤条件的日志' : '暂无日志' }}
           </p>
           <p class="mt-1 max-w-sm text-[11px] text-gray-600">
-            {{ search || activeLevelCount < 4 ? '调整级别或清除搜索后再试。' : '触发一次请求或切换账号后，这里会出现记录。' }}
+            {{ search || activeLevelCount < 4 ? '调整级别或清除搜索后再试。' : '创建/关闭实例或发起请求后，这里会出现记录。' }}
           </p>
           <button
             v-if="search || activeLevelCount < 4"
@@ -869,7 +870,8 @@ onBeforeUnmount(() => {
     </div>
 
     <p class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-400">
-      <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-emerald-500" /> surface 决策</span>
+      <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-sky-400" /> 实例创建/关闭/回收</span>
+      <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-emerald-500" /> 渠道 / 路由决策</span>
       <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-amber-400" /> 账号切换 / 429</span>
       <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-rose-500" /> 4xx/5xx / 熔断</span>
       <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-violet-400" /> borrow</span>

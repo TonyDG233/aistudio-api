@@ -38,7 +38,12 @@ const CHANNEL_DEFAULTS: Record<ChannelName, { enabled: boolean; max_pages: numbe
   official: { enabled: false, max_pages: 0 },
 }
 
-function effective(key: ChannelName): { enabled: boolean; max_pages: number; quota_pool: string | null } {
+function effective(key: ChannelName): {
+  enabled: boolean
+  max_pages: number
+  quota_pool: string | null
+  app_url: string
+} {
   const configured = props.channels?.[key] || {}
   const defaults = CHANNEL_DEFAULTS[key]
   const enabled = typeof configured.enabled === 'boolean'
@@ -50,7 +55,12 @@ function effective(key: ChannelName): { enabled: boolean; max_pages: number; quo
   const pool = configured.quota_pool === 'free' || configured.quota_pool === 'pro'
     ? configured.quota_pool
     : null
-  return { enabled, max_pages: maxPages, quota_pool: pool }
+  return {
+    enabled,
+    max_pages: maxPages,
+    quota_pool: pool,
+    app_url: typeof configured.app_url === 'string' ? configured.app_url : '',
+  }
 }
 
 function baseChannels(): ChannelsConfig {
@@ -61,16 +71,17 @@ function baseChannels(): ChannelsConfig {
   }
 }
 
-function commit(key: ChannelName, patch: { enabled?: boolean; max_pages?: number; quota_pool?: string | null }) {
+function commit(
+  key: ChannelName,
+  patch: { enabled?: boolean; quota_pool?: string | null; app_url?: string },
+) {
   const base = baseChannels()
   base[key] = { ...base[key], ...patch }
   emit('update:channels', base)
 }
 
-function commitMaxPages(key: ChannelName, value: string | number | null) {
-  const n = Number(value)
-  const maxPages = Number.isFinite(n) ? Math.min(16, Math.max(0, Math.round(n))) : CHANNEL_DEFAULTS[key].max_pages
-  commit(key, { max_pages: maxPages })
+function commitAppUrl(value: string | number | null) {
+  commit('build', { app_url: String(value ?? '').trim() })
 }
 
 function commitEnabled(key: ChannelName, value: boolean) {
@@ -88,19 +99,18 @@ function commitPool(key: ChannelName, value: string | number | null) {
       <Boxes class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
-          <span>渠道注册表 (channels)</span>
+          <span>渠道注册表</span>
           <FieldHelpTip schema-key="features.channels" />
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          渠道是请求能力的第一层；max_pages 是该渠道同时存活的页面数上限，不是并发请求上限。
+          渠道是请求能力的第一层；只决定是否参与路由与额度池，页面预算由后端内部管理。
         </p>
       </div>
     </div>
 
     <div class="p-5">
-      <!-- Desktop table -->
       <div class="hidden md:block overflow-x-auto">
-        <table class="w-full min-w-[820px] text-left text-xs">
+        <table class="w-full min-w-[640px] text-left text-xs">
           <thead>
             <tr class="text-[11px] text-gray-400 border-b border-gray-100">
               <th class="py-2 pr-3 font-semibold">
@@ -110,16 +120,13 @@ function commitPool(key: ChannelName, value: string | number | null) {
                 启用
               </th>
               <th class="py-2 pr-3 font-semibold">
-                页面上限
-              </th>
-              <th class="py-2 pr-3 font-semibold">
                 额度池
               </th>
               <th class="py-2 pr-3 font-semibold">
                 实现状态
               </th>
               <th class="py-2 font-semibold">
-                成本提示
+                说明
               </th>
             </tr>
           </thead>
@@ -161,23 +168,6 @@ function commitPool(key: ChannelName, value: string | number | null) {
               </td>
               <td class="py-3 pr-3 align-top">
                 <div class="flex items-center gap-1">
-                  <input
-                    type="number"
-                    min="0"
-                    max="16"
-                    :value="effective(row.key).max_pages"
-                    :disabled="!row.implemented"
-                    class="w-20 px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50"
-                    @input="commitMaxPages(row.key, ($event.target as HTMLInputElement).value)"
-                  >
-                  <FieldHelpTip
-                    schema-key="features.channels.max_pages"
-                    class="shrink-0"
-                  />
-                </div>
-              </td>
-              <td class="py-3 pr-3 align-top">
-                <div class="flex items-center gap-1">
                   <select
                     :value="effective(row.key).quota_pool === null ? '__null__' : effective(row.key).quota_pool"
                     :disabled="!row.implemented"
@@ -211,14 +201,13 @@ function commitPool(key: ChannelName, value: string | number | null) {
                 </span>
               </td>
               <td class="py-3 align-top text-[11px] text-gray-400 leading-relaxed">
-                每页约 +66–71MB；每个 Context 约 +180MB
+                {{ row.key === 'chat' ? '聊天请求的主渠道' : row.key === 'build' ? 'Build 宿主页直连' : '仅注册，不参与路由' }}
               </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <!-- Mobile cards -->
       <div class="md:hidden space-y-3">
         <div
           v-for="row in rows"
@@ -253,43 +242,35 @@ function commitPool(key: ChannelName, value: string | number | null) {
             @update:model-value="commitEnabled(row.key, $event)"
           />
 
-          <div class="grid grid-cols-1 gap-3">
-            <div class="flex items-end gap-1.5">
-              <div class="flex-1">
-                <ConfigInput
-                  :model-value="effective(row.key).max_pages"
-                  type="number"
-                  label="页面上限 (0-16)"
-                  :disabled="!row.implemented"
-                  @update:model-value="commitMaxPages(row.key, $event)"
-                />
-              </div>
-              <FieldHelpTip
-                schema-key="features.channels.max_pages"
-                class="mb-2 shrink-0"
+          <div class="flex items-end gap-1.5">
+            <div class="flex-1">
+              <ConfigSelect
+                :model-value="effective(row.key).quota_pool"
+                label="额度池"
+                :options="QUOTA_POOL_OPTIONS"
+                :disabled="!row.implemented"
+                @update:model-value="commitPool(row.key, $event)"
               />
             </div>
-            <div class="flex items-end gap-1.5">
-              <div class="flex-1">
-                <ConfigSelect
-                  :model-value="effective(row.key).quota_pool"
-                  label="额度池"
-                  :options="QUOTA_POOL_OPTIONS"
-                  :disabled="!row.implemented"
-                  @update:model-value="commitPool(row.key, $event)"
-                />
-              </div>
-              <FieldHelpTip
-                schema-key="features.channels.quota_pool"
-                class="mb-2 shrink-0"
-              />
-            </div>
+            <FieldHelpTip
+              schema-key="features.channels.quota_pool"
+              class="mb-2 shrink-0"
+            />
           </div>
-
-          <p class="text-[11px] text-gray-400">
-            每页约 +66–71MB；每个 Context 约 +180MB
-          </p>
         </div>
+      </div>
+
+      <div class="mt-4 rounded-xl border border-gray-200/80 bg-gray-50/60 p-3.5">
+        <ConfigInput
+          :model-value="effective('build').app_url"
+          label="Build 应用 URL / App ID"
+          description="build.app_url"
+          placeholder="https://aistudio.google.com/apps/<id> 或直接填 app id"
+          @update:model-value="commitAppUrl"
+        />
+        <p class="mt-2 text-[11px] text-gray-400">
+          用于定位账号自己的 Build 应用；留空时回退环境变量 AISTUDIO_APP_URL 和内置默认应用。
+        </p>
       </div>
     </div>
   </div>
