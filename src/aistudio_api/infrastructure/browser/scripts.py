@@ -12,6 +12,13 @@ def _load_js(filename: str) -> str:
     return (_JS_DIR / filename).read_text(encoding="utf-8")
 
 
+def _load_optional_js(filename: str) -> str | None:
+    try:
+        return _load_js(filename)
+    except FileNotFoundError:
+        return None
+
+
 INSTALL_HOOKS_JS = _load_js("install_hooks.js")
 DIALOG_CLEANUP_JS = _load_js("dialog_cleanup.js")
 STREAMING_INIT_JS = _load_js("streaming_init.js")
@@ -22,7 +29,7 @@ CHECK_IDENTITY_JS = _load_js("check_identity.js")
 STOP_GENERATION_JS = _load_js("stop_generation.js")
 DOM_GC_CLEANUP_JS = _load_js("dom_gc_cleanup.js")
 EXTRACT_EMAIL_JS = _load_js("extract_email.js")
-BUILD_SIGNER_JS = _load_js("build_signer.js")
+BUILD_SIGNER_JS = _load_optional_js("build_signer.js")
 
 
 def build_streaming_init_args(

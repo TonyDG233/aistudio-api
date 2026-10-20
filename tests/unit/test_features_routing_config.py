@@ -38,6 +38,7 @@ def test_channels_routing_defaults(tmp_path: Path) -> None:
             "max_instances": 2,
             "max_pages": 1,
             "quota_pool": None,
+            "app_url": "",
         },
         "official": {
             "enabled": False,
@@ -89,6 +90,7 @@ features:
         "max_instances": 4,
         "max_pages": 4,
         "quota_pool": None,
+        "app_url": "",
     }
     assert features["build_surface"] is False
 

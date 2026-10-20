@@ -129,6 +129,8 @@ AUTH_RESPONDER_JS_TEMPLATE = """(() => {
 _app_ws_sink_state: object | None = None
 _APP_WS_CONNS: list[object] = []
 _APP_WS_CONNS_BY_REALM: dict[str, list[object]] = {}
+# request_id → (websocket, queue): native relay 的请求/响应关联表。
+_APP_WS_PENDING: dict[str, tuple[object, asyncio.Queue[dict[str, object]]]] = {}
 
 
 def _ws_realm_id(websocket: object) -> str:
@@ -164,11 +166,34 @@ async def _app_ws_sink_handler(websocket: object, *_args: object) -> None:
         len(connections),
     )
     try:
-        async for _ in websocket:  # type: ignore[attr-defined]
-            pass
+        async for raw in websocket:  # type: ignore[attr-defined]
+            try:
+                message = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(message, dict):
+                continue
+            request_id = str(message.get("request_id") or "")
+            if not request_id:
+                continue
+            pending = _APP_WS_PENDING.get(request_id)
+            if pending is None or pending[0] is not websocket:
+                continue
+            with suppress(asyncio.QueueFull):
+                pending[1].put_nowait(message)
     except Exception:
         pass
     finally:
+        for request_id, (owner, queue) in list(_APP_WS_PENDING.items()):
+            if owner is websocket:
+                with suppress(asyncio.QueueFull):
+                    queue.put_nowait(
+                        {
+                            "event_type": "error",
+                            "request_id": request_id,
+                            "message": "app 内嵌客户端 9998 连接断开",
+                        }
+                    )
         with suppress(Exception):
             connections.remove(websocket)
         if realm_id:
@@ -258,10 +283,14 @@ BUILD_SURFACE_DETECT_JS = """() => {
     const S = window.__buildSigner;
     if (!M) return { code: "MAKERSUITE_MISSING",
         message: "window.default_MakerSuite 不存在：页面未加载完成或上游结构变更" };
-    const tc = typeof M.Cn, tg = typeof M.GB;
-    if (tc !== "function" || tg !== "function")
-        return { code: "SIGNER_FUNCS_DRIFT",
-            message: "签名函数漂移: M.Cn=" + tc + " M.GB=" + tg };
+    if (!S) return { code: "SIGNER_MISSING",
+        message: "window.__buildSigner 不存在：签名脚本未注入或安装失败" };
+    const state = String(S.state || "");
+    if (state === "failed") {
+        let err = "";
+        try { err = String((typeof S.lastError === "function" && S.lastError()) || ""); } catch (e) {}
+        return { code: "SIGNER_FAILED", message: "state=failed lastError=" + err };
+    }
     let harvest = null;
     try { harvest = (S && typeof S.harvest === "function") ? S.harvest() : null; } catch (e) { harvest = null; }
     const h = (harvest && typeof harvest === "object") ? harvest : null;
@@ -277,7 +306,8 @@ BUILD_SURFACE_DETECT_JS = """() => {
 
 _DETECT_GUIDANCE: dict[str, str] = {
     "MAKERSUITE_MISSING": "等待页面就绪后重试；若持续缺失按上游结构变更处理（更新 build_signer.js hook 目标）",
-    "SIGNER_FUNCS_DRIFT": "上游签名函数名漂移；更新 hook 目标名单（M.Cn/M.GB 的新名）",
+    "SIGNER_MISSING": "确认 scripts.BUILD_SIGNER_JS 存在且注入成功；查看页面安装异常",
+    "SIGNER_FAILED": "查看 lastError；按结构探测结果修正 build_signer.js，禁止回退到硬编码符号",
     "TB_MISSING": "重跑 warmup / 检查 XHR hook 注入与真人活动门；确认 tb 与收割头 x-goog-api-key 均已捕获",
     "SIGNER_SCRIPT_MISSING": "build_signer.js 尚未就绪（S1a 未合入或脚本为空）；确认 scripts.BUILD_SIGNER_JS 存在",
     "UNKNOWN": "抓取页面诊断快照（state/lastError）后上报，按 R4 Holder/上游变更处理",
@@ -287,6 +317,64 @@ _DETECT_GUIDANCE: dict[str, str] = {
 BUILD_SIGNER_EXECUTE_JS = (
     "(args) => window.__buildSigner.execute(args.taskId, args.model, args.jsonBody)"
 )
+
+
+def _split_sse_payloads(buffer: str) -> tuple[list[str], str]:
+    """Split completed SSE events off ``buffer``; return (payloads, remainder)."""
+    normalized = buffer.replace("\r\n", "\n")
+    blocks = normalized.split("\n\n")
+    remainder = blocks.pop() if blocks else ""
+    payloads: list[str] = []
+    for block in blocks:
+        data_lines = [
+            line[5:].lstrip() for line in block.split("\n") if line.startswith("data:")
+        ]
+        if data_lines:
+            payloads.append("\n".join(data_lines))
+    return payloads, remainder
+
+
+def _sse_payload_leaves(payload: str) -> list[object]:
+    """Decode one SSE data payload into native REST/JSPB leaves (never raises)."""
+    text = payload.strip()
+    if not text or text == "[DONE]":
+        return []
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [value]
+    if isinstance(value, str):
+        try:
+            nested = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if isinstance(nested, (dict, list)):
+            return [nested]
+    return []
+
+
+def _as_holder_frame(leaf: object) -> str:
+    """Wrap a native REST leaf as a one-element Holder frame for the shared decoder."""
+    leaf_text = json.dumps(leaf, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps([[leaf_text]], ensure_ascii=False)
+
+
+def _preferred_transport(state: BuildSurfaceState) -> str:
+    """Choose native (primary) or signer (redundant) transport.
+
+    ``AISTUDIO_BUILD_TRANSPORT=signer`` is the explicit switch/rollback knob; it only
+    applies when the signer is healthy. Otherwise native wins whenever connected.
+    """
+    forced = os.getenv("AISTUDIO_BUILD_TRANSPORT", "").strip().lower()
+    if forced == "signer" and state.signer_ready:
+        return "signer"
+    if forced == "native" and state.native_ready:
+        return "native"
+    return "native" if state.native_ready else "signer"
 
 
 class BuildSurfaceError(RuntimeError):
@@ -312,10 +400,14 @@ class BuildSurfaceState:
     account_id: str | None = None
     auth_user: str = "0"
     app_id: str = ""
+    # ready 表示至少一条传输可用；两条路径各自维护健康状态，互不前置。
     ready: bool = False
+    native_ready: bool = False
+    signer_ready: bool = False
     ready_state: str = ""
     harvest: dict[str, object] | None = None
     last_error: str = ""
+    signer_error: str = ""
     # rid → asyncio.Queue, the generator task table (one entry per in-flight task).
     task_queues: dict[str, asyncio.Queue[dict[str, object]]] = field(
         default_factory=dict
@@ -718,6 +810,94 @@ class BuildSurface:
     def _connections(self) -> list[object]:
         return _realm_connections(self._realm_id)
 
+    async def _dispatch_native(
+        self, request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]] | None:
+        """Send a generation spec to the app's 9998 client; return its raw event queue.
+
+        Native transport is independent of the top-page signer: it only needs the
+        preview iframe client connected to 9998.
+        """
+        connections = self._connections()
+        if not connections:
+            return None
+        websocket = connections[-1]
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        _APP_WS_PENDING[request_id] = (websocket, queue)
+        spec = {
+            "method": "POST",
+            "path": f"/v1beta/models/{model}:streamGenerateContent",
+            "query_params": {"alt": "sse"},
+            "request_attempt_id": request_id,
+            "request_id": request_id,
+            "streaming_mode": "real",
+            "is_generative": True,
+            "body": json_body,
+        }
+        try:
+            await websocket.send(json.dumps(spec))  # type: ignore[attr-defined]
+        except Exception as exc:
+            _APP_WS_PENDING.pop(request_id, None)
+            logger.warning("[build] native 规格下发失败: %s", exc)
+            return None
+        return queue
+
+    async def _pump_native(
+        self,
+        request_id: str,
+        raw_queue: asyncio.Queue[dict[str, object]],
+        out_queue: asyncio.Queue[dict[str, object]],
+    ) -> None:
+        """Translate native WS events into the same normalized events as the signer."""
+        buffer = ""
+        saw_sse = False
+
+        def emit_payload(payload: str) -> None:
+            for leaf in _sse_payload_leaves(payload):
+                out_queue.put_nowait({"type": "chunk", "text": _as_holder_frame(leaf)})
+
+        try:
+            while True:
+                event = await raw_queue.get()
+                event_type = str(event.get("event_type") or "")
+                if event_type == "response_headers":
+                    out_queue.put_nowait(
+                        {"type": "status", "status": int(str(event.get("status") or 0))}
+                    )
+                    continue
+                if event_type == "chunk":
+                    buffer += str(event.get("data") or "")
+                    payloads, buffer = _split_sse_payloads(buffer)
+                    if payloads:
+                        saw_sse = True
+                    for payload in payloads:
+                        emit_payload(payload)
+                    continue
+                if event_type == "stream_close":
+                    payloads, buffer = _split_sse_payloads(buffer + "\n\n")
+                    if payloads:
+                        saw_sse = True
+                        for payload in payloads:
+                            emit_payload(payload)
+                    elif buffer.strip() and not saw_sse:
+                        # 非 SSE 客户端：整段缓冲就是 holder/JSON 原文。
+                        out_queue.put_nowait({"type": "chunk", "text": buffer})
+                        buffer = ""
+                    out_queue.put_nowait({"type": "done"})
+                    return
+                if event_type == "error":
+                    message = str(event.get("message") or "native relay error")
+                    out_queue.put_nowait({"type": "error", "message": message})
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            out_queue.put_nowait(
+                {"type": "error", "message": f"native relay failed: {exc}"}
+            )
+        finally:
+            _APP_WS_PENDING.pop(request_id, None)
+
     async def _install_realm_ws_tag(self, page: CDPPage) -> None:
         """Tag the app's 9998 WebSocket with ``?realm=`` so the sink can demux it."""
         if not self._realm_id or getattr(page, "has_realm_ws_tag", False):
@@ -824,6 +1004,9 @@ class BuildSurface:
         state.auth_user = auth_user
         state.account_id = account_id
         state.ready = False
+        state.native_ready = False
+        state.signer_ready = False
+        state.signer_error = ""
 
         page = state.page
         created = False
@@ -861,12 +1044,11 @@ class BuildSurface:
                 )
 
             signer_js = _load_build_signer_js()
+            signer_available = bool(signer_js)
             if not signer_js:
-                raise BuildSurfaceError(
-                    "ensure_ready",
-                    "SIGNER_SCRIPT_MISSING",
-                    "scripts.BUILD_SIGNER_JS 缺失或为空，无法安装页面签名器",
-                    _DETECT_GUIDANCE["SIGNER_SCRIPT_MISSING"],
+                # 原生通道不依赖 signer：脚本缺失时仍启动页面，只关闭直连备用路径。
+                logger.warning(
+                    "[build] 签名器脚本缺失：仅启用原生 9998 通道（不阻塞渠道激活）"
                 )
             auth_index = auth_user if str(auth_user).isdigit() else "0"
             responder_js = AUTH_RESPONDER_JS_TEMPLATE.replace(
@@ -875,9 +1057,10 @@ class BuildSurface:
             await page.cdp.send(
                 "Page.addScriptToEvaluateOnNewDocument", {"source": responder_js}
             )
-            await page.cdp.send(
-                "Page.addScriptToEvaluateOnNewDocument", {"source": signer_js}
-            )
+            if signer_js:
+                await page.cdp.send(
+                    "Page.addScriptToEvaluateOnNewDocument", {"source": signer_js}
+                )
 
             try:
                 # 后台标签页会被浏览器节流并跳过 boot 期网络预热；宿主 warmup 需要前台可见性。
@@ -937,12 +1120,31 @@ class BuildSurface:
                     f"app 内嵌客户端未在 {connect_timeout:.0f}s 内连接 9998",
                     "检查 Build 应用是否可打开、账号是否可访问，以及代理/网络是否拦截 9998",
                 )
+            # 原生 Build 的可用性只取决于 9998 客户端连接；signer 是独立备用传输，
+            # 不能反过来作为渠道激活的前置条件。
+            state.native_ready = True
+            state.ready = True
+            state.ready_state = "native"
+            state.last_error = ""
+            logger.info(
+                "[build] 原生通道就绪：9998 app 客户端已连接（realm=%s, signer=%s）",
+                self._realm_id or "default",
+                await self._probe_signer_state_safe(page),
+            )
             # gate#2：落在 app 连接之后，作为"助手就绪后的首次可信交互"触发宿主 warmup 门。
             await self._pass_human_gate(page)
-            # 主动 warmup（装置实证机制，spikeQ3/Q4）：经 9998 WS 向 app 内嵌客户端下发
-            # __warmup__ 规格 → 宿主发起一次被吞没的 RPC → tb 捕获 + 收割头就位（零上游流量）。
-            await self._trigger_warmup()
-            await self._wait_for_ready(page, ready_timeout_s=ready_timeout_s)
+            if signer_available:
+                # 主动 warmup（装置实证机制，spikeQ3/Q4）：经 9998 WS 向 app 内嵌客户端下发
+                # __warmup__ 规格 → 宿主发起一次被吞没的 RPC → tb 捕获 + 收割头就位（零上游流量）。
+                await self._trigger_warmup()
+                await self._wait_for_signer_ready(
+                    page,
+                    ready_timeout_s=min(20.0, ready_timeout_s),
+                    strict=False,
+                )
+            else:
+                state.signer_ready = False
+                state.signer_error = "build_signer.js 未加载：signer 直连不可用"
         except BaseException:
             if created and state.page is page:
                 # A freshly created page that never became ready is not reusable.
@@ -1011,11 +1213,23 @@ class BuildSurface:
             )
             return False
         await self._trigger_warmup()
-        try:
-            await self._wait_for_ready(page, ready_timeout_s=60.0)
-        except BuildSurfaceError:
-            logger.warning("[build] 原地重暖机失败，转完整重建")
-            return False
+        self.state.native_ready = True
+        self.state.ready = True
+        self.state.ready_state = "native"
+        if not _load_build_signer_js():
+            self.state.signer_ready = False
+            self.state.signer_error = "build_signer.js 未加载：signer 直连不可用"
+            logger.warning(
+                "[build] 原地恢复：原生 WS 已重连，signer 脚本缺失（仅原生）"
+            )
+            return True
+        if not await self._wait_for_signer_ready(
+            page, ready_timeout_s=20.0, strict=False
+        ):
+            logger.warning(
+                "[build] 原地恢复：原生 WS 已重连，但签名器未就绪（保留原生通道）"
+            )
+            return True
         logger.info("[build] 原地恢复成功：WS 重连 + 签名器重新就绪")
         return True
 
@@ -1112,16 +1326,29 @@ class BuildSurface:
         return True
 
     async def _wait_for_ready(self, page: CDPPage, *, ready_timeout_s: float) -> None:
+        """Strict signer wait kept for callers/tests that require the direct path."""
+        ready = await self._wait_for_signer_ready(
+            page, ready_timeout_s=ready_timeout_s, strict=True
+        )
+        if not ready:  # pragma: no cover - strict=True always raises on failure
+            raise BuildSurfaceError(
+                "ensure_ready", "SIGNER_FAILED", "签名器未就绪", "重试 ensure_ready"
+            )
+
+    async def _wait_for_signer_ready(
+        self, page: CDPPage, *, ready_timeout_s: float, strict: bool
+    ) -> bool:
+        """Poll the page signer; strict raises, non-strict records health only."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + ready_timeout_s
         last_state = ""
         warmup_retries = 0
-        next_retry_at = loop.time() + 20.0
+        next_retry_at = loop.time() + 10.0
         while loop.time() < deadline:
-            if warmup_retries < 3 and loop.time() >= next_retry_at:
-                # 兜底重发 warmup 规格（首发见 ensure_ready；宿主偶发吞掉第一发）。
+            if warmup_retries < 1 and loop.time() >= next_retry_at:
+                # 首次 warmup 在 ensure_ready 已发；宿主偶发吞掉时最多补发一次。
                 warmup_retries += 1
-                next_retry_at = loop.time() + 20.0
+                next_retry_at = loop.time() + 10.0
                 await self._trigger_warmup()
             if page.is_closed():
                 raise BuildSurfaceError(
@@ -1137,6 +1364,8 @@ class BuildSurface:
                 last_state = str(snapshot.get("state") or "")
                 if last_state == "ready":
                     self.state.ready = True
+                    self.state.signer_ready = True
+                    self.state.signer_error = ""
                     self.state.ready_state = last_state
                     harvest = snapshot.get("harvest")
                     self.state.harvest = harvest if isinstance(harvest, dict) else None
@@ -1148,25 +1377,43 @@ class BuildSurface:
                         "[build] 签名器就绪: harvest 头=%s",
                         sorted(headers) if isinstance(headers, dict) else "n/a",
                     )
-                    return
+                    return True
                 if last_state == "failed":
                     last_error = str(snapshot.get("lastError") or "unknown")
-                    self.state.last_error = last_error
-                    raise BuildSurfaceError(
-                        "ensure_ready",
-                        "SIGNER_FAILED",
-                        f"window.__buildSigner.state=failed lastError={last_error}",
-                        "查看 lastError 详情；按失败类型重试或更新 build_signer.js",
+                    self.state.signer_ready = False
+                    self.state.signer_error = last_error
+                    if strict:
+                        self.state.last_error = last_error
+                        raise BuildSurfaceError(
+                            "ensure_ready",
+                            "SIGNER_FAILED",
+                            f"window.__buildSigner.state=failed lastError={last_error}",
+                            "查看 lastError 详情；按失败类型重试或更新 build_signer.js",
+                        )
+                    logger.warning(
+                        "[build] 签名器失败，保留原生通道（signer_error=%s）",
+                        last_error,
                     )
+                    return False
             await asyncio.sleep(0.5)
 
+        self.state.signer_ready = False
         code, message = await self._probe_diagnosis(page)
-        raise BuildSurfaceError(
-            "ensure_ready",
-            code,
-            f"签名器未在 {ready_timeout_s:.0f}s 内就绪 (last_state={last_state or 'unknown'}): {message}",
-            _DETECT_GUIDANCE.get(code, _DETECT_GUIDANCE["UNKNOWN"]),
+        detail = (
+            f"签名器未在 {ready_timeout_s:.0f}s 内就绪 "
+            f"(last_state={last_state or 'unknown'}): {message}"
         )
+        self.state.signer_error = detail
+        if strict:
+            self.state.last_error = detail
+            raise BuildSurfaceError(
+                "ensure_ready",
+                code,
+                detail,
+                _DETECT_GUIDANCE.get(code, _DETECT_GUIDANCE["UNKNOWN"]),
+            )
+        logger.warning("[build] 签名器未就绪，保留原生通道（%s）", detail)
+        return False
 
     async def _probe_diagnosis(self, page: CDPPage) -> tuple[str, str]:
         with suppress(Exception):
@@ -1195,12 +1442,20 @@ class BuildSurface:
                 "Build 宿主页不存在或已关闭",
                 "先调用 ensure_ready 建立就绪页面",
             )
-        if not state.ready:
+        if not state.ready and not (state.native_ready or state.signer_ready):
             raise BuildSurfaceError(
                 "stream",
                 "SURFACE_NOT_READY",
                 f"Build 面尚未就绪 (ready_state={state.ready_state or 'unknown'})",
                 "先调用 ensure_ready 并确认返回 ready=True",
+            )
+        transport = _preferred_transport(state)
+        if transport == "signer" and not state.signer_ready and not state.ready:
+            raise BuildSurfaceError(
+                "stream",
+                "SIGNER_NOT_READY",
+                "signer 与原生通道均不可用",
+                "先调用 ensure_ready 确认 9998 连接或签名器就绪",
             )
 
         task_id = uuid.uuid4().hex[:12]
@@ -1226,8 +1481,10 @@ class BuildSurface:
         decoded_frames = 0
         dropped_samples: list[str] = []
         terminal = False
+        emitted = False
+        pump_task: asyncio.Task[None] | None = None
 
-        try:
+        async def dispatch_signer() -> None:
             try:
                 # Fire-and-forget: frames回流 through the binding while execute() runs.
                 await page.evaluate(
@@ -1243,6 +1500,41 @@ class BuildSurface:
                     "确认 ensure_ready 已完成且页面未导航离开",
                 ) from exc
 
+        async def fallback_to_signer(trigger: str) -> bool:
+            nonlocal transport, pump_task
+            if transport != "native" or emitted or not state.signer_ready:
+                return False
+            logger.warning("[build] native 传输失败（%s），回退 signer 直连", trigger)
+            if pump_task is not None:
+                pump_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await pump_task
+                pump_task = None
+            _APP_WS_PENDING.pop(task_id, None)
+            while not queue.empty():
+                queue.get_nowait()
+            transport = "signer"
+            await dispatch_signer()
+            return True
+
+        try:
+            if transport == "native":
+                raw_queue = await self._dispatch_native(task_id, model, json_text)
+                if raw_queue is None:
+                    if not await fallback_to_signer("9998 不可用"):
+                        raise BuildSurfaceError(
+                            "stream",
+                            "NATIVE_WS_MISSING",
+                            "原生 9998 客户端不可用，且 signer 未就绪",
+                            "确认 Build app 已连接 9998；或修复 build_signer.js 后重试",
+                        )
+                else:
+                    pump_task = asyncio.create_task(
+                        self._pump_native(task_id, raw_queue, queue)
+                    )
+            if transport == "signer":
+                await dispatch_signer()
+
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout_s
             while not terminal:
@@ -1255,6 +1547,9 @@ class BuildSurface:
                     )
                 remaining = deadline - loop.time()
                 if remaining <= 0:
+                    if await fallback_to_signer("stream timeout"):
+                        deadline = loop.time() + timeout_s
+                        continue
                     break
                 try:
                     event = await asyncio.wait_for(
@@ -1273,12 +1568,14 @@ class BuildSurface:
                 event_type = str(event.get("type") or "")
                 if event_type == "status":
                     status = int(str(event.get("status") or 0))
+                    emitted = True
                     yield ("status", status)
                     deadline = loop.time() + timeout_s
                 elif event_type == "chunk":
                     text = str(event.get("text") or "")
                     if not text:
                         continue
+                    emitted = True
                     deadline = loop.time() + timeout_s
                     leaves, dropped = decode_holder_frame(text)
                     dropped_samples.extend(dropped)
@@ -1315,11 +1612,15 @@ class BuildSurface:
                             yield ("thought_signature", candidate.thought_signature)
                 elif event_type == "error":
                     message = str(event.get("message") or "unknown build surface error")
+                    if await fallback_to_signer(message[:200]):
+                        deadline = loop.time() + timeout_s
+                        continue
+                    code = "NATIVE_ERROR" if transport == "native" else "SIGNER_ERROR"
                     raise BuildSurfaceError(
                         "stream",
-                        "SIGNER_ERROR",
+                        code,
                         message,
-                        "查看 build_signer.js 上报的错误；必要时重跑 ensure_ready",
+                        "查看原生 WS/signer 上报的错误；必要时重跑 ensure_ready",
                     )
                 elif event_type in ("done", "aborted"):
                     while not queue.empty():
@@ -1355,6 +1656,11 @@ class BuildSurface:
                     dropped_samples[:3],
                 )
         finally:
+            if pump_task is not None:
+                pump_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await pump_task
+            _APP_WS_PENDING.pop(task_id, None)
             state.task_queues.pop(task_id, None)
 
         if latest_finish_reason is not None:
