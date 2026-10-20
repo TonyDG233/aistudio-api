@@ -31,26 +31,43 @@ _FALLBACK_MODELS = [
         "id": "gemini-3.8-flash",
         "displayName": "Gemini 3.8 Flash",
         "description": "Latest Gemini 3.8 Flash model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-4-argon",
+        "displayName": "Gemini 4 Argon",
+        "description": "Our most capable model",
+        "paid": True,
+    },
+    {
+        "id": "gemini-3-flash-preview",
+        "displayName": "Gemini 3 Flash Preview",
+        "description": "Fast frontier model",
+        "paid": True,
     },
     {
         "id": "gemini-3.7-flash",
         "displayName": "Gemini 3.7 Flash",
         "description": "Gemini 3.7 Flash default text model",
+        "paid": False,
     },
     {
         "id": "gemini-3.5-flash-lite",
         "displayName": "Gemini 3.5 Flash Lite",
         "description": "Ultra fast and lightweight model",
+        "paid": False,
     },
     {
         "id": "gemini-3.1-pro-preview",
         "displayName": "Gemini 3.1 Pro Preview",
         "description": "Pro capabilities with complex reasoning",
+        "paid": False,
     },
     {
         "id": "gemini-3.6-flash",
         "displayName": "Gemini 3.6 Flash",
         "description": "High throughput flash model",
+        "paid": True,
     },
     {
         "id": "gemini-3.5-flash",
@@ -61,41 +78,49 @@ _FALLBACK_MODELS = [
         "id": "gemini-3.1-flash-image",
         "displayName": "Nano Banana 2",
         "description": "Image generation and multimodal editing",
+        "paid": True,
     },
     {
         "id": "gemini-3-pro-image",
         "displayName": "Nano Banana Pro",
         "description": "High-fidelity multimodal generation",
+        "paid": True,
     },
     {
         "id": "gemma-4-31b-it",
         "displayName": "Gemma 4 31B IT",
         "description": "Open weights flagship text model",
+        "paid": False,
     },
     {
         "id": "gemma-4-26b-a4b-it",
         "displayName": "Gemma 4 26B A4B IT",
         "description": "Open weights instruction tuned model",
+        "paid": False,
     },
     {
         "id": "veo-3.1-generate-preview",
         "displayName": "Veo 3.1",
         "description": "Video generation preview model",
+        "paid": True,
     },
     {
         "id": "gemini-pro-latest",
         "displayName": "Gemini Pro Latest",
         "description": "Latest stable Gemini Pro alias",
+        "paid": False,
     },
     {
         "id": "gemini-flash-latest",
         "displayName": "Gemini Flash Latest",
         "description": "Latest stable Gemini Flash alias",
+        "paid": False,
     },
     {
         "id": "gemini-flash-lite-latest",
         "displayName": "Gemini Flash-Lite Latest",
         "description": "Latest stable Gemini Flash Lite alias",
+        "paid": False,
     },
 ]
 

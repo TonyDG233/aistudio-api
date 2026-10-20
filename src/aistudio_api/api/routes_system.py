@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import get_runtime_state
 from aistudio_api.api.response_models import (
     HealthResponse,
     ModelStatsResponse,
+    StatsBucketResponse,
+    StatsRangeResponse,
     StatsResponse,
-    StatsTotalsResponse,
+    StatsTimeseriesPoint,
+    StatsTimeseriesResponse,
+)
+from aistudio_api.api.state import (
+    STATS_SCHEMA_VERSION,
+    STATS_TIMEZONE,
+    ModelStatsItem,
+    StatsCounters,
+    normalize_model_name,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
     _resolve_config_path,
@@ -28,6 +39,7 @@ logger = get_logger("routes.system")
 
 if TYPE_CHECKING:
     from aistudio_api.api.state import RuntimeState
+    from aistudio_api.infrastructure.gateway.session import BrowserSession
 
 public_router = APIRouter()
 protected_router = APIRouter()
@@ -37,33 +49,115 @@ def health_response() -> HealthResponse:
     return HealthResponse(status="ok", busy=False)
 
 
-def stats_response() -> StatsResponse:
+def _range_response(info: dict[str, object]) -> StatsRangeResponse:
+    def _str(key: str, default: str | None = None) -> str | None:
+        value = info.get(key)
+        return value if isinstance(value, str) else default
+
+    retention = info.get("retention_days")
+    return StatsRangeResponse(
+        key=_str("key", "all") or "all",
+        start=_str("start"),
+        end=_str("end"),
+        timezone=_str("timezone", "Asia/Shanghai") or "Asia/Shanghai",
+        data_start=_str("data_start"),
+        retention_days=retention if isinstance(retention, int) else 90,
+        partial=bool(info.get("partial")),
+    )
+
+
+def _bucket_response(counter: StatsCounters) -> StatsBucketResponse:
+    return StatsBucketResponse(
+        requests=counter.requests,
+        attempts=counter.attempts,
+        success=counter.success,
+        rate_limited=counter.rate_limited,
+        errors=counter.errors,
+        client_requests=counter.client_requests,
+        client_success=counter.client_success,
+        client_errors=counter.client_errors,
+        client_rate_limited=counter.client_rate_limited,
+        client_aborted=counter.client_aborted,
+        prompt_tokens=counter.prompt_tokens,
+        completion_tokens=counter.completion_tokens,
+        reasoning_tokens=counter.reasoning_tokens,
+        cache_read_tokens=counter.cache_read_tokens,
+        cache_write_tokens=counter.cache_write_tokens,
+        total_tokens=counter.total_tokens,
+        cache_hit_rate=counter.cache_hit_rate,
+        count_requests=counter.count_requests,
+        count_success=counter.count_success,
+        count_errors=counter.count_errors,
+        count_input_tokens=counter.count_input_tokens,
+        usage_missing=counter.usage_missing,
+        last_used=counter.last_used,
+    )
+
+
+def _model_response(
+    counter: StatsCounters, *, paid: bool | None = None
+) -> ModelStatsResponse:
+    if isinstance(counter, ModelStatsItem):
+        formats = {
+            name: _bucket_response(bucket) for name, bucket in counter.formats.items()
+        }
+        surfaces = {
+            name: _bucket_response(bucket) for name, bucket in counter.surfaces.items()
+        }
+    else:
+        formats = {}
+        surfaces = {}
+    return ModelStatsResponse(
+        **_bucket_response(counter).model_dump(),
+        paid=paid,
+        formats=formats,
+        surfaces=surfaces,
+    )
+
+
+async def _paid_map(session: BrowserSession | None = None) -> dict[str, bool]:
+    try:
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        discovered = await model_discovery.get_models(session=session)
+    except Exception:
+        return {}
+    result: dict[str, bool] = {}
+    for item in discovered:
+        name = normalize_model_name(item.get("id") or item.get("name"))
+        value = item.get("paid")
+        if name and isinstance(value, bool):
+            result[name] = value
+    return result
+
+
+async def stats_response(
+    *,
+    range_key: str = "all",
+    start: str | None = None,
+    end: str | None = None,
+    session: BrowserSession | None = None,
+) -> StatsResponse:
     from aistudio_api.api.state import runtime_state
 
-    stats = dict(runtime_state.model_stats)
-    totals = StatsTotalsResponse(
-        requests=sum(s.requests for s in stats.values()),
-        success=sum(s.success for s in stats.values()),
-        rate_limited=sum(s.rate_limited for s in stats.values()),
-        errors=sum(s.errors for s in stats.values()),
-        prompt_tokens=sum(s.prompt_tokens for s in stats.values()),
-        completion_tokens=sum(s.completion_tokens for s in stats.values()),
-        total_tokens=sum(s.total_tokens for s in stats.values()),
+    try:
+        models, range_info = runtime_state.stats_for_range(range_key, start, end)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    paid = await _paid_map(session)
+    totals = ModelStatsItem()
+    for item in models.values():
+        totals.add(item)
+    return StatsResponse(
+        schema_version=STATS_SCHEMA_VERSION,
+        generated_at=datetime.now(STATS_TIMEZONE).isoformat(timespec="seconds"),
+        range=_range_response(range_info),
+        models={
+            name: _model_response(item, paid=paid.get(name))
+            for name, item in models.items()
+        },
+        totals=_model_response(totals),
     )
-    models = {
-        name: ModelStatsResponse(
-            requests=s.requests,
-            success=s.success,
-            rate_limited=s.rate_limited,
-            errors=s.errors,
-            prompt_tokens=s.prompt_tokens,
-            completion_tokens=s.completion_tokens,
-            total_tokens=s.total_tokens,
-            last_used=s.last_used,
-        )
-        for name, s in stats.items()
-    }
-    return StatsResponse(models=models, totals=totals)
 
 
 @public_router.get("/health", response_model=HealthResponse)
@@ -71,9 +165,59 @@ async def health():
     return health_response()
 
 
-@protected_router.get("/stats", response_model=StatsResponse)
-async def stats():
-    return stats_response()
+@protected_router.get("/api/stats", response_model=StatsResponse)
+async def stats(
+    range_key: str = Query("all", alias="range"),
+    start: str | None = None,
+    end: str | None = None,
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> StatsResponse:
+    session = runtime_state.client._session if runtime_state.client else None
+    return await stats_response(
+        range_key=range_key, start=start, end=end, session=session
+    )
+
+
+@protected_router.get("/api/stats/timeseries", response_model=StatsTimeseriesResponse)
+async def stats_timeseries(
+    range_key: str = Query("7d", alias="range"),
+    start: str | None = None,
+    end: str | None = None,
+    bucket: str = "day",
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> StatsTimeseriesResponse:
+    if bucket != "day":
+        raise HTTPException(400, detail="only bucket=day is supported")
+    try:
+        _, range_info = runtime_state.stats_for_range(range_key, start, end)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+
+    points: list[StatsTimeseriesPoint] = []
+    raw_start = range_info.get("start")
+    raw_end = range_info.get("end")
+    if isinstance(raw_start, str) and isinstance(raw_end, str):
+        cursor = date.fromisoformat(raw_start)
+        final = date.fromisoformat(raw_end)
+        while cursor <= final:
+            day_models = runtime_state.daily_stats.get(cursor.isoformat())
+            totals = ModelStatsItem()
+            if day_models:
+                for item in day_models.values():
+                    totals.add(item)
+            points.append(
+                StatsTimeseriesPoint(
+                    date=cursor.isoformat(),
+                    totals=_bucket_response(totals) if day_models else None,
+                )
+            )
+            cursor += timedelta(days=1)
+    return StatsTimeseriesResponse(
+        generated_at=datetime.now(STATS_TIMEZONE).isoformat(timespec="seconds"),
+        range=_range_response(range_info),
+        bucket="day",
+        points=points,
+    )
 
 
 # ========== 调度与配额管理 API ==========

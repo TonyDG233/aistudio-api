@@ -8,6 +8,7 @@ specific wire protocol happens outside, in the API layer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -217,7 +218,7 @@ async def _acquire_candidate_lease(
                 _raise_switch_exhausted(ctx)
 
 
-async def generate(
+async def _generate_impl(
     *,
     model_path: str,
     req: GeminiGenerateContentRequest,
@@ -365,7 +366,11 @@ async def generate(
                 account_id=success_account_id,
             )
             runtime_state.record(
-                normalized.model, "success", output.usage, api_format=api_format
+                normalized.model,
+                "success",
+                output.usage,
+                api_format=api_format,
+                surface=surface,
             )
             logger.info(
                 "生成完成: format=%s, model=%s, 输入Tokens=%s, 输出Tokens=%s",
@@ -427,6 +432,42 @@ async def generate(
             "type": "rate_limit_exceeded",
         },
     ) from last_error
+
+
+async def generate(
+    *,
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+    api_format: str = "gemini",
+    atg_factory: Callable[[], AtgProcessor] | None = None,
+) -> GenerationOutcome:
+    """Run a non-streaming generation and record one client-level outcome."""
+    try:
+        outcome = await _generate_impl(
+            model_path=model_path,
+            req=req,
+            client=client,
+            api_format=api_format,
+            atg_factory=atg_factory,
+        )
+    except asyncio.CancelledError:
+        runtime_state.record_client(model_path, "aborted", api_format=api_format)
+        raise
+    except HTTPException as exc:
+        outcome_kind = "rate_limited" if exc.status_code == 429 else "error"
+        runtime_state.record_client(model_path, outcome_kind, api_format=api_format)
+        raise
+    except Exception:
+        runtime_state.record_client(model_path, "error", api_format=api_format)
+        raise
+    runtime_state.record_client(
+        outcome.model,
+        "success",
+        api_format=api_format,
+        surface=outcome.surface,
+    )
+    return outcome
 
 
 async def _stream_generation_impl(
@@ -711,7 +752,11 @@ async def _stream_generation_impl(
     )
     if normalized is not None:
         runtime_state.record(
-            normalized.model, "success", final_usage, api_format=api_format
+            normalized.model,
+            "success",
+            final_usage,
+            api_format=api_format,
+            surface=surface,
         )
     logger.info(
         "流式完成: format=%s, model=%s, 输入Tokens=%s, 输出Tokens=%s",
@@ -737,17 +782,38 @@ async def stream_generation(
     api_format: str = "gemini",
     atg_factory: Callable[[], AtgProcessor] | None = None,
 ) -> AsyncIterator[StreamEvent]:
-    """Run streaming generation; release the lease even if the client cancels."""
+    """Run streaming generation; record one client outcome and always release."""
     holder = _LeaseHolder()
+    yielded = False
+    last_model = model_path
     try:
-        async for event in _stream_generation_impl(
-            model_path=model_path,
-            req=req,
-            client=client,
-            api_format=api_format,
-            atg_factory=atg_factory,
-            lease_holder=holder,
-        ):
-            yield event
+        try:
+            async for event in _stream_generation_impl(
+                model_path=model_path,
+                req=req,
+                client=client,
+                api_format=api_format,
+                atg_factory=atg_factory,
+                lease_holder=holder,
+            ):
+                if event.model:
+                    last_model = event.model
+                yielded = True
+                yield event
+        except (asyncio.CancelledError, GeneratorExit):
+            runtime_state.record_client(last_model, "aborted", api_format=api_format)
+            raise
+        except HTTPException as exc:
+            outcome_kind = "rate_limited" if exc.status_code == 429 else "error"
+            if yielded:
+                outcome_kind = "aborted"
+            runtime_state.record_client(last_model, outcome_kind, api_format=api_format)
+            raise
+        except Exception:
+            runtime_state.record_client(
+                last_model, "aborted" if yielded else "error", api_format=api_format
+            )
+            raise
+        runtime_state.record_client(last_model, "success", api_format=api_format)
     finally:
         await holder.release()

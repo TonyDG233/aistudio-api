@@ -7,6 +7,7 @@ mutates generation templates, captures snapshots, or applies ATG wrapping.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import cast
@@ -146,7 +147,7 @@ def build_count_body(req: GeminiGenerateContentRequest, model: str) -> list[obje
     return _packed_body(req, model)
 
 
-async def count_tokens(
+async def _count_tokens_impl(
     *,
     model_path: str,
     req: GeminiGenerateContentRequest,
@@ -209,7 +210,6 @@ async def count_tokens(
                 surface=surface,
                 account_id=account_id,
             )
-            runtime_state.record_token_count(effective_model_path, api_format)
             logger.info(
                 "计数完成: format=%s, model=%s, totalTokens=%s",
                 api_format,
@@ -235,6 +235,7 @@ async def count_tokens(
                     routing=pipe,
                     route_ctx=ctx,
                     lease=lease,
+                    record_stats=False,
                 )
             except BaseException:
                 if pipe is not None and ctx is not None:
@@ -268,3 +269,38 @@ async def count_tokens(
             "type": "rate_limit_exceeded",
         },
     ) from last_error
+
+
+async def count_tokens(
+    *,
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+    api_format: str = "gemini",
+) -> TokenCountOutcome:
+    """Count tokens and record one client-level count outcome."""
+    try:
+        outcome = await _count_tokens_impl(
+            model_path=model_path,
+            req=req,
+            client=client,
+            api_format=api_format,
+        )
+    except asyncio.CancelledError:
+        runtime_state.record_token_count(
+            model_path, api_format=api_format, outcome="error"
+        )
+        raise
+    except Exception:
+        runtime_state.record_token_count(
+            model_path, api_format=api_format, outcome="error"
+        )
+        raise
+    runtime_state.record_token_count(
+        outcome.model,
+        api_format=api_format,
+        surface=outcome.surface,
+        outcome="success",
+        total_tokens=outcome.total_tokens,
+    )
+    return outcome

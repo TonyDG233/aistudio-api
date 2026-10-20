@@ -26,12 +26,13 @@ def test_model_stats_persistence(tmp_path, monkeypatch):
 
     assert stats_file.is_file()
     saved = json.loads(stats_file.read_text(encoding="utf-8"))
-    assert saved["gemini-3.7-flash"]["requests"] == 2
-    assert saved["gemini-3.7-flash"]["success"] == 1
-    assert saved["gemini-3.7-flash"]["rate_limited"] == 1
-    assert saved["gemini-3.7-flash"]["prompt_tokens"] == 10
-    assert saved["gemini-3.7-flash"]["total_tokens"] == 30
-    assert saved["gemini-3.1-flash-image-preview"]["errors"] == 1
+    assert saved["schema_version"] == 2
+    assert saved["models"]["gemini-3.7-flash"]["requests"] == 2
+    assert saved["models"]["gemini-3.7-flash"]["success"] == 1
+    assert saved["models"]["gemini-3.7-flash"]["rate_limited"] == 1
+    assert saved["models"]["gemini-3.7-flash"]["prompt_tokens"] == 10
+    assert saved["models"]["gemini-3.7-flash"]["total_tokens"] == 30
+    assert saved["models"]["gemini-3.1-flash-image-preview"]["errors"] == 1
 
     # Simulate restart by creating a new RuntimeState instance
     state2 = RuntimeState()
