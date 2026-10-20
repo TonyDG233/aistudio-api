@@ -1,10 +1,11 @@
-<script setup lang="ts">
-import { ref, onMounted } from 'vue'
+﻿<script setup lang="ts">
+import { ref } from 'vue'
 import type { AccountGroupItem } from './types.ts'
 import { SURFACE_OPTIONS } from './schema.ts'
 import ConfigInput from './ConfigInput.vue'
-import { systemApi, type SurfaceInstancesResponse } from '@/api/system.ts'
-import { Plus, RefreshCw, Trash2, Users } from 'lucide-vue-next'
+import ConfigSwitch from './ConfigSwitch.vue'
+import FieldHelpTip from './FieldHelpTip.vue'
+import { ArrowDown, ArrowUp, Plus, Trash2, Users } from 'lucide-vue-next'
 
 const props = withDefaults(defineProps<{ groups?: AccountGroupItem[] }>(), {
   groups: () => [],
@@ -14,38 +15,72 @@ const emit = defineEmits<{
   'update:groups': [val: AccountGroupItem[]]
 }>()
 
+const tierDrafts = ref<Record<number, string>>({})
+
+function clearTierDrafts() {
+  tierDrafts.value = {}
+}
+
 function commit(list: AccountGroupItem[]) {
   emit('update:groups', list)
 }
 
 function updateGroup(index: number, patch: Partial<AccountGroupItem>) {
   const list = [...props.groups]
-  list[index] = { ...list[index], ...patch }
+  const next = { ...list[index], ...patch }
+  delete next.max_page_instances
+  list[index] = next
   commit(list)
 }
 
+function nextGroupName(): string {
+  const used = new Set(props.groups.map((g) => g.name).filter(Boolean))
+  let index = props.groups.length + 1
+  while (used.has(`group-${index}`)) index += 1
+  return `group-${index}`
+}
+
 function addGroup() {
+  clearTierDrafts()
   commit([
     ...props.groups,
     {
-      name: `group-${props.groups.length + 1}`,
+      name: nextGroupName(),
+      enabled: true,
+      weight: 1.0,
       match_tier: [],
       match_emails_regex: null,
       allowed_surfaces: [],
-      max_page_instances: 2,
+      allowed_quota_pools: [],
+      max_pages: 2,
     },
   ])
 }
 
 function removeGroup(index: number) {
+  clearTierDrafts()
   const list = [...props.groups]
   list.splice(index, 1)
+  commit(list)
+}
+
+function moveGroup(index: number, direction: -1 | 1) {
+  const target = index + direction
+  if (target < 0 || target >= props.groups.length) return
+  clearTierDrafts()
+  const list = [...props.groups]
+  const [item] = list.splice(index, 1)
+  list.splice(target, 0, item)
   commit(list)
 }
 
 function toNumber(val: string | number | null, fallback: number): number {
   const n = Number(val)
   return Number.isFinite(n) ? n : fallback
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
 }
 
 function parseTierList(text: string): string[] {
@@ -61,6 +96,22 @@ function tierText(group: AccountGroupItem): string {
   return (group.match_tier || []).join(', ')
 }
 
+function tierValue(index: number, group: AccountGroupItem): string {
+  return tierDrafts.value[index] ?? tierText(group)
+}
+
+function updateTierDraft(index: number, value: string | number | null) {
+  const text = value === null ? '' : String(value)
+  tierDrafts.value = { ...tierDrafts.value, [index]: text }
+  updateGroup(index, { match_tier: parseTierList(text) })
+}
+
+function surfacesText(group: AccountGroupItem): string {
+  const surfaces = group.allowed_surfaces || []
+  if (!surfaces.length) return '未允许任何渠道'
+  return surfaces.map((surface) => (surface === 'chat' ? 'PG/Chat' : 'Build')).join(' + ')
+}
+
 function toggleSurface(index: number, surface: string, checked: boolean) {
   const current = props.groups[index].allowed_surfaces || []
   const next = checked
@@ -69,31 +120,37 @@ function toggleSurface(index: number, surface: string, checked: boolean) {
   updateGroup(index, { allowed_surfaces: next })
 }
 
-const instances = ref<SurfaceInstancesResponse | null>(null)
-const instancesLoading = ref(false)
-const instancesError = ref('')
-
-async function loadInstances() {
-  instancesLoading.value = true
-  instancesError.value = ''
-  try {
-    instances.value = await systemApi.getSurfaceInstances()
-  } catch (e) {
-    instancesError.value = e instanceof Error ? e.message : '获取实例状态失败'
-  } finally {
-    instancesLoading.value = false
-  }
+function toggleQuotaPool(index: number, pool: string, checked: boolean) {
+  const current = props.groups[index].allowed_quota_pools || []
+  const next = checked
+    ? Array.from(new Set([...current, pool]))
+    : current.filter((p) => p !== pool)
+  updateGroup(index, { allowed_quota_pools: next })
 }
 
-onMounted(loadInstances)
+function groupMaxPages(group: AccountGroupItem): number {
+  return typeof group.max_pages === 'number' ? group.max_pages : 2
+}
+
+function isEnabled(group: AccountGroupItem): boolean {
+  return group.enabled !== false
+}
 </script>
 
 <template>
-  <div class="space-y-3">
-    <div class="flex items-center justify-between">
-      <div class="flex items-center gap-2 text-xs font-bold text-gray-800">
+  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden">
+    <div class="px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-2.5">
         <Users class="w-4 h-4 text-brand-600" />
-        <span>账号分组与面编排 (groups)</span>
+        <div>
+          <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
+            <span>策略组 (groups)</span>
+            <FieldHelpTip schema-key="features.groups" />
+          </h4>
+          <p class="text-[11px] text-gray-400 mt-0.5">
+            按顺序匹配，首个命中生效；空组/停用组视同不存在，继续匹配后续组或 tier 默认组。
+          </p>
+        </div>
       </div>
       <button
         type="button"
@@ -101,152 +158,194 @@ onMounted(loadInstances)
         @click="addGroup"
       >
         <Plus class="w-3 h-3" />
-        <span>添加分组</span>
+        <span>添加策略组</span>
       </button>
     </div>
 
-    <p class="text-[11px] text-gray-400">
-      留空即走 tier 默认规则（free→build、pro/ultra/plus→chat）；组内同时允许 chat+build 时，非 chat-only 模型优先 build，argon/Pro 系强制 chat；策略/配额拒绝一律显式报错，不排队不回退。
-    </p>
-
-    <div class="rounded-xl border border-gray-200/80 bg-white/70 p-3 space-y-2">
-      <div class="flex items-center justify-between">
-        <span class="text-xs font-semibold text-gray-700">实时实例（单浏览器）</span>
-        <button
-          type="button"
-          class="inline-flex items-center gap-1 text-[11px] text-brand-700 hover:text-brand-800 rounded px-1 py-0.5 cursor-pointer"
-          :disabled="instancesLoading"
-          @click="loadInstances"
-        >
-          <RefreshCw
-            class="w-3 h-3"
-            :class="{ 'animate-spin': instancesLoading }"
-          />
-          <span>刷新</span>
-        </button>
+    <div class="p-5 space-y-3">
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-gray-400">
+        <span>策略组是约束层，不是独立实例池。</span>
+        <span>只收窄候选账号/渠道/预算/权重，不能放宽系统推导的模型与渠道能力。</span>
       </div>
-      <p class="text-[11px] text-gray-400">
-        页面实例 = 浏览器里活着的页面：chat 页与 build 页各计 1。上限按【账号】校验——需要新建 build 页时，若该账号当前存活实例数 ≥ max_page_instances 即显式拒绝（0 = 禁止为该账号新建 build 页；纯 chat 请求不受影响）。
-      </p>
+
       <div
-        v-if="instancesError"
-        class="text-[11px] text-rose-500"
+        v-if="!groups.length"
+        class="p-6 text-center text-gray-400 text-xs border border-dashed border-gray-200 rounded-xl"
       >
-        {{ instancesError }}
+        未配置策略组；按 tier 默认规则分发（free→build，pro/ultra/plus→chat）
       </div>
+
       <div
-        v-else-if="instances"
-        class="text-[11px] font-mono text-gray-600 space-y-0.5"
+        v-for="(group, index) in groups"
+        :key="index"
+        class="p-4 bg-gray-50/70 border border-gray-200/80 rounded-xl space-y-4"
+        :class="{ 'opacity-75': !isEnabled(group) }"
       >
-        <div>
-          活跃账号:
-          {{ instances.active_account ? (instances.active_account.email || instances.active_account.name || instances.active_account.id) : '无' }}
-          <span v-if="instances.active_account && instances.active_account.tier">（{{ instances.active_account.tier }}）</span>
-          · 组: {{ instances.group || '-' }}
-          · 实例 {{ instances.live_instances }}/{{ instances.effective_max === null ? '-' : instances.effective_max }}
-        </div>
-        <div>
-          chat 页: {{ instances.chat_page.alive ? '存活' : '未挂载' }}
-          · build 页: {{ instances.build_page.alive ? (instances.build_page.ready ? '存活·就绪' : '存活·未就绪') : '未挂载' }}
-          <span v-if="instances.build_page.account_id">（build 归属账号 {{ instances.build_page.account_id }}）</span>
-        </div>
-        <div
-          v-if="instances.build_page.last_error"
-          class="text-rose-500"
-        >
-          build 页最近错误: {{ instances.build_page.last_error }}
-        </div>
-        <div
-          v-if="instances.retiring_contexts > 0"
-          class="text-amber-600"
-        >
-          切号过渡期旧页（drain 中）: {{ instances.retiring_contexts }}
-        </div>
-        <div class="text-gray-400">
-          注：同一时刻仅活跃账号持有实例；切号过渡期旧页不计入配额。
-        </div>
-      </div>
-    </div>
-
-    <div
-      v-if="!groups.length"
-      class="p-4 text-center text-gray-400 text-xs italic border border-dashed border-gray-200 rounded-xl"
-    >
-      未配置任何分组，编排器将按 tier 默认规则分发。
-    </div>
-
-    <div
-      v-for="(group, index) in groups"
-      :key="index"
-      class="p-3.5 bg-gray-50/70 border border-gray-200/80 rounded-xl space-y-3"
-    >
-      <div class="flex items-center justify-between">
-        <span class="text-[11px] font-mono font-semibold text-gray-500">#{{ index + 1 }}</span>
-        <button
-          type="button"
-          class="inline-flex items-center gap-1 text-[11px] text-gray-400 hover:text-rose-600 rounded px-1 py-0.5 cursor-pointer"
-          @click="removeGroup(index)"
-        >
-          <Trash2 class="w-3 h-3" />
-          <span>删除</span>
-        </button>
-      </div>
-
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <ConfigInput
-          :model-value="group.name ?? ''"
-          label="组名"
-          placeholder="group"
-          @update:model-value="updateGroup(index, { name: $event === null ? '' : String($event) })"
-        />
-        <ConfigInput
-          :model-value="group.max_page_instances ?? 2"
-          type="number"
-          label="页面实例上限"
-          description="0-16"
-          placeholder="2"
-          @update:model-value="updateGroup(index, { max_page_instances: toNumber($event, 2) })"
-        />
-        <ConfigInput
-          :model-value="tierText(group)"
-          label="命中档位 (逗号分隔)"
-          description="小写"
-          placeholder="pro, ultra, plus"
-          @update:model-value="updateGroup(index, { match_tier: parseTierList($event === null ? '' : String($event)) })"
-        />
-        <ConfigInput
-          :model-value="group.match_emails_regex ?? ''"
-          label="邮箱正则 (可选)"
-          placeholder="留空则不启用"
-          @update:model-value="updateGroup(index, { match_emails_regex: $event === null || String($event).trim() === '' ? null : String($event) })"
-        />
-      </div>
-
-      <div class="space-y-1.5">
-        <label class="block text-xs font-semibold text-gray-700">
-          允许的面 (allowed_surfaces)
-        </label>
-        <div class="flex flex-wrap items-center gap-3">
-          <label
-            v-for="opt in SURFACE_OPTIONS"
-            :key="opt.value"
-            class="inline-flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer"
-          >
-            <input
-              type="checkbox"
-              class="rounded border-gray-300 text-brand-600 focus:ring-brand-500/30"
-              :checked="(group.allowed_surfaces || []).includes(opt.value)"
-              @change="toggleSurface(index, opt.value, ($event.target as HTMLInputElement).checked)"
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-2 min-w-0">
+            <span class="text-xs font-mono font-semibold text-gray-600">#{{ index + 1 }}</span>
+            <span
+              v-if="index === 0"
+              class="text-[10px] font-semibold text-brand-700 bg-brand-50 border border-brand-200/70 rounded px-1.5 py-0.5"
+            >首个命中生效</span>
+            <span
+              class="text-[10px] font-semibold rounded px-1.5 py-0.5 border"
+              :class="isEnabled(group)
+                ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                : 'text-gray-500 bg-gray-100 border-gray-200'"
+            >{{ isEnabled(group) ? '已启用' : '已停用' }}</span>
+            <span class="text-[11px] text-gray-400 truncate">
+              {{ group.name || '未命名' }} · 页面上限 {{ groupMaxPages(group) }} · {{ surfacesText(group) }}
+            </span>
+          </div>
+          <div class="flex items-center gap-1">
+            <button
+              type="button"
+              class="p-1 text-gray-400 hover:text-brand-700 hover:bg-white rounded transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+              title="上移"
+              :disabled="index === 0"
+              @click="moveGroup(index, -1)"
             >
-            <span class="font-mono">{{ opt.label }}</span>
-            <span class="text-[11px] text-gray-400">{{ opt.description }}</span>
-          </label>
-          <span
-            v-if="!(group.allowed_surfaces || []).length"
-            class="text-[11px] text-rose-500"
-          >
-            未勾选任何面：该组被禁用，调度层直接排除。
-          </span>
+              <ArrowUp class="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              class="p-1 text-gray-400 hover:text-brand-700 hover:bg-white rounded transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+              title="下移"
+              :disabled="index === groups.length - 1"
+              @click="moveGroup(index, 1)"
+            >
+              <ArrowDown class="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 text-[11px] text-gray-400 hover:text-rose-600 rounded px-1.5 py-0.5 cursor-pointer"
+              @click="removeGroup(index)"
+            >
+              <Trash2 class="w-3 h-3" />
+              <span>删除</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <ConfigInput
+            :model-value="group.name ?? ''"
+            label="组名"
+            placeholder="group"
+            @update:model-value="updateGroup(index, { name: $event === null ? '' : String($event) })"
+          />
+          <ConfigInput
+            :model-value="group.weight ?? 1.0"
+            type="number"
+            label="权重 (0.1-100)"
+            description="命中后参与排序"
+            placeholder="1.0"
+            @update:model-value="updateGroup(index, { weight: clamp(toNumber($event, 1.0), 0.1, 100) })"
+          />
+          <ConfigInput
+            :model-value="tierValue(index, group)"
+            label="命中档位 (逗号分隔)"
+            description="小写"
+            placeholder="pro, ultra, plus"
+            @update:model-value="updateTierDraft(index, $event)"
+          />
+          <ConfigInput
+            :model-value="group.match_emails_regex ?? ''"
+            label="邮箱正则 (可选)"
+            placeholder="留空则不启用"
+            @update:model-value="updateGroup(index, { match_emails_regex: $event === null || String($event).trim() === '' ? null : String($event) })"
+          />
+          <div class="sm:col-span-2 flex items-center gap-1.5">
+            <div class="flex-1">
+              <ConfigInput
+                :model-value="groupMaxPages(group)"
+                type="number"
+                label="页面上限 (max_pages)"
+                description="0-16"
+                placeholder="2"
+                @update:model-value="updateGroup(index, { max_pages: clamp(toNumber($event, 2), 0, 16) })"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="features.groups.max_pages"
+              class="mt-4 shrink-0"
+            />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5">
+              <label class="block text-xs font-semibold text-gray-700">
+                允许的渠道 (allowed_surfaces)
+              </label>
+              <FieldHelpTip
+                title="允许的渠道"
+                content="组可使用的渠道子集。空 = 该组被禁用，调度层直接排除。"
+                explanation="渠道注册表决定能力，策略组只能在能力范围内收窄。"
+              />
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+              <label
+                v-for="opt in SURFACE_OPTIONS"
+                :key="opt.value"
+                class="inline-flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  class="rounded border-gray-300 text-brand-600 focus:ring-brand-500/30"
+                  :checked="(group.allowed_surfaces || []).includes(opt.value)"
+                  @change="toggleSurface(index, opt.value, ($event.target as HTMLInputElement).checked)"
+                >
+                <span class="font-mono">{{ opt.label }}</span>
+              </label>
+            </div>
+            <p
+              v-if="!(group.allowed_surfaces || []).length"
+              class="text-[11px] text-amber-600"
+            >
+              该组被禁用，调度层直接排除。
+            </p>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5">
+              <label class="block text-xs font-semibold text-gray-700">
+                允许的额度池 (allowed_quota_pools)
+              </label>
+              <FieldHelpTip
+                title="允许的额度池"
+                content="组可使用的额度池子集：free / pro。留空 = 不限制 (any)。"
+                explanation="额度池是账号凭证属性，不是模型名；pro 凭证与 pro 模型是两个概念。"
+              />
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+              <label
+                v-for="pool in ['free', 'pro']"
+                :key="pool"
+                class="inline-flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  class="rounded border-gray-300 text-brand-600 focus:ring-brand-500/30"
+                  :checked="(group.allowed_quota_pools || []).includes(pool)"
+                  @change="toggleQuotaPool(index, pool, ($event.target as HTMLInputElement).checked)"
+                >
+                <span class="font-mono">{{ pool }}</span>
+              </label>
+              <span class="text-[11px] text-gray-400">留空 = 不限制 (any)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <ConfigSwitch
+            :model-value="isEnabled(group)"
+            label="启用该策略组"
+            description="关=停用，视同不存在，继续匹配后续组"
+            @update:model-value="updateGroup(index, { enabled: $event })"
+          />
         </div>
       </div>
     </div>

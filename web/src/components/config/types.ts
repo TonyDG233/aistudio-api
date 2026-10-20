@@ -82,12 +82,57 @@ export interface FallbackConfig {
 }
 
 export type SurfaceName = 'chat' | 'build'
+export type ChannelName = 'chat' | 'build' | 'official'
+export type QuotaPool = 'free' | 'pro' | null
+
+export interface ChannelConfigItem {
+  enabled?: boolean
+  max_pages?: number
+  quota_pool?: QuotaPool | string | null
+  [key: string]: unknown
+}
+
+export interface ChannelsConfig {
+  chat?: ChannelConfigItem
+  build?: ChannelConfigItem
+  official?: ChannelConfigItem
+  [key: string]: ChannelConfigItem | undefined
+}
+
+export interface CircuitBreakerConfig {
+  window_seconds?: number
+  failure_threshold?: number
+  cooldown_seconds?: number
+  [key: string]: unknown
+}
+
+export interface RoutingConfig {
+  max_switches?: number
+  global_max_pages?: number
+  max_contexts?: number
+  borrow?: boolean
+  prewarm?: boolean
+  circuit_breaker?: CircuitBreakerConfig
+  [key: string]: unknown
+}
+
+export interface SlotConfigItem {
+  account_id?: string
+  channel?: string
+  enabled?: boolean
+  note?: string | null
+  [key: string]: unknown
+}
 
 export interface AccountGroupItem {
   name?: string
+  enabled?: boolean
+  weight?: number
   match_tier?: string[]
   match_emails_regex?: string | null
   allowed_surfaces?: string[]
+  allowed_quota_pools?: string[]
+  max_pages?: number
   max_page_instances?: number
   [key: string]: unknown
 }
@@ -98,6 +143,9 @@ export interface FeaturesConfig {
   account_refresh_concurrency?: number
   auto_switch?: boolean
   auto_switch_interval_hours?: number
+  channels?: ChannelsConfig
+  routing?: RoutingConfig
+  slots?: SlotConfigItem[]
   groups?: AccountGroupItem[]
   atg?: AtgConfig
   fallback?: FallbackConfig
