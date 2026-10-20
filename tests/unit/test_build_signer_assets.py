@@ -17,6 +17,12 @@ from aistudio_api.infrastructure.browser.cdp_client import (
 )
 from aistudio_api.infrastructure.browser.scripts import BUILD_SIGNER_JS
 
+
+def _signer_js() -> str:
+    assert BUILD_SIGNER_JS is not None
+    return BUILD_SIGNER_JS
+
+
 JS_PATH = (
     Path(__file__).resolve().parents[2]
     / "src"
@@ -34,8 +40,8 @@ JS_PATH = (
 def test_build_signer_asset_loads():
     """The JS asset is present on disk and loaded by scripts.py."""
     assert JS_PATH.is_file(), f"missing asset: {JS_PATH}"
-    assert len(BUILD_SIGNER_JS.strip()) > 0
-    assert JS_PATH.read_text(encoding="utf-8") == BUILD_SIGNER_JS
+    assert len(_signer_js().strip()) > 0
+    assert JS_PATH.read_text(encoding="utf-8") == _signer_js()
 
 
 def test_build_signer_frozen_contract_surface():
@@ -48,15 +54,15 @@ def test_build_signer_frozen_contract_surface():
         "execute(taskId, model, jsonBody)",
         "harvest()",
     ):
-        assert token in BUILD_SIGNER_JS, f"missing contract token: {token!r}"
+        assert token in _signer_js(), f"missing contract token: {token!r}"
 
 
 def test_build_signer_install_and_state_machine():
     """Install guard, top-frame guard, and the five-state enum are all present."""
-    assert "if (window.__buildSigner) return" in BUILD_SIGNER_JS
-    assert "window.top" in BUILD_SIGNER_JS
+    assert "if (window.__buildSigner) return" in _signer_js()
+    assert "window.top" in _signer_js()
     for state in ("installing", "harvesting", "warmup-captured", "ready", "failed"):
-        assert f'"{state}"' in BUILD_SIGNER_JS, f"missing state: {state!r}"
+        assert f'"{state}"' in _signer_js(), f"missing state: {state!r}"
 
 
 def test_build_signer_push_event_types():
@@ -71,7 +77,7 @@ def test_build_signer_push_event_types():
         "text: raw",
         "message:",
     ):
-        assert token in BUILD_SIGNER_JS, f"missing push token: {token!r}"
+        assert token in _signer_js(), f"missing push token: {token!r}"
 
 
 def test_build_signer_port_fidelity_markers():
@@ -80,8 +86,10 @@ def test_build_signer_port_fidelity_markers():
         "hookMakerSuite",
         "installFetchHarvest",
         "nativeFetch",
-        "M.Cn",
-        "M.GB",
+        "discoverSignerCandidates",
+        "tokenLike",
+        "kvc",
+        "getMetadata",
         "RPC_HEADER_ALLOWLIST",
         "__warmup__",
         "Authorization",  # gRPC header; not a token leak (header name only)
@@ -91,15 +99,15 @@ def test_build_signer_port_fidelity_markers():
         "alkalimakersuite-pa.clients6.google.com",
         'credentials: "include"',
     ):
-        assert token in BUILD_SIGNER_JS, f"missing port marker: {token!r}"
+        assert token in _signer_js(), f"missing port marker: {token!r}"
 
 
 def test_build_signer_key_source_is_harvested_header():
     """E8: x-goog-api-key must come from the harvested header allowlist, never tb.mb.nK/jK."""
-    assert '"x-goog-api-key"' in BUILD_SIGNER_JS
+    assert '"x-goog-api-key"' in _signer_js()
     # The harvest allowlist must carry the key header name.
-    allowlist_idx = BUILD_SIGNER_JS.index("RPC_HEADER_ALLOWLIST = [")
-    allowlist_block = BUILD_SIGNER_JS[allowlist_idx : allowlist_idx + 400]
+    allowlist_idx = _signer_js().index("RPC_HEADER_ALLOWLIST = [")
+    allowlist_block = _signer_js()[allowlist_idx : allowlist_idx + 400]
     assert '"x-goog-api-key"' in allowlist_block
 
 

@@ -420,7 +420,7 @@ async def test_ensure_ready_success(
     )
 
 
-async def test_ensure_ready_makersuite_missing(
+async def test_ensure_ready_keeps_native_when_makersuite_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_gate: None
 ):
     monkeypatch.setattr(bs, "_load_build_signer_js", lambda: "(() => {})()")
@@ -433,29 +433,30 @@ async def test_ensure_ready_makersuite_missing(
         },
     )
     surface = _build_surface(page)
-    with pytest.raises(bs.BuildSurfaceError) as excinfo:
-        await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
-    assert excinfo.value.stage == "ensure_ready"
-    assert excinfo.value.code == "MAKERSUITE_MISSING"
-    assert "处置建议" in str(excinfo.value)
+    state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    assert state.native_ready is True
+    assert state.ready is True
+    assert state.signer_ready is False
+    assert "default_MakerSuite" in state.signer_error
 
 
-async def test_ensure_ready_signer_funcs_drift(
+async def test_ensure_ready_keeps_native_when_signer_funcs_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_gate: None
 ):
     monkeypatch.setattr(bs, "_load_build_signer_js", lambda: "(() => {})()")
     monkeypatch.setattr(bs, "_load_build_blocked_patterns", list)
     page = FakePage(
         states=[{"state": "loading", "lastError": ""}],
-        detect={"code": "SIGNER_FUNCS_DRIFT", "message": "M.Cn=undefined"},
+        detect={"code": "SIGNER_MISSING", "message": "签名脚本未注入"},
     )
     surface = _build_surface(page)
-    with pytest.raises(bs.BuildSurfaceError) as excinfo:
-        await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
-    assert excinfo.value.code == "SIGNER_FUNCS_DRIFT"
+    state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    assert state.native_ready is True
+    assert state.signer_ready is False
+    assert "签名脚本未注入" in state.signer_error
 
 
-async def test_ensure_ready_tb_missing(
+async def test_ensure_ready_keeps_native_when_tb_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_gate: None
 ):
     monkeypatch.setattr(bs, "_load_build_signer_js", lambda: "(() => {})()")
@@ -465,34 +466,39 @@ async def test_ensure_ready_tb_missing(
         detect={"code": "TB_MISSING", "message": "tb 实例未捕获"},
     )
     surface = _build_surface(page)
-    with pytest.raises(bs.BuildSurfaceError) as excinfo:
-        await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
-    assert excinfo.value.code == "TB_MISSING"
+    state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    assert state.native_ready is True
+    assert state.ready is True
+    assert state.signer_ready is False
+    assert "tb 实例未捕获" in state.signer_error
 
 
-async def test_ensure_ready_signer_failed_reports_last_error(
+async def test_ensure_ready_records_signer_failure_without_blocking_native(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_gate: None
 ):
     monkeypatch.setattr(bs, "_load_build_signer_js", lambda: "(() => {})()")
     monkeypatch.setattr(bs, "_load_build_blocked_patterns", list)
     page = FakePage(states=[{"state": "failed", "lastError": "hook target missing"}])
     surface = _build_surface(page)
-    with pytest.raises(bs.BuildSurfaceError) as excinfo:
-        await surface.ensure_ready(_auth_file(tmp_path))
-    assert excinfo.value.code == "SIGNER_FAILED"
-    assert "hook target missing" in str(excinfo.value)
+    state = await surface.ensure_ready(_auth_file(tmp_path))
+    assert state.native_ready is True
+    assert state.ready is True
+    assert state.signer_ready is False
+    assert state.signer_error == "hook target missing"
 
 
-async def test_ensure_ready_signer_script_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_ensure_ready_signer_script_missing_still_enables_native(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_gate: None
 ):
     monkeypatch.setattr(bs, "_load_build_signer_js", lambda: None)
     monkeypatch.setattr(bs, "_load_build_blocked_patterns", list)
     page = FakePage(states=[{"state": "loading"}])
     surface = _build_surface(page)
-    with pytest.raises(bs.BuildSurfaceError) as excinfo:
-        await surface.ensure_ready(_auth_file(tmp_path))
-    assert excinfo.value.code == "SIGNER_SCRIPT_MISSING"
+    state = await surface.ensure_ready(_auth_file(tmp_path))
+    assert state.native_ready is True
+    assert state.ready is True
+    assert state.signer_ready is False
+    assert "build_signer.js" in state.signer_error
 
 
 async def test_ensure_ready_cookies_missing(monkeypatch: pytest.MonkeyPatch):
@@ -524,6 +530,102 @@ async def test_stream_generate_maps_holder_to_chat_events():
     assert usage_events and isinstance(usage_events[0], dict)
     assert usage_events[0]["total_tokens"] == 153
     assert surface.state.in_flight_count == 0
+
+
+async def test_stream_generate_explicit_signer_transport(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AISTUDIO_BUILD_TRANSPORT", "signer")
+    page = FakePage(events_for=_holder_events(_holder(FRAME0_CHUNK, depth=3)))
+    surface = _surface(page)
+    surface.state.native_ready = True
+    surface.state.signer_ready = True
+    native_calls = {"count": 0}
+
+    async def fail_native(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]] | None:
+        native_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(surface, "_dispatch_native", fail_native)
+    events = await _collect(surface.stream_generate(model="m", json_body="{}"))
+    assert native_calls["count"] == 0
+    assert ("body", "OK") in events
+
+
+async def test_stream_generate_native_transport_when_signer_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    page = FakePage()
+    surface = _surface(page)
+    surface.state.native_ready = True
+    surface.state.signer_ready = False
+
+    sse = "data: " + json.dumps(FRAME0_CHUNK, ensure_ascii=False) + "\n\n"
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]]:
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        queue.put_nowait({"event_type": "response_headers", "status": 200})
+        queue.put_nowait({"event_type": "chunk", "data": sse[:20]})
+        queue.put_nowait({"event_type": "chunk", "data": sse[20:]})
+        queue.put_nowait({"event_type": "stream_close"})
+        return queue
+
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+    events = await _collect(
+        surface.stream_generate(model="gemini-3.8-flash", json_body='{"contents":[]}')
+    )
+    assert ("status", 200) in events
+    assert ("body", "OK") in events
+    assert events[-1] == ("done", None)
+
+
+async def test_stream_generate_native_error_falls_back_to_signer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    page = FakePage(events_for=_holder_events(_holder(FRAME0_CHUNK, depth=3)))
+    surface = _surface(page)
+    surface.state.native_ready = True
+    surface.state.signer_ready = True
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]]:
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        queue.put_nowait(
+            {"event_type": "error", "message": "native 9998 fetch rejected"}
+        )
+        return queue
+
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+    events = await _collect(surface.stream_generate(model="m", json_body="{}"))
+    assert ("body", "OK") in events
+    assert events[-1] == ("done", None)
+
+
+async def test_stream_generate_native_error_without_signer_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    page = FakePage()
+    surface = _surface(page)
+    surface.state.native_ready = True
+    surface.state.signer_ready = False
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]]:
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        queue.put_nowait({"event_type": "error", "message": "native exploded"})
+        return queue
+
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+    with pytest.raises(bs.BuildSurfaceError) as excinfo:
+        await _collect(surface.stream_generate(model="m", json_body="{}"))
+    assert excinfo.value.code == "NATIVE_ERROR"
+    assert "native exploded" in str(excinfo.value)
 
 
 async def test_stream_generate_finish_reason_and_signature():

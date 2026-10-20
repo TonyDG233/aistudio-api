@@ -180,7 +180,9 @@
             } catch (e) {
                 continue;
             }
-            if (source.indexOf("snapshot") === -1 || source.indexOf("content") === -1) continue;
+            // 签名器以 `a.A.snapshot({kvc:{content:b}})` 形态调用；仅用
+            // snapshot+content 会误命中带这些字样的 Angular/UI 方法（实测 OCb）。
+            if (source.indexOf("snapshot") === -1 || source.indexOf("kvc") === -1 || source.indexOf("content") === -1) continue;
             candidates.push({ key: key, fn: fn });
         }
         return candidates;
@@ -218,10 +220,15 @@
     }
 
     function tokenLike(value) {
-        return !!(
-            value &&
-            (value.mb || value.A || typeof value.snapshot === "function" || typeof value.getMetadata === "function")
-        );
+        if (!value || typeof value !== "object") return false;
+        // 旧形态：宿主内部 mb.jK/mb.nK token 载体。
+        if (value.mb && (value.mb.jK || value.mb.nK)) return true;
+        // 当前形态（_.$B）：H 为初始化 Promise，A 为可 snapshot 的 WAA 客户端，
+        // getMetadata 由原型提供。三者同时成立才认，避免把页面组件误当 token 源。
+        if (typeof value.getMetadata !== "function") return false;
+        if (!value.H || typeof value.H.then !== "function") return false;
+        if (!value.A) return true;
+        return typeof value.A === "object" && typeof value.A.snapshot === "function";
     }
 
     async function selfTest() {
