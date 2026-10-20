@@ -167,5 +167,14 @@ class RuntimeState:
         else:
             self._schedule_debounced_save()
 
+    def record_token_count(self, model: str, api_format: str = "gemini") -> None:
+        """Record a token-count request without touching generation statistics."""
+        stats = self.model_stats[model]
+        stats.requests += 1
+        stats.formats[api_format] = stats.formats.get(api_format, 0) + 1
+        tz = timezone(timedelta(hours=8))
+        stats.last_used = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        self._schedule_debounced_save()
+
 
 runtime_state = RuntimeState()

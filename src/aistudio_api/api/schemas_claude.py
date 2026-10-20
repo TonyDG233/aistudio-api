@@ -30,3 +30,21 @@ class ClaudeMessagesRequest(BaseModel):
     metadata: dict[str, object] | None = None
     output_format: dict[str, object] | None = None
     output_config: dict[str, object] | None = None
+
+
+class ClaudeCountTokensRequest(BaseModel):
+    """Client payload for ``POST /v1/messages/count_tokens``.
+
+    Anthropic only requires the prompt-bearing fields here; generation-only
+    fields such as ``max_tokens`` are optional and ignored by the counter.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    messages: list[dict[str, object]]
+    system: str | list[dict[str, object]] | None = None
+    max_tokens: int | None = None
+    tools: list[dict[str, object]] | None = None
+    tool_choice: dict[str, object] | None = None
+    thinking: dict[str, object] | None = None

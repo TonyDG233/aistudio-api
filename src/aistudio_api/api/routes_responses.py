@@ -35,6 +35,7 @@ from aistudio_api.application.generation_service import (
     generate,
     stream_generation,
 )
+from aistudio_api.application.token_counter import count_tokens as count_prompt_tokens
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 if TYPE_CHECKING:
@@ -56,6 +57,44 @@ def _validation_error(exc: ValidationError) -> ConversionError:
     message = str(first.get("msg", "invalid value"))
     text = f"{location}: {message}" if location else message
     return ConversionError(text, field=location or None)
+
+
+@router.post("/v1/responses/input_tokens", dependencies=[Depends(require_responses)])
+async def count_response_input_tokens(
+    request: Request,
+    client: AIStudioClient = Depends(get_client),
+) -> Response:
+    try:
+        raw: object = await request.json()
+    except Exception:
+        return format_error_response(
+            ConversionError("request body is not valid JSON"), "openai"
+        )
+
+    try:
+        payload = ResponsesRequest.model_validate(raw)
+    except ValidationError as exc:
+        return format_error_response(_validation_error(exc), "openai")
+
+    try:
+        media = MediaFetcher(allow_private=format_media_allow_private())
+        body = await convert_responses_request(payload, media)
+        gemini_request = GeminiGenerateContentRequest.model_validate(body)
+        model_path = strip_models_prefix(payload.model)
+        outcome = await count_prompt_tokens(
+            model_path=model_path,
+            req=gemini_request,
+            client=client,
+            api_format="responses",
+        )
+    except Exception as exc:
+        return format_error_response(exc, "openai")
+    return JSONResponse(
+        {
+            "object": "response.input_tokens",
+            "input_tokens": outcome.total_tokens,
+        }
+    )
 
 
 @router.post("/v1/responses", dependencies=[Depends(require_responses)])

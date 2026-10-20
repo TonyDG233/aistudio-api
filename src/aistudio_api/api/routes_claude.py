@@ -17,8 +17,12 @@ from aistudio_api.api.format_errors import (
     require_format_enabled,
 )
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.api.schemas_claude import ClaudeMessagesRequest
+from aistudio_api.api.schemas_claude import (
+    ClaudeCountTokensRequest,
+    ClaudeMessagesRequest,
+)
 from aistudio_api.application.format_converters.claude_request import (
+    convert_claude_count_request,
     convert_claude_request,
 )
 from aistudio_api.application.format_converters.claude_response import (
@@ -35,6 +39,7 @@ from aistudio_api.application.generation_service import (
     generate,
     stream_generation,
 )
+from aistudio_api.application.token_counter import count_tokens as count_prompt_tokens
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 router = APIRouter()
@@ -164,14 +169,27 @@ async def _streaming_response(
 
 
 @router.post("/v1/messages/count_tokens", response_model=None)
-async def count_tokens() -> JSONResponse:
+async def count_message_tokens(request: Request) -> JSONResponse:
     gate = _gate_error()
     if gate is not None:
         return gate
-    return format_error_response(
-        HTTPException(
-            404,
-            detail="count_tokens is not supported by this proxy",
-        ),
-        "claude",
-    )
+
+    try:
+        raw = await request.json()
+        payload = ClaudeCountTokensRequest.model_validate(raw)
+        media = MediaFetcher(allow_private=format_media_allow_private())
+        gemini_body = await convert_claude_count_request(payload, media)
+        gemini_request = GeminiGenerateContentRequest.model_validate(gemini_body)
+        model_path = strip_models_prefix(payload.model)
+        client = get_client()
+        outcome = await count_prompt_tokens(
+            model_path=model_path,
+            req=gemini_request,
+            client=client,
+            api_format="claude",
+        )
+    except ValidationError as exc:
+        return format_error_response(_validation_error(exc), "claude")
+    except Exception as exc:
+        return format_error_response(exc, "claude")
+    return JSONResponse({"input_tokens": outcome.total_tokens})

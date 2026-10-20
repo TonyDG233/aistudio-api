@@ -481,6 +481,65 @@ class AIStudioClient:
             self._captured, body=body, timeout=timeout
         )
 
+    async def count_tokens(
+        self,
+        *,
+        packed_body: list[object],
+        lease=None,
+        timeout: int = 30,
+    ) -> int:
+        """Count prompt tokens through the real upstream ``CountTokens`` RPC.
+
+        The RPC only accepts ``[model, contents]``; system and tool
+        declarations are serialized into the packed contents by the caller.
+        The request reuses the pool slot's live chat page and never touches
+        the generation template, snapshot, or ATG path.
+        """
+        adapter = getattr(lease, "adapter", None)
+        session = getattr(adapter, "session", None) or self._session
+        ctx = session.active_context
+        if ctx is None:
+            ctx = await session.ensure_ready()
+
+        base_url = str(ctx.base_template.get("url") or "")
+        if "/GenerateContent" in base_url:
+            url = base_url.replace("/GenerateContent", "/CountTokens")
+        else:
+            url = (
+                "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+                "google.internal.alkali.applications.makersuite.v1."
+                "MakerSuiteService/CountTokens"
+            )
+
+        raw_headers = ctx.base_template.get("headers")
+        headers = (
+            {str(k): str(v) for k, v in raw_headers.items()}
+            if isinstance(raw_headers, dict)
+            else {}
+        )
+        headers["Content-Type"] = "application/json+protobuf"
+
+        payload = json.dumps(packed_body, ensure_ascii=False, separators=(",", ":"))
+        status, raw = await session.send_hooked_request(
+            body=payload,
+            timeout_ms=timeout * 1000,
+            url=url,
+            headers=headers,
+        )
+        text = raw.decode("utf-8", errors="replace")
+        if status >= 400:
+            raise classify_error(status, text)
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise RequestError(
+                502, "upstream CountTokens returned invalid JSON"
+            ) from exc
+        total = data[0] if isinstance(data, list) and data else None
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise RequestError(502, "upstream CountTokens response missing token total")
+        return total
+
     async def stream_generate_content(
         self,
         *,
