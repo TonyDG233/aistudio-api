@@ -169,11 +169,12 @@ features:
     mode: off
 
     # 分协议面覆盖 (WP8)：inherit 使用上方 mode；off/prefer/required 单独覆盖。
-    # 仅在对应协议面 (openai/claude) 开启后生效。
+    # 仅在对应协议面 (openai/claude/responses) 开启后生效。
     mode_by_format:
       gemini: inherit
       openai: inherit
       claude: inherit
+      responses: inherit
 
     # 每次请求的合成工具名前缀 (对应 Ark ATG_TOOL_PREFIX)，须保持稳定以利于过滤与历史清理。
     tool_prefix: atg_emit_

@@ -46,7 +46,8 @@
 |---|---|
 | **Gemini API Compatibility** | Supports `/v1beta/...` endpoints including Thinking, multimodal inputs, function calling, and image generation |
 | **OpenAI Chat Completions Compatibility** | Exposes `/v1/chat/completions` and `/v1/models` with streaming, tool calls, images, and `reasoning_content`; enabled by default |
-| **Anthropic Messages Compatibility** | Exposes `/v1/messages` with streaming events, tool calls, thinking, and images; `count_tokens` is not implemented yet |
+| **OpenAI Responses Compatibility** | Exposes `/v1/responses` with streaming events, tool calls, reasoning, and images; usage includes input/output/reasoning/cache details; enabled by default |
+| **Anthropic Messages Compatibility** | Exposes `/v1/messages` and `/v1/messages/count_tokens` with streaming events, tool calls, thinking, images, and real upstream counting |
 | **Dynamic Model Discovery** | Automatically synchronizes and discovers available models from upstream Google AI Studio |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
 | **Dual Account Keepalive (WP10)** | Scheduled account rotation (long-cycle balancing + real page activity) and automatic Auth refresh (cookies/origins written back to `auth.json`) coexist; a separate 24h tier/email/expiry metadata refresh runs on its own switch |
@@ -249,9 +250,10 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `features.formats.openai` | bool | `true` | Enables `/v1/chat/completions` and `/v1/models`; when disabled the routes return an explicit 403. Default enabled to match Ark's unconditional endpoint registration. |
-| `features.formats.claude` | bool | `true` | Enables `/v1/messages`; when disabled the route returns an explicit 403. `count_tokens` still returns an explicit 404. |
+| `features.formats.claude` | bool | `true` | Enables `/v1/messages` and `/v1/messages/count_tokens`; when disabled the routes return an explicit 403. |
+| `features.formats.responses` | bool | `true` | Enables `/v1/responses` and `/v1/responses/input_tokens`; when disabled the routes return an explicit 403. |
 | `features.formats.media.allow_private_urls` | bool | `false` | Allow the proxy to download private/loopback image URLs; keep disabled for SSRF safety. `data:` URLs are unaffected. |
-| `features.atg.mode_by_format` | map | `inherit` | Per-face ATG override: `gemini` / `openai` / `claude` each accept `inherit` (follow `features.atg.mode`) or `off` / `prefer` / `required`. |
+| `features.atg.mode_by_format` | map | `inherit` | Per-face ATG override: `gemini` / `openai` / `claude` / `responses` each accept `inherit` (follow `features.atg.mode`) or `off` / `prefer` / `required`. |
 
 ### Account Keepalive (WP10, backend only)
 
@@ -357,6 +359,30 @@ resp = client.chat.completions.create(
 )
 ```
 
+### OpenAI Responses
+
+Use `http://localhost:8080/v1` as the base URL; the full endpoint is `/v1/responses`.
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "input": "Explain quantum computing in one sentence.",
+    "max_output_tokens": 256
+  }'
+```
+
+Preflight token count:
+
+```bash
+curl http://localhost:8080/v1/responses/input_tokens \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemini-3.7-flash", "input": "Explain quantum computing in one sentence."}'
+```
+
 ### Anthropic Messages
 
 Use `http://localhost:8080` as the base URL (the Anthropic SDK appends `/v1/messages`).
@@ -392,7 +418,9 @@ msg = client.messages.create(
 ```
 
 > [!NOTE]
-> Both format faces are enabled by default. If disabled operationally, requests return 403 with the relevant `features.formats.*` key in the error message. `/v1/messages/count_tokens` is not implemented and returns an explicit 404.
+> Gemini / OpenAI Chat / OpenAI Responses / Anthropic faces are enabled by default. If disabled operationally, requests return 403 with the relevant `features.formats.*` key in the error message.
+>
+> Count endpoints use the real upstream tokenizer, but the current implementation packs system/tools/conversation into an aggregate prompt before calling MakerSuite `CountTokens`. Expect roughly +2.8%~+8.6% versus the native structured request; use it as an agent context-length reference, not a per-token exact value. `/v1/messages/count_tokens`, `/v1/responses/input_tokens`, and Gemini `:countTokens` are implemented.
 
 ---
 
