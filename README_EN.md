@@ -48,15 +48,15 @@
 | **OpenAI Chat Completions Compatibility** | Exposes `/v1/chat/completions` and `/v1/models` with streaming, tool calls, images, and `reasoning_content`; enabled by default |
 | **OpenAI Responses Compatibility** | Exposes `/v1/responses` with streaming events, tool calls, reasoning, and images; usage includes input/output/reasoning/cache details; enabled by default |
 | **Anthropic Messages Compatibility** | Exposes `/v1/messages` and `/v1/messages/count_tokens` with streaming events, tool calls, thinking, images, and real upstream counting |
-| **Dynamic Model Discovery** | Automatically synchronizes and discovers available models from upstream Google AI Studio |
+| **Dynamic Model Discovery** | Automatically synchronizes available models and Paid/Pro-only metadata from upstream Google AI Studio; snapshots are persisted and warmed on startup, with fallback to the last snapshot if refresh fails |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
 | **Dual Account Keepalive (WP10)** | Scheduled account rotation (long-cycle balancing + real page activity) and automatic Auth refresh (cookies/origins written back to `auth.json`) coexist; a separate 24h tier/email/expiry metadata refresh runs on its own switch |
-| **Runtime State Persistence** | Model usage statistics (`stats.json`) and account 429 cooldown & quota status (`rotator_state.json`) are automatically persisted to disk across restarts |
+| **Runtime State Persistence** | Token statistics v2 (`stats.json`: per-model/day aggregation, client/attempt layers, separate cache/reasoning/count_tokens, 90-day daily buckets) and account 429 cooldown (`rotator_state.json`) are persisted across restarts |
 | **Downstream Parameter Fault Tolerance** | `drop_unsupported_params` automatically drops unsupported safety categories (e.g. `HARM_CATEGORY_CIVIC_INTEGRITY`) and tools to prevent 400 errors |
 | **Multi-Account Probing** | Extracts and verifies sub-accounts (`u/0`, `u/1`...) automatically when importing a multi-session Cookie |
 | **Built-in Tools** | Supports official tools such as Google Search, Google Maps, and Code Execution sandbox |
 | **Pure Python CDP** | Direct Chrome DevTools Protocol communication over asynchronous WebSockets without Node.js, Playwright, or Selenium |
-| **Web Management Console** | Built-in web dashboard for account management (supporting text and JSON bundle file imports), live request metrics, and runtime `config.yaml` hot reloading |
+| **Web Management Console** | Built-in web dashboard for account management (supporting text and JSON bundle file imports), a dedicated usage statistics page `/stats` (tokens/cache/trends/account scheduling status), and runtime `config.yaml` hot reloading |
 | **Android Companion App** | Native Android app (`android/`) built with Jetpack Compose, featuring isolated multi-profile management, on-demand WebView, Bitwarden autofill, and one-click bundle export |
 > [!NOTE]
 > **Memory Footprint**: The standalone Python backend consumes ~35 - 45 MB RAM. With a single controlled Chromium instance, total actual system memory (PSS) is ~350 - 450 MB on Termux proot (~250 - 350 MB on native Linux). On Android Termux, ≥ 1 GB free RAM is recommended.
@@ -218,7 +218,8 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_PROXY` | string | `""` | Outbound proxy URL (`http://`, `https://`, or `socks5://`) |
 | `AISTUDIO_DATA_DIR` | string | `data/` | Main data directory for persistent files (`/app/data` in Docker) |
 | `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | Directory for storing account credentials |
-| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | Persistent storage file for model usage metrics |
+| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | Persistent storage file for token usage statistics (schema v2) |
+| `AISTUDIO_MODEL_CACHE_FILE` | string | `data/models_cache.json` | Model discovery snapshot (including Paid metadata and `fetched_at`) used for startup recovery and refresh-failure fallback |
 | `AISTUDIO_ROTATOR_STATE_FILE` | string | `data/rotator_state.json` | Persistent storage file for account 429 cooldowns and dispatch states |
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | Path to model rules and default tools configuration YAML |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | Persist request and token usage metrics across service restarts |
@@ -515,6 +516,7 @@ if response.function_calls:
 The service includes a built-in static Web Console served at `http://localhost:8080`:
 
 - **Dashboard**: Real-time view of service health, per-model request stats, success rates, and rate-limit cooldown status.
+- **Usage Statistics (Stats, `/stats`)**: Dedicated token usage page with time/model views for input, output, reasoning, cache reads/writes, and cache hit rate; separates client requests, upstream attempts, and `count_tokens` preflight calls; shows current account scheduling status and Paid/Pro-only markers. Data endpoints are `GET /api/stats` and `GET /api/stats/timeseries`.
 - **Accounts**: Import Cookie credentials (single text or bundle files), auto-probe multiple accounts, switch the active account, or reset rate limits.
 - **Settings**: Online editor for `config.yaml` with instant hot-reloading on save.
 - **Access Control**: Enable authentication by setting `AISTUDIO_WEB_PASSWORD`.
