@@ -237,6 +237,7 @@ docker compose up -d
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
+| `AISTUDIO_LOG_DIR` | string | `data/logs/` | 按天归档日志目录（`aistudio-YYYYMMDD.log`，自动保留最近 7 天） |
 | `AISTUDIO_BUILD_SURFACE` | bool | `false` | Build 页面直连面总开关（free 档账号走 Build 直连通道） |
 | `AISTUDIO_ATG_MODE` | string | `off` | ATG 防截断模式：`off` / `prefer` / `required` |
 | `AISTUDIO_ACCOUNT_REFRESH_CONCURRENCY` | int | `3` | 批量账号信息刷新并发工作池大小 |
@@ -316,6 +317,8 @@ docker compose up -d
 - `GET /api/keepalive`：返回开关、间隔、下次运行、最近一次 refresh/auth_update/auto_switch 结果、chat/build 在途数。
 - `POST /api/keepalive/run`：手动触发 `metadata_refresh` / `auth_update` / `auto_switch` / `active_activity`，用于验收与排障；仍受互斥和在途检查约束。
 - `PUT /config/features`：结构化更新 `features` 并原子落盘、热重载，供后续 WP7 UI 使用。
+- `GET /logs/stream`：SSE 实时日志流（`level`、`last_id` / `Last-Event-ID`，先回放最近 100 条，15s 心跳，最多 8 个订阅者）。
+- `GET /logs/export`：导出最近 7 天日志归档；`start`/`end`（ISO8601）或 `days`，单日为 `.log`，跨天为 `.zip`。
 
 > 配置双写：本地运行配置是根 `config.yaml`（不被 git 追踪）；分发默认配置是 `defaults/config.yaml`。修改 features 时必须两处同步，提交以 `defaults/config.yaml` 为准。
 
