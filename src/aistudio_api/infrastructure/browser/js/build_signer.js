@@ -80,6 +80,15 @@
         _warmup: "",
         _hooked: false,
         _codecError: "",
+        _selfTested: false,
+        _selfTestAttempted: false,
+        _selfTestAttempts: 0,
+        _selfTestCandidateKeys: "",
+        _selfTestError: "",
+        _signer: null,
+        _signerKey: "",
+        _signerCandidates: [],
+        _tokenCandidates: [],
 
         ready() {
             return this.state === "ready";
@@ -139,7 +148,7 @@
     // 收割头未落位即派发生成会被上游 403 "caller does not have permission" 拒绝，服务内实测）。
     function refreshState() {
         if (service.state === "failed") return;
-        if (service._tb && hasHarvestedKey()) {
+        if (service._tb && service._selfTested && hasHarvestedKey()) {
             service.state = "ready";
             return;
         }
@@ -151,6 +160,106 @@
             service.state = "harvesting";
             return;
         }
+    }
+
+    // Bundle 更新会重命名 minified 符号；这里按源码结构发现，而不是记名字。
+    function discoverSignerCandidates(M) {
+        const candidates = [];
+        const keys = Object.keys(M);
+        for (const key of keys) {
+            let fn;
+            try {
+                fn = M[key];
+            } catch (e) {
+                continue;
+            }
+            if (typeof fn !== "function" || fn.__buildSignerHook) continue;
+            let source = "";
+            try {
+                source = Function.prototype.toString.call(fn);
+            } catch (e) {
+                continue;
+            }
+            if (source.indexOf("snapshot") === -1 || source.indexOf("content") === -1) continue;
+            candidates.push({ key: key, fn: fn });
+        }
+        return candidates;
+    }
+
+    function discoverTokenCandidates(M) {
+        const candidates = [];
+        for (const key of Object.keys(M)) {
+            let cls;
+            try {
+                cls = M[key];
+            } catch (e) {
+                continue;
+            }
+            if (typeof cls !== "function") continue;
+            let source = "";
+            try {
+                source = Function.prototype.toString.call(cls);
+            } catch (e) {
+                continue;
+            }
+            if (source.indexOf("getMetadata") === -1) continue;
+            if (source.indexOf("X-Goog-Api-Key") === -1 && source.indexOf("x-goog-api-key") === -1) continue;
+            candidates.push({ key: key, cls: cls });
+        }
+        return candidates;
+    }
+
+    async function sha256Hex(text) {
+        const data = new TextEncoder().encode(String(text));
+        const digest = await crypto.subtle.digest("SHA-256", data);
+        return Array.from(new Uint8Array(digest))
+            .map(byte => byte.toString(16).padStart(2, "0"))
+            .join("");
+    }
+
+    function tokenLike(value) {
+        return !!(
+            value &&
+            (value.mb || value.A || typeof value.snapshot === "function" || typeof value.getMetadata === "function")
+        );
+    }
+
+    async function selfTest() {
+        if (service._selfTested) return true;
+        if (!service._signerCandidates.length) return false;
+        if (service._selfTestAttempted) return false;
+        if (service._selfTestAttempts >= 3) return false;
+        service._selfTestAttempted = true;
+        service._selfTestAttempts += 1;
+        if (service._tbOrigin.indexOf("hook") === 0) {
+            acquireToken(true);
+        }
+        if (!service._tb) return false;
+        const digest = await sha256Hex("build-signer-selftest");
+        const failures = [];
+        for (const candidate of service._signerCandidates) {
+            try {
+                const token = await candidate.fn.call(window.default_MakerSuite, service._tb, digest);
+                if (typeof token === "string" && token.charAt(0) === "!" && token.length > 40) {
+                    service._signer = candidate.fn;
+                    service._signerKey = candidate.key;
+                    service._selfTested = true;
+                    service._selfTestError = "";
+                    refreshState();
+                    safeLog("signer resolved by structure: " + candidate.key + " tokenLen=" + token.length);
+                    return true;
+                }
+                failures.push(
+                    candidate.key + ":prefix=" + String(token).slice(0, 1) +
+                    ",len=" + (typeof token === "string" ? token.length : -1)
+                );
+            } catch (e) {
+                failures.push(candidate.key + ":" + String((e && e.message) || e).slice(0, 140));
+            }
+        }
+        service._selfTestError = failures.join(" | ").slice(0, 500);
+        safeLog("signer self-test failed candidates=" + service._signerCandidates.length + " tb=" + (service._tb ? "yes" : "no") + " error=" + service._selfTestError);
+        return false;
     }
 
     // --------------------------------------------------- codecFactory（内联静态源码）
@@ -742,18 +851,18 @@
             return;
         }
         const M = window.default_MakerSuite;
-        if (!M || typeof M.Cn !== "function" || typeof M.GB !== "function") {
-            push({ rid: rid, type: "error", message: "[buildSigner] default_MakerSuite/M.Cn/M.GB missing (state=" + service.state + ")" });
+        if (!M) {
+            push({ rid: rid, type: "error", message: "[buildSigner] default_MakerSuite missing (state=" + service.state + ")" });
             return;
         }
 
-        // 本地 warmup（零上游流量）：由 Python 侧主动派发一次，调用 M.Cn ⇒ tb 被捕获；
-        // 置 warmup-captured/ready，不等待收割头。对齐 spikeP 实证流程。
+        // 本地 warmup（零上游流量）：只做 token 捕获与一次零额度自检，不生成内容。
         if (model === WARMUP_MARKER) {
             try {
-                await acquireToken();
+                acquireToken();
+                await selfTest();
             } catch (e) {
-                /* tb 捕获尽力而为；失败由外层超时诊断兜底 */
+                /* 自检失败由外层超时诊断兜底；不记录凭据 */
             }
             service._warmup = "swallowed";
             refreshState();
@@ -784,7 +893,8 @@
 
         let token;
         try {
-            token = await M.Cn(tb, await M.GB(pathElement + " " + jsonText));
+            if (!service._signer) throw new Error("signer not resolved");
+            token = await service._signer.call(M, tb, await sha256Hex(pathElement + " " + jsonText));
         } catch (e) {
             push({ rid: rid, type: "error", message: "[buildSigner] signing failed: " + String((e && e.message) || e).slice(0, 300) });
             return;
@@ -910,70 +1020,80 @@
     }
 
     // ---------------------------------------------------------------- 安装流程
-    function acquireToken() {
-        if (service._tb) return true;
+    function acquireToken(force) {
+        if (service._tb && !force) return true;
         const M = window.default_MakerSuite;
         if (!M) return false;
-        try {
+        if (!service._tokenCandidates.length) {
+            service._tokenCandidates = discoverTokenCandidates(M);
+        }
+        for (const candidate of service._tokenCandidates) {
             let inst = null;
-            if (typeof M.TB === "function") {
-                if (typeof M.n === "function") {
-                    try {
-                        inst = M.n(M.TB);
-                    } catch (e) {
-                        /* Angular 注入上下文不可用（NG0203） */
-                    }
-                }
-                if (!inst || !inst.mb) {
-                    try {
-                        inst = new M.TB();
-                    } catch (e) {
-                        /* 构造需要注入上下文 */
-                    }
+            if (typeof M.n === "function") {
+                const injectToken = candidate.cls.ta || candidate.cls;
+                try {
+                    inst = M.n(injectToken);
+                } catch (e) {
+                    /* Angular 注入上下文不可用（NG0203） */
                 }
             }
-            if (inst && inst.mb) {
+            if (!tokenLike(inst)) {
+                try {
+                    inst = new candidate.cls();
+                } catch (e) {
+                    /* 构造需要注入上下文 */
+                }
+            }
+            if (tokenLike(inst)) {
                 service._tb = inst;
-                service._tbOrigin = "self";
+                service._tbOrigin = "resolver:" + candidate.key;
                 return true;
             }
-        } catch (e) {
-            /* 获取尽力而为；hook() 捕获才是可靠路径 */
         }
         return false;
     }
 
-    // 与 Ark hook()（L220-267）逐条对齐；实例择优保留带 key 的（用 nK/jK 仅作择优启发，
-    // 不作 key 来源——key 一律取收割头）。
+    // 结构与行为发现：只按源码特征找候选，名字不参与判定。
     function hookMakerSuite() {
         const M = window.default_MakerSuite;
-        if (!M || !M.Cn || !M.GB) return "module_missing";
-        if (!M.Cn.__buildSignerHook) {
-            const original = M.Cn;
+        if (!M) return "module_missing";
+        if (!service._signerCandidates.length) {
+            service._signerCandidates = discoverSignerCandidates(M);
+        }
+        if (!service._tokenCandidates.length) {
+            service._tokenCandidates = discoverTokenCandidates(M);
+        }
+        if (!service._signerCandidates.length) return "module_missing";
+        for (const candidate of service._signerCandidates) {
+            const original = candidate.fn;
+            if (original.__buildSignerHook) continue;
             const wrapped = function (a) {
-                if (a && a.mb) {
+                if (tokenLike(a)) {
                     const currentKeyed = !!(service._tb && service._tb.mb && (service._tb.mb.jK || service._tb.mb.nK));
-                    const nextKeyed = !!(a.mb.jK || a.mb.nK);
+                    const nextKeyed = !!(a.mb && (a.mb.jK || a.mb.nK));
                     if (!service._tb || nextKeyed || !currentKeyed) {
                         service._tb = a;
-                        service._tbOrigin = "hook";
+                        service._tbOrigin = "hook:" + candidate.key;
                     }
                 }
                 return original.apply(this, arguments);
             };
             wrapped.__buildSignerHook = true;
-            M.Cn = wrapped;
-        }
-        if (M.GB && !M.GB.__buildSignerHook) {
-            const originalGB = M.GB;
-            const wrappedGB = function () {
-                return originalGB.apply(this, arguments);
-            };
-            wrappedGB.__buildSignerHook = true;
-            M.GB = wrappedGB;
+            M[candidate.key] = wrapped;
+            candidate.fn = wrapped;
         }
         service._hooked = true;
-        return service._tb ? "ready" : "token_pending";
+        const candidateKeys = service._signerCandidates.map(candidate => candidate.key).join(",");
+        if (candidateKeys && candidateKeys !== service._selfTestCandidateKeys) {
+            service._selfTestCandidateKeys = candidateKeys;
+            service._selfTestAttempted = false;
+        }
+        if (service._tb && !service._selfTested && !service._selfTestAttempted) {
+            setTimeout(() => {
+                void selfTest().catch(() => {});
+            }, 0);
+        }
+        return "token_pending";
     }
 
     // 本地吞没 warmup（Ark L321-361 / L846-853）；绝不发包、零额度。
@@ -1077,7 +1197,8 @@
         window.fetch = function (input, init) {
             try {
                 const url = typeof input === "string" || input instanceof URL ? String(input) : input.url;
-                if (RPC_RE.test(url)) {
+                const isWarmup = url.indexOf(WARMUP_MARKER) !== -1;
+                if (RPC_RE.test(url) || isWarmup) {
                     const headerBag = new Headers(
                         (init && init.headers) || (input instanceof Request ? input.headers : undefined)
                     );
@@ -1090,6 +1211,25 @@
                         service._headers = Object.assign(service._headers || {}, harvested);
                         refreshState();
                     }
+                }
+                if (isWarmup) {
+                    // The Build client uses fetch (not XHR) for proxy requests. A real
+                    // warmup must be swallowed locally so it never reaches upstream.
+                    try {
+                        acquireToken();
+                        void selfTest();
+                    } catch (e) {
+                        /* tb 捕获尽力而为；后续由就绪探测给出诊断 */
+                    }
+                    service._warmup = "swallowed";
+                    refreshState();
+                    safeLog("warmup fetch swallowed locally (zero upstream traffic)");
+                    return Promise.resolve(
+                        new Response('[3,"build-signer warmup swallowed"]', {
+                            status: 200,
+                            headers: { "content-type": "application/json" },
+                        })
+                    );
                 }
             } catch (e) {
                 /* 收割尽力而为 */
