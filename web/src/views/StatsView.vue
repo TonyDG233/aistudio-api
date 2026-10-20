@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { RefreshCw, BarChart3, AlertCircle, CalendarDays } from 'lucide-vue-next'
+import { RefreshCw, AlertCircle, CalendarDays } from 'lucide-vue-next'
 import { systemApi, type SurfaceContext } from '@/api/system.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
@@ -150,14 +150,8 @@ usePolling(load, 10000, { key: 'stats-page' })
   <div class="space-y-6">
     <div class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
       <div>
-        <div class="flex items-center gap-2">
-          <BarChart3 class="w-5 h-5 text-brand-600" />
-          <h1 class="text-lg font-bold text-gray-900 tracking-tight">
-            用量统计
-          </h1>
-        </div>
-        <p class="mt-1 text-xs text-gray-500">
-          Token 用量、缓存命中与账号调度状态
+        <p class="text-xs text-gray-500">
+          Token 用量、缓存命中与账号调度状态；账号面板是当前调度状态，不是所选时间范围。
           <span
             v-if="lastUpdated"
             class="text-gray-400"
