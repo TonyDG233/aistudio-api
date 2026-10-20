@@ -1,3 +1,25 @@
+export interface FeatureChannelConfig {
+  enabled?: boolean
+  max_instances?: number
+  max_pages?: number
+  quota_pool?: string | null
+  [key: string]: unknown
+}
+
+export interface FeatureSlotRow {
+  account_id: string
+  channel: string
+  enabled?: boolean
+  note?: string
+  [key: string]: unknown
+}
+
+export interface FeaturesConfig {
+  channels?: Record<string, FeatureChannelConfig>
+  slots?: FeatureSlotRow[]
+  [key: string]: unknown
+}
+
 export interface SystemConfig {
   port: number
   browser_port: number
@@ -11,6 +33,7 @@ export interface SystemConfig {
   debug_env_active?: boolean
   dump_to_file?: boolean
   dump_dir?: string
+  features?: FeaturesConfig
 }
 export interface UpdateLoggingConfigRequest {
   level?: string

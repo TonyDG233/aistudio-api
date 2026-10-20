@@ -6,6 +6,7 @@ import type {
   RotationStatusResponse,
   ClearCooldownRequest,
   SystemConfig,
+  FeaturesConfig,
   ApiKeyItem,
   CreateApiKeyRequest,
   UpdateApiKeyRequest,
@@ -22,23 +23,45 @@ export interface SurfacePageState {
   last_error?: string
 }
 
+export interface SurfaceSlotRow {
+  account_id?: string | null
+  channel?: string | null
+  enabled?: boolean
+  note?: string | null
+  [key: string]: unknown
+}
+
 export interface SurfaceContext {
+  slot_id?: string
+  realm_id?: string
+  context_id?: string
   account_id?: string | null
   surface?: string | null
   chat_ready?: boolean
   build_ready?: boolean
+  chat_counted?: boolean
+  build_counted?: boolean
   state?: string | null
   in_flight?: number
+  reservations?: number
+  pages?: { chat?: number; build?: number }
+  last_used?: number | string | null
+  slot_rows?: SurfaceSlotRow[]
+}
+
+export interface SurfaceBudgets {
+  global_max_pages?: number | null
+  channel_max_pages?: Record<string, number>
+  max_contexts?: number | null
+  pages?: { chat?: number; build?: number }
+  contexts?: number
+  [key: string]: unknown
 }
 
 export interface SurfaceInstancesRaw extends Partial<SurfaceInstancesResponse> {
   pages?: { chat?: number; build?: number }
   control_session?: { alive?: boolean; url?: string | null; account_id?: string | null }
-  budgets?: {
-    global_max_pages?: number | null
-    pages?: { chat?: number; build?: number }
-    [key: string]: unknown
-  }
+  budgets?: SurfaceBudgets
   context_count?: number
 }
 
@@ -56,11 +79,30 @@ export interface SurfaceInstancesResponse {
   group: string | null
   max_page_instances: number | null
   effective_max: number | null
-  contexts?: SurfaceContext[]
-  budgets?: Record<string, unknown>
-  planned_instances?: number
+  contexts: SurfaceContext[]
+  budgets: SurfaceBudgets
+  planned_instances: number
+  context_count?: number
 }
 
+
+export interface RoutingStateResponse {
+  circuit?: {
+    open?: boolean
+    failures?: number
+    opened_at?: number | null
+    cooldown_remaining?: number | null
+    [key: string]: unknown
+  }
+  instances?: {
+    contexts?: SurfaceContext[]
+    max_contexts?: number | null
+    pages?: { chat?: number; build?: number }
+    budgets?: SurfaceBudgets
+    planned_instances?: number
+  }
+  [key: string]: unknown
+}
 
 export const systemApi = {
   health(): Promise<HealthCheckResponse> {
@@ -119,9 +161,13 @@ export const systemApi = {
       max_page_instances: raw.max_page_instances ?? maxPages,
       effective_max: raw.effective_max ?? maxPages,
       contexts: raw.contexts ?? [],
-      budgets: raw.budgets,
+      budgets: raw.budgets ?? {},
       planned_instances: raw.planned_instances ?? 0,
     }
+  },
+
+  getRoutingState(): Promise<RoutingStateResponse> {
+    return request<RoutingStateResponse>('/routing/state')
   },
 
   clearCooldown(req: ClearCooldownRequest = {}): Promise<{ ok: boolean; accounts: Record<string, unknown> }> {
@@ -145,6 +191,13 @@ export const systemApi = {
 
   getConfig(): Promise<SystemConfig> {
     return request<SystemConfig>('/config')
+  },
+
+  updateFeatures(features: Record<string, unknown>): Promise<{ ok: boolean; features: FeaturesConfig }> {
+    return request<{ ok: boolean; features: FeaturesConfig }>('/config/features', {
+      method: 'PUT',
+      body: JSON.stringify({ features }),
+    })
   },
 
   updateConfigYaml(yamlContent: string): Promise<{ ok: boolean; message: string }> {
