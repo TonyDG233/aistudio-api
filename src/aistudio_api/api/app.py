@@ -16,6 +16,8 @@ from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
 from aistudio_api.application.instance_manager import InstanceError
+from aistudio_api.application.surface_orchestrator import SurfacePolicyError
+from aistudio_api.infrastructure.gateway.build_surface import BuildSurfaceError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
@@ -285,6 +287,40 @@ async def instance_exception_handler(
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": {"code": exc.code, "message": str(exc)}},
+    )
+
+
+@app.exception_handler(SurfacePolicyError)
+async def surface_policy_exception_handler(
+    _request: Request, exc: SurfacePolicyError
+) -> JSONResponse:
+    """Policy denials are client-visible 4xx, never generic 500."""
+    return JSONResponse(status_code=exc.http_status, content=exc.to_error_body())
+
+
+@app.exception_handler(BuildSurfaceError)
+async def build_surface_exception_handler(
+    _request: Request, exc: BuildSurfaceError
+) -> JSONResponse:
+    """Build not-ready/timeout is retryable 503; upstream failures are 502."""
+    retryable = {
+        "SURFACE_NOT_READY",
+        "PAGE_NOT_READY",
+        "SIGNER_NOT_READY",
+        "APP_NOT_CONNECTED",
+        "TIMEOUT",
+    }
+    status_code = 503 if exc.code in retryable else 502
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": status_code,
+                "message": f"[build_surface:{exc.stage}] {exc.code}: {exc.detail}",
+                "status": "UNAVAILABLE" if status_code == 503 else "BAD_GATEWAY",
+                "advice": exc.guidance,
+            }
+        },
     )
 
 

@@ -113,7 +113,14 @@ def test_build_tools_from_names_allows_four_gemini_builtin_tools():
     ]
 
 
-def test_build_tools_from_names_restricts_unknown_model_to_safe_subset():
+def test_build_tools_from_names_restricts_unknown_model_to_safe_subset(
+    monkeypatch,
+):
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    monkeypatch.setattr(
+        model_discovery, "get_cached_model_info", lambda _model_id: None
+    )
     try:
         build_tools_from_names(
             ["google_maps"], model="models/learnlm-1.5-pro-experimental"
