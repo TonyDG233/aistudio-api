@@ -10,7 +10,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKERHUB_REPO: bedrockblock/aistudio-api
   GHCR_REPO: ghcr.io/${{ github.repository }}
 
 jobs:
@@ -37,7 +36,6 @@ jobs:
         with:
           images: |
             ${{ env.GHCR_REPO }}
-            ${{ env.DOCKERHUB_REPO }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -51,13 +49,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
