@@ -231,7 +231,7 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_BROWSER_EXECUTABLE` | string | Auto | Path to CloakBrowser executable (`/opt/cloakbrowser/chrome` in Docker) |
 | `AISTUDIO_BROWSER_PORT` | int | `9222` | Chromium remote debugging port (CDP) |
 | `AISTUDIO_BROWSER_HEADLESS` | bool | `true` | Run Chromium in headless mode |
-| `AISTUDIO_BROWSER_IDLE_TIMEOUT` | int | `900` / `1800` | Browser idle reclamation timeout in seconds (900s on Termux, 1800s on Desktop; 0 disables) |
+| `AISTUDIO_BROWSER_IDLE_TIMEOUT` | int | `0` | Browser idle reclamation timeout in seconds; disabled by default (0), set a positive value to opt in (e.g. 900 on Termux) |
 | `AISTUDIO_PROOT_NAME` | string | `aistudio-api` | Dedicated proot-distro container name for Termux |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | Default text model |
 | `AISTUDIO_DEFAULT_IMAGE_MODEL` | string | `gemini-3.1-flash-image-preview` | Default image generation model |

@@ -115,7 +115,7 @@ async def logs_stream(
     level: str = Query("DEBUG"),
     last_id: int | None = Query(None),
 ) -> StreamingResponse:
-    """Stream logs as SSE, replaying the newest 100 retained entries."""
+    """Stream logs as SSE, replaying the retained history on connect."""
     header_last_id = request.headers.get("last-event-id")
     if last_id is None and header_last_id:
         try:

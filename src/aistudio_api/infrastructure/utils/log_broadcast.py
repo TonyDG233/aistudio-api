@@ -20,9 +20,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
-DEFAULT_CAPACITY = 2000
+DEFAULT_CAPACITY = 5000
 DEFAULT_QUEUE_SIZE = 500
-DEFAULT_REPLAY_LIMIT = 100
+DEFAULT_REPLAY_LIMIT = 5000
+_LOW_LEVELS = frozenset({"DEBUG", "INFO"})
 DEFAULT_SUBSCRIBER_LIMIT = 8
 LOG_RETENTION_DAYS = 7
 
@@ -146,7 +147,7 @@ class LogBroadcaster:
             raise ValueError("queue_size must be at least 1")
         self._capacity = capacity
         self._queue_size = queue_size
-        self._entries: deque[LogEntry] = deque(maxlen=capacity)
+        self._entries: deque[LogEntry] = deque()
         self._next_id = 0
         self._next_subscription_id = 0
         self._subscribers: dict[int, Subscription] = {}
@@ -190,6 +191,14 @@ class LogBroadcaster:
                 message=safe_message,
             )
             self._entries.append(entry)
+            # Keep WARNING/ERROR/CRITICAL when DEBUG/INFO floods the buffer.
+            while len(self._entries) > self._capacity:
+                for index, item in enumerate(self._entries):
+                    if item.level in _LOW_LEVELS:
+                        del self._entries[index]
+                        break
+                else:
+                    self._entries.popleft()
             subscribers = list(self._subscribers.values())
 
         for subscription in subscribers:

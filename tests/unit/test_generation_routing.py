@@ -154,6 +154,45 @@ async def test_generate_uses_pipeline_surface_and_marks_success(monkeypatch) -> 
     assert events[-1]["account_id"] == "acc_a"
 
 
+async def test_capacity_defer_waits_then_retries(monkeypatch) -> None:
+    ctx = SimpleNamespace(
+        budget=RoutingBudget(max_switches=2, max_defers=2),
+        attempted=set(),
+        request_id="route-defer",
+    )
+    candidate = SimpleNamespace(account_id="acc_a")
+
+    class CapacityPipe:
+        def __init__(self) -> None:
+            self.acquire_calls = 0
+
+        def next_candidate(self, _ctx, _failed_account_id=None):
+            return None
+
+        async def acquire(self, _ctx, _candidate):
+            self.acquire_calls += 1
+            if self.acquire_calls == 1:
+                raise SurfacePolicyError(
+                    "surface_quota_exceeded", message="full", advice="wait"
+                )
+            return SimpleNamespace(
+                account_id="acc_a", realm_id="slot-a", is_borrow=False
+            )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    pipe = CapacityPipe()
+    _, lease = await generation_service._acquire_candidate_lease(
+        cast("Any", pipe), cast("Any", ctx), candidate
+    )
+
+    assert lease.realm_id == "slot-a"
+    assert pipe.acquire_calls == 2
+    assert ctx.budget.snapshot()["defers"] == 1
+
+
 async def test_generate_retries_same_candidate_without_new_switch(monkeypatch) -> None:
     ctx = RouteCtx()
     pipe = FakePipe(ctx)

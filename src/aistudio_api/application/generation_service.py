@@ -195,7 +195,14 @@ async def _acquire_candidate_lease(
     ctx: RouteContext,
     candidate: Any,
 ) -> tuple[Any, InstanceLease]:
-    """Acquire a candidate, advancing past per-candidate capacity denials."""
+    """Acquire a candidate, advancing past per-candidate capacity denials.
+
+    If every candidate is temporarily out of instance capacity, consume the
+    request's defer budget and retry the first candidate instead of failing the
+    caller immediately. This is the "park the request until a slot frees /
+    another instance switches" path.
+    """
+    first_candidate = candidate
     last_capacity: SurfacePolicyError | None = None
     skipped = 0
     skip_limit = max(1, int(cast("int", ctx.budget.snapshot()["max_switches"])) + 1)
@@ -211,6 +218,19 @@ async def _acquire_candidate_lease(
                 raise last_capacity from None
             candidate = pipe.next_candidate(ctx, candidate.account_id)
             if candidate is None:
+                if ctx.budget.can_defer():
+                    ctx.budget.record_defer("instance_capacity")
+                    logger.warning(
+                        "[surface:defer] request=%s waiting for instance capacity "
+                        "budget=%s",
+                        ctx.request_id,
+                        ctx.budget.snapshot(),
+                    )
+                    await asyncio.sleep(1.0)
+                    ctx.attempted.clear()
+                    skipped = 0
+                    candidate = first_candidate
+                    continue
                 if last_capacity is not None:
                     raise last_capacity from None
                 _raise_switch_exhausted(ctx)

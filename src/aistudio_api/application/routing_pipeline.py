@@ -249,9 +249,14 @@ class RoutingPipeline:
         slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
         views = [AccountView.from_account(account) for account in accounts]
         manager = self._instance_manager()
-        if manager is not None and manager.has_instances():
-            allowed_accounts = manager.active_account_ids()
-            views = [view for view in views if view.account_id in allowed_accounts]
+        if manager is not None:
+            instance_accounts = manager.instance_account_ids()
+            if instance_accounts:
+                # Keep explicit instances authoritative, but do not drop accounts
+                # just because their instance is temporarily invalid/asleep.
+                views = [
+                    view for view in views if view.account_id in instance_accounts
+                ]
         selection = choose_channel(
             model_path,
             views,

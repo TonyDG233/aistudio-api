@@ -277,13 +277,10 @@ def _resolve_default_idle_timeout() -> int:
     env_val = os.getenv("AISTUDIO_BROWSER_IDLE_TIMEOUT")
     if env_val is not None and env_val.strip() != "":
         return int(env_val)
-    if (
-        "com.termux" in os.getenv("PREFIX", "")
-        or "com.termux" in os.getenv("PATH", "")
-        or os.getenv("ANDROID_ROOT") is not None
-    ):
-        return 900
-    return 1800
+    # Disabled by default: a request can always wake the browser, and recycling
+    # while instances exist leaves stale slots/pages. Users who prefer aggressive
+    # memory reclamation can opt in explicitly.
+    return 0
 
 
 @dataclass(slots=True)
