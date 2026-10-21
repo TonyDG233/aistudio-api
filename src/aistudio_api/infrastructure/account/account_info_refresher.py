@@ -218,7 +218,7 @@ class AccountInfoRefresher:
             )
 
         checked_at = _now_iso()
-        response = await self._post_tier_request(cookies)
+        response = await self._post_tier_request(cookies, auth_user=account.auth_user)
         envelope = self._parse_envelope(response.body)
         message = self._envelope_message(envelope)
 
@@ -229,7 +229,9 @@ class AccountInfoRefresher:
             wants_email = refresh_email or not account.email
             if wants_email:
                 try:
-                    email = await self._fetch_account_email(cookies, account.email)
+                    email = await self._fetch_account_email(
+                        cookies, account.email, auth_user=account.auth_user
+                    )
                 except Exception as e:
                     email_error = str(e)
 
@@ -342,7 +344,7 @@ class AccountInfoRefresher:
             }
 
         checked_at = _now_iso()
-        response = await self._post_tier_request(cookies)
+        response = await self._post_tier_request(cookies, auth_user=account.auth_user)
         envelope = self._parse_envelope(response.body)
         message = self._envelope_message(envelope)
 
@@ -380,7 +382,9 @@ class AccountInfoRefresher:
         if cookies is None:
             return None
         try:
-            email = await self._fetch_account_email(cookies, account.email)
+            email = await self._fetch_account_email(
+                cookies, account.email, auth_user=account.auth_user
+            )
         except Exception as e:
             logger.warning("账号 %s 邮箱回填失败: %s", account.id, e)
             return None
@@ -425,7 +429,9 @@ class AccountInfoRefresher:
     def _build_authorization(self, jar: dict[str, str]) -> str:
         return calculate_sapisid_hash(jar, origin=ORIGIN)
 
-    def _rpc_headers(self, cookies: _CookieJar) -> dict[str, str]:
+    def _rpc_headers(
+        self, cookies: _CookieJar, *, auth_user: str = "0"
+    ) -> dict[str, str]:
         headers: dict[str, str] = {
             "accept": "*/*",
             "content-type": "application/json+protobuf",
@@ -433,7 +439,7 @@ class AccountInfoRefresher:
             "referer": f"{ORIGIN}/",
             "user-agent": USER_AGENT,
             "x-goog-api-key": self._web_api_key,
-            "x-goog-authuser": "0",
+            "x-goog-authuser": str(auth_user or "0"),
             "x-user-agent": "grpc-web-javascript/0.1",
         }
         if cookies.header:
@@ -443,13 +449,15 @@ class AccountInfoRefresher:
             headers["authorization"] = authorization
         return headers
 
-    async def _post_tier_request(self, cookies: _CookieJar) -> TransportResponse:
-        headers = self._rpc_headers(cookies)
+    async def _post_tier_request(
+        self, cookies: _CookieJar, *, auth_user: str = "0"
+    ) -> TransportResponse:
+        headers = self._rpc_headers(cookies, auth_user=auth_user)
         response = await self._transport.request(
             "POST", RPC_URL, headers=headers, content="[]"
         )
         if response.status == 403 and self._is_key_problem(response.body):
-            rotated = await self._recover_web_api_key(cookies)
+            rotated = await self._recover_web_api_key(cookies, auth_user=auth_user)
             if rotated and rotated != self._web_api_key:
                 self._web_api_key = rotated
                 headers["x-goog-api-key"] = rotated
@@ -467,7 +475,9 @@ class AccountInfoRefresher:
         text = str(body or "")
         return "API_KEY_SERVICE_BLOCKED" in text or "unregistered callers" in text
 
-    async def _recover_web_api_key(self, cookies: _CookieJar) -> str | None:
+    async def _recover_web_api_key(
+        self, cookies: _CookieJar, *, auth_user: str = "0"
+    ) -> str | None:
         """从 apps 页 HTML 回收 web API key（只返回，不在此处改写当前 key）。
 
         注意：Ark 原实现会在回收时立即写入 ``this.webApiKey``，导致其
@@ -475,7 +485,7 @@ class AccountInfoRefresher:
         WP3 规格修正为「回收的 key 与当前 key 不同才重试一次」，由调用方写回。
         """
         try:
-            html = await self._fetch_app_html(cookies)
+            html = await self._fetch_app_html(cookies, auth_user=auth_user)
         except Exception as e:
             logger.warning("[Refresh] Unable to re-extract the web API key: %s", e)
             return None
@@ -487,25 +497,32 @@ class AccountInfoRefresher:
             keys[0],
         )
 
-    async def _fetch_app_html(self, cookies: _CookieJar) -> str:
+    async def _fetch_app_html(
+        self, cookies: _CookieJar, *, auth_user: str = "0"
+    ) -> str:
         headers = {
             "accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             ),
             "user-agent": USER_AGENT,
+            "x-goog-authuser": str(auth_user or "0"),
         }
         if cookies.header:
             headers["cookie"] = cookies.header
-        url = f"https://{PAGE_HOST}/apps/{self._app_id}"
+        url = f"https://{PAGE_HOST}/apps/{self._app_id}?authuser={auth_user or '0'}"
         response = await self._transport.request("GET", url, headers=headers)
         if response.status != 200:
             raise RuntimeError(f"page fetch HTTP {response.status}")
         return response.body
 
     async def _fetch_account_email(
-        self, cookies: _CookieJar, existing_name: str | None
+        self,
+        cookies: _CookieJar,
+        existing_name: str | None,
+        *,
+        auth_user: str = "0",
     ) -> str | None:
-        html = await self._fetch_app_html(cookies)
+        html = await self._fetch_app_html(cookies, auth_user=auth_user)
         # WIZ_global_data 的 "oPEP7c" 字段携带已登录账号邮箱。
         config_match = _STRICT_EMAIL_RE.search(html)
         if config_match:
