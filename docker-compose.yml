@@ -20,7 +20,7 @@ services:
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
       - AISTUDIO_CONFIG_FILE=/app/config.yaml
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1beta/models"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       start_period: 10s
