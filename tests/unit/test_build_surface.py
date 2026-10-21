@@ -737,3 +737,114 @@ async def test_abort_stream_by_rid():
     event = queue.get_nowait()
     assert event["type"] == "error"
     assert event["message"] == "client_disconnected"
+
+
+async def test_stream_generate_waits_for_native_ws_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    surface = _surface(FakePage())
+    surface._realm_id = "realm-test"
+    surface.state.native_ready = True
+    surface.state.signer_ready = False
+    recoveries: list[dict[str, object]] = []
+
+    async def fake_recover(page: object, **kwargs: object) -> bool:
+        recoveries.append(kwargs)
+        return True
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]]:
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        queue.put_nowait({"event_type": "error", "message": "should not be used"})
+        return queue
+
+    monkeypatch.setattr(surface, "_connections", list)
+    monkeypatch.setattr(surface, "_recover_warmup", fake_recover)
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+
+    with pytest.raises(bs.BuildSurfaceError):
+        await _collect(surface.stream_generate(model="m", json_body="{}"))
+
+    assert len(recoveries) == 2
+    assert all(item["wait_signer"] is False for item in recoveries)
+
+
+async def test_stream_generate_retries_native_after_dispatch_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    page = FakePage()
+    surface = _surface(page)
+    surface._realm_id = "realm-test"
+    surface.state.native_ready = True
+    surface.state.signer_ready = False
+    calls = {"recover": 0, "dispatch": 0}
+    sse = "data: " + json.dumps(FRAME0_CHUNK, ensure_ascii=False) + "\n\n"
+
+    async def fake_recover(page_arg: object, **kwargs: object) -> bool:
+        calls["recover"] += 1
+        return True
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]] | None:
+        calls["dispatch"] += 1
+        if calls["dispatch"] == 1:
+            return None
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        queue.put_nowait({"event_type": "response_headers", "status": 200})
+        queue.put_nowait({"event_type": "chunk", "data": sse})
+        queue.put_nowait({"event_type": "stream_close"})
+        return queue
+
+    monkeypatch.setattr(surface, "_connections", list)
+    monkeypatch.setattr(surface, "_recover_warmup", fake_recover)
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+
+    events = await _collect(
+        surface.stream_generate(model="gemini-3.8-flash", json_body='{"contents":[]}')
+    )
+    assert calls == {"recover": 2, "dispatch": 2}
+    assert ("status", 200) in events
+    assert ("body", "OK") in events
+
+
+async def test_stream_generate_retries_native_error_before_first_frame(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    surface = _surface(FakePage())
+    surface._realm_id = "realm-test"
+    surface.state.native_ready = True
+    surface.state.signer_ready = False
+    calls = {"recover": 0, "dispatch": 0}
+    sse = "data: " + json.dumps(FRAME0_CHUNK, ensure_ascii=False) + "\n\n"
+
+    async def fake_recover(page_arg: object, **kwargs: object) -> bool:
+        calls["recover"] += 1
+        return True
+
+    async def fake_dispatch(
+        request_id: str, model: str, json_body: str
+    ) -> asyncio.Queue[dict[str, object]]:
+        calls["dispatch"] += 1
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        if calls["dispatch"] == 1:
+            queue.put_nowait(
+                {"event_type": "error", "message": "9998 连接断开"}
+            )
+        else:
+            queue.put_nowait({"event_type": "response_headers", "status": 200})
+            queue.put_nowait({"event_type": "chunk", "data": sse})
+            queue.put_nowait({"event_type": "stream_close"})
+        return queue
+
+    monkeypatch.setattr(surface, "_connections", lambda: [object()])
+    monkeypatch.setattr(surface, "_recover_warmup", fake_recover)
+    monkeypatch.setattr(surface, "_dispatch_native", fake_dispatch)
+
+    events = await _collect(
+        surface.stream_generate(model="gemini-3.8-flash", json_body='{"contents":[]}')
+    )
+    assert calls == {"recover": 1, "dispatch": 2}
+    assert ("status", 200) in events
+    assert ("body", "OK") in events
