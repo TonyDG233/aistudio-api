@@ -89,8 +89,8 @@ tonygemini38@gmail.com
 合法形态：
 
 - **2c1p**：两个账号各一个渠道实例 → 2 实例、2 上下文、2 页面。
-- **1c2p**：一个账号 PG+Build → 2 实例、1 上下文、2 页面。
-- **2c3p**：A-PG + A-Build + B-PG = 3 个用量窗口 → 超过实例上限，禁止。
+- **1c2p**：一个账号 PG+Build → 2 实例、1 上下文、2 页面（仅 `max_contexts>=2`）。
+- **2c3p**：A-PG + A-Build + B-PG = 3 个用量窗口；`max_contexts>=3` 时成立，`max_contexts<=2` 时超过实例上限，禁止。
 
 ---
 
@@ -135,21 +135,22 @@ routing:
 ## 4. 容量与内存
 
 ```text
-max_contexts = 同时登录账号/上下文上限，也是启动预启动数量
-max_instances = 同时 active 的用量窗口上限
+max_contexts = 用户可见总实例上限（1-16），也是启动预启动数量
+max_instances = max_contexts（API 派生值，不再单独配置）
 ```
 
-实例上限与账号上限分开计算：
+实例上限就是 `max_contexts`：
 
 ```text
-max_instances = max(max_contexts, 2)
+max_instances = max_contexts
 ```
 
 这样：
 
-- `max_contexts=2` 时最多 2 个实例，启动 2 个账号、各 1 个默认渠道实例；
-- `max_contexts=1` 时仍允许该账号的 PG+Build 两个实例（1c2p），但不会出现第二个 context；
-- 任何情况下都不为了切换强行开第三个 context 或第三个用量窗口。
+- `max_contexts=2` 时最多 2 个实例，可按 2c1p 或 1c2p 组合；
+- `max_contexts=1` 时只有 1 个实例、1 个 page；PG/Build 只能顺序切换，不能并行开两个 page；
+- `max_contexts>=3` 时 2c3p 等多实例组合也可成立，只要总实例数不超过 `max_contexts` 且渠道 `max_instances` 允许；
+- 任何情况下都不为了切换强行开第二个 page 或第三个实例。
 
 内存规则：
 
@@ -158,7 +159,7 @@ max_instances = max(max_contexts, 2)
 - 一个账号只有在最后一个实例关闭后才回收 context；
 - 同一账号的多个实例共用一个 context，不重复 cookie；
 - 默认不预加载；
-- 页面预算至少覆盖 `max_instances`；
+- 页面预算 = `max_contexts`；
 - 全局/渠道/组页面预算都是后端内存保护，不进入主 UI；
 - Build-only 账号为 BotGuard 捕获创建的内部 bootstrap 页应在捕获后关闭或复用，不能把它当作额外实例，也不能长期白占页面内存；
 - 关闭实例释放页面；最后一个实例关闭时释放上下文。
@@ -273,7 +274,7 @@ max_instances = max(max_contexts, 2)
 - 已 active 实例切换不创建新页面、不消耗新实例容量；
 - “启动并切换”会创建一个新实例和一个新页面，必须同时通过实例上限和页面预算；
 - 同一账号同一渠道不能重复创建实例；
-- 同一账号不同渠道允许创建第二个实例，但总实例数不能超过 `max_instances`，context 不增加；
+- 同一账号不同渠道允许创建第二个实例，但总实例数不能超过 `max_contexts`，context 不增加；
 - 如果切换动作会关闭旧实例并释放页面，先按释放后的可用容量计算；
 - 前端可以禁用按钮，后端必须再次校验；
 - 渠道按钮直接显示，不用隐藏下拉；
@@ -410,7 +411,7 @@ odindicola5@gmail.com   [free] 可用
 - `[最新实例 ?]` 不参与排序；
 - 组只做约束，不是独立实例池；
 - 同账号多渠道共用一个 context，但每个渠道是独立实例、独立用量窗口；
-- 启动时填满 `max_contexts` 是为了账号可用性；实例数由 `max_instances` 另行约束；
+- 启动时填满 `max_contexts` 是为了账号可用性；实例数同样由 `max_contexts` 约束；
 - 不为“保留旧实例”额外开实例，除非容量和路由确实需要。
 
 ---
@@ -436,8 +437,8 @@ odindicola5@gmail.com   [free] 可用
 
 - 实例/账号上限放在深度设置最前面；
 - `max_contexts` 默认 1；
-- `max_instances = max(max_contexts, 2)`，保证单账号也能开 PG+Build（1c2p）；
-- 上限为 1 时，自定义策略组和高级内存优化整卡收起；
+- `max_instances = max_contexts`，实例总数直接由该值限制；
+- 上限为 1 时是单实例模式：PG/Build 顺序切换，不并行开两个 page；自定义策略组和高级内存优化整卡收起；
 - 上限大于 1 时，两张卡默认折叠；
 - 自定义策略组只做约束，不是独立实例池；
 - 路由安全放在渠道注册表下方；
@@ -445,7 +446,7 @@ odindicola5@gmail.com   [free] 可用
   - 全局页面预算；
   - 单渠道页面预算；
   - 预加载；
-  - 预算至少覆盖 `max_instances`；
+  - 预算 = `max_contexts`；
 - 切换面板读取这些有效预算；
 - 前端可禁用按钮，后端必须校验。
 
@@ -543,10 +544,10 @@ POST   /api/instances/{id}/reassign         { account_id }
 - 可用账号不足时启动实际数量；
 - 同一账号同一渠道不重复启动；
 - 两个账号各一个渠道 → 2 实例、2 上下文、2 页面；
-- 同一账号 PG+Build → 2 实例、1 上下文、2 页面（1c2p）；
+- 同一账号 PG+Build → 2 实例、1 上下文、2 页面（1c2p；仅 `max_contexts>=2`）；
 - 同一账号同一渠道重复创建 → 409；
-- 同一账号不同渠道创建第二个实例 → 允许，但不超过 `max_instances`；
-- 2c3p → 第 3 个实例被拒绝，不留下半页面/半 context；
+- 同一账号不同渠道创建第二个实例 → 允许，但不超过 `max_contexts`；
+- 2c3p → `max_contexts<=2` 时第 3 个实例被拒绝；`max_contexts>=3` 时允许 3 实例，不留下半页面/半 context；
 - 容量满 → 409；
 - 有在途关闭 → 409；
 - 切换 active 目标不关闭旧实例；

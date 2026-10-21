@@ -28,6 +28,7 @@ const systemStore = useSystemStore()
 
 const importModalOpen = ref(false)
 const switchModalOpen = ref(false)
+const switchTargetAccountId = ref<string | null>(null)
 const editModalOpen = ref(false)
 const editingAccount = ref<AccountWithStats | null>(null)
 const importFiles = ref<File[]>([])
@@ -51,6 +52,7 @@ function setStatusFilter(value: 'all' | 'ready' | 'limited' | 'expired') {
 }
 
 function openSwitchPanel(_instanceId?: string) {
+  switchTargetAccountId.value = null
   switchModalOpen.value = true
 }
 
@@ -61,7 +63,21 @@ async function handleSwitchInstance(instanceId: string, channel?: string) {
 
 async function handleCreateInstance(accountId: string, channel: string) {
   const ok = await instancesStore.create(accountId, channel)
-  if (ok) switchModalOpen.value = false
+  if (ok) {
+    switchModalOpen.value = false
+    switchTargetAccountId.value = null
+  }
+}
+
+async function handleReplaceInstance(instanceId: string, accountId: string, channel: string) {
+  const closed = await instancesStore.closeAndWait(instanceId)
+  if (!closed) return
+  const created = await instancesStore.create(accountId, channel)
+  if (created) {
+    switchModalOpen.value = false
+    switchTargetAccountId.value = null
+    await accountsStore.fetchAll()
+  }
 }
 
 function handleCloseInstance(instanceId: string) {
@@ -238,7 +254,8 @@ async function handleRemove(account: AccountWithStats) {
 }
 
 async function handleActivate(account: AccountWithStats) {
-  await instancesStore.create(account.id)
+  switchTargetAccountId.value = account.id
+  switchModalOpen.value = true
 }
 </script>
 
@@ -548,11 +565,14 @@ async function handleActivate(account: AccountWithStats) {
       :accounts="accountsStore.accountRows"
       :max-instances="instancesStore.maxInstances"
       :current-instance-id="instancesStore.currentInstanceId"
+      :target-account-id="switchTargetAccountId"
       :switching-instance-id="instancesStore.switchingInstanceId"
       :creating-account-id="instancesStore.creatingAccountId"
+      :closing-instance-id="instancesStore.closingInstanceId"
       :loading="instancesStore.loading"
       @switch="handleSwitchInstance"
       @create="handleCreateInstance"
+      @replace="handleReplaceInstance"
       @retry="instancesStore.fetch()"
     />
 

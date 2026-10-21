@@ -52,7 +52,7 @@
 | **Anthropic Messages 兼容** | 提供 `/v1/messages` 与 `/v1/messages/count_tokens`，支持流式事件、工具调用、thinking、图片与真实上游计数 |
 | **动态模型发现** | 自动向上游同步可用模型列表与 Paid/Pro-only 元数据，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型；快照持久化 + 启动预热，刷新失败回退上次快照 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
-| **实例与渠道（WP5）** | 实例 = 账号 + 渠道的独立用量窗口；同一账号的 PG/Build 为两个实例、共享一个浏览器上下文；只允许 2c1p/1c2p，禁止 2c3p；渠道切换替换单页，不新增 context |
+| **实例与渠道（WP5）** | 实例 = 账号 + 渠道的独立用量窗口；同一账号的 PG/Build 在总实例上限允许时是两个实例、共享一个浏览器上下文；实例总数由 `max_contexts` 限制，默认单实例顺序切换，`max_contexts>=3` 时 2c3p（3 实例）也成立；渠道切换替换单页，不新增 context |
 | **Build 双路径** | 原生 9998 客户端为默认路径；原生不可用时由顶层 signer 直连兜底；两条路径独立健康状态，signer 失败不阻塞原生渠道 |
 | **账号双保活（WP10）** | 定时切号（长周期均衡 + 真实页面活动）与自动刷新 Auth（cookies/origins 回写 `auth.json`）并存；另有 24h tier/email/过期元数据刷新，三者独立开关 |
 | **运行状态持久化** | Token 统计 v2 (`stats.json`：按模型/日聚合，client/attempt 两层计数，cache/reasoning/count_tokens 分离，保留 90 天日桶) 与账号 429 冷却 (`rotator_state.json`) 自动落盘，重启不丢状态 |
@@ -270,8 +270,8 @@ docker compose up -d
 |---|---|---|---|
 | `features.build_surface` | bool | `false` | 开=free 档账号走 Build 宿主页直连通道；关=仅聊天面（零行为变化）。何时开：需要免费档走 Build 额度。失败：面内失败显式报错，绝不改道。 |
 | `features.channels.build.app_url` | string | 空 | Build 应用 URL 或 App ID；优先于 `AISTUDIO_APP_URL`；为空回退内置默认 |
-| `features.routing.max_contexts` | int | `1` | 同时登录账号/context 上限；用量窗口上限 = max(2, 该值) |
-| `features.routing.global_max_pages` | int | `2` | 全局页面预算；至少覆盖用量窗口上限，实例切换不得突破 |
+| `features.routing.max_contexts` | int | `1` | 用户可见总实例上限（1-16）；总实例数 = 该值，默认单实例；`max_contexts=1` 时 PG/Build 顺序切换，不能并行开两个 page |
+| `features.routing.global_max_pages` | int | `2` | 兼容保留；实际全局页面预算 = `max_contexts`，实例切换不得突破 |
 | `features.route_by_tier` | bool | `false` | 开=按账号档位分发到允许的面；关=始终聊天面默认路由。何时开：WP5 v3 分组编排已落地，需要区分 pro/free 的面或额度池时。失败：无匹配组按默认策略并记录决策链。 |
 | `features.account_refresh_concurrency` | int | `3` | 批量刷新 email/tier/过期的并发数（范围 1-16）。越大越快但越易限流。失败：单账号失败不影响其余。 |
 | `features.auto_switch` | bool | `false` | 开=按间隔周期轮换账号；关=仅按用量/失败/429 触发。失败：无可切换账号时保持当前账号并告警。 |
@@ -640,12 +640,12 @@ ktlint "android/app/src/main/java/**/*.kt"
 
 | 方向 | 本仓库实现 |
 |---|---|
-| **多实例化** | 以「实例 = 账号 + 渠道」作为调度与用量单位：同一账号的 PG/Build 视为两个实例、各自独立用量窗口，但共享同一个浏览器 context（`max_instances = max(2, max_contexts)`，只允许 2c1p / 1c2p，不产生 2c3p） |
+| **多实例化** | 以「实例 = 账号 + 渠道」作为调度与用量单位：同一账号的 PG/Build 在总实例上限允许时是两个实例、各自独立用量窗口，但共享同一个浏览器 context（`max_instances = max_contexts`，2c1p/1c2p 以及 `max_contexts>=3` 时的 2c3p 都只是实例组合，不能超过总上限） |
 | **渠道生命周期** | 支持按渠道单独关闭/回收；仅当最后一个实例退出时才回收 context，避免误伤另一渠道的会话 |
 | **Build 通道** | 原生 9998 直连为主；页内 signer（本地签名绕行）作为 Build 失灵时的冗余方案，signer 失败不阻塞原生通道。signer 采用结构探测（`kvc` / `snapshot` / `content`）与 `tokenLike`（getMetadata / H / A.snapshot）定位签名材料 |
 | **Web 控制台重构** | 实例切换面板、实例总览与账号矩阵、账号多模式管理与批量导入、日志 SSE + 7 天归档导出、独立统计页与分区配置页；UI/API 不暴露 context/page/slot 等实现概念 |
 | **统计口径** | 以模型调用（requests/attempts，含重试与换号）为主指标，客户端请求为次级；`count_*` 独立展示且不计入模型调用；用量按渠道/实例分别统计 |
-| **长期运行约束** | 页面总数上限 2；静态资源 `no-cache, must-revalidate`；默认单实例、按需预热，优先保证低内存 VPS 上的稳定性 |
+| **长期运行约束** | 默认单实例；总页面/实例预算由 `max_contexts`（1-16）控制；静态资源 `no-cache, must-revalidate`；按需预热，优先保证低内存 VPS 上的稳定性 |
 
 ## 致谢
 

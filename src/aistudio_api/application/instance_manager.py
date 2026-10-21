@@ -317,8 +317,9 @@ class InstanceManager:
         An active target is switched in place. If a different channel is
         requested for the target's account, an existing sibling instance is
         reused. When the instance cap is full, the target instance's channel is
-        closed and the requested channel is opened in the same account context
-        (2c1p); otherwise a second instance is created (1c2p).
+        closed and the requested channel is opened in the same account context;
+        otherwise a second instance is created when the total and channel caps
+        allow it.
         """
         requested = self._normalize_channel(channel) if channel is not None else None
         async with self._lifecycle_lock:
@@ -357,8 +358,10 @@ class InstanceManager:
                 )
 
             old_current = self._current_id
-            if self._occupying_count() >= self._max_instances():
-                # Replace this instance's channel; keep its context for reuse.
+            replaced = self._occupying_count() >= self._max_instances()
+            if replaced:
+                # Replace this instance's channel; keep its record until the
+                # new channel is running so a failed start can roll back.
                 if target.state is not InstanceState.ACTIVE:
                     raise InstanceNotReadyError("实例尚未就绪，不能换渠道")
                 if target.runtime_ref:
@@ -371,29 +374,59 @@ class InstanceManager:
                         )
                     except InstanceCapacityError as exc:
                         raise InstanceBusyError(str(exc)) from exc
-                self._cancel(target.id)
-                self._records.pop(target.id, None)
-                if self._current_id == target.id:
-                    self._current_id = None
-                self._repair_latest()
 
             record = self._new_record(account.id, InstanceState.STARTING, requested)
             self._records[record.id] = record
             if not await self._start(record, account, requested):
                 self._records.pop(record.id, None)
+                if replaced:
+                    await self._restore_replaced_channel(target)
+                    self._current_id = (
+                        old_current if old_current in self._records else None
+                    )
+                    self._repair_current()
                 self._repair_latest()
-                self._repair_current()
                 error = record.last_error or "实例启动失败"
                 if "budget" in error.lower() or "capacity" in error.lower():
                     raise InstanceCapacityExhaustedError(error)
                 raise InstanceNotReadyError(error)
             switched = await self._switch_current_account(account)
             if not switched:
+                if record.runtime_ref:
+                    await self._close_now(record)
+                else:
+                    self._records.pop(record.id, None)
+                if replaced:
+                    await self._restore_replaced_channel(target)
                 self._current_id = old_current if old_current in self._records else None
+                self._repair_latest()
                 self._repair_current()
                 raise InstanceNotReadyError("账号状态切换失败")
+            if replaced:
+                self._cancel(target.id)
+                self._records.pop(target.id, None)
             self._current_id = record.id
             return self._view(record)
+
+    async def _restore_replaced_channel(self, target: _Record) -> None:
+        if not target.runtime_ref:
+            target.state = InstanceState.INVALID
+            target.last_error = "换渠道失败，原渠道无法恢复"
+            return
+        try:
+            await self._pool.ensure_channel(target.runtime_ref, target.channel)
+        except Exception as exc:
+            target.state = InstanceState.INVALID
+            target.last_error = f"换渠道失败，原渠道恢复失败: {exc}"
+            log.warning(
+                "[instances] restore failed id=%s channel=%s error=%s",
+                target.id,
+                target.channel,
+                exc,
+            )
+            return
+        target.state = InstanceState.ACTIVE
+        target.last_error = None
 
     async def _settle_starting(self, record: _Record) -> None:
         if record.state is not InstanceState.STARTING:
@@ -755,7 +788,7 @@ class InstanceManager:
         ]
 
     def _max_instances(self) -> int:
-        return max(2, int(self._pool.max_contexts))
+        return max(1, int(self._pool.max_contexts))
 
     def _channel_cap(self, channel: str) -> int | None:
         getter = getattr(self._pool, "channel_max_instances", None)

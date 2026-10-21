@@ -322,8 +322,8 @@ class InstancePool:
         return configured
 
     def _global_max_pages(self) -> int:
-        # Total page budget equals total instance budget: max(2, max_contexts).
-        return max(2, self._max_contexts())
+        # Total page budget equals the user-visible instance limit.
+        return max(1, self._max_contexts())
 
     def _check_page_budget_locked(
         self,
