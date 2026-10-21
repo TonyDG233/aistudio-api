@@ -2,20 +2,22 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { HelpCircle, CheckCircle2 } from 'lucide-vue-next'
 import { CONFIG_SCHEMA } from './schema.ts'
+import { defaultValueFor, formatDefaultValue } from './defaults.ts'
 
 const props = defineProps<{
   schemaKey?: string
   title?: string
   content?: string
   explanation?: string
-  recommended?: string | number | boolean
 }>()
 
 const fieldDef = props.schemaKey ? CONFIG_SCHEMA[props.schemaKey] : null
 const displayTitle = props.title || fieldDef?.title || ''
 const displayContent = props.content || fieldDef?.description || ''
 const displayExplanation = props.explanation || fieldDef?.explanation || ''
-const displayRecommended = props.recommended !== undefined ? props.recommended : fieldDef?.recommendedValue
+const schemaDefault = props.schemaKey ? defaultValueFor(props.schemaKey) : undefined
+const displayRecommended =
+  schemaDefault !== undefined ? schemaDefault : fieldDef?.recommendedValue
 
 // Teleport + fixed 定位：仅靠 z-index 无法逃出父级 stacking context / overflow 裁剪，
 // 会被相邻卡片的白底盖住（2026-10-18 用户实测）；改挂 body 并做视口边缘夹取。
@@ -142,7 +144,7 @@ onBeforeUnmount(() => {
             class="flex items-center gap-1.5 text-[11px] text-emerald-400 font-semibold bg-emerald-950/60 px-2 py-1 rounded-lg border border-emerald-800/60"
           >
             <CheckCircle2 class="w-3.5 h-3.5 shrink-0 text-emerald-400" />
-            <span>推荐配置: {{ String(displayRecommended) }}</span>
+            <span>默认值: {{ formatDefaultValue(displayRecommended) }}</span>
           </div>
 
           <!-- Little Arrow（随夹取后的实际位置对齐 anchor 中心） -->
