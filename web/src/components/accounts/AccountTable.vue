@@ -80,7 +80,8 @@ const filteredAccounts = computed<AccountWithStats[]>(() => {
     const inEmail = (acc.email || '').toLowerCase().includes(kw)
     const inId = acc.id.toLowerCase().includes(kw)
     const inAuthUser = `u/${acc.auth_user}`.toLowerCase().includes(kw) || acc.auth_user === kw
-    return inName || inEmail || inId || inAuthUser
+    const inTier = (acc.tier || 'free').toLowerCase().includes(kw)
+    return inName || inEmail || inId || inAuthUser || inTier
   })
 })
 

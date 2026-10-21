@@ -307,6 +307,84 @@ def test_update_account_email(tmp_path):
     assert store.update_account_email(acc.id, "real_user@gmail.com") is False
 
 
+def test_parse_benefit_tier_and_update_account_tier(tmp_path):
+    """测试 GetAiStudioBenefitTier 响应解析、请求头映射及账号等级持久化。"""
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        get_tier_header_value,
+        parse_benefit_tier_response,
+    )
+
+    assert parse_benefit_tier_response("[]") == "Free"
+    assert parse_benefit_tier_response("[null]") == "Free"
+    assert parse_benefit_tier_response("[0]") == "Free"
+    assert parse_benefit_tier_response(")]}'\n[1]") == "Pro"
+    assert parse_benefit_tier_response([2]) == "Ultra"
+    assert parse_benefit_tier_response([3]) == "Plus"
+
+    assert get_tier_header_value("Free") is None
+    assert get_tier_header_value("Pro") == "TIER1"
+    assert get_tier_header_value("Ultra") == "TIER2"
+    assert get_tier_header_value("Plus") == "TIER0"
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_tier_test")
+    acc = store.save_account(
+        name="Tier Test",
+        email="tier@gmail.com",
+        storage_state={"cookies": []},
+    )
+    # 未探测档位保持为 None（未识别），不硬编码为 Free
+    assert acc.tier is None
+    assert store.update_account_tier(acc.id, "Pro") is True
+    reloaded = store.get_account(acc.id)
+    assert reloaded is not None
+    assert reloaded.tier == "Pro"
+    assert store.update_account_tier(acc.id, "Pro") is False
+
+
+def test_parse_emails_from_ogs_html_and_meta_reconciliation(tmp_path):
+    """测试 Google OGS/AI Studio HTML 邮箱提取以及 meta.json 与 registry.json 自动对齐。"""
+    import json
+
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        parse_emails_from_ogs_html,
+    )
+
+    sample_html = (
+        '{"oPEP7c":"user0@gmail.com"} '
+        '<a data-au="1" data-email="user1@gmail.com"></a> '
+        '<a data-email="user2@gmail.com" data-au="2"></a>'
+    )
+    emails = parse_emails_from_ogs_html(sample_html, "0")
+    assert emails == {
+        "0": "user0@gmail.com",
+        "1": "user1@gmail.com",
+        "2": "user2@gmail.com",
+    }
+
+    # 验证当 meta.json 被外部/浏览器更新了 email 与 tier，而 registry.json 仍为旧值时，加载自动对齐
+    acc_dir = tmp_path / "accounts_reconcile"
+    store = AccountStore(accounts_dir=acc_dir)
+    acc = store.save_account(
+        name="Reconcile Test",
+        email=None,
+        storage_state={"cookies": []},
+    )
+    meta_path = acc_dir / acc.id / "meta.json"
+    meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta_data["email"] = "reconciled@gmail.com"
+    meta_data["tier"] = "Pro"
+    meta_path.write_text(json.dumps(meta_data), encoding="utf-8")
+
+    # 模拟重新加载注册表
+    store._registry = None
+    reloaded = store.get_account(acc.id)
+    assert reloaded is not None
+    assert reloaded.email == "reconciled@gmail.com"
+    assert reloaded.tier == "Pro"
+
+
 @pytest.mark.asyncio
 async def test_delete_cookie_group_migrates_active_account(tmp_path):
     """测试批量删除包含当前活跃账号的 Cookie 组时，正确切换活跃账号与浏览器会话。"""
@@ -372,3 +450,56 @@ async def test_delete_cookie_group_migrates_active_account(tmp_path):
     assert new_active.id == acc3.id
     # 且触发了 browser_session.switch_auth
     assert mock_session.switch_auth.called
+
+
+@pytest.mark.asyncio
+async def test_probe_import_activates_first_account_and_registers_in_rotator(
+    monkeypatch,
+):
+    """Verify probe_and_import registers accounts in rotator and activates first account when registry was empty (PR #1 & Issue #7)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.api.routes_accounts import (
+        ProbeAndImportRequest,
+        probe_and_import,
+    )
+    from aistudio_api.infrastructure.account import cookie_parser
+    from aistudio_api.infrastructure.account.account_store import AccountMeta
+
+    imported = AccountMeta(
+        id="acc_new",
+        name="New u/0",
+        email="new@gmail.com",
+        created_at="2026-09-27T00:00:00+00:00",
+        auth_user="0",
+        cookie_id="cookie_new",
+    )
+    account_service = MagicMock()
+    account_service.get_active_account.return_value = None
+    account_service.batch_import_accounts.return_value = [imported]
+    account_service.activate_account = AsyncMock(return_value=imported)
+
+    browser_session = MagicMock()
+    rotator = MagicMock()
+    runtime_state = MagicMock()
+    runtime_state.client._session = browser_session
+    runtime_state.rotator = rotator
+
+    monkeypatch.setattr(
+        cookie_parser,
+        "probe_google_accounts_infinite",
+        AsyncMock(return_value=[{"auth_user": "0", "status_code": 200}]),
+    )
+
+    response = await probe_and_import(
+        ProbeAndImportRequest(cookies="SAPISID=test-value"),
+        account_service=account_service,
+        runtime_state=runtime_state,
+    )
+
+    assert response.imported_count == 1
+    rotator.add_account.assert_called_once_with("acc_new")
+    rotator.clear_cooldown.assert_called_once_with("acc_new")
+    account_service.activate_account.assert_awaited_once_with(
+        "acc_new", browser_session
+    )

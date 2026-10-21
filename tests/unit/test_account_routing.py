@@ -215,7 +215,7 @@ def test_routing_survives_refresh_and_keepalive_rewrites(tmp_path: Path) -> None
     store, account = _make_store(tmp_path)
     assert store.update_account_routing(account.id, ROUTING) is True
 
-    assert store.update_account_refresh(account.id, tier="pro") is True
+    assert store.update_account_refresh(account.id, tier="Pro") is True
     refreshed = store.get_account(account.id)
     assert refreshed is not None
     assert refreshed.routing == ROUTING

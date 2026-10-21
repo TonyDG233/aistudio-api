@@ -177,10 +177,56 @@ async def lifespan(_app: FastAPI):
                         runtime_state.client, "_session", None
                     ):
                         await runtime_state.client._session.check_idle_timeout()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("空闲回收检查异常: %s", e)
 
         idle_task = asyncio.create_task(_idle_monitor())
+
+    tier_task = None
+
+    async def _auto_refresh_tiers():
+        import json
+
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            probe_account_benefit_tier,
+            probe_account_email,
+        )
+
+        for a in account_store.list_accounts():
+            if not a.email or not a.tier or a.tier == "Free":
+                apath = account_store.get_auth_path(a.id)
+                if apath and apath.is_file():
+                    try:
+                        adata = json.loads(apath.read_text(encoding="utf-8"))
+                        rcookies = adata.get("cookies") or []
+                        cdict = {
+                            str(c.get("name") or ""): str(c.get("value") or "")
+                            for c in rcookies
+                            if isinstance(c, dict) and c.get("name")
+                        }
+                        if cdict:
+                            if not a.email:
+                                em = await probe_account_email(
+                                    cdict, auth_user=a.auth_user or "0"
+                                )
+                                if em:
+                                    account_store.update_account_email(a.id, em)
+                            if a.tier == "Free":
+                                t = await probe_account_benefit_tier(
+                                    cdict, auth_user=a.auth_user or "0"
+                                )
+                                if t and t != "Free":
+                                    account_store.update_account_tier(a.id, t)
+                                    logger.info(
+                                        "启动自动校验并升级账号 %s (u/%s) 订阅等级: %s",
+                                        a.id,
+                                        a.auth_user,
+                                        t,
+                                    )
+                    except Exception:
+                        pass
+
+    tier_task = asyncio.create_task(_auto_refresh_tiers())
 
     yield
     logger.info("服务正在关闭")
@@ -192,6 +238,8 @@ async def lifespan(_app: FastAPI):
         model_warmup_task.cancel()
     if idle_task and not idle_task.done():
         idle_task.cancel()
+    if tier_task and not tier_task.done():
+        tier_task.cancel()
     if runtime_state.keepalive is not None:
         await runtime_state.keepalive.stop()
     if client:

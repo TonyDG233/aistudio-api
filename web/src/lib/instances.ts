@@ -7,7 +7,8 @@ export function normalizeTier(tier: string | null | undefined): string {
 
 export function tierLabel(tier: string | null | undefined): string {
   const value = normalizeTier(tier)
-  return value === 'unknown' ? '未识别' : value
+  if (value === 'unknown') return '未识别'
+  return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
 export function tierPillClass(tier: string | null | undefined): string {

@@ -67,10 +67,31 @@ def _allowed_builtin_tools_for_model(
         return {"google_search", "image_search", "google_search_and_image_search"}
     normalized_model = str(model or "").removeprefix("models/").lower()
     if normalized_model.startswith("gemma-"):
-        return {"google_search", "code_execution"}
-    if normalized_model.startswith("gemini-"):
-        return {"google_search", "code_execution", "google_maps", "url_context"}
-    return {"google_search", "code_execution"}
+        allowed = {"google_search", "code_execution"}
+    elif normalized_model.startswith("gemini-"):
+        allowed = {"google_search", "code_execution", "google_maps", "url_context"}
+    else:
+        allowed = {"google_search", "code_execution"}
+
+    if normalized_model:
+        try:
+            from .model_discovery import model_discovery
+
+            info = model_discovery.get_cached_model_info(normalized_model)
+            if info:
+                caps = info.get("capabilities")
+                if isinstance(caps, list):
+                    for cap in caps:
+                        if cap in (
+                            "google_search",
+                            "code_execution",
+                            "google_maps",
+                            "url_context",
+                        ):
+                            allowed.add(str(cap))
+        except Exception:
+            pass
+    return allowed
 
 
 def build_tools_from_names(

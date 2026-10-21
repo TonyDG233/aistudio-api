@@ -2,6 +2,16 @@
     try {
         const EMAIL_RE = /[\w.+-]+@[\w-]+\.[a-zA-Z0-9.-]+/;
 
+        // 0. Official Google WIZ_global_data.oPEP7c for current u/{auth_user}
+        if (window.WIZ_global_data && typeof window.WIZ_global_data.oPEP7c === "string") {
+            const wizEmail = window.WIZ_global_data.oPEP7c.trim().toLowerCase();
+            if (EMAIL_RE.test(wizEmail)) return wizEmail;
+        }
+        if (document.documentElement && document.documentElement.innerHTML) {
+            const mWiz = document.documentElement.innerHTML.match(/"oPEP7c"\s*:\s*"([^"@\s]+@[^"\s]+)"/);
+            if (mWiz && mWiz[1]) return mWiz[1].trim().toLowerCase();
+        }
+
         // 1. Check all elements with aria-label containing @ (Google account buttons, avatars)
         const ariaEls = document.querySelectorAll('[aria-label*="@"]');
         for (const el of ariaEls) {
@@ -73,6 +83,17 @@
                 } catch (e) {}
             }
         }
+
+        // 5. Fallback: scan all elements with aria-label or title, and document body text
+        const allAria = document.querySelectorAll('[aria-label], [title]');
+        for (const el of allAria) {
+            const txt = (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("title") || "");
+            const m = txt.match(EMAIL_RE);
+            if (m) return m[0].trim().toLowerCase();
+        }
+        const bodyTxt = document.body ? (document.body.innerText || document.body.textContent || "") : "";
+        const bm = bodyTxt.match(EMAIL_RE);
+        if (bm) return bm[0].trim().toLowerCase();
     } catch (e) {}
     return null;
 })()

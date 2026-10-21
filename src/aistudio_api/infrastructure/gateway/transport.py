@@ -9,7 +9,10 @@ from collections.abc import AsyncGenerator
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from aistudio_api.infrastructure.account.cookie_parser import calculate_sapisid_hash
+from aistudio_api.infrastructure.account.cookie_parser import (
+    calculate_sapisid_hash,
+    get_tier_header_value,
+)
 from aistudio_api.infrastructure.browser.scripts import (
     HOOKED_REQUEST_JS,
     STREAM_CLEANUP_JS,
@@ -49,10 +52,27 @@ def _get_active_auth_cookies() -> dict[str, str] | None:
     return None
 
 
+def _get_active_account_tier() -> str:
+    """读取当前活跃账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
+    try:
+        from aistudio_api.infrastructure.account.account_store import AccountStore
+
+        store = AccountStore()
+        active = store.get_active_account()
+        if active and getattr(active, "tier", None):
+            return str(active.tier)
+    except Exception:
+        pass
+    return "Free"
+
+
 async def _ensure_authorization_header(
-    page: CDPPage, headers: dict[str, str], auth_user: str = "0"
+    page: CDPPage,
+    headers: dict[str, str],
+    auth_user: str = "0",
+    tier: str | None = None,
 ) -> dict[str, str]:
-    """Ensure fresh SAPISIDHASH Authorization and X-Goog-AuthUser header are populated in Python."""
+    """Ensure fresh SAPISIDHASH Authorization, X-Goog-AuthUser, and X-AIStudio-G1-Tier headers are populated."""
     incoming_auth = ""
     for k, v in headers.items():
         if k.lower() == "authorization" and v:
@@ -63,11 +83,19 @@ async def _ensure_authorization_header(
         k: v
         for k, v in headers.items()
         if k.lower()
-        not in ("host", "content-length", "authorization", "x-goog-authuser")
+        not in (
+            "host",
+            "content-length",
+            "authorization",
+            "x-goog-authuser",
+            "x-aistudio-g1-tier",
+        )
     }
     clean_headers["X-Goog-AuthUser"] = str(auth_user or "0")
-
-    # 1. 优先使用 page 上的内存缓存 Cookie，避免高并发下向 Chromium 密集发送重复的 Network.getCookies CDP 流量
+    effective_tier = tier if tier and tier != "Free" else _get_active_account_tier()
+    tier_header = get_tier_header_value(effective_tier)
+    if tier_header:
+        clean_headers["X-AIStudio-G1-Tier"] = tier_header
     cookie_dict = getattr(page, "_cached_cookies", None)
     if not cookie_dict or not any("SAPISID" in k for k in cookie_dict):
         with suppress(Exception):
@@ -159,11 +187,12 @@ class XHRStreamTransport:
         body: str,
         timeout_ms: int,
         auth_user: str = "0",
+        tier: str | None = None,
     ) -> tuple[int, bytes]:
         """Replay request via XHR inside the browser page context."""
         timeout_s = timeout_ms / 1000
         clean_headers = await _ensure_authorization_header(
-            page, headers, auth_user=auth_user
+            page, headers, auth_user=auth_user, tier=tier
         )
         args = build_hooked_request_args(
             url=url,
@@ -189,6 +218,7 @@ class XHRStreamTransport:
         body: str,
         timeout_ms: int,
         auth_user: str = "0",
+        tier: str | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Send a streaming request, yielding ('status', int) and ('chunk', bytes) events.
 
@@ -196,7 +226,7 @@ class XHRStreamTransport:
         """
         timeout_s = timeout_ms / 1000
         clean_headers = await _ensure_authorization_header(
-            page, headers, auth_user=auth_user
+            page, headers, auth_user=auth_user, tier=tier
         )
         rid = uuid.uuid4().hex[:8]
 

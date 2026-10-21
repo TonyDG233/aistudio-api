@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from os.path import abspath, basename, join
+from os.path import basename, join, realpath
 from pathlib import Path
 from typing import ClassVar
 
@@ -77,12 +77,17 @@ def _safe_account_dir(accounts_dir: Path, account_id: str) -> Path:
     raw = str(account_id or "").strip()
     clean_id = "".join(c for c in raw if c.isalnum() or c in ("-", "_", ".", "@"))
     safe_name = basename(clean_id)
-    if not safe_name or safe_name != account_id or ".." in safe_name:
+    if (
+        not safe_name
+        or safe_name != account_id
+        or safe_name in (".", "..")
+        or ".." in safe_name
+    ):
         raise ValueError(f"Invalid or unsafe account_id: {account_id!r}")
-    base_str = abspath(str(accounts_dir.resolve()))
-    target_str = abspath(join(base_str, safe_name))
+    base_str = realpath(str(accounts_dir))
+    target_str = realpath(join(base_str, safe_name))
     prefix = base_str if base_str.endswith(os.sep) else base_str + os.sep
-    if not target_str.startswith(prefix) and target_str != base_str:
+    if not target_str.startswith(prefix):
         raise ValueError(f"Account path escapes base directory: {account_id!r}")
     return Path(target_str)
 
@@ -281,6 +286,28 @@ class AccountStore:
             try:
                 data = json.loads(self._registry_path.read_text(encoding="utf-8"))
                 self._registry = Registry.from_dict(data)
+                reconciled = False
+                for acc_id, acc in self._registry.accounts.items():
+                    account_dir = self._accounts_dir / acc_id
+                    meta_path = account_dir / "meta.json"
+                    if meta_path.is_file():
+                        try:
+                            mdata = json.loads(meta_path.read_text(encoding="utf-8"))
+                            if isinstance(mdata, dict):
+                                if not acc.email and mdata.get("email"):
+                                    acc.email = str(mdata["email"])
+                                    reconciled = True
+                                if (
+                                    (not acc.tier or acc.tier == "Free")
+                                    and mdata.get("tier")
+                                    and mdata.get("tier") != "Free"
+                                ):
+                                    acc.tier = str(mdata["tier"])
+                                    reconciled = True
+                        except Exception:
+                            pass
+                if reconciled:
+                    _atomic_write_json(self._registry_path, self._registry.to_dict())
             except Exception:
                 self._registry = Registry(accounts={})
             return self._registry
@@ -296,10 +323,18 @@ class AccountStore:
         registry = self._load_registry()
         return list(registry.accounts.values())
 
+    def _find_registered_account(
+        self, registry: Registry, account_id: str
+    ) -> AccountMeta | None:
+        for stored_id, meta in registry.accounts.items():
+            if stored_id == account_id:
+                return meta
+        return None
+
     def get_account(self, account_id: str) -> AccountMeta | None:
         """获取单个账号。"""
         registry = self._load_registry()
-        return registry.accounts.get(account_id)
+        return self._find_registered_account(registry, account_id)
 
     def get_active_account(self) -> AccountMeta | None:
         """获取当前活跃账号（若未设置或失效，自动兜底至首个账号）。"""
@@ -326,15 +361,16 @@ class AccountStore:
     def set_active_account(self, account_id: str) -> AccountMeta | None:
         """设置活跃账号，返回账号元数据或 None（如果不存在）。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
             return None
-        changed = registry.active_account_id != account_id
-        registry.active_account_id = account_id
+        changed = registry.active_account_id != acc.id
+        registry.active_account_id = acc.id
         now = datetime.now(UTC).isoformat()
-        registry.accounts[account_id].last_used = now
+        acc.last_used = now
         if changed:
             self._save_registry(registry)
-        return registry.accounts[account_id]
+        return acc
 
     def save_account(
         self,
@@ -344,23 +380,33 @@ class AccountStore:
         account_id: str | None = None,
         auth_user: str = "0",
         cookie_id: str | None = None,
+        tier: str | None = None,
     ) -> AccountMeta:
         """保存新账号。"""
         registry = self._load_registry()
         now = datetime.now(UTC).isoformat()
         created_at = now
+        resolved_tier = tier
         if account_id is None and email:
             for acc in registry.accounts.values():
                 if acc.email == email and acc.auth_user == auth_user:
                     account_id = acc.id
                     created_at = acc.created_at
+                    if resolved_tier is None and acc.tier:
+                        resolved_tier = acc.tier
                     break
 
-        if account_id is None:
+        if account_id is not None:
+            existing = self._find_registered_account(registry, account_id)
+            if existing is not None:
+                account_id = existing.id
+        else:
             account_id = _generate_account_id()
 
+        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        safe_id = account_dir.name
         meta = AccountMeta(
-            id=account_id,
+            id=safe_id,
             name=name,
             email=email,
             created_at=created_at,
@@ -368,31 +414,33 @@ class AccountStore:
             auth_user=auth_user,
             cookie_id=cookie_id,
             auth_saved_at=now,
+            tier=resolved_tier,
         )
-        account_dir = _safe_account_dir(self._accounts_dir, account_id)
         account_dir.mkdir(parents=True, exist_ok=True)
         # 原子写入 auth.json 与 meta.json
         _atomic_write_json(account_dir / "auth.json", storage_state)
         _atomic_write_json(account_dir / "meta.json", meta.to_dict())
         # 更新注册表
-        registry.accounts[account_id] = meta
+        registry.accounts[safe_id] = meta
         if registry.active_account_id is None:
-            registry.active_account_id = account_id
+            registry.active_account_id = safe_id
         self._save_registry(registry)
         return meta
 
     def delete_account(self, account_id: str) -> bool:
         """删除账号，返回是否成功。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
             return False
+        safe_id = acc.id
         # 删除目录
-        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        account_dir = _safe_account_dir(self._accounts_dir, safe_id)
         if account_dir.is_dir():
             shutil.rmtree(account_dir, ignore_errors=True)
         # 从注册表移除
-        del registry.accounts[account_id]
-        if registry.active_account_id == account_id:
+        del registry.accounts[safe_id]
+        if registry.active_account_id == safe_id:
             registry.active_account_id = next(iter(registry.accounts), None)
         self._save_registry(registry)
         return True
@@ -400,27 +448,45 @@ class AccountStore:
     def update_account(self, account_id: str, name: str) -> AccountMeta | None:
         """更新账号名称。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
             return None
-        registry.accounts[account_id].name = name
+        acc.name = name
         # 同步更新 meta.json
-        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
         meta_path = account_dir / "meta.json"
         if meta_path.exists():
-            _atomic_write_json(meta_path, registry.accounts[account_id].to_dict())
+            _atomic_write_json(meta_path, acc.to_dict())
         self._save_registry(registry)
-        return registry.accounts[account_id]
+        return acc
 
     def update_account_email(self, account_id: str, email: str) -> bool:
         """更新账号的登录邮箱，并持久化 meta.json 与 registry.json。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
-            return False
-        acc = registry.accounts[account_id]
-        if acc.email == email:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None or acc.email == email:
             return False
         acc.email = email
-        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def update_account_tier(self, account_id: str, tier: str) -> bool:
+        """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)，并持久化 meta.json 与 registry.json。"""
+        registry = self._load_registry()
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
+            return False
+        clean_tier = (tier or "Free").strip().capitalize()
+        if clean_tier not in ("Free", "Pro", "Ultra", "Plus"):
+            clean_tier = "Free"
+        if acc.tier == clean_tier:
+            return False
+        acc.tier = clean_tier
+        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
         meta_path = account_dir / "meta.json"
         if meta_path.exists():
             _atomic_write_json(meta_path, acc.to_dict())
@@ -577,9 +643,10 @@ class AccountStore:
     ) -> Path | None:
         """获取指定账号的 auth.json 路径，可选是否要求文件已存在。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
             return None
-        path = _safe_account_dir(self._accounts_dir, account_id) / "auth.json"
+        path = _safe_account_dir(self._accounts_dir, acc.id) / "auth.json"
         if require_exists and not path.exists():
             return None
         return path
@@ -587,6 +654,7 @@ class AccountStore:
     def get_profile_path(self, account_id: str) -> Path | None:
         """获取指定账号的 profile 目录路径。"""
         registry = self._load_registry()
-        if account_id not in registry.accounts:
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
             return None
-        return _safe_account_dir(self._accounts_dir, account_id) / "profile"
+        return _safe_account_dir(self._accounts_dir, acc.id) / "profile"
