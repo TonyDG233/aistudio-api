@@ -143,7 +143,7 @@ uv run python3 main.py server --port 8080
    - 避免引入形式主义的胶水层、过度抽象与冗余样板代码，保持代码与文档紧凑精炼。
 7. **交付前全量审查完整 diff（Review Full Diff）**：
    - 每次提交或报告完成前，**必须完整查看整个 `git diff`（不带行数折叠与省略）**，逐行确认所有改动准确无误、没有残留调试代码或意外破损。
-   - 确保 `uv run ruff check .`、`bun x pyright` 和 `uv run pytest` 全部零报错通过后再行提交。
+   - 确保 `uv run ruff check .`、`uv run pyright` 和 `uv run pytest` 全部零报错通过后再行提交。
 8. **微创编辑优先与 Diff 审计守则（Prefer Edit & Mandatory Diff Inspection）**：
    - 局部功能调整或代码重构**一律优先使用精准微创的 `edit`**，避免全文件重写引入非预期的代码格式漂移与无关变动。
    - 仅在新建文件、大型嵌入脚本提取（`src/.../js/*.js`）或结构彻底颠覆时使用 `write`。**使用 `write` 进行文件覆盖后，必须在第一时间执行 `git diff` 进行全量逐行审计**，确保无意外功能遗漏、截断或回退。
@@ -158,9 +158,9 @@ uv run python3 main.py server --port 8080
 | 工具 / 阶段 | 命令 | 判定标准 |
 |---|---|---|
 | **Python 代码风格与 Lint** | `uv run ruff check .` | 0 errors |
-| **Python 代码格式化** | `uv run ruff format --check .` | 155 files already formatted |
-| **Python 类型检查** | `bun x pyright src tests` | 0 errors |
-| **Python 单元测试** | `uv run pytest` | 全部通过 (571 passed) |
+| **Python 代码格式化** | `uv run ruff format --check .` | 212 files already formatted |
+| **Python 类型检查** | `uv run pyright src tests` | 0 errors |
+| **Python 单元测试** | `uv run pytest` | 全部通过 (885 passed) |
 | **浏览器 JS 语法校验** | `for f in src/aistudio_api/infrastructure/browser/js/*.js; do bun build "$f" --no-bundle >/dev/null; done` | 0 errors |
 | **前端代码规范** | `cd web && bun run lint` | 0 errors, 0 warnings |
 | **前端类型检查** | `cd web && bun run type-check` | 0 errors |
@@ -258,13 +258,13 @@ aistudio-api/
 │   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
 │   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
 │   │   ├── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
-│   │       ├── instance_pool.py   # 统一 Context 实例池：槽位/页面预算/换绑/冷启动/borrow
+│   │       ├── instance_pool.py   # 账号+渠道用量窗口/单渠道页生命周期/预算/冷启动/borrow
 │   │       └── pooled_session.py  # 单 Context 会话、页面与在途请求复用
 │   │   └── utils/                 # 统一日志 (logger)、线程安全日志广播 ring buffer/SSE 与按天归档 (log_broadcast)
 ├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
 ├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
 ├── main.py                        # 本地统一启动入口
-└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 20s；当前 800+ 用例)
+└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 30s；当前 885 用例)
     ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
     ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
     └── unit/                     # 按职责严格划分的单元测试模块
@@ -290,12 +290,13 @@ aistudio-api/
 - **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
 - **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
-- **复杂策略组（WP5 v3，P4.5）**：唯一决策管线在 `application/routing_pipeline.py`，渠道在请求内固定、链内不换面；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`（`meta.json`/`registry.json`）。统一 Context 实例池在 `infrastructure/gateway/instance_pool.py`：一个槽位是一个独立 BrowserContext，chat/build 是同一 Context 内的 surface page；`features.routing.max_contexts` 控制 Context 数，`global_max_pages`、`channels.*.max_pages`、`groups.*.max_pages` 控制页面数。`max_pages` 不是并发上限：同一页面可承载多个在途请求，只有新增页面/Context 才受页面预算约束。`features.routing.max_switches` 仅约束换号/换实例，独立于同账号 `MAX_RETRIES`；borrow、熔断、冷启动重试（最多 3 次）均在池内处理。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
+- **实例与渠道（WP5 第六轮）**：实例 = 账号 + 渠道的独立用量窗口；同一账号 PG/Build 是两个实例、共享一个 BrowserContext。唯一决策管线在 `application/routing_pipeline.py`；组只收窄候选/面/预算/权重，账号级覆盖存 `AccountMeta.routing`。`features.routing.max_contexts` 控制同时登录账号/context 数，实际用量窗口上限为 `max(2, max_contexts)`；只允许 2c1p/1c2p，禁止 2c3p。关闭/回收只关闭单个渠道实例，账号最后一个实例才回收 context；Build-only bootstrap chat 页在 BotGuard 捕获后关闭/复用。`global_max_pages`、`channels.*.max_pages`、`groups.*.max_pages` 控制页面预算；`max_pages` 不是并发上限。`features.routing.max_switches` 仅约束换号/换实例，独立于同账号 `MAX_RETRIES`；borrow、熔断、冷启动重试均在池内处理。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
+- **Build 双路径与 signer**：原生 9998 客户端为默认传输，顶层页面 signer 直连为冗余路径；两者独立健康状态，signer 失败不阻塞原生渠道。signer 结构探测基于 `snapshot + kvc + content` 与 `tokenLike(getMetadata/H/A.snapshot)`，禁止硬编码 `M.Cn/M.GB/M.TB/M.An/M.NB`；不得记录 token/authorization/cookie/API key。原生不可用或显式 `AISTUDIO_BUILD_TRANSPORT=signer` 时才走 signer，首帧前失败可回退，已产出后不重放。
 - **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
 
 ## 7. 统计与 Paid 模型访问
 
-- **统计**：`state.py` 使用 stats schema v2（`models` + `daily`），记录 client/attempt 两层请求、输入/输出/推理/缓存读写、count_tokens 与 `usage_missing`；模型名统一去掉 `models/` 前缀并合并历史重复键。`/api/stats`、`/api/stats/timeseries` 只读取服务端状态，不使用本地 tokenizer 估算。
+- **统计**：`state.py` 使用 stats schema v2（`models` + `daily`），记录 client/attempt 两层请求、输入/输出/推理/缓存读写、count_tokens 与 `usage_missing`。模型调用（`requests/attempts`，含重试/换号）是 P1/P4 主指标；客户端请求（`client_*`）为次级；`count_*` Token 计数独立，不计入模型调用。模型名统一去掉 `models/` 前缀并合并历史重复键。`/api/stats`、`/api/stats/timeseries` 只读取服务端状态，不使用本地 tokenizer 估算。
 - **Paid 模型**：`model_access.py` 维护 Paid 模型集合；`model_discovery` 成功拉取 ListModels 后按模型更新（`paid: true` 加入、`paid: false` 移除、缺失保留上次状态），并写入 `data/models_cache.json`。启动时加载快照并后台预热，刷新失败保留旧快照与默认兜底。
 - **语义边界**：`account_is_paid(tier)` 判断凭证档位（pro/ultra/plus/paid）；`model_requires_paid_account(model)` 只看模型 Paid 元数据；`is_chat_only_model(model)` 只表示 surface 只能 chat。模型名中的 `pro` 不再影响账号资格或 surface 判定。
