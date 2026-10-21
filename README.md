@@ -36,6 +36,8 @@
   - [工具调用 (Function Calling)](#工具调用-function-calling)
 - [Web 管理控制台](#web-管理控制台)
 - [开发与测试](#开发与测试)
+- [本仓库的定位（与上游差异）](#本仓库的定位与上游差异)
+- [致谢](#致谢)
 - [开源协议](#开源协议)
 
 ---
@@ -629,6 +631,31 @@ Android 伴侣端代码质量检查：
 # 执行 Kotlin 代码规范检查 (已配置于 ~/.zshrc)
 ktlint "android/app/src/main/java/**/*.kt"
 ```
+
+---
+
+## 本仓库的定位（与上游差异）
+
+本仓库是 [`DeconstructedCube/aistudio-api`](https://github.com/DeconstructedCube/aistudio-api) 的下游分支，面向低内存长期运行（连续十几天）与多实例调度做了深度改造。相对上游，主要差异如下：
+
+| 方向 | 本仓库实现 |
+|---|---|
+| **多实例化** | 以「实例 = 账号 + 渠道」作为调度与用量单位：同一账号的 PG/Build 视为两个实例、各自独立用量窗口，但共享同一个浏览器 context（`max_instances = max(2, max_contexts)`，只允许 2c1p / 1c2p，不产生 2c3p） |
+| **渠道生命周期** | 支持按渠道单独关闭/回收；仅当最后一个实例退出时才回收 context，避免误伤另一渠道的会话 |
+| **Build 通道** | 原生 9998 直连为主；页内 signer（本地签名绕行）作为 Build 失灵时的冗余方案，signer 失败不阻塞原生通道。signer 采用结构探测（`kvc` / `snapshot` / `content`）与 `tokenLike`（getMetadata / H / A.snapshot）定位签名材料 |
+| **Web 控制台重构** | 实例切换面板、实例总览与账号矩阵、账号多模式管理与批量导入、日志 SSE + 7 天归档导出、独立统计页与分区配置页；UI/API 不暴露 context/page/slot 等实现概念 |
+| **统计口径** | 以模型调用（requests/attempts，含重试与换号）为主指标，客户端请求为次级；`count_*` 独立展示且不计入模型调用；用量按渠道/实例分别统计 |
+| **长期运行约束** | 页面总数上限 2；静态资源 `no-cache, must-revalidate`；默认单实例、按需预热，优先保证低内存 VPS 上的稳定性 |
+
+## 致谢
+
+本仓库的技术方案建立在以下项目之上，特此致谢：
+
+- [`DeconstructedCube/aistudio-api`](https://github.com/DeconstructedCube/aistudio-api)：本仓库的**上游源方案**。现有的多协议面（Gemini / OpenAI / Anthropic / Responses）、BotGuard 验证链、动态模型发现、账号 tier/邮箱探测与会话重导航等能力均来自该仓库及其维护者，本仓库持续合并其更新。
+- [`iBUHub/AIStudioToAPI`](https://github.com/iBUHub/AIStudioToAPI)：**Build 通道方案的提供者**。本仓库的 Build 面（App 宿主、wire 帧协议、任务提交与结果回收）参考了其公开实现，并在此基础上增加了本地 signer 绕行与原生直连的冗余路径。
+- 谱系与自有研究资料：`chrysoljq/aistudio-api`（原仓）→ `DeconstructedCube/aistudio-api` → 本仓库；Build 通道、直连签名器与 bundle 考古的移交文档见 [`docs/ark-reference/`](./docs/ark-reference/README.md)（已脱敏）。
+
+以上项目的代码与文档版权归各自作者所有；本仓库仅作引用与致谢，不复述任何凭证或密钥材料。
 
 ---
 

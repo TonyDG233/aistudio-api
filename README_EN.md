@@ -36,6 +36,8 @@
   - [Function Calling](#function-calling)
 - [Web Management Console](#web-management-console)
 - [Development & Testing](#development--testing)
+- [Relationship to Upstream](#relationship-to-upstream)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ---
@@ -561,6 +563,31 @@ Android companion app code style checks:
 # Run Kotlin code style check (configured via ~/.zshrc)
 ktlint "android/app/src/main/java/**/*.kt"
 ```
+
+---
+
+## Relationship to Upstream
+
+This repository is a downstream fork of [`DeconstructedCube/aistudio-api`](https://github.com/DeconstructedCube/aistudio-api), heavily reworked for low-memory, long-running deployments (weeks of uptime) and multi-instance scheduling. The main differences:
+
+| Area | This repository |
+|---|---|
+| **Multi-instance** | The scheduling and usage unit is an *instance = account + channel*: the PG and Build channels of the same account are two instances with independent usage windows that share one browser context (`max_instances = max(2, max_contexts)`, only 2c1p / 1c2p, never 2c3p) |
+| **Channel lifecycle** | Channels can be disabled or reclaimed individually; the shared context is reclaimed only when the last instance exits, so the other channel keeps its session |
+| **Build channel** | Native 9998 direct connection is the primary path; an in-page signer (local signature bypass) is the redundant fallback when Build fails, and signer failures never block the native path. The signer locates signing material via structural probes (`kvc` / `snapshot` / `content`) and `tokenLike` (getMetadata / H / A.snapshot) |
+| **Web console rewrite** | Instance switching panel, instance overview and account matrix, multi-mode account management with bulk import, log SSE with 7-day archive export, a dedicated stats page and a partitioned settings page; UI/API never leak context/page/slot implementation terms |
+| **Statistics semantics** | Model calls (requests/attempts, including retries and account switches) are the primary metric and client requests are secondary; `count_*` is shown separately and never counted as model calls; usage is tracked per channel/instance |
+| **Long-running constraints** | At most two pages in total, `no-cache, must-revalidate` for static assets, single instance by default with on-demand warmup, prioritizing stability on low-memory VPS hosts |
+
+## Acknowledgements
+
+This project builds on the following work:
+
+- [`DeconstructedCube/aistudio-api`](https://github.com/DeconstructedCube/aistudio-api): the **upstream source solution**. The multi-protocol surfaces (Gemini / OpenAI / Anthropic / Responses), BotGuard verification chain, dynamic model discovery, account tier/email probing and session re-navigation all come from this repository and its maintainer; this fork continuously merges its updates.
+- [`iBUHub/AIStudioToAPI`](https://github.com/iBUHub/AIStudioToAPI): the **provider of the Build channel approach**. The Build surface here (app host, wire frame protocol, task submission and result collection) references its public implementation, extended with a local signer bypass and a redundant native direct path.
+- Lineage and in-repo research notes: `chrysoljq/aistudio-api` (original) → `DeconstructedCube/aistudio-api` → this fork. The handover documents for the Build channel, direct signer and bundle archaeology live in [`docs/ark-reference/`](./docs/ark-reference/README.md) (sanitized).
+
+All rights to the referenced code and documentation remain with their respective authors; this repository only cites and credits them and does not reproduce any credentials or key material.
 
 ---
 
