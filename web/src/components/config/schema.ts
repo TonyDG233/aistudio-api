@@ -339,6 +339,19 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     recommendedValue: 3,
     tags: ['账号刷新', 'WP3'],
   },
+  'features.keepalive_auth_update': {
+    key: 'features.keepalive_auth_update',
+    title: '自动更新凭证',
+    category: 'features',
+    type: 'boolean',
+    description:
+      '是否自动把浏览器当前 cookies/origins 原子回写 per-account auth.json（对应 Ark ENABLE_AUTH_UPDATE）。',
+    explanation:
+      '开=切号前、初始化/重连、周期到期与浏览器关闭前自动回写凭证，不写 meta；关=仅在登录/切号时自然回写。默认开启，是长期运行时避免登录态失效的主要手段。失败怎么办：单次回写失败只记录日志，不影响请求与账号状态。',
+    defaultValue: true,
+    recommendedValue: true,
+    tags: ['凭证保活', 'WP10', '默认开启'],
+  },
   'features.auto_switch': {
     key: 'features.auto_switch',
     title: '定时自动切换账号',
