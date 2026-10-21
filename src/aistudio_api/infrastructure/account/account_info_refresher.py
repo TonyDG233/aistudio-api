@@ -322,6 +322,12 @@ class AccountInfoRefresher:
             results = await asyncio.gather(*(_run(account) for account in accounts))
         finally:
             self._active_run = False
+        duplicated = self._store.refresh_duplicate_flags()
+        if duplicated:
+            logger.warning(
+                "[Refresh] 检测到 %d 个重复账号（同一邮箱多条），已在账号列表标记",
+                duplicated,
+            )
         return list(results)
 
     async def refresh_tier(self, account: AccountMeta) -> dict[str, object]:

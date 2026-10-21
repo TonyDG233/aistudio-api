@@ -60,6 +60,7 @@ class AccountResponse(BaseModel):
     cookie_id: str | None = None
     tier: str | None = None
     expired: bool = False
+    duplicate_of: str | None = None
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -78,6 +79,7 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         cookie_id=cid,
         tier=getattr(account, "tier", None),
         expired=bool(getattr(account, "expired", False)),
+        duplicate_of=getattr(account, "duplicate_of", None),
     )
 
 
@@ -345,6 +347,7 @@ async def detect_account_email(
 
     if email:
         account_service.update_account_email(account_id, email)
+        account_service.store.refresh_duplicate_flags()
         log.info("已自动识别并更新账号 %s 邮箱: %s", account_id, mask_email(email))
 
     if detected_tier:
@@ -680,7 +683,12 @@ async def probe_and_import(
             rotator.add_account(meta.id)
             rotator.clear_cooldown(meta.id)
 
-    imported_accounts = [to_account_response(account) for account in metas]
+    account_service.store.refresh_duplicate_flags()
+    imported_accounts = [
+        to_account_response(fresh)
+        for item in metas
+        if (fresh := account_service.get_account(item.id)) is not None
+    ]
 
     client_obj = getattr(runtime_state, "client", None)
     if not had_active_account and metas and client_obj is not None:
@@ -835,6 +843,12 @@ async def import_bundle(
         imported_accounts.append(to_account_response(account))
     if not account_service.get_active_account() and imported_accounts:
         account_service.set_active_account(imported_accounts[0].id)
+    account_service.store.refresh_duplicate_flags()
+    imported_accounts = [
+        to_account_response(fresh)
+        for item in imported_accounts
+        if (fresh := account_service.get_account(item.id)) is not None
+    ]
     log.info("批量文件导入完成: 成功入库 %d 个账号", len(imported_accounts))
     return ImportBundleResponse(
         imported_count=len(imported_accounts),
