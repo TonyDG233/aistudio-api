@@ -62,10 +62,23 @@ class FakePool:
         self,
         channel: str,
         *,
+        account_id: str | None = None,
         group_name: str | None = None,
         group_max_pages: int | None = None,
     ) -> None:
-        if len(self._slots) >= self.max_contexts:
+        existing = (
+            next(
+                (
+                    slot
+                    for slot in self._slots.values()
+                    if slot.current_account_id == account_id
+                ),
+                None,
+            )
+            if account_id
+            else None
+        )
+        if existing is None and len(self._slots) >= self.max_contexts:
             raise InstanceCapacityError("capacity")
         if channel == "build" and self.build_budget_full:
             raise InstanceCapacityError("build page budget exhausted")
@@ -75,6 +88,24 @@ class FakePool:
         channel = str(kwargs.get("channel") or "chat")
         if account_id in self.fail_accounts:
             raise RuntimeError("startup failed")
+        existing = next(
+            (
+                slot
+                for slot in self._slots.values()
+                if slot.current_account_id == account_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if channel == "build":
+                if self.build_budget_full:
+                    raise InstanceCapacityError("build page budget exhausted")
+                existing.has_build = True
+                existing.build_counted = True
+            else:
+                existing.has_chat = True
+                existing.chat_counted = True
+            return existing
         if len(self._slots) >= self.max_contexts:
             raise InstanceCapacityError("capacity")
         if channel == "build" and self.build_budget_full:
@@ -109,6 +140,20 @@ class FakePool:
                 raise InstanceCapacityError("build page budget exhausted")
             slot.has_build = True
             slot.build_counted = True
+        else:
+            slot.has_chat = True
+            slot.chat_counted = True
+
+    async def close_channel(self, slot_id: str, channel: str) -> None:
+        slot = self._slots[slot_id]
+        if slot.in_flight > 0:
+            raise InstanceCapacityError("busy")
+        if channel == "build":
+            slot.has_build = False
+            slot.build_counted = False
+        else:
+            slot.has_chat = False
+            slot.chat_counted = False
 
     async def reassign_instance(self, slot_id: str, **kwargs) -> FakeSlot:
         slot = self._slots[slot_id]
@@ -207,7 +252,7 @@ async def test_create_two_instances_and_latest() -> None:
     assert listed.current_instance_id == first.id
     assert first.id != second.id
     assert all(item.state.value == "active" for item in listed.instances)
-    assert listed.instances[0].channels == ("pg",)
+    assert listed.instances[0].channel == "pg"
     assert all(slot.pinned for slot in pool.slots())
 
 
@@ -218,7 +263,7 @@ async def test_create_with_build_channel_does_not_report_hidden_chat_page() -> N
     await _settle(manager)
 
     listed = await manager.list_instances()
-    assert listed.instances[0].channels == ("build",)
+    assert listed.instances[0].channel == "build"
     assert len(pool.slots()) == 1
     assert pool.slots()[0].has_chat is True
     assert pool.slots()[0].chat_counted is False
@@ -460,8 +505,8 @@ async def test_switch_active_target_can_start_another_channel_without_new_instan
     await manager.switch_to(item.id, "build")
     listed = await manager.list_instances()
 
-    assert len(listed.instances) == 1
-    assert listed.instances[0].channels == ("pg", "build")
+    assert len(listed.instances) == 2
+    assert {item.channel for item in listed.instances} == {"pg", "build"}
     assert len(pool.slots()) == 1
     assert pool.slots()[0].has_build is True
 
@@ -478,7 +523,7 @@ async def test_switch_channel_budget_failure_returns_409_without_page() -> None:
         await manager.switch_to(item.id, "build")
 
     listed = await manager.list_instances()
-    assert listed.instances[0].channels == ("pg",)
+    assert listed.instances[0].channel == "pg"
     assert pool.slots()[0].has_build is False
 
 

@@ -60,9 +60,13 @@ class InstanceSlot:
     generation: int = 0
     reservations: int = 0
     pending_pages: int = 0
+    pending_channel: str = ""
     chat_counted: bool = False
     build_counted: bool = False
     build_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+    chat_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, repr=False, compare=False
     )
     group_name: str = ""
@@ -234,9 +238,10 @@ class InstancePool:
         chat = 1 if slot.chat_counted else 0
         build = 1 if slot.build_counted else 0
         if slot.pending_pages:
-            if slot.channel_role == "chat":
+            pending_channel = slot.pending_channel or slot.channel_role
+            if pending_channel == "chat":
                 chat = max(chat, 1)
-            elif slot.channel_role == "build":
+            elif pending_channel == "build":
                 build = max(build, 1)
         return {"chat": chat, "build": build}
 
@@ -479,42 +484,54 @@ class InstancePool:
         auth_user: str = "0",
         channel: str = "chat",
     ) -> InstanceSlot:
-        """Create one explicit, pinned instance for a user-selected account.
+        """Activate one explicit instance (account + channel) and pin it.
 
-        Unlike request-driven ``acquire`` this never rebinds an existing slot:
-        the returned slot is a stable instance identity until the user closes or
-        reassigns it.
+        A second channel for the same account reuses that account's context and
+        only adds its channel page; it never creates a second context.
         """
         async with self._condition:
-            if any(
-                slot.current_account_id == account_id
-                and slot.state is not SlotState.RETIRING
-                for slot in self._slots.values()
-            ):
-                raise InstanceCapacityError(f"account already bound: {account_id}")
-            if len(self._slots) >= self._max_contexts():
-                raise InstanceCapacityError(
-                    f"instance capacity exhausted: live={len(self._slots)} "
-                    f"limit={self._max_contexts()}"
+            existing = next(
+                (
+                    slot
+                    for slot in self._slots.values()
+                    if slot.current_account_id == account_id
+                    and slot.state is not SlotState.RETIRING
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.pinned = True
+                slot = existing
+                created = False
+            else:
+                if len(self._slots) >= self._max_contexts():
+                    raise InstanceCapacityError(
+                        f"instance capacity exhausted: live={len(self._slots)} "
+                        f"limit={self._max_contexts()}"
+                    )
+                self._check_page_budget_locked(
+                    channel=channel,
+                    group_name=None,
+                    group_max_pages=None,
                 )
-            self._check_page_budget_locked(
-                channel=channel,
-                group_name=None,
-                group_max_pages=None,
-            )
-            slot = InstanceSlot(
-                slot_id=f"slot-{next(self._counter)}",
-                state=SlotState.LOADING,
-                current_account_id=account_id,
-                auth_file=auth_file,
-                auth_user=auth_user or "0",
-                channel_role=channel,
-                pending_pages=1,
-                pinned=True,
-                last_used=self._clock(),
-            )
-            self._slots[slot.slot_id] = slot
-            self._condition.notify_all()
+                slot = InstanceSlot(
+                    slot_id=f"slot-{next(self._counter)}",
+                    state=SlotState.LOADING,
+                    current_account_id=account_id,
+                    auth_file=auth_file,
+                    auth_user=auth_user or "0",
+                    channel_role=channel,
+                    pending_pages=1,
+                    pending_channel=channel,
+                    pinned=True,
+                    last_used=self._clock(),
+                )
+                self._slots[slot.slot_id] = slot
+                created = True
+                self._condition.notify_all()
+        if not created:
+            await self.ensure_channel(slot.slot_id, channel)
+            return slot
         try:
             await self._load_slot(
                 slot,
@@ -538,12 +555,26 @@ class InstancePool:
         self,
         channel: str,
         *,
+        account_id: str | None = None,
         group_name: str | None = None,
         group_max_pages: int | None = None,
     ) -> None:
         """Preflight an explicit instance creation without allocating anything."""
         async with self._condition:
-            if len(self._slots) >= self._max_contexts():
+            existing = (
+                next(
+                    (
+                        slot
+                        for slot in self._slots.values()
+                        if slot.current_account_id == account_id
+                        and slot.state is not SlotState.RETIRING
+                    ),
+                    None,
+                )
+                if account_id
+                else None
+            )
+            if existing is None and len(self._slots) >= self._max_contexts():
                 raise InstanceCapacityError(
                     f"instance capacity exhausted: live={len(self._slots)} "
                     f"limit={self._max_contexts()}"
@@ -555,7 +586,7 @@ class InstancePool:
             )
 
     async def ensure_channel(self, slot_id: str, channel: str) -> None:
-        """Activate an additional channel page on an existing explicit instance."""
+        """Activate one channel page on an existing explicit instance."""
         surface = "build" if channel == "build" else "chat"
         async with self._condition:
             slot = self._slots.get(slot_id)
@@ -563,9 +594,7 @@ class InstancePool:
                 raise InstanceCapacityError(f"slot missing: {slot_id}")
             if slot.state is SlotState.RETIRING:
                 raise InstanceCapacityError(f"slot retiring: {slot_id}")
-            if surface == "chat" and slot.chat_ready():
-                return
-            if surface == "build" and slot.build_ready():
+            if self._page_ready(slot, surface):
                 return
             self._check_page_budget_locked(
                 channel=surface,
@@ -573,25 +602,85 @@ class InstancePool:
                 group_max_pages=None,
             )
             slot.pending_pages = max(1, slot.pending_pages + 1)
+            slot.pending_channel = surface
         try:
             if surface == "build":
                 await asyncio.wait_for(
                     self._ensure_surface(slot, "build"),
                     timeout=BUILD_CHANNEL_READY_TIMEOUT_S,
                 )
+            else:
+                await asyncio.wait_for(
+                    self._ensure_chat_surface(slot),
+                    timeout=BUILD_CHANNEL_READY_TIMEOUT_S,
+                )
         except TimeoutError as exc:
             async with self._condition:
                 slot.pending_pages = max(0, slot.pending_pages - 1)
+                slot.pending_channel = ""
             raise InstanceCapacityError(
                 f"渠道启动超时（{BUILD_CHANNEL_READY_TIMEOUT_S:.0f}s）"
             ) from exc
         except BaseException:
             async with self._condition:
                 slot.pending_pages = max(0, slot.pending_pages - 1)
+                slot.pending_channel = ""
             raise
         async with self._condition:
             slot.pending_pages = max(0, slot.pending_pages - 1)
+            slot.pending_channel = ""
+            slot.channel_role = surface
             self._condition.notify_all()
+
+    async def close_channel(self, slot_id: str, channel: str) -> None:
+        """Close one channel page while keeping the account context alive."""
+        surface = "build" if channel == "build" else "chat"
+        session = None
+        build_surface = None
+        async with self._condition:
+            slot = self._slots.get(slot_id)
+            if slot is None:
+                return
+            if slot.in_flight > 0:
+                raise InstanceCapacityError(f"slot busy: {slot_id}")
+            if surface == "chat":
+                session = slot.session
+                slot.session = None
+                slot.chat_counted = False
+            else:
+                build_surface = slot.build_surface
+                slot.build_surface = None
+                slot.build_counted = False
+            slot.channel_role = (
+                "build" if slot.build_counted else ("chat" if slot.chat_counted else "")
+            )
+            self._condition.notify_all()
+        if session is not None:
+            with suppress(Exception):
+                await session.close()
+        if build_surface is not None:
+            page = getattr(getattr(build_surface, "state", None), "page", None)
+            if page is not None:
+                with suppress(Exception):
+                    await page.close()
+
+    async def _ensure_chat_surface(self, slot: InstanceSlot) -> None:
+        async with slot.chat_lock:
+            if slot.chat_ready():
+                slot.chat_counted = True
+                return
+            if not slot.context_id:
+                raise InstanceCapacityError(f"slot has no context: {slot.slot_id}")
+            cdp = await self._cdp_provider()
+            session = await self._session_factory(
+                cdp,
+                context_id=slot.context_id,
+                auth_file=slot.auth_file,
+                auth_user=slot.auth_user,
+                realm_id=slot.realm_id,
+            )
+            slot.session = session
+            slot.chat_counted = True
 
     async def close_instance(self, slot_id: str) -> None:
         """Close one explicit instance; refuse while it still has requests."""
@@ -696,6 +785,7 @@ class InstancePool:
                 slot.last_used = self._clock()
                 if slot.reservations == 0:
                     slot.pending_pages = 0
+                    slot.pending_channel = ""
                     if not slot.chat_ready():
                         slot.chat_counted = False
                     if not slot.build_ready():
@@ -836,7 +926,15 @@ class InstancePool:
         slot.current_account_id = account_id
         slot.state = SlotState.READY
         slot.pending_pages = 0
+        slot.pending_channel = ""
         if slot.channel_role == "build":
+            # The chat page is only a BotGuard bootstrap page for a build-only
+            # context. Keep the context/cookies, but close the hidden page so it
+            # neither counts as an instance page nor costs a renderer.
+            with suppress(Exception):
+                await session.close()
+            slot.session = None
+            slot.chat_counted = False
             slot.build_counted = True
         elif slot.channel_role == "chat":
             slot.chat_counted = True
@@ -963,11 +1061,15 @@ class InstancePool:
         return slot.chat_ready()
 
     async def _ensure_surface(self, slot: InstanceSlot, surface: str) -> None:
+        if surface == "chat":
+            await self._ensure_chat_surface(slot)
+            return
         if surface != "build":
             return
         cdp = await self._cdp_provider()
         await slot.ensure_build_surface(cdp)
         slot.pending_pages = 0
+        slot.pending_channel = ""
         slot.build_counted = True
 
     def _touch_locked(self, slot: InstanceSlot) -> None:

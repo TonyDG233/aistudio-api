@@ -29,9 +29,9 @@ const contextMax = computed(() => {
   const value = budgets.value.max_contexts
   return typeof value === 'number' ? value : null
 })
-const contextChip = computed(() => {
-  if (!props.snapshot) return 'Context —'
-  return `Context ${contextCurrent.value} / ${contextMax.value ?? '—'}`
+const instanceChip = computed(() => {
+  if (!props.snapshot) return '实例 —'
+  return `实例 ${current.value} / ${planned.value || '—'}`
 })
 
 const channelRows = computed(() => {
@@ -65,8 +65,8 @@ function channelText(channel: { label: string; actual: number; plan: number }): 
       </div>
       <span
         class="text-[10px] font-medium text-gray-500 bg-gray-50 border border-gray-200/70 rounded-md px-1.5 py-0.5 font-mono"
-        :title="`页面实例 ${current} / ${planned}；Context ${contextCurrent} / ${contextMax ?? '未知'}`"
-      >{{ contextChip }}</span>
+        :title="`实例 ${current} / ${planned}；账号会话 ${contextCurrent} / ${contextMax ?? '未知'}`"
+      >{{ instanceChip }}</span>
     </div>
 
     <div

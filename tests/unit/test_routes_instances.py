@@ -20,7 +20,7 @@ EXPECTED_KEYS = {
     "number",
     "account_id",
     "state",
-    "channels",
+    "channel",
     "in_flight",
     "latest",
 }
@@ -44,7 +44,7 @@ class FakeManager:
                     number=1,
                     account_id="a",
                     state=InstanceState.ACTIVE,
-                    channels=("pg",),
+                    channel="pg",
                     in_flight=1,
                     latest=True,
                 ),
@@ -60,6 +60,7 @@ class FakeManager:
             number=2,
             account_id=account_id,
             state=InstanceState.STARTING,
+            channel="pg",
         )
 
     async def close(self, instance_id: str) -> Instance:
@@ -71,6 +72,7 @@ class FakeManager:
             number=2,
             account_id="b",
             state=InstanceState.RECLAIMING,
+            channel="pg",
         )
 
     async def switch_to(self, instance_id: str, channel: str | None = None) -> Instance:
@@ -81,7 +83,7 @@ class FakeManager:
             number=2,
             account_id="b",
             state=InstanceState.ACTIVE,
-            channels=("pg",),
+            channel="pg",
         )
 
     async def reassign(self, instance_id: str, account_id: str) -> Instance:
@@ -93,6 +95,7 @@ class FakeManager:
             number=2,
             account_id=account_id,
             state=InstanceState.STARTING,
+            channel="pg",
         )
 
 

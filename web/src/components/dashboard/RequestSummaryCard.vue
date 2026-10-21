@@ -15,10 +15,10 @@ const emit = defineEmits<{
   retry: []
 }>()
 
-const total = computed(() => props.totals?.client_requests ?? props.totals?.requests ?? null)
-const success = computed(() => props.totals?.client_success ?? props.totals?.success ?? null)
-const errors = computed(() => props.totals?.client_errors ?? props.totals?.errors ?? null)
-const aborted = computed(() => props.totals?.client_aborted ?? null)
+const total = computed(() => props.totals?.requests ?? props.totals?.client_requests ?? null)
+const success = computed(() => props.totals?.success ?? null)
+const errors = computed(() => props.totals?.errors ?? null)
+const clientRequests = computed(() => props.totals?.client_requests ?? null)
 const rateLimited = computed(() => props.totals?.rate_limited ?? null)
 
 function fmt(value: number | null | undefined): string {
@@ -32,7 +32,7 @@ function fmt(value: number | null | undefined): string {
     <div class="flex items-center justify-between gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider">
       <div class="flex items-center gap-2">
         <Activity class="w-4 h-4 text-brand-600" />
-        <span>总请求数</span>
+        <span title="上游实际调用次数，含重试/换号；不含 Token 计数请求">总模型调用</span>
       </div>
       <button
         type="button"
@@ -61,7 +61,7 @@ function fmt(value: number | null | undefined): string {
         <button
           type="button"
           class="hover:text-rose-700 transition-colors cursor-pointer"
-          title="客户端请求失败数；可在日志中按错误级别查看"
+          title="上游尝试层的失败数；同一客户端请求重试可能产生多次尝试"
           @click="emit('goLogs', 'levels=warn,error&q=HTTP')"
         >
           失败 <b
@@ -69,7 +69,6 @@ function fmt(value: number | null | undefined): string {
             :class="(errors || 0) > 0 ? 'text-rose-600' : 'text-gray-600'"
           >{{ fmt(errors) }}</b>
         </button>
-        <span>中断 <b class="font-mono text-gray-600">{{ fmt(aborted) }}</b></span>
         <button
           type="button"
           class="inline-flex items-center gap-1 text-amber-700 hover:text-amber-800 transition-colors cursor-pointer"
@@ -88,6 +87,11 @@ function fmt(value: number | null | undefined): string {
       >
         统计读取失败，重试
       </button>
+    </div>
+    <div class="mt-1 text-[11px] text-gray-400">
+      客户端请求 <span class="font-mono tabular-nums">{{ fmt(clientRequests) }}</span>
+      <span class="mx-1 text-gray-300">·</span>
+      一次客户端请求可能触发多次模型调用
     </div>
   </section>
 </template>

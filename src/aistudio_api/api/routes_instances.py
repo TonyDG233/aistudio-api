@@ -22,7 +22,7 @@ class InstanceResponse(BaseModel):
     number: int
     account_id: str
     state: str
-    channels: list[str]
+    channel: str
     in_flight: int
     latest: bool
 
@@ -53,7 +53,7 @@ def to_instance_response(instance: Instance) -> InstanceResponse:
         number=instance.number,
         account_id=instance.account_id,
         state=instance.state.value,
-        channels=list(instance.channels),
+        channel=instance.channel,
         in_flight=instance.in_flight,
         latest=instance.latest,
     )

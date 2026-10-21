@@ -412,7 +412,7 @@ onBeforeRouteLeave((_to, _from, next) => {
                 系统与模型配置 (config.yaml)
               </h3>
               <p class="text-[11px] text-gray-400 mt-0.5">
-                功能开关、实例上限、渠道、路由与模型规则统一写入一份 YAML，保存后热重载。
+                功能开关、账号会话上限、渠道、路由与模型规则统一写入一份 YAML，保存后热重载。
               </p>
             </div>
           </div>
@@ -505,7 +505,7 @@ onBeforeRouteLeave((_to, _from, next) => {
       <div class="border-t border-gray-100 bg-gray-50/50 p-4 sm:p-6 space-y-5">
         <!-- Mode 1: Visual Form Editor -->
         <template v-if="activeTab === 'visual'">
-          <!-- 实例上限置顶：默认单实例，不受深度模式开关影响 -->
+          <!-- 账号会话上限置顶：默认单账号，不受深度模式开关影响 -->
           <InstanceLimitCard
             :routing="featuresConfig.routing || {}"
             @update:routing="updateRouting"

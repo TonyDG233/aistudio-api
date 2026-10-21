@@ -21,6 +21,7 @@ const clientSuccess = computed(() => totals.value?.client_success ?? null)
 const clientErrors = computed(() => totals.value?.client_errors ?? null)
 const clientAborted = computed(() => totals.value?.client_aborted ?? null)
 const attempts = computed(() => totals.value?.attempts ?? totals.value?.requests ?? null)
+const attemptSuccess = computed(() => totals.value?.success ?? null)
 const attempt429 = computed(() => totals.value?.rate_limited ?? null)
 const attemptErrors = computed(() => totals.value?.errors ?? null)
 
@@ -42,48 +43,68 @@ const outputShare = computed(() => {
       <div class="flex items-start justify-between gap-3">
         <div>
           <div class="text-xs font-semibold text-gray-500 uppercase tracking-wider">
-            客户端请求
+            模型调用
           </div>
           <div class="mt-2 flex items-baseline gap-2">
             <span class="text-3xl font-bold tracking-tight font-mono tabular-nums text-gray-900">
-              {{ formatInt(clientRequests) }}
+              {{ formatInt(attempts) }}
             </span>
             <span class="text-xs text-gray-400">{{ rangeLabel }}</span>
           </div>
+          <p class="mt-1 text-[11px] text-gray-400">
+            上游实际调用，含重试/换号；不含 Token 计数请求
+          </p>
         </div>
-        <span class="text-[11px] text-gray-400">反代接受</span>
+        <div class="text-right">
+          <div class="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+            客户端请求
+          </div>
+          <div class="mt-1 text-sm font-semibold font-mono tabular-nums text-gray-700">
+            {{ formatInt(clientRequests) }}
+          </div>
+        </div>
       </div>
       <div class="mt-4 grid grid-cols-3 gap-2 text-xs">
-        <div class="rounded-xl bg-gray-50 px-3 py-2">
+        <div
+          class="rounded-xl bg-gray-50 px-3 py-2"
+          title="上游尝试中成功的次数"
+        >
           <div class="text-gray-400">
             成功
           </div>
           <div class="mt-0.5 font-mono tabular-nums font-semibold text-emerald-600">
-            {{ formatInt(clientSuccess) }}
+            {{ formatInt(attemptSuccess) }}
           </div>
         </div>
-        <div class="rounded-xl bg-gray-50 px-3 py-2">
+        <div
+          class="rounded-xl bg-gray-50 px-3 py-2"
+          title="上游尝试中的 429 次数，含重试/换号"
+        >
           <div class="text-gray-400">
-            失败
-          </div>
-          <div class="mt-0.5 font-mono tabular-nums font-semibold text-rose-600">
-            {{ formatInt(clientErrors) }}
-          </div>
-        </div>
-        <div class="rounded-xl bg-gray-50 px-3 py-2">
-          <div class="text-gray-400">
-            中断
+            429
           </div>
           <div class="mt-0.5 font-mono tabular-nums font-semibold text-amber-600">
-            {{ formatInt(clientAborted) }}
+            {{ formatInt(attempt429) }}
+          </div>
+        </div>
+        <div
+          class="rounded-xl bg-gray-50 px-3 py-2"
+          title="上游尝试中的其他错误次数"
+        >
+          <div class="text-gray-400">
+            错误
+          </div>
+          <div class="mt-0.5 font-mono tabular-nums font-semibold text-rose-600">
+            {{ formatInt(attemptErrors) }}
           </div>
         </div>
       </div>
       <div class="mt-3 text-[11px] text-gray-500">
-        上游尝试 <span class="font-mono tabular-nums">{{ formatInt(attempts) }}</span>
-        · 429 <span class="font-mono tabular-nums">{{ formatInt(attempt429) }}</span>
-        · 错误 <span class="font-mono tabular-nums">{{ formatInt(attemptErrors) }}</span>
-        <span class="text-gray-400">（含重试/换号）</span>
+        客户端 成功 <span class="font-mono tabular-nums">{{ formatInt(clientSuccess) }}</span>
+        <span class="mx-1 text-gray-300">·</span>
+        失败 <span class="font-mono tabular-nums">{{ formatInt(clientErrors) }}</span>
+        <span class="mx-1 text-gray-300">·</span>
+        中断 <span class="font-mono tabular-nums">{{ formatInt(clientAborted) }}</span>
       </div>
     </div>
 

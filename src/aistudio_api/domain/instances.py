@@ -21,7 +21,7 @@ class Instance:
     number: int
     account_id: str
     state: InstanceState
-    channels: tuple[str, ...] = ()
+    channel: str
     in_flight: int = 0
     latest: bool = False
 

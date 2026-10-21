@@ -48,7 +48,7 @@ function setStatusFilter(value: 'all' | 'ready' | 'limited' | 'expired') {
   statusFilter.value = value
 }
 
-function openSwitchPanel() {
+function openSwitchPanel(_instanceId?: string) {
   switchModalOpen.value = true
 }
 
@@ -62,20 +62,19 @@ async function handleCreateInstance(accountId: string, channel: string) {
   if (ok) switchModalOpen.value = false
 }
 
-function closeInstanceForAccount(account: AccountWithStats) {
-  const instance = instancesStore.instanceForAccount(account.id)
-  if (instance) void instancesStore.close(instance.id)
-}
-
-function isClosing(account: AccountWithStats): boolean {
-  const instance = instancesStore.instanceForAccount(account.id)
-  return Boolean(instance && instancesStore.closingInstanceId === instance.id)
+function handleCloseInstance(instanceId: string) {
+  void instancesStore.close(instanceId)
 }
 
 async function handleClearCooldown(accountId: string) {
   await systemStore.clearCooldown({ account_id: accountId })
   await accountsStore.fetchAll()
 }
+
+const instanceOrdinals = computed(() => {
+  const sorted = [...instancesStore.instances].sort((a, b) => a.number - b.number)
+  return Object.fromEntries(sorted.map((instance, index) => [instance.id, index + 1]))
+})
 
 const filteredAccounts = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
@@ -205,7 +204,7 @@ async function handleRemove(account: AccountWithStats) {
           账号管理
         </h2>
         <p class="text-xs text-gray-400 mt-1">
-          一个账号对应一个同时登录实例；实例有编号，容量由实例上限控制。
+          同一账号可开 PG/Build 两个用量窗口；实例有编号，总量由用量窗口上限控制。
         </p>
       </div>
 
@@ -407,10 +406,11 @@ async function handleRemove(account: AccountWithStats) {
           v-for="account in filteredAccounts"
           :key="account.id"
           :account="account"
-          :instance="instancesStore.instanceForAccount(account.id)"
-          :closing="isClosing(account)"
+          :instances="instancesStore.instancesForAccount(account.id)"
+          :ordinals="instanceOrdinals"
+          :closing-instance-id="instancesStore.closingInstanceId"
           :refreshing="accountsStore.refreshingIds[account.id]"
-          @close="closeInstanceForAccount(account)"
+          @close="handleCloseInstance"
           @switch="openSwitchPanel"
           @refresh="accountsStore.refreshAccount(account.id)"
           @edit="handleEditName(account)"

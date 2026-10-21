@@ -387,14 +387,27 @@ async def logging_and_dump_middleware(request, call_next):
 
 
 # 挂载前端静态资源与 SPA 路由支持
+class _NoCacheStaticFiles(StaticFiles):
+    """Revalidate unhashed frontend assets so rebuilds are picked up."""
+
+    async def get_response(self, path: str, scope):  # type: ignore[no-untyped-def]
+        response = await super().get_response(path, scope)
+        response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
+        return response
+
+
 static_dir = Path(__file__).resolve().parents[1] / "static"
 index_html_path = static_dir / "index.html"
 
 if static_dir.is_dir():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.mount("/static", _NoCacheStaticFiles(directory=str(static_dir)), name="static")
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
-        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+        app.mount(
+            "/assets",
+            _NoCacheStaticFiles(directory=str(assets_dir)),
+            name="assets",
+        )
 
 
 @app.get("/auth/check")

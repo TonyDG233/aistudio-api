@@ -766,10 +766,110 @@ async def test_reassign_explicit_instance_keeps_identity_and_pin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_instance_duplicate_account_is_rejected() -> None:
+async def test_explicit_instance_same_channel_reuses_slot() -> None:
     cdp = FakeCDP()
     pool = _pool(cdp, max_contexts=2)
-    await pool.create_instance(account_id="a", auth_file="a.json")
-    with pytest.raises(InstanceCapacityError, match="already bound"):
-        await pool.create_instance(account_id="a", auth_file="a.json")
+    first = await pool.create_instance(account_id="a", auth_file="a.json")
+    again = await pool.create_instance(account_id="a", auth_file="a.json")
+    assert again.slot_id == first.slot_id
+    assert len(pool.slots()) == 1
+    assert len(cdp.created) == 1
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_instance_second_channel_reuses_context(monkeypatch) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+
+    async def fake_ensure(self, _cdp):
+        if self.build_surface is None:
+            self.build_surface = FakeBuildSurface(
+                context_id=self.context_id, realm_id=self.realm_id
+            )
+        return self.build_surface
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
+    chat = await pool.create_instance(account_id="a", auth_file="a.json")
+    build = await pool.create_instance(
+        account_id="a", auth_file="a.json", channel="build"
+    )
+    assert build.slot_id == chat.slot_id
+    assert build.context_id == chat.context_id
+    assert len(pool.slots()) == 1
+    assert len(cdp.created) == 1
+    assert pool.page_counts() == {"chat": 1, "build": 1}
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_close_channel_only_closes_one_page(monkeypatch) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+
+    async def fake_ensure(self, _cdp):
+        if self.build_surface is None:
+            self.build_surface = FakeBuildSurface(
+                context_id=self.context_id, realm_id=self.realm_id
+            )
+        return self.build_surface
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
+    chat = await pool.create_instance(account_id="a", auth_file="a.json")
+    await pool.create_instance(account_id="a", auth_file="a.json", channel="build")
+    await pool.close_channel(chat.slot_id, "build")
+    assert chat.chat_ready() is True
+    assert chat.build_ready() is False
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    await pool.ensure_channel(chat.slot_id, "build")
+    assert chat.build_ready() is True
+    assert pool.page_counts() == {"chat": 1, "build": 1}
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_build_only_slot_closes_bootstrap_chat_page(monkeypatch) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+
+    async def fake_ensure(self, _cdp):
+        if self.build_surface is None:
+            self.build_surface = FakeBuildSurface(
+                context_id=self.context_id, realm_id=self.realm_id
+            )
+        return self.build_surface
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
+    slot = await pool.create_instance(
+        account_id="a", auth_file="a.json", channel="build"
+    )
+    assert slot.session is None
+    assert slot.chat_ready() is False
+    assert slot.build_ready() is True
+    assert pool.page_counts() == {"chat": 0, "build": 1}
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_channel_reopens_chat_in_existing_context(monkeypatch) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+
+    async def fake_ensure(self, _cdp):
+        if self.build_surface is None:
+            self.build_surface = FakeBuildSurface(
+                context_id=self.context_id, realm_id=self.realm_id
+            )
+        return self.build_surface
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
+    slot = await pool.create_instance(
+        account_id="a", auth_file="a.json", channel="build"
+    )
+    await pool.ensure_channel(slot.slot_id, "chat")
+    assert slot.session is not None
+    assert slot.chat_ready() is True
+    assert slot.build_ready() is True
+    assert len(cdp.created) == 1
+    assert pool.page_counts() == {"chat": 1, "build": 1}
     await pool.close()
