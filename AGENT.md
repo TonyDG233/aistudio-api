@@ -300,6 +300,7 @@ aistudio-api/
 
 - **统计**：`state.py` 使用 stats schema v2（`models` + `daily`），记录 client/attempt 两层请求、输入/输出/推理/缓存读写、count_tokens 与 `usage_missing`。模型调用（`requests/attempts`，含重试/换号）是 P1/P4 主指标；客户端请求（`client_*`）为次级；`count_*` Token 计数独立，不计入模型调用。模型名统一去掉 `models/` 前缀并合并历史重复键。`/api/stats`、`/api/stats/timeseries` 只读取服务端状态，不使用本地 tokenizer 估算。
 - **Paid 模型**：`model_access.py` 维护 Paid 模型集合；`model_discovery` 成功拉取 ListModels 后按模型更新（`paid: true` 加入、`paid: false` 移除、缺失保留上次状态），并写入 `data/models_cache.json`。启动时加载快照并后台预热，刷新失败保留旧快照与默认兜底。
+- **模型列表**：单渠道返回裸模型 ID；多渠道同时返回裸 ID（自动路由入口）与 `pg/`、`build/` 前缀（显式渠道入口）。`models/<bare>` 始终按裸模型处理；paid 模型只会出现在 chat 前缀下，chat-only 模型不会出现在 build 前缀下。
 - **语义边界**：`account_is_paid(tier)` 判断凭证档位（pro/ultra/plus/paid）；`model_requires_paid_account(model)` 只看模型 Paid 元数据；`is_chat_only_model(model)` 只表示 surface 只能 chat。模型名中的 `pro` 不再影响账号资格或 surface 判定。
 
 ---

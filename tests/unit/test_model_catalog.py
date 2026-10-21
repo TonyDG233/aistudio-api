@@ -31,12 +31,16 @@ def test_single_channel_returns_bare_ids() -> None:
     ) == ["gemini-3.8-flash", "gemini-2.5-pro"]
 
 
-def test_multi_channel_emits_one_prefix_per_real_channel() -> None:
+def test_multi_channel_lists_bare_and_prefixed_ids() -> None:
     projected = project_model_ids(
         _models("models/gemini-3.8-flash"),
         _features(build=True),
     )
-    assert projected == ["pg/gemini-3.8-flash", "build/gemini-3.8-flash"]
+    assert projected == [
+        "gemini-3.8-flash",
+        "pg/gemini-3.8-flash",
+        "build/gemini-3.8-flash",
+    ]
 
 
 def test_chat_only_model_is_not_duplicated_into_build() -> None:
@@ -47,7 +51,12 @@ def test_chat_only_model_is_not_duplicated_into_build() -> None:
         ],
         _features(build=True),
     )
-    assert projected == ["pg/gemini-4-argon", "pg/gemini-2.5-pro"]
+    assert projected == [
+        "gemini-4-argon",
+        "gemini-2.5-pro",
+        "pg/gemini-4-argon",
+        "pg/gemini-2.5-pro",
+    ]
 
 
 def test_duplicate_discovery_entries_are_deduped() -> None:
@@ -55,7 +64,7 @@ def test_duplicate_discovery_entries_are_deduped() -> None:
         _models("models/flash", "flash", "models/flash"),
         _features(build=True),
     )
-    assert projected == ["pg/flash", "build/flash"]
+    assert projected == ["flash", "pg/flash", "build/flash"]
 
 
 def test_official_is_not_listed_before_wp9() -> None:
