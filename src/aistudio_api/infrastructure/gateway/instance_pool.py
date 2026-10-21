@@ -276,6 +276,32 @@ class InstancePool:
         except Exception:
             return {}
 
+    def channel_max_instances(self, channel: str) -> int | None:
+        """该渠道允许并存的实例数；未配置返回 None（只受全局实例上限约束）。"""
+        features = self._features()
+        raw_channels = features.get("channels")
+        channels = raw_channels if isinstance(raw_channels, dict) else {}
+        key = "chat" if channel in ("chat", "pg") else channel
+        raw = channels.get(key)
+        spec = raw if isinstance(raw, dict) else {}
+        if "max_instances" not in spec:
+            return None
+        try:
+            return max(0, int(spec.get("max_instances", 0)))
+        except (TypeError, ValueError):
+            return None
+
+    def channel_enabled(self, channel: str) -> bool:
+        features = self._features()
+        raw_channels = features.get("channels")
+        channels = raw_channels if isinstance(raw_channels, dict) else {}
+        key = "chat" if channel in ("chat", "pg") else channel
+        raw = channels.get(key)
+        spec = raw if isinstance(raw, dict) else {}
+        if key == "build":
+            return bool(spec.get("enabled", features.get("build_surface", False)))
+        return bool(spec.get("enabled", True))
+
     def _channel_max_pages(self, channel: str) -> int:
         features = self._features()
         raw_channels = features.get("channels")
@@ -283,24 +309,21 @@ class InstancePool:
         raw = channels.get(channel)
         spec = raw if isinstance(raw, dict) else {}
         try:
-            configured = max(0, int(spec.get("max_pages", 1)))
+            configured = max(0, int(spec.get("max_pages", 2)))
         except (TypeError, ValueError):
-            configured = 1
+            configured = 2
         if channel in ("chat", "build"):
-            # Every simultaneously logged-in account needs one page for the
-            # channel; page budgets are internal memory guards, not a user cap.
-            return max(configured, self._max_contexts())
+            # Page count is not an independent user budget: one channel page is
+            # one instance. Deriving it from max_instances keeps every path
+            # (startup, manual create, switch_to, 429 request acquire) bounded
+            # by the same channel cap.
+            instance_cap = self.channel_max_instances(channel)
+            return configured if instance_cap is None else max(0, instance_cap)
         return configured
 
     def _global_max_pages(self) -> int:
-        features = self._features()
-        raw = features.get("routing")
-        routing = raw if isinstance(raw, dict) else {}
-        try:
-            configured = max(1, int(routing.get("global_max_pages", 2)))
-        except (TypeError, ValueError):
-            configured = 2
-        return max(configured, self._max_contexts())
+        # Total page budget equals total instance budget: max(2, max_contexts).
+        return max(2, self._max_contexts())
 
     def _check_page_budget_locked(
         self,

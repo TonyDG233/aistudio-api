@@ -53,7 +53,7 @@ def test_flag_on_tier_free_routes_build(
     assert _resolve_surface("models/gemini-3.8-flash") == "build"
 
 
-def test_flag_on_tier_pro_routes_chat(
+def test_flag_on_tier_pro_prefers_build(
     monkeypatch: pytest.MonkeyPatch, no_override: None
 ) -> None:
     monkeypatch.setattr(
@@ -68,4 +68,4 @@ def test_flag_on_tier_pro_routes_chat(
     monkeypatch.setattr(
         account_store_mod.AccountStore, "get_active_account", lambda self: _Acc()
     )
-    assert _resolve_surface("models/gemini-3.8-flash") == "chat"
+    assert _resolve_surface("models/gemini-3.8-flash") == "build"

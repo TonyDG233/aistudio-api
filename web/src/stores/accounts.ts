@@ -111,6 +111,39 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  async function deleteAccounts(ids: string[]) {
+    const toast = useToastStore()
+    if (!ids.length) return
+    try {
+      const res = await accountsApi.batchDelete(ids)
+      toast.success(`已删除 ${res.deleted} 个账号`)
+      await fetchAll()
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '批量删除失败'
+      toast.error(msg)
+    }
+  }
+
+  async function refreshAccountsByIds(ids: string[]) {
+    const toast = useToastStore()
+    if (!ids.length) return
+    refreshingAll.value = true
+    try {
+      const res = await accountsApi.refreshAccounts({
+        account_ids: ids,
+        refresh_email: true,
+      })
+      toast.success(summarizeRefresh(res))
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      reportRefreshError(err, '批量刷新账号信息失败')
+      return null
+    } finally {
+      refreshingAll.value = false
+    }
+  }
+
   async function deleteCookieGroup(cookieId: string) {
     const toast = useToastStore()
     try {
@@ -123,16 +156,20 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  async function updateAccountName(id: string, name: string) {
+  async function updateAccountProfile(id: string, name: string, tags?: string[]) {
     const toast = useToastStore()
     try {
-      await accountsApi.update(id, name)
-      toast.success('账号名称已更新')
+      await accountsApi.update(id, name, tags)
+      toast.success('账号信息已更新')
       await fetchAll()
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '更新失败'
       toast.error(msg)
     }
+  }
+
+  async function updateAccountName(id: string, name: string) {
+    await updateAccountProfile(id, name)
   }
 
   async function importCookies(payload: ImportCookiesRequest) {
@@ -322,6 +359,7 @@ export const useAccountsStore = defineStore('accounts', () => {
       surfaces,
       weight: current.weight ?? 1,
       model_surfaces: current.model_surfaces ?? {},
+      quota_pools: current.quota_pools ?? [],
     })
     routingByAccount.value = { ...routingByAccount.value, [id]: updated }
     const errors = { ...routingErrors.value }
@@ -334,7 +372,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     await accountsApi.clearRouting(id)
     routingByAccount.value = {
       ...routingByAccount.value,
-      [id]: { surfaces: [], weight: 1, model_surfaces: {} },
+      [id]: { surfaces: [], weight: 1, model_surfaces: {}, quota_pools: [] },
     }
   }
 
@@ -421,8 +459,11 @@ export const useAccountsStore = defineStore('accounts', () => {
     fetchAll,
     activateAccount,
     deleteAccount,
+    deleteAccounts,
+    refreshAccountsByIds,
     deleteCookieGroup,
     updateAccountName,
+    updateAccountProfile,
     importCookies,
     probeAndImport,
     importBundle,

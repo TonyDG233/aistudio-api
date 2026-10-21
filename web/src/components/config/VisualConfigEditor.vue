@@ -505,26 +505,34 @@ onBeforeRouteLeave((_to, _from, next) => {
       <div class="border-t border-gray-100 bg-gray-50/50 p-4 sm:p-6 space-y-5">
         <!-- Mode 1: Visual Form Editor -->
         <template v-if="activeTab === 'visual'">
-          <!-- 账号会话上限置顶：默认单账号，不受深度模式开关影响 -->
-          <InstanceLimitCard
-            :routing="featuresConfig.routing || {}"
-            @update:routing="updateRouting"
-          />
+          <section class="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-gray-100">
+              <h3 class="font-bold text-gray-900 text-sm">
+                运行与路由
+              </h3>
+              <p class="text-[11px] text-gray-400 mt-0.5">
+                基础功能、渠道与路由安全。实例 = 账号 + 渠道；页面预算由实例数派生。
+              </p>
+            </div>
 
-          <!-- 运行与调度 + 基础功能开关 -->
-          <FeaturesCard
-            :features="featuresConfig"
-            @update:features="updateFeatures"
-          />
-
-          <!-- 页面中间层：日志 / 接入密钥（由 SettingsView 注入） -->
-          <slot name="after-basic" />
-
-          <!-- 深度区：模型规则与安全之上 -->
-          <AdvancedZone
-            :features="featuresConfig"
-            @update:features="updateFeatures"
-          />
+            <div class="p-4 sm:p-6 space-y-5">
+              <div class="text-[11px] font-semibold uppercase tracking-wider text-gray-400">
+                基础功能
+              </div>
+              <InstanceLimitCard
+                :routing="featuresConfig.routing || {}"
+                @update:routing="updateRouting"
+              />
+              <FeaturesCard
+                :features="featuresConfig"
+                @update:features="updateFeatures"
+              />
+              <AdvancedZone
+                :features="featuresConfig"
+                @update:features="updateFeatures"
+              />
+            </div>
+          </section>
 
           <!-- 模型规则与安全 -->
           <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-5">
@@ -614,7 +622,6 @@ onBeforeRouteLeave((_to, _from, next) => {
 
         <!-- Mode 2: Raw YAML Code Editor -->
         <template v-else>
-          <slot name="after-basic" />
           <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-2">
             <div class="flex items-center justify-between text-xs text-gray-400 font-mono">
               <span>config.yaml 直接编辑</span>

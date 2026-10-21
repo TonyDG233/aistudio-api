@@ -418,8 +418,8 @@ async def test_rebind_to_build_reserves_page_while_surface_loads(
         features={
             "routing": {"max_contexts": 2, "global_max_pages": 2},
             "channels": {
-                "chat": {"enabled": True, "max_pages": 2},
-                "build": {"enabled": True, "max_pages": 1},
+                "chat": {"enabled": True, "max_pages": 1, "max_instances": 2},
+                "build": {"enabled": True, "max_pages": 1, "max_instances": 2},
             },
         },
     )
@@ -586,8 +586,8 @@ async def test_channel_page_budget_scales_with_instance_capacity() -> None:
         features={
             "routing": {"max_contexts": 2, "global_max_pages": 4},
             "channels": {
-                "chat": {"enabled": True, "max_pages": 1},
-                "build": {"enabled": True, "max_pages": 1},
+                "chat": {"enabled": True, "max_pages": 1, "max_instances": 2},
+                "build": {"enabled": True, "max_pages": 1, "max_instances": 2},
             },
         },
     )
@@ -599,6 +599,27 @@ async def test_channel_page_budget_scales_with_instance_capacity() -> None:
     assert channel_budget["chat"] == 2
     await pool.release(first)
     await pool.release(second)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_instance_cap_blocks_second_page_for_429_acquire() -> None:
+    cdp = FakeCDP()
+    pool = _pool(
+        cdp,
+        features={
+            "routing": {"max_contexts": 3, "global_max_pages": 3},
+            "channels": {
+                "chat": {"enabled": True, "max_pages": 1, "max_instances": 1},
+                "build": {"enabled": True, "max_pages": 1, "max_instances": 1},
+            },
+        },
+    )
+    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
+    assert pool.page_counts().get("chat") == 1
+    await pool.release(first)
     await pool.close()
 
 

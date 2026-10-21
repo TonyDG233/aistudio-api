@@ -27,6 +27,8 @@ const props = defineProps<{
   ordinals?: Record<string, number>
   closingInstanceId?: string | null
   refreshing?: boolean
+  selectable?: boolean
+  selected?: boolean
   capacityFull?: boolean
   creating?: boolean
 }>()
@@ -38,6 +40,7 @@ const emit = defineEmits<{
   remove: []
   clearCooldown: []
   switch: [id: string]
+  toggleSelect: []
   activate: []
 }>()
 
@@ -79,6 +82,18 @@ const detailText = computed(() => {
   <article class="px-4 py-4 sm:px-5 sm:py-5">
     <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
       <div class="flex items-start gap-3 min-w-0">
+        <label
+          v-if="selectable"
+          class="shrink-0 flex items-center pt-2.5 cursor-pointer"
+          @click.stop
+        >
+          <input
+            type="checkbox"
+            :checked="selected"
+            class="w-3.5 h-3.5 rounded border-gray-300 text-brand-600 focus:ring-brand-500 cursor-pointer"
+            @change="emit('toggleSelect')"
+          >
+        </label>
         <div class="shrink-0 w-9 h-9 rounded-xl border border-gray-200 bg-gray-50 flex items-center justify-center">
           <span class="text-[10px] font-mono font-bold text-gray-500">u/{{ account.auth_user || '0' }}</span>
         </div>

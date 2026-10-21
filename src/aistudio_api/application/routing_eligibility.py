@@ -2,16 +2,16 @@
 
 This module answers one question without touching the browser or the request
 pipeline: given an account, a channel and a model, may this account serve the
-request, and under which group/quota-pool constraints?
+request, and under which group/tag constraints?
 
 Design rules (see ``docs/dev/WP5-V3-DESIGN-20261019.md``):
 
 - Groups are *per-account* constraint layers, never a request-level singleton.
-- A channel's ``quota_pool`` is a capability gate, not a model list.
-- Account-level routing and group quota pools only narrow the tier-derived pool.
-- Pro-only models require a paid account independently of the quota pool.
-- Bare-model channel selection uses candidate previews, but never switches the
-  channel after a request is pinned.
+- A channel's ``allowed_tags`` is an admission gate, not a model list.
+- Account tags and group surfaces only narrow the tier-derived capability.
+- Pro-only models require a paid account independently of tags.
+- Candidate ordering lives in ``routing_selection``; switch-specific planning
+  lives in ``instance_switch``; capacity lives in the instance pool/manager.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from aistudio_api.application.channel_registry import (
     normalize_channel,
     select_channel,
 )
+from aistudio_api.application.routing_selection import rank_eligible
 from aistudio_api.application.surface_orchestrator import (
     GroupPolicy,
     SurfacePolicyError,
@@ -41,6 +42,7 @@ from aistudio_api.application.surface_orchestrator import (
     model_requires_paid_account,
     select_group,
 )
+from aistudio_api.domain.account_tags import account_tags, tag_matches
 
 _QUOTA_POOLS = frozenset({"free", "pro", "official"})
 
@@ -55,17 +57,23 @@ class AccountView:
     expired: bool
     routing: AccountRouting
     name: str = ""
+    tags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tags", tuple(account_tags(self.tags, self.tier)))
 
     @classmethod
     def from_account(cls, account: object) -> AccountView:
         raw_routing = getattr(account, "routing", None)
+        tier = getattr(account, "tier", None)
         return cls(
             account_id=str(getattr(account, "id", "") or ""),
-            tier=getattr(account, "tier", None),
+            tier=tier,
             email=getattr(account, "email", None),
             expired=bool(getattr(account, "expired", False)),
             routing=normalize_account_routing(raw_routing),
             name=str(getattr(account, "name", "") or ""),
+            tags=tuple(account_tags(getattr(account, "tags", []), tier)),
         )
 
 
@@ -137,18 +145,9 @@ def resolve_account_group(
     """
     registry = build_registry(features)
     build_enabled = registry["build"].enabled
-    has_groups = isinstance(groups, (list, tuple)) and any(
-        isinstance(group, Mapping) for group in groups
-    )
     route_by_tier = bool(features.get("route_by_tier", False))
-    if has_groups:
-        return select_group(
-            tier,
-            email,
-            groups,
-            route_by_tier=True,
-            build_enabled=build_enabled,
-        )
+    if not bool(features.get("groups_enabled", True)):
+        groups = []
     return select_group(
         tier,
         email,
@@ -160,24 +159,6 @@ def resolve_account_group(
 
 def _group_surface_allows(group: GroupPolicy, channel: str) -> bool:
     return channel in group.allowed_surfaces
-
-
-def _quota_pool_allows(
-    spec: ChannelSpec,
-    group: GroupPolicy,
-    account_pools: tuple[str, ...],
-) -> bool:
-    """Evaluate channel/group/account quota-pool intersection."""
-    if spec.quota_pool is not None:
-        if spec.quota_pool not in account_pools:
-            return False
-        return not (
-            group.allowed_quota_pools
-            and spec.quota_pool not in group.allowed_quota_pools
-        )
-    if group.allowed_quota_pools:
-        return bool(set(group.allowed_quota_pools) & set(account_pools))
-    return bool(account_pools)
 
 
 def eligible_account(
@@ -213,10 +194,10 @@ def eligible_account(
     if canonical not in narrowed:
         return None
 
-    pools = effective_account_pools(account.tier, account.routing)
-    if not _quota_pool_allows(spec, group, pools):
+    if not tag_matches(spec.allowed_tags, account.tags):
         return None
 
+    pools = effective_account_pools(account.tier, account.routing)
     return EligibleAccount(
         account=account,
         group=group,
@@ -248,15 +229,7 @@ def eligible_accounts(
         )
         if candidate is not None:
             result.append(candidate)
-    result.sort(
-        key=lambda item: (
-            item.affinity,
-            -item.group.weight,
-            -item.account.routing.weight,
-            item.account.account_id,
-        )
-    )
-    return result
+    return rank_eligible(result)
 
 
 def _no_capable_account(
@@ -271,8 +244,8 @@ def _no_capable_account(
             "本次请求不静默换渠道或降级。"
         ),
         advice=(
-            "请检查账号 tier/额度池、组 allowed_surfaces/allowed_quota_pools、"
-            "渠道的 enabled/quota_pool，或为请求显式指定可用渠道前缀。"
+            "请检查账号 tier/tag、组 allowed_surfaces、"
+            "渠道的 enabled/allowed_tags，或为请求显式指定可用渠道前缀。"
         ),
     )
 

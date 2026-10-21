@@ -342,10 +342,97 @@ def build_google_cookie_list(
     return cookies
 
 
+def parse_storage_state(raw: object) -> dict[str, object] | None:
+    """识别 Playwright storage-state（cookies 数组带 domain），原样保留跨域值。
+
+    普通 ``name=value`` 文本/数组会被压平成单域字典，导致同名 cookie 的
+    ``accounts.google.com`` 值覆盖 ``.google.com`` 值，Google RPC 会 401。
+    """
+    obj: object = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text.startswith(("{", "[")):
+            return None
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return None
+
+    origins: object = []
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict) and isinstance(obj.get("cookies"), list):
+        items = obj["cookies"]
+        origins = obj.get("origins") or []
+    else:
+        return None
+    if not any(isinstance(item, dict) and item.get("domain") for item in items):
+        return None
+
+    now = time.time()
+    cleaned: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = item.get("value")
+        if not name or value is None:
+            continue
+        domain = str(item.get("domain") or "").lower()
+        if not (domain == "google.com" or domain.endswith(".google.com")):
+            continue
+        expires = item.get("expires")
+        if isinstance(expires, (int, float)) and 0 < expires < now:
+            continue
+        path = str(item.get("path") or "/")
+        key = (name, domain, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(
+            {
+                "name": name,
+                "value": str(value),
+                "domain": domain,
+                "path": path,
+                "expires": expires if isinstance(expires, (int, float)) else -1,
+                "httpOnly": bool(item.get("httpOnly", False)),
+                "secure": bool(item.get("secure", True)),
+                "sameSite": str(item.get("sameSite") or "None"),
+            }
+        )
+    if not cleaned:
+        return None
+    return {"cookies": cleaned, "origins": origins}
+
+
+_GOOGLE_RPC_DOMAINS = {"google.com", ".google.com"}
+
+
+def cookies_for_google_rpc(raw: object) -> dict[str, str]:
+    """取对 ``clients6.google.com`` 有效的 cookie（只认 google.com/.google.com）。"""
+    state = parse_storage_state(raw)
+    if state is not None:
+        cookies = state.get("cookies")
+        if not isinstance(cookies, list):
+            return {}
+        return {
+            str(cookie["name"]): str(cookie["value"])
+            for cookie in cookies
+            if isinstance(cookie, dict)
+            and str(cookie.get("domain") or "").lower() in _GOOGLE_RPC_DOMAINS
+        }
+    return parse_raw_cookies(raw)
+
+
 def parse_cookie_string(
     raw: object, *, discard_transient: bool = True
 ) -> dict[str, object]:
     """将任意格式 cookie 解析为 storage state dict，包含 cookies 和 origins 字段。"""
+    state = parse_storage_state(raw)
+    if state is not None:
+        return state
     cookie_dict = parse_raw_cookies(raw)
     return {
         "cookies": build_google_cookie_list(
@@ -385,7 +472,7 @@ async def probe_account_emails_map(
         raw_or_dict
         if isinstance(raw_or_dict, dict)
         and all(isinstance(v, str) for v in raw_or_dict.values())
-        else parse_raw_cookies(raw_or_dict)
+        else cookies_for_google_rpc(raw_or_dict)
     )
     if not cookie_dict:
         return {}
@@ -448,7 +535,7 @@ async def probe_account_benefit_tier(
         raw_or_dict
         if isinstance(raw_or_dict, dict)
         and all(isinstance(v, str) for v in raw_or_dict.values())
-        else parse_raw_cookies(raw_or_dict)
+        else cookies_for_google_rpc(raw_or_dict)
     )
     if not cookie_dict:
         return "Free"
@@ -495,7 +582,7 @@ async def probe_google_accounts_infinite(
     Returns:
         有效账号列表，例如 [{"auth_user": "0", "status_code": 200, "name": "Google Account (u/0)"}, ...]
     """
-    cookie_dict = parse_raw_cookies(raw_or_dict)
+    cookie_dict = cookies_for_google_rpc(raw_or_dict)
     if not cookie_dict:
         return []
 

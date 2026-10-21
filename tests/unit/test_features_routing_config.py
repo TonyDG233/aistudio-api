@@ -30,21 +30,21 @@ def test_channels_routing_defaults(tmp_path: Path) -> None:
         "chat": {
             "enabled": True,
             "max_instances": 2,
-            "max_pages": 1,
-            "quota_pool": None,
+            "max_pages": 2,
+            "allowed_tags": [],
         },
         "build": {
             "enabled": False,
             "max_instances": 2,
-            "max_pages": 1,
-            "quota_pool": None,
+            "max_pages": 2,
+            "allowed_tags": [],
             "app_url": "",
         },
         "official": {
             "enabled": False,
             "max_instances": 0,
             "max_pages": 0,
-            "quota_pool": None,
+            "allowed_tags": [],
         },
     }
     assert features["routing"] == {
@@ -89,7 +89,7 @@ features:
         "enabled": False,
         "max_instances": 4,
         "max_pages": 4,
-        "quota_pool": None,
+        "allowed_tags": [],
         "app_url": "",
     }
     assert features["build_surface"] is False
@@ -112,13 +112,13 @@ features:
         "enabled": False,
         "max_instances": 5,
         "max_pages": 5,
-        "quota_pool": None,
+        "allowed_tags": [],
     }
     assert channels["official"] == {
         "enabled": False,
         "max_instances": 0,
         "max_pages": 0,
-        "quota_pool": None,
+        "allowed_tags": [],
     }
     assert "bogus" not in channels
 

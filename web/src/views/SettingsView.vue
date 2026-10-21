@@ -192,20 +192,21 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- Unified YAML config editor: basic features + logs/keys + deep zone + model rules -->
+      <!-- Independent runtime controls: logging and API keys are not config.yaml -->
+      <div class="space-y-5">
+        <LogConfigCard
+          :initial-config="config"
+          @saved="loadConfig"
+        />
+        <ApiKeyManagerCard />
+      </div>
+
+      <!-- Unified YAML config editor: runtime routing + deep zone + model rules -->
       <VisualConfigEditor
         :initial-yaml="config.yaml_content"
         @saved="loadConfig"
         @update:dirty="hasUnsavedChanges = $event"
-      >
-        <template #after-basic>
-          <LogConfigCard
-            :initial-config="config"
-            @saved="loadConfig"
-          />
-          <ApiKeyManagerCard />
-        </template>
-      </VisualConfigEditor>
+      />
     </template>
   </div>
 </template>

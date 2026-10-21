@@ -4,6 +4,7 @@ import pytest
 
 from aistudio_api.infrastructure.account.cookie_parser import (
     build_google_cookie_list,
+    cookies_for_google_rpc,
     parse_cookie_string,
 )
 from aistudio_api.infrastructure.account.cookie_refresher import (
@@ -77,7 +78,7 @@ def test_load_cookies_from_string_keeps_accounts_cookies_from_raw_string(monkeyp
     assert "__Host-1PLSID" not in by_name
 
 
-def test_parse_cookie_string_prefers_canonical_google_domains():
+def test_parse_cookie_string_preserves_cross_domain_google_cookies():
     raw = json.dumps(
         {
             "cookies": [
@@ -101,14 +102,65 @@ def test_parse_cookie_string_prefers_canonical_google_domains():
     state = parse_cookie_string(raw, discard_transient=False)
     cookies = state.get("cookies")
     assert isinstance(cookies, list)
-    by_name = {cookie["name"]: cookie for cookie in cookies if isinstance(cookie, dict)}
+    entries = [cookie for cookie in cookies if isinstance(cookie, dict)]
 
-    assert by_name["SID"]["value"] == "sid_canonical"
-    assert by_name["SID"]["domain"] == ".google.com"
-    assert by_name["OSID"]["value"] == "osid_studio"
-    assert by_name["OSID"]["domain"] == "aistudio.google.com"
-    assert by_name["LSID"]["value"] == "lsid_accounts"
-    assert by_name["LSID"]["domain"] == "accounts.google.com"
+    assert {cookie["domain"] for cookie in entries} == {
+        ".google.com",
+        "aistudio.google.com",
+        "accounts.google.com",
+    }
+    osid = [cookie for cookie in entries if cookie["name"] == "OSID"]
+    assert {cookie["value"] for cookie in osid} == {"osid_studio", "osid_regional"}
+    assert {cookie["domain"] for cookie in osid} == {
+        "aistudio.google.com",
+        ".google.com",
+    }
+    lsid = [cookie for cookie in entries if cookie["name"] == "LSID"]
+    assert {cookie["domain"] for cookie in lsid} == {"accounts.google.com"}
+
+    rpc = cookies_for_google_rpc(state)
+    assert rpc["SID"] == "sid_canonical"
+    assert rpc["OSID"] == "osid_regional"
+    # accounts.google.com does not apply to clients6.google.com.
+    assert "LSID" not in rpc
+    assert "sid_regional" not in rpc.values()
+    assert "lsid_regional" not in rpc.values()
+
+
+def test_cookie_injection_preserves_storage_state_domains():
+    raw = json.dumps(
+        {
+            "cookies": [
+                {"name": "SID", "value": "sid", "domain": ".google.com", "path": "/"},
+                {
+                    "name": "OSID",
+                    "value": "osid_studio",
+                    "domain": "aistudio.google.com",
+                    "path": "/",
+                },
+                {
+                    "name": "OSID",
+                    "value": "osid_root",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+                {
+                    "name": "LSID",
+                    "value": "lsid",
+                    "domain": "accounts.google.com",
+                    "path": "/",
+                },
+            ]
+        }
+    )
+    cookies = load_cookies_from_string(raw)
+    assert {cookie["domain"] for cookie in cookies} == {
+        ".google.com",
+        "aistudio.google.com",
+        "accounts.google.com",
+    }
+    osid = [cookie for cookie in cookies if cookie["name"] == "OSID"]
+    assert {cookie["value"] for cookie in osid} == {"osid_studio", "osid_root"}
 
 
 def test_parse_raw_cookies_json_array_and_netscape():

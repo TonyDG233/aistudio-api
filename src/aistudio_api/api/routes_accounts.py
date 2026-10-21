@@ -61,6 +61,7 @@ class AccountResponse(BaseModel):
     tier: str | None = None
     expired: bool = False
     duplicate_of: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -80,11 +81,13 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         tier=getattr(account, "tier", None),
         expired=bool(getattr(account, "expired", False)),
         duplicate_of=getattr(account, "duplicate_of", None),
+        tags=list(getattr(account, "tags", []) or []),
     )
 
 
 class UpdateAccountRequest(BaseModel):
     name: str
+    tags: list[str] | None = None
 
 
 class ImportCookiesRequest(BaseModel):
@@ -135,6 +138,14 @@ class ImportBundleResponse(BaseModel):
     accounts: list[AccountResponse]
 
 
+class BatchDeleteRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
+class BatchDeleteResponse(BaseModel):
+    deleted: int
+
+
 class RefreshAccountsRequest(BaseModel):
     account_ids: list[str] | None = None
     all: bool = False
@@ -176,6 +187,14 @@ async def get_active_account(
     if account is None:
         raise HTTPException(status_code=404, detail="没有活跃账号")
     return to_account_response(account)
+
+
+@router.get("/tags", response_model=list[str])
+async def list_account_tags(
+    account_service: AccountService = Depends(get_account_service),
+) -> list[str]:
+    """账号 tag 目录：自定义 tag + tier 自动 tag。"""
+    return account_service.list_tags()
 
 
 @router.post("/refresh", response_model=RefreshAccountsResponse)
@@ -415,12 +434,14 @@ class AccountRoutingUpdate(BaseModel):
     surfaces: list[str] | None = None
     weight: float | None = None
     model_surfaces: dict[str, str] | None = None
+    quota_pools: list[str] | None = None
 
 
 class AccountRoutingResponse(BaseModel):
     surfaces: list[str] = Field(default_factory=list)
     weight: float = 1.0
     model_surfaces: dict[str, str] = Field(default_factory=dict)
+    quota_pools: list[str] = Field(default_factory=list)
 
 
 @router.get("/{account_id}/routing", response_model=AccountRoutingResponse)
@@ -503,6 +524,44 @@ async def delete_account(
     return {"ok": True}
 
 
+@router.post("/batch-delete", response_model=BatchDeleteResponse)
+async def batch_delete_accounts(
+    req: BatchDeleteRequest,
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> BatchDeleteResponse:
+    """批量删除账号（用于清理重复项）。"""
+    active_account = account_service.get_active_account()
+    active_id = active_account.id if active_account is not None else None
+
+    deleted_ids: list[str] = []
+    for account_id in dict.fromkeys(req.ids):
+        if not account_service.delete_account(account_id):
+            continue
+        deleted_ids.append(account_id)
+        if runtime_state.rotator:
+            runtime_state.rotator.remove_account(account_id)
+
+    if active_id is not None and active_id in deleted_ids:
+        remaining_accounts = account_service.list_accounts()
+        new_active = remaining_accounts[0] if remaining_accounts else None
+        browser_session = (
+            runtime_state.client._session if runtime_state.client else None
+        )
+        if new_active is not None:
+            account_service.set_active_account(new_active.id)
+            if browser_session is not None:
+                new_auth_path = account_service.get_account_auth_path(new_active.id)
+                await browser_session.switch_auth(
+                    str(new_auth_path) if new_auth_path else None
+                )
+        elif browser_session is not None:
+            await browser_session.switch_auth(None)
+
+    log.info("批量删除账号: %d 个", len(deleted_ids))
+    return BatchDeleteResponse(deleted=len(deleted_ids))
+
+
 @router.delete("/group/{cookie_id}")
 async def delete_cookie_group(
     cookie_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
@@ -554,8 +613,8 @@ async def update_account(
     req: UpdateAccountRequest = Body(...),
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
-    """更新账号名称。"""
-    account = account_service.update_account(account_id, req.name)
+    """更新账号名称与自定义 tag。"""
+    account = account_service.update_account(account_id, req.name, req.tags)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     log.info("账号已更新: %s -> %s", account.id, req.name)

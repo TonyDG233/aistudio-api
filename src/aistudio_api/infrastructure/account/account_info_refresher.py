@@ -57,7 +57,6 @@ DEFAULT_APP_ID = "3b85b4ed-f945-422c-ba25-395d1feef528"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
-_GOOGLE_DOMAIN_RE = re.compile(r"(^|\.)google\.com$", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _STRICT_EMAIL_RE = re.compile(
     r'"oPEP7c":"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"'
@@ -424,8 +423,10 @@ class AccountInfoRefresher:
             for cookie in raw_cookies:
                 if not isinstance(cookie, dict):
                     continue
-                domain = str(cookie.get("domain") or "")
-                if not _GOOGLE_DOMAIN_RE.search(domain):
+                domain = str(cookie.get("domain") or "").lower()
+                # clients6.google.com 只接受 google.com/.google.com 的 cookie；
+                # accounts.google.com 等同名值覆盖会导致 401。
+                if domain not in ("google.com", ".google.com"):
                     continue
                 expires = cookie.get("expires")
                 if isinstance(expires, (int, float)) and 0 < expires < now:

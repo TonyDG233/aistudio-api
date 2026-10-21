@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from aistudio_api.config import resolve_config_file
+from aistudio_api.domain.account_tags import normalize_tags
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
@@ -575,13 +576,14 @@ _CHANNEL_ALIASES = {
 }
 _DEFAULT_CHANNEL_MAX_INSTANCES = 2
 _MAX_CHANNEL_MAX_INSTANCES = 16
-_DEFAULT_CHANNEL_MAX_PAGES = {"chat": 1, "build": 1, "official": 0}
+_DEFAULT_CHANNEL_MAX_PAGES = {"chat": 2, "build": 2, "official": 0}
 _DEFAULT_GLOBAL_MAX_PAGES = 2
 _DEFAULT_MAX_CONTEXTS = 1
 
 _FEATURES_DEFAULTS: dict[str, object] = {
     "build_surface": False,
     "route_by_tier": False,
+    "groups_enabled": False,
     "account_refresh_concurrency": 3,
     "auto_switch": False,
     "auto_switch_interval_hours": 3.0,
@@ -810,40 +812,40 @@ def _normalize_channels(
     )
     chat_raw = by_channel.get("chat") or {}
     build_raw = by_channel.get("build") or {}
-    chat_max_pages = _coerce_feature_int(
-        chat_raw.get("max_pages", chat_raw.get("max_instances")),
-        _DEFAULT_CHANNEL_MAX_PAGES["chat"],
+    chat_max_instances = _coerce_feature_int(
+        chat_raw.get("max_instances"),
+        _DEFAULT_CHANNEL_MAX_INSTANCES,
         minimum=0,
         maximum=_MAX_CHANNEL_MAX_INSTANCES,
     )
-    build_max_pages = _coerce_feature_int(
-        build_raw.get("max_pages", build_raw.get("max_instances")),
-        _DEFAULT_CHANNEL_MAX_PAGES["build"],
+    build_max_instances = _coerce_feature_int(
+        build_raw.get("max_instances"),
+        _DEFAULT_CHANNEL_MAX_INSTANCES,
         minimum=0,
         maximum=_MAX_CHANNEL_MAX_INSTANCES,
     )
+    chat_max_pages = chat_max_instances
+    build_max_pages = build_max_instances
+    chat_allowed_tags = normalize_tags(chat_raw.get("allowed_tags"))
+    build_allowed_tags = normalize_tags(build_raw.get("allowed_tags"))
+    legacy_chat_pool = _coerce_feature_quota_pool(chat_raw.get("quota_pool"))
+    legacy_build_pool = _coerce_feature_quota_pool(build_raw.get("quota_pool"))
+    if not chat_allowed_tags and legacy_chat_pool:
+        chat_allowed_tags = [legacy_chat_pool]
+    if not build_allowed_tags and legacy_build_pool:
+        build_allowed_tags = [legacy_build_pool]
     return {
         "chat": {
             "enabled": _coerce_feature_bool(chat_raw.get("enabled"), True),
-            "max_instances": _coerce_feature_int(
-                chat_raw.get("max_instances"),
-                _DEFAULT_CHANNEL_MAX_INSTANCES,
-                minimum=0,
-                maximum=_MAX_CHANNEL_MAX_INSTANCES,
-            ),
+            "max_instances": chat_max_instances,
             "max_pages": chat_max_pages,
-            "quota_pool": _coerce_feature_quota_pool(chat_raw.get("quota_pool")),
+            "allowed_tags": chat_allowed_tags,
         },
         "build": {
             "enabled": build_enabled,
-            "max_instances": _coerce_feature_int(
-                build_raw.get("max_instances"),
-                _DEFAULT_CHANNEL_MAX_INSTANCES,
-                minimum=0,
-                maximum=_MAX_CHANNEL_MAX_INSTANCES,
-            ),
+            "max_instances": build_max_instances,
             "max_pages": build_max_pages,
-            "quota_pool": _coerce_feature_quota_pool(build_raw.get("quota_pool")),
+            "allowed_tags": build_allowed_tags,
             "app_url": str(build_raw.get("app_url") or "").strip(),
         },
         # WP9 前官网渠道只注册不实现：无论配置如何都保持关闭。
@@ -851,7 +853,7 @@ def _normalize_channels(
             "enabled": False,
             "max_instances": 0,
             "max_pages": 0,
-            "quota_pool": None,
+            "allowed_tags": [],
         },
     }
 
@@ -1039,6 +1041,7 @@ def _normalize_features(
     return {
         "build_surface": bool(channels["build"]["enabled"]),
         "route_by_tier": _coerce_feature_bool(raw.get("route_by_tier"), False),
+        "groups_enabled": _coerce_feature_bool(raw.get("groups_enabled"), False),
         "account_refresh_concurrency": _coerce_feature_int(
             raw.get("account_refresh_concurrency"), 3, minimum=1, maximum=16
         ),
@@ -1140,12 +1143,6 @@ def _migrate_legacy_feature_keys(features: dict[str, object]) -> dict[str, objec
         channels: dict[str, object] = {}
         for key, value in raw_channels.items():
             item = dict(value) if isinstance(value, dict) else value
-            if (
-                isinstance(item, dict)
-                and "max_pages" not in item
-                and "max_instances" in item
-            ):
-                item["max_pages"] = item["max_instances"]
             channels[key] = item
         migrated["channels"] = channels
 

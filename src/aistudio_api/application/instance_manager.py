@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -98,11 +98,13 @@ class InstanceManager:
         *,
         clock: Callable[[], float] = time.time,
         switch_account: Callable[[str], Awaitable[bool]] | None = None,
+        features_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> None:
         self._pool = pool
         self._accounts = account_store
         self._clock = clock
         self._switch_account = switch_account
+        self._features_provider = features_provider
         self._records: dict[str, _Record] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_lock = asyncio.Lock()
@@ -113,14 +115,15 @@ class InstanceManager:
     # ------------------------------------------------------------- public API
 
     async def startup(self) -> None:
-        """Start ``max_contexts`` available accounts with one default instance each.
+        """Start enabled channels within channel caps and the context limit.
 
-        An instance is one account+channel usage window. Startup creates one
-        default-channel instance per account; additional channel instances can
-        be created later, subject to ``max_instances``.
+        Account selection goes through the same eligibility graph as the request
+        path (channel registry -> account tag -> group/quota pool -> affinity).
+        There is no tier-based branch in this method.
         """
         async with self._lifecycle_lock:
             self._adopt_orphans()
+            features = self._features()
             active = self._accounts.get_active_account()
             accounts = list(self._accounts.list_accounts())
             ordered = [
@@ -132,43 +135,94 @@ class InstanceManager:
                 for account in accounts
                 if active is None or account.id != active.id
             ]
-            target_accounts = max(1, int(self._pool.max_contexts))
+            max_contexts = max(1, int(self._pool.max_contexts))
+            slots = self._startup_slots()
+            used_channels: dict[str, set[str]] = {}
             started_accounts: set[str] = set()
             log.info(
-                "[instances] startup begin max_contexts=%d accounts=%d",
-                target_accounts,
+                "[instances] startup begin max_contexts=%d slots=%s accounts=%d",
+                max_contexts,
+                slots,
                 len(ordered),
             )
-            for account in ordered:
-                if len(started_accounts) >= target_accounts:
-                    break
-                if self._has_record_for_account(account.id):
-                    continue
-                try:
-                    self._validate_account(account.id)
-                except InstanceError as exc:
-                    log.warning(
-                        "[instances] startup skip account=%s reason=%s",
-                        account.id,
-                        exc,
-                    )
-                    continue
-                record = self._new_record(
-                    account.id, InstanceState.STARTING, self._default_channel()
+            failed_accounts: set[str] = set()
+            for channel in slots:
+                ranked = self._startup_candidates(
+                    [
+                        account
+                        for account in ordered
+                        if account.id not in failed_accounts
+                    ],
+                    channel,
+                    features,
                 )
-                self._records[record.id] = record
-                if await self._start(record, account, record.channel):
-                    started_accounts.add(account.id)
-                    log.info(
-                        "[instances] startup started id=%s account=%s channel=%s",
-                        record.id,
-                        account.id,
-                        record.channel,
+                if not ranked:
+                    log.warning(
+                        "[instances] startup no eligible account channel=%s",
+                        channel,
                     )
+                    continue
+                if len(started_accounts) < max_contexts:
+                    unused = [
+                        account
+                        for account in ranked
+                        if account.id not in started_accounts
+                    ]
+                    reused = [
+                        account
+                        for account in ranked
+                        if account.id in started_accounts
+                    ]
+                    ranked = unused + reused
                 else:
+                    ranked = [
+                        account
+                        for account in ranked
+                        if account.id in started_accounts
+                    ]
+                    if not ranked:
+                        log.warning(
+                            "[instances] startup context limit reached channel=%s",
+                            channel,
+                        )
+                        continue
+                started = False
+                for account in ranked:
+                    if channel in used_channels.get(account.id, set()):
+                        continue
+                    try:
+                        self._validate_account(account.id)
+                    except InstanceError as exc:
+                        log.warning(
+                            "[instances] startup skip account=%s reason=%s",
+                            account.id,
+                            exc,
+                        )
+                        failed_accounts.add(account.id)
+                        continue
+                    record = self._new_record(
+                        account.id, InstanceState.STARTING, channel
+                    )
+                    self._records[record.id] = record
+                    if await self._start(record, account, channel):
+                        used_channels.setdefault(account.id, set()).add(channel)
+                        started_accounts.add(account.id)
+                        started = True
+                        log.info(
+                            "[instances] startup started id=%s account=%s channel=%s",
+                            record.id,
+                            account.id,
+                            channel,
+                        )
+                        break
                     self._records.pop(record.id, None)
                     self._repair_latest()
                     self._repair_current()
+                    failed_accounts.add(account.id)
+                if not started:
+                    log.warning(
+                        "[instances] startup could not start channel=%s", channel
+                    )
 
             if active is not None:
                 for record in self._records.values():
@@ -220,6 +274,11 @@ class InstanceManager:
             if self._occupying_count() >= self._max_instances():
                 raise InstanceCapacityExhaustedError(
                     f"实例上限已满（{self._max_instances()}），请先关闭一个实例"
+                )
+            cap = self._channel_cap(normalized)
+            if cap is not None and self._channel_count(normalized) >= cap:
+                raise InstanceCapacityExhaustedError(
+                    f"{normalized} 渠道实例已达上限（{cap}），请先关闭该渠道实例"
                 )
             await self._preflight_channel(normalized, account_id)
 
@@ -290,6 +349,12 @@ class InstanceManager:
                     raise InstanceNotReadyError("账号状态切换失败")
                 self._current_id = existing.id
                 return self._view(existing)
+
+            cap = self._channel_cap(requested)
+            if cap is not None and self._channel_count(requested) >= cap:
+                raise InstanceCapacityExhaustedError(
+                    f"{requested} 渠道实例已达上限（{cap}），请先关闭该渠道实例"
+                )
 
             old_current = self._current_id
             if self._occupying_count() >= self._max_instances():
@@ -691,6 +756,99 @@ class InstanceManager:
 
     def _max_instances(self) -> int:
         return max(2, int(self._pool.max_contexts))
+
+    def _channel_cap(self, channel: str) -> int | None:
+        getter = getattr(self._pool, "channel_max_instances", None)
+        if not callable(getter):
+            return None
+        getter_fn: Any = getter
+        result = getter_fn(channel)
+        return int(result) if result is not None else None
+
+    def _channel_enabled(self, channel: str) -> bool:
+        getter = getattr(self._pool, "channel_enabled", None)
+        if not callable(getter):
+            return True
+        return bool(getter(channel))
+
+    def _channel_count(self, channel: str) -> int:
+        return sum(
+            1
+            for record in self._records.values()
+            if record.channel == channel
+            and record.state is not InstanceState.RECLAIMING
+        )
+
+    def _startup_slots(self) -> list[str]:
+        """One slot per enabled channel, then fill up to the remaining budget."""
+        total = max(0, self._max_instances() - self._occupying_count())
+        if total == 0:
+            return []
+        enabled = [
+            channel for channel in ("chat", "build") if self._channel_enabled(channel)
+        ]
+        if not enabled:
+            return []
+        existing = {channel: self._channel_count(channel) for channel in enabled}
+        slots: list[str] = []
+        for channel in enabled:
+            if len(slots) >= total:
+                break
+            cap = self._channel_cap(channel)
+            if cap is None or existing[channel] + slots.count(channel) < cap:
+                slots.append(channel)
+        while len(slots) < total:
+            added = False
+            for channel in enabled:
+                cap = self._channel_cap(channel)
+                used = existing[channel] + slots.count(channel)
+                if cap is not None and used >= cap:
+                    continue
+                slots.append(channel)
+                added = True
+                break
+            if not added:
+                break
+        return slots[:total]
+
+    def _features(self) -> Mapping[str, object]:
+        if self._features_provider is not None:
+            return self._features_provider() or {}
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_features_config,
+        )
+
+        return get_features_config()
+
+    def _startup_candidates(
+        self,
+        accounts: list[AccountMeta],
+        channel: str,
+        features: Mapping[str, object],
+    ) -> list[AccountMeta]:
+        from aistudio_api.application.routing_eligibility import (
+            AccountView,
+            eligible_accounts,
+        )
+
+        views = [AccountView.from_account(account) for account in accounts]
+        eligible = eligible_accounts(
+            views,
+            channel,
+            "",
+            features=features,
+            groups=features.get("groups") or [],
+        )
+        by_id = {account.id: account for account in accounts}
+        order = {account.id: index for index, account in enumerate(accounts)}
+        return [
+            by_id[item.account_id]
+            for item in sorted(
+                eligible,
+                key=lambda item: (item.affinity, order.get(item.account_id, 10**9)),
+            )
+            if item.account_id in by_id
+        ]
 
     def _occupying_count(self) -> int:
         return sum(

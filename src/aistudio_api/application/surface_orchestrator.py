@@ -34,9 +34,10 @@ logger = get_logger("application.surface")
 # 未显式分组的账号按 tier 落入的自动默认组策略（PLAN WP5）。
 DEFAULT_ALLOWED_BY_TIER: dict[str, list[str]] = {
     "free": ["build"],
-    "pro": ["chat"],
-    "ultra": ["chat"],
-    "plus": ["chat"],
+    "pro": ["chat", "build"],
+    "ultra": ["chat", "build"],
+    "plus": ["chat", "build"],
+    "paid": ["chat", "build"],
 }
 # 未知/缺省 tier 的自动默认组策略。
 UNKNOWN_TIER_ALLOWED: list[str] = ["chat"]
@@ -292,30 +293,18 @@ def select_group(
 ) -> GroupPolicy:
     """Resolve the constraint group for one account.
 
-    - ``route_by_tier`` off -> implicit global group (all accounts; enabled
-      surfaces only). This reproduces the zero-config candidate pool.
-    - ``route_by_tier`` on -> first enabled, non-empty explicit group whose
-      tier/email matches; otherwise the tier default group.
-    - Disabled or empty groups are treated as non-existent and skipped.
+    Explicit groups always apply when one matches.  A matched group with no
+    usable surface is a deliberate deny: "empty allowed_surfaces" means "this
+    account has no channel", not "ignore this group".  Disabled groups are
+    skipped.  Accounts that match no explicit group always fall back to their
+    tier default, so Free stays Build-only even with the legacy
+    ``route_by_tier`` switch off.
     """
+    del route_by_tier  # legacy config key: tier default is now unconditional
     tier_norm = _normalize_tier(tier)
-    enabled_surfaces = tuple(
-        surface
-        for surface in _VALID_SURFACES
-        if _surface_available(surface, build_enabled)
+    tier_allowed = set(
+        DEFAULT_ALLOWED_BY_TIER.get(tier_norm or "", UNKNOWN_TIER_ALLOWED)
     )
-    if not route_by_tier:
-        return GroupPolicy(
-            name=None,
-            source="implicit-global",
-            allowed_surfaces=enabled_surfaces,
-            max_pages=MAX_PAGES_DEFAULT,
-            weight=1.0,
-            enabled=True,
-            allowed_quota_pools=(),
-            tier_key=None,
-        )
-
     if isinstance(groups, (list, tuple)):
         for group in groups:
             if not isinstance(group, dict):
@@ -328,11 +317,9 @@ def select_group(
                 surface
                 for surface in _as_str_list(group.get("allowed_surfaces"))
                 if surface in _VALID_SURFACES
+                and surface in tier_allowed
                 and _surface_available(surface, build_enabled)
             )
-            if not allowed:
-                # 空组/停用组视同不存在：继续尝试后续分组或 tier 自动组。
-                continue
             return GroupPolicy(
                 name=str(group.get("name") or "unnamed"),
                 source="explicit",
@@ -472,63 +459,35 @@ def resolve_surface(
         _log_decision(model_path, tier_norm, email, decision)
         return decision
 
-    build_enabled = bool(features.get("build_surface"))
+    from aistudio_api.application.channel_registry import build_registry
+
+    build_enabled = build_registry(features)["build"].enabled
     route_by_tier = bool(features.get("route_by_tier"))
     groups = features.get("groups") or []
+    if not bool(features.get("groups_enabled", True)):
+        groups = []
 
-    if not route_by_tier:
-        surface = "build" if (build_enabled and tier_norm == "free") else "chat"
-        default_allowed = ("build",) if build_enabled else ("chat",)
-        if is_chat_only_model(model_path):
-            # chat-only 模型（argon/Pro 系）在旧路由下也强制 chat，不派发到 build。
-            surface = "chat"
-            default_allowed = ("chat",)
-        decision = SurfaceDecision(
-            surface=surface,
-            group_name=None,
-            group_source="default-tier",
-            allowed=default_allowed,
-            reason=(
-                "route_by_tier=false 沿用旧行为: "
-                f"build_surface={build_enabled}, tier={tier_norm or 'unknown'} "
-                f"-> {surface}"
-            ),
-        )
-        _log_decision(model_path, tier_norm, email, decision)
-        return decision
+    policy = select_group(
+        tier_norm,
+        email,
+        groups,
+        route_by_tier=route_by_tier,
+        build_enabled=build_enabled,
+    )
+    allowed = list(policy.allowed_surfaces)
+    group_name = policy.name or policy.tier_key
+    group_source = policy.source
 
-    group = match_group(tier_norm, email, groups)
-    if group is not None:
-        group_name: str | None = str(group.get("name") or "unnamed")
-        group_source = "explicit"
-        raw_allowed = _as_str_list(group.get("allowed_surfaces"))
-    else:
-        group_name = None
-        group_source = "default-tier"
-        raw_allowed = list(
-            DEFAULT_ALLOWED_BY_TIER.get(tier_norm or "", UNKNOWN_TIER_ALLOWED)
-        )
-
-    allowed: list[str] = []
-    for raw_surface in raw_allowed:
-        surface_norm = raw_surface.strip().lower()
-        if surface_norm not in _VALID_SURFACES:
-            continue
-        if not _surface_available(surface_norm, build_enabled):
-            continue
-        if surface_norm not in allowed:
-            allowed.append(surface_norm)
-
-    if not allowed:
+    if not policy.enabled or not allowed:
         raise _deny(
             "surface_group_disabled",
             message=(
-                f"分组 '{group_name or tier_norm or 'unknown'}' 无可用面 "
-                f"(allowed_surfaces={raw_allowed or []}, build_surface={build_enabled})。"
+                f"分组 '{group_name or 'unknown'}' 无可用面 "
+                f"(allowed_surfaces={allowed or []}, build_enabled={build_enabled})。"
             ),
             advice=(
-                "请在该分组 allowed_surfaces 中至少保留 chat，或开启 "
-                "features.build_surface 以启用 build 面；本次请求不换面、不换账号。"
+                "该组已启用但 allowed_surfaces 为空，按配置语义该账号被排除；"
+                "请在该组中至少启用一个渠道，或关闭该组。本次请求不换面、不换账号。"
             ),
         )
 

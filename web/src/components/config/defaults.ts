@@ -9,7 +9,6 @@ const DEFAULT_CONFIG = (YAML.parse(rawDefaults) || {}) as Record<string, unknown
 
 const PATH_ALIASES: Record<string, string> = {
   'features.channels.enabled': 'features.channels.chat.enabled',
-  'features.channels.quota_pool': 'features.channels.chat.quota_pool',
 }
 
 function pick(path: string): unknown {

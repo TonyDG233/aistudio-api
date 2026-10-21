@@ -288,8 +288,8 @@ function isEnabled(group: AccountGroupItem): boolean {
               </label>
               <FieldHelpTip
                 title="允许的渠道"
-                content="组可使用的渠道子集。空 = 该组被禁用，调度层直接排除。"
-                explanation="渠道注册表决定能力，策略组只能在能力范围内收窄。"
+                content="组可使用的渠道子集。启用但留空 = 命中该组的账号没有可用渠道，直接拒绝，不会回落。"
+                explanation="渠道注册表决定能力，策略组只能在能力范围内收窄；账号标签留空=不限，这里留空=拒绝。"
               />
             </div>
             <div class="flex flex-wrap items-center gap-3">
@@ -311,7 +311,7 @@ function isEnabled(group: AccountGroupItem): boolean {
               v-if="!(group.allowed_surfaces || []).length"
               class="text-[11px] text-amber-600"
             >
-              该组被禁用，调度层直接排除。
+              该组已启用但未选渠道：命中即拒绝，不会回落到默认组。
             </p>
           </div>
 
@@ -323,7 +323,7 @@ function isEnabled(group: AccountGroupItem): boolean {
               <FieldHelpTip
                 title="允许的额度池"
                 content="组可使用的额度池子集：free / pro。留空 = 不限制 (any)。"
-                explanation="额度池是账号凭证属性，不是模型名；pro 凭证与 pro 模型是两个概念。"
+                explanation="额度池是可选档位门槛，不是用量/配额，也不是选账号开关；与 allowed_surfaces 留空=拒绝的方向相反。"
               />
             </div>
             <div class="flex flex-wrap items-center gap-3">

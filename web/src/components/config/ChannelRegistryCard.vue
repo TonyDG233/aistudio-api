@@ -1,23 +1,31 @@
 <script setup lang="ts">
+import { computed, onMounted } from 'vue'
 import type { ChannelName, ChannelsConfig } from './types.ts'
-import { QUOTA_POOL_OPTIONS } from './schema.ts'
+import { useTagsStore } from '@/stores/tags.ts'
+import TagMultiSelect from './TagMultiSelect.vue'
 import ConfigInput from './ConfigInput.vue'
-import ConfigSelect from './ConfigSelect.vue'
 import ConfigSwitch from './ConfigSwitch.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
 import { Boxes } from 'lucide-vue-next'
 
 const props = withDefaults(defineProps<{
   channels?: ChannelsConfig
-  buildSurface?: boolean
+  flat?: boolean
 }>(), {
   channels: () => ({}),
-  buildSurface: false,
+  flat: false,
 })
 
 const emit = defineEmits<{
   'update:channels': [val: ChannelsConfig]
 }>()
+
+const tagsStore = useTagsStore()
+const tagOptions = computed(() => tagsStore.sorted)
+
+onMounted(() => {
+  void tagsStore.refresh()
+})
 
 interface ChannelRow {
   key: ChannelName
@@ -32,33 +40,33 @@ const rows: ChannelRow[] = [
   { key: 'official', label: 'Official', implemented: false, description: '官网消费者端' },
 ]
 
-const CHANNEL_DEFAULTS: Record<ChannelName, { enabled: boolean; max_pages: number }> = {
-  chat: { enabled: true, max_pages: 1 },
-  build: { enabled: false, max_pages: 1 },
-  official: { enabled: false, max_pages: 0 },
+const CHANNEL_DEFAULTS: Record<ChannelName, { enabled: boolean; max_pages: number; max_instances: number }> = {
+  chat: { enabled: true, max_pages: 2, max_instances: 2 },
+  build: { enabled: false, max_pages: 2, max_instances: 2 },
+  official: { enabled: false, max_pages: 0, max_instances: 0 },
 }
 
 function effective(key: ChannelName): {
   enabled: boolean
   max_pages: number
-  quota_pool: string | null
+  max_instances: number | null
+  allowed_tags: string[]
   app_url: string
 } {
   const configured = props.channels?.[key] || {}
   const defaults = CHANNEL_DEFAULTS[key]
   const enabled = typeof configured.enabled === 'boolean'
     ? configured.enabled
-    : key === 'build'
-      ? props.buildSurface
-      : defaults.enabled
+    : defaults.enabled
   const maxPages = typeof configured.max_pages === 'number' ? configured.max_pages : defaults.max_pages
-  const pool = configured.quota_pool === 'free' || configured.quota_pool === 'pro'
-    ? configured.quota_pool
-    : null
+  const maxInstances = typeof configured.max_instances === 'number'
+    ? configured.max_instances
+    : defaults.max_instances
   return {
     enabled,
     max_pages: maxPages,
-    quota_pool: pool,
+    max_instances: maxInstances,
+    allowed_tags: Array.isArray(configured.allowed_tags) ? configured.allowed_tags : [],
     app_url: typeof configured.app_url === 'string' ? configured.app_url : '',
   }
 }
@@ -73,11 +81,30 @@ function baseChannels(): ChannelsConfig {
 
 function commit(
   key: ChannelName,
-  patch: { enabled?: boolean; quota_pool?: string | null; app_url?: string },
+  patch: {
+    enabled?: boolean
+    max_instances?: number | null
+    allowed_tags?: string[]
+    app_url?: string
+  },
 ) {
   const base = baseChannels()
   base[key] = { ...base[key], ...patch }
   emit('update:channels', base)
+}
+
+function commitMaxInstances(key: ChannelName, value: string | number | null) {
+  const raw = String(value ?? '').trim()
+  if (!raw) {
+    commit(key, { max_instances: CHANNEL_DEFAULTS[key].max_instances })
+    return
+  }
+  const parsed = Number.parseInt(raw, 10)
+  commit(key, {
+    max_instances: Number.isFinite(parsed)
+      ? Math.min(16, Math.max(0, parsed))
+      : CHANNEL_DEFAULTS[key].max_instances,
+  })
 }
 
 function commitAppUrl(value: string | number | null) {
@@ -88,14 +115,14 @@ function commitEnabled(key: ChannelName, value: boolean) {
   commit(key, { enabled: key === 'official' ? false : value })
 }
 
-function commitPool(key: ChannelName, value: string | number | null) {
-  commit(key, { quota_pool: value === null ? null : String(value) })
+function commitTags(key: ChannelName, tags: string[]) {
+  commit(key, { allowed_tags: tags })
 }
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden">
-    <div class="px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5">
+  <div :class="flat ? 'bg-transparent' : 'bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden'">
+    <div :class="flat ? 'flex items-center gap-2.5 pb-3' : 'px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5'">
       <Boxes class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
@@ -103,12 +130,12 @@ function commitPool(key: ChannelName, value: string | number | null) {
           <FieldHelpTip schema-key="features.channels" />
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          渠道是请求能力的第一层；只决定是否参与路由与额度池，页面预算由后端内部管理。
+          渠道只决定是否参与路由；准入 tag 决定哪些账号能注册实例，实例上限决定该渠道最多几个实例。
         </p>
       </div>
     </div>
 
-    <div class="p-5">
+    <div :class="flat ? '' : 'p-5'">
       <div class="hidden md:block overflow-x-auto">
         <table class="w-full min-w-[640px] text-left text-xs">
           <thead>
@@ -120,7 +147,10 @@ function commitPool(key: ChannelName, value: string | number | null) {
                 启用
               </th>
               <th class="py-2 pr-3 font-semibold">
-                额度池
+                准入 tag
+              </th>
+              <th class="py-2 pr-3 font-semibold">
+                实例上限
               </th>
               <th class="py-2 pr-3 font-semibold">
                 实现状态
@@ -168,26 +198,34 @@ function commitPool(key: ChannelName, value: string | number | null) {
               </td>
               <td class="py-3 pr-3 align-top">
                 <div class="flex items-center gap-1">
-                  <select
-                    :value="effective(row.key).quota_pool === null ? '__null__' : effective(row.key).quota_pool"
+                  <TagMultiSelect
+                    :model-value="effective(row.key).allowed_tags"
+                    :options="tagOptions"
                     :disabled="!row.implemented"
-                    class="w-32 px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50"
-                    @change="commitPool(row.key, ($event.target as HTMLSelectElement).value === '__null__' ? null : ($event.target as HTMLSelectElement).value)"
-                  >
-                    <option value="__null__">
-                      不限制 (any)
-                    </option>
-                    <option value="free">
-                      free
-                    </option>
-                    <option value="pro">
-                      pro
-                    </option>
-                  </select>
+                    @update:model-value="commitTags(row.key, $event)"
+                  />
                   <FieldHelpTip
-                    schema-key="features.channels.quota_pool"
+                    schema-key="features.channels.allowed_tags"
                     class="shrink-0"
                   />
+                </div>
+                <div class="mt-1 text-[10px] text-gray-400 whitespace-nowrap">
+                  空=不限；tier 自动 tag 也可选
+                </div>
+              </td>
+              <td class="py-3 pr-3 align-top">
+                <input
+                  type="number"
+                  min="0"
+                  max="16"
+                  :value="effective(row.key).max_instances"
+                  :disabled="!row.implemented"
+                  placeholder="2"
+                  class="w-20 px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50"
+                  @change="commitMaxInstances(row.key, ($event.target as HTMLInputElement).value)"
+                >
+                <div class="mt-1 text-[10px] text-gray-400 whitespace-nowrap">
+                  默认 2；0=禁用
                 </div>
               </td>
               <td class="py-3 pr-3 align-top">
@@ -244,16 +282,21 @@ function commitPool(key: ChannelName, value: string | number | null) {
 
           <div class="flex items-end gap-1.5">
             <div class="flex-1">
-              <ConfigSelect
-                :model-value="effective(row.key).quota_pool"
-                label="额度池"
-                :options="QUOTA_POOL_OPTIONS"
+              <div class="mb-1 text-[11px] font-semibold text-gray-500">
+                准入 tag
+              </div>
+              <TagMultiSelect
+                :model-value="effective(row.key).allowed_tags"
+                :options="tagOptions"
                 :disabled="!row.implemented"
-                @update:model-value="commitPool(row.key, $event)"
+                @update:model-value="commitTags(row.key, $event)"
               />
+              <p class="mt-1 text-[10px] text-gray-400">
+                空=不限；tier 自动 tag 也可选
+              </p>
             </div>
             <FieldHelpTip
-              schema-key="features.channels.quota_pool"
+              schema-key="features.channels.allowed_tags"
               class="mb-2 shrink-0"
             />
           </div>

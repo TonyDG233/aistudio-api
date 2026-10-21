@@ -34,23 +34,31 @@ function budgetValue(value: string | number | null, fallback: number, minimum = 
 }
 
 function updateGlobalBudget(value: string | number | null) {
+  const floor = Math.max(2, contexts.value)
   emit('update:routing', {
     ...(props.routing || {}),
-    global_max_pages: budgetValue(value, contexts.value, contexts.value),
+    global_max_pages: budgetValue(value, floor, floor),
   })
 }
 
 function channelMax(key: 'chat' | 'build'): number {
   const configured = Number(props.channels?.[key]?.max_pages)
-  return Math.max(contexts.value, Number.isFinite(configured) ? configured : contexts.value)
+  const instances = Number(props.channels?.[key]?.max_instances)
+  const floor = Math.max(
+    contexts.value,
+    Number.isFinite(instances) ? instances : 0,
+    1,
+  )
+  return Math.max(floor, Number.isFinite(configured) ? configured : floor)
 }
 
 function updateChannelMax(key: 'chat' | 'build', value: string | number | null) {
+  const floor = channelMax(key)
   emit('update:channels', {
     ...(props.channels || {}),
     [key]: {
       ...(props.channels?.[key] || {}),
-      max_pages: budgetValue(value, channelMax(key), contexts.value),
+      max_pages: budgetValue(value, floor, floor),
     },
   })
 }

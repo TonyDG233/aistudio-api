@@ -15,6 +15,8 @@ from os.path import basename, join, realpath
 from pathlib import Path
 from typing import ClassVar
 
+from aistudio_api.domain.account_tags import normalize_tags
+
 # 用于区分"未提供该字段"与"显式置为 None"的哨兵。
 _UNSET: object = object()
 
@@ -144,6 +146,8 @@ class AccountMeta:
     last_refresh_error: str | None = None
     # 账号级路由覆盖；空表示跟随组，随 meta.json/registry.json 持久化。
     routing: dict[str, object] = field(default_factory=dict)
+    # 用户自定义 tag；tier tag 不入库，由 tier 派生。
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -186,6 +190,7 @@ class AccountMeta:
             if data.get("last_refresh_error") is not None
             else None,
             routing=routing,
+            tags=normalize_tags(data.get("tags")),
         )
 
 
@@ -489,13 +494,17 @@ class AccountStore:
         self.refresh_duplicate_flags()
         return True
 
-    def update_account(self, account_id: str, name: str) -> AccountMeta | None:
-        """更新账号名称。"""
+    def update_account(
+        self, account_id: str, name: str, tags: object = _UNSET
+    ) -> AccountMeta | None:
+        """更新账号名称与自定义 tag。"""
         registry = self._load_registry()
         acc = self._find_registered_account(registry, account_id)
         if acc is None:
             return None
         acc.name = name
+        if tags is not _UNSET:
+            acc.tags = normalize_tags(tags)
         # 同步更新 meta.json
         account_dir = _safe_account_dir(self._accounts_dir, acc.id)
         meta_path = account_dir / "meta.json"

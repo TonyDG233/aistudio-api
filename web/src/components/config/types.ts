@@ -87,12 +87,12 @@ export interface FallbackConfig {
 
 export type SurfaceName = 'chat' | 'build'
 export type ChannelName = 'chat' | 'build' | 'official'
-export type QuotaPool = 'free' | 'pro' | null
 
 export interface ChannelConfigItem {
   enabled?: boolean
+  max_instances?: number | null
   max_pages?: number
-  quota_pool?: QuotaPool | string | null
+  allowed_tags?: string[]
   app_url?: string
   [key: string]: unknown
 }
