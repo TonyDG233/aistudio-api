@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { systemApi } from '@/api/system.ts'
+import { useSystemStore } from '@/stores/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { SystemConfig } from '@/types/system.ts'
 import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
@@ -16,6 +17,7 @@ import {
 } from 'lucide-vue-next'
 
 const toast = useToastStore()
+const systemStore = useSystemStore()
 
 const config = ref<SystemConfig | null>(null)
 const loading = ref(false)
@@ -26,7 +28,9 @@ async function loadConfig() {
   loading.value = true
   loadError.value = null
   try {
-    config.value = await systemApi.getConfig()
+    const loaded = await systemApi.getConfig()
+    config.value = loaded
+    systemStore.setConfig(loaded)
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '获取系统配置失败'
     loadError.value = msg
