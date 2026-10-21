@@ -27,6 +27,7 @@ def _to_gemini_model(
     raw_id = id_override or str(model_data.get("id") or model_data.get("name") or "")
     clean_id = raw_id.removeprefix("models/")
     name = f"models/{clean_id}"
+    version = str(model_data.get("version") or "001")
     display_name = str(model_data.get("displayName") or clean_id)
     description = str(model_data.get("description") or f"Google {display_name} model")
     input_tokens = int(str(model_data.get("inputTokenLimit") or 1048576))
@@ -34,24 +35,42 @@ def _to_gemini_model(
     raw_methods = model_data.get("supportedGenerationMethods")
     methods = (
         [str(x) for x in raw_methods]
-        if isinstance(raw_methods, list)
+        if isinstance(raw_methods, list) and raw_methods
         else [
             "generateContent",
             "countTokens",
             "createCachedContent",
         ]
     )
+    raw_temp = model_data.get("temperature")
+    temperature = (
+        float(raw_temp)
+        if isinstance(raw_temp, (int, float)) and not isinstance(raw_temp, bool)
+        else 1.0
+    )
+    raw_top_p = model_data.get("topP")
+    top_p = (
+        float(raw_top_p)
+        if isinstance(raw_top_p, (int, float)) and not isinstance(raw_top_p, bool)
+        else 0.95
+    )
+    raw_top_k = model_data.get("topK")
+    top_k = (
+        int(raw_top_k)
+        if isinstance(raw_top_k, (int, float)) and not isinstance(raw_top_k, bool)
+        else 64
+    )
     return GeminiModelResponse(
         name=name,
-        version="001",
+        version=version,
         displayName=display_name,
         description=description,
         inputTokenLimit=input_tokens,
         outputTokenLimit=output_tokens,
         supportedGenerationMethods=methods,
-        temperature=1.0,
-        topP=0.95,
-        topK=64,
+        temperature=temperature,
+        topP=top_p,
+        topK=top_k,
     )
 
 

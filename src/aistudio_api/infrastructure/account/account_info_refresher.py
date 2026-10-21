@@ -4,7 +4,7 @@
 - 探测 RPC：``POST .../MakerSuiteService/GetAiStudioBenefitTier``，body ``"[]"``，
   ``content-type: application/json+protobuf``，携带账号 Cookie、SAPISIDHASH
   Authorization（复用本仓 :func:`calculate_sapisid_hash`）与 AI Studio web API key。
-- 档位映射：``[]``/``0`` -> free；``1`` -> pro；``2`` -> ultra；``3`` -> plus；
+- 档位映射：``[]``/``0`` -> Free；``1`` -> Pro；``2`` -> Ultra；``3`` -> Plus；
   其他 -> ``unknown-N``。
 - ``200`` -> 凭据有效；``401`` -> 标记过期；``403`` 且疑为 key 被拒 -> 回收 key
   重试一次；``5xx``/网络故障 -> 非权威失败，不改状态。
@@ -45,7 +45,7 @@ ORIGIN = "https://aistudio.google.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
-TIER_BY_CODE: dict[int, str] = {1: "pro", 2: "ultra", 3: "plus"}
+TIER_BY_CODE: dict[int, str] = {1: "Pro", 2: "Ultra", 3: "Plus"}
 # 与 Ark 同款的公网 AI Studio web API key（可用 MAKERSUITE_WEB_API_KEY 覆盖）。
 DEFAULT_WEB_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
 # Ark ConfigLoader 默认 app id，用于 apps 页取 HTML（邮箱回填 / key 回收）。
@@ -532,7 +532,7 @@ class AccountInfoRefresher:
 
     @staticmethod
     def _tier_name(code: int) -> str:
-        return TIER_BY_CODE.get(code) or ("free" if code == 0 else f"unknown-{code}")
+        return TIER_BY_CODE.get(code) or ("Free" if code == 0 else f"unknown-{code}")
 
     @staticmethod
     def _envelope_message(envelope: list[object] | None) -> str:

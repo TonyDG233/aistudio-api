@@ -526,3 +526,169 @@ async def test_browser_session_enable_temporary_chat(mock_cdp_page):
     mock_cdp_page.evaluate.assert_called_once()
     expr = mock_cdp_page.evaluate.call_args[0][0]
     assert "temporary" in expr.lower()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_botguard_in_page_interception_zero_quota(mock_cdp_page):
+    """Verify bootstrap_botguard_and_template captures in-page aborted GenerateContent template without network round-trip."""
+    from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
+        bootstrap_botguard_and_template,
+    )
+
+    mock_cdp_page.title = AsyncMock(return_value="Google AI Studio")
+
+    async def fake_eval(expr, *args, **kwargs):
+        if "isSnapCandidate" in expr:
+            return "hooked:snap_fn_key"
+        if "window.__AISTUDIO__?.service" in expr:
+            return True
+        if "window.__AISTUDIO__?.capturedTemplate" in expr:
+            return {
+                "url": "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",
+                "headers": {
+                    "Content-Type": "application/json+protobuf",
+                    "X-Goog-Api-Key": "AIzaSyTest",
+                },
+                "body": '["models/gemini-3.8-flash",[[[[null,"say \'1\'"]],"user"]]]',
+            }
+        if "runBtn" in expr:
+            return True
+        return None
+
+    mock_cdp_page.evaluate.side_effect = fake_eval
+
+    snap_key, captured = await bootstrap_botguard_and_template(
+        mock_cdp_page, max_wait_seconds=2
+    )
+    assert snap_key == "snap_fn_key"
+    assert "GenerateContent" in str(captured.get("url"))
+    assert "gemini-3.8-flash" in str(captured.get("body"))
+
+
+@pytest.mark.asyncio
+async def test_transport_injects_and_strips_g1_tier_header(mock_cdp_page):
+    """Verify _ensure_authorization_header sets X-AIStudio-G1-Tier for Pro/Ultra/Plus and strips stale header for Free."""
+    from aistudio_api.infrastructure.gateway.transport import (
+        _ensure_authorization_header,
+    )
+
+    mock_cdp_page._cached_cookies = {"SAPISID": "test_sapisid_value"}
+
+    # 1. Pro account injects TIER1
+    pro_headers = await _ensure_authorization_header(
+        mock_cdp_page,
+        {"Content-Type": "application/json+protobuf"},
+        auth_user="1",
+        tier="Pro",
+    )
+    assert pro_headers["X-Goog-AuthUser"] == "1"
+    assert pro_headers["X-AIStudio-G1-Tier"] == "TIER1"
+
+    # 2. Ultra account injects TIER2
+    ultra_headers = await _ensure_authorization_header(
+        mock_cdp_page,
+        {"Content-Type": "application/json+protobuf"},
+        auth_user="0",
+        tier="Ultra",
+    )
+    assert ultra_headers["X-AIStudio-G1-Tier"] == "TIER2"
+
+    # 3. Free account strips any stale X-AIStudio-G1-Tier from previous template
+    free_headers = await _ensure_authorization_header(
+        mock_cdp_page,
+        {
+            "Content-Type": "application/json+protobuf",
+            "X-AIStudio-G1-Tier": "TIER1",
+        },
+        auth_user="0",
+        tier="Free",
+    )
+    assert "X-AIStudio-G1-Tier" not in free_headers
+
+
+@pytest.mark.asyncio
+async def test_hook_install_rejects_google_login_page_before_evaluation(mock_cdp_page):
+    """Verify install_page_hooks immediately raises SessionExpiredError on Google login page (PR #1 & Issue #6)."""
+    from aistudio_api.domain.errors import SessionExpiredError
+    from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
+        install_page_hooks,
+    )
+
+    mock_cdp_page.url = (
+        "https://accounts.google.com/v3/signin/identifier?"
+        "continue=https://aistudio.google.com/u/5/prompts/new_chat"
+    )
+
+    with pytest.raises(SessionExpiredError):
+        await install_page_hooks(mock_cdp_page)
+
+    mock_cdp_page.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_navigate_to_aistudio_re_navigates_after_cookie_reinjection(
+    mock_cdp_page, monkeypatch
+):
+    """Regression for Issue #6:
+    After redirecting to login page and re-injecting cookies, navigate_to_aistudio must
+    re-navigate to AI Studio and verify page readiness instead of returning early on the login page.
+    """
+    from aistudio_api.domain.errors import SessionExpiredError
+    from aistudio_api.infrastructure.gateway import session_auth
+
+    login_url = (
+        "https://accounts.google.com/v3/signin/identifier?"
+        "continue=https://aistudio.google.com/prompts/new_chat"
+    )
+    aistudio_url = "https://aistudio.google.com/prompts/new_chat?model=gemini-3.7-flash&temporary=true"
+
+    goto_calls: list[str] = []
+
+    async def fake_goto_recover(url, **kwargs):
+        goto_calls.append(url)
+        mock_cdp_page.url = login_url if len(goto_calls) == 1 else aistudio_url
+
+    mock_cdp_page.goto = AsyncMock(side_effect=fake_goto_recover)
+    mock_cdp_page.evaluate = AsyncMock(
+        side_effect=lambda expr, *a, **kw: (
+            mock_cdp_page.url
+            if "location.href" in expr
+            else (True if "default_MakerSuite" in expr else None)
+        )
+    )
+    monkeypatch.setattr(
+        session_auth, "load_cookies_to_page", AsyncMock(return_value=True)
+    )
+    mock_verify = AsyncMock(return_value=True)
+    mock_save = AsyncMock()
+
+    await session_auth.navigate_to_aistudio(
+        mock_cdp_page,
+        auth_user="0",
+        auth_file="/data/auth.json",
+        verify_identity_cb=mock_verify,
+        save_cookies_cb=mock_save,
+    )
+
+    assert len(goto_calls) == 2
+    mock_verify.assert_awaited_once()
+    mock_save.assert_awaited_once()
+
+    # Case 2: If still stuck on login page after re-injecting cookies and re-navigating,
+    # must raise SessionExpiredError immediately!
+    goto_calls.clear()
+
+    async def fake_goto_stuck(url, **kwargs):
+        goto_calls.append(url)
+        mock_cdp_page.url = login_url
+
+    mock_cdp_page.goto = AsyncMock(side_effect=fake_goto_stuck)
+    with pytest.raises(SessionExpiredError):
+        await session_auth.navigate_to_aistudio(
+            mock_cdp_page,
+            auth_user="0",
+            auth_file="/data/auth.json",
+            verify_identity_cb=mock_verify,
+            save_cookies_cb=mock_save,
+        )
+    assert len(goto_calls) == 2

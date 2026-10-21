@@ -1,4 +1,5 @@
 export interface AccountRotationStats {
+  tier?: string | null
   requests: number
   success: number
   rate_limited: number

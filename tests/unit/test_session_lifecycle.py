@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,3 +154,36 @@ async def test_session_capture_template_breaks_on_dead_proc():
         RuntimeError, match="Browser process died during template capture"
     ):
         await session.capture_template("models/gemini-custom-uncached")
+
+
+@pytest.mark.asyncio
+async def test_ensure_browser_cdp_refreshes_activity_timestamp(monkeypatch):
+    """Verify cold-starting the browser refreshes the idle activity timestamp (PR #2)."""
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway import session as session_module
+
+    session = BrowserSession(port=9222)
+    session._auth_file = None
+    session._in_flight = 0
+    session._last_activity_time = time.time() - 115_285.0
+
+    fake_page = MagicMock(spec=CDPPage)
+    fake_client = MagicMock()
+    fake_client.wait_until_ready = AsyncMock()
+    fake_client.connect_page = AsyncMock(return_value=fake_page)
+
+    monkeypatch.setattr(
+        session_module, "launch_chromium_process", MagicMock(return_value=MagicMock())
+    )
+    monkeypatch.setattr(
+        session_module, "CDPClient", MagicMock(return_value=fake_client)
+    )
+
+    await session._ensure_browser_cdp()
+
+    assert time.time() - session._last_activity_time < 5.0
+
+    monkeypatch.setattr(settings, "browser_idle_timeout", 1800)
+    session._close_internal = AsyncMock()  # type: ignore[method-assign]
+    assert await session.check_idle_timeout() is False
+    session._close_internal.assert_not_called()

@@ -18,6 +18,49 @@ DEFAULT_EXT_BIN = "CAESAUwwATgEQABQBGICSlBwAHgBkAEAmAEB"
 DEFAULT_ORIGIN = "https://aistudio.google.com"
 DEFAULT_USER_AGENT = "grpc-web-javascript/0.1"
 
+
+BENEFIT_TIER_TO_NAME: dict[int, str] = {
+    0: "Free",
+    1: "Pro",
+    2: "Ultra",
+    3: "Plus",
+}
+
+BENEFIT_TIER_TO_HEADER: dict[str, str] = {
+    "Pro": "TIER1",
+    "Ultra": "TIER2",
+    "Plus": "TIER0",
+}
+
+
+def parse_benefit_tier_response(raw_data: object) -> str:
+    """解析 GetAiStudioBenefitTier 响应数组为标准权益名称 (Free / Pro / Ultra / Plus)。"""
+    if isinstance(raw_data, str):
+        text = raw_data.strip().removeprefix(")]}'").strip()
+        if text.startswith("[,"):
+            text = "[null," + text[2:]
+        try:
+            raw_data = json.loads(text)
+        except Exception:
+            return "Free"
+    if not isinstance(raw_data, list) or not raw_data or raw_data[0] is None:
+        return "Free"
+    val = raw_data[0]
+    if isinstance(val, bool):
+        return "Free"
+    if isinstance(val, (int, float)):
+        return BENEFIT_TIER_TO_NAME.get(int(val), "Free")
+    return "Free"
+
+
+def get_tier_header_value(tier: str | None) -> str | None:
+    """根据账号权益等级返回对应的 X-AIStudio-G1-Tier 请求头取值。"""
+    if not tier:
+        return None
+    clean = tier.strip().capitalize()
+    return BENEFIT_TIER_TO_HEADER.get(clean)
+
+
 # Cookies that need httpOnly=False so JS can read them for SAPISIDHASH.
 _AUTH_COOKIE_NAMES = {
     "SID",
@@ -312,6 +355,136 @@ def parse_cookie_string(
     }
 
 
+def parse_emails_from_ogs_html(
+    html_text: str, default_auth_user: str = "0"
+) -> dict[str, str]:
+    """从 Google OGS Widget 或 AI Studio HTML 中提取 u/{index} 对应的真实邮箱字典。"""
+    mapping: dict[str, str] = {}
+    if not html_text:
+        return mapping
+    m_primary = re.search(r'"oPEP7c"\s*:\s*"([^"@\s]+@[^"\s]+)"', html_text)
+    if m_primary:
+        mapping[str(default_auth_user)] = m_primary.group(1).strip().lower()
+    for m in re.finditer(
+        r'data-au="(\d+)"\s+data-email="([^"@\s]+@[^"\s]+)"', html_text
+    ):
+        mapping[m.group(1)] = m.group(2).strip().lower()
+    for m in re.finditer(
+        r'data-email="([^"@\s]+@[^"\s]+)"\s+data-au="(\d+)"', html_text
+    ):
+        mapping[m.group(2)] = m.group(1).strip().lower()
+    return mapping
+
+
+async def probe_account_emails_map(
+    raw_or_dict: object,
+    auth_user: str = "0",
+) -> dict[str, str]:
+    """通过 Google OneGoogleWidget / AI Studio 页面探测全部已登录子账号的邮箱映射。"""
+    cookie_dict = (
+        raw_or_dict
+        if isinstance(raw_or_dict, dict)
+        and all(isinstance(v, str) for v in raw_or_dict.values())
+        else parse_raw_cookies(raw_or_dict)
+    )
+    if not cookie_dict:
+        return {}
+
+    import httpx
+
+    from aistudio_api.config import settings
+
+    u_index = str(auth_user or "0")
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Cookie": cookie_header,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0, proxy=settings.proxy_url, follow_redirects=True
+        ) as client:
+            resp = await client.get(
+                f"https://ogs.google.com/u/{u_index}/widget/account",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                emails = parse_emails_from_ogs_html(resp.text, u_index)
+                if emails:
+                    return emails
+            resp_ai = await client.get(
+                f"https://aistudio.google.com/u/{u_index}/prompts/new_chat",
+                headers=headers,
+            )
+            if resp_ai.status_code == 200:
+                return parse_emails_from_ogs_html(resp_ai.text, u_index)
+    except Exception as e:
+        logger.debug("通过 HTTP 探测子账号 u/%s 邮箱失败: %s", u_index, e)
+    return {}
+
+
+async def probe_account_email(
+    raw_or_dict: object,
+    auth_user: str = "0",
+) -> str | None:
+    """探测单个指定 auth_user 的登录邮箱。"""
+    u_index = str(auth_user or "0")
+    emails_map = await probe_account_emails_map(raw_or_dict, auth_user=u_index)
+    if u_index in emails_map:
+        return emails_map[u_index]
+    if u_index != "0":
+        root_map = await probe_account_emails_map(raw_or_dict, auth_user="0")
+        if u_index in root_map:
+            return root_map[u_index]
+    return None
+
+
+async def probe_account_benefit_tier(
+    raw_or_dict: object,
+    auth_user: str = "0",
+) -> str:
+    """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。"""
+    cookie_dict = (
+        raw_or_dict
+        if isinstance(raw_or_dict, dict)
+        and all(isinstance(v, str) for v in raw_or_dict.values())
+        else parse_raw_cookies(raw_or_dict)
+    )
+    if not cookie_dict:
+        return "Free"
+
+    import httpx
+
+    from aistudio_api.config import settings
+
+    u_index = str(auth_user or "0")
+    auth_header = calculate_sapisid_hash(cookie_dict)
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    headers = {
+        "Content-Type": "application/json+protobuf",
+        "X-User-Agent": DEFAULT_USER_AGENT,
+        "X-Goog-Api-Key": DEFAULT_API_KEY,
+        "X-Goog-AuthUser": u_index,
+        "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+        "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
+        "Origin": DEFAULT_ORIGIN,
+        "Referer": f"{DEFAULT_ORIGIN}/",
+        "Cookie": cookie_header,
+    }
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
+    try:
+        async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as client:
+            resp = await client.post(tier_url, headers=headers, content="[]")
+            if resp.status_code == 200:
+                return parse_benefit_tier_response(resp.text)
+    except Exception as e:
+        logger.debug("探测子账号 u/%s 权益等级失败: %s", u_index, e)
+    return "Free"
+
+
 async def probe_google_accounts_infinite(
     raw_or_dict: object,
     *,
@@ -335,7 +508,7 @@ async def probe_google_accounts_infinite(
 
     auth_user_idx = 0
     consecutive_failures = 0
-
+    emails_map = await probe_account_emails_map(cookie_dict, auth_user="0")
     async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
         while True:
             u_index = str(auth_user_idx)
@@ -361,15 +534,41 @@ async def probe_google_accounts_infinite(
                 # 401 表示该 auth_user 未登录或 Session 无效
                 if resp.status_code in (200, 400, 403):
                     consecutive_failures = 0
+                    detected_tier = "Free"
+                    tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
+                    try:
+                        tier_resp = await client.post(
+                            tier_url, headers=headers, content="[]"
+                        )
+                        if tier_resp.status_code == 200:
+                            detected_tier = parse_benefit_tier_response(tier_resp.text)
+                    except Exception:
+                        pass
+                    detected_email = emails_map.get(u_index)
+                    if not detected_email:
+                        try:
+                            extra_map = await probe_account_emails_map(
+                                cookie_dict, auth_user=u_index
+                            )
+                            emails_map.update(extra_map)
+                            detected_email = emails_map.get(u_index)
+                        except Exception:
+                            pass
                     valid_accounts.append(
                         {
                             "auth_user": u_index,
                             "status_code": resp.status_code,
                             "name": f"Google Account (u/{u_index})",
+                            "email": detected_email,
+                            "tier": detected_tier,
                         }
                     )
                     logger.info(
-                        "子账号 u/%s 探活成功 (HTTP %d)", u_index, resp.status_code
+                        "子账号 u/%s 探活成功 (HTTP %d, email=%s, tier=%s)",
+                        u_index,
+                        resp.status_code,
+                        detected_email or "unknown",
+                        detected_tier,
                     )
                 elif resp.status_code == 401:
                     consecutive_failures += 1

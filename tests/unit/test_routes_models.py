@@ -165,3 +165,66 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
     call_cookies, call_auth_user = service._fetch_via_http.call_args[0]
     assert call_cookies["SAPISID"] == "test_sapisid"
     assert call_auth_user == "0"
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_extended_fields_and_aliases():
+    """Verify ListModels parses version, temperature, topP, topK, aliases, capabilities, and accessModes."""
+    from aistudio_api.api.routes_models import _to_gemini_model
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    row: list[object] = [None] * 85
+    row[0] = "models/gemini-4-ultra-preview"
+    row[2] = "2.5"
+    row[3] = "Gemini 4 Ultra Preview"
+    row[4] = "Ultra reasoning model"
+    row[5] = 2097152
+    row[6] = 65536
+    row[7] = ["generateContent", "countTokens"]
+    row[8] = 0.7
+    row[9] = 0.9
+    row[10] = 40
+    row[56] = [["models/gemini-ultra-latest", "alias"]]
+    row[64] = [1, 9, 10, 12, 13, 25, 58]
+    row[77] = 2
+    row[82] = [4]  # Ultra only
+
+    svc = ModelDiscoveryService()
+    parsed = svc._parse_raw_models([[row]])
+    assert len(parsed) == 1
+    m = parsed[0]
+    assert m["id"] == "gemini-4-ultra-preview"
+    assert m["version"] == "2.5"
+    assert m["temperature"] == 0.7
+    assert m["topP"] == 0.9
+    assert m["topK"] == 40
+    assert m["aliases"] == ["gemini-ultra-latest"]
+    caps = m["capabilities"]
+    assert isinstance(caps, list)
+    assert "google_search" in caps
+    assert "google_maps" in caps
+    assert "url_context" in caps
+    assert m["paid"] is True
+    assert m["accessModes"] == [4]
+
+    svc._cached_models = parsed
+    svc._last_fetched_at = 9999999999.0
+
+    # Alias lookup works
+    by_alias = await svc.get_model_by_id("models/gemini-ultra-latest")
+    assert by_alias is not None
+    assert by_alias["id"] == "gemini-4-ultra-preview"
+
+    # Tier check works
+    assert svc.is_model_allowed_for_tier("gemini-4-ultra-preview", "Free") is False
+    assert svc.is_model_allowed_for_tier("gemini-4-ultra-preview", "Pro") is False
+    assert svc.is_model_allowed_for_tier("gemini-4-ultra-preview", "Ultra") is True
+
+    # _to_gemini_model preserves custom sampling parameters and version
+    resp_model = _to_gemini_model(m)
+    assert resp_model.version == "2.5"
+    assert resp_model.temperature == 0.7
+    assert resp_model.topP == 0.9
+    assert resp_model.topK == 40

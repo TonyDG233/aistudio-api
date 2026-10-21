@@ -111,14 +111,14 @@ def _make_store(tmp_path: Path) -> tuple[AccountStore, AccountMeta]:
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        ("[]", "free"),
-        ("[0]", "free"),
-        ("[1]", "pro"),
-        ("[2]", "ultra"),
-        ("[3]", "plus"),
+        ("[]", "Free"),
+        ("[0]", "Free"),
+        ("[1]", "Pro"),
+        ("[2]", "Ultra"),
+        ("[3]", "Plus"),
         ("[9]", "unknown-9"),
-        ("null", "free"),  # 非法/空 envelope 视作 free（对齐 Ark code=0）
-        ("not-json", "free"),
+        ("null", "Free"),  # 非法/空 envelope 视作 free（对齐 Ark code=0）
+        ("not-json", "Free"),
     ],
 )
 def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
@@ -175,13 +175,13 @@ def test_401_cleared_after_recovery(tmp_path: Path) -> None:
     stored = store.get_account(account.id)
     assert stored is not None
     assert stored.expired is False
-    assert stored.tier == "pro"
+    assert stored.tier == "Pro"
 
 
 def test_server_error_does_not_change_state(tmp_path: Path) -> None:
     store, account = _make_store(tmp_path)
     store.update_account_refresh(
-        account.id, tier="pro", tier_checked_at="2026-01-01T00:00:00Z"
+        account.id, tier="Pro", tier_checked_at="2026-01-01T00:00:00Z"
     )
     transport = FakeTransport([TransportResponse(status=500, body="boom")])
     refresher = AccountInfoRefresher(store, transport=transport)
@@ -194,7 +194,7 @@ def test_server_error_does_not_change_state(tmp_path: Path) -> None:
     stored = store.get_account(account.id)
     assert stored is not None
     assert stored.expired is False
-    assert stored.tier == "pro"  # 未被清空
+    assert stored.tier == "Pro"  # 未被清空
     assert stored.tier_checked_at == "2026-01-01T00:00:00Z"
 
 
@@ -216,7 +216,7 @@ def test_403_key_blocked_recovers_and_retries_once(tmp_path: Path) -> None:
     result = asyncio.run(refresher.refresh_account(account, refresh_email=False))
 
     assert result.ok is True
-    assert result.tier == "ultra"
+    assert result.tier == "Ultra"
 
     rpc_calls = [r for r in transport.requests if r.method == "POST"]
     assert len(rpc_calls) == 2, "一次原始 + 一次带回收 key 的重试"
@@ -387,7 +387,7 @@ def test_account_meta_roundtrip_with_refresh_fields() -> None:
         name="n",
         email="e@x.com",
         created_at="t",
-        tier="pro",
+        tier="Pro",
         tier_checked_at="2026-10-18T00:00:00Z",
         expired=True,
     )
@@ -399,23 +399,23 @@ def test_update_account_refresh_persists(tmp_path: Path) -> None:
     store, account = _make_store(tmp_path)
     assert (
         store.update_account_refresh(
-            account.id, tier="plus", tier_checked_at="ts", expired=True
+            account.id, tier="Plus", tier_checked_at="ts", expired=True
         )
         is True
     )
     # 幂等：相同值不再有改动
     assert (
         store.update_account_refresh(
-            account.id, tier="plus", tier_checked_at="ts", expired=True
+            account.id, tier="Plus", tier_checked_at="ts", expired=True
         )
         is False
     )
     meta_path = tmp_path / "accounts" / account.id / "meta.json"
     on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert on_disk["tier"] == "plus"
+    assert on_disk["tier"] == "Plus"
     assert on_disk["expired"] is True
     # 未知账号
-    assert store.update_account_refresh("missing", tier="free") is False
+    assert store.update_account_refresh("missing", tier="Free") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -484,7 +484,7 @@ class _FakeRefresher(AccountInfoRefresher):
         self.calls.append(([a.id for a in accounts], refresh_email))
         return [
             RefreshResult(
-                account_id=a.id, ok=True, tier="pro", expired=False, email=a.email
+                account_id=a.id, ok=True, tier="Pro", expired=False, email=a.email
             )
             for a in accounts
         ]
@@ -590,9 +590,9 @@ def test_account_response_includes_tier_and_expired() -> None:
         name="n",
         email="e@x.com",
         created_at="t",
-        tier="ultra",
+        tier="Ultra",
         expired=True,
     )
     resp = to_account_response(meta)
-    assert resp.tier == "ultra"
+    assert resp.tier == "Ultra"
     assert resp.expired is True

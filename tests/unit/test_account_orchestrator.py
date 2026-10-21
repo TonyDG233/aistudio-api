@@ -395,3 +395,60 @@ def test_cleanup_ghost_accounts():
     # 测试单账号删除同步
     rotator.remove_account("real_acc")
     assert "real_acc" not in rotator._stats
+
+
+@pytest.mark.asyncio
+async def test_newly_imported_account_manual_activation_stays_sticky_on_first_request(
+    tmp_path,
+):
+    """Regression for Issue #7:
+    When a new account is imported while the server is running and manually activated,
+    the first generateContent request must NOT switch back to the old account due to missing rotator stats.
+    """
+    from unittest.mock import AsyncMock
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_issue7")
+    store.save_account(
+        name="Old Account",
+        email="old@gmail.com",
+        storage_state={"cookies": [{"name": "SID", "value": "old"}]},
+    )
+    # Initialize rotator with only old_acc existing at startup
+    rotator = AccountRotator(account_store=store)
+    service = AccountService(store)
+
+    # Import new_acc at runtime after rotator was already initialized
+    new_acc = service.save_account_from_cookies(
+        name="New Account",
+        email="new@gmail.com",
+        storage_state={"cookies": [{"name": "SID", "value": "new"}]},
+    )
+    service.set_active_account(new_acc.id)
+
+    # Even before explicit rotator.add_account(), rotator must recognize new_acc from store as available
+    assert rotator.is_account_available(new_acc.id, model="gemini-3.8-flash") is True
+    assert rotator.get_account_stats(new_acc.id) is not None
+
+    mock_client = MagicMock(spec=AIStudioClient)
+    mock_client.session = MagicMock()
+    service.activate_account = AsyncMock(return_value=new_acc)
+
+    orig_rotator = runtime_state.rotator
+    orig_service = runtime_state.account_service
+    orig_client = runtime_state.client
+    try:
+        runtime_state.rotator = rotator
+        runtime_state.account_service = service
+        runtime_state.client = mock_client
+
+        await ensure_active_account(attempt=0, model="models/gemini-3.8-flash")
+
+        # Active account must remain new_acc and never fail over to old_acc
+        active = service.get_active_account()
+        assert active is not None
+        assert active.id == new_acc.id
+        service.activate_account.assert_not_awaited()
+    finally:
+        runtime_state.rotator = orig_rotator
+        runtime_state.account_service = orig_service
+        runtime_state.client = orig_client

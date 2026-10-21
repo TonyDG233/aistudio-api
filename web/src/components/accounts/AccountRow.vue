@@ -66,6 +66,13 @@ const todayRequests = computed(() => {
 
 const accountsStore = useAccountsStore()
 const detectingEmail = ref(false)
+const detectingTier = ref(false)
+
+const accountTier = computed(() => {
+  const raw = (props.account.tier || '').trim()
+  if (!raw) return '未识别'
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase()
+})
 
 const isExpired = computed(() =>
   Boolean(props.account.expired || props.account.session_expired),
@@ -105,19 +112,6 @@ const qualified = computed(
   () => Boolean(props.routing) && !isExpired.value && allowedSurfaces.value.length > 0,
 )
 
-function tierVariant(tier?: string | null): 'green' | 'red' | 'amber' | 'blue' | 'gray' {
-  switch ((tier || '').toLowerCase()) {
-    case 'pro':
-      return 'blue'
-    case 'ultra':
-      return 'amber'
-    case 'plus':
-      return 'green'
-    default:
-      return 'gray'
-  }
-}
-
 async function handleDetectEmail() {
   detectingEmail.value = true
   try {
@@ -129,6 +123,15 @@ async function handleDetectEmail() {
 
 async function handleRefresh() {
   await accountsStore.refreshAccount(props.account.id)
+}
+
+async function handleDetectTier() {
+  detectingTier.value = true
+  try {
+    await accountsStore.detectAccountTier(props.account.id)
+  } finally {
+    detectingTier.value = false
+  }
 }
 </script>
 
@@ -162,6 +165,27 @@ async function handleRefresh() {
         >
           u/{{ account.auth_user }}
         </span>
+
+        <!-- Benefit Tier Badge: Free / Plus / Pro / Ultra -->
+        <button
+          type="button"
+          class="px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold shrink-0 transition-opacity hover:opacity-80 cursor-pointer"
+          :class="[
+            accountTier === 'Ultra'
+              ? 'bg-purple-100 text-purple-800 border border-purple-300'
+              : accountTier === 'Pro'
+                ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                : accountTier === 'Plus'
+                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  : 'bg-gray-100 text-gray-600 border border-gray-200/80',
+            { 'opacity-50 cursor-wait': detectingTier },
+          ]"
+          :disabled="detectingTier"
+          title="点击重新探测此子账号的 Google AI 订阅权益等级 (Free / Plus / Pro / Ultra)"
+          @click="handleDetectTier"
+        >
+          {{ detectingTier ? '...' : accountTier }}
+        </button>
 
         <!-- Account Name & Memo -->
         <div class="truncate min-w-0">
@@ -208,15 +232,6 @@ async function handleRefresh() {
             size="sm"
           >
             429: {{ account.rate_limited || 0 }}
-          </Badge>
-          <!-- 档位徽章：与过期徽章并存显示（tier 恒显，过期状态独立表达） -->
-          <Badge
-            v-if="account.tier"
-            :variant="tierVariant(account.tier)"
-            size="sm"
-            :title="`档位: ${account.tier}`"
-          >
-            {{ account.tier }}
           </Badge>
           <Badge
             v-if="refreshState === 'pending'"
@@ -327,7 +342,7 @@ async function handleRefresh() {
             type="button"
             class="p-1 text-gray-400 hover:text-brand-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
             :class="{ 'opacity-50 cursor-not-allowed': detectingEmail }"
-            title="自动识别并记录此子账号真实邮箱"
+            title="自动识别并记录此子账号真实邮箱与订阅等级"
             :disabled="detectingEmail"
             @click="handleDetectEmail"
           >

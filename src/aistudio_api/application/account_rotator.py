@@ -556,6 +556,7 @@ class AccountRotator:
             result[account.id] = {
                 "name": account.name,
                 "email": account.email,
+                "tier": getattr(account, "tier", "Free") or "Free",
                 "requests": stats.requests,
                 "success": stats.success,
                 "rate_limited": stats.rate_limited,
@@ -587,8 +588,14 @@ class AccountRotator:
         return result
 
     def get_account_stats(self, account_id: str) -> AccountStats | None:
-        """获取指定账号的统计对象。"""
-        return self._stats.get(account_id)
+        """获取指定账号的统计对象（若账号已存在于存储层但尚未登记，自动补齐默认统计）。"""
+        stats = self._stats.get(account_id)
+        if stats is None and any(
+            a.id == account_id for a in self._store.list_accounts()
+        ):
+            stats = AccountStats(account_id=account_id)
+            self._stats[account_id] = stats
+        return stats
 
     def is_account_available(
         self,
@@ -645,11 +652,30 @@ class AccountRotator:
                     account.id,
                 )
                 continue
-            stats = self._stats.get(account.id, AccountStats(account_id=account.id))
+            stats = self._stats.setdefault(
+                account.id, AccountStats(account_id=account.id)
+            )
             if stats.is_available(
                 model, ignore_auth_cooldown=ignore_auth_cooldown, surface=surface
             ):
                 available.append((account, stats))
+        if model and available:
+            try:
+                from aistudio_api.infrastructure.gateway.model_discovery import (
+                    model_discovery,
+                )
+
+                tier_matched = [
+                    (acc, st)
+                    for acc, st in available
+                    if model_discovery.is_model_allowed_for_tier(
+                        model, getattr(acc, "tier", "Free")
+                    )
+                ]
+                if tier_matched:
+                    return tier_matched
+            except Exception:
+                pass
         return available
 
     async def get_next_account(
@@ -882,14 +908,15 @@ class AccountRotator:
         surface: str = DEFAULT_SURFACE,
     ) -> None:
         """清除指定账号的 429 锁定。"""
-        if account_id in self._stats:
-            self._stats[account_id].clear_cooldown(model, surface=surface)
-            logger.info(
-                "已手动清除账号 %s 锁定 (surface=%s, model=%s)",
-                account_id,
-                surface,
-                model,
-            )
+        if account_id not in self._stats:
+            self._stats[account_id] = AccountStats(account_id=account_id)
+        self._stats[account_id].clear_cooldown(model, surface=surface)
+        logger.info(
+            "已手动清除账号 %s 锁定 (surface=%s, model=%s)",
+            account_id,
+            surface,
+            model,
+        )
 
         self.save_state()
 

@@ -29,6 +29,7 @@ class SessionContext:
     auth_user: str
     auth_file: str | None
     base_template: dict[str, object]
+    tier: str = "Free"
     context_id: int = field(default_factory=itertools.count(1).__next__)
     created_at: float = field(default_factory=time.time)
     in_flight: int = 0

@@ -10,6 +10,12 @@ from urllib.parse import urlsplit
 
 from aistudio_api.domain.errors import SessionExpiredError
 from aistudio_api.infrastructure.account.account_store import write_storage_state
+from aistudio_api.infrastructure.account.cookie_parser import (
+    DEFAULT_API_KEY,
+    DEFAULT_EXT_BIN,
+    DEFAULT_USER_AGENT,
+    parse_benefit_tier_response,
+)
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     CHECK_IDENTITY_JS,
@@ -53,6 +59,17 @@ def is_login_page_url(url: str | None) -> bool:
     )
 
 
+def is_aistudio_page_url(url: str | None) -> bool:
+    """True if URL points to aistudio.google.com and is not a Google login page."""
+    if not url or is_login_page_url(url):
+        return False
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+        return host == "aistudio.google.com" or host.endswith(".aistudio.google.com")
+    except Exception:
+        return False
+
+
 def derive_profile_dir(auth_file: str | None) -> str | None:
     """Derive user data profile directory corresponding to an auth file."""
     if not auth_file:
@@ -71,6 +88,21 @@ def get_auth_user_from_meta(auth_file: str | None) -> str:
         except Exception:
             pass
     return "0"
+
+
+def get_tier_from_meta(auth_file: str | None) -> str:
+    """Read benefit tier from meta.json adjacent to auth_file."""
+    if auth_file:
+        try:
+            meta_path = Path(auth_file).parent / "meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                tier = str(meta.get("tier") or "Free").strip().capitalize()
+                if tier in ("Free", "Pro", "Ultra", "Plus"):
+                    return tier
+        except Exception:
+            pass
+    return "Free"
 
 
 def get_aistudio_urls(
@@ -136,6 +168,76 @@ async def extract_account_email(page: CDPPage | None) -> str | None:
     return None
 
 
+async def extract_account_tier(
+    page: CDPPage | None, auth_user: str = "0"
+) -> str | None:
+    """Extract authenticated Google AI benefit tier via in-page GetAiStudioBenefitTier XHR."""
+    if page is None or page.is_closed():
+        return None
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        calculate_sapisid_hash,
+    )
+
+    auth_header = ""
+    with suppress(Exception):
+        cookie_dict = getattr(page, "_cached_cookies", None)
+        if not cookie_dict:
+            cookie_list = await page.get_cookies()
+            cookie_dict = {
+                str(c.get("name") or ""): str(c.get("value") or "")
+                for c in cookie_list
+                if isinstance(c, dict) and c.get("name")
+            }
+        if cookie_dict:
+            auth_header = calculate_sapisid_hash(cookie_dict)
+
+    script = """
+    (args) => {
+        return new Promise((resolve) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', 'https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier');
+            xhr.setRequestHeader('Content-Type', 'application/json+protobuf');
+            xhr.setRequestHeader('X-User-Agent', args.userAgent);
+            xhr.setRequestHeader('X-Goog-Api-Key', args.apiKey);
+            xhr.setRequestHeader('X-Goog-AuthUser', String(args.authUser || '0'));
+            xhr.setRequestHeader('X-Goog-Ext-519733851-bin', args.extBin);
+            if (args.authHeader) {
+                xhr.setRequestHeader('Authorization', args.authHeader);
+            }
+            xhr.withCredentials = true;
+            xhr.timeout = 8000;
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    resolve({ok: true, text: xhr.responseText || '[]'});
+                } else {
+                    resolve({ok: false, status: xhr.status});
+                }
+            };
+            xhr.onerror = () => resolve({ok: false});
+            xhr.ontimeout = () => resolve({ok: false});
+            xhr.send('[]');
+        });
+    }
+    """
+    try:
+        res = await page.evaluate(
+            script,
+            {
+                "authUser": str(auth_user or "0"),
+                "apiKey": DEFAULT_API_KEY,
+                "userAgent": DEFAULT_USER_AGENT,
+                "extBin": DEFAULT_EXT_BIN,
+                "authHeader": auth_header,
+            },
+            timeout_s=10.0,
+        )
+        if isinstance(res, dict) and res.get("ok"):
+            return parse_benefit_tier_response(res.get("text"))
+    except Exception as e:
+        log.debug("从页面提取账号订阅等级失败: %s", e)
+    return None
+
+
 async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
     """Verify currently loaded account matches metadata in auth_file."""
     if not auth_file:
@@ -171,16 +273,60 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
                 mask_email(discovered_email),
             )
             meta["email"] = discovered_email
+            expected_email = discovered_email.strip().lower()
             with suppress(Exception):
                 meta_path.write_text(
                     json.dumps(meta, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
-            expected_email = discovered_email.strip().lower()
+            with suppress(Exception):
+                from aistudio_api.infrastructure.account.account_store import (
+                    AccountStore,
+                )
+
+                if account_id and account_id != "unknown":
+                    AccountStore().update_account_email(account_id, discovered_email)
+
+    if is_on_correct_user and (not meta.get("tier") or meta.get("tier") == "Free"):
+        discovered_tier = await extract_account_tier(page, auth_user=auth_user)
+        if not discovered_tier or discovered_tier == "Free":
+            try:
+                auth_data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+                cookie_dict = {
+                    str(c.get("name") or ""): str(c.get("value") or "")
+                    for c in auth_data.get("cookies", [])
+                    if isinstance(c, dict) and c.get("name")
+                }
+                if cookie_dict:
+                    from aistudio_api.infrastructure.account.cookie_parser import (
+                        probe_account_benefit_tier,
+                    )
+
+                    http_tier = await probe_account_benefit_tier(
+                        cookie_dict, auth_user=auth_user
+                    )
+                    if http_tier and http_tier != "Free":
+                        discovered_tier = http_tier
+            except Exception:
+                pass
+
+        if discovered_tier:
+            meta["tier"] = discovered_tier
+            with suppress(Exception):
+                meta_path.write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            with suppress(Exception):
+                from aistudio_api.infrastructure.account.account_store import (
+                    AccountStore,
+                )
+
+                if account_id and account_id != "unknown":
+                    AccountStore().update_account_tier(account_id, discovered_tier)
 
     if not expected_email:
         return is_on_correct_user
-
     if (
         discovered_email
         and discovered_email.strip().lower() == expected_email
@@ -264,6 +410,45 @@ async def bootstrap_google_session(page: CDPPage) -> None:
     raise RuntimeError(f"bootstrap stayed on login flow: url={page.url}")
 
 
+async def _goto_url_with_abort_tolerance(
+    page: CDPPage, url: str, auth_user: str = "0"
+) -> str:
+    """Navigate page to target AI Studio URL, tolerating net::ERR_ABORTED if already on target."""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout_s=20.0)
+    except RuntimeError as nav_exc:
+        if "net::ERR_ABORTED" in str(nav_exc):
+            curr = page.url or ""
+            with suppress(Exception):
+                eval_url = await page.evaluate(
+                    "() => window.location.href", timeout_s=2.0
+                )
+                if eval_url:
+                    curr = str(eval_url)
+            expected_match = (
+                f"/u/{auth_user}/"
+                if auth_user and auth_user != "0"
+                else "aistudio.google.com"
+            )
+            curr_parsed = urlsplit(curr)
+            if is_aistudio_page_url(curr) and (
+                expected_match in curr_parsed.path
+                or expected_match == "aistudio.google.com"
+            ):
+                log.debug("页面导航被终止但已处于 AI Studio 域: %s", curr)
+            else:
+                raise
+        else:
+            raise
+
+    current_url = page.url or ""
+    with suppress(Exception):
+        eval_url = await page.evaluate("() => window.location.href", timeout_s=2.0)
+        if eval_url:
+            current_url = str(eval_url)
+    return current_url
+
+
 async def navigate_to_aistudio(
     page: CDPPage,
     auth_user: str = "0",
@@ -276,45 +461,9 @@ async def navigate_to_aistudio(
     target_urls = get_aistudio_urls(auth_user=auth_user)
     for url in target_urls:
         try:
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout_s=20.0)
-            except RuntimeError as nav_exc:
-                if "net::ERR_ABORTED" in str(nav_exc):
-                    curr = page.url or ""
-                    with suppress(Exception):
-                        eval_url = await page.evaluate(
-                            "() => window.location.href", timeout_s=2.0
-                        )
-                        if eval_url:
-                            curr = str(eval_url)
-                    expected_match = (
-                        f"/u/{auth_user}/"
-                        if auth_user and auth_user != "0"
-                        else "aistudio.google.com"
-                    )
-                    curr_parsed = urlsplit(curr)
-                    curr_host = (curr_parsed.hostname or "").lower()
-                    is_aistudio = (
-                        curr_host == "aistudio.google.com"
-                        or curr_host.endswith(".aistudio.google.com")
-                    )
-                    if is_aistudio and (
-                        expected_match in curr_parsed.path
-                        or expected_match == "aistudio.google.com"
-                    ):
-                        log.debug("页面导航被终止但已处于 AI Studio 域: %s", curr)
-                    else:
-                        raise
-                else:
-                    raise
-
-            current_url = page.url or ""
-            with suppress(Exception):
-                eval_url = await page.evaluate(
-                    "() => window.location.href", timeout_s=2.0
-                )
-                if eval_url:
-                    current_url = str(eval_url)
+            current_url = await _goto_url_with_abort_tolerance(
+                page, url, auth_user=auth_user
+            )
 
             if "available-regions" in current_url:
                 raise RuntimeError(
@@ -325,17 +474,35 @@ async def navigate_to_aistudio(
                     "访问 AI Studio 后检测到重定向至登录页: %s，尝试重新注入 Cookie...",
                     current_url,
                 )
-                if await load_cookies_to_page(page, auth_file):
-                    return
-                raise SessionExpiredError(
-                    f"Cookie 认证失败，已被重定向到 Google 登录页。 (url={current_url})"
+                if not await load_cookies_to_page(page, auth_file):
+                    raise SessionExpiredError(
+                        f"Cookie 认证失败，已被重定向到 Google 登录页。 (url={current_url})"
+                    )
+                current_url = await _goto_url_with_abort_tolerance(
+                    page, url, auth_user=auth_user
                 )
+                if "available-regions" in current_url:
+                    raise RuntimeError(
+                        f"Google AI Studio 地区限制 (IP 漏了/不支持): {current_url}"
+                    )
+                if is_login_page_url(current_url) or not is_aistudio_page_url(
+                    current_url
+                ):
+                    raise SessionExpiredError(
+                        f"Cookie 认证失败，重新注入并导航后仍处于登录页。 (url={current_url})"
+                    )
 
             for _ in range(15):
                 with suppress(Exception):
                     if await page.evaluate("() => !!window.default_MakerSuite"):
                         break
                 await page.wait_for_timeout(500)
+
+            curr_after_wait = getattr(page, "url", "") or ""
+            if is_login_page_url(curr_after_wait):
+                raise SessionExpiredError(
+                    f"Cookie 认证失败，等待页面就绪期间重定向到 Google 登录页。 (url={curr_after_wait})"
+                )
 
             if verify_identity_cb is not None:
                 is_verified = await verify_identity_cb(page)
@@ -349,7 +516,11 @@ async def navigate_to_aistudio(
                     await save_browser_cookies(page, auth_file)
             return
         except Exception as exc:
-            if "地区限制" in str(exc) or "Cookie 认证失败" in str(exc):
+            if (
+                isinstance(exc, SessionExpiredError)
+                or "地区限制" in str(exc)
+                or "Cookie 认证失败" in str(exc)
+            ):
                 raise exc
             log.debug("访问 %s 失败: %s", url, exc)
             last_exc = exc

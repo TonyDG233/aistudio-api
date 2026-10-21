@@ -134,6 +134,10 @@ class AccountService:
         """更新账号的登录邮箱。"""
         return self._store.update_account_email(account_id, email)
 
+    def update_account_tier(self, account_id: str, tier: str) -> bool:
+        """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
+        return self._store.update_account_tier(account_id, tier)
+
     def save_account_from_cookies(
         self,
         *,
@@ -143,6 +147,7 @@ class AccountService:
         account_id: str | None = None,
         auth_user: str = "0",
         cookie_id: str | None = None,
+        tier: str = "Free",
     ) -> AccountMeta:
         """从 Cookie 存储状态保存新账号。"""
         return self._store.save_account(
@@ -152,6 +157,7 @@ class AccountService:
             account_id=account_id,
             auth_user=auth_user,
             cookie_id=cookie_id,
+            tier=tier,
         )
 
     def batch_import_accounts(
@@ -165,6 +171,8 @@ class AccountService:
         imported: list[AccountMeta] = []
         for p in probed_list:
             u_idx = str(p.get("auth_user") or "0")
+            tier = str(p.get("tier") or "Free")
+            email_val = str(p["email"]) if p.get("email") else None
             acc_name = (
                 f"{prefix} (u/{u_idx})"
                 if len(probed_list) > 1 or u_idx != "0"
@@ -172,10 +180,11 @@ class AccountService:
             )
             account = self._store.save_account(
                 name=acc_name,
-                email=None,
+                email=email_val,
                 storage_state=storage_state,
                 auth_user=u_idx,
                 cookie_id=cookie_id,
+                tier=tier,
             )
             imported.append(account)
 

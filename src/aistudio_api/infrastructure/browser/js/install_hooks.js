@@ -1,5 +1,7 @@
 ((() => {
     window.__AISTUDIO__ = window.__AISTUDIO__ || {};
+    window.__AISTUDIO__.interceptBootstrap = true;
+    window.__AISTUDIO__.capturedTemplate = null;
     if (window.__AISTUDIO__.hooked && window.__AISTUDIO__.snapKey) return 'already_hooked';
 
     const dms = window.default_MakerSuite;
@@ -46,17 +48,54 @@
         dms[snapKey].__api_hooked = true;
     }
 
-    // Intercept prompt save requests in-page to avoid polluting user account history
+    // Intercept prompt save requests and one-shot bootstrap GenerateContent in-page
     if (!window.__api_fetch_hooked && typeof window.fetch === 'function') {
         const origFetch = window.fetch;
         window.fetch = function(...args) {
             try {
-                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+                const req = args[0];
+                const init = args[1] || {};
+                const url = typeof req === 'string' ? req : (req && req.url ? req.url : '');
                 if (url.includes('SavePrompt') || url.includes('CreatePrompt')) {
                     return (async () => new Response(JSON.stringify([]), {
                         status: 200,
                         headers: { 'Content-Type': 'application/json+protobuf' }
                     }))();
+                }
+                if (
+                    window.__AISTUDIO__ &&
+                    window.__AISTUDIO__.interceptBootstrap &&
+                    url.includes('GenerateContent') &&
+                    !url.includes('Count')
+                ) {
+                    const rawBody = init.body !== undefined ? init.body : '';
+                    const bodyStr = typeof rawBody === 'string' ? rawBody : '';
+                    if (bodyStr) {
+                        const headersObj = { 'Referer': 'https://aistudio.google.com/' };
+                        const rawHeaders = init.headers || (req && req.headers);
+                        if (rawHeaders) {
+                            if (typeof rawHeaders.forEach === 'function') {
+                                rawHeaders.forEach((v, k) => { headersObj[String(k)] = String(v); });
+                            } else if (Array.isArray(rawHeaders)) {
+                                for (const pair of rawHeaders) {
+                                    if (pair && pair.length >= 2) {
+                                        headersObj[String(pair[0])] = String(pair[1]);
+                                    }
+                                }
+                            } else if (typeof rawHeaders === 'object') {
+                                for (const k of Object.keys(rawHeaders)) {
+                                    headersObj[String(k)] = String(rawHeaders[k]);
+                                }
+                            }
+                        }
+                        window.__AISTUDIO__.capturedTemplate = {
+                            url: url,
+                            headers: headersObj,
+                            body: bodyStr
+                        };
+                        window.__AISTUDIO__.interceptBootstrap = false;
+                        return Promise.reject(new DOMException('Bootstrap GenerateContent intercepted', 'AbortError'));
+                    }
                 }
             } catch(e) {}
             return origFetch.apply(this, args);
@@ -64,6 +103,61 @@
         window.__api_fetch_hooked = true;
     }
 
+    if (!window.__api_xhr_hooked && typeof window.XMLHttpRequest === 'function') {
+        const proto = window.XMLHttpRequest.prototype;
+        const origOpen = proto.open;
+        const origSetHeader = proto.setRequestHeader;
+        const origSend = proto.send;
+
+        proto.open = function(method, url, ...rest) {
+            try {
+                this.__aistudio_method = String(method || 'GET');
+                this.__aistudio_url = String(url || '');
+                this.__aistudio_headers = { 'Referer': 'https://aistudio.google.com/' };
+            } catch(e) {}
+            return origOpen.call(this, method, url, ...rest);
+        };
+
+        proto.setRequestHeader = function(name, value) {
+            try {
+                if (!this.__aistudio_headers) {
+                    this.__aistudio_headers = { 'Referer': 'https://aistudio.google.com/' };
+                }
+                this.__aistudio_headers[String(name)] = String(value);
+            } catch(e) {}
+            return origSetHeader.call(this, name, value);
+        };
+
+        proto.send = function(body) {
+            try {
+                const url = this.__aistudio_url || '';
+                if (url.includes('SavePrompt') || url.includes('CreatePrompt')) {
+                    setTimeout(() => { try { this.abort(); } catch(e) {} }, 0);
+                    return;
+                }
+                if (
+                    window.__AISTUDIO__ &&
+                    window.__AISTUDIO__.interceptBootstrap &&
+                    url.includes('GenerateContent') &&
+                    !url.includes('Count')
+                ) {
+                    const bodyStr = typeof body === 'string' ? body : '';
+                    if (bodyStr) {
+                        window.__AISTUDIO__.capturedTemplate = {
+                            url: url,
+                            headers: Object.assign({}, this.__aistudio_headers || {}),
+                            body: bodyStr
+                        };
+                        window.__AISTUDIO__.interceptBootstrap = false;
+                        setTimeout(() => { try { this.abort(); } catch(e) {} }, 0);
+                        return;
+                    }
+                }
+            } catch(e) {}
+            return origSend.call(this, body);
+        };
+        window.__api_xhr_hooked = true;
+    }
     window.__AISTUDIO__.hooked = true;
     window.__AISTUDIO__.snapKey = snapKey;
     return 'hooked:' + snapKey;

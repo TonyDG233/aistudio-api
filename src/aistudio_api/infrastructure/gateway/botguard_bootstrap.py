@@ -24,6 +24,12 @@ BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
 
 async def install_page_hooks(page: CDPPage) -> str:
     """Install WAA service hooks on page and extract snapshot function key."""
+    initial_url = getattr(page, "url", "") or ""
+    if is_login_page_url(initial_url):
+        raise SessionExpiredError(
+            f"Cookie 认证失效，当前页面为 Google 登录页: {initial_url}"
+        )
+
     result = await page.evaluate(INSTALL_HOOKS_JS)
     if result == "already_hooked":
         snap_key = await page.evaluate("() => window.__AISTUDIO__?.snapKey || ''")
@@ -35,6 +41,11 @@ async def install_page_hooks(page: CDPPage) -> str:
 
     for _ in range(3):
         await page.wait_for_timeout(1500)
+        curr_url = getattr(page, "url", "") or ""
+        if is_login_page_url(curr_url):
+            raise SessionExpiredError(
+                f"Cookie 认证失效，当前页面为 Google 登录页: {curr_url}"
+            )
         result = await page.evaluate(INSTALL_HOOKS_JS)
         if result == "already_hooked":
             snap_key = await page.evaluate("() => window.__AISTUDIO__?.snapKey || ''")
@@ -45,7 +56,18 @@ async def install_page_hooks(page: CDPPage) -> str:
             return result.split(":", 1)[1]
 
     page_url = getattr(page, "url", "(unknown)")
+    if is_login_page_url(str(page_url)):
+        raise SessionExpiredError(
+            f"Cookie 认证失效，当前页面为 Google 登录页: {page_url}"
+        )
     page_title = await page.title()
+    if (
+        isinstance(page_title, str)
+        and "sign in - google accounts" in page_title.lower()
+    ):
+        raise SessionExpiredError(
+            f"Cookie 认证失效，当前页面为 Google 登录页: {page_url} (title={page_title!r})"
+        )
     raise RuntimeError(
         f"Hook install failed: {result} (url={page_url}, title={page_title!r})"
     )
@@ -142,7 +164,10 @@ async def bootstrap_botguard_and_template(
         raise RuntimeError(
             "Google AI Studio 地区限制: 访问被重定向至 available-regions"
         )
-
+    if is_login_page_url(current_url):
+        raise SessionExpiredError(
+            f"Cookie 认证失效，当前页面为 Google 登录页: {current_url}"
+        )
     snap_key = await install_page_hooks(page)
 
     t0 = time.time()
@@ -238,14 +263,39 @@ async def bootstrap_botguard_and_template(
 
             await page.wait_for_timeout(1000)
             if await page.evaluate("() => !!window.__AISTUDIO__?.service"):
+                if not captured:
+                    with suppress(Exception):
+                        in_page_tpl = await page.evaluate(
+                            "() => window.__AISTUDIO__?.capturedTemplate || null"
+                        )
+                        if (
+                            isinstance(in_page_tpl, dict)
+                            and in_page_tpl.get("url")
+                            and in_page_tpl.get("body")
+                        ):
+                            captured["url"] = str(in_page_tpl["url"])
+                            captured["headers"] = in_page_tpl.get("headers") or {}
+                            captured["body"] = str(in_page_tpl["body"])
                 with suppress(Exception):
                     await page.evaluate(STOP_GENERATION_JS)
                 if not captured:
                     for _ in range(25):
                         if captured:
                             break
+                        with suppress(Exception):
+                            in_page_tpl = await page.evaluate(
+                                "() => window.__AISTUDIO__?.capturedTemplate || null"
+                            )
+                            if (
+                                isinstance(in_page_tpl, dict)
+                                and in_page_tpl.get("url")
+                                and in_page_tpl.get("body")
+                            ):
+                                captured["url"] = str(in_page_tpl["url"])
+                                captured["headers"] = in_page_tpl.get("headers") or {}
+                                captured["body"] = str(in_page_tpl["body"])
+                                break
                         await page.wait_for_timeout(100)
-
                 await page.fill("textarea", original_text)
                 with suppress(Exception):
                     await page.evaluate(DOM_GC_CLEANUP_JS)
@@ -265,5 +315,9 @@ async def bootstrap_botguard_and_template(
         raise RuntimeError(f"BotGuardService capture timeout after {max_wait_seconds}s")
     finally:
         unsub()
+        with suppress(Exception):
+            await page.evaluate(
+                "() => { if (window.__AISTUDIO__) window.__AISTUDIO__.interceptBootstrap = false; }"
+            )
         with suppress(Exception):
             await page.fill("textarea", original_text)
