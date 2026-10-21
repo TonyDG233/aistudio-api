@@ -806,8 +806,12 @@ class BuildSurface:
         self._context_id = context_id
         self._realm_id = realm_id
         self.state = BuildSurfaceState()
+        # One page has exactly one navigation/recovery writer.  The slot-level
+        # build_lock does not protect direct client calls, so keep the lock here.
+        self._ensure_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._signer_task: asyncio.Task[None] | None = None
 
     def _connections(self) -> list[object]:
         return _realm_connections(self._realm_id)
@@ -976,10 +980,34 @@ class BuildSurface:
         account_id: str | None = None,
         ready_timeout_s: float = BUILD_SURFACE_READY_TIMEOUT_S,
     ) -> BuildSurfaceState:
+        """Serialize readiness so concurrent requests never navigate one page."""
+        async with self._ensure_lock:
+            return await self._ensure_ready_impl(
+                auth_file,
+                auth_user,
+                account_id=account_id,
+                ready_timeout_s=ready_timeout_s,
+            )
+
+    async def _ensure_ready_impl(
+        self,
+        auth_file: str | None,
+        auth_user: str = "0",
+        *,
+        account_id: str | None = None,
+        ready_timeout_s: float = BUILD_SURFACE_READY_TIMEOUT_S,
+    ) -> BuildSurfaceState:
         """Create/attach the host page and wait for the signer to capture token material."""
         state = self.state
         same_auth = state.auth_file == auth_file
         state.app_id = self.app_id
+        if state.in_flight_count > 0 and not (same_auth and state.ready):
+            raise BuildSurfaceError(
+                "ensure_ready",
+                "BUILD_BUSY",
+                "Build 页面仍有在途请求，禁止换账号或重载",
+                "等待在途请求结束后再切换 build 账号",
+            )
 
         # 复用快路径（2026-10-18 通信优化）：页面存活 + 已就绪 + 账号未变时免去
         # 重导航/重过门/重暖机；WS 断开则先试原地恢复（Ark 轻量重连思路），
@@ -1010,6 +1038,8 @@ class BuildSurface:
         state.native_ready = False
         state.signer_ready = False
         state.signer_error = ""
+        if self._signer_task is not None and not self._signer_task.done():
+            self._signer_task.cancel()
 
         page = state.page
         created = False
@@ -1139,11 +1169,10 @@ class BuildSurface:
             if signer_available:
                 # 主动 warmup（装置实证机制，spikeQ3/Q4）：经 9998 WS 向 app 内嵌客户端下发
                 # __warmup__ 规格 → 宿主发起一次被吞没的 RPC → tb 捕获 + 收割头就位（零上游流量）。
+                # native 已就绪，signer 只是备用路径；探测放后台，禁止阻塞请求 dispatch。
                 await self._trigger_warmup()
-                await self._wait_for_signer_ready(
-                    page,
-                    ready_timeout_s=min(20.0, ready_timeout_s),
-                    strict=False,
+                self._schedule_signer_probe(
+                    page, timeout_s=min(20.0, ready_timeout_s)
                 )
             else:
                 state.signer_ready = False
@@ -1157,6 +1186,27 @@ class BuildSurface:
             raise
         self._start_watchdog()
         return state
+
+    def _schedule_signer_probe(self, page: CDPPage, *, timeout_s: float) -> None:
+        task = asyncio.create_task(
+            self._probe_signer_background(page, timeout_s=timeout_s),
+            name=f"build-signer-{self._realm_id or 'default'}",
+        )
+        self._signer_task = task
+
+    async def _probe_signer_background(
+        self, page: CDPPage, *, timeout_s: float
+    ) -> None:
+        try:
+            await self._wait_for_signer_ready(
+                page, ready_timeout_s=timeout_s, strict=False
+            )
+        except asyncio.CancelledError:
+            raise
+        except BuildSurfaceError as exc:
+            logger.warning("[build] 签名器后台探测结束: %s", exc)
+        except Exception as exc:
+            logger.debug("[build] 签名器后台探测异常: %s", exc)
 
     async def _dismiss_interstitials(
         self, page: CDPPage, *, max_rounds: int = 12
@@ -1279,6 +1329,9 @@ class BuildSurface:
             page = self.state.page
             if page is None or page.is_closed():
                 return
+            if self._ensure_lock.locked():
+                # A full readiness rebuild owns the page; never race its navigation.
+                continue
             if self._connections():
                 disconnected_since = None
                 continue

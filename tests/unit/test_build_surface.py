@@ -212,6 +212,12 @@ def _surface(page: FakePage) -> bs.BuildSurface:
     return surface
 
 
+async def _await_signer_probe(surface: bs.BuildSurface) -> None:
+    task = surface._signer_task
+    if task is not None:
+        await task
+
+
 @pytest.fixture
 def fast_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Skip interstitial/gate loops in unit tests (covered by live acceptance)."""
@@ -406,7 +412,10 @@ async def test_ensure_ready_success(
     surface = _build_surface(page)
     state = await surface.ensure_ready(_auth_file(tmp_path), "0", account_id="acc-1")
     assert state.ready is True
+    assert state.native_ready is True
+    await _await_signer_probe(surface)
     assert state.ready_state == "ready"
+    assert state.signer_ready is True
     assert state.harvest == {"tb": {"mb": {}}}
     assert state.app_id == bs.DEFAULT_BUILD_APP_ID
     assert page.blocked == ["*analytics*"]
@@ -434,6 +443,7 @@ async def test_ensure_ready_keeps_native_when_makersuite_missing(
     )
     surface = _build_surface(page)
     state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    await _await_signer_probe(surface)
     assert state.native_ready is True
     assert state.ready is True
     assert state.signer_ready is False
@@ -451,6 +461,7 @@ async def test_ensure_ready_keeps_native_when_signer_funcs_drift(
     )
     surface = _build_surface(page)
     state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    await _await_signer_probe(surface)
     assert state.native_ready is True
     assert state.signer_ready is False
     assert "签名脚本未注入" in state.signer_error
@@ -467,6 +478,7 @@ async def test_ensure_ready_keeps_native_when_tb_missing(
     )
     surface = _build_surface(page)
     state = await surface.ensure_ready(_auth_file(tmp_path), ready_timeout_s=0.01)
+    await _await_signer_probe(surface)
     assert state.native_ready is True
     assert state.ready is True
     assert state.signer_ready is False
@@ -481,10 +493,48 @@ async def test_ensure_ready_records_signer_failure_without_blocking_native(
     page = FakePage(states=[{"state": "failed", "lastError": "hook target missing"}])
     surface = _build_surface(page)
     state = await surface.ensure_ready(_auth_file(tmp_path))
+    await _await_signer_probe(surface)
     assert state.native_ready is True
     assert state.ready is True
     assert state.signer_ready is False
     assert state.signer_error == "hook target missing"
+
+
+async def test_ensure_ready_serializes_concurrent_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = _build_surface(FakePage())
+    active = 0
+    max_active = 0
+
+    async def fake_impl(*_args: object, **_kwargs: object) -> bs.BuildSurfaceState:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.03)
+            return surface.state
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(surface, "_ensure_ready_impl", fake_impl)
+    await asyncio.gather(
+        surface.ensure_ready("a.json", "0"),
+        surface.ensure_ready("a.json", "0"),
+    )
+    assert max_active == 1
+
+
+async def test_ensure_ready_rejects_account_change_while_in_flight() -> None:
+    surface = _build_surface(FakePage())
+    surface.state.auth_file = "a.json"
+    surface.state.ready = True
+    surface.state.native_ready = True
+    surface.state.task_queues["rid-1"] = asyncio.Queue()
+
+    with pytest.raises(bs.BuildSurfaceError) as exc:
+        await surface.ensure_ready("b.json", "0")
+    assert exc.value.code == "BUILD_BUSY"
 
 
 async def test_ensure_ready_signer_script_missing_still_enables_native(

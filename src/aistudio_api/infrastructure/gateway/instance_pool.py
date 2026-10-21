@@ -109,8 +109,17 @@ class InstanceSlot:
 
     def build_ready(self) -> bool:
         page = self.build_page
+        state = getattr(self.build_surface, "state", None)
         try:
-            return page is not None and not page.is_closed()
+            return bool(
+                page is not None
+                and not page.is_closed()
+                and getattr(state, "ready", False)
+                and (
+                    getattr(state, "native_ready", False)
+                    or getattr(state, "signer_ready", False)
+                )
+            )
         except Exception:
             return False
 

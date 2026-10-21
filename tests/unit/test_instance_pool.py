@@ -53,7 +53,16 @@ class FakeBuildSurface:
     def __init__(self, *, context_id: str, realm_id: str) -> None:
         self.context_id = context_id
         self.realm_id = realm_id
-        self.state = type("State", (), {"page": FakePage()})()
+        self.state = type(
+            "State",
+            (),
+            {
+                "page": FakePage(),
+                "ready": True,
+                "native_ready": True,
+                "signer_ready": False,
+            },
+        )()
 
     async def ensure_ready(self, *_args, **_kwargs) -> None:
         return None
@@ -846,6 +855,35 @@ async def test_close_channel_only_closes_one_page(monkeypatch) -> None:
     assert chat.build_ready() is True
     assert pool.page_counts() == {"chat": 1, "build": 1}
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_build_acquire_waits_until_surface_ready(monkeypatch) -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=2)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_ensure(self: InstanceSlot, _cdp):
+        started.set()
+        await release.wait()
+        if self.build_surface is None:
+            self.build_surface = FakeBuildSurface(
+                context_id=self.context_id, realm_id=self.realm_id
+            )
+        return self.build_surface
+
+    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
+    task = asyncio.create_task(
+        pool.acquire(account_id="a", auth_file="a.json", channel="build")
+    )
+    await started.wait()
+    await asyncio.sleep(0.01)
+    assert task.done() is False
+
+    release.set()
+    lease = await task
+    assert lease.adapter.build_ready() is True
 
 
 @pytest.mark.asyncio
