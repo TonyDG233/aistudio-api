@@ -59,7 +59,8 @@ _VALID_SURFACES = ("chat", "build")
 
 # 面策略错误 code -> HTTP 状态；未列出者统一 403（策略拒绝语义）。
 _HTTP_STATUS_BY_CODE = {
-    "surface_quota_exceeded": 429,
+    "surface_quota_exceeded": 503,
+    "surface_instance_busy": 503,
     "surface_switch_exhausted": 503,
     "surface_instance_not_ready": 503,
     "surface_no_capable_account": 403,

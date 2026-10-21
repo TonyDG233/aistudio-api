@@ -365,15 +365,15 @@ def test_check_instance_quota_raises_when_full() -> None:
     with pytest.raises(SurfacePolicyError) as err:
         check_instance_quota("free", 2, 2, "build", need_new=True)
     assert err.value.code == "surface_quota_exceeded"
-    assert err.value.http_status == 429
+    assert err.value.http_status == 503
     assert "free" in err.value.message
     assert "2" in err.value.message
 
 
 def test_surface_policy_error_status_code_alias() -> None:
     err = SurfacePolicyError("surface_quota_exceeded", message="m", advice="a")
-    assert err.status_code == 429
-    assert err.http_status == 429
+    assert err.status_code == 503
+    assert err.http_status == 503
     other = SurfacePolicyError("surface_model_guard", message="m", advice="a")
     assert other.status_code == 403
 

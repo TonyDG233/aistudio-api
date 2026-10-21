@@ -410,7 +410,7 @@ async def test_acquire_loads_candidate_account_and_releases(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_capacity_error_maps_to_explicit_429(monkeypatch) -> None:
+async def test_capacity_error_maps_to_explicit_503(monkeypatch) -> None:
     pipe, _ = _pipeline(
         monkeypatch,
         [Account("pro-1", tier="pro")],

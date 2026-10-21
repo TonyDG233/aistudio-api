@@ -155,6 +155,20 @@ class AIStudioClient:
             self._realm_replay[realm_id] = service
         return service
 
+    async def _build_lease_auth(self, lease) -> tuple[str | None, str]:
+        """Resolve build auth from the lease, never from the global PG session."""
+        adapter = getattr(lease, "adapter", None) if lease is not None else None
+        auth_file = getattr(adapter, "auth_file", None)
+        auth_user = str(getattr(adapter, "auth_user", "0") or "0")
+        if auth_file:
+            return auth_file, auth_user
+        if lease is None:
+            ctx = self._session.active_context
+            if ctx is None:
+                ctx = await self._session.ensure_ready()
+            return ctx.auth_file, str(ctx.auth_user or "0")
+        raise RequestError(503, "build lease missing auth_file")
+
     async def _ensure_lease_build_surface(self, lease) -> BuildSurface:
         adapter = getattr(lease, "adapter", None)
         if adapter is None:
@@ -571,14 +585,12 @@ class AIStudioClient:
                 )
             if lease is None:
                 self._enforce_build_instance_quota()
-            ctx = session.active_context
-            if ctx is None:
-                ctx = await session.ensure_ready()
+            auth_file, auth_user = await self._build_lease_auth(lease)
             async with self._session.request_scope():
                 build_surface = await self._ensure_lease_build_surface(lease)
                 await build_surface.ensure_ready(
-                    ctx.auth_file,
-                    ctx.auth_user,
+                    auth_file,
+                    auth_user,
                     account_id=getattr(lease, "account_id", None),
                 )
                 async for event in build_surface.stream_generate(
@@ -683,14 +695,12 @@ class AIStudioClient:
                 )
             if lease is None:
                 self._enforce_build_instance_quota()
-            ctx = session.active_context
-            if ctx is None:
-                ctx = await session.ensure_ready()
+            auth_file, auth_user = await self._build_lease_auth(lease)
             async with self._session.request_scope():
                 build_surface = await self._ensure_lease_build_surface(lease)
                 await build_surface.ensure_ready(
-                    ctx.auth_file,
-                    ctx.auth_user,
+                    auth_file,
+                    auth_user,
                     account_id=getattr(lease, "account_id", None),
                 )
                 return await self._collect_build_output(

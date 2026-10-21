@@ -441,14 +441,19 @@ class RoutingPipeline:
                 group_max_pages=candidate.group.max_pages,
             )
         except InstanceCapacityError as exc:
+            capacity_code = (
+                "surface_instance_busy"
+                if ctx.channel == "build"
+                else "surface_quota_exceeded"
+            )
             if not ctx.borrow_enabled:
                 _raise(
-                    "surface_quota_exceeded",
+                    capacity_code,
                     message=(
                         f"渠道 '{ctx.channel}' 实例预算已满，无法为账号 "
                         f"'{candidate.account_id}' 装载/切换实例。"
                     ),
-                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
+                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
                 )
             borrow_ids = {
                 item.account_id
@@ -458,9 +463,9 @@ class RoutingPipeline:
             }
             if not borrow_ids:
                 _raise(
-                    "surface_quota_exceeded",
+                    capacity_code,
                     message=f"渠道 '{ctx.channel}' 无空闲可借实例：{exc}",
-                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
+                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
                 )
             try:
                 lease = await self.pool.acquire(
@@ -476,9 +481,9 @@ class RoutingPipeline:
                 )
             except InstanceCapacityError as borrow_exc:
                 _raise(
-                    "surface_quota_exceeded",
+                    capacity_code,
                     message=(f"渠道 '{ctx.channel}' 无可用/可借实例：{borrow_exc}"),
-                    advice="请提高 max_contexts、释放闲置槽位，或稍后重试。",
+                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
                 )
         logger.info(
             "[surface] request=%s account=%s channel=%s realm=%s slot=%s borrow=%s step=⑤",

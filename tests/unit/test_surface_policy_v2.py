@@ -145,8 +145,9 @@ def test_group_identity_is_stable() -> None:
         ("surface_no_capable_account", 403),
         ("surface_channel_disabled", 403),
         ("surface_model_guard", 403),
-        ("surface_quota_exceeded", 429),
-        ("surface_switch_exhausted", 503),
+            ("surface_quota_exceeded", 503),
+            ("surface_instance_busy", 503),
+            ("surface_switch_exhausted", 503),
         ("surface_instance_not_ready", 503),
     ],
 )

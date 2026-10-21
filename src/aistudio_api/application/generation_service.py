@@ -210,6 +210,21 @@ async def _acquire_candidate_lease(
         try:
             return candidate, await pipe.acquire(ctx, candidate)
         except SurfacePolicyError as exc:
+            if exc.code == "surface_instance_busy":
+                # A build instance is a single page.  Wait for that instance to
+                # free instead of walking candidates and trying to bind another
+                # account to a channel that has no second slot.
+                if ctx.budget.can_defer():
+                    ctx.budget.record_defer("build_instance_busy")
+                    logger.warning(
+                        "[surface:defer] request=%s waiting for build instance "
+                        "budget=%s",
+                        ctx.request_id,
+                        ctx.budget.snapshot(),
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
             if exc.code != "surface_quota_exceeded":
                 raise
             last_capacity = exc

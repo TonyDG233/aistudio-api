@@ -269,7 +269,7 @@ def test_client_quota_check_raises_request_error_when_over_limit(
     with pytest.raises(RequestError) as excinfo:
         client._enforce_build_instance_quota()
     err = excinfo.value
-    assert err.status == 429
+    assert err.status == 503
     text = str(err)
     assert "surface_quota_exceeded" in text
     assert "处置建议" in text
@@ -323,5 +323,5 @@ async def test_build_stream_branch_enforces_quota_before_surface_ready(
         )
         async for _ in agen:
             pass
-    assert excinfo.value.status == 429
+    assert excinfo.value.status == 503
     assert calls == [("free", 3, 3, "build", True)]
