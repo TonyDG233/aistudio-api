@@ -155,6 +155,9 @@ def test_refresh_uses_account_auth_user(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert transport.requests[0].headers["x-goog-authuser"] == "1"
+    assert transport.requests[0].headers["x-goog-ext-519733851-bin"]
+    assert transport.requests[0].headers["x-ai-studio-visit-id"].startswith("v1_")
+    assert "authorization" in transport.requests[0].headers
 
 
 def test_email_fetch_uses_account_auth_user(tmp_path: Path) -> None:

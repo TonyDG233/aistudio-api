@@ -18,6 +18,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
@@ -25,7 +26,10 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 
 from aistudio_api.config import settings
-from aistudio_api.infrastructure.account.cookie_parser import calculate_sapisid_hash
+from aistudio_api.infrastructure.account.cookie_parser import (
+    DEFAULT_EXT_BIN,
+    calculate_sapisid_hash,
+)
 from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -269,12 +273,20 @@ class AccountInfoRefresher:
 
         error_text = f"HTTP {response.status}{f': {message}' if message else ''}"
         if response.status == 401:
-            self._store.update_account_refresh(account.id, expired=True)
             logger.warning(
                 "[Refresh] %s credentials invalid (401), marked as expired; "
-                "credential expired, re-import cookies",
+                "credential expired, re-import cookies "
+                "(authuser=%s, cookies=%d, sapisid=%s, authorization=%s, body=%s)",
                 account.id,
+                account.auth_user,
+                len(cookies.jar),
+                bool(
+                    cookies.jar.get("SAPISID") or cookies.jar.get("__Secure-1PAPISID")
+                ),
+                bool(self._build_authorization(cookies.jar)),
+                message or "-",
             )
+            self._store.update_account_refresh(account.id, expired=True)
             return RefreshResult(
                 account_id=account.id,
                 ok=False,
@@ -440,6 +452,8 @@ class AccountInfoRefresher:
             "user-agent": USER_AGENT,
             "x-goog-api-key": self._web_api_key,
             "x-goog-authuser": str(auth_user or "0"),
+            "x-goog-ext-519733851-bin": DEFAULT_EXT_BIN,
+            "x-ai-studio-visit-id": f"v1_{uuid.uuid4()}",
             "x-user-agent": "grpc-web-javascript/0.1",
         }
         if cookies.header:
