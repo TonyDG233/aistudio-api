@@ -265,7 +265,7 @@
             }
         }
         service._selfTestError = failures.join(" | ").slice(0, 500);
-        safeLog("signer self-test failed candidates=" + service._signerCandidates.length + " tb=" + (service._tb ? "yes" : "no") + " error=" + service._selfTestError);
+        safeLog("signer self-test failed candidates=" + service._signerCandidates.length + " tb=" + (service._tb ? "yes" : "no") + " origin=" + (service._tbOrigin || "none") + " error=" + service._selfTestError);
         return false;
     }
 
@@ -866,7 +866,14 @@
         // 本地 warmup（零上游流量）：只做 token 捕获与一次零额度自检，不生成内容。
         if (model === WARMUP_MARKER) {
             try {
-                acquireToken();
+                // Warmup is the explicit recovery signal: refresh the token and
+                // allow one fresh self-test even if an earlier attempt failed.
+                acquireToken(true);
+                if (!service._selfTested) {
+                    service._selfTestAttempted = false;
+                    service._selfTestAttempts = 0;
+                    service._selfTestError = "";
+                }
                 await selfTest();
             } catch (e) {
                 /* 自检失败由外层超时诊断兜底；不记录凭据 */
@@ -1081,6 +1088,12 @@
                     if (!service._tb || nextKeyed || !currentKeyed) {
                         service._tb = a;
                         service._tbOrigin = "hook:" + candidate.key;
+                    }
+                    // A newly observed token is a new opportunity to self-test.
+                    // Do not let a previous failed attempt poison the page forever.
+                    if (!service._selfTested && service._selfTestAttempted) {
+                        service._selfTestAttempted = false;
+                        service._selfTestError = "";
                     }
                 }
                 return original.apply(this, arguments);

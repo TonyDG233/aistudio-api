@@ -111,6 +111,19 @@ def test_build_signer_key_source_is_harvested_header():
     assert '"x-goog-api-key"' in allowlist_block
 
 
+def test_build_signer_retries_self_test_after_token_or_warmup():
+    """A failed self-test must not poison the page forever.
+
+    Warmup force-refreshes the token, resets the attempt gate, and a newly
+    observed hook token clears the attempt gate as well.
+    """
+    js = _signer_js()
+    assert "acquireToken(true)" in js
+    assert "service._selfTestAttempts = 0" in js
+    assert "service._selfTestAttempted = false" in js
+    assert "if (!service._selfTested && service._selfTestAttempted)" in js
+
+
 # ------------------------------------------------------------- blocklist split
 
 

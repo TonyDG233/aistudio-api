@@ -806,6 +806,8 @@ class BuildSurface:
         self._context_id = context_id
         self._realm_id = realm_id
         self.state = BuildSurfaceState()
+        self._recovery_lock = asyncio.Lock()
+        self._watchdog_task: asyncio.Task[None] | None = None
 
     def _connections(self) -> list[object]:
         return _realm_connections(self._realm_id)
@@ -998,6 +1000,7 @@ class BuildSurface:
                 self._realm_id or "default",
                 len(connections),
             )
+            self._start_watchdog()
             return state
 
         state.auth_file = auth_file
@@ -1152,6 +1155,7 @@ class BuildSurface:
                     await page.close()
                 state.page = None
             raise
+        self._start_watchdog()
         return state
 
     async def _dismiss_interstitials(
@@ -1191,14 +1195,32 @@ class BuildSurface:
                 return str(snapshot.get("state") or "")
         return "unknown"
 
-    async def _recover_warmup(self, page: CDPPage) -> bool:
+    async def _recover_warmup(
+        self,
+        page: CDPPage,
+        *,
+        timeout_s: float = 60.0,
+        wait_signer: bool = True,
+    ) -> bool:
+        async with self._recovery_lock:
+            return await self._recover_warmup_impl(
+                page, timeout_s=timeout_s, wait_signer=wait_signer
+            )
+
+    async def _recover_warmup_impl(
+        self,
+        page: CDPPage,
+        *,
+        timeout_s: float = 60.0,
+        wait_signer: bool = True,
+    ) -> bool:
         """页面存活但 9998 断开时的原地恢复：重过门→等连接→重发 warmup→等就绪。
 
-        对齐 Ark 的"轻量重连"思路（不重导航）：仅当连接与暖机均恢复时复用页面，
+        对齐 Ark 的「轻量重连」思路（不重导航）：仅当连接与暖机均恢复时复用页面；
         否则返回 False，交由完整重建路径（重导航）处理。
         """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 60.0
+        deadline = loop.time() + timeout_s
         connections = self._connections()
         while loop.time() < deadline and not connections:
             await self._dismiss_interstitials(page, max_rounds=2)
@@ -1208,8 +1230,9 @@ class BuildSurface:
                 break
         if not connections:
             logger.warning(
-                "[build] 原地恢复失败：realm=%s 的 9998 未在 60s 内重连，转完整重建",
+                "[build] 原地恢复失败：realm=%s 的 9998 未在 %.0fs 内重连，转完整重建",
                 self._realm_id or "default",
+                timeout_s,
             )
             return False
         await self._trigger_warmup()
@@ -1223,6 +1246,9 @@ class BuildSurface:
                 "[build] 原地恢复：原生 WS 已重连，signer 脚本缺失（仅原生）"
             )
             return True
+        if not wait_signer:
+            # 请求路径只需要原生通道；warmup 已在后台触发，signer 可就绪后自然接管。
+            return True
         if not await self._wait_for_signer_ready(
             page, ready_timeout_s=20.0, strict=False
         ):
@@ -1232,6 +1258,52 @@ class BuildSurface:
             return True
         logger.info("[build] 原地恢复成功：WS 重连 + 签名器重新就绪")
         return True
+
+    def _start_watchdog(self) -> None:
+        """Start the proactive 9998 watchdog (old Ark-style grace + reconnect)."""
+        if not self._realm_id:
+            return
+        task = self._watchdog_task
+        if task is not None and not task.done():
+            return
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(), name=f"build-ws-watchdog:{self._realm_id}"
+        )
+
+    async def _watchdog_loop(self) -> None:
+        """Reconnect 9998 after a 10s grace period, without waiting for a request."""
+        loop = asyncio.get_running_loop()
+        disconnected_since: float | None = None
+        while True:
+            await asyncio.sleep(5.0)
+            page = self.state.page
+            if page is None or page.is_closed():
+                return
+            if self._connections():
+                disconnected_since = None
+                continue
+            now = loop.time()
+            if disconnected_since is None:
+                disconnected_since = now
+                logger.warning(
+                    "[build] 9998 已断开，进入 10s 重连宽限期（realm=%s）",
+                    self._realm_id or "default",
+                )
+                continue
+            if now - disconnected_since < 10.0:
+                continue
+            logger.warning(
+                "[build] 9998 断线超过 10s，后台触发轻量重连（realm=%s）",
+                self._realm_id or "default",
+            )
+            recovered = await self._recover_warmup(
+                page, timeout_s=120.0, wait_signer=False
+            )
+            disconnected_since = None if recovered else loop.time()
+            if recovered:
+                logger.info(
+                    "[build] 后台轻量重连完成（realm=%s）", self._realm_id or "default"
+                )
 
     async def _pass_human_gate(self, page: CDPPage) -> None:
         """Best-effort trusted-input pass (mouse sweep + real click + Escape).
@@ -1449,6 +1521,9 @@ class BuildSurface:
                 f"Build 面尚未就绪 (ready_state={state.ready_state or 'unknown'})",
                 "先调用 ensure_ready 并确认返回 ready=True",
             )
+        if not self._connections() and self._realm_id:
+            logger.warning("[build] 9998 未连接，请求前等待原生通道重连...")
+            await self._recover_warmup(page, timeout_s=15.0, wait_signer=False)
         transport = _preferred_transport(state)
         if transport == "signer" and not state.signer_ready and not state.ready:
             raise BuildSurfaceError(
@@ -1483,6 +1558,39 @@ class BuildSurface:
         terminal = False
         emitted = False
         pump_task: asyncio.Task[None] | None = None
+        native_retries = 0
+
+        async def retry_native(trigger: str) -> bool:
+            """Retry native once if the WS dropped before any frame was emitted."""
+            nonlocal pump_task, native_retries
+            if (
+                transport != "native"
+                or emitted
+                or native_retries >= 1
+                or not self._realm_id
+                or page.is_closed()
+            ):
+                return False
+            native_retries += 1
+            logger.warning(
+                "[build] native 在首帧前断开，等待 9998 重连后重试（%s）", trigger
+            )
+            if pump_task is not None:
+                pump_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await pump_task
+                pump_task = None
+            _APP_WS_PENDING.pop(task_id, None)
+            while not queue.empty():
+                queue.get_nowait()
+            await self._recover_warmup(page, timeout_s=15.0, wait_signer=False)
+            raw_queue = await self._dispatch_native(task_id, model, json_text)
+            if raw_queue is None:
+                return False
+            pump_task = asyncio.create_task(
+                self._pump_native(task_id, raw_queue, queue)
+            )
+            return True
 
         async def dispatch_signer() -> None:
             try:
@@ -1520,6 +1628,15 @@ class BuildSurface:
         try:
             if transport == "native":
                 raw_queue = await self._dispatch_native(task_id, model, json_text)
+                if raw_queue is None and self._realm_id and not page.is_closed():
+                    # 连接可能在检查后瞬间断开；给 Ark 同款轻量重连一次机会。
+                    logger.warning("[build] native 下发时 9998 已断开，尝试轻量重连...")
+                    await self._recover_warmup(
+                        page, timeout_s=15.0, wait_signer=False
+                    )
+                    raw_queue = await self._dispatch_native(
+                        task_id, model, json_text
+                    )
                 if raw_queue is None:
                     if not await fallback_to_signer("9998 不可用"):
                         raise BuildSurfaceError(
@@ -1612,6 +1729,9 @@ class BuildSurface:
                             yield ("thought_signature", candidate.thought_signature)
                 elif event_type == "error":
                     message = str(event.get("message") or "unknown build surface error")
+                    if await retry_native(message[:200]):
+                        deadline = loop.time() + timeout_s
+                        continue
                     if await fallback_to_signer(message[:200]):
                         deadline = loop.time() + timeout_s
                         continue
