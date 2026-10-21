@@ -32,7 +32,7 @@ function toNumber(val: string | number | null, fallback: number): number {
           运行与调度 / 基础功能 (features)
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          全部开关默认保守关闭；修改后点击「保存并热重载」即生效，无需重启。同名环境变量仅作为启动基线的兜底。
+          开关默认值见各项说明（凭证保活默认开启）；修改后点击「保存并热重载」即生效，无需重启。同名环境变量仅作为启动基线的兜底。
         </p>
       </div>
     </div>
@@ -74,6 +74,21 @@ function toNumber(val: string | number | null, fallback: number): number {
             <FieldHelpTip
               schema-key="features.auto_switch_interval_hours"
               class="mt-4 shrink-0"
+            />
+          </div>
+
+          <div class="flex items-center gap-1.5 md:col-span-2">
+            <div class="flex-1">
+              <ConfigSwitch
+                :model-value="Boolean(features.keepalive_auth_update ?? true)"
+                label="自动更新凭证"
+                description="开=切号/重连/周期到期/关闭前把 cookies 原子回写 auth.json（默认开）"
+                @update:model-value="updateRoot('keepalive_auth_update', $event)"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="features.keepalive_auth_update"
+              class="shrink-0"
             />
           </div>
 

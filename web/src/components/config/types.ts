@@ -148,6 +148,7 @@ export interface FeaturesConfig {
   account_refresh_concurrency?: number
   auto_switch?: boolean
   auto_switch_interval_hours?: number
+  keepalive_auth_update?: boolean
   channels?: ChannelsConfig
   routing?: RoutingConfig
   slots?: SlotConfigItem[]
