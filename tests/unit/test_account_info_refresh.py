@@ -138,6 +138,51 @@ def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 多身份账号：x-goog-authuser 必须跟随 account.auth_user
+# --------------------------------------------------------------------------- #
+def test_refresh_uses_account_auth_user(tmp_path: Path) -> None:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    account = store.save_account(
+        name="Acc u1",
+        email="second@gmail.com",
+        storage_state=_storage_state(),
+        auth_user="1",
+    )
+    transport = FakeTransport([TransportResponse(status=200, body="[1]")])
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    result = asyncio.run(refresher.refresh_account(account, refresh_email=False))
+
+    assert result.ok is True
+    assert transport.requests[0].headers["x-goog-authuser"] == "1"
+
+
+def test_email_fetch_uses_account_auth_user(tmp_path: Path) -> None:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    account = store.save_account(
+        name="Acc u1",
+        email="second@gmail.com",
+        storage_state=_storage_state(),
+        auth_user="1",
+    )
+    html = '<script>{"oPEP7c":"second@gmail.com"}</script>'
+    transport = FakeTransport(
+        [
+            TransportResponse(status=200, body="[1]"),
+            TransportResponse(status=200, body=html),
+        ]
+    )
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    result = asyncio.run(refresher.refresh_account(account, refresh_email=True))
+
+    assert result.ok is True
+    page_request = transport.requests[1]
+    assert page_request.headers["x-goog-authuser"] == "1"
+    assert "authuser=1" in page_request.url
+
+
+# --------------------------------------------------------------------------- #
 # 401 -> 过期；5xx -> 不改状态
 # --------------------------------------------------------------------------- #
 def test_401_marks_expired(tmp_path: Path) -> None:
