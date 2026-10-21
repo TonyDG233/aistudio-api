@@ -574,17 +574,18 @@ class AIStudioClient:
             ctx = session.active_context
             if ctx is None:
                 ctx = await session.ensure_ready()
-            build_surface = await self._ensure_lease_build_surface(lease)
-            await build_surface.ensure_ready(
-                ctx.auth_file,
-                ctx.auth_user,
-                account_id=getattr(lease, "account_id", None),
-            )
-            async for event in build_surface.stream_generate(
-                model=model, json_body=rest_body
-            ):
-                yield event
-            return
+            async with self._session.request_scope():
+                build_surface = await self._ensure_lease_build_surface(lease)
+                await build_surface.ensure_ready(
+                    ctx.auth_file,
+                    ctx.auth_user,
+                    account_id=getattr(lease, "account_id", None),
+                )
+                async for event in build_surface.stream_generate(
+                    model=model, json_body=rest_body
+                ):
+                    yield event
+                return
 
         _, stream_gateway = self._ensure_realm_services(lease)
         async with session.request_scope():
@@ -685,17 +686,18 @@ class AIStudioClient:
             ctx = session.active_context
             if ctx is None:
                 ctx = await session.ensure_ready()
-            build_surface = await self._ensure_lease_build_surface(lease)
-            await build_surface.ensure_ready(
-                ctx.auth_file,
-                ctx.auth_user,
-                account_id=getattr(lease, "account_id", None),
-            )
-            return await self._collect_build_output(
-                model=model,
-                json_body=rest_body,
-                build_surface=build_surface,
-            )
+            async with self._session.request_scope():
+                build_surface = await self._ensure_lease_build_surface(lease)
+                await build_surface.ensure_ready(
+                    ctx.auth_file,
+                    ctx.auth_user,
+                    account_id=getattr(lease, "account_id", None),
+                )
+                return await self._collect_build_output(
+                    model=model,
+                    json_body=rest_body,
+                    build_surface=build_surface,
+                )
 
         replay = self._replay_for(lease)
         async with session.request_scope():

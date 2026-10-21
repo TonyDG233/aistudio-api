@@ -209,6 +209,36 @@ def test_no_pro_account_raises_explicit_403(monkeypatch) -> None:
     assert exc.value.code == "surface_no_capable_account"
 
 
+def test_invalid_instance_accounts_stay_routable(monkeypatch) -> None:
+    """Invalid/asleep instances must not hide their account from routing.
+
+    The request path is allowed to wake or reload the instance. Explicit
+    instances remain authoritative, but an invalid state is not a 403.
+    """
+    accounts = [
+        Account("free-1", tier="free"),
+        Account("pro-1", tier="pro"),
+    ]
+    pipe, _ = _pipeline(
+        monkeypatch,
+        accounts,
+        features=_features(groups=_native_groups()),
+        active_id="free-1",
+    )
+    monkeypatch.setattr(
+        pipe,
+        "_instance_manager",
+        lambda: SimpleNamespace(
+            has_instances=lambda: True,
+            active_account_ids=lambda: set(),
+            instance_account_ids=lambda: {"pro-1"},
+        ),
+    )
+
+    ctx = pipe.begin(model_path="pg/argon", api_format="gemini")
+    assert [candidate.account_id for candidate in ctx.candidates] == ["pro-1"]
+
+
 def test_groups_are_per_candidate_in_snapshot(monkeypatch) -> None:
     accounts = [
         Account("free-1", tier="free"),

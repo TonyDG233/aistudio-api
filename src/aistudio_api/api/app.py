@@ -81,9 +81,13 @@ async def lifespan(_app: FastAPI):
     from aistudio_api.application.instance_manager import InstanceManager
 
     async def _switch_instance_account(account_id: str) -> bool:
-        from aistudio_api.application.account_orchestrator import switch_to_account
-
-        return await switch_to_account(account_id, require_idle=False)
+        # Instances use their own pooled sessions. Keep the active-account
+        # marker in sync, but do not perform a second blue-green browser switch.
+        current = account_store.get_active_account()
+        if current is not None and current.id == account_id:
+            return True
+        account_store.set_active_account(account_id)
+        return True
 
     runtime_state.instance_manager = InstanceManager(
         client.instance_pool,
@@ -175,10 +179,16 @@ async def lifespan(_app: FastAPI):
             while True:
                 await asyncio.sleep(10.0)
                 try:
-                    if runtime_state.client and getattr(
-                        runtime_state.client, "_session", None
-                    ):
-                        await runtime_state.client._session.check_idle_timeout()
+                    client = runtime_state.client
+                    session = getattr(client, "_session", None) if client else None
+                    if client is not None and session is not None:
+                        pool = getattr(client, "_instance_pool", None)
+                        if pool is not None and pool.has_active_work():
+                            # Instance load/switch already owns the browser; do
+                            # not recycle it while BotGuard/WS is warming up.
+                            session.touch_activity()
+                        else:
+                            await session.check_idle_timeout()
                 except Exception as e:
                     logger.debug("空闲回收检查异常: %s", e)
 

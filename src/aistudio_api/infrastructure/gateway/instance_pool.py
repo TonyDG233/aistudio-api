@@ -352,6 +352,15 @@ class InstancePool:
                     f"page budget exhausted: group {group_name}>{group_max_pages}"
                 )
 
+    def has_active_work(self) -> bool:
+        """True while a slot is loading, reserved, or serving a request."""
+        return any(
+            slot.state is SlotState.LOADING
+            or slot.in_flight > 0
+            or slot.pending_pages > 0
+            for slot in self._slots.values()
+        )
+
     def budget_snapshot(self) -> dict[str, object]:
         channel_limits: dict[str, int] = {}
         for channel in ("chat", "build", "official"):
@@ -433,6 +442,19 @@ class InstancePool:
                         self._touch_locked(lease.adapter)
                         return lease
                     needs_surface = True
+                    break
+
+                # A browser can be recycled while its slot record remains. Revive
+                # that same-account slot instead of treating it as capacity.
+                slot = self._reserve_stale_slot_locked(
+                    account_id,
+                    auth_file=auth_file,
+                    auth_user=auth_user or "0",
+                    channel=channel,
+                    group_name=group_name,
+                    group_max_pages=group_max_pages,
+                )
+                if slot is not None:
                     break
 
                 if borrow_accounts:
@@ -882,6 +904,50 @@ class InstancePool:
             slot.pending_pages = 1
             slot.group_name = group_name or ""
             slot.channel_role = channel
+            return slot
+        return None
+
+    def _reserve_stale_slot_locked(
+        self,
+        account_id: str,
+        *,
+        auth_file: str | None,
+        auth_user: str,
+        channel: str,
+        group_name: str | None,
+        group_max_pages: int | None,
+    ) -> InstanceSlot | None:
+        """Reuse a same-account slot whose pages/context died with the browser."""
+        for slot in self._slots.values():
+            if slot.current_account_id != account_id:
+                continue
+            if slot.in_flight > 0 or slot.state in (
+                SlotState.LOADING,
+                SlotState.RETIRING,
+            ):
+                continue
+            if slot.chat_ready() or slot.build_ready():
+                continue
+            try:
+                self._check_page_budget_locked(
+                    channel=channel,
+                    group_name=group_name,
+                    group_max_pages=group_max_pages,
+                    exclude_slot_id=slot.slot_id,
+                )
+            except InstanceCapacityError:
+                continue
+            slot.state = SlotState.LOADING
+            slot.current_account_id = account_id
+            slot.auth_file = auth_file or slot.auth_file
+            slot.auth_user = auth_user or slot.auth_user
+            slot.group_name = group_name or ""
+            slot.channel_role = channel
+            slot.pending_pages = 1
+            slot.pending_channel = channel
+            slot.chat_counted = False
+            slot.build_counted = False
+            slot.reservations = 0
             return slot
         return None
 

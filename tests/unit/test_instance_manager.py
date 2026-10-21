@@ -741,16 +741,18 @@ async def test_three_instance_limit_allows_2c3p() -> None:
 
 
 @pytest.mark.asyncio
-async def test_single_instance_failed_account_switch_restores_old_channel() -> None:
+async def test_single_instance_replace_skips_account_switch_for_current_account() -> None:
     pool = FakePool(max_contexts=1)
+    calls: list[str] = []
 
-    async def deny(_account_id: str) -> bool:
+    async def switch_account(account_id: str) -> bool:
+        calls.append(account_id)
         return False
 
     manager = InstanceManager(
         pool,  # type: ignore[arg-type]
         _store(_account("a")),  # type: ignore[arg-type]
-        switch_account=deny,
+        switch_account=switch_account,
         features_provider=lambda: TEST_FEATURES,
     )
     await manager.startup()
@@ -758,15 +760,15 @@ async def test_single_instance_failed_account_switch_restores_old_channel() -> N
     target = listed.instances[0]
     slot = pool.slots()[0]
 
-    with pytest.raises(InstanceNotReadyError):
-        await manager.switch_to(target.id, "build")
+    switched = await manager.switch_to(target.id, "build")
 
     await _settle(manager)
     listed = await manager.list_instances()
+    assert switched.channel == "build"
+    assert calls == []
     assert len(listed.instances) == 1
-    assert listed.instances[0].id == target.id
-    assert listed.instances[0].channel == "pg"
+    assert listed.instances[0].channel == "build"
     assert listed.instances[0].state.value == "active"
     assert len(pool.slots()) == 1
-    assert slot.has_chat is True
-    assert slot.has_build is False
+    assert slot.has_chat is False
+    assert slot.has_build is True

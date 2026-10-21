@@ -455,6 +455,12 @@ class InstanceManager:
     async def _switch_current_account(self, account: AccountMeta) -> bool:
         if self._switch_account is None:
             return True
+        active = self._accounts.get_active_account()
+        if active is not None and active.id == account.id:
+            # The instance already owns this account's pooled session. A full
+            # blue-green account switch would create another page and rerun
+            # BotGuard for no request-path benefit.
+            return True
         return await self._switch_account(account.id)
 
     async def reassign(self, instance_id: str, account_id: str) -> Instance:
@@ -493,6 +499,19 @@ class InstanceManager:
             record.account_id
             for record in self._records.values()
             if record.state is InstanceState.ACTIVE
+        }
+
+    def instance_account_ids(self) -> set[str]:
+        """Accounts with any managed instance, including starting/invalid ones."""
+        return {
+            record.account_id
+            for record in self._records.values()
+            if record.state
+            in (
+                InstanceState.STARTING,
+                InstanceState.ACTIVE,
+                InstanceState.INVALID,
+            )
         }
 
     async def wait_idle(self) -> None:

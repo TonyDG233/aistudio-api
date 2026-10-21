@@ -69,6 +69,28 @@ def test_replay_limit_keeps_most_recent_entries():
     assert entries[-1].id == 250
 
 
+def test_default_replay_returns_full_retained_history():
+    broadcaster = LogBroadcaster(capacity=300)
+    _publish(broadcaster, 250)
+
+    entries, _ = broadcaster.replay()
+    assert len(entries) == 250
+    assert entries[0].id == 1
+    assert entries[-1].id == 250
+
+
+def test_warning_error_survive_debug_flood():
+    broadcaster = LogBroadcaster(capacity=4)
+    broadcaster.publish("ERROR", "aistudio.test", "important")
+    _publish(broadcaster, 5, level="DEBUG")
+
+    entries, _ = broadcaster.replay(level="DEBUG")
+    assert len(entries) == 4
+    assert entries[0].level == "ERROR"
+    assert entries[0].message == "important"
+    assert [entry.level for entry in entries[1:]] == ["DEBUG", "DEBUG", "DEBUG"]
+
+
 async def test_subscriber_queue_overflow_drops_oldest_and_counts():
     broadcaster = LogBroadcaster(capacity=10, queue_size=2)
     subscription = broadcaster.subscribe()

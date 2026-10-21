@@ -991,3 +991,30 @@ async def test_single_instance_rebind_replaces_page_sequentially() -> None:
     assert len(pool.slots()) == 1
     assert cdp.disposed == ["ctx-1"]
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_pinned_slot_is_revived_for_same_account() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+    slot = pool.slots()[0]
+    await pool.release(lease)
+
+    # Simulate the browser being recycled: the slot record survives, pages do not.
+    slot.pinned = True
+    slot.state = SlotState.READY
+    slot.session = None
+    slot.build_surface = None
+    slot.chat_counted = True
+    slot.build_counted = False
+
+    revived = await pool.acquire(account_id="a", auth_file="a.json")
+
+    assert revived.slot_id == slot.slot_id
+    assert slot.session is not None
+    assert slot.chat_ready() is True
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    assert len(pool.slots()) == 1
+    await pool.release(revived)
+    await pool.close()
