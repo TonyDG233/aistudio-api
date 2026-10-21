@@ -1,8 +1,10 @@
 """Model-list projection for WP5 v3.
 
 Single-channel deployments keep returning bare model IDs. Multi-channel
-deployments return one canonical prefix per real channel:
+deployments return the bare model ID for automatic routing plus one canonical
+prefix per real channel:
 
+- bare ``gemini-x``: automatic channel selection
 - ``pg/`` for the chat channel (``chat``/``playground`` are input aliases only)
 - ``build/`` for the build channel
 
@@ -80,6 +82,10 @@ def project_model_ids(
         return seen_models
 
     projected: list[str] = []
+    # Keep bare IDs discoverable: they are the automatic-routing entry point.
+    for clean in seen_models:
+        if clean not in projected:
+            projected.append(clean)
     for clean in seen_models:
         for spec in channels:
             if spec.key == "build" and (

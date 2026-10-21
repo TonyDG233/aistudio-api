@@ -792,6 +792,7 @@ async def test_route_models_list_uses_canonical_prefixes(monkeypatch):
     listing = await _get(app, "/v1/models")
     body = _as_dict(listing.json())
     assert [item["id"] for item in body["data"]] == [
+        "gemini-x",
         "pg/gemini-x",
         "build/gemini-x",
     ]

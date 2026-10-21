@@ -66,7 +66,11 @@ async def test_multi_channel_model_list_uses_canonical_prefixes(monkeypatch):
     async with _build_client() as client:
         response = await client.get("/v1beta/models")
         names = [item["name"] for item in response.json()["models"]]
-        assert names == ["models/pg/flash", "models/build/flash"]
+        assert names == [
+            "models/flash",
+            "models/pg/flash",
+            "models/build/flash",
+        ]
 
 
 async def _discovered_models(**kwargs):
