@@ -1,11 +1,13 @@
-﻿"""重复账号标记（同一邮箱多条）的存储层测试。"""
+"""重复账号标记（同一邮箱多条）的存储层测试。"""
 
 from __future__ import annotations
 
 from aistudio_api.infrastructure.account.account_store import AccountMeta, AccountStore
 
 
-def _save(store: AccountStore, name: str, email: str, auth_user: str = "0") -> AccountMeta:
+def _save(
+    store: AccountStore, name: str, email: str, auth_user: str = "0"
+) -> AccountMeta:
     return store.save_account(
         name=name,
         email=email,
