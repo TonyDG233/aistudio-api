@@ -50,6 +50,8 @@
 | **Anthropic Messages 兼容** | 提供 `/v1/messages` 与 `/v1/messages/count_tokens`，支持流式事件、工具调用、thinking、图片与真实上游计数 |
 | **动态模型发现** | 自动向上游同步可用模型列表与 Paid/Pro-only 元数据，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型；快照持久化 + 启动预热，刷新失败回退上次快照 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
+| **实例与渠道（WP5）** | 实例 = 账号 + 渠道的独立用量窗口；同一账号的 PG/Build 为两个实例、共享一个浏览器上下文；只允许 2c1p/1c2p，禁止 2c3p；渠道切换替换单页，不新增 context |
+| **Build 双路径** | 原生 9998 客户端为默认路径；原生不可用时由顶层 signer 直连兜底；两条路径独立健康状态，signer 失败不阻塞原生渠道 |
 | **账号双保活（WP10）** | 定时切号（长周期均衡 + 真实页面活动）与自动刷新 Auth（cookies/origins 回写 `auth.json`）并存；另有 24h tier/email/过期元数据刷新，三者独立开关 |
 | **运行状态持久化** | Token 统计 v2 (`stats.json`：按模型/日聚合，client/attempt 两层计数，cache/reasoning/count_tokens 分离，保留 90 天日桶) 与账号 429 冷却 (`rotator_state.json`) 自动落盘，重启不丢状态 |
 | **下游参数容错与丢弃** | 支持配置 `drop_unsupported_params` 自动过滤下游传入的非标准安全分类（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）与不兼容工具，避免 400 阻断 |
@@ -59,7 +61,7 @@
 | **Web 管理面板** | 提供 Web 管理控制台，支持账号管理（文本与 JSON 批量导入）、独立用量统计页 `/stats`（Token/缓存/趋势/账号调度状态）、在线编辑与热重载 `config.yaml` |
 | **Android 伴侣端** | 配套 Android 原生应用（`android/`），采用 Jetpack Compose 构建，支持多 Profile 隔离登录、Bitwarden 自动填充与一键导出凭据包 |
 > [!NOTE]
-> **内存占用参考**：纯 Python 后端服务常驻内存约 35 - 45 MB；拉起单实例受控 Chromium 后总物理内存 (PSS) 约 350 - 450 MB（宿主 Linux 下约 250 - 350 MB）。Android Termux 环境建议空闲 RAM ≥ 1 GB。
+> **内存占用参考**：纯 Python 后端常驻约 80 MB Working Set。实测 2 个实例（其中一个为 Build 渠道，Private Working Set 求和）平均约 454 MB、峰值约 523 MB；同批 WorkingSet 求和约 908 MB，仅作对比，不作为主指标。Android Termux 环境建议空闲 RAM ≥ 1 GB。
 
 ## 技术架构与文档
 
@@ -239,6 +241,8 @@ docker compose up -d
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
 | `AISTUDIO_LOG_DIR` | string | `data/logs/` | 按天归档日志目录（`aistudio-YYYYMMDD.log`，自动保留最近 7 天） |
 | `AISTUDIO_BUILD_SURFACE` | bool | `false` | Build 页面直连面总开关（free 档账号走 Build 直连通道） |
+| `AISTUDIO_APP_URL` | string | 空 | Build 应用 URL/App ID 回退；`channels.build.app_url` 为空时使用 |
+| `AISTUDIO_BUILD_TRANSPORT` | enum | `native` | Build 传输偏好：`native`（默认）/`signer`；signer 不可用时回退原生 |
 | `AISTUDIO_ATG_MODE` | string | `off` | ATG 防截断模式：`off` / `prefer` / `required` |
 | `AISTUDIO_ACCOUNT_REFRESH_CONCURRENCY` | int | `3` | 批量账号信息刷新并发工作池大小 |
 | `AISTUDIO_ROUTE_BY_TIER` | bool | `false` | 是否按账号档位（tier）路由到不同的面 |
@@ -263,6 +267,9 @@ docker compose up -d
 | 字段 | 类型 | 默认值 | 说明（开=什么 / 关=什么 / 何时用 / 失败怎么办） |
 |---|---|---|---|
 | `features.build_surface` | bool | `false` | 开=free 档账号走 Build 宿主页直连通道；关=仅聊天面（零行为变化）。何时开：需要免费档走 Build 额度。失败：面内失败显式报错，绝不改道。 |
+| `features.channels.build.app_url` | string | 空 | Build 应用 URL 或 App ID；优先于 `AISTUDIO_APP_URL`；为空回退内置默认 |
+| `features.routing.max_contexts` | int | `1` | 同时登录账号/context 上限；用量窗口上限 = max(2, 该值) |
+| `features.routing.global_max_pages` | int | `2` | 全局页面预算；至少覆盖用量窗口上限，实例切换不得突破 |
 | `features.route_by_tier` | bool | `false` | 开=按账号档位分发到允许的面；关=始终聊天面默认路由。何时开：WP5 v3 分组编排已落地，需要区分 pro/free 的面或额度池时。失败：无匹配组按默认策略并记录决策链。 |
 | `features.account_refresh_concurrency` | int | `3` | 批量刷新 email/tier/过期的并发数（范围 1-16）。越大越快但越易限流。失败：单账号失败不影响其余。 |
 | `features.auto_switch` | bool | `false` | 开=按间隔周期轮换账号；关=仅按用量/失败/429 触发。失败：无可切换账号时保持当前账号并告警。 |
@@ -583,7 +590,7 @@ if response.function_calls:
 系统内置静态打包的 Web 前端管理控制台（访问 `http://localhost:8080`）：
 
 - **仪表盘 (Dashboard)**：实时展示服务健康状况、各模型请求量、成功率及 429 冷却指标。
-- **用量统计 (Stats, `/stats`)**：独立 Token 用量页，按时间/模型查看输入、输出、推理、缓存读写与命中率；区分客户端请求/上游尝试与 count_tokens 预检；展示账号当前调度状态与 Paid/Pro-only 标记。数据接口为 `GET /api/stats`、`GET /api/stats/timeseries`。
+- **用量统计 (Stats, `/stats`)**：模型调用（上游 attempts，含重试/换号，不含 count_tokens）为主指标；客户端请求为次级；Token 计数独立展示且不计入模型调用。支持按时间/模型查看输入、输出、推理、缓存读写与命中率，以及账号调度状态与 Paid/Pro-only 标记。数据接口为 `GET /api/stats`、`GET /api/stats/timeseries`。
 - **账号管理 (Accounts)**：支持 Cookie 单条与凭据包批量导入、自动探测多账号、手动切换当前活跃账号或重置冷却状态。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
 - **访问鉴权**：设置环境变量 `AISTUDIO_WEB_PASSWORD` 后自动开启登录鉴权守卫。
