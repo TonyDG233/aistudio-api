@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -13,11 +14,18 @@ OUT = Path(__file__).resolve().parent.parent / "raw"
 OUT.mkdir(parents=True, exist_ok=True)
 
 
-def _snapshot(client: httpx.Client) -> dict[str, object]:
+def _snapshot(client: httpx.Client) -> dict[str, Any]:
     resp = client.get(f"{BASE}/surface/instances")
     if resp.status_code != 200:
         return {"status": resp.status_code, "body": resp.text[:2000]}
     return resp.json()
+
+
+def _contexts(value: object) -> list[Any]:
+    if not isinstance(value, dict):
+        return []
+    contexts = value.get("contexts")
+    return contexts if isinstance(contexts, list) else []
 
 
 def main() -> None:
@@ -66,7 +74,7 @@ def main() -> None:
         {
             str(slot.get("account_id"))
             for item in rounds
-            for slot in ((item.get("snapshot") or {}).get("contexts") or [])
+            for slot in _contexts(item.get("snapshot"))
             if isinstance(slot, dict) and slot.get("account_id")
         }
     )

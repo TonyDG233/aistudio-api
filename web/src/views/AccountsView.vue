@@ -19,6 +19,7 @@ import {
   Search,
   Upload,
   UserRound,
+  Trash2,
 } from 'lucide-vue-next'
 
 const accountsStore = useAccountsStore()
@@ -33,6 +34,7 @@ const importFiles = ref<File[]>([])
 const importInputRef = ref<HTMLInputElement | null>(null)
 const searchKeyword = ref('')
 const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired'>('all')
+const selectedIds = ref<Set<string>>(new Set())
 const dragActive = ref(false)
 const dragCount = ref(0)
 let dragDepth = 0
@@ -92,6 +94,52 @@ const filteredAccounts = computed(() => {
     )
   })
 })
+
+const duplicateAccounts = computed(() =>
+  filteredAccounts.value.filter((account) => Boolean(account.duplicate_of)),
+)
+const allFilteredSelected = computed(
+  () =>
+    filteredAccounts.value.length > 0
+    && filteredAccounts.value.every((account) => selectedIds.value.has(account.id)),
+)
+
+function toggleSelect(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+}
+
+function toggleSelectAll() {
+  selectedIds.value = allFilteredSelected.value
+    ? new Set()
+    : new Set(filteredAccounts.value.map((account) => account.id))
+}
+
+function clearSelection() {
+  selectedIds.value = new Set()
+}
+
+function selectDuplicates() {
+  selectedIds.value = new Set(duplicateAccounts.value.map((account) => account.id))
+}
+
+async function handleBatchRefresh() {
+  const ids = [...selectedIds.value]
+  if (!ids.length) return
+  await accountsStore.refreshAccountsByIds(ids)
+  const alive = new Set(accountsStore.accountRows.map((account) => account.id))
+  selectedIds.value = new Set(ids.filter((id) => alive.has(id)))
+}
+
+async function handleBatchDelete() {
+  const count = selectedIds.value.size
+  if (!count) return
+  if (!confirm(`确定删除选中的 ${count} 个账号？此操作不可逆。`)) return
+  await accountsStore.deleteAccounts([...selectedIds.value])
+  selectedIds.value = new Set()
+}
 
 async function loadData() {
   await Promise.allSettled([accountsStore.fetchAll(), instancesStore.fetch()])
@@ -343,6 +391,59 @@ async function handleActivate(account: AccountWithStats) {
             </button>
           </div>
         </div>
+
+        <div class="flex flex-wrap items-center gap-2 border-t border-gray-100 pt-2.5">
+          <label class="inline-flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              :checked="allFilteredSelected"
+              class="w-3.5 h-3.5 rounded border-gray-300 text-brand-600 focus:ring-brand-500 cursor-pointer"
+              @change="toggleSelectAll"
+            >
+            全选
+          </label>
+          <span class="text-xs text-gray-500">
+            已选 <b class="font-mono text-gray-900">{{ selectedIds.size }}</b>
+          </span>
+          <button
+            v-if="duplicateAccounts.length"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 transition-colors cursor-pointer"
+            @click="selectDuplicates"
+          >
+            仅选重复（{{ duplicateAccounts.length }}）
+          </button>
+          <button
+            v-if="selectedIds.size"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer"
+            @click="clearSelection"
+          >
+            清空选择
+          </button>
+          <span class="flex-1" />
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            :disabled="!selectedIds.size || accountsStore.refreshingAll"
+            @click="handleBatchRefresh"
+          >
+            <RefreshCw
+              class="w-3.5 h-3.5"
+              :class="{ 'animate-spin': accountsStore.refreshingAll }"
+            />
+            批量刷新
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            :disabled="!selectedIds.size"
+            @click="handleBatchDelete"
+          >
+            <Trash2 class="w-3.5 h-3.5" />
+            批量删除
+          </button>
+        </div>
       </div>
 
       <div
@@ -416,9 +517,12 @@ async function handleActivate(account: AccountWithStats) {
           :refreshing="accountsStore.refreshingIds[account.id]"
           :capacity-full="instancesStore.atCapacity"
           :creating="instancesStore.creatingAccountId === account.id"
+          :selectable="true"
+          :selected="selectedIds.has(account.id)"
           @close="handleCloseInstance"
           @switch="openSwitchPanel"
           @refresh="accountsStore.refreshAccount(account.id)"
+          @toggle-select="toggleSelect(account.id)"
           @activate="handleActivate(account)"
           @edit="handleEditName(account)"
           @remove="handleRemove(account)"

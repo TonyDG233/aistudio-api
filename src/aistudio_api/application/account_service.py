@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     )
     from aistudio_api.infrastructure.gateway.client import AIStudioClient
     from aistudio_api.infrastructure.gateway.session import BrowserSession
+from aistudio_api.domain.account_tags import account_tags
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("account")
@@ -126,9 +127,26 @@ class AccountService:
         """删除账号。"""
         return self._store.delete_account(account_id)
 
-    def update_account(self, account_id: str, name: str) -> AccountMeta | None:
-        """更新账号名称。"""
-        return self._store.update_account(account_id, name)
+    def update_account(
+        self, account_id: str, name: str, tags: list[str] | None = None
+    ) -> AccountMeta | None:
+        """更新账号名称与自定义 tag；tags=None 表示保持不变。"""
+        if tags is None:
+            return self._store.update_account(account_id, name)
+        return self._store.update_account(account_id, name, tags)
+
+    def list_tags(self) -> list[str]:
+        """所有账号的 tag 目录：自定义 tag + tier 自动 tag。"""
+        tags: list[str] = []
+        seen: set[str] = set()
+        for account in self._store.list_accounts():
+            for tag in account_tags(account.tags, account.tier):
+                key = tag.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tags.append(tag)
+        return sorted(tags, key=str.casefold)
 
     def update_account_email(self, account_id: str, email: str) -> bool:
         """更新账号的登录邮箱。"""

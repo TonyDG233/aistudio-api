@@ -25,6 +25,7 @@ def setup_mock_account_service():
         last_used=None,
         auth_user="0",
         cookie_id="cookie_1",
+        tags=["vip"],
     )
     mock_svc.list_accounts.return_value = [sample_acc]
     mock_svc.get_active_account.return_value = sample_acc
@@ -94,7 +95,31 @@ async def test_api_accounts_endpoint_headers():
             data = resp.json()
             assert isinstance(data, list)
             assert len(data) == 1
-            assert data[0]["id"] == "acc_1"
+        assert data[0]["id"] == "acc_1"
+        assert data[0]["tags"] == ["vip"]
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_accounts_deduplicates_and_deletes(setup_mock_account_service):
+    setup_mock_account_service.get_active_account.return_value = None
+    setup_mock_account_service.delete_account.return_value = True
+    async with _client() as client:
+        resp = await client.post(
+            "/api/accounts/batch-delete",
+            json={"ids": ["acc_1", "acc_2", "acc_1"]},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": 2}
+    assert setup_mock_account_service.delete_account.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_account_tags_catalog_endpoint(setup_mock_account_service):
+    setup_mock_account_service.list_tags.return_value = ["pro", "vip"]
+    async with _client() as client:
+        resp = await client.get("/api/accounts/tags")
+    assert resp.status_code == 200
+    assert resp.json() == ["pro", "vip"]
 
 
 @pytest.mark.asyncio
@@ -161,6 +186,7 @@ async def test_account_routing_get_put_delete():
             "surfaces": ["chat"],
             "weight": 2.5,
             "model_surfaces": {"gemini-3.8-flash": "chat"},
+            "quota_pools": [],
         }
 
         resp = await client.put(

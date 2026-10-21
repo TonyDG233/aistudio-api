@@ -43,11 +43,24 @@ export const accountsApi = {
     })
   },
 
-  update(id: string, name: string): Promise<Account> {
+  batchDelete(ids: string[]): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>('/api/accounts/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    })
+  },
+
+  update(id: string, name: string, tags?: string[]): Promise<Account> {
+    const body: { name: string; tags?: string[] } = { name }
+    if (tags !== undefined) body.tags = tags
     return request<Account>(`/api/accounts/${id}`, {
       method: 'PUT',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(body),
     })
+  },
+
+  listTags(): Promise<string[]> {
+    return request<string[]>('/api/accounts/tags')
   },
 
   importCookies(req: ImportCookiesRequest): Promise<ImportCookiesResponse> {

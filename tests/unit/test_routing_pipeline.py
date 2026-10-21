@@ -223,7 +223,7 @@ def test_groups_are_per_candidate_in_snapshot(monkeypatch) -> None:
         {
             "name": "free",
             "match_tier": ["free"],
-            "allowed_surfaces": ["chat", "build"],
+            "allowed_surfaces": ["build"],
         },
     ]
     pipe, _ = _pipeline(
@@ -232,7 +232,7 @@ def test_groups_are_per_candidate_in_snapshot(monkeypatch) -> None:
         features=_features(groups=groups),
     )
 
-    ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
+    ctx = pipe.begin(model_path="build/flash", api_format="gemini")
     snapshot = ctx.snapshot()
     assert snapshot["groups"] == ["free", "pro"]
     candidates = cast("list[dict[str, object]]", snapshot["candidates"])
@@ -242,16 +242,16 @@ def test_groups_are_per_candidate_in_snapshot(monkeypatch) -> None:
 def test_lifetime_requests_do_not_starve_older_account(monkeypatch) -> None:
     class StatsRotator(FakeRotator):
         def get_account_stats(self, account_id):
-            if account_id == "free-1":
+            if account_id == "pro-1":
                 return SimpleNamespace(requests=100, last_used=0)
             return SimpleNamespace(requests=1, last_used=50)
 
-    accounts = [Account("free-1", tier="free"), Account("free-2", tier="free")]
+    accounts = [Account("pro-1", tier="pro"), Account("pro-2", tier="pro")]
     features = _features(
         groups=[
             {
                 "name": "all",
-                "match_tier": ["free"],
+                "match_tier": ["pro"],
                 "allowed_surfaces": ["chat"],
             }
         ]
@@ -264,8 +264,8 @@ def test_lifetime_requests_do_not_starve_older_account(monkeypatch) -> None:
     )
     ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
     assert [candidate.account_id for candidate in ctx.candidates] == [
-        "free-1",
-        "free-2",
+        "pro-1",
+        "pro-2",
     ]
 
 
@@ -273,16 +273,16 @@ def test_rotation_fairness_beats_warm_slot_stickiness(monkeypatch) -> None:
     class StatsRotator(FakeRotator):
         def get_account_stats(self, account_id):
             return SimpleNamespace(
-                requests=3 if account_id == "free-1" else 0,
+                requests=3 if account_id == "pro-1" else 0,
                 last_used=0,
             )
 
-    accounts = [Account("free-1", tier="free"), Account("free-2", tier="free")]
+    accounts = [Account("pro-1", tier="pro"), Account("pro-2", tier="pro")]
     features = _features(
         groups=[
             {
                 "name": "all",
-                "match_tier": ["free"],
+                "match_tier": ["pro"],
                 "allowed_surfaces": ["chat"],
             }
         ]
@@ -293,7 +293,7 @@ def test_rotation_fairness_beats_warm_slot_stickiness(monkeypatch) -> None:
         def slots(self):
             return (
                 SimpleNamespace(
-                    current_account_id="free-1",
+                    current_account_id="pro-1",
                     in_flight=0,
                     chat_ready=lambda: True,
                     build_ready=lambda: False,
@@ -311,8 +311,8 @@ def test_rotation_fairness_beats_warm_slot_stickiness(monkeypatch) -> None:
 
     ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
     assert [candidate.account_id for candidate in ctx.candidates] == [
-        "free-2",
-        "free-1",
+        "pro-2",
+        "pro-1",
     ]
 
 
@@ -321,12 +321,12 @@ def test_equal_fairness_prefers_warm_slot(monkeypatch) -> None:
         def get_account_stats(self, account_id) -> Any:
             return SimpleNamespace(requests=0, last_used=0)
 
-    accounts = [Account("free-1", tier="free"), Account("free-2", tier="free")]
+    accounts = [Account("pro-1", tier="pro"), Account("pro-2", tier="pro")]
     features = _features(
         groups=[
             {
                 "name": "all",
-                "match_tier": ["free"],
+                "match_tier": ["pro"],
                 "allowed_surfaces": ["chat"],
             }
         ]
@@ -337,7 +337,7 @@ def test_equal_fairness_prefers_warm_slot(monkeypatch) -> None:
         def slots(self):
             return (
                 SimpleNamespace(
-                    current_account_id="free-2",
+                    current_account_id="pro-2",
                     in_flight=0,
                     chat_ready=lambda: True,
                     build_ready=lambda: False,
@@ -355,8 +355,8 @@ def test_equal_fairness_prefers_warm_slot(monkeypatch) -> None:
 
     ctx = pipe.begin(model_path="pg/flash", api_format="gemini")
     assert [candidate.account_id for candidate in ctx.candidates] == [
-        "free-2",
-        "free-1",
+        "pro-2",
+        "pro-1",
     ]
 
 

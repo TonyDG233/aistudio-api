@@ -51,6 +51,14 @@ class FakePool:
         self.closed: list[str] = []
         self.fail_accounts: set[str] = set()
         self.build_budget_full = False
+        self.channel_caps: dict[str, int] = {}
+        self.enabled_channels: set[str] = {"chat", "build"}
+
+    def channel_max_instances(self, channel: str) -> int | None:
+        return self.channel_caps.get(channel)
+
+    def channel_enabled(self, channel: str) -> bool:
+        return channel in self.enabled_channels
 
     def slots(self) -> tuple[FakeSlot, ...]:
         return tuple(self._slots.values())
@@ -191,14 +199,31 @@ def _store(
     return Store()
 
 
-def _account(account_id: str, *, expired: bool = False) -> AccountMeta:
+def _account(
+    account_id: str,
+    *,
+    expired: bool = False,
+    tier: str | None = "Pro",
+    routing: dict[str, object] | None = None,
+) -> AccountMeta:
     return AccountMeta(
         id=account_id,
         name=account_id,
         email=f"{account_id}@gmail.com",
         created_at="2026-10-20T00:00:00Z",
         expired=expired,
+        tier=tier,
+        routing=routing or {},
     )
+
+
+TEST_FEATURES: dict[str, object] = {
+    "channels": {
+        "chat": {"enabled": True},
+        "build": {"enabled": True},
+    },
+    "groups": [],
+}
 
 
 def _manager(
@@ -216,6 +241,7 @@ def _manager(
             active_id=active_id,
             missing_auth=missing_auth,
         ),
+        features_provider=lambda: TEST_FEATURES,
     )
     return manager, fake_pool
 
@@ -301,7 +327,8 @@ async def test_startup_starts_fewer_when_accounts_are_unavailable() -> None:
     await manager.startup()
 
     listed = await manager.list_instances()
-    assert [item.account_id for item in listed.instances] == ["a"]
+    assert [item.account_id for item in listed.instances] == ["a", "a"]
+    assert sorted(item.channel for item in listed.instances) == ["build", "pg"]
     assert len(pool.slots()) == 1
 
 
@@ -575,3 +602,63 @@ async def test_switch_inactive_target_closes_current_when_capacity_full() -> Non
     assert [item.id for item in listed.instances] == [second.id]
     assert listed.current_instance_id == second.id
     assert first.id not in {item.id for item in listed.instances}
+
+async def test_startup_assigns_chat_to_paid_and_build_to_free() -> None:
+    manager, _ = _manager(
+        FakePool(max_contexts=2),
+        accounts=(
+            _account("free", tier="Free"),
+            _account("pro", tier="Pro"),
+        ),
+        active_id="free",
+    )
+    await manager.startup()
+
+    listed = await manager.list_instances()
+
+    by_channel = {item.channel: item.account_id for item in listed.instances}
+    assert by_channel == {"pg": "pro", "build": "free"}
+
+
+async def test_startup_respects_channel_caps() -> None:
+    pool = FakePool(max_contexts=2)
+    pool.channel_caps = {"chat": 1, "build": 1}
+    manager, _ = _manager(
+        pool,
+        accounts=(_account("pro", tier="Pro"), _account("free", tier="Free")),
+    )
+    await manager.startup()
+
+    listed = await manager.list_instances()
+
+    assert sorted((item.channel, item.account_id) for item in listed.instances) == [
+        ("build", "free"),
+        ("pg", "pro"),
+    ]
+
+
+async def test_startup_respects_account_channel_tags() -> None:
+    manager, _ = _manager(
+        FakePool(max_contexts=2),
+        accounts=(
+            _account("pro", tier="Pro", routing={"surfaces": ["build"]}),
+            _account("free", tier="Free", routing={"surfaces": ["build"]}),
+        ),
+    )
+    await manager.startup()
+
+    listed = await manager.list_instances()
+
+    assert sorted((item.channel, item.account_id) for item in listed.instances) == [
+        ("build", "free"),
+    ]
+
+
+async def test_create_rejects_when_channel_cap_reached() -> None:
+    pool = FakePool(max_contexts=2)
+    pool.channel_caps = {"chat": 1}
+    manager, _ = _manager(pool, accounts=(_account("a"), _account("b")))
+
+    await manager.create("a", "chat")
+    with pytest.raises(InstanceCapacityExhaustedError):
+        await manager.create("b", "chat")

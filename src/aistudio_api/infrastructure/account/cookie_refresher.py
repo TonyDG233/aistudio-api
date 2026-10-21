@@ -7,6 +7,7 @@ import time
 from aistudio_api.infrastructure.account.cookie_parser import (
     DISCARDABLE_IMPORT_COOKIE_NAMES,
     parse_raw_cookies,
+    parse_storage_state,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -76,10 +77,41 @@ def _refresh_session_cookies(cookies: dict[str, str]) -> dict[str, str]:
 def load_cookies_from_string(cookie_string: str) -> list[dict[str, object]]:
     """Load cookies from a raw cookie string.
 
-    Parses directly, refreshes session cookies via curl_cffi,
-    returns Playwright-format cookies for browser injection.
-    Real expires come from browser export after visiting the page.
+    Playwright storage-state input is injected as-is so cross-domain cookies
+    (for example ``accounts.google.com`` and ``.google.com`` with the same name)
+    survive the import. Plain name/value input keeps the legacy flatten+refresh
+    path.
     """
+    state = parse_storage_state(cookie_string)
+    if state is not None:
+        raw_cookies = state.get("cookies")
+        if isinstance(raw_cookies, list):
+            cookies: list[dict[str, object]] = []
+            for item in raw_cookies:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                value = item.get("value")
+                domain = str(item.get("domain") or "").strip()
+                if not name or value is None or not domain:
+                    continue
+                expires = item.get("expires")
+                cookies.append(
+                    {
+                        "name": name,
+                        "value": str(value),
+                        "domain": domain,
+                        "path": str(item.get("path") or "/"),
+                        "expires": expires if isinstance(expires, (int, float)) else -1,
+                        "httpOnly": bool(item.get("httpOnly", False)),
+                        "secure": bool(item.get("secure", True)),
+                        "sameSite": str(item.get("sameSite") or "None"),
+                    }
+                )
+            if cookies:
+                log.info("Storage-state 注入：保留 %d 个跨域 Cookie", len(cookies))
+                return cookies
+
     parsed = parse_raw_cookies(cookie_string)
     refreshed = _refresh_session_cookies(parsed)
     merged = dict(parsed)

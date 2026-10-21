@@ -71,7 +71,7 @@ def test_service_override_wins_over_group_policy(
 def test_service_legacy_routing_regression(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # route_by_tier off -> old behavior, groups must be ignored.
+    # route_by_tier is legacy; explicit groups always apply and only narrow tier.
     _patch_features(
         monkeypatch,
         {
@@ -83,10 +83,13 @@ def test_service_legacy_routing_regression(
         },
     )
     _patch_account(monkeypatch, "free")
-    assert _resolve_surface("models/gemini-3.8-flash") == "build"
+    # The group tries to widen Free to chat; the intersection is empty -> deny.
+    with pytest.raises(SurfacePolicyError):
+        _resolve_surface("models/gemini-3.8-flash")
 
     _patch_account(monkeypatch, "pro")
-    assert _resolve_surface("models/gemini-3.8-flash") == "chat"
+    # Pro has no matching group and may use either surface; Build is preferred.
+    assert _resolve_surface("models/gemini-3.8-flash") == "build"
 
     _patch_features(monkeypatch, {"build_surface": False, "route_by_tier": False})
     assert _resolve_surface("models/gemini-3.8-flash") == "chat"

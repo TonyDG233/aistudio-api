@@ -41,7 +41,7 @@ _SURFACE_BY_CHANNEL: dict[str, str | None] = {
 }
 _DEFAULT_MAX_INSTANCES = 2
 _MAX_INSTANCES_LIMIT = 16
-_DEFAULT_MAX_PAGES = {"chat": 1, "build": 1, "official": 0}
+_DEFAULT_MAX_PAGES = {"chat": 2, "build": 2, "official": 0}
 _QUOTA_POOL_CHOICES = frozenset({"free", "pro", "official"})
 _DISPLAY_PREFIX = {"chat": "pg", "build": "build", "official": "official"}
 
@@ -60,8 +60,8 @@ class ChannelSpec:
     enabled: bool
     max_instances: int
     implemented: bool
-    max_pages: int = 1
-    quota_pool: str | None = None
+    max_pages: int = 2
+    allowed_tags: tuple[str, ...] = ()
     display_prefix: str = ""
 
     @property
@@ -135,6 +135,21 @@ def _coerce_quota_pool(value: object) -> str | None:
     return text if text in _QUOTA_POOL_CHOICES else None
 
 
+def _coerce_allowed_tags(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw: list[object] = [value]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        raw = list(value)
+    else:
+        return ()
+    tags: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text.casefold() not in {tag.casefold() for tag in tags}:
+            tags.append(text)
+    return tuple(tags)
+
+
 def _channel_specs(
     raw_channels: Mapping[object, object] | None,
 ) -> dict[str, Mapping[str, object]]:
@@ -172,25 +187,24 @@ def build_registry(features: Mapping[str, object]) -> dict[str, ChannelSpec]:
                 max_instances=0,
                 implemented=False,
                 max_pages=0,
-                quota_pool=None,
                 display_prefix=_DISPLAY_PREFIX[key],
             )
             continue
         if raw is None:
             enabled = True if key == "chat" else build_legacy_enabled
             max_instances = _DEFAULT_MAX_INSTANCES
-            max_pages = _DEFAULT_MAX_PAGES[key]
-            quota_pool = None
+            max_pages = max_instances if key in ("chat", "build") else 0
+            allowed_tags: tuple[str, ...] = ()
         else:
             enabled = _coerce_bool(raw.get("enabled"), True)
             max_instances = _coerce_max_instances(
                 raw.get("max_instances"), _DEFAULT_MAX_INSTANCES
             )
-            max_pages = _coerce_max_instances(
-                raw.get("max_pages", raw.get("max_instances")),
-                _DEFAULT_MAX_PAGES[key],
-            )
-            quota_pool = _coerce_quota_pool(raw.get("quota_pool"))
+            max_pages = max_instances if key in ("chat", "build") else 0
+            legacy_pool = _coerce_quota_pool(raw.get("quota_pool"))
+            allowed_tags = _coerce_allowed_tags(raw.get("allowed_tags"))
+            if not allowed_tags and legacy_pool:
+                allowed_tags = (legacy_pool,)
         registry[key] = ChannelSpec(
             key=key,
             label=_CHANNEL_LABELS[key],
@@ -198,7 +212,7 @@ def build_registry(features: Mapping[str, object]) -> dict[str, ChannelSpec]:
             max_instances=max_instances,
             implemented=key in _IMPLEMENTED_CHANNELS,
             max_pages=max_pages,
-            quota_pool=quota_pool,
+            allowed_tags=allowed_tags,
             display_prefix=_DISPLAY_PREFIX[key],
         )
     return registry

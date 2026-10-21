@@ -5,8 +5,9 @@ import ConfigSwitch from './ConfigSwitch.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
 import { Activity, ShieldCheck } from 'lucide-vue-next'
 
-const props = withDefaults(defineProps<{ routing?: RoutingConfig }>(), {
+const props = withDefaults(defineProps<{ routing?: RoutingConfig; flat?: boolean }>(), {
   routing: () => ({}),
+  flat: false,
 })
 
 const emit = defineEmits<{
@@ -35,8 +36,8 @@ const breaker = () => props.routing.circuit_breaker || {}
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden">
-    <div class="px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5">
+  <div :class="flat ? 'bg-transparent' : 'bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden'">
+    <div :class="flat ? 'flex items-center gap-2.5 pb-3' : 'px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5'">
       <ShieldCheck class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
@@ -53,7 +54,7 @@ const breaker = () => props.routing.circuit_breaker || {}
       </div>
     </div>
 
-    <div class="p-5 space-y-4">
+    <div :class="flat ? 'space-y-4' : 'p-5 space-y-4'">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div class="flex items-end gap-1.5">
           <div class="flex-1">

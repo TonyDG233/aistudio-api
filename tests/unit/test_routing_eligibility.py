@@ -41,6 +41,7 @@ def _account(
     email: str | None = None,
     expired: bool = False,
     routing: dict[str, object] | None = None,
+    tags: tuple[str, ...] = (),
 ) -> AccountView:
     return AccountView(
         account_id=account_id,
@@ -48,6 +49,7 @@ def _account(
         email=email,
         expired=expired,
         routing=normalize_account_routing(routing),
+        tags=tags,
     )
 
 
@@ -129,6 +131,33 @@ def test_channel_quota_pool_rejects_wrong_tier() -> None:
         accounts, "chat", "models/gemini-3.8-flash", features=features
     )
     assert [item.account_id for item in chat] == ["pro-1"]
+
+    build = eligible_accounts(
+        accounts, "build", "models/gemini-3.8-flash", features=features
+    )
+    assert [item.account_id for item in build] == ["free-1"]
+
+
+def test_channel_allowed_tags_gate_accounts() -> None:
+    features = {
+        "groups_enabled": False,
+        "build_surface": True,
+        "channels": {
+            "chat": {"enabled": True, "allowed_tags": ["vip"]},
+            "build": {"enabled": True, "allowed_tags": ["free"]},
+        },
+        "groups": [],
+    }
+    accounts = [
+        _account("free-1", tier="free"),
+        _account("vip-1", tier="pro", tags=("vip",)),
+        _account("pro-1", tier="pro"),
+    ]
+
+    chat = eligible_accounts(
+        accounts, "chat", "models/gemini-3.8-flash", features=features
+    )
+    assert [item.account_id for item in chat] == ["vip-1"]
 
     build = eligible_accounts(
         accounts, "build", "models/gemini-3.8-flash", features=features

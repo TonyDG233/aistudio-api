@@ -112,8 +112,7 @@ def test_build_registry_defaults_match_single_account_behavior() -> None:
         enabled=True,
         max_instances=2,
         implemented=True,
-        max_pages=1,
-        quota_pool=None,
+        max_pages=2,
         display_prefix="pg",
     )
     assert registry["build"] == ChannelSpec(
@@ -122,8 +121,7 @@ def test_build_registry_defaults_match_single_account_behavior() -> None:
         enabled=False,
         max_instances=2,
         implemented=True,
-        max_pages=1,
-        quota_pool=None,
+        max_pages=2,
         display_prefix="build",
     )
     assert registry["official"] == ChannelSpec(
@@ -133,7 +131,6 @@ def test_build_registry_defaults_match_single_account_behavior() -> None:
         max_instances=0,
         implemented=False,
         max_pages=0,
-        quota_pool=None,
         display_prefix="official",
     )
 
@@ -156,7 +153,7 @@ def test_explicit_channels_build_overrides_build_surface_alias() -> None:
     assert registry["build"].max_pages == 3
 
 
-def test_channel_max_pages_and_quota_pool_are_normalized() -> None:
+def test_channel_max_pages_follows_instances_and_legacy_pool_becomes_tag() -> None:
     registry = build_registry(
         {
             "channels": {
@@ -166,10 +163,10 @@ def test_channel_max_pages_and_quota_pool_are_normalized() -> None:
         }
     )
     assert registry["chat"].max_pages == 2
-    assert registry["chat"].quota_pool == "pro"
+    assert registry["chat"].allowed_tags == ("pro",)
     assert registry["chat"].prefix == "pg"
-    assert registry["build"].max_pages == 16
-    assert registry["build"].quota_pool is None
+    assert registry["build"].max_pages == 2
+    assert registry["build"].allowed_tags == ()
     assert registry["build"].prefix == "build"
 
 

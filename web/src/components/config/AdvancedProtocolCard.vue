@@ -15,13 +15,14 @@ import { ChevronDown, ChevronUp, ShieldOff } from 'lucide-vue-next'
 
 const props = defineProps<{
   features: FeaturesConfig
+  flat?: boolean
 }>()
 
 const emit = defineEmits<{
   'update:features': [val: FeaturesConfig]
 }>()
 
-const expanded = ref(false)
+const expanded = ref(true)
 
 const atgFormats: Array<{ value: AtgRequestFormat; label: string }> = [
   { value: 'gemini', label: 'Gemini 原生' },
@@ -64,10 +65,12 @@ function toNumber(val: string | number | null, fallback: number): number {
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden">
+  <div :class="props.flat ? 'bg-transparent' : 'bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden'">
     <button
       type="button"
-      class="w-full px-5 py-3.5 bg-gray-50/60 flex items-center justify-between gap-3 text-left cursor-pointer hover:bg-gray-50 transition-colors"
+      :class="props.flat
+        ? 'w-full flex items-center justify-between gap-3 pb-3 text-left cursor-pointer'
+        : 'w-full px-5 py-3.5 bg-gray-50/60 flex items-center justify-between gap-3 text-left cursor-pointer hover:bg-gray-50 transition-colors'"
       :aria-expanded="expanded"
       @click="expanded = !expanded"
     >
@@ -99,7 +102,7 @@ function toNumber(val: string | number | null, fallback: number): number {
 
     <div
       v-if="expanded"
-      class="p-5 space-y-5 border-t border-gray-100"
+      :class="props.flat ? 'space-y-5' : 'p-5 space-y-5 border-t border-gray-100'"
     >
       <!-- ATG -->
       <div class="space-y-3">

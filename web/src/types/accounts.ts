@@ -12,6 +12,7 @@ export interface Account {
   tier_checked_at?: string | null
   expired?: boolean
   duplicate_of?: string | null
+  tags?: string[]
 }
 
 export interface AccountWithStats extends Omit<Account, 'last_used'>, Partial<AccountRotationStats> {
@@ -92,4 +93,5 @@ export interface AccountRouting {
   surfaces: string[]
   weight: number
   model_surfaces: Record<string, string>
+  quota_pools: string[]
 }

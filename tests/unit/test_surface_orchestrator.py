@@ -50,9 +50,10 @@ def _no_override(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_default_allowed_by_tier_constant() -> None:
     assert DEFAULT_ALLOWED_BY_TIER == {
         "free": ["build"],
-        "pro": ["chat"],
-        "ultra": ["chat"],
-        "plus": ["chat"],
+        "pro": ["chat", "build"],
+        "ultra": ["chat", "build"],
+        "plus": ["chat", "build"],
+        "paid": ["chat", "build"],
     }
     assert MAX_PAGE_INSTANCES_DEFAULT == 2
 
@@ -174,12 +175,11 @@ def test_resolve_override_beats_route_by_tier(
     ("tier", "build_surface", "expected"),
     [
         ("free", True, "build"),
-        ("pro", True, "chat"),
-        ("free", False, "chat"),
+        ("pro", True, "build"),
         (None, True, "chat"),
     ],
 )
-def test_resolve_route_by_tier_off_legacy_behavior(
+def test_resolve_route_by_tier_off_uses_tier_default(
     tier: str | None, build_surface: bool, expected: str
 ) -> None:
     decision = resolve_surface(
@@ -190,7 +190,18 @@ def test_resolve_route_by_tier_off_legacy_behavior(
     )
     assert decision.surface == expected
     assert decision.group_source == "default-tier"
-    assert decision.group_name is None
+
+
+def test_resolve_free_with_build_disabled_is_denied() -> None:
+    # Free is Build-only; with Build disabled there is no legal surface.
+    with pytest.raises(SurfacePolicyError) as err:
+        resolve_surface(
+            "models/gemini-3.8-flash",
+            "free",
+            None,
+            {"route_by_tier": False, "build_surface": False},
+        )
+    assert err.value.code == "surface_group_disabled"
 
 
 def test_resolve_default_tier_group_free_routes_build() -> None:
@@ -223,10 +234,10 @@ def test_resolve_explicit_group_by_email_regex() -> None:
         "user@vip.corp",
         {"route_by_tier": True, "build_surface": True, "groups": GROUPS},
     )
-    assert decision.surface == "build"  # free tier prefers build, both allowed
+    assert decision.surface == "build"  # Free stays Build-only; group cannot widen it
     assert decision.group_name == "vip"
     assert decision.group_source == "explicit"
-    assert set(decision.allowed) == {"chat", "build"}
+    assert decision.allowed == ("build",)
 
 
 def test_resolve_multi_surface_prefers_build_for_non_chat_only() -> None:
@@ -243,8 +254,8 @@ def test_resolve_multi_surface_prefers_build_for_non_chat_only() -> None:
     assert decision.allowed == ("chat", "build")
 
 
-def test_resolve_multi_surface_unknown_tier_prefers_build() -> None:
-    # 非 chat-only 模型在双面许可下优先 build（与 tier、allowed 顺序均无关）。
+def test_resolve_explicit_group_cannot_widen_unknown_tier() -> None:
+    # Unknown tier is chat-only; an explicit group may only narrow it.
     groups = [
         {"name": "both", "match_tier": ["weird"], "allowed_surfaces": ["build", "chat"]}
     ]
@@ -254,8 +265,8 @@ def test_resolve_multi_surface_unknown_tier_prefers_build() -> None:
         None,
         {"route_by_tier": True, "build_surface": True, "groups": groups},
     )
-    assert decision.surface == "build"
-    assert decision.allowed == ("build", "chat")
+    assert decision.surface == "chat"
+    assert decision.allowed == ("chat",)
 
 
 def test_resolve_chat_only_model_forced_chat_in_multi_surface_group() -> None:
@@ -271,16 +282,16 @@ def test_resolve_chat_only_model_forced_chat_in_multi_surface_group() -> None:
     assert decision.surface == "chat"
 
 
-def test_resolve_legacy_chat_only_model_stays_chat() -> None:
-    # 旧路由（route_by_tier=false）+ free + build_surface=true 下，argon 仍强制 chat。
-    decision = resolve_surface(
-        "models/gemini-4-argon",
-        "free",
-        None,
-        {"route_by_tier": False, "build_surface": True},
-    )
-    assert decision.surface == "chat"
-    assert decision.allowed == ("chat",)
+def test_resolve_free_chat_only_model_is_denied() -> None:
+    # Free is Build-only; a chat-only model cannot be served on Build.
+    with pytest.raises(SurfacePolicyError) as err:
+        resolve_surface(
+            "models/gemini-4-argon",
+            "free",
+            None,
+            {"route_by_tier": False, "build_surface": True},
+        )
+    assert err.value.code == "surface_model_guard"
 
 
 def test_resolve_filters_build_when_feature_disabled() -> None:

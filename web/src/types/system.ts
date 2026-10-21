@@ -2,7 +2,7 @@ export interface FeatureChannelConfig {
   enabled?: boolean
   max_instances?: number
   max_pages?: number
-  quota_pool?: string | null
+  allowed_tags?: string[]
   [key: string]: unknown
 }
 

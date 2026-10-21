@@ -54,12 +54,11 @@ GROUPS = [
 ]
 
 
-def test_implicit_global_group_when_route_by_tier_off() -> None:
+def test_explicit_group_applies_when_route_by_tier_off() -> None:
     policy = select_group("pro", None, GROUPS, route_by_tier=False, build_enabled=True)
-    assert policy.source == "implicit-global"
-    assert policy.name is None
-    assert policy.allowed_surfaces == ("chat", "build")
-    assert policy.max_page_instances == 2
+    assert policy.source == "explicit"
+    assert policy.name == "pro"
+    assert policy.allowed_surfaces == ("chat",)
     assert policy.enabled is True
 
 
@@ -71,14 +70,17 @@ def test_explicit_group_first_match_with_weight_and_quota() -> None:
     assert policy.source == "explicit"
     assert policy.weight == 3.0
     assert policy.max_page_instances == 5
-    assert policy.allowed_surfaces == ("chat", "build")
-
-
-def test_disabled_and_empty_groups_are_skipped() -> None:
-    # disabled group is ignored, empty group is ignored, next matching group wins.
-    policy = select_group("free", None, GROUPS, route_by_tier=True, build_enabled=True)
-    assert policy.name == "free"
+    # Free is Build-only; the group may not widen it to chat.
     assert policy.allowed_surfaces == ("build",)
+
+
+def test_disabled_group_skipped_and_empty_group_denies() -> None:
+    # disabled group is ignored; the next matching group is enabled but empty,
+    # so it denies instead of falling through to the later "free" group.
+    policy = select_group("free", None, GROUPS, route_by_tier=True, build_enabled=True)
+    assert policy.name == "empty"
+    assert policy.enabled is True
+    assert policy.allowed_surfaces == ()
 
 
 def test_unmatched_account_falls_back_to_tier_default() -> None:
@@ -89,7 +91,7 @@ def test_unmatched_account_falls_back_to_tier_default() -> None:
     assert free.enabled is True
 
     pro = select_group("pro", None, [], route_by_tier=True, build_enabled=True)
-    assert pro.allowed_surfaces == ("chat",)
+    assert pro.allowed_surfaces == ("chat", "build")
 
 
 def test_default_tier_free_disabled_when_build_channel_off() -> None:
@@ -129,11 +131,6 @@ def test_account_membership_for_each_group_source() -> None:
     default = select_group("free", None, [], route_by_tier=True, build_enabled=True)
     assert account_matches_group(default, "free", None, GROUPS) is True
     assert account_matches_group(default, "pro", None, GROUPS) is False
-
-    implicit = select_group(
-        "pro", None, GROUPS, route_by_tier=False, build_enabled=True
-    )
-    assert account_matches_group(implicit, "free", None, GROUPS) is True
 
 
 def test_group_identity_is_stable() -> None:

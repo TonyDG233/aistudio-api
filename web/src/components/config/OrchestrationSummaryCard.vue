@@ -19,17 +19,27 @@ const enabledSlots = computed(() => props.slots.filter((slot) => slot.enabled !=
 
 function surfacesText(group: AccountGroupItem): string {
   const surfaces = group.allowed_surfaces || []
-  if (!surfaces.length) return '无渠道（禁用）'
+  if (!surfaces.length) return '无渠道（命中即拒绝）'
   return surfaces.map((surface) => (surface === 'chat' ? 'PG/Chat' : 'Build')).join(' + ')
 }
 
 function tiersText(group: AccountGroupItem): string {
   const tiers = group.match_tier || []
-  return tiers.length ? tiers.join(', ') : '全部档位（按邮箱/默认）'
+  if (tiers.length) return tiers.join(', ')
+  return group.match_emails_regex ? '按邮箱匹配' : '未设置（不会命中）'
+}
+
+function hasSurfaces(group: AccountGroupItem): boolean {
+  return (group.allowed_surfaces || []).length > 0
 }
 
 function isEnabled(group: AccountGroupItem): boolean {
-  return group.enabled !== false && (group.allowed_surfaces || []).length > 0
+  return group.enabled !== false
+}
+
+function stateText(group: AccountGroupItem): string {
+  if (!isEnabled(group)) return '已停用'
+  return hasSurfaces(group) ? '参与编排' : '命中即拒绝'
 }
 </script>
 
@@ -94,7 +104,7 @@ function isEnabled(group: AccountGroupItem): boolean {
         v-if="!groups.length"
         class="p-4 text-center text-gray-400 text-xs border border-dashed border-gray-200 rounded-xl"
       >
-        未配置策略组；未命中任何组时按 tier 默认规则兜底（free→build，pro/ultra/plus→chat）。
+        未配置策略组；未命中任何组时按 tier 默认规则兜底（free→build，pro/ultra/plus→PG+Build）。
       </div>
 
       <div
@@ -105,16 +115,18 @@ function isEnabled(group: AccountGroupItem): boolean {
           v-for="(group, index) in groups"
           :key="index"
           class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3.5 py-2.5 text-[11px]"
-          :class="isEnabled(group) ? 'bg-white' : 'bg-gray-50/70 text-gray-400'"
+          :class="isEnabled(group) ? (hasSurfaces(group) ? 'bg-white' : 'bg-amber-50/40') : 'bg-gray-50/70 text-gray-400'"
         >
           <span class="font-mono font-semibold text-gray-600">#{{ index + 1 }}</span>
           <span class="font-medium text-gray-800">{{ group.name || '未命名' }}</span>
           <span
             class="rounded px-1.5 py-0.5 text-[10px] font-semibold border"
-            :class="isEnabled(group)
-              ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
-              : 'text-gray-500 bg-gray-100 border-gray-200'"
-          >{{ isEnabled(group) ? '参与编排' : (group.enabled === false ? '已停用' : '空组排除') }}</span>
+            :class="!isEnabled(group)
+              ? 'text-gray-500 bg-gray-100 border-gray-200'
+              : hasSurfaces(group)
+                ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                : 'text-amber-700 bg-amber-50 border-amber-200'"
+          >{{ stateText(group) }}</span>
           <span class="text-gray-400">tier: {{ tiersText(group) }}</span>
           <span class="text-gray-400">渠道: {{ surfacesText(group) }}</span>
           <span class="text-gray-400">max_pages: {{ group.max_pages ?? 2 }}</span>
@@ -123,7 +135,7 @@ function isEnabled(group: AccountGroupItem): boolean {
       </div>
 
       <p class="text-[11px] text-gray-400 leading-relaxed">
-        未命中任何策略组时按 tier 默认规则兜底；空组/停用组视同不存在。槽位只做预留，不绕过渠道、策略组与全局预算。
+        未命中任何策略组时按 tier 默认规则兜底；停用组视同不存在，启用但未选渠道的组=命中即拒绝，不会回落。槽位只做预留，不绕过渠道、策略组与全局预算。
       </p>
     </div>
   </div>

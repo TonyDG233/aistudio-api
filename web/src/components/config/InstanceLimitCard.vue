@@ -5,9 +5,13 @@ import type { RoutingConfig } from './types.ts'
 import ConfigInput from './ConfigInput.vue'
 import FieldHelpTip from './FieldHelpTip.vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   routing?: RoutingConfig
-}>()
+  flat?: boolean
+}>(), {
+  routing: () => ({}),
+  flat: false,
+})
 
 const emit = defineEmits<{
   'update:routing': [val: RoutingConfig]
@@ -23,8 +27,8 @@ function update(value: string | number | null) {
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden">
-    <div class="px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5">
+  <div :class="flat ? 'bg-transparent' : 'bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden'">
+    <div :class="flat ? 'flex items-center gap-2.5 pb-2' : 'px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center gap-2.5'">
       <Boxes class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
@@ -44,7 +48,7 @@ function update(value: string | number | null) {
       </div>
     </div>
 
-    <div class="p-5">
+    <div :class="flat ? 'pt-0' : 'p-5'">
       <div class="flex flex-col sm:flex-row sm:items-end gap-3">
         <div class="w-full sm:max-w-[12rem]">
           <ConfigInput
