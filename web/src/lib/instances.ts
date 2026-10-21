@@ -33,6 +33,10 @@ export function instanceStateDotClass(state: string): string {
   return 'text-gray-300'
 }
 
+export function channelLabel(channel: string): string {
+  return channel === 'pg' ? 'PG' : channel === 'build' ? 'Build' : channel
+}
+
 export function channelLabels(channels: string[]): string[] {
-  return channels.map((channel) => (channel === 'pg' ? 'PG' : channel === 'build' ? 'Build' : channel))
+  return channels.map(channelLabel)
 }

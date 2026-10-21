@@ -113,12 +113,11 @@ class InstanceManager:
     # ------------------------------------------------------------- public API
 
     async def startup(self) -> None:
-        """Start up to ``max_contexts`` available account instances.
+        """Start ``max_contexts`` available accounts with one default instance each.
 
-        The active account is tried first, then the remaining accounts in
-        registry (rotation) order. Invalid/credential-missing accounts and
-        duplicate instances are skipped; one failed account never blocks the
-        others.
+        An instance is one account+channel usage window. Startup creates one
+        default-channel instance per account; additional channel instances can
+        be created later, subject to ``max_instances``.
         """
         async with self._lifecycle_lock:
             self._adopt_orphans()
@@ -133,14 +132,15 @@ class InstanceManager:
                 for account in accounts
                 if active is None or account.id != active.id
             ]
-            target = self._max_instances()
+            target_accounts = max(1, int(self._pool.max_contexts))
+            started_accounts: set[str] = set()
             log.info(
                 "[instances] startup begin max_contexts=%d accounts=%d",
-                target,
+                target_accounts,
                 len(ordered),
             )
             for account in ordered:
-                if self._occupying_count() >= target:
+                if len(started_accounts) >= target_accounts:
                     break
                 if self._has_record_for_account(account.id):
                     continue
@@ -158,10 +158,12 @@ class InstanceManager:
                 )
                 self._records[record.id] = record
                 if await self._start(record, account, record.channel):
+                    started_accounts.add(account.id)
                     log.info(
-                        "[instances] startup started id=%s account=%s",
+                        "[instances] startup started id=%s account=%s channel=%s",
                         record.id,
                         account.id,
+                        record.channel,
                     )
                 else:
                     self._records.pop(record.id, None)
@@ -211,13 +213,15 @@ class InstanceManager:
         normalized = self._normalize_channel(channel)
         async with self._lifecycle_lock:
             self._adopt_orphans()
-            if self._has_record_for_account(account_id):
-                raise InstanceAlreadyExistsError(f"账号 {account_id} 已有实例")
+            if self._has_record_for(account_id, normalized):
+                raise InstanceAlreadyExistsError(
+                    f"账号 {account_id} 已存在 {normalized} 实例"
+                )
             if self._occupying_count() >= self._max_instances():
                 raise InstanceCapacityExhaustedError(
                     f"实例上限已满（{self._max_instances()}），请先关闭一个实例"
                 )
-            await self._preflight_channel(normalized)
+            await self._preflight_channel(normalized, account_id)
 
             record = self._new_record(account.id, InstanceState.STARTING, normalized)
             self._records[record.id] = record
@@ -249,45 +253,111 @@ class InstanceManager:
             return self._view(record)
 
     async def switch_to(self, instance_id: str, channel: str | None = None) -> Instance:
-        """Switch the current account state to an instance.
+        """Switch current instance, or replace one instance's channel.
 
-        An already active target is switched in place. An inactive target is
-        (re)started; if runtime capacity is full, the current instance is closed
-        first so ``max_contexts=1`` behaves as close-old-then-open-new.
+        An active target is switched in place. If a different channel is
+        requested for the target's account, an existing sibling instance is
+        reused. When the instance cap is full, the target instance's channel is
+        closed and the requested channel is opened in the same account context
+        (2c1p); otherwise a second instance is created (1c2p).
         """
-        normalized = self._normalize_channel(channel) if channel is not None else None
+        requested = self._normalize_channel(channel) if channel is not None else None
         async with self._lifecycle_lock:
             self._adopt_orphans()
             target = self._record(instance_id)
             account = self._validate_account(target.account_id)
-
-            if target.state is InstanceState.STARTING:
-                task = self._tasks.get(target.id)
-                if task is not None:
-                    await asyncio.shield(task)
-                if target.id not in self._records:
-                    raise InstanceNotFoundError("实例启动失败")
-                self._refresh_records()
+            await self._settle_starting(target)
 
             if target.state is InstanceState.RECLAIMING:
                 raise InstanceNotReadyError("实例正在回收，不能切换")
-            if target.state is InstanceState.INVALID:
-                await self._start_inactive_target(target, account, normalized)
-            elif target.state is not InstanceState.ACTIVE:
-                raise InstanceNotReadyError("实例尚未就绪，不能切换")
 
-            if normalized is not None:
-                try:
-                    await self._pool.ensure_channel(target.runtime_ref, normalized)
-                except InstanceCapacityError as exc:
-                    raise InstanceCapacityExhaustedError(str(exc)) from exc
-
-            if self._switch_account is not None:
-                switched = await self._switch_account(account.id)
+            if requested is None or requested == target.channel:
+                await self._ensure_record_active(target, account)
+                switched = await self._switch_current_account(account)
                 if not switched:
                     raise InstanceNotReadyError("账号状态切换失败")
-            self._current_id = target.id
-            return self._view(target)
+                self._current_id = target.id
+                return self._view(target)
+
+            existing = self._find_record_for(
+                account.id, requested, exclude_id=target.id
+            )
+            if existing is not None:
+                await self._settle_starting(existing)
+                await self._ensure_record_active(existing, account)
+                switched = await self._switch_current_account(account)
+                if not switched:
+                    raise InstanceNotReadyError("账号状态切换失败")
+                self._current_id = existing.id
+                return self._view(existing)
+
+            old_current = self._current_id
+            if self._occupying_count() >= self._max_instances():
+                # Replace this instance's channel; keep its context for reuse.
+                if target.state is not InstanceState.ACTIVE:
+                    raise InstanceNotReadyError("实例尚未就绪，不能换渠道")
+                if target.runtime_ref:
+                    slot = self._pool.get(target.runtime_ref)
+                    if slot is not None and int(getattr(slot, "in_flight", 0)) > 0:
+                        raise InstanceBusyError("该实例仍有在途请求")
+                    try:
+                        await self._pool.close_channel(
+                            target.runtime_ref, target.channel
+                        )
+                    except InstanceCapacityError as exc:
+                        raise InstanceBusyError(str(exc)) from exc
+                self._cancel(target.id)
+                self._records.pop(target.id, None)
+                if self._current_id == target.id:
+                    self._current_id = None
+                self._repair_latest()
+
+            record = self._new_record(account.id, InstanceState.STARTING, requested)
+            self._records[record.id] = record
+            if not await self._start(record, account, requested):
+                self._records.pop(record.id, None)
+                self._repair_latest()
+                self._repair_current()
+                error = record.last_error or "实例启动失败"
+                if "budget" in error.lower() or "capacity" in error.lower():
+                    raise InstanceCapacityExhaustedError(error)
+                raise InstanceNotReadyError(error)
+            switched = await self._switch_current_account(account)
+            if not switched:
+                self._current_id = old_current if old_current in self._records else None
+                self._repair_current()
+                raise InstanceNotReadyError("账号状态切换失败")
+            self._current_id = record.id
+            return self._view(record)
+
+    async def _settle_starting(self, record: _Record) -> None:
+        if record.state is not InstanceState.STARTING:
+            return
+        task = self._tasks.get(record.id)
+        if task is not None:
+            await asyncio.shield(task)
+        if record.id not in self._records:
+            raise InstanceNotFoundError("实例启动失败")
+        self._refresh_records()
+
+    async def _ensure_record_active(
+        self, record: _Record, account: AccountMeta
+    ) -> None:
+        if record.state is InstanceState.INVALID:
+            await self._start_inactive_target(record, account, record.channel)
+            return
+        if record.state is not InstanceState.ACTIVE:
+            raise InstanceNotReadyError("实例尚未就绪，不能切换")
+        if record.runtime_ref:
+            try:
+                await self._pool.ensure_channel(record.runtime_ref, record.channel)
+            except InstanceCapacityError as exc:
+                raise InstanceCapacityExhaustedError(str(exc)) from exc
+
+    async def _switch_current_account(self, account: AccountMeta) -> bool:
+        if self._switch_account is None:
+            return True
+        return await self._switch_account(account.id)
 
     async def reassign(self, instance_id: str, account_id: str) -> Instance:
         account = self._validate_account(account_id)
@@ -297,6 +367,10 @@ class InstanceManager:
                 raise InstanceNotReadyError("实例尚未就绪，不能换账号")
             if record.account_id == account.id:
                 return self._view(record)
+            if self._siblings(record):
+                raise InstanceAlreadyExistsError(
+                    "同一账号有多个渠道实例时，不能单独迁移其中一个实例"
+                )
             if self._has_record_for_account(account.id, exclude_id=record.id):
                 raise InstanceAlreadyExistsError(f"账号 {account_id} 已有实例")
             if record.runtime_ref:
@@ -354,7 +428,13 @@ class InstanceManager:
                     record.last_error = "该实例仍有在途请求"
                     return False
                 try:
-                    await self._pool.close_instance(record.runtime_ref)
+                    if self._siblings(record):
+                        # Shared account context: only replace this instance's page.
+                        await self._pool.close_channel(
+                            record.runtime_ref, record.channel
+                        )
+                    else:
+                        await self._pool.close_instance(record.runtime_ref)
                 except Exception as exc:
                     record.state = InstanceState.INVALID
                     record.last_error = str(exc)
@@ -410,7 +490,7 @@ class InstanceManager:
         target_slot = self._pool.get(target.runtime_ref) if target.runtime_ref else None
         if target_slot is not None and int(getattr(target_slot, "in_flight", 0)) > 0:
             raise InstanceBusyError("该实例仍有在途请求")
-        if target_slot is None and self._runtime_occupancy() >= self._max_instances():
+        if target_slot is None and len(self._pool.slots()) >= self._pool.max_contexts:
             victim = self._current_instance()
             if victim is None or victim.id == target.id:
                 victim = self._most_recent_active(exclude_id=target.id)
@@ -424,7 +504,10 @@ class InstanceManager:
     async def _reclaim(self, record: _Record) -> None:
         try:
             if record.runtime_ref:
-                await self._pool.close_instance(record.runtime_ref)
+                if self._siblings(record):
+                    await self._pool.close_channel(record.runtime_ref, record.channel)
+                else:
+                    await self._pool.close_instance(record.runtime_ref)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -444,7 +527,10 @@ class InstanceManager:
             if slot is not None and int(getattr(slot, "in_flight", 0)) > 0:
                 raise InstanceBusyError("该实例仍有在途请求")
             try:
-                await self._pool.close_instance(record.runtime_ref)
+                if self._siblings(record):
+                    await self._pool.close_channel(record.runtime_ref, record.channel)
+                else:
+                    await self._pool.close_instance(record.runtime_ref)
             except InstanceCapacityError as exc:
                 raise InstanceBusyError(str(exc)) from exc
         else:
@@ -490,12 +576,14 @@ class InstanceManager:
 
     # ------------------------------------------------------------------ helpers
 
-    async def _preflight_channel(self, channel: str) -> None:
+    async def _preflight_channel(
+        self, channel: str, account_id: str | None = None
+    ) -> None:
         checker = getattr(self._pool, "check_create_budget", None)
         if checker is None:
             return
         try:
-            await checker(channel)
+            await checker(channel, account_id=account_id)
         except InstanceCapacityError as exc:
             raise InstanceCapacityExhaustedError(str(exc)) from exc
 
@@ -566,8 +654,43 @@ class InstanceManager:
             for record in self._records.values()
         )
 
+    def _has_record_for(
+        self, account_id: str, channel: str, *, exclude_id: str | None = None
+    ) -> bool:
+        return any(
+            record.account_id == account_id
+            and record.channel == channel
+            and record.id != exclude_id
+            and record.state is not InstanceState.RECLAIMING
+            for record in self._records.values()
+        )
+
+    def _find_record_for(
+        self, account_id: str, channel: str, *, exclude_id: str | None = None
+    ) -> _Record | None:
+        for record in self._records.values():
+            if (
+                record.account_id == account_id
+                and record.channel == channel
+                and record.id != exclude_id
+                and record.state is not InstanceState.RECLAIMING
+            ):
+                return record
+        return None
+
+    def _siblings(self, record: _Record) -> list[_Record]:
+        if not record.runtime_ref:
+            return []
+        return [
+            other
+            for other in self._records.values()
+            if other.id != record.id
+            and other.runtime_ref == record.runtime_ref
+            and other.state is not InstanceState.RECLAIMING
+        ]
+
     def _max_instances(self) -> int:
-        return max(1, int(self._pool.max_contexts))
+        return max(2, int(self._pool.max_contexts))
 
     def _occupying_count(self) -> int:
         return sum(
@@ -645,7 +768,13 @@ class InstanceManager:
                     record.last_error = "runtime missing"
                 continue
             if record.state is not InstanceState.RECLAIMING:
-                record.state = self._state_from_slot(slot)
+                state = self._state_from_slot(slot)
+                if state is InstanceState.ACTIVE and not self._surface_active(
+                    slot, record.channel
+                ):
+                    state = InstanceState.INVALID
+                    record.last_error = "渠道页面缺失"
+                record.state = state
 
     @staticmethod
     def _state_from_slot(slot: Any) -> InstanceState:
@@ -660,20 +789,16 @@ class InstanceManager:
 
     def _view(self, record: _Record) -> Instance:
         slot = self._pool.get(record.runtime_ref) if record.runtime_ref else None
-        channels: tuple[str, ...] = ()
         in_flight = 0
         if slot is not None:
-            if self._surface_active(slot, "chat"):
-                channels = (*channels, "pg")
-            if self._surface_active(slot, "build"):
-                channels = (*channels, "build")
             in_flight = int(getattr(slot, "in_flight", 0))
+        channel = "build" if record.channel == "build" else "pg"
         return Instance(
             id=record.id,
             number=record.number,
             account_id=record.account_id,
             state=record.state,
-            channels=channels,
+            channel=channel,
             in_flight=in_flight,
             latest=record.id == self._latest_id,
         )

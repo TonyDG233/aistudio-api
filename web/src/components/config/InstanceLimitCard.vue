@@ -28,18 +28,18 @@ function update(value: string | number | null) {
       <Boxes class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
-          <span>实例上限</span>
+          <span>账号会话上限</span>
           <span class="text-[10px] font-semibold text-brand-700 bg-brand-50 border border-brand-200/70 rounded px-1.5 py-0.5">
-            默认单实例
+            默认单账号
           </span>
           <FieldHelpTip
-            title="实例上限"
-            content="max_contexts：最多同时登录几个账号，也就是反代能同时路由到几个实例。"
-            explanation="实例是用户可见的登录会话，不是页面数。"
+            title="账号会话上限"
+            content="max_contexts：最多同时登录几个账号（浏览器上下文），不是用量窗口数。"
+            explanation="同一账号的 PG/Build 是两个实例、两个用量窗口，共享一个上下文；用量窗口上限 = max(max_contexts, 2)。"
           />
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          等于同时登录账号数，也是反代可同时路由到的实例数；受内存约束。
+          账号数决定上下文数；每个账号默认一个渠道实例，还可以再加另一个渠道（1c2p）。
         </p>
       </div>
     </div>
@@ -50,14 +50,14 @@ function update(value: string | number | null) {
           <ConfigInput
             :model-value="value"
             type="number"
-            label="最多同时登录实例"
-            description="1-16；默认 1"
+            label="最多同时登录账号"
+            description="1-16；默认 1；用量窗口上限 = max(该值, 2)"
             placeholder="1"
             @update:model-value="update"
           />
         </div>
         <p class="text-[11px] text-gray-400 leading-relaxed pb-1">
-          设为 1 时，自定义策略组与高级内存优化会整卡收起；设为 2 以上才会显示。
+          设为 1 时按单账号模式收起高级项；该账号仍可同时拥有 PG 与 Build 两个用量窗口。
           修改后需保存并热重载，不会自动关闭现有实例。
         </p>
       </div>

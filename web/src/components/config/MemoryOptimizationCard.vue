@@ -147,7 +147,7 @@ onUnmounted(stopPolling)
       <div class="rounded-xl border border-gray-200/80 bg-gray-50/60 p-4 space-y-3">
         <div class="flex items-center justify-between gap-2">
           <span class="text-xs font-bold text-gray-800">页面预算</span>
-          <span class="text-[10px] text-gray-400">至少覆盖实例上限 {{ contexts }}</span>
+          <span class="text-[10px] text-gray-400">至少覆盖用量窗口上限 {{ contexts }}</span>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <ConfigInput

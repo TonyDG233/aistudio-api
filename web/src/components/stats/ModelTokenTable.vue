@@ -57,7 +57,7 @@ function breakdownRows(value: Record<string, StatsBucket>) {
                 模型
               </th>
               <th class="px-3 py-3 text-right">
-                客户端请求 / 成功
+                模型调用 / 成功
               </th>
               <th class="px-3 py-3 text-right">
                 输入
@@ -103,10 +103,10 @@ function breakdownRows(value: Record<string, StatsBucket>) {
                 </td>
                 <td class="px-3 py-3.5 text-right">
                   <div class="font-mono tabular-nums text-gray-800">
-                    {{ formatInt(row.item.client_requests) }} / {{ formatInt(row.item.client_success) }}
+                    {{ formatInt(row.item.attempts) }} / {{ formatInt(row.item.success) }}
                   </div>
                   <div class="text-[10px] text-gray-400 font-mono tabular-nums">
-                    上游 {{ formatInt(row.item.attempts) }} · 429 {{ formatInt(row.item.rate_limited) }}
+                    客户端 {{ formatInt(row.item.client_requests) }} · 429 {{ formatInt(row.item.rate_limited) }}
                   </div>
                 </td>
                 <td class="px-3 py-3.5 text-right font-mono tabular-nums text-brand-600">
@@ -175,10 +175,10 @@ function breakdownRows(value: Record<string, StatsBucket>) {
                               名称
                             </th>
                             <th class="px-2 py-1.5 text-right font-medium">
-                              客户端
+                              模型调用
                             </th>
                             <th class="px-2 py-1.5 text-right font-medium">
-                              上游
+                              客户端
                             </th>
                             <th class="px-2 py-1.5 text-right font-medium">
                               输入
@@ -203,10 +203,10 @@ function breakdownRows(value: Record<string, StatsBucket>) {
                               {{ item.name }}
                             </td>
                             <td class="px-2 py-1.5 text-right font-mono tabular-nums">
-                              {{ formatInt(item.bucket.client_requests) }}
+                              {{ formatInt(item.bucket.attempts) }}
                             </td>
                             <td class="px-2 py-1.5 text-right font-mono tabular-nums">
-                              {{ formatInt(item.bucket.attempts) }}
+                              {{ formatInt(item.bucket.client_requests) }}
                             </td>
                             <td class="px-2 py-1.5 text-right font-mono tabular-nums">
                               {{ formatInt(item.bucket.prompt_tokens) }}
@@ -251,7 +251,7 @@ function breakdownRows(value: Record<string, StatsBucket>) {
                 </Badge>
               </div>
               <div class="text-[11px] text-gray-400 mt-0.5">
-                客户端 {{ formatInt(row.item.client_requests) }} / 成功 {{ formatInt(row.item.client_success) }}
+                模型调用 {{ formatInt(row.item.attempts) }} / 成功 {{ formatInt(row.item.success) }} · 客户端 {{ formatInt(row.item.client_requests) }}
               </div>
             </div>
             <button

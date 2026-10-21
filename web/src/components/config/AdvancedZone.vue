@@ -21,7 +21,7 @@ const emit = defineEmits<{
   'update:features': [val: FeaturesConfig]
 }>()
 
-const singleInstance = computed(
+const singleAccount = computed(
   () => Math.max(1, Number(props.features.routing?.max_contexts ?? 1) || 1) <= 1,
 )
 
@@ -46,7 +46,8 @@ function updateRouting(val: RoutingConfig) {
   <div class="space-y-5">
     <div class="px-4 py-3 bg-blue-50/70 border border-blue-200/80 rounded-xl text-[11px] text-blue-900 leading-relaxed">
       <span class="font-semibold">深度模式：</span>
-      修改会直接影响实例容量、渠道与路由。实例是同时登录的账号会话；页面预算只在高级内存优化里配置。
+      修改会直接影响账号容量、渠道与路由。账号是登录会话；实例是账号+渠道的独立用量窗口，
+      同一账号的 PG/Build 共享一个上下文。页面预算只在高级内存优化里配置。
       所有修改统一通过「保存并热重载」写入。
     </div>
 
@@ -62,12 +63,13 @@ function updateRouting(val: RoutingConfig) {
     />
 
     <div
-      v-if="singleInstance"
+      v-if="singleAccount"
       class="flex items-start gap-2 px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-[11px] text-gray-500"
     >
       <Info class="w-4 h-4 text-gray-400 shrink-0 mt-0.5" />
       <p>
-        单实例模式：自定义策略组与高级内存优化已收起。把实例上限调到 2 以上并保存后才会显示。
+        单账号模式：自定义策略组与高级内存优化已收起。该账号仍允许 PG+Build 两个用量窗口（1c2p）；
+        把账号会话上限调到 2 以上并保存后会显示这些高级项。
       </p>
     </div>
 
@@ -82,7 +84,7 @@ function updateRouting(val: RoutingConfig) {
         :routing="features.routing || {}"
         :channels="features.channels || {}"
         :groups="features.groups || []"
-        :max-contexts="Math.max(1, Number(features.routing?.max_contexts ?? 1) || 1)"
+        :max-contexts="Math.max(2, Math.max(1, Number(features.routing?.max_contexts ?? 1) || 1))"
         @update:routing="updateRouting"
         @update:channels="updateChannels"
         @update:groups="updateGroups"

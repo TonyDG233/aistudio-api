@@ -18,8 +18,12 @@ export const useInstancesStore = defineStore('instances', () => {
   const reassigningInstanceId = ref<string | null>(null)
 
   const byAccount = computed(() => {
-    const map = new Map<string, Instance>()
-    for (const instance of instances.value) map.set(instance.account_id, instance)
+    const map = new Map<string, Instance[]>()
+    for (const instance of instances.value) {
+      const bucket = map.get(instance.account_id) ?? []
+      bucket.push(instance)
+      map.set(instance.account_id, bucket)
+    }
     return map
   })
 
@@ -62,8 +66,8 @@ export const useInstancesStore = defineStore('instances', () => {
     return instances.value.find((item) => item.id === instanceId) ?? null
   }
 
-  function instanceForAccount(accountId: string): Instance | null {
-    return byAccount.value.get(accountId) ?? null
+  function instancesForAccount(accountId: string): Instance[] {
+    return byAccount.value.get(accountId) ?? []
   }
 
   async function create(accountId: string, channel?: string): Promise<boolean> {
@@ -159,7 +163,7 @@ export const useInstancesStore = defineStore('instances', () => {
     occupiedCount,
     atCapacity,
     fetch,
-    instanceForAccount,
+    instancesForAccount,
     create,
     close,
     switchTo,

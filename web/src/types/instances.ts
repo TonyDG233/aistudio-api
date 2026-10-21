@@ -5,7 +5,7 @@ export interface Instance {
   number: number
   account_id: string
   state: InstanceState
-  channels: string[]
+  channel: string
   in_flight: number
   latest: boolean
 }

@@ -26,13 +26,13 @@ const formats = computed(() =>
     <div class="px-6 py-4 border-b border-gray-100 flex flex-wrap items-center justify-between gap-2">
       <div>
         <h2 class="text-sm font-semibold text-gray-900">
-          预检查询
+          Token 计数
         </h2>
         <p class="text-xs text-gray-400 mt-0.5">
           {{ rangeLabel }} · count_tokens / input_tokens
         </p>
       </div>
-      <span class="text-[11px] text-gray-400">不是生成请求记录</span>
+      <span class="text-[11px] text-gray-400">不计入模型调用</span>
     </div>
     <div class="p-5">
       <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -80,7 +80,7 @@ const formats = computed(() =>
         </div>
       </div>
       <p class="mt-3 text-[11px] text-gray-500">
-        预检查询不计入生成 token 总量；没有请求级明细。请求记录属于未来的中转站管理模式。
+        预检查询不计入模型调用次数与生成 token 总量；没有请求级明细。请求记录属于未来的中转站管理模式。
       </p>
     </div>
   </section>

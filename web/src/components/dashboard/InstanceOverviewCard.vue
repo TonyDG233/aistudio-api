@@ -5,7 +5,7 @@ import type { AccountWithStats } from '@/types'
 import type { Instance } from '@/types'
 import Button from '@/components/ui/Button.vue'
 import {
-  channelLabels,
+  channelLabel,
   instanceStateDotClass,
   instanceStateLabel,
   tierLabel,
@@ -33,19 +33,21 @@ const accountMap = computed(() => {
   return map
 })
 
-const rows = computed(() =>
-  [...props.instances]
-    .sort((a, b) => a.number - b.number)
-    .map((instance) => {
-      const account = accountMap.value.get(instance.account_id)
-      return {
-        ...instance,
-        label: account?.email || account?.name || instance.account_id,
-        tier: account?.tier ?? null,
-        channels: channelLabels(instance.channels),
-      }
-    }),
-)
+const rows = computed(() => {
+  const sorted = [...props.instances].sort((a, b) => a.number - b.number)
+  return sorted.map((instance, index) => {
+    const account = accountMap.value.get(instance.account_id)
+    return {
+      ...instance,
+      ordinal: index + 1,
+      label: account?.email || account?.name || instance.account_id,
+      tier: account?.tier ?? null,
+      channel: channelLabel(instance.channel),
+      sameAccount:
+        index > 0 && sorted[index - 1]?.account_id === instance.account_id,
+    }
+  })
+})
 
 const occupied = computed(
   () => props.instances.filter((instance) => instance.state !== 'reclaiming').length,
@@ -68,7 +70,7 @@ const inFlight = computed(() =>
             </span>
           </h2>
           <p class="text-[11px] text-gray-400 mt-0.5">
-            实例 = 一个同时登录的账号会话；同一账号的 PG + Build 仍是一个实例。
+            实例 = 账号 + 渠道的用量窗口；同一账号的 PG 与 Build 是两个实例。
           </p>
         </div>
       </div>
@@ -156,7 +158,13 @@ const inFlight = computed(() =>
         <div class="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
           <div class="min-w-0">
             <div class="flex flex-wrap items-center gap-2">
-              <span class="text-[11px] font-mono font-semibold text-gray-500">实例 #{{ row.number }}</span>
+              <span class="text-[11px] font-mono font-semibold text-gray-500">实例 #{{ row.ordinal }}</span>
+              <span
+                v-if="row.sameAccount"
+                class="rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-500"
+              >
+                同账号
+              </span>
               <span
                 class="text-[13px] font-semibold text-gray-900 truncate"
                 :title="row.label"
@@ -198,16 +206,10 @@ const inFlight = computed(() =>
               <span class="flex items-center gap-1">
                 <span class="text-gray-400">渠道</span>
                 <span
-                  v-for="channel in row.channels"
-                  :key="channel"
                   class="rounded border border-gray-200 bg-white px-1.5 py-0.5 font-mono text-[10px] text-gray-600"
                 >
-                  {{ channel }}
+                  {{ row.channel }}
                 </span>
-                <span
-                  v-if="!row.channels.length"
-                  class="text-gray-400"
-                >尚未就绪</span>
               </span>
               <span class="text-gray-200">|</span>
               <span class="flex items-center gap-1">

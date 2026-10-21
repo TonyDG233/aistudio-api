@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Circle, HelpCircle, Plus, RefreshCw } from 'lucide-vue-next'
 import type { AccountWithStats } from '@/types'
@@ -7,6 +7,7 @@ import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import { useSystemStore } from '@/stores/system.ts'
 import {
+  channelLabel,
   instanceStateDotClass,
   instanceStateLabel,
   tierLabel,
@@ -45,31 +46,44 @@ const accountMap = computed(() => {
   return map
 })
 
-const rows = computed(() =>
-  [...props.instances]
+const rows = computed(() => {
+  const counts = new Map<string, number>()
+  for (const instance of props.instances) {
+    counts.set(instance.account_id, (counts.get(instance.account_id) ?? 0) + 1)
+  }
+  return [...props.instances]
     .sort((a, b) => a.number - b.number)
-    .map((instance) => {
+    .map((instance, index) => {
       const account = accountMap.value.get(instance.account_id)
       return {
         ...instance,
+        ordinal: index + 1,
         label: account?.email || account?.name || instance.account_id,
         tier: account?.tier ?? null,
+        channel: instance.channel,
+        channelText: channelLabel(instance.channel),
+        sameAccount: (counts.get(instance.account_id) ?? 0) > 1,
         isCurrent: instance.id === props.currentInstanceId,
       }
-    }),
-)
+    })
+})
 
 const occupiedCount = computed(
   () => props.instances.filter((instance) => instance.state !== 'reclaiming').length,
 )
 
-const availableAccounts = computed(() =>
+const availableAccountsForChannel = computed(() =>
   props.accounts.filter(
     (account) =>
       !account.expired &&
       !account.session_expired &&
       account.is_available !== false &&
-      !props.instances.some((instance) => instance.account_id === account.id),
+      !props.instances.some(
+        (instance) =>
+          instance.account_id === account.id
+          && instance.channel === selectedChannel.value
+          && instance.state !== 'reclaiming',
+      ),
   ),
 )
 
@@ -91,83 +105,111 @@ const channelDefs = computed<Array<{ key: ChannelKey; label: string }>>(() => {
   return defs.filter((channel) => channel.enabled).map(({ key, label }) => ({ key, label }))
 })
 
-const effectiveContexts = computed(() =>
-  Math.max(1, Number(systemStore.config?.features?.routing?.max_contexts ?? props.maxInstances) || 1),
-)
-const globalBudget = computed(() =>
-  Math.max(
-    effectiveContexts.value,
-    Number(systemStore.config?.features?.routing?.global_max_pages ?? effectiveContexts.value) || effectiveContexts.value,
-  ),
-)
+const globalBudget = computed(() => {
+  const configured = Number(
+    systemStore.config?.features?.routing?.global_max_pages ?? props.maxInstances,
+  )
+  return Math.max(1, Math.min(props.maxInstances, Number.isFinite(configured) ? configured : props.maxInstances))
+})
 const usedGlobal = computed(() =>
-  props.instances
-    .filter((instance) => instance.state === 'active')
-    .reduce((sum, instance) => sum + instance.channels.length, 0),
+  props.instances.filter((instance) => instance.state === 'active').length,
 )
 
 function channelBudget(channel: ChannelKey): number {
   const features = systemStore.config?.features
   const key = channel === 'pg' ? 'chat' : 'build'
-  const configured = Number(features?.channels?.[key]?.max_pages ?? effectiveContexts.value)
-  return Math.max(effectiveContexts.value, Number.isFinite(configured) ? configured : effectiveContexts.value)
+  const configured = Number(features?.channels?.[key]?.max_pages ?? props.maxInstances)
+  return Math.max(1, Math.min(props.maxInstances, Number.isFinite(configured) ? configured : props.maxInstances))
 }
 
 function usedChannel(channel: ChannelKey): number {
   return props.instances.filter(
-    (instance) => instance.state === 'active' && instance.channels.includes(channel),
+    (instance) => instance.state === 'active' && instance.channel === channel,
   ).length
 }
 
 function channelAllowed(channel: ChannelKey): boolean {
-  return usedGlobal.value < globalBudget.value && usedChannel(channel) < channelBudget(channel)
+  return usedGlobal.value < props.maxInstances
+    && usedGlobal.value < globalBudget.value
+    && usedChannel(channel) < channelBudget(channel)
+}
+
+function siblingFor(row: Instance, channel: ChannelKey): Instance | null {
+  return props.instances.find(
+    (instance) =>
+      instance.id !== row.id
+      && instance.account_id === row.account_id
+      && instance.channel === channel
+      && instance.state !== 'reclaiming',
+  ) ?? null
 }
 
 function channelButton(
   row: Instance & { isCurrent: boolean },
   channel: ChannelKey,
 ): { enabled: boolean; label: string; title: string } {
-  const active = row.channels.includes(channel)
-  if (active) {
+  if (row.channel === channel) {
     if (row.isCurrent) {
       return {
         enabled: false,
         label: '使用中',
-        title: '当前实例已在使用这个渠道',
+        title: '当前实例正在使用这个渠道',
       }
     }
     return {
       enabled: row.state === 'active',
       label: '切换',
-      title: '切换到这个渠道',
+      title: '切换到这个实例',
     }
   }
-  const allowed = channelAllowed(channel)
+
+  const sibling = siblingFor(row, channel)
+  if (sibling) {
+    return {
+      enabled: sibling.state === 'active',
+      label: '切换',
+      title: '切换到同账号的另一个渠道实例',
+    }
+  }
+
+  const replace = occupiedCount.value >= props.maxInstances
+  const allowed = replace
+    ? row.state === 'active' && usedChannel(channel) < channelBudget(channel)
+    : row.state === 'active' && channelAllowed(channel)
   return {
-    enabled: row.state === 'active' && allowed,
-    label: allowed ? '启动并切换' : '预算不足',
-    title: allowed ? '启动该渠道并切换' : '页面/渠道预算不足，不能启动新页面',
+    enabled: allowed,
+    label: allowed
+      ? (replace ? '替换并切换' : '启动并切换')
+      : (replace ? '实例上限已满' : '预算不足'),
+    title: allowed
+      ? (replace
+          ? '关闭该实例的当前渠道，并在同一账号上下文启动目标渠道'
+          : '为该账号启动另一个渠道实例')
+      : (replace
+          ? '实例上限已满，且目标渠道预算不足'
+          : '实例上限或页面/渠道预算不足'),
   }
 }
 
 const selectedAccount = computed(
-  () => availableAccounts.value.find((account) => account.id === selectedAccountId.value) ?? null,
+  () => availableAccountsForChannel.value.find((account) => account.id === selectedAccountId.value) ?? null,
 )
 
 const selectedChannelAllowed = computed(() =>
-  channelDefs.value.some((channel) => channel.key === selectedChannel.value) && channelAllowed(selectedChannel.value),
+  channelDefs.value.some((channel) => channel.key === selectedChannel.value)
+  && channelAllowed(selectedChannel.value),
 )
 
 const canCreate = computed(
-  () => availableAccounts.value.length > 0
+  () => availableAccountsForChannel.value.length > 0
     && occupiedCount.value < props.maxInstances
     && selectedChannelAllowed.value,
 )
 
 function resetNewForm() {
-  selectedAccountId.value = availableAccounts.value[0]?.id ?? ''
   const firstAllowed = channelDefs.value.find((channel) => channelAllowed(channel.key))
   selectedChannel.value = firstAllowed?.key ?? channelDefs.value[0]?.key ?? 'pg'
+  selectedAccountId.value = availableAccountsForChannel.value[0]?.id ?? ''
 }
 
 function openNewForm() {
@@ -185,9 +227,15 @@ watch(
   },
 )
 
-watch(availableAccounts, (accounts) => {
+watch(availableAccountsForChannel, (accounts) => {
   if (!accounts.some((account) => account.id === selectedAccountId.value)) {
     selectedAccountId.value = accounts[0]?.id ?? ''
+  }
+})
+
+watch(selectedChannel, () => {
+  if (!availableAccountsForChannel.value.some((account) => account.id === selectedAccountId.value)) {
+    selectedAccountId.value = availableAccountsForChannel.value[0]?.id ?? ''
   }
 })
 
@@ -199,6 +247,15 @@ watch(channelDefs, (channels) => {
 
 function switchTo(instance: Instance & { isCurrent: boolean }, channel: ChannelKey) {
   if (!channelButton(instance, channel).enabled) return
+  if (instance.channel === channel) {
+    emit('switch', instance.id)
+    return
+  }
+  const sibling = siblingFor(instance, channel)
+  if (sibling) {
+    emit('switch', sibling.id)
+    return
+  }
   emit('switch', instance.id, channel)
 }
 
@@ -280,7 +337,18 @@ function createInstance() {
                 class="w-2.5 h-2.5 fill-current"
                 :class="instanceStateDotClass(row.state)"
               />
-              <span class="text-xs font-mono font-semibold text-gray-500">实例 #{{ row.number }}</span>
+              <span class="text-xs font-mono font-semibold text-gray-500">实例 #{{ row.ordinal }}</span>
+              <span
+                class="rounded border border-gray-200 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold text-gray-600"
+              >
+                {{ row.channelText }}
+              </span>
+              <span
+                v-if="row.sameAccount"
+                class="rounded border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[10px] font-medium text-gray-500"
+              >
+                同账号
+              </span>
               <span
                 class="text-sm font-medium text-gray-900 truncate"
                 :title="row.label"
@@ -345,7 +413,7 @@ function createInstance() {
           class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2"
         >
           <p class="text-[11px] text-gray-400">
-            新建实例消耗一个并发账号容量；关闭实例释放容量。
+            新建实例消耗一个用量窗口容量；同账号新渠道复用上下文。
           </p>
           <Button
             variant="outline"
@@ -354,7 +422,7 @@ function createInstance() {
             :disabled="!canCreate"
             :title="occupiedCount >= maxInstances
               ? '实例上限已满，请先关闭一个实例'
-              : availableAccounts.length === 0
+              : availableAccountsForChannel.length === 0
                 ? '没有可创建实例的账号'
                 : !selectedChannelAllowed
                   ? '所选渠道预算不足'
@@ -384,16 +452,16 @@ function createInstance() {
           <select
             v-model="selectedAccountId"
             class="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20"
-            :disabled="!availableAccounts.length"
+            :disabled="!availableAccountsForChannel.length"
           >
             <option
-              v-if="!availableAccounts.length"
+              v-if="!availableAccountsForChannel.length"
               value=""
             >
               没有可用账号
             </option>
             <option
-              v-for="account in availableAccounts"
+              v-for="account in availableAccountsForChannel"
               :key="account.id"
               :value="account.id"
             >

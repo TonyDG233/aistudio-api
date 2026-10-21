@@ -139,7 +139,7 @@ function stateLabel(state: string): string {
       </div>
       <div class="rounded-xl bg-gray-50 border border-gray-100 px-3 py-2.5">
         <div class="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-          Context
+          账号
         </div>
         <div class="mt-1 text-lg font-bold tabular-nums text-gray-900">
           {{ budgets.contexts ?? snapshot?.contexts?.length ?? 0 }}

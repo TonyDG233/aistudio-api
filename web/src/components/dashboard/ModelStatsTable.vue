@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed } from 'vue'
 import type { ModelStatItem } from '@/types/stats.ts'
 import Badge from '@/components/ui/Badge.vue'
@@ -86,7 +86,7 @@ function fmt(value: number | null | undefined): string {
                 模型
               </th>
               <th class="py-3 px-3 text-center">
-                请求
+                模型调用
               </th>
               <th class="py-3 px-3 text-center">
                 成功
@@ -169,7 +169,7 @@ function fmt(value: number | null | undefined): string {
           </div>
           <div class="mt-3 grid grid-cols-2 gap-2 text-[11px]">
             <div class="rounded-lg bg-gray-50 border border-gray-100 px-2.5 py-2">
-              <span class="text-gray-400">请求</span>
+              <span class="text-gray-400">模型调用</span>
               <b class="ml-1 font-mono text-gray-800">{{ fmt(item.requests) }}</b>
             </div>
             <div class="rounded-lg bg-gray-50 border border-gray-100 px-2.5 py-2">

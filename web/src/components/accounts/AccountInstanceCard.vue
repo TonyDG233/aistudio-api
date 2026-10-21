@@ -12,7 +12,7 @@ import {
 import type { AccountWithStats, Instance } from '@/types'
 import Button from '@/components/ui/Button.vue'
 import {
-  channelLabels,
+  channelLabel,
   instanceStateDotClass,
   instanceStateLabel,
   tierLabel,
@@ -22,18 +22,19 @@ import { formatDate } from '@/utils/format.ts'
 
 const props = defineProps<{
   account: AccountWithStats
-  instance: Instance | null
-  closing?: boolean
+  instances: Instance[]
+  ordinals?: Record<string, number>
+  closingInstanceId?: string | null
   refreshing?: boolean
 }>()
 
 const emit = defineEmits<{
-  close: []
+  close: [id: string]
   refresh: []
   edit: []
   remove: []
   clearCooldown: []
-  switch: []
+  switch: [id: string]
 }>()
 
 const label = computed(() => props.account.email || props.account.name || props.account.id)
@@ -43,11 +44,9 @@ const accountExpired = computed(
 const limited = computed(
   () => !accountExpired.value && props.account.is_available === false,
 )
-const closeDisabled = computed(
-  () => !props.instance
-    || props.instance.state === 'starting'
-    || props.instance.state === 'reclaiming',
-)
+function closeDisabled(instance: Instance): boolean {
+  return instance.state === 'starting' || instance.state === 'reclaiming'
+}
 const detailText = computed(() => {
   const parts = [
     `账号：${label.value}`,
@@ -155,83 +154,77 @@ const detailText = computed(() => {
     </div>
 
     <div
-      v-if="instance"
-      class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/50 p-3.5"
+      v-if="instances.length"
+      class="mt-3 space-y-2"
     >
-      <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div class="min-w-0">
-          <div class="flex flex-wrap items-center gap-2">
-            <Circle
-              class="w-2.5 h-2.5 fill-current"
-              :class="instanceStateDotClass(instance.state)"
-            />
-            <span class="text-xs font-mono font-semibold text-gray-700">实例 #{{ instance.number }}</span>
-            <span class="text-[11px] text-gray-500">{{ instanceStateLabel(instance.state) }}</span>
-            <span
-              v-if="instance.latest"
-              class="inline-flex items-center gap-0.5 rounded-full border border-brand-200 bg-brand-50 px-1.5 py-0.5 text-[10px] font-semibold text-brand-700"
-            >
-              最新实例
+      <div
+        v-for="instance in instances"
+        :key="instance.id"
+        class="rounded-xl border border-gray-200/90 bg-gray-50/50 p-3.5"
+      >
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              <Circle
+                class="w-2.5 h-2.5 fill-current"
+                :class="instanceStateDotClass(instance.state)"
+              />
+              <span class="text-xs font-mono font-semibold text-gray-700">实例 #{{ ordinals?.[instance.id] ?? instance.number }}</span>
               <span
-                class="inline-flex"
-                title="最近启动的实例，仅用于展示，不代表路由优先级"
+                class="rounded border border-gray-200 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold text-gray-600"
               >
-                <HelpCircle
-                  class="w-3 h-3 text-brand-500"
-                  aria-label="最近启动的实例，仅用于展示，不代表路由优先级"
-                  role="img"
-                />
+                {{ channelLabel(instance.channel) }}
               </span>
-            </span>
-          </div>
-          <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-500">
-            <span
-              v-if="instance.channels.length"
-              class="flex items-center gap-1"
-            >
-              <span class="text-gray-400">服务渠道</span>
+              <span class="text-[11px] text-gray-500">{{ instanceStateLabel(instance.state) }}</span>
               <span
-                v-for="channel in channelLabels(instance.channels)"
-                :key="channel"
-                class="rounded border border-gray-200 bg-white px-1.5 py-0.5 font-mono text-[10px] text-gray-600"
+                v-if="instance.latest"
+                class="inline-flex items-center gap-0.5 rounded-full border border-brand-200 bg-brand-50 px-1.5 py-0.5 text-[10px] font-semibold text-brand-700"
               >
-                {{ channel }}
+                最新实例
+                <span
+                  class="inline-flex"
+                  title="最近启动的实例，仅用于展示，不代表路由优先级"
+                >
+                  <HelpCircle
+                    class="w-3 h-3 text-brand-500"
+                    aria-label="最近启动的实例，仅用于展示，不代表路由优先级"
+                    role="img"
+                  />
+                </span>
               </span>
-            </span>
-            <span
-              v-else
-              class="text-gray-400"
-            >渠道尚未就绪</span>
-            <span :class="instance.in_flight > 0 ? 'text-amber-700' : 'text-gray-400'">
-              在途 {{ instance.in_flight }}
-            </span>
+            </div>
+            <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-500">
+              <span :class="instance.in_flight > 0 ? 'text-amber-700' : 'text-gray-400'">
+                在途 {{ instance.in_flight }}
+              </span>
+            </div>
           </div>
-        </div>
-        <div class="flex items-center gap-2 w-full sm:w-auto shrink-0">
-          <Button
-            variant="secondary"
-            size="sm"
-            class="flex-1 sm:flex-none"
-            :disabled="instance.state !== 'active'"
-            :title="instance.state === 'active' ? '打开实例切换面板' : '实例尚未就绪'"
-            @click="emit('switch')"
-          >
-            <ArrowLeftRight class="w-3.5 h-3.5" />
-            切换
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            class="flex-1 sm:flex-none"
-            :loading="closing"
-            :disabled="closeDisabled"
-            :title="closeDisabled
-              ? '实例正在启动或回收，暂不能关闭'
-              : '关闭实例并释放容量'"
-            @click="emit('close')"
-          >
-            关闭
-          </Button>
+          <div class="flex items-center gap-2 w-full sm:w-auto shrink-0">
+            <Button
+              variant="secondary"
+              size="sm"
+              class="flex-1 sm:flex-none"
+              :disabled="instance.state !== 'active'"
+              :title="instance.state === 'active' ? '打开实例切换面板' : '实例尚未就绪'"
+              @click="emit('switch', instance.id)"
+            >
+              <ArrowLeftRight class="w-3.5 h-3.5" />
+              切换
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              class="flex-1 sm:flex-none"
+              :loading="closingInstanceId === instance.id"
+              :disabled="closeDisabled(instance)"
+              :title="closeDisabled(instance)
+                ? '实例正在启动或回收，暂不能关闭'
+                : '关闭该实例并释放容量'"
+              @click="emit('close', instance.id)"
+            >
+              关闭
+            </Button>
+          </div>
         </div>
       </div>
     </div>
