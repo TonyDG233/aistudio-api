@@ -81,6 +81,13 @@ const detailText = computed(() => {
               {{ tierLabel(account.tier) }}
             </span>
             <span
+              v-if="account.duplicate_of"
+              class="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700"
+              title="同一邮箱存在多个账号；此为重复项，建议删除冗余账号"
+            >
+              重复
+            </span>
+            <span
               v-if="accountExpired"
               class="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700"
             >

@@ -234,6 +234,14 @@ async function handleDetectTier() {
             429: {{ account.rate_limited || 0 }}
           </Badge>
           <Badge
+            v-if="account.duplicate_of"
+            variant="red"
+            size="sm"
+            title="同一邮箱存在多个账号；此条为重复项，建议删除冗余账号"
+          >
+            重复
+          </Badge>
+          <Badge
             v-if="refreshState === 'pending'"
             variant="amber"
             size="sm"

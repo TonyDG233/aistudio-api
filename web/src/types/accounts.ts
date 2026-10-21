@@ -11,6 +11,7 @@ export interface Account {
   tier?: string | null
   tier_checked_at?: string | null
   expired?: boolean
+  duplicate_of?: string | null
 }
 
 export interface AccountWithStats extends Omit<Account, 'last_used'>, Partial<AccountRotationStats> {

@@ -136,6 +136,8 @@ class AccountMeta:
     tier: str | None = None
     tier_checked_at: str | None = None
     expired: bool = False
+    # 重复标记：同一邮箱存在多个账号时，指向保留（最早创建）的账号 id。
+    duplicate_of: str | None = None
     # 保活落点（WP10）：最近一次凭证回写/刷新尝试。
     auth_saved_at: str | None = None
     last_refresh_attempt_at: str | None = None
@@ -171,6 +173,9 @@ class AccountMeta:
             if data.get("tier_checked_at") is not None
             else None,
             expired=bool(data.get("expired", False)),
+            duplicate_of=str(data["duplicate_of"])
+            if data.get("duplicate_of") is not None
+            else None,
             auth_saved_at=str(data["auth_saved_at"])
             if data.get("auth_saved_at") is not None
             else None,
@@ -323,6 +328,44 @@ class AccountStore:
         registry = self._load_registry()
         return list(registry.accounts.values())
 
+    def refresh_duplicate_flags(self) -> int:
+        """按邮箱重算重复标记（忽略大小写）。
+
+        同一邮箱保留最早创建的账号，其余标记 ``duplicate_of=<保留账号 id>``；
+        无邮箱或已不再重复的账号清除标记。返回被标记的重复账号数。
+        """
+        registry = self._load_registry()
+        groups: dict[str, list[AccountMeta]] = {}
+        for acc in registry.accounts.values():
+            email = (acc.email or "").strip().lower()
+            if email:
+                groups.setdefault(email, []).append(acc)
+
+        targets: dict[str, str | None] = {
+            acc.id: None for acc in registry.accounts.values()
+        }
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda a: (a.created_at or "", a.id))
+            keeper = group[0]
+            for duplicate in group[1:]:
+                targets[duplicate.id] = keeper.id
+
+        changed = 0
+        for acc in registry.accounts.values():
+            target = targets.get(acc.id)
+            if acc.duplicate_of == target:
+                continue
+            acc.duplicate_of = target
+            changed += 1
+            meta_path = _safe_account_dir(self._accounts_dir, acc.id) / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+        if changed:
+            self._save_registry(registry)
+        return sum(1 for value in targets.values() if value)
+
     def _find_registered_account(
         self, registry: Registry, account_id: str
     ) -> AccountMeta | None:
@@ -443,6 +486,7 @@ class AccountStore:
         if registry.active_account_id == safe_id:
             registry.active_account_id = next(iter(registry.accounts), None)
         self._save_registry(registry)
+        self.refresh_duplicate_flags()
         return True
 
     def update_account(self, account_id: str, name: str) -> AccountMeta | None:

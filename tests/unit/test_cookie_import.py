@@ -477,6 +477,7 @@ async def test_probe_import_activates_first_account_and_registers_in_rotator(
     account_service = MagicMock()
     account_service.get_active_account.return_value = None
     account_service.batch_import_accounts.return_value = [imported]
+    account_service.get_account.return_value = imported
     account_service.activate_account = AsyncMock(return_value=imported)
 
     browser_session = MagicMock()
