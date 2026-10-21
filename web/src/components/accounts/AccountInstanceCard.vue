@@ -5,6 +5,7 @@ import {
   Circle,
   HelpCircle,
   Pencil,
+  PlayCircle,
   RefreshCw,
   RotateCcw,
   Trash2,
@@ -26,6 +27,8 @@ const props = defineProps<{
   ordinals?: Record<string, number>
   closingInstanceId?: string | null
   refreshing?: boolean
+  capacityFull?: boolean
+  creating?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -35,6 +38,7 @@ const emit = defineEmits<{
   remove: []
   clearCooldown: []
   switch: [id: string]
+  activate: []
 }>()
 
 const label = computed(() => props.account.email || props.account.name || props.account.id)
@@ -44,6 +48,18 @@ const accountExpired = computed(
 const limited = computed(
   () => !accountExpired.value && props.account.is_available === false,
 )
+const activateDisabled = computed(
+  () =>
+    accountExpired.value
+    || Boolean(props.capacityFull)
+    || Boolean(props.creating),
+)
+const activateTitle = computed(() => {
+  if (accountExpired.value) return '账号失效，请先刷新'
+  if (props.capacityFull) return '实例上限已满，请先关闭一个实例'
+  if (props.creating) return '正在启动实例'
+  return '为该账号创建实例并切换过去'
+})
 function closeDisabled(instance: Instance): boolean {
   return instance.state === 'starting' || instance.state === 'reclaiming'
 }
@@ -120,6 +136,20 @@ const detailText = computed(() => {
       </div>
 
       <div class="flex items-center gap-1.5 shrink-0 self-end lg:self-start">
+        <button
+          v-if="instances.length === 0"
+          type="button"
+          class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          :class="activateDisabled
+            ? 'border-gray-200 bg-gray-50 text-gray-400'
+            : 'border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100'"
+          :disabled="activateDisabled"
+          :title="activateTitle"
+          @click="emit('activate')"
+        >
+          <PlayCircle class="w-3.5 h-3.5" />
+          切换到该账号
+        </button>
         <button
           v-if="limited"
           type="button"

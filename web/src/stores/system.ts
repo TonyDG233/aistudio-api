@@ -117,6 +117,10 @@ export const useSystemStore = defineStore('system', () => {
     return res.features
   }
 
+  function setConfig(next: SystemConfig) {
+    config.value = next
+  }
+
 
   async function clearCooldown(req: ClearCooldownRequest = {}) {
     const toast = useToastStore()
@@ -179,6 +183,7 @@ export const useSystemStore = defineStore('system', () => {
     fetchSurfaceInstances,
     fetchRoutingState,
     fetchConfig,
+    setConfig,
     clearCooldown,
     forceNextAccount,
     checkHealth,

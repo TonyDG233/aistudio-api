@@ -105,11 +105,18 @@ const channelDefs = computed<Array<{ key: ChannelKey; label: string }>>(() => {
   return defs.filter((channel) => channel.enabled).map(({ key, label }) => ({ key, label }))
 })
 
+const maxContexts = computed(() => {
+  const raw = Number(systemStore.config?.features?.routing?.max_contexts ?? 1)
+  return Number.isFinite(raw) ? Math.max(1, raw) : 1
+})
 const globalBudget = computed(() => {
   const configured = Number(
-    systemStore.config?.features?.routing?.global_max_pages ?? props.maxInstances,
+    systemStore.config?.features?.routing?.global_max_pages ?? maxContexts.value,
   )
-  return Math.max(1, Math.min(props.maxInstances, Number.isFinite(configured) ? configured : props.maxInstances))
+  return Math.max(
+    maxContexts.value,
+    Number.isFinite(configured) ? configured : maxContexts.value,
+  )
 })
 const usedGlobal = computed(() =>
   props.instances.filter((instance) => instance.state === 'active').length,
@@ -118,8 +125,13 @@ const usedGlobal = computed(() =>
 function channelBudget(channel: ChannelKey): number {
   const features = systemStore.config?.features
   const key = channel === 'pg' ? 'chat' : 'build'
-  const configured = Number(features?.channels?.[key]?.max_pages ?? props.maxInstances)
-  return Math.max(1, Math.min(props.maxInstances, Number.isFinite(configured) ? configured : props.maxInstances))
+  const configured = Number(
+    features?.channels?.[key]?.max_pages ?? maxContexts.value,
+  )
+  return Math.max(
+    maxContexts.value,
+    Number.isFinite(configured) ? configured : maxContexts.value,
+  )
 }
 
 function usedChannel(channel: ChannelKey): number {
@@ -221,7 +233,7 @@ watch(
   () => props.modelValue,
   (open) => {
     if (!open) return
-    if (!systemStore.config) void systemStore.fetchConfig()
+    void systemStore.fetchConfig()
     newFormOpen.value = false
     resetNewForm()
   },

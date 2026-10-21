@@ -188,6 +188,10 @@ async function handleRemove(account: AccountWithStats) {
     await accountsStore.deleteAccount(account.id)
   }
 }
+
+async function handleActivate(account: AccountWithStats) {
+  await instancesStore.create(account.id)
+}
 </script>
 
 <template>
@@ -410,9 +414,12 @@ async function handleRemove(account: AccountWithStats) {
           :ordinals="instanceOrdinals"
           :closing-instance-id="instancesStore.closingInstanceId"
           :refreshing="accountsStore.refreshingIds[account.id]"
+          :capacity-full="instancesStore.atCapacity"
+          :creating="instancesStore.creatingAccountId === account.id"
           @close="handleCloseInstance"
           @switch="openSwitchPanel"
           @refresh="accountsStore.refreshAccount(account.id)"
+          @activate="handleActivate(account)"
           @edit="handleEditName(account)"
           @remove="handleRemove(account)"
           @clear-cooldown="handleClearCooldown(account.id)"
