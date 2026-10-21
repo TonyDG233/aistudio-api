@@ -894,3 +894,100 @@ async def test_ensure_channel_reopens_chat_in_existing_context(monkeypatch) -> N
     assert len(cdp.created) == 1
     assert pool.page_counts() == {"chat": 1, "build": 1}
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_single_instance_cannot_open_second_page_in_parallel() -> None:
+    features = {
+        "routing": {"max_contexts": 1, "global_max_pages": 2},
+        "channels": {
+            "chat": {"enabled": True, "max_pages": 2},
+            "build": {"enabled": True, "max_pages": 2},
+        },
+    }
+    pool = _pool(FakeCDP(), max_contexts=1, features=features)
+
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+    assert pool.budget_snapshot()["global_max_pages"] == 1
+    assert pool.page_counts()["chat"] == 1
+    assert sum(pool.page_counts().values()) == 1
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(
+            account_id="a",
+            auth_file="a.json",
+            channel="build",
+            surface="build",
+        )
+
+    await pool.release(lease)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_single_instance_ensure_channel_rejects_second_page() -> None:
+    pool = _pool(FakeCDP(), max_contexts=1)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.ensure_channel(lease.slot_id, "build")
+
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    assert len(pool.slots()) == 1
+    await pool.release(lease)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_single_instance_check_create_budget_rejects_second_channel() -> None:
+    pool = _pool(FakeCDP(), max_contexts=1)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.check_create_budget("build", account_id="a")
+
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    await pool.release(lease)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_single_instance_borrow_does_not_add_second_page() -> None:
+    pool = _pool(FakeCDP(), max_contexts=1)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.acquire(
+            account_id="b",
+            auth_file="b.json",
+            channel="build",
+            surface="build",
+            borrow_accounts={"a"},
+        )
+
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    assert len(pool.slots()) == 1
+    await pool.release(lease)
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_single_instance_rebind_replaces_page_sequentially() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    lease = await pool.acquire(account_id="a", auth_file="a.json")
+    slot_id = lease.slot_id
+    await pool.release(lease)
+
+    await pool.rebind(
+        slot_id,
+        account_id="b",
+        auth_file="b.json",
+        auth_user="2",
+        channel="chat",
+    )
+
+    assert pool.page_counts() == {"chat": 1, "build": 0}
+    assert len(pool.slots()) == 1
+    assert cdp.disposed == ["ctx-1"]
+    await pool.close()

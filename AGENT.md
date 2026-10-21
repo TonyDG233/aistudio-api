@@ -291,7 +291,7 @@ aistudio-api/
 - **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
 - **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
 - **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
-- **实例与渠道（WP5 第六轮，2026-10 收敛）**：实例 = 账号 + 渠道的独立用量窗口；同一账号 PG/Build 是两个实例、共享一个 BrowserContext。唯一决策管线在 `application/routing_pipeline.py`。`features.routing.max_contexts` 控制同时登录账号/context 数，总实例上限为 `max(2, max_contexts)`；只允许 2c1p/1c2p，禁止 2c3p。渠道 `max_instances` 是该渠道的业务硬上限，`create`/`startup`/`switch_to`/429 换号全部遵守；page 数不是独立预算，渠道 page = 渠道 `max_instances`，全局 page = 总实例数。策略组默认隐藏（`features.groups_enabled=false`），隐藏时后端不参与；启用后显式组始终生效，空 `allowed_surfaces` = 命中即拒绝，停用组跳过，未命中回落 tier 默认。渠道准入改为账号 tag + `channels.*.allowed_tags`，`quota_pool` 不再是业务概念。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
+- **实例与渠道（WP5 第六轮，2026-10 收敛）**：实例 = 账号 + 渠道的独立用量窗口；同一账号 PG/Build 在总实例上限允许时是两个实例、共享一个 BrowserContext。唯一决策管线在 `application/routing_pipeline.py`。`features.routing.max_contexts` 是用户可见的总实例上限（1-16），总实例数 = `max_contexts`；2c1p、1c2p 以及 `max_contexts>=3` 时的 2c3p 都只是实例组合，只要不超过总实例上限和渠道 `max_instances` 即可。单实例模式（`max_contexts=1`）只能有一个实例、一个 page，PG/Build 顺序切换。渠道 `max_instances` 是该渠道的业务硬上限，`create`/`startup`/`switch_to`/429 换号全部遵守；page 数不是独立预算，渠道 page = 渠道 `max_instances`，全局 page = `max_contexts`。策略组默认隐藏（`features.groups_enabled=false`），隐藏时后端不参与；启用后显式组始终生效，空 `allowed_surfaces` = 命中即拒绝，停用组跳过，未命中回落 tier 默认。渠道准入改为账号 tag + `channels.*.allowed_tags`，`quota_pool` 不再是业务概念。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
 - **Build 双路径与 signer**：原生 9998 客户端为默认传输，顶层页面 signer 直连为冗余路径；两者独立健康状态，signer 失败不阻塞原生渠道。signer 结构探测基于 `snapshot + kvc + content` 与 `tokenLike(getMetadata/H/A.snapshot)`，禁止硬编码 `M.Cn/M.GB/M.TB/M.An/M.NB`；不得记录 token/authorization/cookie/API key。原生不可用或显式 `AISTUDIO_BUILD_TRANSPORT=signer` 时才走 signer，首帧前失败可回退，已产出后不重放。
 - **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
 - **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
@@ -311,15 +311,15 @@ aistudio-api/
 
 ### 8.1 不可混淆的量
 
-- **实例**：账号 + 渠道 + 激活态，是用户侧的调度与用量单位；不是后端 Context/Page/Slot。一个实例就是一个用量窗口；同一账号的 PG 与 Build 是两个实例、两个用量窗口，但共享一个 Context。
-- **总实例上限**：`max(2, features.routing.max_contexts)`。只允许 2c1p（2 context、每渠道 1 page）与 1c2p（1 context、2 page）；禁止 2c3p。单渠道可单独关闭/回收，只有最后一个实例退出才回收 Context。
+- **实例**：账号 + 渠道 + 激活态，是用户侧的调度与用量单位；不是后端 Context/Page/Slot。一个实例就是一个用量窗口；同一账号的 PG 与 Build 在总实例上限允许时是两个实例、两个用量窗口，共享一个 Context；单实例模式下两者不会同时存在，只能顺序切换。
+- **总实例上限**：`features.routing.max_contexts`（1-16），总实例数不能超过该值。2c1p（2 实例）、1c2p（2 实例）以及 `max_contexts>=3` 时的 2c3p（3 实例）都只是组合，只要总数和渠道 `max_instances` 允许即可；`max_contexts=1` 只有一个实例、一个 page，PG/Build 顺序切换。单渠道可单独关闭/回收，只有最后一个实例退出才回收 Context。
 - **渠道注册表**：只回答“这个渠道是否实现、是否参与路由”。`enabled`/`implemented` 是能力开关，不是用户限额。
 - **渠道实例数**：`features.channels.<chat|build>.max_instances`，是该渠道最多几个实例，属于业务硬限额。`create`、`startup`、`switch_to`、429 请求期 acquire 全部遵守。
 - **账号 Tag**：账号信息中的自定义 tag 集合；tier 自动派生一个只读 tag（free/pro/ultra/plus/paid）。自定义 tag 可增删；删除 tier 不改变 tag 规则。
 - **渠道准入 Tag**：`features.channels.<chat|build>.allowed_tags`，多选；空 = 不限；账号的 tag（tier 自动 tag + 自定义 tag）至少命中一个才可注册该渠道实例。
 - **策略组**：可选层，默认隐藏且 `features.groups_enabled=false`，隐藏时后端完全忽略 `features.groups`。启用后：显式组始终优先匹配；`allowed_surfaces` 为空 = 命中即拒绝；停用组跳过；未命中回落 tier 默认组。显式组只能收窄 tier，不能放宽。
 - **Tier 默认**：`free -> build`；`pro/ultra/plus/paid -> chat+build`；未知 tier -> chat。用于未命中显式组时的兜底。
-- **Page 数**：不是用户配置项，也不是业务限额。渠道 page = 渠道 `max_instances`；全局 page = 总实例数 `max(2, max_contexts)`。后台只把它当内部页面预算。
+- **Page 数**：不是用户配置项，也不是业务限额。渠道 page = 渠道 `max_instances`；全局 page = 总实例数 = `max_contexts`。`global_max_pages` 仅为兼容保留，实际全局预算由 `max_contexts` 决定；后台只把它当内部页面预算。
 - **quota_pool**：已废弃，不再是业务概念。旧配置中的 `quota_pool` 只做兼容迁移为单 tag；策略组 `allowed_quota_pools`、账号 `quota_pools` 不再参与准入，后续清理。
 
 ### 8.2 请求期资格链（只能收窄）

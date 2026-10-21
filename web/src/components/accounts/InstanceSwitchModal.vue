@@ -24,8 +24,10 @@ const props = defineProps<{
   accounts: AccountWithStats[]
   maxInstances: number
   currentInstanceId: string | null
+  targetAccountId?: string | null
   switchingInstanceId?: string | null
   creatingAccountId?: string | null
+  closingInstanceId?: string | null
   loading?: boolean
 }>()
 
@@ -33,12 +35,26 @@ const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   switch: [id: string, channel?: string]
   create: [accountId: string, channel: string]
+  replace: [instanceId: string, accountId: string, channel: string]
   retry: []
 }>()
 
 const newFormOpen = ref(false)
 const selectedAccountId = ref('')
 const selectedChannel = ref<ChannelKey>('pg')
+
+const targetAccount = computed(
+  () => props.accounts.find((account) => account.id === props.targetAccountId) ?? null,
+)
+const targetLabel = computed(
+  () => targetAccount.value?.email || targetAccount.value?.name || targetAccount.value?.id || '',
+)
+const modalTitle = computed(
+  () => (targetAccount.value ? `切换到 ${targetLabel.value}` : '切换实例'),
+)
+const busy = computed(
+  () => Boolean(props.closingInstanceId) || Boolean(props.creatingAccountId),
+)
 
 const accountMap = computed(() => {
   const map = new Map<string, AccountWithStats>()
@@ -105,19 +121,6 @@ const channelDefs = computed<Array<{ key: ChannelKey; label: string }>>(() => {
   return defs.filter((channel) => channel.enabled).map(({ key, label }) => ({ key, label }))
 })
 
-const maxContexts = computed(() => {
-  const raw = Number(systemStore.config?.features?.routing?.max_contexts ?? 1)
-  return Number.isFinite(raw) ? Math.max(1, raw) : 1
-})
-const globalBudget = computed(() => {
-  const configured = Number(
-    systemStore.config?.features?.routing?.global_max_pages ?? maxContexts.value,
-  )
-  return Math.max(
-    maxContexts.value,
-    Number.isFinite(configured) ? configured : maxContexts.value,
-  )
-})
 const usedGlobal = computed(() =>
   props.instances.filter((instance) => instance.state === 'active').length,
 )
@@ -125,13 +128,14 @@ const usedGlobal = computed(() =>
 function channelBudget(channel: ChannelKey): number {
   const features = systemStore.config?.features
   const key = channel === 'pg' ? 'chat' : 'build'
-  const configured = Number(
-    features?.channels?.[key]?.max_pages ?? maxContexts.value,
-  )
-  return Math.max(
-    maxContexts.value,
-    Number.isFinite(configured) ? configured : maxContexts.value,
-  )
+  const instances = Number(features?.channels?.[key]?.max_instances)
+  const pages = Number(features?.channels?.[key]?.max_pages)
+  const configured = Number.isFinite(instances)
+    ? instances
+    : Number.isFinite(pages)
+      ? pages
+      : props.maxInstances
+  return Math.max(1, Math.min(props.maxInstances, configured))
 }
 
 function usedChannel(channel: ChannelKey): number {
@@ -140,9 +144,37 @@ function usedChannel(channel: ChannelKey): number {
   ).length
 }
 
+function usedChannelExcluding(row: Instance, channel: ChannelKey): number {
+  const count = usedChannel(channel)
+  return row.channel === channel && row.state === 'active'
+    ? Math.max(0, count - 1)
+    : count
+}
+
+const emptySlotCount = computed(
+  () => Math.max(0, props.maxInstances - occupiedCount.value),
+)
+
+function targetChannelAllowed(channel: ChannelKey): boolean {
+  if (!props.targetAccountId) return false
+  if (props.instances.some(
+    (instance) =>
+      instance.account_id === props.targetAccountId
+      && instance.channel === channel
+      && instance.state !== 'reclaiming',
+  )) {
+    return false
+  }
+  return usedChannel(channel) < channelBudget(channel)
+}
+
+function createForTarget(channel: ChannelKey) {
+  if (!props.targetAccountId || !targetChannelAllowed(channel) || busy.value) return
+  emit('create', props.targetAccountId, channel)
+}
+
 function channelAllowed(channel: ChannelKey): boolean {
   return usedGlobal.value < props.maxInstances
-    && usedGlobal.value < globalBudget.value
     && usedChannel(channel) < channelBudget(channel)
 }
 
@@ -160,6 +192,33 @@ function channelButton(
   row: Instance & { isCurrent: boolean },
   channel: ChannelKey,
 ): { enabled: boolean; label: string; title: string } {
+  if (busy.value) {
+    return {
+      enabled: false,
+      label: '处理中',
+      title: '正在释放或启动实例',
+    }
+  }
+
+  if (props.targetAccountId && row.account_id !== props.targetAccountId) {
+    const selectable = (row.state === 'active' || row.state === 'invalid')
+      && row.in_flight === 0
+    const allowed = selectable && usedChannelExcluding(row, channel) < channelBudget(channel)
+    return {
+      enabled: allowed,
+      label: allowed
+        ? '释放并切换'
+        : row.in_flight > 0
+          ? '有在途请求'
+          : '暂不可用',
+      title: allowed
+        ? `关闭实例 #${row.number}，为 ${targetLabel.value} 启动 ${channelLabel(channel)}`
+        : row.in_flight > 0
+          ? '实例还有在途请求，结束后才能释放'
+          : '实例状态或渠道预算不允许',
+    }
+  }
+
   if (row.channel === channel) {
     if (row.isCurrent) {
       return {
@@ -259,6 +318,10 @@ watch(channelDefs, (channels) => {
 
 function switchTo(instance: Instance & { isCurrent: boolean }, channel: ChannelKey) {
   if (!channelButton(instance, channel).enabled) return
+  if (props.targetAccountId && instance.account_id !== props.targetAccountId) {
+    emit('replace', instance.id, props.targetAccountId, channel)
+    return
+  }
   if (instance.channel === channel) {
     emit('switch', instance.id)
     return
@@ -280,17 +343,25 @@ function createInstance() {
 <template>
   <Modal
     :model-value="modelValue"
-    title="切换实例"
+    :title="modalTitle"
     max-width="lg"
     @update:model-value="emit('update:modelValue', $event)"
   >
     <div class="space-y-4">
       <div class="flex items-end justify-between gap-3">
-        <div class="flex items-baseline gap-2">
-          <span class="text-xs font-semibold text-gray-500">实例</span>
-          <span class="text-2xl font-bold tracking-tight tabular-nums text-gray-900">
-            {{ occupiedCount }}<span class="text-base font-semibold text-gray-300"> / {{ maxInstances }}</span>
-          </span>
+        <div
+          class="min-w-0"
+          title="实例 = 账号 + 渠道 + 激活态"
+        >
+          <div class="flex items-baseline gap-2">
+            <span class="text-xs font-semibold text-gray-500">实例</span>
+            <span class="text-2xl font-bold tracking-tight tabular-nums text-gray-900">
+              {{ occupiedCount }}<span class="text-base font-semibold text-gray-300"> / {{ maxInstances }}</span>
+            </span>
+          </div>
+          <p class="mt-1 text-[11px] text-gray-400">
+            实例 = 账号 + 渠道 + 激活态
+          </p>
         </div>
         <button
           type="button"
@@ -303,6 +374,23 @@ function createInstance() {
             :class="{ 'animate-spin': loading }"
           />
         </button>
+      </div>
+
+      <div
+        v-if="targetAccount"
+        class="flex flex-wrap items-center gap-2 rounded-xl border border-brand-200 bg-brand-50/60 px-3.5 py-2.5"
+      >
+        <span class="text-[11px] font-semibold text-brand-700">目标账号</span>
+        <span class="text-sm font-medium text-gray-900 truncate">{{ targetLabel }}</span>
+        <span
+          class="inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-semibold"
+          :class="tierPillClass(targetAccount.tier)"
+        >
+          {{ tierLabel(targetAccount.tier) }}
+        </span>
+        <span class="text-[11px] text-brand-700/80">
+          选一个实例位和类型；已占用的会先释放再启动。
+        </span>
       </div>
 
       <div
@@ -325,7 +413,9 @@ function createInstance() {
           还没有实例
         </p>
         <p class="mt-1 text-xs text-gray-400">
-          用下面的“新建实例”为账号创建登录会话。
+          {{ targetAccount
+            ? '下面选择一个空闲实例位和渠道类型即可启动。'
+            : '用下面的“新建实例”为账号创建登录会话。' }}
         </p>
       </div>
 
@@ -419,7 +509,65 @@ function createInstance() {
         </div>
       </div>
 
-      <div class="border-t border-gray-100 pt-4">
+      <div
+        v-if="targetAccount"
+        class="space-y-2"
+      >
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-semibold text-gray-500">空闲实例位</span>
+          <span class="text-[11px] text-gray-400">{{ emptySlotCount }} 个可选</span>
+        </div>
+        <div
+          v-for="slot in emptySlotCount"
+          :key="`empty-${slot}`"
+          class="flex flex-col gap-2 rounded-xl border border-dashed border-gray-200 bg-gray-50/50 px-3.5 py-3 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              <h3 class="text-xs font-mono font-semibold text-gray-600">
+                空闲实例位 {{ occupiedCount + slot }}
+              </h3>
+              <span class="rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-500">
+                未占用
+              </span>
+            </div>
+            <p class="mt-1 text-[11px] text-gray-400">
+              为 {{ targetLabel }} 启动一个新实例
+            </p>
+          </div>
+          <div class="flex w-full flex-wrap gap-1.5 sm:w-auto sm:shrink-0">
+            <button
+              v-for="channel in channelDefs"
+              :key="channel.key"
+              type="button"
+              class="inline-flex shrink-0 grow basis-[calc(50%-0.1875rem)] items-center justify-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 sm:grow-0 sm:basis-[8.5rem]"
+              :class="targetChannelAllowed(channel.key)
+                ? 'border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100'
+                : 'border-gray-200 bg-gray-50 text-gray-400'"
+              :disabled="!targetChannelAllowed(channel.key) || busy"
+              :title="targetChannelAllowed(channel.key)
+                ? `用 ${channel.label} 启动 ${targetLabel} 的实例`
+                : '渠道预算不足或账号已有该渠道实例'"
+              @click="createForTarget(channel.key)"
+            >
+              <span class="font-mono">{{ channel.label }}</span>
+              <span class="text-gray-300">·</span>
+              <span>{{ targetChannelAllowed(channel.key) ? '启动并切换' : '不可用' }}</span>
+            </button>
+          </div>
+        </div>
+        <p
+          v-if="emptySlotCount === 0"
+          class="rounded-xl border border-dashed border-amber-200 bg-amber-50/50 px-3.5 py-3 text-[11px] text-amber-800"
+        >
+          没有空闲实例位。请在上面的已占用实例上选择“释放并切换”，系统会先关闭该实例再启动目标账号。
+        </p>
+      </div>
+
+      <div
+        v-if="!targetAccount"
+        class="border-t border-gray-100 pt-4"
+      >
         <div
           v-if="!newFormOpen"
           class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2"
@@ -525,6 +673,15 @@ function createInstance() {
             </Button>
           </div>
         </div>
+      </div>
+
+      <div
+        v-else
+        class="border-t border-gray-100 pt-4"
+      >
+        <p class="text-[11px] text-gray-400">
+          选择上面的空闲实例位或已占用实例完成切换。
+        </p>
       </div>
     </div>
   </Modal>

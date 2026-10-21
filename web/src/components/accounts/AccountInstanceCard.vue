@@ -54,13 +54,12 @@ const limited = computed(
 const activateDisabled = computed(
   () =>
     accountExpired.value
-    || Boolean(props.capacityFull)
     || Boolean(props.creating),
 )
 const activateTitle = computed(() => {
   if (accountExpired.value) return '账号失效，请先刷新'
-  if (props.capacityFull) return '实例上限已满，请先关闭一个实例'
   if (props.creating) return '正在启动实例'
+  if (props.capacityFull) return '实例上限已满，点击选择一个实例释放后切换'
   return '为该账号创建实例并切换过去'
 })
 function closeDisabled(instance: Instance): boolean {

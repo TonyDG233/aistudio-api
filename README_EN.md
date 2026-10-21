@@ -52,7 +52,7 @@
 | **Anthropic Messages Compatibility** | Exposes `/v1/messages` and `/v1/messages/count_tokens` with streaming events, tool calls, thinking, images, and real upstream counting |
 | **Dynamic Model Discovery** | Automatically synchronizes available models and Paid/Pro-only metadata from upstream Google AI Studio; snapshots are persisted and warmed on startup, with fallback to the last snapshot if refresh fails |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
-| **Instances & Channels (WP5)** | An instance is one account+channel usage window. PG and Build for the same account are two instances sharing one browser context. Only 2c1p/1c2p are allowed; 2c3p is rejected. Channel switching replaces a single page without adding a context. |
+| **Instances & Channels (WP5)** | An instance is one account+channel usage window. PG and Build for the same account are two instances sharing one browser context when the total instance limit allows it. The total instance count is bounded by `max_contexts`; the default is one instance with sequential switching, and 2c3p (3 instances) is valid when `max_contexts>=3`. Channel switching replaces a single page without adding a context. |
 | **Dual Build Paths** | The native 9998 client is primary; the top-page signer direct path is a fallback when native is unavailable. Both have independent health state, and signer failure never blocks the native channel. |
 | **Dual Account Keepalive (WP10)** | Scheduled account rotation (long-cycle balancing + real page activity) and automatic Auth refresh (cookies/origins written back to `auth.json`) coexist; a separate 24h tier/email/expiry metadata refresh runs on its own switch |
 | **Runtime State Persistence** | Token statistics v2 (`stats.json`: per-model/day aggregation, client/attempt layers, separate cache/reasoning/count_tokens, 90-day daily buckets) and account 429 cooldown (`rotator_state.json`) are persisted across restarts |
@@ -572,12 +572,12 @@ This repository is a downstream fork of [`DeconstructedCube/aistudio-api`](https
 
 | Area | This repository |
 |---|---|
-| **Multi-instance** | The scheduling and usage unit is an *instance = account + channel*: the PG and Build channels of the same account are two instances with independent usage windows that share one browser context (`max_instances = max(2, max_contexts)`, only 2c1p / 1c2p, never 2c3p) |
+| **Multi-instance** | The scheduling and usage unit is an *instance = account + channel*: the PG and Build channels of the same account are two instances with independent usage windows that share one browser context when the total instance limit allows it. `max_instances = max_contexts`; 2c1p/1c2p and, when `max_contexts>=3`, 2c3p are valid combinations as long as the total and channel caps are respected |
 | **Channel lifecycle** | Channels can be disabled or reclaimed individually; the shared context is reclaimed only when the last instance exits, so the other channel keeps its session |
 | **Build channel** | Native 9998 direct connection is the primary path; an in-page signer (local signature bypass) is the redundant fallback when Build fails, and signer failures never block the native path. The signer locates signing material via structural probes (`kvc` / `snapshot` / `content`) and `tokenLike` (getMetadata / H / A.snapshot) |
 | **Web console rewrite** | Instance switching panel, instance overview and account matrix, multi-mode account management with bulk import, log SSE with 7-day archive export, a dedicated stats page and a partitioned settings page; UI/API never leak context/page/slot implementation terms |
 | **Statistics semantics** | Model calls (requests/attempts, including retries and account switches) are the primary metric and client requests are secondary; `count_*` is shown separately and never counted as model calls; usage is tracked per channel/instance |
-| **Long-running constraints** | At most two pages in total, `no-cache, must-revalidate` for static assets, single instance by default with on-demand warmup, prioritizing stability on low-memory VPS hosts |
+| **Long-running constraints** | Single instance by default; total page/instance budget follows `max_contexts` (1-16); `no-cache, must-revalidate` for static assets; on-demand warmup for stability on low-memory VPS hosts |
 
 ## Acknowledgements
 

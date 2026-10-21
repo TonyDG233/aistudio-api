@@ -32,36 +32,36 @@ function update(value: string | number | null) {
       <Boxes class="w-4 h-4 text-brand-600" />
       <div>
         <h4 class="font-bold text-gray-900 text-xs flex items-center gap-1.5">
-          <span>账号会话上限</span>
+          <span>实例上限（max_contexts）</span>
           <span class="text-[10px] font-semibold text-brand-700 bg-brand-50 border border-brand-200/70 rounded px-1.5 py-0.5">
-            默认单账号
+            用户可见实例上限
           </span>
           <FieldHelpTip
-            title="账号会话上限"
-            content="max_contexts：最多同时登录几个账号（浏览器上下文），不是用量窗口数。"
-            explanation="同一账号的 PG/Build 是两个实例、两个用量窗口，共享一个上下文；用量窗口上限 = max(max_contexts, 2)。"
+            title="实例上限"
+            content="max_contexts：用户可见的总实例上限。"
+            explanation="实例 = 账号 + 渠道 + 激活态；同一账号的 PG/Build 各算一个实例。"
           />
         </h4>
         <p class="text-[11px] text-gray-400 mt-0.5">
-          账号数决定上下文数；每个账号默认一个渠道实例，还可以再加另一个渠道（1c2p）。
+          实例 = 账号 + 渠道 + 激活态；这个值就是总实例上限。
         </p>
       </div>
     </div>
 
     <div :class="flat ? 'pt-0' : 'p-5'">
-      <div class="flex flex-col sm:flex-row sm:items-end gap-3">
-        <div class="w-full sm:max-w-[12rem]">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-start">
+        <div class="w-full sm:w-56">
           <ConfigInput
             :model-value="value"
             type="number"
-            label="最多同时登录账号"
-            description="1-16；默认 1；用量窗口上限 = max(该值, 2)"
+            label="总实例上限"
+            description="1-16；默认 1；直接限制实例总数。"
             placeholder="1"
             @update:model-value="update"
           />
         </div>
-        <p class="text-[11px] text-gray-400 leading-relaxed pb-1">
-          设为 1 时按单账号模式收起高级项；该账号仍可同时拥有 PG 与 Build 两个用量窗口。
+        <p class="text-[11px] text-gray-400 leading-relaxed pt-1">
+          实例 = 账号 + 渠道 + 激活态；同一账号的 PG/Build 各算一个实例。
           修改后需保存并热重载，不会自动关闭现有实例。
         </p>
       </div>

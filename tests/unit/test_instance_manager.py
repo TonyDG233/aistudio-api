@@ -662,3 +662,111 @@ async def test_create_rejects_when_channel_cap_reached() -> None:
     await manager.create("a", "chat")
     with pytest.raises(InstanceCapacityExhaustedError):
         await manager.create("b", "chat")
+
+@pytest.mark.asyncio
+async def test_single_instance_mode_starts_one_and_replaces_channel() -> None:
+    manager, pool = _manager(
+        FakePool(max_contexts=1),
+        accounts=(_account("a"),),
+    )
+    await manager.startup()
+
+    listed = await manager.list_instances()
+    assert listed.max_instances == 1
+    assert len(listed.instances) == 1
+    assert listed.instances[0].channel == "pg"
+
+    with pytest.raises(InstanceCapacityExhaustedError):
+        await manager.create("a", "build")
+
+    switched = await manager.switch_to(listed.instances[0].id, "build")
+    await _settle(manager)
+
+    assert switched.channel == "build"
+    listed = await manager.list_instances()
+    assert len(listed.instances) == 1
+    assert listed.instances[0].channel == "build"
+    assert len(pool.slots()) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_instance_failed_channel_replace_restores_old_channel() -> None:
+    manager, pool = _manager(
+        FakePool(max_contexts=1),
+        accounts=(_account("a"),),
+    )
+    await manager.startup()
+    listed = await manager.list_instances()
+    target = listed.instances[0]
+    slot = pool.slots()[0]
+
+    pool.fail_accounts.add("a")
+    with pytest.raises(InstanceNotReadyError):
+        await manager.switch_to(target.id, "build")
+
+    await _settle(manager)
+    listed = await manager.list_instances()
+    assert len(listed.instances) == 1
+    assert listed.instances[0].id == target.id
+    assert listed.instances[0].channel == "pg"
+    assert listed.instances[0].state.value == "active"
+    assert len(pool.slots()) == 1
+    assert slot.has_chat is True
+    assert slot.has_build is False
+
+
+@pytest.mark.asyncio
+async def test_three_instance_limit_allows_2c3p() -> None:
+    manager, pool = _manager(
+        FakePool(max_contexts=3),
+        accounts=(_account("a"), _account("b")),
+    )
+
+    await manager.create("a", "chat")
+    await _settle(manager)
+    await manager.create("a", "build")
+    await _settle(manager)
+    await manager.create("b", "chat")
+    await _settle(manager)
+
+    listed = await manager.list_instances()
+    assert len(listed.instances) == 3
+    assert len(pool.slots()) == 2
+    assert [(item.account_id, item.channel) for item in listed.instances] == [
+        ("a", "pg"),
+        ("a", "build"),
+        ("b", "pg"),
+    ]
+
+
+
+@pytest.mark.asyncio
+async def test_single_instance_failed_account_switch_restores_old_channel() -> None:
+    pool = FakePool(max_contexts=1)
+
+    async def deny(_account_id: str) -> bool:
+        return False
+
+    manager = InstanceManager(
+        pool,  # type: ignore[arg-type]
+        _store(_account("a")),  # type: ignore[arg-type]
+        switch_account=deny,
+        features_provider=lambda: TEST_FEATURES,
+    )
+    await manager.startup()
+    listed = await manager.list_instances()
+    target = listed.instances[0]
+    slot = pool.slots()[0]
+
+    with pytest.raises(InstanceNotReadyError):
+        await manager.switch_to(target.id, "build")
+
+    await _settle(manager)
+    listed = await manager.list_instances()
+    assert len(listed.instances) == 1
+    assert listed.instances[0].id == target.id
+    assert listed.instances[0].channel == "pg"
+    assert listed.instances[0].state.value == "active"
+    assert len(pool.slots()) == 1
+    assert slot.has_chat is True
+    assert slot.has_build is False

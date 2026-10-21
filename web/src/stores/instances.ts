@@ -131,6 +131,18 @@ export const useInstancesStore = defineStore('instances', () => {
     }
   }
 
+  async function closeAndWait(instanceId: string, timeoutMs = 30_000): Promise<boolean> {
+    if (!(await close(instanceId))) return false
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      await fetch(true)
+      if (!instances.value.some((item) => item.id === instanceId)) return true
+      await new Promise((resolve) => window.setTimeout(resolve, 500))
+    }
+    useToastStore().error('实例回收超时，请稍后重试')
+    return false
+  }
+
   async function reassign(instanceId: string, accountId: string): Promise<boolean> {
     const toast = useToastStore()
     reassigningInstanceId.value = instanceId
@@ -166,6 +178,7 @@ export const useInstancesStore = defineStore('instances', () => {
     instancesForAccount,
     create,
     close,
+    closeAndWait,
     switchTo,
     reassign,
   }

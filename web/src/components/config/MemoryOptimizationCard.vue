@@ -34,7 +34,7 @@ function budgetValue(value: string | number | null, fallback: number, minimum = 
 }
 
 function updateGlobalBudget(value: string | number | null) {
-  const floor = Math.max(2, contexts.value)
+  const floor = Math.max(1, contexts.value)
   emit('update:routing', {
     ...(props.routing || {}),
     global_max_pages: budgetValue(value, floor, floor),

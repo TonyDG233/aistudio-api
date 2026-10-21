@@ -78,8 +78,9 @@ features:
   # chat=聊天/Playground 面 (别名 pg/playground)；build=Build 宿主页；
   # official=官网消费者端，WP9 前仅注册、不实现 (请求会显式 403)。
   # enabled: 渠道是否参与路由；关=该渠道请求显式拒绝，不静默换面。
-  # max_pages: 渠道同时存活的页面数上限 (0-16)，参与页面预算取最严。
-  # max_instances: WP5 v2 兼容别名；Phase 3 后移除。
+  # max_pages: 渠道同时存活的页面数上限 (0-16)；chat/build 实际取 max_instances，
+  #   且总页面预算受 routing.max_contexts 限制。
+  # max_instances: 该渠道的实例硬上限；总实例上限由 routing.max_contexts 控制。
   # quota_pool: 该渠道要求的额度池 (free/pro/official)；null/any=不限制。
   #   零配置保持 null，确保 free 账号仍可 chat；黄金模板显式配 chat=pro/build=free。
   # 裸名在多渠道启用时按候选资格推导，系统不硬编码默认渠道。
@@ -106,8 +107,8 @@ features:
   # 路由安全与预算 (routing，WP5 二期)
   # max_switches: 单请求内“换账号/换实例”动作上限；同账号重试仍由
   #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
-  # global_max_pages: 全局页面数硬顶 (所有渠道/Context 合计)。
-  # max_contexts: 用户可见实例上限（同时登录账号数）；默认 1。
+  # global_max_pages: 兼容保留字段；实际全局页面预算 = max_contexts。
+  # max_contexts: 用户可见总实例上限（1-16）；默认 1，也是启动预启动数量。
   # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
   # prewarm: 备用实例预热；默认关 (黄金模板可开)。
   # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
