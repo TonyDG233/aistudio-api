@@ -1,145 +1,82 @@
-# 05 重启地图（一页版）
+# 05 Restart Map
 
-- 目的：保住 free/QQ bot 可用，同时让 paid 模型走 Pro 账号；不再按反代途径路由。
-- 约束：不访问真实网页、不发真实请求、不提交、不构建；先离线验证。
-- 原则：一页地图，不是 WP；功能必须能指到图上的位置。
+状态：2026-10-24 重写。本文只保留重构方向、决策规则和大致步骤；逐功能决定在 `06-feature-ledger.md`、`06-feature-index.csv`、`06-decision-log.md`。当前进度：P1/P2/P3 已决定；P4 进行中。
 
-## 1. 五个对象
+## 1. 重构大方向
 
-| 对象 | 责任 | 不负责 |
-|---|---|---|
-| Account | 一个 Google 登录状态（auth.json） | 页面、路由 |
-| Context | 一个隔离的浏览器上下文 | 多 page |
-| Page | 一个上下文里唯一的活动页面 | 与别的 page 共享 context |
-| Instance | Account + Context + Page + Channel（chat/build） | 跨账号复用 |
-| Router | 根据模型 `paid` 标记选池子 | 按反代类型分流 |
+目标不是继续修当前 fork，而是：
 
-硬规则：
+- 以 `upstream/master` 的相对干净实现为骨架；
+- 新建独立分支/worktree，不合并当前 `master` 或 `rebuild`；
+- 当前 fork 只作为功能参考、失败样本和证据来源；
+- 按垂直切片逐项移植，不做大爆炸式合并。
 
-- 一个 Context 只能有一个 Page。
-- 同账号需要 chat + build，就建两个 Context，不共享。
-- Free 池和 Pro 池不互相借实例。
-- QQ bot 固定绑定 Free 池。
+核心原则：
 
-## 2. 两条路由
+- `tier` 保留，以上游原生解析为准，fork 不重复定义。
+- `paid` 模型进 Pro/paid 池；free 模型进 free 池；QQ bot 固定 free 池。
+- 一个 Context 只放一个 Page；同账号 chat/build 需要两个 Context。
+- 不再按反代途径/channel 做第一层路由；只保留 `surface=chat/build` 和模型 tier。
+- 旧策略组、打分、账号 tag、quota group、死 UI 不进入新骨架。
+- 日志页保留为原始事件流；统计页保留为聚合视图，后端使用单一事件模型。
+- Cookie 保活保留；OAuth/refresh_token 当前不存在，本轮不做。
 
-```text
-paid == true  -> Pro pool  -> 选一个 Pro 实例
-paid == false -> Free pool -> 选一个 Free 实例
-QQ bot        -> Free pool（固定，不受 paid 请求影响）
-```
+## 2. 决策治理
 
-不做：
+- `D01-D12`：冻结的 domain。
+- `Dxx-NNN`：功能唯一 ID，见 `06-feature-index.csv`。
+- `P1-P10`：决策包/移植波次，只做分组，不是事实标准。
+- 每个决定必须落到 feature ID；不能只写“某 domain 保留”。
+- AI 默认建议不是决定；未获明确确认前只能记为提案。
+- `05` 只写方向和步骤，不复制 515 行。
+- `06-feature-ledger.md` 是人类台账；`06-feature-index.csv` 是机器索引；`06-decision-log.md` 是决策记录。
+- 变更 06 后必须同步重新生成 index，禁止两套各改各的。
 
-- 不按 chat/build 反代类型做第一层路由。
-- 不在 Pro 额度耗尽时把 QQ bot 切到 Free 池。
-- 不因为 paid 请求失败去占用 Free 实例。
+## 3. 目标骨架
 
-## 3. 复用 / 改造 / 隔离
+建议只保留五个稳定层：
 
-| 模块 | 处理 | 原因 |
-|---|---|---|
-| `cdp_client.py` | 保留 | 浏览器/Context/Page 底层 |
-| `session_auth.py` | 保留 | Cookie 灌入/保存 |
-| `wire_codec.py`、`wire_parser.py`、`wire_spec.py` | 保留 | 协议编码/解码 |
-| `capture.py`、`transport.py`、`streaming.py`、`stream_parser.py` | 保留 | 请求模板、流式传输 |
-| `build_surface.py` | 保留 native 路径 | 9998 已跑通；signer 可隔离 |
-| `pooled_session.py` | 改造 | 去掉“隐藏 chat 页”绑定，改为单 context 单 page |
-| `instance_pool.py` | 只保留 Context 创建/销毁 | 去掉租约/预算/rebind 语义 |
-| `client.py` | 拆分 | 保留发送/解析，移出实例/账号选择 |
-| `instance_manager.py` | 隔离 | 记录/编号/UI 不再做运行时权威 |
-| `routing_pipeline.py` | 隔离 | 候选/配额/反代维度全部重写 |
-| `surface_orchestrator.py` | 隔离 | 组策略/配额不再进新核心 |
-| `instance_switch.py` | 隔离 | 自动重排不进入第一版 |
-| `account_keepalive.py` | 暂缓 | 第一版只做手动/显式刷新 |
-| `generation_service.py` | 重写编排 | 只保留 attempt/release，不保留候选代数 |
+1. **Account/Auth**：账号身份、tier、Cookie、expired 状态。
+2. **Instance**：账号会话 + 一个 Context + 一个 Page + 一个 surface。
+3. **Pool/Router**：free/pro 池隔离；按模型 `paid` 标记选池。
+4. **Executor**：一次请求的 lease、attempt、release；不承担账号选择策略。
+5. **Event Sink**：日志原始事件 + 统计聚合事件，UI 只消费稳定接口。
 
-## 4. 已有测试和证据
+Build 是独立 surface，不是一个 pool tier。Build 页面、9998、signer 只通过明确接口接入，不反向控制 router。
 
-> 重要：仓库 `tests/unit` 是伴随实现写的 TDD/回归测试，部分断言固化了当时实现（如 capacity 429、提前租约）。它们只能证明“代码仍符合当前预期”，不能单独证明原始行为。先行验证脚本、真机日志、SSE 记录、bundle 证据优先于这些测试。
+## 4. 移植顺序
 
-### 先行验证脚本（`%TEMP%\kilo`）
+0. 冻结 P1-P10 的逐项决定。
+1. 审计 `upstream/master` 的扩展缝：账号身份、Context/Page 工厂、请求执行、事件出口。
+2. 在 clean 分支建立最小 core，不接 FastAPI/UI。
+3. P1：Account / Auth / Paid。
+4. P2：Routing / Retry（先修 `retry_same` 语义）。
+5. P3：Context / Page / Pool / Lease。
+6. P4：Build Surface（native/signer 分离）。
+7. P5：Generation / Protocol / Wire。
+8. P6：Keepalive / 24h / 自动切号。
+9. P7：Logs / Stats（单一事件模型）。
+10. P8-P10：API/UI、Boot/Config、Tests/Evidence。
 
-这些是独立探针，不是按实现反推的单测；只复用其结论/输出，不默认重跑（多数依赖真实 CDP/账号/9222，当前 IP 风控期禁止）：
+每一片只能在前一片的验收通过后进入下一片。
 
-| 脚本/目录 | 证明什么 | 使用方式 |
-|---|---|---|
-| `probe_signer_live.py` | signer `tb` 的实际字段、`H/A`、headers、selfTestError | 只读其输出；不重跑 |
-| `probe-current.cjs`、`bundles-current/` | 当前 AI Studio bundle 的函数/字段形态 | 离线分析 |
-| `probe_bundle.py`、`probe_bundle2.py` | bundle 内 `An/OCb/$B` 等符号证据 | 离线分析 |
-| `probe_frontend_paid.py`、`analyze_paid_fields.py`、`chunks/` | paid/free 模型元数据来源 | 直接支撑 paid 路由设计 |
-| `capture_headers.py`、`compare_page_cookies.py`、`send_after_inject.py` | 请求头/Cookie/注入后发送的真实行为 | 只读输出；不重跑 |
-| `test_accounts_refresh.py` | 账号刷新 RPC/authuser 行为 | 只读输出；不重跑 |
-| `wp5_budget_race_probe.py`、`wp5_cancel_probe.py`、`wp5v3_parallel_chat.py` | 预算竞态、取消、并发真机行为 | 作为旧架构证据 |
-| `wp10_real_auth.py`、`wp10_real_refresh.py` | 保活/Auth 回写的真实行为 | 作为旧架构证据 |
-| `mt-audit/` | 上游合并时的 ours/theirs/base 快照 | 只读对比 |
+## 5. 验收底线
 
-### 先行验证输出（raw evidence，`%TEMP%\kilo`）
+- 不需要真实 Google 请求即可证明：
+  - paid 只进 Pro 池；
+  - free/QQ bot 有独立池；
+  - 一个 Context 只有一个 Page；
+  - 同账号 chat/build 使用两个 Context；
+  - 关闭实例不误杀其他实例；
+  - 429/auth/transient 错误的重试路径符合新契约。
+- 统计页能回答：哪个账号、模型、surface、尝试、错误、用量、延迟。
+- 日志页保留原始事件，不把统计聚合混进日志总线。
 
-`docs/dev/evidence/` 是整理后的副本；完整原始输出在 `%TEMP%\kilo`。这些目录包含真实 SSE、服务日志、失败码和实验 JSON，优先于仓库 TDD：
+## 6. 不做的事
 
-| 目录/文件 | 内容 | 用途 |
-|---|---|---|
-| `p2-verify/` | ATG off/prefer/required 的 SSE 与服务日志 | ATG 真实行为 |
-| `p3-build3/` | Build 验收 run1/run2、service log/err | Build 原始链路 |
-| `p3-build/` | `build-stream.sse`、`auth-1.json` | Build 流式/Auth 现场 |
-| `wp5-verify/` | build/quota/guard/chat 的 `.out` 与服务日志 | 渠道/配额/守卫真实行为 |
-| `wp6-verify/` | reuse/gatefix/switch-inflight/xconn 的 SSE；`wp6-coexist.json`、`wp6-stats.json` | 并发/统计/coexist 真实行为 |
-| `atg-live/` | required/non-stream/stream、config、accounts | ATG 端到端证据 |
-| `spike*-evidence.json` | A/B/C/D、Build、App、signer、native 的实验结果 | Build/页面/签名逆向证据 |
-| `direct-run*.log` | Build 直连多轮完整日志 | 失败路径和协议细节 |
-| `mem-dual.csv`、`mem-private-2c.csv` | 双实例内存采样 | 资源规模 |
-| `bundles-current/`、`chunks/` | 当前 bundle、console、resource URL | 函数/字段形态 |
-| `mt-audit/` | 上游合并的 ours/theirs/base 快照 | 对照原始实现 |
-| `wp7p2/` | 账号/单 auth/坏 auth 夹具 | UI/导入边界 |
-
-注意：这些目录可能含真实账号 auth/cookie；**只引用路径和结论，不复制进仓库、不提交、不上传**。当前 IP 风控期也不重跑依赖真实 CDP/账号的脚本。
-
-结论：**先行脚本 + raw evidence 是“原始行为证据”，仓库 TDD 是“当前实现回归”**；重启时必须先读前者，再决定后者哪些还能保留。
-
-直接复用（作为回归，不作为原始行为证明）：
-
-- `test_cookie_persistence.py`
-- `test_cdp_browser_context.py`
-- `test_cdp_client.py`
-- `test_build_surface.py`
-- `test_build_lease_identity.py`
-- `test_stream_transport.py`
-- `test_wire_codec.py`、`test_wire_parser.py`
-- `test_format_openai.py`、`test_format_claude.py`、`test_format_responses.py`
-- `docs/dev/evidence/p2-verify/`、`p3-build3/`、`wp5*/`、`wp11*/`
-- `docs/ark-reference/build-channel/evidence-20261017/`
-
-新增最小测试：
-
-- 一个账号 → 一个 context → 一个 page；
-- 同账号 chat/build → 两个 context；
-- paid 模型只走 Pro 池；
-- free 模型只走 Free 池；
-- Pro 池失败不影响 Free 池；
-- 关闭一个实例只销毁自己的 context/page。
-
-## 5. 重启顺序
-
-1. 新建 `rebuild/core` 分支；旧 `master` 冻结。
-2. 只写 `rebuild/core` 包，不接 FastAPI/UI。
-3. 先跑通：一个 Free 实例 + 一个 Free 请求（用已有 fixture/回放，不发真实请求）。
-4. 再加一个 Pro 实例 + 一个 paid 请求（同样离线回放）。
-5. 加池隔离：paid 失败不碰 free。
-6. 通过后，再把现有 API 适配器接上；UI/统计/日志后置。
-
-## 6. 完成标准
-
-- 不需要任何真实 Google 请求就能证明：
-  - paid 只进 Pro；
-  - free/QQ bot 永远有独立池；
-  - 一个 context 只有一个 page；
-  - 关实例不误杀另一个实例。
-- 旧项目只作为模块/证据来源，不再作为运行时骨架。
-
-## 7. 不做的事
-
-- 不写新 WP；
-- 不再用 500 行设计稿替代可执行验证；
-- 不在风控期做真实登录/请求；
-- 不在第一版恢复自动切号、保活、UI 实例切换、统计页、日志页。
+- 不修复当前 fork 的业务代码；
+- 不合并当前 `master`；
+- 不把 `rebuild` 的 95 个提交整体移植；
+- 不恢复旧策略组、打分、channel 路由、tag、quota group；
+- 不在风控期访问真实账号/IP/Google；
+- 不写新 WP，不用长文档替代可执行验证。
