@@ -40,6 +40,7 @@
 | D12 Tests/Evidence | Ark build-channel 证据 | `66fa05f`；`docs/ark-reference/build-channel/evidence-20261017/*` | 新增 | working | bundle 考古：GenerateContent server-streaming、wire 字段、candidateCount 零命中 | keep | 是否作为协议权威 |
 | D12 Tests/Evidence | 提交信息质量门自证 | `8e5e0cb`（942/双并发）、`9de3c8c`（919，见 `%TEMP%` handoff）、`b59d6f3`（774，见 `docs/dev/evidence/wp5v3-20261019/README.md:114`） | 改造 | unverified | 未验证：942 与本次收集一致；双并发无独立工件；自报不得作 E2E 证据 | port（仅线索） | 是否要求每次验收附 raw 工件 |
 | D12 Tests/Evidence | `%TEMP%` handoff（20261021） | 无 Git 溯源；HEAD `9de3c8c`；`%TEMP%\kilo\handoff-aistudio-api-20261021-1326.md` | 改造 | partial | 记录 max_contexts=1、cookie fix、919 passed、未提交；含真实账号 ID 与路径 | keep（上下文） | 是否转为正式交接文档 |
+| D12 Tests/Evidence | 验收后同步架构插入点、AGENT.md、两份 README、docs/ARCHITECTURE.md，并新增 docs/changelog.md | 用户要求；无 Git 溯源 | 新增 | unverified | 未验证；文档同步流程 | port | 待用户决定 |
 
 ## 冲突/缺口
 

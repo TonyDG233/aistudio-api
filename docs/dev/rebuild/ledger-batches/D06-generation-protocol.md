@@ -73,6 +73,7 @@
 | D06 | 原始请求／响应落盘（dump_raw_response） | `4623109` `client.py:426-451`；`streaming.py:25-50` | 原生 | unverified | 未验证（仅 settings 开关，无测试） | keep | 待定：重建是否保留 |
 | D06 | chat 流式网关聚合（status→chunk→finish／usage，非 200 分类） | `4623109` `streaming.py:69-155` | 原生 | unverified | `test_stream_transport.py` 仅底层；网关无单测 | keep | 待定 |
 | D06 | 生图旧路径（size 映射＋search tool＋replay＋保存） | `4623109` `client.py:752-840`；`wire_codec.py:36-149` | 原生 | working | `test_multimodal_pipeline.py:43-88`；`test_wire_codec.py:46-133` | keep | 待定：是否随新管线保留 |
+| D06 | 官方 API key 仅用于 countTokens 完整计数（不生成、不回显、不落日志） | 用户要求；无 Git 溯源 | 新增 | unverified | 未验证；需安全存储/脱敏/权限测试 | port | 待用户决定 |
 
 ## 冲突/缺口
 

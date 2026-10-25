@@ -50,6 +50,7 @@
 | D07 | 非流式 build 收集（`_collect_build_output`：status≥400 抛错，聚合 text/thinking/tools/images/usage） | `ec35c8d`; `client.py:630-666` | 新增 | partial | 无直接单测（`未验证`）；仅流式路径有覆盖 | port | 确认非流式 build 是否保留 |
 | D07 | 清理路径（新页未就绪即关闭、finally 取消 pump/清 pending/task_queues、切号与 close 关 surface、slot 关页） | `1cc634e`, `8e5e0cb`; `build_surface.py:1180-1186`, `:1831-1837`; `client.py:226-235`, `:419-424`; `instance_pool.py:142-155` | 新增 | working | `test_instance_pool.py:307`; `test_build_surface.py:569-582`（in_flight 归零） | port | — |
 | D07 | signer 脚本缺失降级（只启用原生 9998，记录 `signer_error`，不阻塞渠道） | `8dd6782`; `build_surface.py:1079-1085`, `:1292-1298`, `:1177-1179` | 新增 | working | `test_build_surface.py:540-551` | port | — |
+| D07 | 失败现场截图 PNG + 页面 HTML dump（Build 流程失败时保存，供 debug） | 用户要求/参考项目；无 Git 溯源 | 新增 | unverified | 未验证；参考项目实现待移植 | port | 待用户决定 |
 
 ## 冲突/缺口
 
