@@ -35,6 +35,15 @@
 - `06-feature-ledger.md` 是人类台账；`06-feature-index.csv` 是机器索引；`06-decision-log.md` 是决策记录。P2/P3 决策日志是行为权威，CSV/ledger 只是索引。
 - 变更 06 后必须同步重新生成/校验 index，禁止两套各改各的；方法见 `06-index-validation.md`。
 
+### 2.1 Agent 工作模式
+
+- **主线 integrator**：唯一持有目标分支/worktree、接口、`05/06/ARCHITECTURE` 和提交权；负责切片顺序、合并、验收、changelog。
+- **worker**：只负责一个 `Dxx-NNN` 或明确文件域；在独立 worktree 工作；不得改 05/06/architecture/decision log；提交前报告“测试项 + 预期结果 + 实际结果”。
+- **reviewer**：只读；在 Gate0、Gate0.5、P3 状态机、P2 路由、P5 PG、P7 统计、最终 handoff 等节点独立审查；不得改代码/文档。
+- **并行条件**：接口和 schema 已冻结、文件域互不重叠、无共享文件；最多 2-3 个 worker。禁止两个 agent 同时改 `routing_pipeline.py`、`instance_pool.py`、`generation_service.py`、`05/06/ARCHITECTURE`。
+- **默认串行**：Gate0/Gate0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7。P1 与 P3 可在接口冻结后有限并行；P4/P8 在 API 稳定后并行。
+- 任何 agent 不得用“保持旧测试绿”为由复活旧契约；最终合并与提交只由 integrator 执行。
+
 ## 3. 目标骨架
 
 只保留五个稳定层：
