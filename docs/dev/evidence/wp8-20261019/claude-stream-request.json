@@ -1,0 +1,1 @@
+{"model":"gemini-flash-latest","max_tokens":96,"stream":true,"messages":[{"role":"user","content":"Count from 1 to 5, one number per line."}]}

@@ -1,0 +1,7 @@
+{
+  "tag": "forced429",
+  "model": "pg/gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 20.4,
+  "body": "{\"id\":\"chatcmpl-1792435154992_f469e6bf\",\"object\":\"chat.completion\",\"created\":1792435154,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Initiating Inquiry Processing**\\n\\nI'm currently engaged in analyzing the user's input to fully understand the nature of the request. I'm focusing on identifying the core query and any implicit assumptions or constraints. My immediate aim is to establish a clear and concise understanding of what's being asked.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":20,\"total_tokens\":31,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}"
+}

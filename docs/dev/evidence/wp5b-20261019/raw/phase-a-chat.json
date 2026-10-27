@@ -1,0 +1,7 @@
+{
+  "tag": "phase-a-chat",
+  "model": "gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 3.1,
+  "body": "{\"id\":\"chatcmpl-1792415825282_c6b6f983\",\"object\":\"chat.completion\",\"created\":1792415825,\"model\":\"gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Beginning Analysis Process**\\n\\nI've initiated an analysis of the user's request. My focus right now is on understanding the prompt's intent and scope, identifying any key terms or concepts that might influence further processing and interpreting the incomplete prompt. It seems I am starting with a limited understanding.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":21,\"total_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}"
+}

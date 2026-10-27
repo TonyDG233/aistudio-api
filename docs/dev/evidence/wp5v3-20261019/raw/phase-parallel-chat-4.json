@@ -1,0 +1,6 @@
+{
+  "tag": "phase-parallel-chat-4",
+  "status": 200,
+  "elapsed_s": 11.6,
+  "body": "{\"id\":\"chatcmpl-1792435474595_4bafad5c\",\"object\":\"chat.completion\",\"created\":1792435474,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":27,\"total_tokens\":40,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":26}}}"
+}

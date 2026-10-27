@@ -1,0 +1,7 @@
+{
+  "tag": "phase-b-official",
+  "model": "official/gemini-flash-latest",
+  "status": 403,
+  "elapsed_s": 0.0,
+  "body": "{\"error\":{\"message\":\"渠道 'official' 不可用（model=official/gemini-flash-latest）：该渠道未启用或尚未实现。\",\"type\":\"permission_error\",\"code\":null,\"param\":null}}"
+}
