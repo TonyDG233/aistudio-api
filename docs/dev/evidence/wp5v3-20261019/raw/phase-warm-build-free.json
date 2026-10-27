@@ -1,0 +1,7 @@
+{
+  "tag": "phase-warm-build-free",
+  "model": "build/gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 102.8,
+  "body": "{\"id\":\"chatcmpl-1792426285149_6e1936bd\",\"object\":\"chat.completion\",\"created\":1792426285,\"model\":\"build/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":21,\"total_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}"
+}

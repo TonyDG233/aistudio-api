@@ -1,0 +1,116 @@
+{
+  "round": 4,
+  "status": 200,
+  "elapsed_s": 11.4,
+  "body": "{\"id\":\"chatcmpl-1792435097379_083ed538\",\"object\":\"chat.completion\",\"created\":1792435097,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Analyzing the Request's Scope**\\n\\nI'm now zeroing in on the request, parsing its scope to understand the limitations being imposed. Focusing particularly on how \\\"只回答\\\" restricts the response to specific boundaries is the next step.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":21,\"total_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}",
+  "snapshot": {
+    "active_account": {
+      "id": "acc_46223636",
+      "name": "Ark:auth-5",
+      "tier": "pro",
+      "email": "tonygemini38@gmail.com"
+    },
+    "contexts": [
+      {
+        "slot_id": "slot-1",
+        "realm_id": "slot-1-g4",
+        "account_id": "acc_a78228ce",
+        "context_id": "469E3BC809D6B1255A3A0846BC3DF55C",
+        "state": "ready",
+        "in_flight": 0,
+        "reservations": 0,
+        "chat_ready": true,
+        "build_ready": false,
+        "chat_counted": true,
+        "build_counted": false,
+        "pending_pages": 0,
+        "pages": {
+          "chat": 1,
+          "build": 0
+        },
+        "last_used": 52637.4121362,
+        "slot_rows": []
+      }
+    ],
+    "pages": {
+      "chat": 1,
+      "build": 0
+    },
+    "live_instances": 1,
+    "context_count": 1,
+    "planned_instances": 0,
+    "budgets": {
+      "global_max_pages": 2,
+      "channel_max_pages": {
+        "chat": 1,
+        "build": 1,
+        "official": 0
+      },
+      "max_contexts": 2,
+      "pages": {
+        "chat": 1,
+        "build": 0
+      },
+      "contexts": 1
+    },
+    "control_session": {
+      "alive": true,
+      "url": "https://aistudio.google.com/prompts/new_chat?model=gemini-3.7-flash&temporary=true"
+    },
+    "routing": {
+      "circuit": {
+        "open": false,
+        "failures": 0,
+        "window_seconds": 600,
+        "failure_threshold": 5,
+        "cooldown_seconds": 300,
+        "open_until": null,
+        "retry_after_seconds": 0.0
+      },
+      "instances": {
+        "contexts": [
+          {
+            "slot_id": "slot-1",
+            "realm_id": "slot-1-g4",
+            "account_id": "acc_a78228ce",
+            "context_id": "469E3BC809D6B1255A3A0846BC3DF55C",
+            "state": "ready",
+            "in_flight": 0,
+            "reservations": 0,
+            "chat_ready": true,
+            "build_ready": false,
+            "chat_counted": true,
+            "build_counted": false,
+            "pending_pages": 0,
+            "pages": {
+              "chat": 1,
+              "build": 0
+            },
+            "last_used": 52637.4121362,
+            "slot_rows": []
+          }
+        ],
+        "max_contexts": 2,
+        "pages": {
+          "chat": 1,
+          "build": 0
+        },
+        "budgets": {
+          "global_max_pages": 2,
+          "channel_max_pages": {
+            "chat": 1,
+            "build": 1,
+            "official": 0
+          },
+          "max_contexts": 2,
+          "pages": {
+            "chat": 1,
+            "build": 0
+          },
+          "contexts": 1
+        },
+        "planned_instances": 0
+      }
+    }
+  }
+}

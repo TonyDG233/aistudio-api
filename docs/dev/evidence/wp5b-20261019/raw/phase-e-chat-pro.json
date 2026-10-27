@@ -1,0 +1,8 @@
+{
+  "tag": "phase-e-chat-pro",
+  "model": "chat/gemini-flash-latest",
+  "status": 200,
+  "started_at": 1792416239.5866008,
+  "elapsed_s": 3.2,
+  "body": "{\"id\":\"chatcmpl-1792416242740_9f0854ac\",\"object\":\"chat.completion\",\"created\":1792416242,\"model\":\"chat/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Defining the Core Constraint**\\n\\nI've zeroed in on the absolute constraint: the sole output must be \\\"OK\\\". I'm making sure to flag any deviations from this hard rule, and now I'm evaluating the implication of this constraint.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":61,\"total_tokens\":65,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":61}}}"
+}

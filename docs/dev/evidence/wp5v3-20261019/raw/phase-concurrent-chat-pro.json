@@ -1,0 +1,8 @@
+{
+  "tag": "phase-concurrent-chat-pro",
+  "model": "pg/gemini-flash-latest",
+  "status": 200,
+  "started_at": 1792426291.5349631,
+  "elapsed_s": 3.8,
+  "body": "{\"id\":\"chatcmpl-1792426295290_60e8e50c\",\"object\":\"chat.completion\",\"created\":1792426295,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Defining the Parameters**\\n\\nI've zeroed in on the core of the request - it's brutally simple: a single \\\"OK\\\". The constraint is absolute; anything beyond that is a deviation. I'm focusing on the single, allowed output, making sure there's no room for misinterpretation.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":60,\"total_tokens\":64,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":60}}}"
+}

@@ -1,0 +1,49 @@
+{
+    "tools":  [
+                  {
+                      "function":  {
+                                       "description":  "Get weather for a city",
+                                       "name":  "get_weather",
+                                       "parameters":  {
+                                                          "properties":  {
+                                                                             "city":  {
+                                                                                          "type":  "string"
+                                                                                      }
+                                                                         },
+                                                          "type":  "object",
+                                                          "required":  [
+                                                                           "city"
+                                                                       ]
+                                                      }
+                                   },
+                      "type":  "function"
+                  }
+              ],
+    "messages":  [
+                     {
+                         "content":  "What is the weather in Paris? Use the tool.",
+                         "role":  "user"
+                     },
+                     {
+                         "content":  null,
+                         "tool_calls":  [
+                                            {
+                                                "function":  {
+                                                                 "arguments":  "{\"city\": \"Paris\"}",
+                                                                 "name":  "get_weather"
+                                                             },
+                                                "id":  "call_1475479",
+                                                "type":  "function"
+                                            }
+                                        ],
+                         "role":  "assistant"
+                     },
+                     {
+                         "tool_call_id":  "call_1475479",
+                         "content":  "{\"temperature_c\":21,\"condition\":\"sunny\"}",
+                         "role":  "tool"
+                     }
+                 ],
+    "model":  "gemini-flash-latest",
+    "max_tokens":  128
+}

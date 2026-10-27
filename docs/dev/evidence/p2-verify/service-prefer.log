@@ -1,0 +1,50 @@
+2026-10-18 20:42:10 [INFO] [aistudio.server] 正在启动服务，监听端口 8080
+2026-10-18 20:42:10 [INFO] [aistudio.rotator] 已从 D:\LLM\self_programming\aistudio-api\data\rotator_state.json 恢复 2 个账号的运行与限额状态
+2026-10-18 20:42:10 [INFO] [aistudio.server] Client initialized (port=9222, accounts=2)
+2026-10-18 20:42:10 [INFO] [aistudio.browser] 正在启动 CloakBrowser 进程: D:\LLM\self_programming\aistudio-api\.cloakbrowser\chromium-146.0.7680.177.4\chrome.exe (调试端口 9222)
+2026-10-18 20:42:11 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:42:11 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:42:11 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/list "HTTP/1.1 200 OK"
+2026-10-18 20:42:11 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:42:11 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/list "HTTP/1.1 200 OK"
+2026-10-18 20:42:11 [INFO] [aistudio.session.auth] 已向页面载入 8 个 Cookie (auth_file=D:\LLM\Ark_AIStudioToAPI\configs\auth\auth-5.json)
+2026-10-18 20:42:12 [INFO] [httpx] HTTP Request: POST https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels "HTTP/1.1 200 OK"
+2026-10-18 20:42:12 [INFO] [aistudio.model_discovery] 通过 HTTP RPC 动态更新了 35 个模型
+2026-10-18 20:42:12 [INFO] [aistudio.routes.models] 获取模型列表完成 (共发现 35 个)
+2026-10-18 20:42:12 [INFO] [aistudio.server] HTTP GET /v1beta/models -> 200 (1344.0ms)
+2026-10-18 20:42:12 [INFO] [aistudio.routes.gemini] 收到 Gemini streamGenerateContent 流式请求: model=models/gemini-4-argon
+2026-10-18 20:42:12 [INFO] [aistudio.api.gemini] [ATG] 已注入合成通道: tool=atg_emit_08ee716891c556c1711e511d, model=models/gemini-4-argon, contents=2, tools=1
+2026-10-18 20:42:12 [INFO] [aistudio.api.gemini] Gemini 流式请求: model=models/gemini-4-argon, 对话轮数=2
+2026-10-18 20:42:12 [INFO] [aistudio.capture] Hook 模板已就绪并缓存: model=models/gemini-4-argon
+2026-10-18 20:42:12 [INFO] [aistudio.server] HTTP POST /v1beta/models/gemini-4-argon:streamGenerateContent -> 200 (4.1ms)
+2026-10-18 20:42:15 [INFO] [aistudio.session.auth] 已保存 10 个 Cookie 至 D:\LLM\Ark_AIStudioToAPI\configs\auth\auth-5.json
+2026-10-18 20:42:22 [INFO] [aistudio.session.botguard] BotGuard 握手成功并截获模板，耗时 1 秒 (累计 6.7 秒)
+2026-10-18 20:42:22 [INFO] [aistudio.session] 会话蓝绿平滑热切成功: auth_file=D:\LLM\Ark_AIStudioToAPI\configs\auth\auth-5.json, u/0 (活跃在途=1)
+2026-10-18 20:42:22 [INFO] [aistudio.client] 浏览器预热完成
+2026-10-18 20:42:22 [ERROR] [aistudio.api.gemini] Gemini 未知严重异常: list index out of range
+2026-10-18 20:42:27 [INFO] [aistudio.routes.gemini] 收到 Gemini streamGenerateContent 流式请求: model=models/gemini-4-argon
+2026-10-18 20:42:27 [INFO] [aistudio.api.gemini] [ATG] 已注入合成通道: tool=atg_emit_8de5e3d7d79127680d246228, model=models/gemini-4-argon, contents=2, tools=1
+2026-10-18 20:42:27 [INFO] [aistudio.api.gemini] Gemini 流式请求: model=models/gemini-4-argon, 对话轮数=2
+2026-10-18 20:42:27 [INFO] [aistudio.capture] Hook 模板已就绪并缓存: model=models/gemini-4-argon
+2026-10-18 20:42:27 [INFO] [aistudio.server] HTTP POST /v1beta/models/gemini-4-argon:streamGenerateContent -> 200 (3.8ms)
+2026-10-18 20:42:27 [INFO] [aistudio.capture] Hook 拦截成功: model=models/gemini-4-argon, snapshot=1535 chars, body=2374 chars
+2026-10-18 20:42:27 [WARNING] [aistudio.api.gemini] 账号 403 权限拒绝: 禁止访问: The caller does not have permission
+2026-10-18 20:42:27 [INFO] [aistudio.capture] 已清空捕获模板缓存
+2026-10-18 20:42:27 [WARNING] [aistudio.rotator] 账号 acc_b1a36ccf 遇到 403 权限拒绝，暂停使用 300s 并切换备用账号
+2026-10-18 20:42:27 [WARNING] [aistudio.rotator] 账号 acc_b1a36ccf 遇到 403 权限拒绝，暂停使用 300s 并切换备用账号
+2026-10-18 20:42:27 [INFO] [aistudio.rotator] 账号故障转移切换: Ark:auth-5 (model=models/gemini-4-argon)
+2026-10-18 20:42:27 [INFO] [aistudio.account] 已切换活跃账号持久化状态: acc_46223636
+2026-10-18 20:42:27 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:42:27 [INFO] [httpx] HTTP Request: PUT http://127.0.0.1:9222/json/new "HTTP/1.1 200 OK"
+2026-10-18 20:42:27 [INFO] [aistudio.session.auth] 已向页面载入 13 个 Cookie (auth_file=D:\LLM\self_programming\aistudio-api\data\accounts\acc_46223636\auth.json)
+2026-10-18 20:42:29 [INFO] [aistudio.session.auth] 已保存 14 个 Cookie 至 D:\LLM\self_programming\aistudio-api\data\accounts\acc_46223636\auth.json
+2026-10-18 20:42:32 [INFO] [aistudio.session.botguard] BotGuard 握手成功并截获模板，耗时 1 秒 (累计 3.1 秒)
+2026-10-18 20:42:32 [INFO] [aistudio.session] 会话蓝绿平滑热切成功: auth_file=D:\LLM\self_programming\aistudio-api\data\accounts\acc_46223636\auth.json, u/0 (活跃在途=0)
+2026-10-18 20:42:32 [INFO] [aistudio.account] 已切换到账号: acc_46223636 (Ark:auth-5)
+2026-10-18 20:42:32 [INFO] [aistudio.rotator] 已手动清除账号 acc_46223636 锁定 (model=models/gemini-4-argon)
+2026-10-18 20:42:32 [INFO] [aistudio.api.gemini] 切换至可用账号重试 (1/5)
+2026-10-18 20:42:32 [INFO] [aistudio.capture] Hook 模板已就绪并缓存: model=models/gemini-4-argon
+2026-10-18 20:42:32 [INFO] [aistudio.capture] Hook 拦截成功: model=models/gemini-4-argon, snapshot=1528 chars, body=2367 chars
+2026-10-18 20:42:33 [INFO] [httpx] HTTP Request: PUT http://127.0.0.1:9222/json/close/61FE3FDD0979D4790F59807C9C53D7FF "HTTP/1.1 404 Not Found"
+2026-10-18 20:42:35 [INFO] [aistudio.api.gemini] [ATG] 流式解包: tool=atg_emit_8de5e3d7d79127680d246228, stats={"syntheticHit": true, "syntheticCount": 1, "realToolCount": 0, "repaired": false, "conflict": false}
+2026-10-18 20:42:35 [INFO] [aistudio.api.gemini] Gemini 流式完成: model=models/gemini-4-argon, 输入Tokens=338, 输出Tokens=51

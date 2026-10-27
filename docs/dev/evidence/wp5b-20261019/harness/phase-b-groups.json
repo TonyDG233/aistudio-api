@@ -1,0 +1,43 @@
+{
+  "features": {
+    "build_surface": true,
+    "route_by_tier": true,
+    "channels": {
+      "chat": {"enabled": true, "max_instances": 2},
+      "build": {"enabled": true, "max_instances": 2},
+      "official": {"enabled": false, "max_instances": 0}
+    },
+    "routing": {
+      "max_switches": 2,
+      "global_max_instances": 2,
+      "max_realms": 2,
+      "realm_mode": true,
+      "borrow": false,
+      "prewarm": false,
+      "circuit_breaker": {
+        "window_seconds": 600,
+        "failure_threshold": 5,
+        "cooldown_seconds": 300
+      }
+    },
+    "slots": [],
+    "groups": [
+      {
+        "name": "pro",
+        "enabled": true,
+        "weight": 1.0,
+        "match_tier": ["pro", "ultra", "plus"],
+        "allowed_surfaces": ["chat"],
+        "max_page_instances": 2
+      },
+      {
+        "name": "free",
+        "enabled": true,
+        "weight": 1.0,
+        "match_tier": ["free"],
+        "allowed_surfaces": ["build"],
+        "max_page_instances": 2
+      }
+    ]
+  }
+}

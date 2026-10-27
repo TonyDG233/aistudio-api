@@ -1,0 +1,33 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "status": 200,
+      "elapsed_s": 10.9
+    },
+    {
+      "round": 2,
+      "status": 200,
+      "elapsed_s": 12.2
+    },
+    {
+      "round": 3,
+      "status": 200,
+      "elapsed_s": 27.6
+    },
+    {
+      "round": 4,
+      "status": 200,
+      "elapsed_s": 11.4
+    }
+  ],
+  "accounts_seen": [
+    "acc_4cd8be58",
+    "acc_8808817d",
+    "acc_93c6ead1",
+    "acc_a78228ce"
+  ],
+  "distinct_accounts": 4,
+  "final_context_count": 1,
+  "max_contexts": 2
+}

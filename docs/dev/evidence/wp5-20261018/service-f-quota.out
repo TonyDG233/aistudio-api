@@ -1,0 +1,2 @@
+INFO:     127.0.0.1:1221 - "POST /accounts/refresh HTTP/1.1" 200 OK
+INFO:     127.0.0.1:9956 - "POST /v1beta/models/gemini-3.8-flash%3AstreamGenerateContent?alt=sse HTTP/1.1" 200 OK

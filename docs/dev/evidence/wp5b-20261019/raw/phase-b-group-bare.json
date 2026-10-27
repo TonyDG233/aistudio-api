@@ -1,0 +1,7 @@
+{
+  "tag": "phase-b-group-bare",
+  "model": "gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 4.2,
+  "body": "{\"id\":\"chatcmpl-1792416110701_03d0c31c\",\"object\":\"chat.completion\",\"created\":1792416110,\"model\":\"gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Decoding the Input**\\n\\nI'm currently focused on dissecting the user's input, which consists solely of the Chinese character \\\"只\\\". I'm trying to figure out the best approach to handling this. It seems that the prompt will require me to provide a suitable response that caters for a user's intent to communicate via a single Chinese character. I will need to interpret the intent.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":21,\"total_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}"
+}

@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "1\n2\n3"}]}, "index": 0}], "modelVersion": "models/gemini-4-argon", "responseId": "v1_Chc5cjdVYXZMQkRZYlZqckVQNXJXZGtBURIXOXI3VWFyV09GS25HLThZUHVianBrQUU"}
+data: {"candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "STOP", "index": 0}], "usageMetadata": {"promptTokenCount": 338, "candidatesTokenCount": 51, "thoughtsTokenCount": 0, "totalTokenCount": 389}, "modelVersion": "models/gemini-4-argon", "responseId": "v1_Chc5cjdVYXZMQkRZYlZqckVQNXJXZGtBURIXOXI3VWFyV09GS25HLThZUHVianBrQUU"}

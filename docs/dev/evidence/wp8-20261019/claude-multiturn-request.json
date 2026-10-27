@@ -1,0 +1,50 @@
+{
+    "tools":  [
+                  {
+                      "description":  "Get weather for a city",
+                      "name":  "get_weather",
+                      "input_schema":  {
+                                           "properties":  {
+                                                              "city":  {
+                                                                           "type":  "string"
+                                                                       }
+                                                          },
+                                           "type":  "object",
+                                           "required":  [
+                                                            "city"
+                                                        ]
+                                       }
+                  }
+              ],
+    "messages":  [
+                     {
+                         "content":  "What is the weather in Paris? Use the tool.",
+                         "role":  "user"
+                     },
+                     {
+                         "content":  [
+                                         {
+                                             "input":  {
+                                                           "city":  "Paris"
+                                                       },
+                                             "name":  "get_weather",
+                                             "id":  "call_1460422",
+                                             "type":  "tool_use"
+                                         }
+                                     ],
+                         "role":  "assistant"
+                     },
+                     {
+                         "content":  [
+                                         {
+                                             "content":  "{\"temperature_c\":21,\"condition\":\"sunny\"}",
+                                             "type":  "tool_result",
+                                             "tool_use_id":  "call_1460422"
+                                         }
+                                     ],
+                         "role":  "user"
+                     }
+                 ],
+    "model":  "gemini-flash-latest",
+    "max_tokens":  128
+}

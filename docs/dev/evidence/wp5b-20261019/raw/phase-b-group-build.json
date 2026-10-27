@@ -1,0 +1,7 @@
+{
+  "tag": "phase-b-group-build",
+  "model": "build/gemini-flash-latest",
+  "status": 403,
+  "elapsed_s": 0.0,
+  "body": "{\"error\":{\"message\":\"分组 'pro' 不允许 build 面（allowed=['chat']）。\",\"type\":\"permission_error\",\"code\":null,\"param\":null}}"
+}

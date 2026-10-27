@@ -1,0 +1,7 @@
+{
+  "tag": "phase-warm-chat-pro",
+  "model": "pg/gemini-flash-latest",
+  "status": 200,
+  "elapsed_s": 23.8,
+  "body": "{\"id\":\"chatcmpl-1792426176293_374e611c\",\"object\":\"chat.completion\",\"created\":1792426176,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Initiating Simple Response**\\n\\nI've begun analyzing the user's input, which consists solely of \\\"只回答 OK\\\". My aim is to extract the core instruction and formulate a concise and appropriate response. I'm focusing on the imperative nature of the request, and what the user is requesting.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":21,\"total_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":21}}}"
+}

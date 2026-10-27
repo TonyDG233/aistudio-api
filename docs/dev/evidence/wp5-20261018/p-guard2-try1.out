@@ -1,0 +1,1 @@
+data: {"error": {"code": 403, "message": "模型 'models/gemini-4-argon' 属 argon/Pro 系，仅可在 chat 面使用，但分组 'pro' allowed=['build'] 不含 chat。", "status": "PERMISSION_DENIED", "advice": "请在分组 allowed_surfaces 中加入 chat，或改用该分组支持的非 chat-only 模型；本次请求不静默换面、不换账号。"}}

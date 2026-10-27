@@ -1,0 +1,6 @@
+{
+  "tag": "phase-parallel-chat-2",
+  "status": 200,
+  "elapsed_s": 12.0,
+  "body": "{\"id\":\"chatcmpl-1792435474991_6e2fd71f\",\"object\":\"chat.completion\",\"created\":1792435474,\"model\":\"pg/gemini-flash-latest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"**Initiating the Analysis**\\n\\nI'm currently engaged in analyzing the user's prompt, focusing on the keywords and constraints, particularly the \\\"只回答 OK\\\" element. My immediate goal is to understand the precise context and intended response format. I'm prioritizing the brevity and directness required.\\n\\n\\n\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":29,\"total_tokens\":42,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":29}}}"
+}

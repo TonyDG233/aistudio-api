@@ -1,0 +1,7 @@
+{
+  "tag": "phase-c-quota",
+  "model": "build/gemini-flash-latest",
+  "status": 429,
+  "elapsed_s": 0.0,
+  "body": "{\"error\":{\"message\":\"渠道 'build' 的候选实例均无法落地，顺延次数=1。\",\"type\":\"rate_limit_error\",\"code\":null,\"param\":null}}"
+}

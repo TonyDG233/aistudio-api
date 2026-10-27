@@ -1,0 +1,42 @@
+{
+  "source_files": [
+    "auth-21.json",
+    "auth-3.json",
+    "auth-32.json",
+    "auth-35.json",
+    "auth-36.json",
+    "auth-38.json",
+    "auth-45.json",
+    "auth-49.json",
+    "auth-55.json",
+    "auth-7.json",
+    "auth-8.json"
+  ],
+  "imported": [
+    {
+      "id": "acc_afcf0cdd",
+      "name": "WP5v3:auth-55",
+      "tier": null,
+      "expired": true
+    },
+    {
+      "id": "acc_e1956d45",
+      "name": "WP5v3:auth-36",
+      "tier": null,
+      "expired": true
+    },
+    {
+      "id": "acc_d8652b3a",
+      "name": "WP5v3:auth-21",
+      "tier": null,
+      "expired": true
+    },
+    {
+      "id": "acc_8808817d",
+      "name": "WP5v3:auth-7",
+      "tier": "free",
+      "expired": false
+    }
+  ],
+  "valid_count": 1
+}

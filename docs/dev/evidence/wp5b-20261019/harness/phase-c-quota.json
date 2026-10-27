@@ -1,0 +1,26 @@
+{
+  "features": {
+    "build_surface": true,
+    "route_by_tier": false,
+    "channels": {
+      "chat": {"enabled": true, "max_instances": 2},
+      "build": {"enabled": true, "max_instances": 2},
+      "official": {"enabled": false, "max_instances": 0}
+    },
+    "routing": {
+      "max_switches": 2,
+      "global_max_instances": 1,
+      "max_realms": 2,
+      "realm_mode": false,
+      "borrow": false,
+      "prewarm": false,
+      "circuit_breaker": {
+        "window_seconds": 600,
+        "failure_threshold": 5,
+        "cooldown_seconds": 300
+      }
+    },
+    "slots": [],
+    "groups": []
+  }
+}
