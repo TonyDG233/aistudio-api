@@ -1,5 +1,7 @@
 # 08-06 Final Readiness Audit
 
+> **历史横幅（2026-10-27）**：本文已被 `08-07-upstream-99c38ba-reaudit.md` 取代。结论基于旧上游 `4623109`，不再作为 handoff 依据；G0.1/0.5/0.6 与测试覆盖口径均需按 `99c38ba` 重审。正文保留原文，不回改。
+
 > 本文件取代 `08-05-final-readiness-audit.md` 作为最终 handoff 门；`10-handoff-prompt.md` 的 Gate 0 完整条件以本文 §6 为准。`08-05` 保留为历史审计，不回改原文。
 
 - 审计对象：`rebuild` @ `0f9357b0e18b3c727dbe4258706e8d05e7265c3d`（审计开始时 `git status --porcelain` 为空），`upstream/master` @ `4623109b97d14db30e304005fe1d52c29a46a7c2`。

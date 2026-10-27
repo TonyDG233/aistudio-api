@@ -40,7 +40,7 @@
 | D01 Boot & Config | 实例预启动 task（warmup 后 manager.startup） | da6ea25 + src/aistudio_api/api/app.py:135-149 | 新增 | partial | test_instance_manager.py:300-344 覆盖 startup；app task 未验证 | port | port |
 | D01 Boot & Config | 模型发现周期预热 task | 1980ada + src/aistudio_api/api/app.py:151-163 | 新增 | unverified | 未验证 | keep | keep |
 | D01 Boot & Config | Keepalive 服务启动 | 1f9ba61 + src/aistudio_api/api/app.py:165-173 | 新增 | partial | test_account_keepalive.py；app 装配未验证 | port | port |
-| D01 Boot & Config | 浏览器空闲回收监控与活跃工作保护 | 86391c8 + src/aistudio_api/api/app.py:175-195 | 改造 | unverified | 未验证 | keep | keep |
+| D01 Boot & Config | 浏览器空闲回收监控与活跃工作保护 | 86391c8 + src/aistudio_api/api/app.py:175-195 | 改造 | unverified | 未验证 | keep | drop |
 | D01 Boot & Config | 启动时账号 email/tier 自动校验 | 47cec70 + src/aistudio_api/api/app.py:197-241 | 改造 | unverified | 未验证 | port | port |
 | D01 Boot & Config | 关闭流程：取消后台任务、停 keepalive、client.close、清空 runtime_state | da6ea25, 1980ada, 1f9ba61 + src/aistudio_api/api/app.py:243-267 | 改造 | unverified | 未验证 | keep | keep |
 | D01 Boot & Config | 基础路由注册（system/accounts/gemini/models） | upstream/master..master + src/aistudio_api/api/app.py:270-290 | 原生 | working | test_routes_system.py, test_routes_models.py, test_format_error_routing.py | keep | keep |
@@ -66,7 +66,7 @@
 | D01 Boot & Config | auth 文件发现（registry 活跃账号优先 + 扫描 + utf-8） | dceaa3d + src/aistudio_api/config.py:174-203 | 改造 | unverified | 未验证 | keep | keep |
 | D01 Boot & Config | 代理探测与浏览器 proxy 构造 | upstream/master..master + src/aistudio_api/config.py:206-247 | 原生 | unverified | 未验证 | keep | keep |
 | D01 Boot & Config | 时区与 locale 解析 | upstream/master..master + src/aistudio_api/config.py:250-273 | 原生 | unverified | 未验证 | keep | keep |
-| D01 Boot & Config | 浏览器空闲超时默认值改为 0 | 86391c8 + src/aistudio_api/config.py:276-283 | 改造 | unverified | 未验证 | keep | keep |
+| D01 Boot & Config | 浏览器空闲超时默认值改为 0 | 86391c8 + src/aistudio_api/config.py:276-283 | 改造 | unverified | 未验证 | keep | drop |
 | D01 Boot & Config | Settings 基础字段（端口/浏览器/鉴权/超时/统计） | upstream/master..master + src/aistudio_api/config.py:286-323 | 原生 | working | config 导入与 test_features_config.py:87-93 | keep | keep |
 | D01 Boot & Config | Settings 功能开关基线（WP1/WP10 环境变量） | 3d01ed2, 1f9ba61 + src/aistudio_api/config.py:324-359 | 新增 | working | test_features_config.py:87-93 | port | port |
 | D01 Boot & Config | Settings aistudio_app_url | da6ea25 + src/aistudio_api/config.py:298 | 新增 | unverified | 未验证 | port | port |
@@ -135,12 +135,12 @@
 | D03 | 控制面 `BrowserSession`：懒启动、`ensure_ready` 就绪门、profile dir 派生 | upstream/master(4623109); session.py:67-215,564-583 | 原生 | working | test_session_lifecycle.py:18,160；test_browser_session.py:175 | keep | keep |
 | D03 | Chromium 直接子进程启动（CloakBrowser 独占、stealth/low-mem args、fingerprint key=user_data_dir） | upstream/master(4623109); browser_engine.py:61-227,1013-1071 | 原生 | working | test_browser_engine.py:34,59,141,184 | keep | keep |
 | D03 | 遗留/孤儿 Chromium 清理、端口等待、Singleton/DevTools 锁文件删除 | upstream/master(4623109); browser_engine.py:471-680,1024 | 原生 | working | test_browser_engine.py:153,232 | keep | keep |
-| D03 | 进程守护：pipe watchdog、进程组 SIGTERM/SIGKILL、Windows Job Object、atexit/signal hook | upstream/master(4623109); browser_engine.py:683-898,931-1010 | 原生 | working | test_browser_engine.py:169,203 | keep | keep |
+| D03 | 进程守护：pipe watchdog、进程组 SIGTERM/SIGKILL、Windows Job Object、atexit/signal hook | upstream/master(4623109); browser_engine.py:683-898,931-1010 | 原生 | working | test_browser_engine.py:169,203 | keep | rewrite |
 | D03 | CDP WebSocket JSON-RPC：请求 future、事件分发、超时、断线失败全部 pending | upstream/master(4623109); cdp_client.py:93-308 | 原生 | working | test_cdp_client.py:38-93 | keep | keep |
 | D03 | `connect_page`：复用首个 page target、关闭多余 about:blank tab、3 次重试 | 4aa35cb,0fe5821; cdp_client.py:871-918 | 原生 | working | test_cdp_client.py:235-260 | keep | keep |
 | D03 | page 创建/关闭：`create_new_page`、`CDPPage.close`(Page.close+WS close)、`close_target` | f110d51a,8960de9; cdp_client.py:810-819,920-939,1038-1050 | 原生 | working | test_session_blue_green_readiness.py:82；无真实 target 关闭测试，未验证 | keep | keep |
 | D03 | Inspector.detached 与 Inspector/Target.targetCrashed：标记 page closed 并立即失败 pending futures | 4aa35cb,4586271; cdp_client.py:164-198,375-396 | 原生 | working | test_cdp_client.py:200-213 | keep | keep |
-| D03 | page liveness (`Runtime.evaluate 1`) + 浏览器进程 liveness checker（发送/等待命令中轮询） | 4c39542,4aa35cb; cdp_client.py:107-117,216-276,338-350 | 原生 | working | test_cdp_client.py:184-196,216-231；test_browser_session.py:175 | keep | keep |
+| D03 | page liveness (`Runtime.evaluate 1`) + 浏览器进程 liveness checker（发送/等待命令中轮询） | 4c39542,4aa35cb; cdp_client.py:107-117,216-276,338-350 | 原生 | working | test_cdp_client.py:184-196,216-231；test_browser_session.py:175 | keep | rewrite |
 | D03 | 资源拦截拆分：chat 面全量清单；build 面放行 monaco/codemirror/vs/mathjax/katex | 1cc634e; cdp_client.py:26-80,398-407 | 改造 | working | test_cdp_client.py:24-35 | keep | keep |
 | D03 | BrowserContext 创建：`Target.createBrowserContext {disposeOnDetach:True}`，进程内串行锁 | 28c981f; cdp_client.py:941-968 | 新增 | partial | test_cdp_browser_context.py:28-44 断言参数；真实 detach 语义未验证 | keep | keep |
 | D03 | `create_page_in_context`：Target.createTarget 后轮询 /json/list 取 WS，失败关 target | 28c981f; cdp_client.py:983-1036 | 新增 | unverified | 无直接单测；仅被 PooledSession 生产路径调用，未验证 | keep | keep |
@@ -166,7 +166,7 @@
 | D03 | build 面 realm WS 分桶：`?realm=` 解析，default/各 realm 连接列表隔离 | 1cc634e; build_surface.py:136-205 | 新增 | working | test_cdp_browser_context.py:47-71 | keep | port |
 | D03 | 单实例单页：全局页预算=max(1,max_contexts)，chat/build 页预算由 max_instances 派生；第二页拒绝 | 7cd6d74,9786b3a; instance_pool.py:202-255,314-363 | 改造 | working | test_instance_pool.py:938-1031 | keep | port |
 | D03 | 浏览器回收后 stale/pinned slot 复活：同账号复用原 slot 重载 context/page | 86391c8; instance_pool.py:919-961; test_instance_pool.py:1034-1058 | 新增 | working | test_instance_pool.py:1034-1058 | keep | drop |
-| D03 | 浏览器空闲回收：`browser_idle_timeout<=0` 关闭；LOADING/PREPARING 不回收；冷启动刷新时间戳 | 4aa35cb,4623109,86391c8; session.py:197-215,564-583 | 原生 | working | test_session_lifecycle.py:127-189；默认 0（86391c8 config），未验证运行时 | keep | port |
+| D03 | 浏览器空闲回收：`browser_idle_timeout<=0` 关闭；LOADING/PREPARING 不回收；冷启动刷新时间戳 | 4aa35cb,4623109,86391c8; session.py:197-215,564-583 | 原生 | working | test_session_lifecycle.py:127-189；默认 0（86391c8 config），未验证运行时 | keep | drop |
 
 ### D04 Instance / Pool / Lease / Capacity
 
@@ -213,7 +213,7 @@
 | D04 | rebind 空闲 slot 换账号/组，generation 自增并重建 Context | dd5e359; instance_pool.py:773-830 | 新增 | working | test_instance_pool.py:704-742 | keep | drop |
 | D04 | retire_idle 空闲回收 API 存在但无 src 调用方 | 1201a37; instance_pool.py:1180-1205 | 新增 | legacy | test_instance_pool.py:562-574；src 无调用，未验证 | drop（或接线） | drop |
 | D04 | slots/pages/budget snapshot 供路由与诊断 | dd5e359,86391c8; instance_pool.py:364-407 | 新增 | working | test_instance_pool.py:577-587；routing_pipeline.py:581-582 | keep | port |
-| D04 | has_active_work 阻止浏览器空闲回收处于 LOADING/BUSY 的实例 | 86391c8; instance_pool.py:364-371 | 新增 | working | app.py:185-187 | keep | port |
+| D04 | has_active_work 阻止浏览器空闲回收处于 LOADING/BUSY 的实例 | 86391c8; instance_pool.py:364-371 | 新增 | working | app.py:185-187 | keep | drop |
 | D04 | _runtime_occupancy 统计辅助无调用方 | 79901b0; instance_manager.py:912-919 | 新增 | legacy | 全仓无引用，未验证 | drop | drop |
 | D04 | generation/realm_id 随重载自增，旧 realm 触发 retire 回调 | 1201a37; instance_pool.py:80-84,982-984,986-1023 | 新增 | working | test_instance_pool.py:147-164,562-574 | keep | keep |
 | D04 | switch_to 当前实例原地切换，不动其他实例 | da6ea25; instance_manager.py:334-340 | 新增 | working | test_instance_manager.py:469-496 | keep | port |
@@ -432,7 +432,7 @@
 | D08 | switch_to_account 共享切号锁与 require_idle | `1f9ba61 src/aistudio_api/application/account_orchestrator.py:32-65`; `routes_accounts.py:280-282`; `routes_system.py:378-380` | 新增 | unverified | `未验证`（路由/手动切换实际调用，无直接单测） | keep | port |
 | D08 | 429 冷却分层与 drip（60s→300s→600s） | `d8bbb22 account_rotator.py:335-367`; 基线 `4623109` 已有 date-key/cooldown | 改造 | working | `tests/unit/test_account_orchestrator.py:327-344`；`test_rotator_surface_keys.py`（本轮 43 passed） | keep | keep |
 | D08 | 美西午夜跨天重置与 session_expired 86400 隔离 | `9fd237d account_rotator.py:241-265`; `413496f account_rotator.py:398-415`; `d8bbb22 account_rotator.py:241-265` | 改造 | partial | `test_account_orchestrator.py:305-324`；`test_account_rotation_concurrency.py:306-309`（只验 0..86400） | keep | keep |
-| D08 | idle browser 回收监控（pool 有活跃工作时 touch、否则 check_idle_timeout） | `4aa35cb api/app.py:175-195`; `86391c8 app.py:182-191`; `86391c8 src/aistudio_api/config.py:276-294`; `4623109 session.py:197-215` | 改造 | partial | `tests/unit/test_session_lifecycle.py:126-141,159-189`；app 监控循环未验证 | keep | keep |
+| D08 | idle browser 回收监控（pool 有活跃工作时 touch、否则 check_idle_timeout） | `4aa35cb api/app.py:175-195`; `86391c8 app.py:182-191`; `86391c8 src/aistudio_api/config.py:276-294`; `4623109 session.py:197-215` | 改造 | partial | `tests/unit/test_session_lifecycle.py:126-141,159-189`；app 监控循环未验证 | keep | rewrite |
 | D08 | tier/email 启动自动校验（仅 email 缺失或 tier=Free 时探测） | `6384ca9 api/app.py:197-241`; `47cec70 app.py:208` | 改造 | unverified | `未验证`（无 `_auto_refresh_tiers` 测试） | keep | keep |
 | D08 | AccountInfoRefresher 批量刷新/进程互斥/401 标过期/5xx 不改状态/邮箱回填 | `dad9cf7 account_info_refresher.py:208-344`; `0a3342b`; `1ef8ac2`; `fcd6f1f` | 新增 | working | `tests/unit/test_account_info_refresh.py`（本轮 38 passed 含 session） | keep | keep |
 | D08 | Keepalive HTTP 状态与手动运行（409 busy / 400 unknown） | `1f9ba61 src/aistudio_api/api/routes_keepalive.py:1-50`; `1f9ba61 app.py:38,274-278` | 新增 | working | `tests/unit/test_routes_keepalive.py:32-76` | keep | keep |

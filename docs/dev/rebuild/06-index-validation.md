@@ -11,7 +11,7 @@
 - 无 `pending`。
 - P1-P10 行数分别为 31/43/97/44/70/25/67/42/62/37，总 518。
 - D1 冲突项：D05-016..018 drop、D05-019 port、D05-021 port、D05-036..037 port、D05-039 drop、D06-066 port；相关 note 必须出现 `active_requests` 或明确“无 lease”。
-- 第二轮冲突项：D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D07-026 keep、D08-022 keep；D05-026 note 必须包含“同账号/429/503”，D05-039 note 必须区分“手动/后台”，D08-022 note 必须包含“唤醒/SLEEPING”。
+- 第二轮冲突项：D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D07-026 keep、D08-022 rewrite；D05-026 note 必须包含“同账号/429/503”，D05-039 note 必须区分“手动/后台”，D08-022 note 必须包含“唤醒/SLEEPING”。
 
 ## 校验脚本
 
@@ -38,7 +38,7 @@ EXPECTED_DECISIONS = {
     "D05-016": "drop", "D05-017": "drop", "D05-018": "drop",
     "D05-019": "port", "D05-021": "port", "D05-036": "port",
     "D05-037": "port", "D05-039": "drop", "D06-066": "port",
-    "D05-026": "port", "D07-026": "keep", "D08-022": "keep",
+    "D05-026": "port", "D07-026": "keep", "D08-022": "rewrite",
 }
 REQUIRED_NOTES = {
     "D05-026": ("同账号", "429", "503"),

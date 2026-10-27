@@ -408,4 +408,30 @@ Feature ID：`D05-041`
 - **P10-Q7 证据索引**：`D12-033` → port。
 - **P10-Q8 验收工件与文档同步**：`D12-035`, `D12-037` → port；同步 AGENT/READMEs/ARCHITECTURE/changelog。
 
+## 99c38ba 上游裁决（2026-10-27，追加；不改 P1-P10 原结论）
+
+本节只追加新裁决、标注被替代的旧表述；`08-07-upstream-99c38ba-reaudit.md` 是完整影响矩阵。feature 集不变，仍为 518 行；不新增 feature 行。
+
+| 决策包 | 动作 | 裁决 |
+|---|---|---|
+| P1 Account / Auth / Paid | adopt | `AccountMeta.enabled/group/notes`、`AccountPreset`/`presets.json`、分组/预设 CRUD 与路由、`get_active_account` 只回退 enabled 账号，全部采上游原生；禁用账号不入候选。 |
+| P2 Routing / Candidate / Switch / Retry | rewrite | `AccountStats` 的 `daily_models`、`resolve_tier_quota`、`tier_weights/stickiness/drip_penalty`、`required_tiers` 只作现有实例候选的排序/准入；不新增请求实例、不后台改绑、不另立并发账本。付费模型无合格账号的本地 403 fast-fail adopt；与 429→503 分开。 |
+| P3 Browser / CDP / Context / Page / Instance / Pool / Lease | adopt + rewrite | 移除 watchdog/liveness checker/CDP ping/idle 回收；adopt `capture._ensure_template` 的 `await session.ensure_ready()` 与只清理 `about:blank`；rewrite `close_context`：只保留关闭后等待释放语义，不采用 `session.py:211` 的 blue-green `create_new_page`/`_retiring_contexts` 后台 drain。1 账号 + 1 Context + 1 Page + 1 surface、无 lease 不变。 |
+| P4 Build Surface | keep | Build 计划不变；只继承 wire/transport 修复，不因上游变化新增 Build 范围。 |
+| P5 Generation / Protocol / Wire | adopt | `session_token`/`request_context`/`SEED=18`/`WIRE_FINISH_REASON_CONTINUING=22`/角色守卫/结构化 functionCall/functionResponse/per-chunk usage/response_id/统一 thought+signature 写回均采上游；F-01/F-04 仍用离线 fixture 证明。 |
+| P6 Keepalive / Rotation / 24h | disable + keep | 24h 回写、手动保活、429 冷却/跨天 keep；idle 回收/watchdog/liveness/CDP ping disable（上游已移除）；`active_activity` 因失去“阻止 idle 回收”的语义置 disable；无后台 stale 复活。 |
+| P7 Logs / Stats | adopt | `reasoning_tokens`、`cached_tokens`、`finish_reasons`、`account_breakdown`、`cachedContentTokenCount` 采上游；`account_breakdown` 是 stats REST 派生字段，不是事件类型；token 汇总仍不含 countTokens。 |
+| P8 API / UI | adopt + rewrite | 账号分组/预设/toggle、Dashboard 统计 UI 采上游原生；API Key 守卫 rewrite 为默认拒绝（上游“无 Key 即免密”不采用）；其余最小 UI 不重写。 |
+| P9 Boot / Config | adopt + rewrite | `rotator/paid_model_rules/tier_quotas/account_presets/defaults/config.yaml/video+imagen profile` 纳入单一 schema；删除浏览器 idle 超时键；超时默认 600；缺失/部分 rotator fail-fast；删除 channel registry 不变。 |
+| P10 Tests / Evidence | rewrite | 保留主 `rebuild` 80 个测试处置；99c38ba 实际 28 个测试文件（含 conftest），新增 `test_account_presets.py`（keep）与 `test_tier_preemption.py`（rewrite）已补入 disposition，共 82 行；删除 watchdog/idle/liveness 测试不恢复。 |
+
+被本节替代/修正的旧表述：
+
+- P6-Q6 的 “active_activity 阻止 idle 回收” 与 P6 总原则的 idle 自动回收默认关闭：上游已无 idle 回收，active_activity 置 disable；`SLEEPING` 仍保留为消息唤醒状态，但只由显式释放进入。
+- 索引行随 99c38ba 调整（不改 518 行集合，只改 decision/note）：`D01-012`、`D01-038`、`D03-035`、`D04-042` → `drop`（idle 回收/超时/监控不再存在）；`D03-004` → `rewrite`（删 pipe watchdog，保留进程组/Job Object/atexit）；`D03-009` → `rewrite`（删 liveness checker 与轮询，保留页面失败即失败）；`D08-022` → `rewrite`（只保留消息唤醒 SLEEPING/UNSTARTED 与失败/stale 手动重启，idle 回收不实现）。CSV 与 ledger 已同步。
+- `08-06` 基于 `4623109` 的 handoff 结论失效，只作历史；新基线为 `99c38ba`。
+- 旧 “26/26 新 worktree 测试覆盖” 修正为 `99c38ba` 28/28；26 是 `b8af406` 计数，不能与主 `rebuild` 80/80 混同。
+
+D12/lease 措辞复核：D02/D05/D06/D12 相关行已按“无 lease、`active_requests` 唯一账本、429→503 retained”执行；本次不新增 feature 行，也不改变 518 行集合。
+
 
