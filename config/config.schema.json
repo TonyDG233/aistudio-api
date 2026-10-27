@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aistudio-api.local/config.schema.json",
+  "title": "aistudio-api runtime config (Gate 0.5 baseline)",
+  "description": "Gate 0.5 冻结的最小配置契约；与 12-gate0-inputs.md §3 对应。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "instances": {
+      "type": "array",
+      "description": "实例级配置：1 账号 + 1 Context + 1 Page + 1 surface；同账号 chat/build 不得并存。",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["account_id", "count", "surface"],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "surface": {
+            "enum": ["chat", "build"]
+          },
+          "min_tier": {
+            "enum": ["free", "pro"],
+            "default": "free"
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "description": "全局只做总上限；容量按实例数计算，不引入 lease/reservation。",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "max_instances": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 8
+        }
+      }
+    },
+    "api_keys": {
+      "type": "array",
+      "description": "[] 或缺失 = 默认拒绝；显式 [\"\"] 才开放匿名访问；不保留 loopback 免鉴权。",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "formats": {
+          "type": "array",
+          "uniqueItems": true,
+          "default": ["openai", "gemini"],
+          "items": {
+            "enum": ["openai", "gemini", "claude", "responses"]
+          }
+        },
+        "build_surface": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "keepalive": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "interval_hours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 168,
+          "default": 24
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "level": {
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+          "default": "INFO"
+        },
+        "daily_dir": {
+          "type": "string",
+          "minLength": 1,
+          "default": "logs"
+        },
+        "retention_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90,
+          "default": 7
+        },
+        "dump_requests": {
+          "type": "boolean",
+          "default": false
+        },
+        "dump_to_file": {
+          "type": "boolean",
+          "default": false
+        },
+        "dump_dir": {
+          "type": "string",
+          "default": "dumps"
+        }
+      }
+    },
+    "model_defaults": {
+      "type": "object",
+      "description": "upstream 原生模型默认规则；新分支保留，不在此 schema 内重复定义。"
+    }
+  }
+}
