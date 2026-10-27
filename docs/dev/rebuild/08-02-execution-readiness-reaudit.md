@@ -1,4 +1,4 @@
-# 11 Execution Readiness Re-audit
+# 08-02 Execution Readiness Re-audit
 
 - 审计对象：`rebuild` 工作区（`c3b47e5` + 未提交文档修复），`upstream/master` `4623109`。
 - 方法：只读文档、CSV/ledger、git 元数据；运行 `06-index-validation.md` 的只读校验脚本与 scoped `git grep`。未修改代码/测试/配置，未提交、未联网、未访问真实账号/IP。
@@ -75,14 +75,14 @@
 5. **429 路径**：D4 要求 429 先同账号重试、耗尽 503（`05-restart-map.md:58`、`06-decision-log.md:52`）；P2-F 却把 `D05-026` 标 keep（`06-decision-log.md:163`），CSV 原文仍是“预算/候选耗尽→HTTP 429”（`06-feature-index.csv:217`），且无改写 note。`D05-038` 的 503（`:229`）与 `D05-026` 的 429 并存，验收会打架。
 6. **rebind 既要求又删除**：D4 说“rebind 必须显式关闭旧实例再重建”（`05-restart-map.md:58`、`06-decision-log.md:52`）；P3 总原则又写“丢弃 pinned、后台 rebind”（`06-decision-log.md:188`），但 P2-E `D05-039` 写“pinned/rebind/defer 删除”（`:156`），CSV 同样无“background”限定（`06-feature-index.csv:230`）；P3-H 又写“手动切换保留；pinned/rebind/auto drop”（`06-decision-log.md:202`）。manual rebind 与自动 rebind 没有拆开。
 7. **自动唤醒 vs idle 手动重启**：D4/P3 说消息到达唤醒所有合格“休眠/未启动”实例（`05-restart-map.md:58`、`06-decision-log.md:52`、`:184`、`:199`）；P6 说 idle browser 默认关闭、需要时手动重启（`06-decision-log.md:289`、`:300`），CSV `D08-022` 的 note 也是“idle default 0; manual restart required”（`06-feature-index.csv:370`）。若 idle 关闭浏览器，“唤醒未启动账号”就必须自动启动，和“手动重启”矛盾；若坚持手动重启，D4 的“候选包含未启动账号”无法实现。
-8. **P9-pre 输入不存在且与 P5 顺序循环**：`05-restart-map.md:70` 和 `06-decision-log.md:237` 要求把“目标 seam、状态机、config/event schema”作为 P9-pre 输入；但没有对应文档（08 的 M1-M4，`08-execution-readiness-audit.md:78-81`）。同时 `05-restart-map.md:61` 说“统计事件 schema 在 P5 生成记账时定稿”，而 P9-pre 在 P5 之前，形成“先要 schema、后定稿 schema”的循环。
+8. **P9-pre 输入不存在且与 P5 顺序循环**：`05-restart-map.md:70` 和 `06-decision-log.md:237` 要求把“目标 seam、状态机、config/event schema”作为 P9-pre 输入；但没有对应文档（08 的 M1-M4，`08-01-execution-readiness-audit.md:78-81`）。同时 `05-restart-map.md:61` 说“统计事件 schema 在 P5 生成记账时定稿”，而 P9-pre 在 P5 之前，形成“先要 schema、后定稿 schema”的循环。
 
 必须：修正上述 decision log 范围/行级冲突并重跑校验；新增一页最小 ADR/状态表（状态枚举、active_requests 合约、sleep/wake/rebind/429/503、capacity、控制面），明确 seam/config/event schema 的产生步骤（Gate0.5 或 P9-pre 前置），再允许进入编码。
 
 ### B4（阻断 P9-pre/P3）942 单测处置表仍未建立
 
 - `05-restart-map.md:81` 明确要求“P10 的测试处置表在 Gate 0/P9-pre 阶段先建立，不能整体后置”；但 Gate0 §6 没有该步骤，10 也没有提及。
-- 08 的 M6 要求逐文件 keep/rewrite/delete 并绑定 feature ID（`08-execution-readiness-audit.md:83`）；旧测试大量以 lease/多页/pinned 为契约（`08-execution-readiness-audit.md:62-64`），若先写新实现再处理，agent 很容易为保持 942 全绿而复活旧行为。
+- 08 的 M6 要求逐文件 keep/rewrite/delete 并绑定 feature ID（`08-01-execution-readiness-audit.md:83`）；旧测试大量以 lease/多页/pinned 为契约（`08-01-execution-readiness-audit.md:62-64`），若先写新实现再处理，agent 很容易为保持 942 全绿而复活旧行为。
 - 这不是“实现阶段可补”的普通缺口：它必须在 P3/P2 编码前存在，否则新测试会被旧契约反向绑架。
 
 ### B5（Gate0 冻结不完整）迁移目录仍含过期批次/待定内容
@@ -95,7 +95,7 @@
 ### B6（handoff 质量）10 的缺口
 
 - 基线未更新（`10-handoff-prompt.md:7`），且未说明“文档修复必须先提交/复制工作区”。
-- 仍写“G0-G11 逐项有证据”（`10-handoff-prompt.md:46`），但 G0-G11 只存在于历史审计 `08-execution-readiness-audit.md:129-140`；10 没给链接/定义，且 08 引用的旧 05 行号已过时。
+- 仍写“G0-G11 逐项有证据”（`10-handoff-prompt.md:46`），但 G0-G11 只存在于历史审计 `08-01-execution-readiness-audit.md:129-140`；10 没给链接/定义，且 08 引用的旧 05 行号已过时。
 - 没有提到 target seam/状态机/config/event schema、942 处置表、acceptance 模板、changelog/INDEX、evidence allowlist 的实际路径；这些恰是新 agent 从 Gate0 进入 P9-pre 所需。
 - `05-restart-map.md:167-171` 要求“修复后独立审计再开工”，但 10 没有给出本次复审的通过条件（例如 §5 的 G0.1-G0.8）。
 
@@ -103,7 +103,7 @@
 
 | 缺口 | 何时必须 | 依据 |
 |---|---|---|
-| 目标 seam/ADR（Account 权威、Context/Page 工厂、surface 解析、Executor、Event Sink） | P9-pre 前 | 08 M1 `08-execution-readiness-audit.md:78`；05:70 |
+| 目标 seam/ADR（Account 权威、Context/Page 工厂、surface 解析、Executor、Event Sink） | P9-pre 前 | 08 M1 `08-01-execution-readiness-audit.md:78`；05:70 |
 | 实例/并发状态机（UNSTARTED/SLEEPING/STARTING/READY/BUSY/RETIRING/CLOSED + active_requests） | P9-pre/P3 前 | 08 M2 `:79`；05:56-58 |
 | config schema/example（`count/surface/min_tier`、api_keys、formats、keepalive） | P9-pre 前 | 08 M3 `:80`；05:70 |
 | event schema/聚合口径（request/attempt/usage/error/latency/surface/paid、client vs attempt） | P5 前（不能等 P7） | 08 M4 `:81`；05:61；06:309 |

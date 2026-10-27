@@ -2,7 +2,7 @@
 
 范围：`docs/dev/rebuild/06-feature-ledger.md` 的逐包决策记录。只记录决定，不复制台账行；未确认项标 `pending`。
 
-修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序。`08-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md` 保留历史审计原文，不回改；修复后需重新独立审计。
+修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序。`08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md` 保留历史审计原文，不回改；修复后需重新独立审计。
 
 ## 重构大方向（2026-10-24）
 
@@ -42,7 +42,7 @@
 
 ## 执行前置 / 顺序 / 状态机（D1-D8，2026-10-27）
 
-`08-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
+`08-01-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
 
 | 决策 | 执行规则 |
 |---|---|

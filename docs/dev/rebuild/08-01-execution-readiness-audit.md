@@ -1,4 +1,4 @@
-# 08 Execution Readiness Audit
+# 08-01 Execution Readiness Audit
 
 - 审计基准：`rebuild` @ `be6eda6`，工作树干净；对照 `upstream/master` @ `4623109`（`rebuild` 相对 upstream 为 108 ahead / 0 behind）。
 - 方法：只读文档、代码、测试和 git 元数据；未 fetch、未访问账号/IP/网络、未修改代码。离线执行 `pytest -q`：**942 passed / 33.58s**。

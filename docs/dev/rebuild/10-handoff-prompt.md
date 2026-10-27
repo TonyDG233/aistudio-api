@@ -5,7 +5,7 @@
 ```text
 项目路径：D:\LLM\self_programming\aistudio-api
 基线：rebuild @ 当前 HEAD（不要写死旧 SHA）；upstream/master @ 4623109（离线用现有 ref，fetch 可选/后置）
-交接前：先提交本轮文档修复，记录 `git rev-parse HEAD` 并把 SHA 填到本行；若未提交，必须显式从 rebuild 工作区复制 docs/dev/rebuild，并注明来源不是 commit。
+交接前：先提交本轮文档修复，把 `git rev-parse HEAD` 记录到 `08-03-final-readiness-audit.md` 与 `docs/changelog.md`；10 保持“当前 HEAD + git rev-parse 现查”，不要把 SHA 写回本行（避免自引用）。若未提交，必须显式从 rebuild 工作区复制 docs/dev/rebuild，并注明来源不是 commit。
 目标：从 upstream/master 新建 rebuild/upstream worktree，按 D1-D8 重建；不合并 master/rebuild。
 
 必读（按顺序）：
@@ -15,10 +15,13 @@
 4. docs/dev/rebuild/06-feature-ledger.md 与 06-feature-index.csv（唯一事实源；索引不覆盖决策）
 5. docs/dev/rebuild/12-gate0-inputs.md（seam/状态表/config/event/acceptance 模板）
 6. docs/dev/rebuild/06-test-disposition.csv（942 单测逐文件处置）
-7. docs/dev/rebuild/08-execution-readiness-audit.md、09-pg-toolcall-analysis.md、11-execution-readiness-reaudit.md（只读历史审计，不回改）
-8. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
+7. docs/dev/rebuild/08-01-execution-readiness-audit.md、09-pg-toolcall-analysis.md、08-02-execution-readiness-reaudit.md（只读历史审计，不回改）
+8. docs/dev/rebuild/08-03-final-readiness-audit.md（最终复审；只有结论为可 handoff 才使用本提示词）
+9. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
 
-Gate 0（先做，不改业务代码；完整条件见 11 §6）：
+本提示词仅在 `08-03-final-readiness-audit.md` 结论为“可 handoff”后使用；修复后须再由独立审计复核（05 §6.7）。
+
+Gate 0（先做，不改业务代码；完整条件见 08-02 §6）：
 G0.1 基线：`git status --porcelain` 为空；`git rev-parse HEAD` 记录新 SHA；05/10 基线一致。
 G0.2 索引：跑 06-index-validation.md；518 行、ledger_line 全对、桥接 31/43/97/44/70/25/67/42/62/37、无 pending、errors=0。
 G0.3 决策冲突：EXPECTED_DECISIONS 覆盖 D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D05-039 drop、D07-026 keep、D08-022 keep；P9-Q3 不得 drop 日志功能。

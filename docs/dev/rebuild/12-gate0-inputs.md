@@ -47,14 +47,14 @@ class EventSink(Protocol):
 | `SLEEPING` | 实例已释放页面，可被消息唤醒 | idle（默认不自动关）、消息唤醒 | `STARTING` |
 | `STARTING` | 正在建 context/page/surface | 消息唤醒、手动重启 | `READY` / `CLOSED` |
 | `READY` | 可接请求，`active_requests==0` | 初始化完成 | `BUSY` / `RETIRING` |
-| `BUSY` | 有在途请求，`active_requests>0` | acquire | `READY`（全部释放）/ `RETIRING`（拒绝新请求） |
+| `BUSY` | 有在途请求，`active_requests>0` | acquire | `READY`（全部释放）；`active_requests=0` 后才允许 `RETIRING` |
 | `RETIRING` | 正在关闭，不再接新请求 | 关闭/手动 rebind | `CLOSED` |
 | `CLOSED` | 已释放；需重建才能再用 | 显式重建 | `STARTING`（仅手动） |
 
 事件与转换：
 
 - 消息到达：`SLEEPING` / `UNSTARTED` 合格实例 → `STARTING` → `READY` → `BUSY`。
-- 请求结束：`BUSY` → `READY`（`active_requests` 归零）；关闭/改绑被拒直到归零。
+- 请求结束：`BUSY` → `READY`（`active_requests` 归零）；关闭/改绑在 `BUSY` 时拒绝并提示等待，`active_requests==0` 后才允许 `RETIRING`。
 - idle browser 自动回收默认关闭；开启时也只把无 `active_requests` 的实例转 `SLEEPING`，不自动关账号。
 - 失败/stale 才手动重启；禁止自动 stale 复活。
 - 手动 rebind：`READY`（`active_requests==0`）→ `RETIRING` → `CLOSED` → `STARTING`；后台自动 rebind 不存在。
@@ -129,6 +129,17 @@ logging:
 - P3/P2：无 lease 断言；`active_requests` finally 释放；候选含 SLEEPING/UNSTARTED；429 同号重试→切换→503；保存后切换重试。
 - P5/PG：F-01 functionCall 缺 thoughtSignature 兜底；F-02 首事件前真实 HTTP 4xx/5xx；F-03 finish-only/工具流终止兜底；F-04 functionResponse/functionCall 强制 Struct；`[toolshape]` 脱敏。F-05/06/07 后置。
 - P6/P7：24h fake clock；build-only 回写；日志 SSE/1/3/7 天；client/attempt 分母；token 汇总不含 countTokens。
+
+### 5.1 目标路径（待创建，不阻塞文档，但阻塞 Gate0.5 勾选）
+
+- `config/config.example.yaml`：本页 §3 的示例。
+- `config/config.schema.json`：§3 的机器校验 schema。
+- `tests/fixtures/events/event.sample.json`：§4 的事件样例。
+- `tests/fixtures/pg/f01_missing_signature.json`
+- `tests/fixtures/pg/f02_prestream_400.json`
+- `tests/fixtures/pg/f03_finish_only.bin`
+- `tests/fixtures/pg/f04_string_response.json`
+- `docs/dev/rebuild/acceptance/README.md`：每片验收工件目录规范。
 
 ## 6. Gate 0.5 退出清单
 

@@ -1,6 +1,6 @@
 # PG 渠道工具调用链路调查（只读）
 
-- 分支/基线：`rebuild` @ `be6eda6`（工作区另有未跟踪的 `08-execution-readiness-audit.md`，本文件不改动它）
+- 分支/基线：`rebuild` @ `be6eda6`（工作区另有未跟踪的 `08-01-execution-readiness-audit.md`，本文件不改动它）
 - 调查方式：只读源码 + 既有单测/fixture/证据文档 + 离线构造 wire 数据；未访问真实账号、未走网络、未重跑真实请求、未提交
 - 目标：判断“pg 渠道 + 酒馆预设（把发送文本塞进工具调用输出框）”从请求到返回的哪里断了，并列出可验证的根因假设
 - 术语：本文的“预设工具”指酒馆 anti-truncation 扩展声明的 `emit_complete_response_<nonce>`（见 `tests/unit/test_gemini_request_normalization.py:448-502`），不是 ATG 的 `atg_emit_*`

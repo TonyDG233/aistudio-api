@@ -112,10 +112,35 @@ git remote -v
 ```powershell
 git grep -n -I -E "(AIza[0-9A-Za-z_-]{20,}|SAPISIDHASH|authorization:|x-goog-api-key|cookie:|Bearer [A-Za-z0-9._-]{20,})" -- docs/dev/rebuild
 # evidence 按 allowlist 逐路径扫描；不要用 -- docs 整树
-git grep -n -I -E "(AIza[0-9A-Za-z_-]{20,}|SAPISIDHASH|authorization:|x-goog-api-key|cookie:|Bearer [A-Za-z0-9._-]{20,})" -- docs/dev/evidence/p2-verify docs/dev/evidence/p5-final-20261021
+$scan = @(
+  "docs/dev/evidence/INDEX.md"
+  "docs/dev/evidence/p1-ark-merge-archive/README.md"
+  "docs/dev/evidence/p2-verify"
+  "docs/dev/evidence/p3-build3/acceptance-run1.log"
+  "docs/dev/evidence/p3-build3/acceptance-run1.sse"
+  "docs/dev/evidence/p3-build3/acceptance-run2.log"
+  "docs/dev/evidence/p3-build3/acceptance-run2.sse"
+  "docs/dev/evidence/p3-build3/service.err.log"
+  "docs/dev/evidence/p5-final-20261021"
+  "docs/dev/evidence/ui-p1-20261020"
+  "docs/dev/evidence/wp5-20261018"
+  "docs/dev/evidence/wp5b-20261019"
+  "docs/dev/evidence/wp5v3-20261019"
+  "docs/dev/evidence/wp6-20261020"
+  "docs/dev/evidence/wp7-20261020"
+  "docs/dev/evidence/wp7-v2-20261020"
+  "docs/dev/evidence/wp8-20261019"
+  "docs/dev/evidence/wp10-20261019/README.md"
+  "docs/dev/evidence/wp11-count-20261020/README.md"
+  "docs/dev/evidence/wp11-responses-20261020/README.md"
+  "docs/changelog.md"
+)
+foreach ($item in $scan) {
+  git grep -n -I -E "(AIza[0-9A-Za-z_-]{20,}|SAPISIDHASH|authorization:|x-goog-api-key|cookie:|Bearer [A-Za-z0-9._-]{20,})" -- $item
+}
 ```
 
-- 通过条件：迁移集合只命中占位符/说明文字（如扫描命令本身、D06-031 的 `SAPISIDHASH` 字样、`08-execution-readiness-audit.md` 对敏感形状的描述）；不得出现真实 key/cookie/header 值。
+- 通过条件：迁移集合只命中占位符/说明文字（如扫描命令本身、D06-031 的 `SAPISIDHASH` 字样、`08-01-execution-readiness-audit.md` 对敏感形状的描述）；不得出现真实 key/cookie/header 值。
 - `docs/BOTGUARD_VERIFICATION_CHAIN.md` 是 upstream 原生文件，按 grandfather 处理：**不复制、不改写、不计入 secret scan 失败**。
 - `docs/dev/evidence/p3-build3/spikeQ4-evidence.json` 与 `spikeQ4.py` 含敏感形状，**不得进入新仓库**；只在 `rebuild` 中通过 `git show` 查阅。
 - evidence 必须按 `docs/dev/evidence/INDEX.md` 的 allowlist 迁移；未列出的路径默认不迁移。
@@ -167,9 +192,32 @@ git -C $new restore --source=rebuild -- docs/dev/rebuild
 Remove-Item "$new\docs\dev\rebuild\ledger-batches\*.md" -Exclude README.md -Force -ErrorAction SilentlyContinue
 
 # evidence 仅在 INDEX.md allowlist 内逐路径复制/restore；本仓当前不复制 spikeQ4*
-git -C $new restore --source=rebuild -- docs/dev/evidence/INDEX.md
-git -C $new restore --source=rebuild -- docs/dev/evidence/p1-ark-merge-archive/README.md
-git -C $new restore --source=rebuild -- docs/changelog.md
+$evidence = @(
+  "docs/dev/evidence/INDEX.md"
+  "docs/dev/evidence/p1-ark-merge-archive/README.md"
+  "docs/dev/evidence/p2-verify"
+  "docs/dev/evidence/p3-build3/acceptance-run1.log"
+  "docs/dev/evidence/p3-build3/acceptance-run1.sse"
+  "docs/dev/evidence/p3-build3/acceptance-run2.log"
+  "docs/dev/evidence/p3-build3/acceptance-run2.sse"
+  "docs/dev/evidence/p3-build3/service.err.log"
+  "docs/dev/evidence/p5-final-20261021"
+  "docs/dev/evidence/ui-p1-20261020"
+  "docs/dev/evidence/wp5-20261018"
+  "docs/dev/evidence/wp5b-20261019"
+  "docs/dev/evidence/wp5v3-20261019"
+  "docs/dev/evidence/wp6-20261020"
+  "docs/dev/evidence/wp7-20261020"
+  "docs/dev/evidence/wp7-v2-20261020"
+  "docs/dev/evidence/wp8-20261019"
+  "docs/dev/evidence/wp10-20261019/README.md"
+  "docs/dev/evidence/wp11-count-20261020/README.md"
+  "docs/dev/evidence/wp11-responses-20261020/README.md"
+  "docs/changelog.md"
+)
+foreach ($item in $evidence) {
+  git -C $new restore --source=rebuild -- $item
+}
 ```
 
 约束：
@@ -212,7 +260,7 @@ Gate 0.5 未通过，不得进入 P9-pre 编码。
 ### 6.7 重新独立审计
 
 - 修复文档后，由独立审计重新检查 05/06/07/08/09/11/12 与 CSV 的一致性、Gate 0/0.5 可行性、P9-pre/状态机/顺序是否可执行。
-- `08-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md`、`11-execution-readiness-reaudit.md` 保留为历史审计，不回改原文；新审计结论写入新文档。
+- `08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md`、`08-02-execution-readiness-reaudit.md` 保留为历史审计，不回改原文；新审计结论写入新文档。
 - 通过后，把 `10-handoff-prompt.md` 交给全新 agent；未通过不得进入 P9-pre 编码。
 
 ## 7. 索引校验

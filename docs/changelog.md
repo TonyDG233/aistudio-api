@@ -16,5 +16,5 @@
 
 - 范围：`docs/dev/rebuild/05`、`06*`、`10`、`12`
 - 变更：按第二轮复审修复 Gate 0/0.5 阻塞；明确 429/rebind/sleep-wake/idle 口径；新增测试处置表与 P9-pre 输入。
-- 原因：`11-execution-readiness-reaudit.md` B1-B6、G0.1-G0.8。
+- 原因：`08-02-execution-readiness-reaudit.md` B1-B6、G0.1-G0.8。
 - 验证：`06-index-validation.md` 脚本输出 `errors=0`。
