@@ -4,6 +4,7 @@
 
 - 审计对象：`rebuild` @ `0f9357b0e18b3c727dbe4258706e8d05e7265c3d`（审计开始时 `git status --porcelain` 为空），`upstream/master` @ `4623109b97d14db30e304005fe1d52c29a46a7c2`。
 - 审计基线 SHA：`0f9357b`。本文件只记录审计基线；提交本文件后的交接 SHA 由新 agent 按 `10:25` 用 `git rev-parse HEAD` 现查，不写回 `10`。
+- 交接基线 SHA：`7cd92f7dcb2b8675050aa342a38b9853a27e33c4`（rebuild，本轮文档修复提交；`git rev-parse HEAD` 于该提交后现查）。其后仅追加本记录与 changelog，内容基线仍为该 SHA。
 - 输入：`05-restart-map.md`、`10-handoff-prompt.md`、`08-05-final-readiness-audit.md`、`06-index-validation.md`、`06-feature-index.csv`、`06-feature-ledger.md`、`06-decision-log.md`、`06-test-disposition.csv`、`12-gate0-inputs.md`、`docs/dev/evidence/INDEX.md`、`.gitignore`、`docs/changelog.md`。
 - 方法：只读 git 元数据/文档/CSV/ledger；原样运行 `06-index-validation.md:20-127` 的脚本；复核 08-05 的 R1/R3/R4/C1/C2/C3；实测 11 个 ignored `.log` 的 ignore/tracked 状态与内容扫描；统计测试处置覆盖；核对 D12/状态机/证据 allowlist。未修改代码/测试/配置，未提交/推送/合并，未联网，未访问真实账号/IP/Google。
 - 本文件新增时为 untracked；必须提交后才能满足 G0.1/G0.9（`08-05:138,146`、`05:96`、`10:8`）。
