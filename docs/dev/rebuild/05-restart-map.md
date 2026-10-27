@@ -93,7 +93,7 @@ git remote -v
 
 ### 6.0 基线提交（先于迁移）
 
-- 先提交本轮文档修复；`git status --porcelain` 为空；执行 `git rev-parse HEAD` 并把 SHA 写入 `10-handoff-prompt.md`。
+- 先提交本轮文档修复；`git status --porcelain` 为空；执行 `git rev-parse HEAD`，把 SHA 记录到最新最终复审/changelog；`10-handoff-prompt.md` 保持“当前 HEAD + 现查”，不写回 SHA（避免自引用）。
 - `git restore --source=rebuild` **只在文档修复已 commit 后使用**。若未 commit，禁止用 `--source=rebuild`（它读取的是旧 commit 树）；必须显式从工作区复制并记录来源，例如 `Copy-Item docs/dev/rebuild/* $new/docs/dev/rebuild -Recurse -Force`，evidence/changelog 也按 allowlist 从工作区复制，并在交接说明中写明“来源为 rebuild 工作区而非 commit”。
 - 基线只认 `rebuild @ 当前 HEAD`；不得在 05/10 写死旧 SHA。
 
@@ -137,6 +137,17 @@ $scan = @(
 )
 foreach ($item in $scan) {
   git grep -n -I -E "(AIza[0-9A-Za-z_-]{20,}|SAPISIDHASH|authorization:|x-goog-api-key|cookie:|Bearer [A-Za-z0-9._-]{20,})" -- $item
+}
+# *.log 被 .gitignore 忽略，git grep 会假阴性；用 Select-String 直接扫工作区
+$ignoredLogs = @(
+  "docs/dev/evidence/p3-build3/acceptance-run1.log"
+  "docs/dev/evidence/p3-build3/acceptance-run2.log"
+  "docs/dev/evidence/p3-build3/service.err.log"
+)
+foreach ($item in $ignoredLogs) {
+  if (Test-Path -LiteralPath $item) {
+    Select-String -LiteralPath $item -Pattern "AIza[0-9A-Za-z_-]{20,}|SAPISIDHASH|authorization:|x-goog-api-key|cookie:|Bearer [A-Za-z0-9._-]{20,}"
+  }
 }
 ```
 
@@ -217,6 +228,19 @@ $evidence = @(
 )
 foreach ($item in $evidence) {
   git -C $new restore --source=rebuild -- $item
+}
+
+# .log 被 .gitignore 忽略，git restore 不会带过去；显式从工作区复制并 force-add
+$evidenceLogs = @(
+  "docs/dev/evidence/p3-build3/acceptance-run1.log"
+  "docs/dev/evidence/p3-build3/acceptance-run2.log"
+  "docs/dev/evidence/p3-build3/service.err.log"
+)
+foreach ($item in $evidenceLogs) {
+  $dest = Join-Path $new $item
+  New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+  Copy-Item -LiteralPath $item -Destination $dest -Force
+  git -C $new add -f -- $item
 }
 ```
 
