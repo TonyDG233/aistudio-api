@@ -116,11 +116,8 @@ $scan = @(
   "docs/dev/evidence/INDEX.md"
   "docs/dev/evidence/p1-ark-merge-archive/README.md"
   "docs/dev/evidence/p2-verify"
-  "docs/dev/evidence/p3-build3/acceptance-run1.log"
   "docs/dev/evidence/p3-build3/acceptance-run1.sse"
-  "docs/dev/evidence/p3-build3/acceptance-run2.log"
   "docs/dev/evidence/p3-build3/acceptance-run2.sse"
-  "docs/dev/evidence/p3-build3/service.err.log"
   "docs/dev/evidence/p5-final-20261021"
   "docs/dev/evidence/ui-p1-20261020"
   "docs/dev/evidence/wp5-20261018"
@@ -140,9 +137,17 @@ foreach ($item in $scan) {
 }
 # *.log 被 .gitignore 忽略，git grep 会假阴性；用 Select-String 直接扫工作区
 $ignoredLogs = @(
+  "docs/dev/evidence/p2-verify/service-off.log"
+  "docs/dev/evidence/p2-verify/service-prefer.log"
+  "docs/dev/evidence/p2-verify/service-required.log"
   "docs/dev/evidence/p3-build3/acceptance-run1.log"
   "docs/dev/evidence/p3-build3/acceptance-run2.log"
   "docs/dev/evidence/p3-build3/service.err.log"
+  "docs/dev/evidence/wp5-20261018/service-f-build.log"
+  "docs/dev/evidence/wp5-20261018/service-f-quota.log"
+  "docs/dev/evidence/wp5-20261018/service-p-chat.log"
+  "docs/dev/evidence/wp5-20261018/service-p-guard.log"
+  "docs/dev/evidence/wp5-20261018/service-p-guard2.log"
 )
 foreach ($item in $ignoredLogs) {
   if (Test-Path -LiteralPath $item) {
@@ -207,11 +212,8 @@ $evidence = @(
   "docs/dev/evidence/INDEX.md"
   "docs/dev/evidence/p1-ark-merge-archive/README.md"
   "docs/dev/evidence/p2-verify"
-  "docs/dev/evidence/p3-build3/acceptance-run1.log"
   "docs/dev/evidence/p3-build3/acceptance-run1.sse"
-  "docs/dev/evidence/p3-build3/acceptance-run2.log"
   "docs/dev/evidence/p3-build3/acceptance-run2.sse"
-  "docs/dev/evidence/p3-build3/service.err.log"
   "docs/dev/evidence/p5-final-20261021"
   "docs/dev/evidence/ui-p1-20261020"
   "docs/dev/evidence/wp5-20261018"
@@ -232,15 +234,31 @@ foreach ($item in $evidence) {
 
 # .log 被 .gitignore 忽略，git restore 不会带过去；显式从工作区复制并 force-add
 $evidenceLogs = @(
+  "docs/dev/evidence/p2-verify/service-off.log"
+  "docs/dev/evidence/p2-verify/service-prefer.log"
+  "docs/dev/evidence/p2-verify/service-required.log"
   "docs/dev/evidence/p3-build3/acceptance-run1.log"
   "docs/dev/evidence/p3-build3/acceptance-run2.log"
   "docs/dev/evidence/p3-build3/service.err.log"
+  "docs/dev/evidence/wp5-20261018/service-f-build.log"
+  "docs/dev/evidence/wp5-20261018/service-f-quota.log"
+  "docs/dev/evidence/wp5-20261018/service-p-chat.log"
+  "docs/dev/evidence/wp5-20261018/service-p-guard.log"
+  "docs/dev/evidence/wp5-20261018/service-p-guard2.log"
 )
 foreach ($item in $evidenceLogs) {
   $dest = Join-Path $new $item
   New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
   Copy-Item -LiteralPath $item -Destination $dest -Force
   git -C $new add -f -- $item
+}
+
+# 迁移后存在性检查（含最终复审报告）
+$mustExist = @($evidence + $evidenceLogs + @("docs/dev/rebuild/08-06-final-readiness-audit.md"))
+foreach ($item in $mustExist) {
+  if (-not (Test-Path -LiteralPath (Join-Path $new $item))) {
+    throw "Gate0 migration missing: $item"
+  }
 }
 ```
 
