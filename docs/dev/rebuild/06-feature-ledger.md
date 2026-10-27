@@ -4,7 +4,7 @@
 基线：`upstream/master`；开发范围：`upstream/master..master`（含 `p1-ark-merge` 95 个独有提交 + master 后 8 个修复提交）。
 证据优先级：代码/日志/SSE/fixture > `docs/dev/rebuild/01-05`；02/05 只作调查线索，不作事实来源。
 约束：不修代码、不合并 master、不访问真实账号/IP；每行必须有 provenance 和证据，缺失必须显式标注。全局规则：上游原生实现无必要修改则不动；UI 布局、文案、交互和细节不得无故重写或删除。
-索引：`06-feature-index.csv`（`Dxx-NNN` 唯一 feature ID）；决策记录：`06-decision-log.md`。
+索引：`06-feature-index.csv`（`Dxx-NNN` 唯一 feature ID）；决策记录：`06-decision-log.md`；行映射校验：`06-index-validation.md`。
 
 ## 1. 已验证生命周期（只作 domain 框架，不是功能清单）
 
@@ -165,7 +165,7 @@
 | D03 | realm 服务缓存：capture/streaming/replay 按 realm_id 复用，slot retire 时 pop 清缓存 | 1201a37,6305377; client.py:75-100,128-156 | 新增 | partial | test_instance_pool.py:562-574 仅证回调触发；缓存确实删除未验证 | keep | port |
 | D03 | build 面 realm WS 分桶：`?realm=` 解析，default/各 realm 连接列表隔离 | 1cc634e; build_surface.py:136-205 | 新增 | working | test_cdp_browser_context.py:47-71 | keep | port |
 | D03 | 单实例单页：全局页预算=max(1,max_contexts)，chat/build 页预算由 max_instances 派生；第二页拒绝 | 7cd6d74,9786b3a; instance_pool.py:202-255,314-363 | 改造 | working | test_instance_pool.py:938-1031 | keep | port |
-| D03 | 浏览器回收后 stale/pinned slot 复活：同账号复用原 slot 重载 context/page | 86391c8; instance_pool.py:919-961; test_instance_pool.py:1034-1058 | 新增 | working | test_instance_pool.py:1034-1058 | keep | port |
+| D03 | 浏览器回收后 stale/pinned slot 复活：同账号复用原 slot 重载 context/page | 86391c8; instance_pool.py:919-961; test_instance_pool.py:1034-1058 | 新增 | working | test_instance_pool.py:1034-1058 | keep | drop |
 | D03 | 浏览器空闲回收：`browser_idle_timeout<=0` 关闭；LOADING/PREPARING 不回收；冷启动刷新时间戳 | 4aa35cb,4623109,86391c8; session.py:197-215,564-583 | 原生 | working | test_session_lifecycle.py:127-189；默认 0（86391c8 config），未验证运行时 | keep | port |
 
 ### D04 Instance / Pool / Lease / Capacity
@@ -202,7 +202,7 @@
 | D04 | channel_enabled：build 回退 features.build_surface | 7cd6d74; instance_pool.py:303-312 | 改造 | working | test_features_routing_config.py:24-53 | keep | drop |
 | D04 | pending_pages/pending_channel 占位计数，避免 build 并发双计页 | a59c885; instance_pool.py:232-255 | 改造 | working | test_instance_pool.py:229-261,529-538 | keep | drop |
 | D04 | borrow：容量失败后借用其他账号 idle slot 的现成页 | 1201a37; instance_pool.py:1096-1131 | 新增 | working | test_instance_pool.py:541-559；test_routing_pipeline.py:429-446 | keep | drop |
-| D04 | stale slot 复活：浏览器回收后同账号复用原 slot 重载 | 86391c8; instance_pool.py:919-961 | 新增 | working | test_instance_pool.py:1034-1058 | keep | port |
+| D04 | stale slot 复活：浏览器回收后同账号复用原 slot 重载 | 86391c8; instance_pool.py:919-961 | 新增 | working | test_instance_pool.py:1034-1058 | keep | drop |
 | D04 | pinned slot 不参与 rebind、borrow、idle retire | 79901b0; instance_pool.py:76,854-868,1188 | 新增 | working | test_instance_pool.py:746-759 | keep | drop |
 | D04 | SlotState 状态机含 COOLDOWN，但无任何赋值点 | 1201a37; instance_pool.py:36-42 | 新增 | legacy | 引用见 instance_pool.py:239,791,867,1189；无 COOLDOWN 赋值，未验证 | drop（或补状态转换） | drop |
 | D04 | _load_slot 冷启动重建 Context，最多 3 次尝试 | b59d6f3; instance_pool.py:963-1017 | 新增 | unverified | 无单测覆盖 3 次重试；未验证 | keep | keep |
@@ -228,7 +228,7 @@
 | D04 | build 请求身份取 lease.auth_file/auth_user，不回退全局 session | 8e5e0cb; client.py:158-178,588,698 | 改造 | working | test_build_lease_identity.py:10-39 | keep | port |
 | D04 | acquire 首试 30s、切号后 15s，超时映射容量错误 | 8e5e0cb; routing_pipeline.py:430-442 | 改造 | working | test_routing_pipeline.py:429-446 | keep | drop |
 | D04 | 容量错误码：chat=surface_quota_exceeded，build=surface_instance_busy，统一 503 | 8e5e0cb; routing_pipeline.py:443-487 | 改造 | working | test_generation_routing.py:196-235 | keep | port |
-| D04 | 单实例 failover 限制：无空闲 slot 时不跨账号抢占，只能等待/defer/rebind | 1201a37,8e5e0cb; instance_pool.py:333-335,490-502; routing_pipeline.py:443-487 | 新增 | partial | test_instance_pool.py:938-1009；test_generation_routing.py:157-235；跨号切换需先释放 | port（一 context 一页时需重设计） | port |
+| D04 | 单实例 failover 限制：无空闲 slot 时不跨账号抢占，只能等待/defer/rebind | 1201a37,8e5e0cb; instance_pool.py:333-335,490-502; routing_pipeline.py:443-487 | 新增 | partial | test_instance_pool.py:938-1009；test_generation_routing.py:157-235；跨号切换需先释放 | port（一 context 一页时需重设计） | drop |
 | D04 | 容量满时 defer 等待后重试同候选 | 86391c8; generation_service.py:201-250; routing_safety.py:25-71 | 新增 | working | test_generation_routing.py:157-235 | keep | drop |
 | D04 | InstanceSwitcher 只规划 idle slot，最受限 slot 优先，跳过 in_flight | dd5e359; instance_switch.py:71-137 | 新增 | working | test_instance_switch.py:52-96 | keep | drop |
 | D04 | InstanceSwitcher 以 pool.rebind 应用迁移并带组页预算 | dd5e359; instance_switch.py:173-216 | 新增 | working | test_instance_switch.py:99-171 | keep | drop |
@@ -254,9 +254,9 @@
 | D05 | 账号级 routing 覆盖：surfaces / model_surfaces 钉面 / weight(0.1-100) | 8b6b52e; account_routing.py:88-143; routing_eligibility.py:193-195 | 新增 | working | test_account_routing.py；test_routing_eligibility.py:182-190 | keep | drop |
 | D05 | 资格图顺序：expired→paid/chat→组启用与面→账号收窄→tag→pools | 8b6b52e,1980ada; routing_eligibility.py:164-207 | 新增 | working | test_routing_eligibility.py:84-190 | keep | port |
 | D05 | 原生渠道亲和度（paid=chat 优先，free=build 优先，其他=2） | 8b6b52e; routing_eligibility.py:124-132,205 | 新增 | working | test_routing_pipeline.py:165-198（间接） | keep | drop |
-| D05 | 资格排序 `rank_eligible`：affinity→组权重→账号权重→account_id | 7cd6d74; routing_selection.py:17-27 | 新增 | working | 无 test_routing_selection.py；仅经 pipeline 排序间接覆盖，未验证 | keep | port |
-| D05 | 候选二次排序：available→affinity→weight→公平分→slot→ready→id | cd569bc,ec35c8d; routing_pipeline.py:303-355 | 新增 | working | test_routing_pipeline.py:272-391 | keep | port |
-| D05 | 公平分：last_used 为主、requests/weight 为辅，避免老账号被永久饿死 | ec35c8d; routing_pipeline.py:398-412 | 新增 | working | test_routing_pipeline.py:272-347 | keep | port |
+| D05 | 资格排序 `rank_eligible`：affinity→组权重→账号权重→account_id | 7cd6d74; routing_selection.py:17-27 | 新增 | working | 无 test_routing_selection.py；仅经 pipeline 排序间接覆盖，未验证 | keep | drop |
+| D05 | 候选二次排序：available→affinity→weight→公平分→slot→ready→id | cd569bc,ec35c8d; routing_pipeline.py:303-355 | 新增 | working | test_routing_pipeline.py:272-391 | keep | drop |
+| D05 | 公平分：last_used 为主、requests/weight 为辅，避免老账号被永久饿死 | ec35c8d; routing_pipeline.py:398-412 | 新增 | working | test_routing_pipeline.py:272-347 | keep | drop |
 | D05 | warm slot / ready 账号仅作同分 tie-breaker，不绑架后续请求 | cd569bc; routing_pipeline.py:305-311,349-353 | 新增 | working | test_routing_pipeline.py:302-390 | keep | port |
 | D05 | rotator 可用性过滤（异常时 fail-open） | ec35c8d; routing_pipeline.py:304-324 | 新增 | partial | rotator 异常→available=True，无测试；未验证 | port（fail-open 需复核） | drop |
 | D05 | acquire：派发前装载候选账号，首次 30s / 后续 15s 预算，返回 lease | cd569bc; routing_pipeline.py:419-442,488-497 | 新增 | working | test_routing_pipeline.py:393-409；`pytest` 96 passed | keep | port |
@@ -264,7 +264,7 @@
 | D05 | 容量拒绝映射：build→`surface_instance_busy`，chat→`surface_quota_exceeded`；无 borrow 直接拒绝 | 8e5e0cb; routing_pipeline.py:443-456; surface_orchestrator.py:61-69 | 改造 | working | test_routing_pipeline.py:412-426；test_generation_routing.py:196-235；真机未复跑 | keep | port |
 | D05 | `features.routing.max_switches` 单请求切号预算（默认 2，非法值回落 2） | ec35c8d; routing_pipeline.py:357-362,371; routing_safety.py:24-37 | 新增 | working | test_routing_safety.py:39-49,103-125；test_generation_routing.py:275-289 | keep | port |
 | D05 | defer 预算：`max_defers` 固定 2、不可配置；容量/build busy 时 sleep 1s 重试 | b59d6f3,86391c8; routing_safety.py:27,39-56; generation_service.py:193-251 | 新增 | partial | test_generation_routing.py:157-235；sleep 与上限硬编码 | port（改为可配） | drop |
-| D05 | 429 限额：未出数据→切号；预算/候选耗尽→HTTP 429 显式失败 | ec35c8d,6a6afbe; upstream_errors.py:247-288 | 改造 | working | test_generation_routing.py:257-273；test_genai_sdk_compat.py:253 | keep | keep |
+| D05 | 429 限额：未出数据→同账号重试→唤醒/切现有实例→保存后重试；耗尽 503 | ec35c8d,6a6afbe; upstream_errors.py:247-288 | 改造 | working | test_generation_routing.py:257-273；test_genai_sdk_compat.py:253 | keep | port |
 | D05 | 401 会话失效：清模板、记录 auth_error、未出数据→切号，否则 401 | ec35c8d; upstream_errors.py:186-219 | 改造 | working | test_api_responses.py:79-83；切号分支未单测，未验证 | keep | keep |
 | D05 | 403 AuthError：清模板、记录 auth_error、未出数据→切号，否则 403 | ec35c8d; upstream_errors.py:221-245 | 改造 | working | test_api_responses.py:84-88；切号分支未单测，未验证 | keep | keep |
 | D05 | 204 空响应：首次且未出数据→清模板并重试一次（语义应为同账号 retry） | 6a6afbe; upstream_errors.py:290-299 | 改造 | broken | test_api_responses.py:246-248 仅覆盖流式首块；真实 retry_same 未置真（见下） | port（先修 retry_same） | port |
@@ -274,10 +274,10 @@
 | D05 | 同账号 retry（`retry_same`）：`record_retry` 只计数，从不置 True → 所有 retry 变成换号 | ec35c8d; routing_pipeline.py:514-522 vs generation_service.py:305,315,445,580,597,716 | 新增 | broken | test_generation_routing.py:64-67 的 FakePipe 自行置 True，掩盖缺陷 | port（必须修） | port |
 | D05 | 流式已出数据不可切号：`has_yielded_data` 时 429/403/204/404/hang 一律不再切号 | 6a6afbe,ec35c8d; upstream_errors.py:195,230,261,290-295,326,330; generation_service.py:578,684-685 | 改造 | working | test_api_responses.py:171-180；test_surface_policy_routing.py:186 | keep | keep |
 | D05 | 熔断：滚动窗口 5 次失败/600s、冷却 300s、半开保留失败 | ec35c8d; routing_safety.py:76-164; routing_pipeline.py:524-530,548-555 | 新增 | broken | test_routing_safety.py:127-270 仅测原语；`record_switch_failure` 全仓无调用点，熔断永不触发 | port（接线或删除） | drop |
-| D05 | 成功闭环：清熔断失败、`retry_same=False`、释放 lease、记录 rotator success | ec35c8d,cd569bc; routing_pipeline.py:557-565; generation_service.py:390-400,773-785 | 新增 | working | test_generation_routing.py:129-155 | keep | keep |
-| D05 | lease 释放：异常/取消/流关闭 finally 均释放，不泄漏在途实例 | cd569bc,b59d6f3; generation_service.py:424-457,694-726,810-852 | 新增 | working | test_generation_routing.py:292-355 | keep | keep |
+| D05 | 成功闭环：清熔断失败、`retry_same=False`、释放 lease、记录 rotator success | ec35c8d,cd569bc; routing_pipeline.py:557-565; generation_service.py:390-400,773-785 | 新增 | working | test_generation_routing.py:129-155 | keep | port |
+| D05 | lease 释放：异常/取消/流关闭 finally 均释放，不泄漏在途实例 | cd569bc,b59d6f3; generation_service.py:424-457,694-726,810-852 | 新增 | working | test_generation_routing.py:292-355 | keep | port |
 | D05 | 切换耗尽：候选/预算/熔断→`surface_switch_exhausted`（HTTP 503），不误报 403 | 0cb1b82,ec35c8d; routing_pipeline.py:524-546; generation_service.py:180-190; surface_orchestrator.py:61-69 | 改造 | working | test_generation_routing.py:275-289；test_app_error_handlers.py；test_surface_policy_v2.py:154 | keep | port |
-| D05 | 单实例 failover 限制：pinned slot 不可 rebind，max_contexts=1 时 build 只能等（defer），不能跨账号抢占 | 79901b0,8e5e0cb; instance_pool.py:854-917,490-502; routing_pipeline.py:444-456 | 改造 | partial | test_instance_pool.py 覆盖 rebind；跨账号 build failover 未验证 | port（需与"来消息即唤醒"对齐） | port |
+| D05 | 单实例 failover 限制：pinned slot 不可 rebind，max_contexts=1 时 build 只能等（defer），不能跨账号抢占 | 79901b0,8e5e0cb; instance_pool.py:854-917,490-502; routing_pipeline.py:444-456 | 改造 | partial | test_instance_pool.py 覆盖 rebind；跨账号 build failover 未验证 | port（需与"来消息即唤醒"对齐） | drop |
 | D05 | 遗留回退路径：pipeline 不可用时 `ensure_active_account` + `try_switch_account`（MAX_RETRIES=5） | 6a6afbe,ec35c8d; generation_service.py:160-177,316-317,598-601; account_orchestrator.py:13,68,202 | 原生 | working | test_account_orchestrator.py；非流式回退 surface 硬编码 chat（见冲突表） | drop（回退仅排障） | drop |
 | D05 | 换号规划 InstanceSwitcher.rebalance：按最受限 slot 先分配、只动 idle、逐槽 rebind | dd5e359,b59d6f3; instance_switch.py:71-137,173-199 | 新增 | working | test_instance_switch.py；与 D08 自动切号共用，真机未复跑 | keep | drop |
 | D05 | 上游错误分类：异常→(HTTP 状态, 清洗消息, Gemini status)，JSPB 嵌套消息解包 | 6a6afbe; upstream_errors.py:42-138 | 改造 | working | test_api_responses.py:77-127；`pytest` 9 passed | keep | keep |
