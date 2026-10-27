@@ -26,7 +26,7 @@ G0.1 基线：`git status --porcelain` 为空；`git rev-parse HEAD` 记录新 S
 G0.2 索引：跑 06-index-validation.md；518 行、ledger_line 全对、桥接 31/43/97/44/70/25/67/42/62/37、无 pending、errors=0。
 G0.3 决策冲突：EXPECTED_DECISIONS 覆盖 D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D05-039 drop、D07-026 keep、D08-022 keep；P9-Q3 不得 drop 日志功能。
 G0.4 Secret/evidence：只扫 docs/dev/rebuild + INDEX.md allowlist，不扫整个 docs；BOTGUARD 是 upstream 原生 grandfather，不复制/不改；spikeQ4-evidence.json/spikeQ4.py 不得进入新仓库。
-G0.5 worktree/迁移：先查 git worktree list 和目标路径；`git worktree add .kilo/worktrees/rebuild-upstream -b rebuild/upstream upstream/master`。只在文档修复已 commit 后用 `git -C $new restore --source=rebuild -- docs/dev/rebuild`；未 commit 则显式 Copy-Item 并说明。禁止 `-- docs` 整树，禁止 checkout src/tests。迁移后确认 06-index-validation.md、10-handoff-prompt.md、12-gate0-inputs.md、06-test-disposition.csv、docs/dev/evidence/INDEX.md、docs/changelog.md 均存在；`git add -A` + `git status -uall`。
+G0.5 worktree/迁移：先查 git worktree list 和目标路径；`git worktree add .kilo/worktrees/rebuild-upstream -b rebuild/upstream upstream/master`。只在文档修复已 commit 后用 `git -C $new restore --source=rebuild -- docs/dev/rebuild`；未 commit 则显式 Copy-Item 并说明。禁止 `-- docs` 整树，禁止 checkout src/tests。迁移后确认 06-index-validation.md、10-handoff-prompt.md、12-gate0-inputs.md、06-test-disposition.csv、08-06-final-readiness-audit.md、docs/dev/evidence/INDEX.md、docs/changelog.md 均存在；`git add -A` + `git status -uall`。
 G0.6 归属：ledger-batches 仅历史输入（排除批次文件或保留 README 标注）；旧 WP 正文留在 rebuild，archive/INDEX/changelog 按 05 §6.5 归属。
 G0.7 Gate0.5 文档：12-gate0-inputs.md、06-test-disposition.csv 与 acceptance 模板已存在并通过评审。
 G0.8 Handoff：本提示词已更新，能独立执行；不再依赖旧 08 行号。

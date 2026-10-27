@@ -1,6 +1,6 @@
 # 08-05 Final Readiness Audit
 
-> 本文件是 `rebuild` 的最终交接验收报告。`10-handoff-prompt.md` 的 Gate 0 完整条件以本文 §6 为准；本文结论为“可 handoff”之前不得把 10 交给全新 agent。
+> 历史快照：本文件是修复过程中的复审报告；最终 handoff 门以 `08-06-final-readiness-audit.md` 为准。本文不改写历史结论。
 
 - 审计对象：`rebuild` @ `7a6e69a15fe82409c749c818c2381784373fc9dc`（审计开始时 `git status --porcelain` 为空），`upstream/master` @ `4623109`。
 - 审计基线 SHA：`7a6e69a15fe82409c749c818c2381784373fc9dc`。交接时的 HEAD 以 `git rev-parse HEAD` 现查；本文不记录自身提交的 SHA（避免自引用）。
