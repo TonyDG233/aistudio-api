@@ -130,7 +130,7 @@ logging:
 - P5/PG：F-01 functionCall 缺 thoughtSignature 兜底；F-02 首事件前真实 HTTP 4xx/5xx；F-03 finish-only/工具流终止兜底；F-04 functionResponse/functionCall 强制 Struct；`[toolshape]` 脱敏。F-05/06/07 后置。
 - P6/P7：24h fake clock；build-only 回写；日志 SSE/1/3/7 天；client/attempt 分母；token 汇总不含 countTokens。
 
-### 5.1 目标路径（待创建，不阻塞文档，但阻塞 Gate0.5 勾选）
+### 5.1 目标路径（已创建，见 `13-gate0-execution-record.md` §4）
 
 - `config/config.example.yaml`：本页 §3 的示例。
 - `config/config.schema.json`：§3 的机器校验 schema。
@@ -143,8 +143,10 @@ logging:
 
 ## 6. Gate 0.5 退出清单
 
-- [ ] 本页五节均通过评审并绑定 feature ID。
-- [ ] `06-test-disposition.csv` 覆盖所有 `tests/**/*.py`，且无 `pending`。
-- [ ] 状态表能覆盖 sleep/wake/idle/rebind/429/503 的转换测试。
-- [ ] config/event schema 有示例与离线 fixture 路径。
-- [ ] 每片 acceptance 模板已用于 P9-pre 的首个切片。
+评审：2026-10-27 主线 integrator 自检通过；执行与工件见 `13-gate0-execution-record.md` §3-§4。独立 reviewer 在进入 P9-pre 前复核。
+
+- [x] 本页五节均通过评审并绑定 feature ID。绑定：§1 `D04-001..004`/`D05-021`/`D06-066`/`D09-*`/`D10-*`；§2 `D03-034`/`D04-031`/`D05-038`/`D08-022`；§3 `D01-029..033`/`D01-047..049`/`D08-001`；§4 `D06-067`/`D09-025..032`/`D10-001..010`；§5 `D12-035`/`D12-037`。
+- [x] `06-test-disposition.csv` 覆盖所有 `tests/**/*.py`，且无 `pending`。实测：新 worktree 26/26，`rebuild` 80/80，missing 0，pending 0。
+- [x] 状态表能覆盖 sleep/wake/idle/rebind/429/503 的转换测试。覆盖：`UNSTARTED/SLEEPING→STARTING→READY→BUSY→READY`、`BUSY` 时拒绝 RETIRING、手动 `RETIRING→CLOSED→STARTING`、429 同号重试→唤醒/切换→保存后重试→503。
+- [x] config/event schema 有示例与离线 fixture 路径。`config/config.example.yaml`、`config/config.schema.json`、`tests/fixtures/events/event.sample.json`、`tests/fixtures/pg/f01..f04`。
+- [x] 每片 acceptance 模板已用于 P9-pre 的首个切片。`acceptance/P9-pre.md`（8 项 planned；执行后回填）。

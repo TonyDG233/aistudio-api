@@ -28,3 +28,13 @@
 - 变更：修正 05 的文档编号引用、10 的 G1-G11 固定出处、D12-006/008 的 decision note；08-05 顶部加“已被 08-06 取代”历史横幅；记录 handoff 基线 SHA。
 - 原因：`08-06-final-readiness-audit.md` §3.2 非阻断残留；G0.1 交接基线。
 - 验证：`06-index-validation.md` 脚本输出 `OK ... errors=0`；交接基线 `7cd92f7dcb2b8675050aa342a38b9853a27e33c4`。
+
+- 范围：`docs/dev/rebuild`、`docs/dev/evidence`、`docs/changelog.md`
+- 变更：从 `rebuild @ 8e0ab11` 迁移文档与 evidence allowlist 到 `upstream/master @ 4623109` 之上的 `rebuild-upstream` worktree；`ledger-batches` 仅留 README。
+- 原因：Gate 0 / D6 迁移边界。
+- 验证：迁移提交 `cf6e681`（236 files）；11 个 `.log` force-add；`spikeQ4*` 未迁移；`mustExist` 全过；索引 `errors=0`。
+
+- 范围：`docs/dev/rebuild/13-gate0-execution-record.md`、`12-gate0-inputs.md`、`acceptance/`、`config/`、`tests/fixtures/{events,pg}`
+- 变更：记录 Gate 0 执行与分支名偏差；冻结 Gate 0.5 五层接口/状态表/config+event schema/PG F-01..F-04 fixture/acceptance 模板，并勾满 12 §6。
+- 原因：`10-handoff-prompt.md` Gate 0/0.5；`08-06-final-readiness-audit.md` §6。
+- 验证：索引脚本 `errors=0`；`config.example.yaml` 通过 `config.schema.json`（jsonschema 0 错误）；disposition 26/26（worktree）/80/80（rebuild）；详见 `13-gate0-execution-record.md` §3。

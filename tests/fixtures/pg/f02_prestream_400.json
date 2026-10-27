@@ -1,0 +1,24 @@
+{
+  "feature_id": "D06-066",
+  "case": "F-02",
+  "description": "上游在首个流事件之前返回 400；HTTP 必须保留真实状态，不得包装为 200 SSE。",
+  "upstream": {
+    "status": 400,
+    "error": {
+      "code": 400,
+      "message": "Function call is missing a thought signature",
+      "status": "INVALID_ARGUMENT"
+    }
+  },
+  "client": {
+    "stream": true,
+    "api_format": "gemini"
+  },
+  "expected": {
+    "http_status": 400,
+    "content_type": "application/json",
+    "sse": false,
+    "error_code": 400,
+    "error_status": "INVALID_ARGUMENT"
+  }
+}

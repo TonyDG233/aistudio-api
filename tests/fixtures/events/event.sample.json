@@ -1,0 +1,20 @@
+{
+  "request_id": "req_01J00000000000000000000000",
+  "client_request_id": "client_01J00000000000000000000000",
+  "account_id": "primary",
+  "model": "gemini-3.7-flash",
+  "surface": "chat",
+  "paid": false,
+  "api_format": "openai",
+  "attempt": 1,
+  "status": "success",
+  "error_class": null,
+  "latency_ms": 842,
+  "usage": {
+    "input": 12,
+    "output": 34,
+    "cache": 0,
+    "count_tokens": 40
+  },
+  "ts": "2026-10-27T18:30:00Z"
+}

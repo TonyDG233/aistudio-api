@@ -1,0 +1,36 @@
+{
+  "feature_id": "D06-066",
+  "case": "F-04",
+  "description": "functionResponse.response 是裸字符串；写 wire 前必须强制 Struct（非 dict/list 包成 {\"result\": <str>}）。",
+  "request": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "emit_complete_response_x",
+              "response": "user text"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "wire_part_index": 11,
+    "must_be_struct": true,
+    "wire_shape": [
+      "emit_complete_response_x",
+      [
+        [
+          [
+            "result",
+            [null, null, "user text"]
+          ]
+        ]
+      ]
+    ],
+    "empty_response_shape": {}
+  }
+}
