@@ -310,7 +310,7 @@ Gate 0.5 未通过，不得进入 P9-pre 编码。
 
 ### 6.7 重新独立审计
 
-- 修复文档后，由独立审计重新检查 05/06/07/08/09/11/12 与 CSV 的一致性、Gate 0/0.5 可行性、P9-pre/状态机/顺序是否可执行。
+- 修复文档后，由独立审计重新检查 05/06/07/08/09/10/12 与 CSV 的一致性、Gate 0/0.5 可行性、P9-pre/状态机/顺序是否可执行。
 - `08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md`、`08-02-execution-readiness-reaudit.md` 保留为历史审计，不回改原文；新审计结论写入新文档。
 - 通过后，把 `10-handoff-prompt.md` 交给全新 agent；未通过不得进入 P9-pre 编码。
 

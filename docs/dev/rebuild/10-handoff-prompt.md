@@ -68,6 +68,6 @@ F-05/06/07 后做，不阻塞 P5 最小闭环；F-08..F-13 在 P5/P4 前 triage�
 
 禁止：修改测试/配置绕过契约；合并 master/rebuild；整树 checkout；访问真实账号/IP/Google；提交敏感内容。
 
-验收：G0.1-G0.8 全过；G1-G11 见 08 §验收清单与 12 §5 模板（不要只按旧 08 行号）；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API Key 默认拒绝；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过。
+验收：G0.1-G0.8 全过；G1-G11 见 08-06 §6.3（固定出处：08-05 附录 A / 08-01:129-140）与 12 §5 模板；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API Key 默认拒绝；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过。
 完成后报告：修改文件、测试命令/结果、未验证项、证据路径。
 ```

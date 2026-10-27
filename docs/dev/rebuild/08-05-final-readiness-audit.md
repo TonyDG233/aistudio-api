@@ -1,5 +1,7 @@
 # 08-05 Final Readiness Audit
 
+> 历史快照：本文件已被 `08-06-final-readiness-audit.md` 取代；最终 handoff 门与 Gate0 完整条件以 08-06 §6 为准，本文结论（含“不可”）不再作为下发依据。原文保留不回改。
+
 > 历史快照：本文件是修复过程中的复审报告；最终 handoff 门以 `08-06-final-readiness-audit.md` 为准。本文不改写历史结论。
 
 - 审计对象：`rebuild` @ `7a6e69a15fe82409c749c818c2381784373fc9dc`（审计开始时 `git status --porcelain` 为空），`upstream/master` @ `4623109`。
