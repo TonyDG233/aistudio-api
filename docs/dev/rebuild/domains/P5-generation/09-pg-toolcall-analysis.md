@@ -25,7 +25,7 @@
 - 显式前缀优先且被钉死：`select_channel()` 在 `channel_registry.py:344-368` 解析 `pg/<model>` → `channel=chat`、`surface=chat`、`clean_model=<model>`；不会因为 build 可用而改道。
 - 路由资格：`application/routing_eligibility.py:253-312` 先用 `select_channel` 钉住渠道，再用 `eligible_account()`（`:164-207`）检查 tier/组/模型门槛。
 - 模型名归一：`application/chat_service.py:545-560` 把 `requested_model` 统一成 `models/<clean_model>`；正常路径 `effective_model_path` 来自 `ctx.clean_model`（`generation_service.py:264`、`:519`）。
-- 只有**回退旧路径**时才会保留 `pg/` 前缀并可能误路由/误写模型：见 §3 的 F-09。
+- 只有**回退旧路径**时才会保留 `pg/` 前缀并可能误路由/误写模型：见 §3 的 PG-09。
 - `model_defaults` 不按 `pg` 分支；它只提供模型级 generation defaults / `default_tools`，与本问题无直接关系（`infrastructure/gateway/model_defaults.py:571` 只是重复别名映射）。
 
 结论：正常路径下 `pg` 不会被 build/chat 误路由；问题发生在 chat 面内部的工具请求/流处理，而不是“pg 被当成 build”。
@@ -92,7 +92,7 @@
 ### 2.5 ATG（若开启）
 
 25. wrap：`application/atg/injector.py:104-217`（注入 `atg_emit_*` + 控制 user turn + 改写 `toolConfig`）。
-26. guard：`application/atg/client_patterns.py:72-190`（5 个信号；只读 `parameters`，见 F-07）。
+26. guard：`application/atg/client_patterns.py:72-190`（5 个信号；只读 `parameters`，见 PG-07）。
 27. 流解包：`application/atg/stream_extractor.py:70-115`（只对自己的合成名/无名续块累积；真实调用透传）。
 28. 非流解包：`application/atg/extractor.py:141-200`（合成调用→正文、finish 重写）。
 29. 集成点：`generation_service.py:531-551`、`:605-606`、`:664-682`、`:755-770`。
@@ -103,14 +103,14 @@
 
 > 标注约定：`[代码]` = 只读代码即可确认；`[离线]` = 用本机离线构造的数据可复现；`[未验证]` = 需要真实请求/日志/页面，不能当已证实。
 
-### F-01　Gemini 原生面历史 `functionCall` 缺 thoughtSignature 兜底（最可能）
+### PG-01　Gemini 原生面历史 `functionCall` 缺 thoughtSignature 兜底（最可能）
 
 - **症状**：pg + 预设第一/第二轮都可能在生成前失败；酒馆计时器启动后无正文，最终超时或无输出。上游错误通常是 `Function call is missing a thought signature`。
 - **证据**：
   - `chat_service.py:588-599` 只把客户端的 `part.thoughtSignature` 透传；缺失时不注入占位签名。
   - 占位签名常量只被 OpenAI/Claude 转换器使用：`format_converters/common.py:27`，使用点 `openai_request.py:201`、`claude_request.py:203`；Gemini 原生路径没有引用。
   - `docs/dev/evidence/wp8-20261019/README.md` 的 “thoughtSignature 修复” 记录了真实上游 400 与修复方案，但验收只覆盖 OpenAI/Claude；Gemini 原生面只做了文本回归。
-  - WP8 的 OpenAI 多轮工具请求（`docs/dev/evidence/wp8-20261019/openai-tool-multiturn-request.json`）同样经过 `normalize_gemini_request` → wire 下标 10，并靠 dummy 签名成功；这说明 **wire 下标 10 本身可用，缺的只是签名兜底**，进一步支持 F-01 是本路径的高概率缺口。
+  - WP8 的 OpenAI 多轮工具请求（`docs/dev/evidence/wp8-20261019/openai-tool-multiturn-request.json`）同样经过 `normalize_gemini_request` → wire 下标 10，并靠 dummy 签名成功；这说明 **wire 下标 10 本身可用，缺的只是签名兜底**，进一步支持 PG-01 是本路径的高概率缺口。
   - `tests/unit/test_gemini_request_normalization.py:448-502` 只验证“声明”编码，未覆盖 `functionCall/functionResponse` 历史与签名。
 - **触发**：预设重建上一轮模型 `functionCall` 时没有回传 `thoughtSignature`（常见：扩展只保存 `args.content` 的可见文本、或上游本轮没有把签名附在 functionCall part 上）。`pg` chat 面使用 Gemini 3.x 时，上游对历史 functionCall 强制要求签名。
 - **离线验证**：
@@ -119,7 +119,7 @@
   - 追加单测：`test_normalize_gemini_request_injects_dummy_signature_for_historical_function_call`。
 - **置信度**：中高（代码缺口确定；“该预设一定丢签名”需一次脱敏请求样本确认）。
 
-### F-02　上游 4xx 被包成 HTTP 200 + SSE error，客户端“看不到错误也等不到正文”
+### PG-02　上游 4xx 被包成 HTTP 200 + SSE error，客户端“看不到错误也等不到正文”
 
 - **症状**：计时器有反应（HTTP 头/`: resolving-instance` 注释已到），但既没有正文，也没有正常的 4xx；最终客户端自己超时。
 - **证据**：
@@ -127,11 +127,11 @@
   - 对比：OpenAI/Claude/Responses 都预读首事件以保留真实 HTTP 状态（`routes_openai.py:102-122`、`routes_claude.py:121-144`、`routes_responses.py:138-152`；台账 `docs/dev/rebuild/06-feature-ledger.md:299`）。
   - 架构审计已列此风险：`docs/dev/rebuild/02-architecture-audit.md:34`（“SDK 看到 200，错误码在 data 里”）；台账 `06-feature-ledger.md:297` 标 `partial`。
   - **离线复现**：用 TestClient 让 `stream_generation` 抛 `RequestError(400, ...)`，实际响应为 `HTTP 200`、`content-type: text/event-stream`、body 仅 `data: {"error": {"code": 400, ...}}`（本次 probe 已复现）。
-- **触发**：F-01/F-04/F-08/F-12 任一在**首个事件之前**失败；或首事件之后上游 4xx。首事件之前失败本可返回 4xx，现在是 200。
+- **触发**：PG-01/PG-04/PG-08/PG-12 任一在**首个事件之前**失败；或首事件之后上游 4xx。首事件之前失败本可返回 4xx，现在是 200。
 - **离线验证**：对 `handle_gemini_generate_content(stream=True)` 注入会抛 400 的 fake stream，断言 status=200 且 body 只有 error；对比 OpenAI 路由的同类测试（`test_format_openai.py:701-726` 期望 500 JSON）。
 - **置信度**：高（代码/离线已证实）；“酒馆是否忽略 200 SSE error 后一直等”需客户端侧确认，但这是最符合“计时器有反应→最终超时”的放大器。
 
-### F-03　流终止只认 finishReason；工具调用流可能不终结/丢 finish → 120s 超时
+### PG-03　流终止只认 finishReason；工具调用流可能不终结/丢 finish → 120s 超时
 
 - **症状**：计时器跑满约 120s（或酒馆自己的超时），没有任何内容；代理侧可能只记录超时。
 - **证据**：
@@ -146,7 +146,7 @@
   - `3)` fake session 给 functionCall 后直接 `done`（无 finish）→ 当前依赖默认 `STOP`，能结束；与 (2) 对比可确定“是否上游不关连接”。
 - **置信度**：中（终止逻辑代码确定；“上游确实不关/不发 finish”需实机/抓包）。
 
-### F-04　工具载荷未强制 Struct：`functionResponse.response`/`functionCall.args` 是字符串时直接写 wire
+### PG-04　工具载荷未强制 Struct：`functionResponse.response`/`functionCall.args` 是字符串时直接写 wire
 
 - **症状**：预设把“发送文本”放进工具输出；若该字段是裸字符串，上游 400（invalid Struct）或忽略该 tool output；所有轮次都可能无回复。
 - **证据**：
@@ -158,7 +158,7 @@
 - **离线验证**：构造 string 与 dict 两种 response，检查 wire 下标 11；再 mock 上游校验（或看上游 400 日志）确认拒绝。再构造一个只有 functionResponse 的 contents，检查 normalize 后的 wire 仍把它原样放在 user 轮。
 - **置信度**：中高（wire 形状确定；预设实际发送类型需一次脱敏请求样本）。
 
-### F-05　流式 tool_calls 不做跨 chunk 聚合；无名续块被当作独立调用
+### PG-05　流式 tool_calls 不做跨 chunk 聚合；无名续块被当作独立调用
 
 - **症状**：客户端收到多个部分 tool_call（有的 name 为空/`unknown`、args 只含半截），酒馆执行失败或等待完整 JSON，最终无输出。
 - **证据**：
@@ -170,7 +170,7 @@
 - **离线验证**：已有 probe 的事件序列；补 `test_streaming_merges_partial_tool_calls`，输入两个 chunk，断言只产生一个带完整 name/args 的调用。
 - **置信度**：中（聚合缺口确定；上游是否分片在 chat/该预设上未证实）。
 
-### F-06　`thought=True` 下标 10 被误判成 functionCall（潜在“幽灵工具调用”）
+### PG-06　`thought=True` 下标 10 被误判成 functionCall（潜在“幽灵工具调用”）
 
 - **症状**：每个 thinking chunk 都额外产出一个 name 为空、args 为 `True`/`{}` 的 functionCall；客户端可能把它当工具调用执行/报错，或把预设的正文覆盖。
 - **证据**：
@@ -182,7 +182,7 @@
 - **离线验证**：上面的 probe；补 `assert not parsed.function_calls`。
 - **置信度**：代码确定、当前模型触发未证实（低-中）；但一旦触发，表现就是“模型在思考，客户端却收到工具调用”。
 
-### F-07　ATG 客户端合成守卫漏看 `parametersJsonSchema`；required 模式下会在出数据后硬失败
+### PG-07　ATG 客户端合成守卫漏看 `parametersJsonSchema`；required 模式下会在出数据后硬失败
 
 - **症状**：ATG 开着时出现“双通道叠加”或 500/无终块：模型被 ATG 控制消息引到 `atg_emit_*`（正文被转成纯文本），或只调用了预设工具但 ATG 要求合成调用。
 - **证据**：
@@ -194,7 +194,7 @@
 - **离线验证**：probe 2；再用 `atg.wrap()` 喂 OpenAI 转换后的 body，断言 `client_synthetic` 是否命中；模拟 `required` 且只给真实工具调用，断言 finalize 抛错。
 - **置信度**：代码/离线确定；是否命中取决于用户 ATG 配置（默认 `off`，`defaults/config.yaml:170`）。
 
-### F-08　OpenAI/Claude 面的工具历史校验过严（预设形态直接 400）
+### PG-08　OpenAI/Claude 面的工具历史校验过严（预设形态直接 400）
 
 - **症状**：请求在转换阶段失败，没有进入上游；酒馆可能显示错误或被当作空回复。
 - **证据**：
@@ -208,7 +208,7 @@
 - **离线验证**：probe 5；补兼容性用例。
 - **置信度**：代码/离线确定；是否为该酒馆配置的实际形状需请求样本。
 
-### F-09　路由管线回退时，`pg/` 前缀会泄漏上游或把请求误送到 build
+### PG-09　路由管线回退时，`pg/` 前缀会泄漏上游或把请求误送到 build
 
 - **症状**：偶发“模型不存在”的 404，或 pg 请求被 build 面执行（模型/能力不匹配），在工具请求上表现为空响应。
 - **证据**：
@@ -218,7 +218,7 @@
 - **离线验证**：monkeypatch `get_routing_pipeline` 为抛错/None，调用 `generate`/`stream_generation` 的路径，检查 `normalized.model` 与 `surface`。
 - **置信度**：代码确定；触发频率低（正常路由管线可用时不发生）。
 
-### F-10　Free 账号 + pg/chat 被默认组策略直接拒绝（所有工具问题之前的 403）
+### PG-10　Free 账号 + pg/chat 被默认组策略直接拒绝（所有工具问题之前的 403）
 
 - **症状**：pg 请求很快被拒（或无正文），与工具无关。
 - **证据**：`surface_orchestrator.py:35-43`（free → `["build"]`）、`:301-346`（默认组按 tier）、`routing_eligibility.py:160-191`（`channel not in group.allowed_surfaces` 即不合格）；`docs/dev/rebuild/02-architecture-audit.md:30`、`03-context-and-summary.md:67` 已记录“Free 被硬编码为 build-only；build 关闭时全部 403”。
@@ -226,7 +226,7 @@
 - **离线验证**：`eligible_account(free, "chat", ...)` 返回 None；`_resolve_surface` 对 free 抛 `surface_group_disabled`（`test_surface_policy_routing.py:166-183`）。
 - **置信度**：代码确定；是否适用于该用户取决于账号 tier（先查 `[surface]`/账号 tier 日志）。
 
-### F-11　`toolConfig` 不写入上游：ANY/required 被静默降级为 AUTO
+### PG-11　`toolConfig` 不写入上游：ANY/required 被静默降级为 AUTO
 
 - **症状**：预设若依赖强制工具调用（`tool_choice: required`/Gemini `mode: ANY`），模型可以自由输出纯文本；只消费工具输出的预设于是“没有回复”。
 - **证据**：
@@ -239,7 +239,7 @@
 - **离线验证**：probe 6；或看 `modify_body` 结果。
 - **置信度**：代码确定；对本 preset 的优先级低（AUTO）。
 
-### F-12　snapshot 内容 hash 对 functionCall/functionResponse 视而不见（可能触发 403 重放/校验失败）
+### PG-12　snapshot 内容 hash 对 functionCall/functionResponse 视而不见（可能触发 403 重放/校验失败）
 
 - **症状**：工具内容占比越高，越容易出现 403；代理把 403 当鉴权错误切号，耗时后仍失败/超时。
 - **证据**：
@@ -251,7 +251,7 @@
 - **离线验证**：按 `session.py:387-403` 的同一逻辑，对两段不同的 tool-only 历史计算 hash，断言相等；再对“把同样文本放 text part”的版本计算，断言不同。**只有拿到真实 403 日志/抓包后才能升级为根因。**
 - **置信度**：代码缺陷确定；上游后果未验证（低-中）。修复前应先加日志，不要盲目改 hash。
 
-### F-13（补充）错误 finish code 原样透传：MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / TOO_MANY_TOOL_CALLS
+### PG-13（补充）错误 finish code 原样透传：MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / TOO_MANY_TOOL_CALLS
 
 - **症状**：客户端收到“functionCall + 非 STOP finishReason”（10/12/13），SDK 可能丢弃该调用或报错，表现为无输出。
 - **证据**：映射表 `upstream_errors.py:42-61` 有 10/12/13，但 `api_service_gemini.py:218`/`:173` 原样输出；没有“有合法 functionCall 时把 10/12/13 视作可交付调用”的判断；ATG 的 `_is_tool_calls_finish` 只认字符串 `"TOOL_CALLS"`（`extractor.py:36-40,131-132`），而真实 finish 是 wire int，因此 **TOOL_CALLS→STOP 的重写在真实管线中永不触发**（`generation_service.py:654-659`）。
@@ -273,8 +273,8 @@
    - 工具声明：name hash、参数 schema 的键名（`parameters` vs `parametersJsonSchema`）、mode。
    - **不记录**正文、完整签名、cookie/header。
 2. **`[snapshot]`**：`content_hash[:8]`、是否包含 tool parts、连续两次请求的 hash 是否相同、token 长度/前缀（不记录完整 token）。
-3. **`[stream]` 终止摘要**：是否见到 finishReason、最后 chunk 的 `candidates` 长度、工具调用数、是否等到 `done`/超时；用于区分 F-03 的两种路径。
-4. **`[surface]`/`[route]`**：账号 tier、channel、surface、`clean_model`；用于排除 F-09/F-10。
+3. **`[stream]` 终止摘要**：是否见到 finishReason、最后 chunk 的 `candidates` 长度、工具调用数、是否等到 `done`/超时；用于区分 PG-03 的两种路径。
+4. **`[surface]`/`[route]`**：账号 tier、channel、surface、`clean_model`；用于排除 PG-09/PG-10。
 5. **上游错误**：保留 `status` + 脱敏后的 `error.message`（签名/Struct/function name 的报错文本），不要记录请求体全文。
 
 ### 4.2 Fixture / 单测
@@ -310,7 +310,7 @@
    - 在 `_encode_wire_args` 前做，避免字符串直接落到 Struct 位置。
 
 3. **Gemini 流式预读首事件**
-   复制 `routes_openai.py:102-122` 的模式：在 `StreamingResponse` 之前 `__anext__()` 一次；首事件前的 `SurfacePolicyError`/`RequestError` 直接返回真实 HTTP 4xx/5xx。这样 F-01/F-04 会以 400 显示，而不是“200 空流”。
+   复制 `routes_openai.py:102-122` 的模式：在 `StreamingResponse` 之前 `__anext__()` 一次；首事件前的 `SurfacePolicyError`/`RequestError` 直接返回真实 HTTP 4xx/5xx。这样 PG-01/PG-04 会以 400 显示，而不是“200 空流”。
    若必须保留 200 SSE，至少把 error 事件升级为“带 finishReason/终止标记”的终块，并在客户端侧验证。
 
 4. **流终止兜底**
@@ -356,27 +356,27 @@
 
 **已验证（只读代码或离线数据）**
 - pg=chat 的别名与显式选路（§1）。
-- 工具请求的 wire 形状：functionCall 下标 10、functionResponse 下标 11、签名 14；裸字符串 response 不成为 Struct（F-04）。
-- 上游 4xx 在 Gemini 流式入口变成 HTTP 200 + SSE error（F-02）。
-- finish-only chunk 的 finish 丢失（F-03）。
-- 流式 tool_calls 无聚合、无名续块产生空 name（F-05）。
-- thought 下标 10 被误判为 functionCall（F-06）。
-- ATG guard 对 `parametersJsonSchema` 漏判（F-07）。
-- OpenAI/Claude 严格工具历史的三类 400（F-08）。
-- toolConfig 不写入 wire（F-11）。
-- snapshot hash 不含 function parts（F-12）。
+- 工具请求的 wire 形状：functionCall 下标 10、functionResponse 下标 11、签名 14；裸字符串 response 不成为 Struct（PG-04）。
+- 上游 4xx 在 Gemini 流式入口变成 HTTP 200 + SSE error（PG-02）。
+- finish-only chunk 的 finish 丢失（PG-03）。
+- 流式 tool_calls 无聚合、无名续块产生空 name（PG-05）。
+- thought 下标 10 被误判为 functionCall（PG-06）。
+- ATG guard 对 `parametersJsonSchema` 漏判（PG-07）。
+- OpenAI/Claude 严格工具历史的三类 400（PG-08）。
+- toolConfig 不写入 wire（PG-11）。
+- snapshot hash 不含 function parts（PG-12）。
 
 **未验证（需要一次脱敏请求/日志/真实上游，不能当结论）**
 - 该酒馆预设实际发送的 `functionResponse.response` 是字符串还是 dict；历史 functionCall 是否带签名；工具名是否每轮变化。
-- 上游在该 chat 模型上是否对 functionCall 流保持连接/不发 finish（F-03 的触发端）。
-- 上游是否对 functionCall 参数做增量分片（F-05 的触发端；现有证据倾向“整块”，但有未决矛盾）。
-- snapshot 403 是否真的由 tool-blind hash 触发（F-12）。
-- 酒馆客户端是否忽略 200 SSE error 并继续等待（F-02 的客户端侧）。
+- 上游在该 chat 模型上是否对 functionCall 流保持连接/不发 finish（PG-03 的触发端）。
+- 上游是否对 functionCall 参数做增量分片（PG-05 的触发端；现有证据倾向“整块”，但有未决矛盾）。
+- snapshot 403 是否真的由 tool-blind hash 触发（PG-12）。
+- 酒馆客户端是否忽略 200 SSE error 并继续等待（PG-02 的客户端侧）。
 
 **明确排除**
-- 不是“pg 被 build surface 误路由”（正常路径 `select_channel` 钉死 chat；只有回退路径 F-09）。
-- 不是“模型 4a 不会输出 functionCall”；即使输出正确，F-01/F-02/F-03/F-04 任一都能让它在酒馆侧表现为无输出。
-- 不是 ATG 的合成工具在**默认 off** 配置下导致的；ATG 只在显式开启时才是 F-07 的触发条件。
+- 不是“pg 被 build surface 误路由”（正常路径 `select_channel` 钉死 chat；只有回退路径 PG-09）。
+- 不是“模型 4a 不会输出 functionCall”；即使输出正确，PG-01/PG-02/PG-03/PG-04 任一都能让它在酒馆侧表现为无输出。
+- 不是 ATG 的合成工具在**默认 off** 配置下导致的；ATG 只在显式开启时才是 PG-07 的触发条件。
 
 ---
 
