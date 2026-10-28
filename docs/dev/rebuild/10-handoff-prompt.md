@@ -31,7 +31,7 @@ D-14 指针：API 免密只由 `security.api_allow_anonymous` 控制且默认关
 
 ## 阶段与顺序
 
-- **A 文档收敛**：收 05/06/10，消除 06 内部 P6→P7→P5 与旧 P5→P6→P7 的冲突。A 经用户审计确认并 commit、且目标 worktree docs 同步后，才可进入 B。
+- **A 文档收敛**：A1-A6 已提交；A7 做 agent 工作流准备（任务包、A→B 检查、incident、真实测试闸门），A7 经审计后才可进入 B。
 - **B 实现（顺序固定）**：P9-pre 装配/鉴权 → P1+P3+P2 → **P6 保活/24h** → **P7 结构化日志/错误码/请求关联** → **B5a PG/toolcall/preset 复现** → **B5b P5 最小 OpenAI chat**。每步先写测试项 + 预期，实现后报实际，用户审计确认后才 commit。
 - **C 扩面**：P4 Build（启动时先按 08-10 §4 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。
 - 每个 Step 的范围与退出条件见 `05 §4.1`；前一 Step 审计未通过不得进入下一 Step。

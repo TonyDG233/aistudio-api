@@ -37,7 +37,7 @@
 ## 4. 阶段与顺序
 
 - Gate0/G0.x 不再作为独立体系，改为 A/B/C 阶段 + 每步审计。
-- A 文档收敛：A1 `06` 顺序 → A2 D-14 → A3 05 → A4 10 → A5 归档旧审计 → A6 同步目标 docs。
+- A 文档收敛：A1 `06` 顺序 → A2 D-14 → A3 05 → A4 10 → A5 归档旧审计 → A6 同步目标 docs → A7 agent 工作流准备。
 - B 实现：P9-pre → P1+P3+P2 → P6 → P7 → B5a PG/toolcall 复现 → B5b P5 OpenAI。
 - C 扩展：P4 Build（先按 `08-10` §4 探索）→ P8/UI → Claude/Responses → 统计页 → P10。
 - 顺序 P6 → P7 → P5 固定；每阶段前一步审计通过才进下一步。
@@ -52,6 +52,7 @@
 | A4 | `10` 一页交接 | 不超过 100 行；下一任可独立执行 B |
 | A5 | 归档旧审计/Gate 文档 | 旧 01-04/07/08-01..07/12/13/P*-questions 移入 `archive/`；09 保留为 P5 输入 |
 | A6 | 同步目标 worktree | 目标 docs 与 A1-A5 一致；`src` diff 仍为 0 |
+| A7 | agent 工作流准备 | 任务包 8 字段、A→B 检查、incident 规则、真实测试闸门可执行；不写 AGENT.md |
 | B1 | P9-pre 装配/配置/API guard | 启停/配置校验通过；空 Key 拒绝；不写业务逻辑 |
 | B2 | P1+P3+P2 账号/页面/路由 | 1 账号 1 Context 1 Page；`active_requests`；路由/重试测试 |
 | B3 | P6 保活/24h | 凭证回写覆盖 chat/build-only；fake clock；VPS 可用 |
