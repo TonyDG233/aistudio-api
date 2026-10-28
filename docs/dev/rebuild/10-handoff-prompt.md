@@ -22,7 +22,7 @@
 4. `06-decision-log.md` — P2/P3 落地；与 08-09 冲突时以 08-09 为准。
 5. `06-feature-ledger.md` + `06-feature-index.csv` — inventory（534 行）。
 6. `06-test-disposition.csv` — 测试处置；seam/config/event 以 06/08-09 为准，`archive/12-gate0-inputs.md` 归历史。
-7. `domains/P5-generation/index.md` + `09-pg-toolcall-analysis.md` — P5 早期约束与 PG/toolcall/preset 详情；D7 的 F-01..F-04 是门槛。
+7. `domains/P5-generation/index.md` + `09-pg-toolcall-analysis.md` — P5 早期约束与 PG/toolcall/preset 详情；D7 的 PG-01..PG-04 是门槛。
 8. `08-10-build-surface-incident-20261028.md` — 仅 C 阶段 P4 启动时读 §4。
 
 `archive/08-07-upstream-99c38ba-reaudit.md` 仅历史，不得作为行为依据。

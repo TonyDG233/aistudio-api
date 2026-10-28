@@ -5,7 +5,7 @@
 ## B5a 早期约束
 
 - 复现“酒馆预设把发送文本放进 `functionResponse`、回答放进 `functionCall.args`”的 PG/toolcall/preset 链路。
-- F-01..F-04 必须有离线复现/修复/回归；F-05..F-13 逐项 triage，标阻塞或后置。
+- PG-01..PG-04 必须有离线复现/修复/回归；PG-05..PG-13 逐项 triage，标阻塞或后置。
 - 预设形态 harness 必须通过。
 - 只允许离线 fixture/probe；不得访问真实账号/IP/Google。
 - B5a 未通过不得进入 B5b。
@@ -24,4 +24,4 @@
 - 技术详情：`09-pg-toolcall-analysis.md`
 - 交接指针：`10-handoff-prompt.md`
 - 证据：`docs/dev/evidence/P5/`
-- 不创建 `B5a.md`；不把 F-01..F-13 复制到 05/06/10。
+- 不创建 `B5a.md`；不把 PG-01..PG-13 复制到 05/06/10。
