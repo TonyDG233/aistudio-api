@@ -41,6 +41,29 @@
 - C 扩展：P4 Build（先按 `08-10` §4 探索）→ P8/UI → Claude/Responses → 统计页 → P10。
 - 顺序 P6 → P7 → P5 固定；每阶段前一步审计通过才进下一步。
 
+### 4.1 步骤详情
+
+| Step | 范围 | 退出条件 |
+|---|---|---|
+| A1 | `06` D5 顺序与预检 | `P6→P7→P5`，无旧顺序/伪日期，索引通过 |
+| A2 | D-14 引用与 D11 台账 | 空 Key 不开放；管理页 env-only；D11-015=rewrite；D11-016=drop |
+| A3 | `05` 一页地图 | 不超过 100 行；含目标/权威/顺序/审计/停止条件 |
+| A4 | `10` 一页交接 | 不超过 100 行；下一任可独立执行 B |
+| A5 | 归档旧审计/Gate 文档 | 旧 01-04/07/08-01..06/09/12/13/P*-questions 标历史；权威集无重复 |
+| A6 | 同步目标 worktree | 目标 docs 与 A1-A5 一致；`src` diff 仍为 0 |
+| B1 | P9-pre 装配/配置/API guard | 启停/配置校验通过；空 Key 拒绝；不写业务逻辑 |
+| B2 | P1+P3+P2 账号/页面/路由 | 1 账号 1 Context 1 Page；`active_requests`；路由/重试测试 |
+| B3 | P6 保活/24h | 凭证回写覆盖 chat/build-only；fake clock；VPS 可用 |
+| B4 | P7 日志/错误关联 | 日志页/导出；请求-尝试关联；不含统计页 |
+| B5 | P5 OpenAI 集成切片 | 新 seam 端到端；无 page/context 泄露；证据完整 |
+| C1 | P4 Build | 先按 `08-10` §4 探索；400 分类；无 9998 无限重试 |
+| C2 | P8 API/UI | 现有 UI 增量；D-12；ModelCatalog 单一所有者 |
+| C3 | Claude/Responses | OpenAI 稳定后；协议映射与测试 |
+| C4 | 统计页 | 单一事件账本；client/attempt 分母分离 |
+| C5 | P10 收尾 | 测试/证据/changelog/文档同步；无未验证项隐瞒 |
+
+每个 Step 的审计通过并经用户确认后才 commit；前一 Step 未通过不进入下一 Step。
+
 ## 5. 第一个集成切片（B5，不是最小产品）
 
 B5 不是“上游原生能跑”的证明：99c38ba 已有 Gemini/Responses 原生路径；只跑原生协议不能证明重建。B5 是第一个经过新架构 seam 的切片：1 账号 + 1 Context + 1 Page，经新 account/page/routing/active_requests/guard/log 路径发出 1 个 OpenAI Chat 请求并收到完整回复；空 API Key 不放行，同账号仅 1 active Page，无 page/context 泄露。OpenAI Chat 是上游没有、fork 侧新增的适配器。B5 前不得要求 534 条全量完成。
