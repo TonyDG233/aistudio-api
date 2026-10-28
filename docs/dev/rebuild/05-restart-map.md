@@ -22,7 +22,7 @@
 | `05-restart-map.md` | 本页地图 |
 | `10-handoff-prompt.md` | 一页 handoff |
 | `00-chat-postmortem.md` | 事故复盘，只读 |
-| `08-10` / `08-11` | P4 事故记录/附录，P4 前不进入主线 |
+| `incidents/INC-20261028-01-build-400.md` / `INC-20261028-02-build-400-trace.md` | P4 事故记录/附录，P4 前不进入主线 |
 | `12` / `13` | Gate 旧文档；A5 归档，不再作权威 |
 
 ## 3. 当前状态
@@ -39,7 +39,7 @@
 - Gate0/G0.x 不再作为独立体系，改为 A/B/C 阶段 + 每步审计。
 - A 文档收敛：A1 `06` 顺序 → A2 D-14 → A3 05 → A4 10 → A5 归档旧审计 → A6 同步目标 docs → A7 agent 工作流准备。
 - B 实现：P9-pre → P1+P3+P2 → P6 → P7 → B5a PG/toolcall 复现 → B5b P5 OpenAI。
-- C 扩展：P4 Build（先按 `08-10` §4 探索）→ P8/UI → Claude/Responses → 统计页 → P10。
+- C 扩展：P4 Build（先按 `INC-20261028-01` §4 探索）→ P8/UI → Claude/Responses → 统计页 → P10。
 - 顺序 P6 → P7 → P5 固定；每阶段前一步审计通过才进下一步。
 
 ### 4.1 步骤详情
@@ -59,7 +59,7 @@
 | B4 | P7 日志/错误关联 | 日志页/导出；请求-尝试关联；不含统计页 |
 | B5a | PG/toolcall/preset 复现 | 见 `domains/P5-generation/index.md` |
 | B5b | P5 OpenAI 集成切片 | 见 `domains/P5-generation/index.md`；B5a 未过不得进入 |
-| C1 | P4 Build | 先按 `08-10` §4 探索；400 分类；无 9998 无限重试 |
+| C1 | P4 Build | 先按 `INC-20261028-01` §4 探索；400 分类；无 9998 无限重试 |
 | C2 | P8 API/UI | 现有 UI 增量；D-12；ModelCatalog 单一所有者 |
 | C3 | Claude/Responses | OpenAI 稳定后；协议映射与测试 |
 | C4 | 统计页 | 单一事件账本；client/attempt 分母分离 |

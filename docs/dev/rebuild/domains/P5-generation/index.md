@@ -1,6 +1,7 @@
 # P5 Generation / Protocol / Wire
 
 状态：B 未开始。本文件是 P5 唯一域索引；详细技术分析只在 `09-pg-toolcall-analysis.md`。
+执行基线：B5a 在 `.kilo/worktrees/rebuild-upstream`（99c38ba+9b5cdea）执行；09 的 file:line 来自旧 fork，仅作排查参考，不能直接当目标树实现依据。
 
 ## B5a 早期约束
 

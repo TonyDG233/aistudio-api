@@ -4,6 +4,7 @@
 - 调查方式：只读源码 + 既有单测/fixture/证据文档 + 离线构造 wire 数据；未访问真实账号、未走网络、未重跑真实请求、未提交
 - 目标：判断“pg 渠道 + 酒馆预设（把发送文本塞进工具调用输出框）”从请求到返回的哪里断了，并列出可验证的根因假设
 - 术语：本文的“预设工具”指酒馆 anti-truncation 扩展声明的 `emit_complete_response_<nonce>`（见 `tests/unit/test_gemini_request_normalization.py:448-502`），不是 ATG 的 `atg_emit_*`
+- 目标分支重锚：本文 file:line 与分支来自旧 fork；B5a 必须在目标 worktree（99c38ba+9b5cdea）重做，引用仅作排查线索。
 
 ---
 
