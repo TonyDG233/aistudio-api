@@ -203,7 +203,7 @@ Feature ID：`D05-041`
 - **P3-H 手动切换 / pin / auto rebind**：`D04-032`, `D04-038`..`D04-040`, `D04-045`..`D04-051`, `D04-059`, `D04-060` → 手动切换（含显式关闭旧实例后重建）保留；后台自动 rebind、pinned、auto drop。
 - **P3-I 死状态/死 API**：`D04-033`, `D04-043` → drop；账号额度冷却不在 P3 清理范围。
 
-## P4 Build Surface / 9998 / Signer（已确认 2026-10-25）
+## P4 Build Surface / 9998 / Signer（原始确认 2026-10-25；P4-B0 后 Q4 待重审）
 
 ### 总原则
 

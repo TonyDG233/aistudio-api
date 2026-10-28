@@ -193,5 +193,10 @@ diagnostics:
 - [ ] 状态表能覆盖 sleep/wake/rebind/429/403/503 的转换测试（无 idle 自动回收；D-05 有界 rebind；D-10/D-11 drain/prune）。
 - [ ] config/event schema 有示例与离线 fixture 路径，并在迁移 worktree 实际创建；`quota_scope`、`api_allow_anonymous`、`web_password`、`hash_include_code` 均有校验用例。
 - [ ] UI 验收：现有 `SettingsView`/`ApiKeyManagerCard` 中 `quota_scope`、API 免密开关、管理页密码空=免密均“可见且可保存”；不新增 IP/CIDR/本机-局域网模式；不重构 Web 布局/导航。
-- **P4-B0（不属于 Gate 0.5 退出项，是 P4 前置门）**：P4-B0a 先产出 `08-11-build-400-trace.md` 并写回 Q4；P4 实现后 P4-B0b 验证 native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED` 时能区分端点/账号/tier/代理/签名失败，禁止 `9998` 无限重连，native 与 signer 分别验证。详见 `08-10-build-surface-incident-20261028.md`。
 - [ ] 每片 acceptance 模板已用于 P9-pre 的首个切片。
+
+### 6.1 P4 前置门（不属于 Gate 0.5）
+
+- **P4-B0a（实现前）**：产出 `08-11-build-400-trace.md` 并写回 Q4；独立 reviewer 签字后才解除。
+- **P4-B0b（实现后）**：验证 native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED` 时能区分端点/账号/tier/代理/签名失败，禁止 `9998` 无限重连，native 与 signer 分别验证。
+- 详见 `08-10-build-surface-incident-20261028.md`；本门不阻塞 Gate 0.5 退出。

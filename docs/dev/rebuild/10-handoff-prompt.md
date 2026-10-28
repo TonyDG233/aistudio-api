@@ -47,7 +47,7 @@ Gate 0.5 未通过，不得进入 P9-pre 编码。
 Agent 工作模式（详见 05 §2.1）：
 - 你是主线 integrator：唯一持有目标分支/worktree、接口、05/06/ARCHITECTURE 和提交权；负责顺序、合并、验收、changelog。
 - worker 只接一个 Dxx-NNN 或明确文件域；独立 worktree；不得改 05/06/architecture/decision log；报告测试项+预期+实际。
-- reviewer 只读；在 Gate0/0.5、P3 状态机、P2 路由、P5 PG、P7 统计、最终 handoff 独立审查，不参与实现。
+- reviewer 只读；在 Gate0/0.5、P3 状态机、P2 路由、P5 PG、P7 统计、P4-B0a 溯源报告签字、最终 handoff 独立审查，不参与实现。
 - 并行仅限接口已冻结且文件域不重叠；最多 2-3 个 worker；禁止同时改 routing_pipeline.py、instance_pool.py、generation_service.py、05/06/ARCHITECTURE；禁止 F1↔F3、F3↔F4、F4↔F5、F6↔F7 同时改共享语义文件。
 - Gate0/0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7 默认串行；P8 在 API 稳定后并行；**P4-B0a 未完成前不得写 native/transport/Q4 相关实现**；signer-only 离线 spike 与非传输 P4 工作可继续；B0b 未通过不得进入 P4 验收。
 - 不用“保持旧测试绿”复活旧契约；最终合并/提交只由 integrator 做。

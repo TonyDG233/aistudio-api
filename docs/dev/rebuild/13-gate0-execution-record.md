@@ -78,7 +78,7 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 历史提交 b3f09d1、e64a4d9 已存在；本轮 P4-B0 修订提交前工作区非干净，不能写通过。 |
+| G0.1 基线 | **未通过** | b3f09d1、e64a4d9、1bc0efc 已提交且工作区干净；但 P4-B0 文档当前独立复审 BLOCKED，Gate0 其他项也未闭合，不能写通过。 |
 | G0.2 上游硬门 | **通过（本次）** | fetch 成功，`upstream/master=99c38ba` 已记录。 |
 | G0.3 索引 | **历史（518）** | 当轮 `errors=0`、518/518；本轮已更新为 534/534，实际输出见 §3。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | D-01..D-14 已由用户确认；17 个 `NO_FEATURE_ROW` 与 20 冲突已在 08-09 逐项闭合；但尚未经独立 reviewer 复核，不得写“通过”。 |
@@ -93,12 +93,12 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| P4-B0a | **未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。实现前必须按 `08-10-build-surface-incident-20261028.md` 完成离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4。 |
+| P4-B0a | **未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。实现前必须按 `08-10-build-surface-incident-20261028.md` 完成离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4；**须有独立 reviewer 签字后解除 B0a**。 |
 | P4-B0b | **未开始** | P4 实现后验证 fail-fast、错误透传、native/signer 分别测试、9998 无循环重连；未通过不得进入 P4 功能验收。 |
 
 ### 2.5 明确不能声称的事
 
-- 不声称 Gate 0 已通过；G0.1 需文档提交后才成立。
+- 不声称 Gate 0 已通过；G0.1 需文档提交、工作区干净且独立复审通过后才成立；当前 P4-B0 文档复审仍 BLOCKED。
 - 不声称 Gate 0.5 已通过；§4 工件需在迁移 worktree 按 99c38ba + 本文件 §3 schema 重新创建/验证。
 - 不声称 `08-06` 的“可 handoff（有条件）”仍有效；该结论基于 4623109。
 - 不声称 26/26 等于 80/80。
@@ -131,7 +131,7 @@ Gate 状态（不宣称通过）：
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 历史提交 b3f09d1、e64a4d9 已存在；本轮 P4-B0 修订提交前工作区非干净；不得把历史提交当作本轮 Gate0 通过。 |
+| G0.1 基线 | **未通过** | b3f09d1、e64a4d9、1bc0efc 已提交且工作区干净；但 P4-B0 文档独立复审仍 BLOCKED，Gate0 其他项未闭合；不得把提交存在当作 Gate0 通过。 |
 | G0.2 上游硬门 | **未复核（本轮未 fetch）** | 沿用 99c38ba 记录，但本文件不把“未重跑”写成“通过”；进入 Gate 0 时必须重新 fetch 并记录。 |
 | G0.3 索引 | **通过（索引）** | 534/534，`errors=0`，桥接计数正确。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | 14 项已确认、17 分类/20 冲突已闭合；需独立 reviewer 复核。 |

@@ -4,7 +4,7 @@
 
 ## 1. 事故日志
 
-用户提供的运行日志（整理摘录；时间精度/字段顺序按日志查看器为准，未添加或删改错误文本）：
+用户提供的运行日志（整理摘录；时间精度/字段顺序按日志查看器为准；未独立核对原始日志，仅按用户提供文本录入）：
 
 ```text
 2026-10-28 12:04:21.000
@@ -32,7 +32,7 @@ aistudio.upstream.errors
 
 ## 3. 初步判断（待溯源验证）
 
-`PROXY_GENERATION_DISABLED: streamGenerateContent is not supported` 更像**端点/渠道级拒绝**，不是 `9998` 瞬时断线：
+`PROXY_GENERATION_DISABLED: streamGenerateContent is not supported` 的候选假设是**端点/渠道级拒绝**（未确认），不是已证明的 `9998` 瞬时断线：
 
 - 不能假定单纯重连 `9998` 会改变上游对 `streamGenerateContent` 的支持状态；必须用端点/tier/账号/代理证据验证。
 - 不能把该 400 当成瞬态错误无限重试；否则只会形成 native 断线→9998 重连→再次 400 的循环。

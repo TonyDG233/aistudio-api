@@ -188,7 +188,7 @@
 | P5 (D06) | 70 | 74 | +N11/N12/N13/N14 |
 | P7 (D09+D10) | 67 | 69 | +N09/N10 |
 | P9 (D01) | 62 | 64 | +N15/N17 |
-| P4/P6/P8/P10 | 44/25/42/37 | 不变 | 无新增行；**P4 受 08-10/P4-B0 阻塞**：Build native 400 `PROXY_GENERATION_DISABLED` 未溯源前不得实现。 |
+| P4/P6/P8/P10 | 44/25/42/37 | 不变 | 无新增行；**P4 受 08-10/P4-B0a 阻塞**：Build native 400 `PROXY_GENERATION_DISABLED` 未完成离线溯源/Q4 写回前，不得写 native/transport/Q4 相关实现；signer-only 离线 spike 与非传输 P4 可继续；B0b 未通过不得进入 P4 验收。 |
 | 测试处置行 | 82 | **86** | 新增 4 个行为/路由测试文件行；现有行处置按 D-02/D-03/D-05/D-09/D-11 修正。 |
 
 索引脚本同步更新后必须以 `errors=0` 为准；数字变化不得通过把 17 项/20 冲突塞进“其他”实现。
@@ -197,7 +197,7 @@
 
 ## 7. 仍未完成 / 不得声称
 
-- **Gate 0 未通过**：计划文档已提交 b3f09d1，Build 事故记录已提交 e64a4d9；P4-B0 修订提交前工作区仍非干净，G0.1 不得写通过。
+- **Gate 0 未通过**：计划文档已提交 b3f09d1，Build 事故记录已提交 e64a4d9，P4-B0 修订已提交 1bc0efc 且工作区干净；但 P4-B0 文档当前独立复审仍 BLOCKED，且 Gate0 其他项未闭合，G0.1 不得写通过。
 - **Gate 0.5 未执行**：config/event schema、fixture、acceptance 必须在迁移 worktree 基于 99c38ba 重新验证；本文件只冻结输入。
 - **不宣告 handoff**：是否可交接由后续独立 reviewer 判定；本文件不自称通过。
 - 未运行上游测试套件、未访问真实账号/IP/Google、未验证 `static/assets` 本地可复现构建。

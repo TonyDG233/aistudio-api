@@ -14,11 +14,17 @@
 
 ## 2026-10-28
 
+- 范围：`docs/dev/rebuild/05`、`06-P4-questions`、`06-decision-log`、`06-feature-ledger`、`08-09`、`08-10`、`10`、`12`、`13`；`docs/changelog.md`
+- 变更：拆分 `P4-B0a`（实现前离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4，需独立 reviewer 签字）与 `P4-B0b`（实现后 fail-fast/错误透传/native-signer/9998 无循环重试验收）；阻塞范围限定为 native/transport/Q4 相关实现，signer-only 离线 spike 与非传输 P4 可继续。
+- 原因：独立 reviewer 指出单门“实现前/验收前”摇摆、08-11 交付物缺失、12/10 门类别混用、Q4 旧结论残留。
+- 验证：HEAD `1bc0efc`，工作区干净；仅 docs 变更；`08-11` 尚未产出，B0a 未通过。
+- 状态：P4-B0 文档仍被独立复审 BLOCKED；不宣告 Build 渠道可用或 handoff。
+
 - 范围：`docs/dev/rebuild/06-P4-questions.md`、`06-decision-log.md`、`06-feature-ledger.md`、`05`、`08-10-build-surface-incident-20261028.md`、`10`、`12`、`13`；`docs/changelog.md`
-- 变更：记录 Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED` 的事故；新增 P4-B0 阻塞门，要求 P4 实现前按 08-10 重新做端点/账号/tier/代理/签名溯源与 native/signer 解决方案测试；禁止把 9998 重连当作修复。
+- 变更：记录 Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED` 的事故；新增 P4-B0 门（后被上一条拆分为 B0a/B0b）；禁止把 9998 重连当作修复。
 - 原因：2026-10-28 12:04:21/22 的 build_surface 日志；P4-Q4 旧“native 主 + signer 回退”不再可直接作为实现依据。
-- 验证：事故日志原文、08-10 §4/§5 清单；P4 未实现、未访问真实账号/IP/Google。
-- 状态：P4 阻塞；不宣告 Build 渠道可用或 handoff。
+- 验证：事故日志摘录、08-10 §4/§5 清单；P4 未实现、未访问真实账号/IP/Google。
+- 状态：历史条目；P4-B0 单门描述已被上一条 B0a/B0b 条目取代。
 
 - 范围：`docs/dev/rebuild/05`、`06*`、`08-07`、`08-09`、`10`、`12`、`13`；`docs/changelog.md`
 - 变更：新增 `08-09-decision-record.md`，把用户确认的 D-01..D-14、17 个 `NO_FEATURE_ROW` 分类（16 feature + 1 out-of-scope）、20 个冲突闭合、`ENGINEERING_DEFAULT` 清单与 F1-F8 阶段固定为行为权威；修订 05/06/10/12/13 与 08-07 历史横幅。
