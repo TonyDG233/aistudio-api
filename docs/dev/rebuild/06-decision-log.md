@@ -50,7 +50,7 @@
 | D2 并发原语 | 取消 lease / reservation / lease 超时预算；只保留 `active_requests`。acquire 返回 `active_requests` 句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。**手动关闭/改绑**在有 `active_requests` 时仍可拒绝；但**禁用账号/应用预设的 rebind 不得直接拒绝**（D-05）：必须进入 `RETIRING`、停止新请求、有界等待 `active_requests=0` 或超时强制关闭，再关旧页/切号。容量按实例数计算，不再有 reservation 计数。 |
 | D3 控制面 | 控制面只负责登录与保活，不是请求实例，不占池容量。请求实例固定为 `1 账号 + 1 Context + 1 Page + 1 surface`；同账号 chat/build 不并存。账号有活动实例时，Cookie 回写走实例页；否则允许独立控制页。控制面不做蓝绿；切号必须关闭旧页再重建。 |
 | D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁用账号/应用预设触发同一控制面 rebind（D-05）：RETIRING → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
-| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P6 保活/24h → P7 日志/导出 → P5 OpenAI/Gemini → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。VPS 运行 P5 前必须先有 P6 保活和 P7 可用的 debug 日志。每片验收通过后才进入下一片。 |
+| D5 顺序 | 预检（A 文档收敛，不是独立 Gate）→ P9-pre 装配/API Key guard → P1+P3+P2 → P6 保活/24h → P7 日志/导出 → P5 OpenAI/Gemini → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。VPS 运行 P5 前必须先有 P6 保活和 P7 可用的 debug 日志。每片验收通过后才进入下一片。 |
 | D6 迁移 | 只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist；禁止 `-- docs` 整树。迁移前 secret scan；旧 WP 归档到 `docs/dev/evidence/p1-ark-merge-archive/`，关键文档可留 `docs/dev/` 根。 |
 | D7 PG 修复门槛 | P5 验收前完成 F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。 |
 | D8 UI / 模型目录 | upstream Vue 原生布局、文案、交互细节不得无故重写或删除；新 UI 以原生增量为先。ModelCatalog 是模型/paid 元数据唯一所有者；日志、统计、路由只消费，不各自维护 paid map。 |
@@ -239,14 +239,14 @@ Feature ID：`D05-041`
 - 当前不处理：这不是 P4 当前轮次，不要求现在溯源、补证据、改代码或写回 Q4。等到 P4 Build 实现阶段启动时，先按 `08-10-build-surface-incident-20261028.md` §4 做前期探索与功能可行性重试。
 - P4 阶段验收：明确 400 时 fail-fast 或有限回退；禁止 9998 无限循环；客户端收到准确 Build 错误；若当前无成功样本，必须明确“无基线”并补 native/signer 成功 fixture。
 
-## 实现优先级（2026-10-27 按 D5 固定）
+## 实现优先级（按 D5 固定：P6 → P7 → P5）
 
-0. Gate 0：文档/索引/证据冻结，CSV 与 06 对齐，secret scan，迁移与重审。
+0. 预检（A 文档收敛，不是独立 Gate）：文档/索引/证据冻结，CSV 与 06 对齐，secret scan，迁移与重审。
 1. P9-pre：lifespan/config 装配钩子 + API Key guard；目标 seam、状态机、config/event schema 作为输入。
 2. P1 基础 + P3 多实例/Context/Page + P2 路由/重试；只用 `active_requests`，不引入 lease。
-3. P5 最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；P5 验收前过 PG 门槛（D7）。
-4. P6 凭证保活与 24h。
-5. P7 日志页 + 导出（D09，不含统计页）。
+3. P6 凭证保活与 24h。
+4. P7 日志页 + 导出（D09，不含统计页）。
+5. P5 最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；P5 验收前过 PG 门槛（D7）。
 6. P4 Build Surface：当前不执行；P4 阶段启动时先按 08-10 §4 做前期探索，再实现。
 7. P8 API/UI；upstream Vue 原生细节优先，ModelCatalog 单一所有者。
 8. Claude/Responses。
@@ -314,7 +314,7 @@ Feature ID：`D05-041`
 ### 总原则
 
 - 日志页先于统计页实现：查看、级别过滤、搜索、暂停、1/3/7 天导出；P7 gate 只覆盖日志。
-- 统计事件 schema 基线在 Gate 0.5 冻结（`12-gate0-inputs.md` §4）；P5 只扩展字段并实际记账，P7 只做聚合与展示，不另起账本。
+- 统计事件 schema 基线在 P9-pre 前冻结（以 08-09 与 06 为准；12 归历史）；P5 只扩展字段并实际记账，P7 只做聚合与展示，不另起账本。
 - 日志存储：ring 5000 + 每日文件 7 天。
 - dump 只落 `safe_*`，默认关闭；禁止明文 headers/raw_body。
 - root DEBUG 保留，但必须按命名空间/三方库过滤 WARP/tunnel/CDP/websockets/httpx 噪音。
@@ -343,7 +343,7 @@ Feature ID：`D05-041`
 
 - OpenAI Chat + Gemini 首批；Claude 在 Build 后；Responses 更后。
 - 模型列表默认裸 ID；只有双渠道实际启用且实例分配分流时，才暴露条件前缀。
-- API Key 默认要求；显式配置才允许空 Key；loopback 免鉴权不保留。**（已被 D-14 取代：API 独立免密开关默认关闭；管理页 `AISTUDIO_WEB_PASSWORD` 空值免密；不引入 IP/CIDR/设备白名单；见文末 08-09 节）**
+- API 免密只由 `security.api_allow_anonymous` 控制且默认关闭；空 Key ≠ 开放；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空=免密）；不引入 IP/CIDR；管理页不被 API Key 锁死；API Key 与 Web 密码互不复用。见文末 08-09 节。
 - 保留协议感知错误体与明确 HTTP 契约。
 - 最小 UI：登录、总览、账号、实例、日志、设置；统计页后置。
 - 实例 UI 一实例=账号+Context+Page+surface；提供手动切换/重启。
@@ -355,7 +355,7 @@ Feature ID：`D05-041`
 
 - **P8-Q1 协议端点**：`D11-001`..`D11-011` → port。
 - **P8-Q2 模型列表**：`D11-004`, `D11-005`, `D11-007` → port。
-- **P8-Q3 鉴权**：`D11-015`..`D11-018`, `D11-035`, `D11-036` → keep/port；`D11-016` drop。**D-14 注**：API 免密由单一开关控制且默认关闭；管理页 no-auth（`AISTUDIO_WEB_PASSWORD` 空）保留，管理页不被 API Key 锁死；不引入 IP/CIDR。
+- **P8-Q3 鉴权**：`D11-015` → rewrite（D-14）；`D11-016` → drop；`D11-017`、`D11-018`、`D11-035`、`D11-036` → keep/port。**D-14 注**：API 免密由单一开关控制且默认关闭；管理页 no-auth（`AISTUDIO_WEB_PASSWORD` 空）保留，管理页不被 API Key 锁死；不引入 IP/CIDR；API Key 与 Web 密码互不复用；CF Tunnel 绑定不变。
 - **P8-Q4 错误映射**：`D11-013`, `D11-014` → port。
 - **P8-Q5 最小 UI**：`D11-022`..`D11-034`, `D11-037`..`D11-039`, `D11-042` → port；统计页后置。
 - **P8-Q6 实例 UI**：`D11-029`..`D11-031`, `D11-039`, `D11-040` → port。
@@ -369,7 +369,7 @@ Feature ID：`D05-041`
 
 - P9 拆成 P9-pre 与 P9 收尾：P9-pre 只做 lifespan/config 装配钩子、启动/关闭顺序、manager/pool/keepalive 接线；必须在 P1/P3/P2 编码前完成。
 - 保留 upstream lifespan 骨架和关闭清理顺序；只替换装配清单、增加 manager/pool/keepalive 钩子、补生命周期测试。
-- API Key guard 在 P9-pre 完成，P5 暴露端点前必须生效：默认拒绝，显式配置空 Key 才开放；loopback 免鉴权不保留。**（已被 D-14 取代：`security.api_allow_anonymous` 默认 false；管理页空密码免密；API Key 不锁管理页；见文末 08-09 节）**
+- API Key guard 在 P9-pre 完成，P5 暴露端点前必须生效：必须实现 `security.api_allow_anonymous` 且默认 false；空 `api_keys` 不放行；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制；API Key 不锁管理页；不引入 IP/CIDR；API Key 与 Web 密码互不复用。见文末 08-09 节。
 - 启动顺序：active 预热 → 实例 startup → 模型发现 → keepalive；idle/tier 保持。
 - 删除 fork 的 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
 - 配置统一为 YAML + env + 默认值单一 schema；实例配置使用 `count/surface/min_tier`。
@@ -394,7 +394,7 @@ Feature ID：`D05-041`
 
 ### 总原则
 
-- 现有 942 单测保留为“理解旧项目预期行为”的参考，不是新契约；按新逻辑调整，彻底过时的删除。逐文件处置见 `06-test-disposition.csv`（Gate 0.5 前完成）。
+- 现有 942 单测保留为“理解旧项目预期行为”的参考，不是新契约；按新逻辑调整，彻底过时的删除。逐文件处置见 `06-test-disposition.csv`（P9-pre 前完成）。
 - 新测试必须先说明测试项和预期结果，便于用户对齐意图；关键步骤不允许错误滚雪球。
 - 仓库不提交敏感内容；能迁移到新项目做参考、或能通过 Git 查看细节的证据必须保留，避免重复测试和 IP 风控。
 - 尽量减少真实测试；必要时可用 WARP 作为中转层做少量定向测试/单独测试。
@@ -428,7 +428,7 @@ Feature ID：`D05-041`
 | P5 Generation / Protocol / Wire | adopt | `session_token`/`request_context`/`SEED=18`/`WIRE_FINISH_REASON_CONTINUING=22`/角色守卫/结构化 functionCall/functionResponse/per-chunk usage/response_id/统一 thought+signature 写回均采上游；F-01/F-04 仍用离线 fixture 证明。 |
 | P6 Keepalive / Rotation / 24h | keep + disable | 24h 回写、手动保活、429 冷却/跨天 keep；**watchdog keep（D-02）**、**WebSocket ping keep（D-03）**、**liveness checker disable**；idle 回收 disable；`active_activity` 因失去“阻止 idle 回收”的语义置 disable；无后台 stale 复活。 |
 | P7 Logs / Stats | adopt | `reasoning_tokens`、`cached_tokens`、`finish_reasons`、`account_breakdown`、`cachedContentTokenCount` 采上游；`account_breakdown` 是 stats REST 派生字段，不是事件类型；token 汇总仍不含 countTokens。 |
-| P8 API / UI | adopt + rewrite | 账号分组/预设/toggle、Dashboard 统计 UI 采上游原生；API Key 守卫按 **D-14** rewrite：单一免密开关默认关闭，空 Key ≠ 开放；管理页 `AISTUDIO_WEB_PASSWORD` 空=免密且不被 API Key 锁死；不引入 IP/CIDR；其余最小 UI 不重写。 |
+| P8 API / UI | adopt + rewrite | 账号分组/预设/toggle、Dashboard 统计 UI 采上游原生；API Key 守卫按 **D-14** rewrite：单一免密开关默认关闭，空 Key ≠ 开放；管理页 `AISTUDIO_WEB_PASSWORD` 空=免密且不被 API Key 锁死；不引入 IP/CIDR；API Key 与 Web 密码互不复用；CF Tunnel 绑定不变；其余最小 UI 不重写。 |
 | P9 Boot / Config | adopt + rewrite | `rotator/paid_model_rules/tier_quotas/account_presets/defaults/config.yaml/video+imagen profile` 纳入单一 schema；删除浏览器 idle 超时键；超时默认 600；rotator 深合并默认 + 启动校验（D-07）；删除 channel registry 不变。 |
 | P10 Tests / Evidence | rewrite | 保留主 `rebuild` 80 个测试处置；99c38ba 实际 28 个测试文件（含 conftest）；`test_account_presets.py` 改 rewrite、`test_tier_preemption.py` 改 rewrite，共 86 行；**保留 watchdog 用例，删除 liveness/idle 用例**；28/28 仅文件覆盖，不等于行为覆盖。 |
 

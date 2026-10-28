@@ -548,8 +548,8 @@
 | D11 API | 协议面功能开关 features.formats | `3d01ed2`,`dcb7592`,`2b39b53`; `format_errors.py:69-114`; `defaults/config.yaml:69-74` | 新增 | working | `tests/unit/test_format_error_routing.py:57-106`; `test_format_openai.py:808-815` | port | keep |
 | D11 API | 协议感知错误体映射 | `dcb7592`,`2b39b53` `1375646`; `format_errors.py:16-220` | 新增 | working | `tests/unit/test_format_error_routing.py:24-106` | port | port |
 | D11 API | 应用级异常到 HTTP 状态映射 | `0cb1b82`; `app.py:293-373` | 改造 | working | `tests/unit/test_app_error_handlers.py:13-33`; `test_format_error_routing.py` | port | port |
-| D11 API | API Key 鉴权四种取键方式（D-14：单一免密开关默认关闭；空 Key ≠ 开放；管理页空密码=免密；不引入 IP/CIDR） | `upstream/master` 原生；`dependencies.py:18-115` 未被本分支改写 | 原生 | working | `tests/unit/test_api_auth.py:24-126`; `test_routes_models.py:101-115` | keep | port |
-| D11 API | 本地回环免鉴权 | 无实现；`dependencies.py:69-115` 仅按 Key 判定，未见 127.0.0.1 分支 | 待判定 | broken | `未验证`（全仓检索无 loopback bypass） | drop | drop |
+| D11 API | API Key 鉴权四种取键方式（D-14：单一免密开关默认关闭；空 Key ≠ 开放；管理页空密码=免密；不引入 IP/CIDR） | `upstream/master` 原生；`dependencies.py:18-115` 未被本分支改写 | 原生 | working | `tests/unit/test_api_auth.py:24-126`; `test_routes_models.py:101-115` | keep | rewrite |
+| D11 API | 本地回环免鉴权 | 无实现；`dependencies.py:69-115` 仅按 Key 判定，未见 127.0.0.1 分支 | broken | broken | `未验证`（全仓检索无 loopback bypass） | drop | drop |
 | D11 API | 控制台密码鉴权与 `/auth/check` | `upstream/master..master` `fa1d9d3`; `dependencies.py:47-66`; `app.py:507-512` | 原生 | working | `tests/unit/test_api_auth.py:81-126`; `test_routes_system.py:101-108` | keep | port |
 | D11 API | API Key 管理 CRUD `/api-keys` | `upstream/master` 原生；`routes_system.py:570-710` 写回 config.yaml | 原生 | unverified | `未验证`（无 tests/unit 直接覆盖） | port | port |
 | D11 API | 健康检查 `/health` | `upstream/master` 原生；`routes_system.py:164-167`；`9de3c8c` 仅容器探针改路径 | 原生 | working | `tests/unit/test_routes_system.py:92-99` | keep | keep |
