@@ -1,73 +1,70 @@
 # 10 Handoff Prompt
 
-复制以下提示词给全新 agent：
+一页交接。写给下一任 agent：先读完本文，再按“必读顺序”查权威文件。
 
-```text
-项目路径：D:\LLM\self_programming\aistudio-api
-基线：rebuild @ 当前 HEAD（不要写死旧 SHA）；upstream/master @ 4623109（离线用现有 ref，fetch 可选/后置）
-交接前：先提交本轮文档修复，把 `git rev-parse HEAD` 记录到 `08-06-final-readiness-audit.md` 与 `docs/changelog.md`；10 保持“当前 HEAD + git rev-parse 现查”，不要把 SHA 写回本行（避免自引用）。若未提交，必须显式从 rebuild 工作区复制 docs/dev/rebuild，并注明来源不是 commit。
-目标：从 upstream/master 新建 rebuild/upstream worktree，按 D1-D8 重建；不合并 master/rebuild。
+## 接手现状
 
-必读（按顺序）：
-1. docs/dev/rebuild/05-restart-map.md（Gate 0/0.5 流程与迁移边界）
-2. docs/dev/rebuild/06-decision-log.md（P2/P3 与 D1-D8 是行为权威）
-3. docs/dev/rebuild/06-index-validation.md（只读校验脚本）
-4. docs/dev/rebuild/06-feature-ledger.md 与 06-feature-index.csv（唯一事实源；索引不覆盖决策）
-5. docs/dev/rebuild/12-gate0-inputs.md（seam/状态表/config/event/acceptance 模板）
-6. docs/dev/rebuild/06-test-disposition.csv（942 单测逐文件处置）
-7. docs/dev/rebuild/08-01-execution-readiness-audit.md、09-pg-toolcall-analysis.md、08-02-execution-readiness-reaudit.md（只读历史审计，不回改）
-8. docs/dev/rebuild/08-06-final-readiness-audit.md（最终复审；只有结论为可 handoff 才使用本提示词）
-9. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
+- 工作分支 `rebuild`；当前 HEAD 以 `git rev-parse HEAD` 为准；A1-A6 已提交，A7 待计划审计；**未 push**；master 保持不动。
+- A5 已把旧审计/Gate/问题清单移入 `docs/dev/rebuild/archive/`；A6 已把权威 docs 同步到目标 worktree，均随 A5/A6 提交。
+- 目标 worktree `.kilo/worktrees/rebuild-upstream`（HEAD 以 `git rev-parse HEAD` 为准）；其 src 相对基准 diff 为 0，docs 为 A5/A6 同步版。
+- 实际迁移代码 **0 行**；534 行只是 feature inventory，不是迁移成果。
+- Gate0 / Gate0.5 **不再是独立门**；改为 A/B/C 阶段 + 每步审计。
 
-本提示词仅在 `08-06-final-readiness-audit.md` 结论为“可 handoff”后使用；修复后须再由独立审计复核（05 §6.7）。
+## 目标
 
-Gate 0（先做，不改业务代码；完整条件见 08-06 §6）：
-G0.1 基线：`git status --porcelain` 为空；`git rev-parse HEAD` 记录新 SHA；05/10 基线一致。
-G0.2 索引：跑 06-index-validation.md；518 行、ledger_line 全对、桥接 31/43/97/44/70/25/67/42/62/37、无 pending、errors=0。
-G0.3 决策冲突：EXPECTED_DECISIONS 覆盖 D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D05-039 drop、D07-026 keep、D08-022 keep；P9-Q3 不得 drop 日志功能。
-G0.4 Secret/evidence：只扫 docs/dev/rebuild + INDEX.md allowlist，不扫整个 docs；BOTGUARD 是 upstream 原生 grandfather，不复制/不改；spikeQ4-evidence.json/spikeQ4.py 不得进入新仓库。
-G0.5 worktree/迁移：先查 git worktree list 和目标路径；`git worktree add .kilo/worktrees/rebuild-upstream -b rebuild/upstream upstream/master`。只在文档修复已 commit 后用 `git -C $new restore --source=rebuild -- docs/dev/rebuild`；未 commit 则显式 Copy-Item 并说明。禁止 `-- docs` 整树，禁止 checkout src/tests。迁移后确认 06-index-validation.md、10-handoff-prompt.md、12-gate0-inputs.md、06-test-disposition.csv、08-06-final-readiness-audit.md、docs/dev/evidence/INDEX.md、docs/changelog.md 均存在；`git add -A` + `git status -uall`。
-G0.6 归属：ledger-batches 仅历史输入（排除批次文件或保留 README 标注）；旧 WP 正文留在 rebuild，archive/INDEX/changelog 按 05 §6.5 归属。
-G0.7 Gate0.5 文档：12-gate0-inputs.md、06-test-disposition.csv 与 acceptance 模板已存在并通过评审。
-G0.8 Handoff：本提示词已更新，能独立执行；不再依赖旧 08 行号。
+在 `rebuild-upstream` worktree 按 D-01..D-14 与 08-09 重建：先让最小链路真实跑通，再扩面。验收看代码与可复现证据，不看文档进度。
 
-Gate 0.5（P9-pre 前，输入见 12-gate0-inputs.md）：
-1. 五层接口（Account/Auth、Instance、Pool/Router、Executor、Event Sink）与 Account 权威、Context/Page 工厂、surface 解析、active_requests、Event Sink。
-2. 状态表：UNSTARTED/SLEEPING/STARTING/READY/BUSY/RETIRING/CLOSED + active_requests；消息唤醒、idle 默认不自动关、失败/stale 手动重启、手动显式 rebind、429/503。
-3. config schema：count/surface/min_tier、api_keys、formats、keepalive、日志路径。
-4. event schema：request/attempt/usage/error/latency/surface/paid；client/attempt 分母分离；P5 只扩展字段。
-5. 06-test-disposition.csv 与 acceptance 模板（测试项+预期+命令+工件路径）。
-Gate 0.5 未通过，不得进入 P9-pre 编码。
+## 必读顺序
 
-Agent 工作模式（详见 05 §2.1）：
-- 你是主线 integrator：唯一持有目标分支/worktree、接口、05/06/ARCHITECTURE 和提交权；负责顺序、合并、验收、changelog。
-- worker 只接一个 Dxx-NNN 或明确文件域；独立 worktree；不得改 05/06/architecture/decision log；报告测试项+预期+实际。
-- reviewer 只读；在 Gate0/0.5、P3 状态机、P2 路由、P5 PG、P7 统计、最终 handoff 独立审查，不参与实现。
-- 并行仅限接口已冻结且文件域不重叠；最多 2-3 个 worker；禁止同时改 routing_pipeline.py、instance_pool.py、generation_service.py、05/06/ARCHITECTURE。
-- Gate0/0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7 默认串行；P4/P8 在 API 稳定后并行。
-- 不用“保持旧测试绿”复活旧契约；最终合并/提交只由 integrator 做。
+1. `08-09-decision-record.md` — 行为权威：D-01..D-14、17 分类、20 冲突闭合、ENGINEERING_DEFAULT、F1-F8。
+2. `08-08-upstream-99c38ba-full-diff-audit.md` — 事实源：逐文件审计。
+3. `05-restart-map.md` — 迁移边界与 agent 工作模式。
+4. `06-decision-log.md` — P2/P3 落地；与 08-09 冲突时以 08-09 为准。
+5. `06-feature-ledger.md` + `06-feature-index.csv` — inventory（534 行）。
+6. `06-test-disposition.csv` — 测试处置；seam/config/event 以 06/08-09 为准，`archive/12-gate0-inputs.md` 归历史。
+7. `domains/P5-generation/index.md` + `09-pg-toolcall-analysis.md` — P5 早期约束与 PG/toolcall/preset 详情；D7 的 F-01..F-04 是门槛。
+8. `08-10-build-surface-incident-20261028.md` — 仅 C 阶段 P4 启动时读 §4。
 
-顺序（D5）：
-Gate 0 + Gate 0.5 → P9-pre 装配/API Key guard → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → P4 Build → P8/UI → Claude/Responses → 统计页 → P10 收尾。
-每片测试先写“测试项 + 预期结果”，验收通过再进下一片。
+`archive/08-07-upstream-99c38ba-reaudit.md` 仅历史，不得作为行为依据。
 
-状态机红线：
-- 只用 active_requests；禁止 lease/reservation/30s/15s 预算；finally 释放。
-- 控制面只做登录/保活，不算请求实例；有活动实例时 Cookie 回写走实例页。
-- 消息唤醒所有合格 SLEEPING/UNSTARTED 实例；idle browser 自动回收默认关闭（不自动关）。
-- 失败/stale 才手动重启；禁止自动 stale 复活。
-- rebind：后台自动 rebind 不实现；手动显式关闭旧实例再重建允许；禁止 pinned/自动 rebalance。
-- 429：先同账号重试 → 唤醒/切现有实例 → 保存消息后切换再重试 → 耗尽 503 + 等待/管理页提示；已出正文不切号。
-- API Key 默认拒绝，显式空 Key 才开放；loopback 免鉴权不保留。
-- P7 日志先于统计；事件 schema 基线在 Gate 0.5 冻结（12 §4），P5 只扩展字段，P7 只聚合。
-- upstream Vue 原生布局/文案/交互不得无故重写；ModelCatalog 单一所有者。
+D-14 指针：API 免密只由 `security.api_allow_anonymous` 控制且默认关闭；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空=免密）；空 API Key ≠ 开放；不引入 IP/CIDR；API Key 与 Web 密码互不复用。
 
-PG 门槛（P5 验收前）：
-F-01 functionCall 缺 thoughtSignature 兜底；F-02 首事件前真实 HTTP 4xx/5xx；F-03 finish-only/工具流终止兜底；F-04 functionResponse/functionCall 强制 Struct；脱敏 [toolshape] 摘要。
-F-05/06/07 后做，不阻塞 P5 最小闭环；F-08..F-13 在 P5/P4 前 triage。
+## 阶段与顺序
 
-禁止：修改测试/配置绕过契约；合并 master/rebuild；整树 checkout；访问真实账号/IP/Google；提交敏感内容。
+- **A 文档收敛**：收 05/06/10，消除 06 内部 P6→P7→P5 与旧 P5→P6→P7 的冲突。A 经用户审计确认并 commit、且目标 worktree docs 同步后，才可进入 B。
+- **B 实现（顺序固定）**：P9-pre 装配/鉴权 → P1+P3+P2 → **P6 保活/24h** → **P7 结构化日志/错误码/请求关联** → **B5a PG/toolcall/preset 复现** → **B5b P5 最小 OpenAI chat**。每步先写测试项 + 预期，实现后报实际，用户审计确认后才 commit。
+- **C 扩面**：P4 Build（启动时先按 08-10 §4 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。
+- 每个 Step 的范围与退出条件见 `05 §4.1`；前一 Step 审计未通过不得进入下一 Step。
+- B 内部顺序不得改回 P5→P6→P7；任何改序须单独警示用户确认。
 
-验收：G0.1-G0.8 全过；G1-G11 见 08-06 §6.3（固定出处：08-05 附录 A / 08-01:129-140）与 12 §5 模板；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API Key 默认拒绝；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过。
-完成后报告：修改文件、测试命令/结果、未验证项、证据路径。
-```
+B5a/B5b 的范围与退出条件见 `05 §4.1`；B5a 的排查细节见 `09`。B5a 未过不得进入 B5b；B5b 不替代 B 阶段其他步骤。文档布局与每步不新建文档的规则见 `05 §5`。
+
+## Agent 与审计规则
+
+- 主 agent 是唯一 integrator：持有目标分支/worktree、接口与提交权，负责顺序、分派、回收报告和验收。
+- worker/reviewer 的报告先原样交用户；用户审计前，主 agent 不直接改报告/代码/文档，也不自行派下一步。
+- worker 只接一个 Dxx-NNN 或明确文件域，独立 worktree；不得改 05/06/08-09/架构文档；报告必须含测试项、预期、实际。
+- reviewer 只读，在 P3 状态机、P2 路由、P5 PG、P7 统计、P4 前期探索、最终 handoff 独立审查。
+- 并行仅限接口冻结且文件域不重叠，最多 2-3 个 worker；共享语义文件禁止同时修改。
+- 每步闭环：测试项 + 预期 → 实现 → 实际结果 → 主 agent 自审并主动报缺陷 → 用户审计确认 → commit。用户确认前不得 commit。
+- 不得把 ENGINEERING_DEFAULT 写成用户裁决。
+
+## 停止条件
+
+遇到以下情况停下问用户，不得自行决定：
+
+- 需要改 06/08-09 的 D-xx 决策或路线图顺序；
+- 需要真实账号、真实 IP、Google 真实接口或生产授权；
+- 需要 merge、push、改写历史或其他破坏性 git 操作；
+- 权威文档与仓库现状冲突且现有证据无法判定；
+- 需要新增文档、扩大范围或引入新依赖。
+
+## 禁止事项
+
+- 合并 master/rebuild、push、整树 checkout。
+- 恢复 Gate0/Gate0.5 为独立门，或重建 G0.x 计划体系。
+- 把 534 行 inventory 当作迁移成果，或用文档进度替代实现。
+- 为通过测试修改测试/配置/契约。
+- 把 roadmap 改回 P5→P6→P7。
+- 用 `archive/08-07` 作行为依据，或把 9998 重连当作 Build 400 修复。
+- 在 P4 前期探索完成前写 native/transport/Q4 相关 Build 代码。

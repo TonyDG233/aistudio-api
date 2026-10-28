@@ -2,7 +2,7 @@
 
 范围：`docs/dev/rebuild/06-feature-ledger.md` 的逐包决策记录。只记录决定，不复制台账行；未确认项标 `pending`。
 
-修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序。`08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md` 保留历史审计原文，不回改；修复后需重新独立审计。
+修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序；2026-10-28 按 08-08/08-09 闭合 99c38ba 的 14 项决策、17 个 NO_FEATURE_ROW 与 20 个冲突。`archive/08-01-execution-readiness-audit.md` 保留历史审计原文；`domains/P5-generation/09-pg-toolcall-analysis.md` 保留为 P5 工具链路输入，不回改；修复后需重新独立审计。
 
 ## 重构大方向（2026-10-24）
 
@@ -28,31 +28,31 @@
 
 | 包 | Domain | 台账总行 | 非原生行 | 决策内容 |
 |---|---|---:|---:|---|
-| P1 | D02 | 31 | 22 | Account / Auth / Paid |
-| P2 | D05 | 43 | 42 | Routing / Candidate / Switch / Retry |
-| P3 | D03 + D04 | 97 | 81 | Browser / Context / Page / Instance / Pool / Lease |
+| P1 | D02 | 34 | 25 | Account / Auth / Paid |
+| P2 | D05 | 47 | 46 | Routing / Candidate / Switch / Retry |
+| P3 | D03 + D04 | 98 | 82 | Browser / Context / Page / Instance / Pool / Lease |
 | P4 | D07 | 44 | 44 | Build Surface |
-| P5 | D06 | 70 | 50 | Generation / Protocol / Wire |
+| P5 | D06 | 74 | 54 | Generation / Protocol / Wire |
 | P6 | D08 | 25 | 25 | Keepalive / Rotation / 24h |
-| P7 | D09 + D10 | 67 | 51 | Logs / Stats |
+| P7 | D09 + D10 | 69 | 53 | Logs / Stats |
 | P8 | D11 | 42 | 34 | API / UI |
-| P9 | D01 | 62 | 41 | Boot / Config |
+| P9 | D01 | 64 | 43 | Boot / Config |
 | P10 | D12 | 37 | 36 | Tests / Evidence |
-| **合计** | — | **518** | **426** | 与 CSV 实际行数一致 |
+| **合计** | — | **534** | **442** | 与 CSV 实际行数一致（08-09 新增 16 行） |
 
 ## 执行前置 / 顺序 / 状态机（D1-D8，2026-10-27）
 
-`08-01-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
+`archive/08-01-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
 
 | 决策 | 执行规则 |
 |---|---|
-| D1 文档权威 | P2/P3 决策日志为行为权威；CSV/ledger 只是索引。`ledger_line` 必须指向实际台账行；feature 文本、行顺序、decision 三者必须一致。历史 feature 文本可能描述旧 lease/defer；`decision_note` 的“改写为…”是执行口径。桥接行数以 CSV 为准：P1 31、P2 43、P3 97、P4 44、P5 70、P6 25、P7 67、P8 42、P9 62、P10 37，总 518。 |
-| D2 并发原语 | 取消 lease / reservation / lease 超时预算；只保留 `active_requests`。acquire 返回 `active_requests` 句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。关闭/改绑在有 `active_requests` 时拒绝。容量按实例数计算，不再有 reservation 计数。 |
+| D1 文档权威 | P2/P3 决策日志与 08-09 为行为权威；CSV/ledger 只是索引。`ledger_line` 必须指向实际台账行；feature 文本、行顺序、decision 三者必须一致。历史 feature 文本可能描述旧 lease/defer；`decision_note` 的“改写为…”是执行口径。桥接行数以 CSV 为准：P1 34、P2 47、P3 98、P4 44、P5 74、P6 25、P7 69、P8 42、P9 64、P10 37，总 534。 |
+| D2 并发原语 | 取消 lease / reservation / lease 超时预算；只保留 `active_requests`。acquire 返回 `active_requests` 句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。**手动关闭/改绑**在有 `active_requests` 时仍可拒绝；但**禁用账号/应用预设的 rebind 不得直接拒绝**（D-05）：必须进入 `RETIRING`、停止新请求、有界等待 `active_requests=0` 或超时强制关闭，再关旧页/切号。容量按实例数计算，不再有 reservation 计数。 |
 | D3 控制面 | 控制面只负责登录与保活，不是请求实例，不占池容量。请求实例固定为 `1 账号 + 1 Context + 1 Page + 1 surface`；同账号 chat/build 不并存。账号有活动实例时，Cookie 回写走实例页；否则允许独立控制页。控制面不做蓝绿；切号必须关闭旧页再重建。 |
-| D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
-| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → P4 Build → P8/UI → Claude/Responses → 统计页 → P10 收尾。每片验收通过后才进入下一片。 |
+| D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁用账号/应用预设触发同一控制面 rebind（D-05）：RETIRING → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
+| D5 顺序 | 预检（A 文档收敛，不是独立 Gate）→ P9-pre 装配/API Key guard → P1+P3+P2 → P6 保活/24h → P7 日志/导出 → P5 OpenAI/Gemini → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。VPS 运行 P5 前必须先有 P6 保活和 P7 可用的 debug 日志。每片验收通过后才进入下一片。 |
 | D6 迁移 | 只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist；禁止 `-- docs` 整树。迁移前 secret scan；旧 WP 归档到 `docs/dev/evidence/p1-ark-merge-archive/`，关键文档可留 `docs/dev/` 根。 |
-| D7 PG 修复门槛 | P5 验收前完成 F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。 |
+| D7 PG 修复门槛 | P5 验收前先完成 **B5a**：F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。完整 F-01..F-13 与“预设把内容搬进工具通道 / pg 回退”链路见 `domains/P5-generation/index.md` 与 `domains/P5-generation/09-pg-toolcall-analysis.md`；F-08..F-13 未纳入 P5 门，不得当成已验证。B5a 未通过不得进入 B5b/P5。 |
 | D8 UI / 模型目录 | upstream Vue 原生布局、文案、交互细节不得无故重写或删除；新 UI 以原生增量为先。ModelCatalog 是模型/paid 元数据唯一所有者；日志、统计、路由只消费，不各自维护 paid map。 |
 
 ## P1 Account / Auth / Paid
@@ -186,7 +186,7 @@ Feature ID：`D05-041`
 - 取消 lease/reservation 和 30s/15s 预算；只保留 `active_requests`，用于防止关闭/改绑杀流。
 - 容量满按 P2 路由/切号/503；不自动新开实例，不恢复 defer。
 - 关闭即释放实例；失败/stale 才手动重启，禁止自动 stale 复活。
-- rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许；丢弃 pinned、自动 rebalance。
+- rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许；禁用账号/应用预设触发同一控制面 rebind（D-05）：`RETIRING` → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝；丢弃 pinned、自动 rebalance。
 - Build 使用独立 Context/Page；BotGuard 参考项目实现研究/移植，不把临时 chat bootstrap 页作为常态。
 - 丢弃控制面蓝绿；控制面保持单页，切号关闭重建。
 - 丢弃 slot COOLDOWN、retire_idle、_runtime_occupancy；账号额度冷却/解封逻辑保留在账号层。
@@ -203,7 +203,7 @@ Feature ID：`D05-041`
 - **P3-H 手动切换 / pin / auto rebind**：`D04-032`, `D04-038`..`D04-040`, `D04-045`..`D04-051`, `D04-059`, `D04-060` → 手动切换（含显式关闭旧实例后重建）保留；后台自动 rebind、pinned、auto drop。
 - **P3-I 死状态/死 API**：`D04-033`, `D04-043` → drop；账号额度冷却不在 P3 清理范围。
 
-## P4 Build Surface / 9998 / Signer（已确认 2026-10-25）
+## P4 Build Surface / 9998 / Signer（原始确认 2026-10-25；P4-B0 后 Q4 待重审）
 
 ### 总原则
 
@@ -211,7 +211,7 @@ Feature ID：`D05-041`
 - `Q1 B`：Build app 配置优先，保留 Ark 默认。
 - `Q2 C`：健康时复用页面；异常、换号、断线时重建。
 - `Q3 A`：参考项目移植 BotGuard 到 build；失败时保存 PNG + 页面 HTML。
-- `Q4 A`：native 9998 主，signer 首帧前回退。
+- `Q4 A`：native 9998 主，signer 首帧前回退。**2026-10-28 事故后，在 P4 实现阶段重新确认前不得作为现行实现依据**；当前不进入 P4，不要求现在做溯源或补证据。
 - `Q5 A`：human gate、focus、过场点击全部保留；仍标未验证。
 - `Q6 A`：单 9998 端口 + 每实例 realm。
 - `Q7`：不限制 build 页并发；按均衡负载路由。`BUILD_BUSY` 只作为换号/重载保护，不是并发上限。
@@ -224,7 +224,7 @@ Feature ID：`D05-041`
 - **P4-Q1 Build app 来源**：`D07-001` → keep。
 - **P4-Q2 页面复用/清理**：`D07-002`, `D07-003`, `D07-042` → port。
 - **P4-Q3 BotGuard/失败现场**：`D07-004`, `D07-005`, `D07-044` → port。
-- **P4-Q4 native/signer/解析**：`D07-012`..`017`, `D07-019`..`022`, `D07-027`..`029`, `D07-032`..`037`, `D07-043` → port/keep。
+- **P4-Q4 native/signer/解析**：`D07-012`..`017`, `D07-019`..`022`, `D07-027`..`029`, `D07-032`..`037`, `D07-043` → port/keep。**2026-10-28 起暂停作为实现依据**：Build native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`，P4 必须先按 `08-10-build-surface-incident-20261028.md` 重新溯源，确认 native/signer 端点与回退条件后再实现。
 - **P4-Q5 反自动化层**：`D07-006`..`009` → keep；`D07-044` → port。
 - **P4-Q6 9998 sink/realm**：`D07-010`, `D07-011`, `D07-018`, `D07-030` → port。
 - **P4-Q7 并发/中止**：`D07-023`..`026`, `D07-031` → `D07-024` keep 作为换号/重载保护，`D07-026` keep（PAGE_CLOSED 三处检测），其余 port；不限制请求并发。
@@ -232,15 +232,22 @@ Feature ID：`D05-041`
 - **P4-Q9 身份/配额**：`D07-038`, `D07-039` → port；使用实例 session/scope 与实例配置。
 - **P4-Q10 非流式**：`D07-041` → port。
 
-## 实现优先级（2026-10-27 按 D5 固定）
+### P4 Build 渠道事故记录（2026-10-28，未来 P4 阶段处理）
 
-0. Gate 0：文档/索引/证据冻结，CSV 与 06 对齐，secret scan，迁移与重审。
+- 日志：`build_surface:stream` native 首帧前断开；上游 `400 INVALID_ARGUMENT`，`PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；进入 `9998` 重连后仍报 `NATIVE_ERROR`。
+- 影响：Build native 端点可能被渠道/账号/代理级禁用；P4-Q4 的 native 主 + signer 回退假设在 P4 实现阶段必须重新确认。
+- 当前不处理：这不是 P4 当前轮次，不要求现在溯源、补证据、改代码或写回 Q4。等到 P4 Build 实现阶段启动时，先按 `08-10-build-surface-incident-20261028.md` §4 做前期探索与功能可行性重试。
+- P4 阶段验收：明确 400 时 fail-fast 或有限回退；禁止 9998 无限循环；客户端收到准确 Build 错误；若当前无成功样本，必须明确“无基线”并补 native/signer 成功 fixture。
+
+## 实现优先级（按 D5 固定：P6 → P7 → P5）
+
+0. 预检（A 文档收敛，不是独立 Gate）：文档/索引/证据冻结，CSV 与 06 对齐，secret scan，迁移与重审。
 1. P9-pre：lifespan/config 装配钩子 + API Key guard；目标 seam、状态机、config/event schema 作为输入。
 2. P1 基础 + P3 多实例/Context/Page + P2 路由/重试；只用 `active_requests`，不引入 lease。
-3. P5 最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；P5 验收前过 PG 门槛（D7）。
-4. P6 凭证保活与 24h。
-5. P7 日志页 + 导出（D09，不含统计页）。
-6. P4 Build Surface。
+3. P6 凭证保活与 24h。
+4. P7 日志页 + 导出（D09，不含统计页）。
+5. P5 最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；P5 验收前过 PG 门槛（D7）。
+6. P4 Build Surface：当前不执行；P4 阶段启动时先按 08-10 §4 做前期探索，再实现。
 7. P8 API/UI；upstream Vue 原生细节优先，ModelCatalog 单一所有者。
 8. Claude/Responses。
 9. P7 统计页（D10）。
@@ -298,7 +305,7 @@ Feature ID：`D05-041`
 - **P6-Q3 metadata/tier/email**：`D08-006`, `D08-007`, `D08-023`, `D08-024` → keep/port。
 - **P6-Q4 auto switch/rebalance**：`D08-015`..`D08-018` → drop。
 - **P6-Q5 429 冷却/跨天**：`D08-020`, `D08-021` → keep。
-- **P6-Q6 active_activity/idle browser**：`D08-014`, `D08-022` → active_activity keep 可选；idle 自动回收默认关闭（不自动关），消息到达唤醒 SLEEPING/UNSTARTED，失败/stale 才手动重启。
+- **P6-Q6 active_activity/idle browser**：`D08-014`, `D08-022` → 上游已无 idle 自动回收，不实现 idle 关闭；active_activity keep 可选；消息到达唤醒 SLEEPING/UNSTARTED，失败/stale 才手动重启。
 - **P6-Q7 手动切换/触发/状态**：`D08-019`, `D08-025` → port/keep。
 - **P6-Q8 job 锁/重试**：`D08-003`..`D08-005` → port；A 方案。
 
@@ -307,7 +314,7 @@ Feature ID：`D05-041`
 ### 总原则
 
 - 日志页先于统计页实现：查看、级别过滤、搜索、暂停、1/3/7 天导出；P7 gate 只覆盖日志。
-- 统计事件 schema 基线在 Gate 0.5 冻结（`12-gate0-inputs.md` §4）；P5 只扩展字段并实际记账，P7 只做聚合与展示，不另起账本。
+- 统计事件 schema 基线在 P9-pre 前冻结（以 08-09 与 06 为准；12 归历史）；P5 只扩展字段并实际记账，P7 只做聚合与展示，不另起账本。
 - 日志存储：ring 5000 + 每日文件 7 天。
 - dump 只落 `safe_*`，默认关闭；禁止明文 headers/raw_body。
 - root DEBUG 保留，但必须按命名空间/三方库过滤 WARP/tunnel/CDP/websockets/httpx 噪音。
@@ -336,7 +343,7 @@ Feature ID：`D05-041`
 
 - OpenAI Chat + Gemini 首批；Claude 在 Build 后；Responses 更后。
 - 模型列表默认裸 ID；只有双渠道实际启用且实例分配分流时，才暴露条件前缀。
-- API Key 默认要求；显式配置才允许空 Key；loopback 免鉴权不保留。
+- API 免密只由 `security.api_allow_anonymous` 控制且默认关闭；空 Key ≠ 开放；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空=免密）；不引入 IP/CIDR；管理页不被 API Key 锁死；API Key 与 Web 密码互不复用。见文末 08-09 节。
 - 保留协议感知错误体与明确 HTTP 契约。
 - 最小 UI：登录、总览、账号、实例、日志、设置；统计页后置。
 - 实例 UI 一实例=账号+Context+Page+surface；提供手动切换/重启。
@@ -348,7 +355,7 @@ Feature ID：`D05-041`
 
 - **P8-Q1 协议端点**：`D11-001`..`D11-011` → port。
 - **P8-Q2 模型列表**：`D11-004`, `D11-005`, `D11-007` → port。
-- **P8-Q3 鉴权**：`D11-015`..`D11-018`, `D11-035`, `D11-036` → keep/port；`D11-016` drop。
+- **P8-Q3 鉴权**：`D11-015` → rewrite（D-14）；`D11-016` → drop；`D11-017`、`D11-018`、`D11-035`、`D11-036` → keep/port。**D-14 注**：API 免密由单一开关控制且默认关闭；管理页 no-auth（`AISTUDIO_WEB_PASSWORD` 空）保留，管理页不被 API Key 锁死；不引入 IP/CIDR；API Key 与 Web 密码互不复用；CF Tunnel 绑定不变。
 - **P8-Q4 错误映射**：`D11-013`, `D11-014` → port。
 - **P8-Q5 最小 UI**：`D11-022`..`D11-034`, `D11-037`..`D11-039`, `D11-042` → port；统计页后置。
 - **P8-Q6 实例 UI**：`D11-029`..`D11-031`, `D11-039`, `D11-040` → port。
@@ -362,13 +369,13 @@ Feature ID：`D05-041`
 
 - P9 拆成 P9-pre 与 P9 收尾：P9-pre 只做 lifespan/config 装配钩子、启动/关闭顺序、manager/pool/keepalive 接线；必须在 P1/P3/P2 编码前完成。
 - 保留 upstream lifespan 骨架和关闭清理顺序；只替换装配清单、增加 manager/pool/keepalive 钩子、补生命周期测试。
-- API Key guard 在 P9-pre 完成，P5 暴露端点前必须生效：默认拒绝，显式配置空 Key 才开放；loopback 免鉴权不保留。
+- API Key guard 在 P9-pre 完成，P5 暴露端点前必须生效：必须实现 `security.api_allow_anonymous` 且默认 false；空 `api_keys` 不放行；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制；API Key 不锁管理页；不引入 IP/CIDR；API Key 与 Web 密码互不复用。见文末 08-09 节。
 - 启动顺序：active 预热 → 实例 startup → 模型发现 → keepalive；idle/tier 保持。
 - 删除 fork 的 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
 - 配置统一为 YAML + env + 默认值单一 schema；实例配置使用 `count/surface/min_tier`。
 - 删除 channel registry，只保留 `surface=chat/build`。
 - 保留热更新与原子写回；legacy 配置键一次性迁移后删除。
-- 关键配置 fail-fast，非关键配置回退默认。
+- 关键配置 fail-fast，非关键配置回退默认。**（rotator 按 D-07 深合并默认 + 启动校验；不得静默/请求期 KeyError）**
 - 全局原生优先：upstream 原生实现无必要修改则不动，尤其 UI 细节不得无故重写/删除。
 
 ### 关键 Feature IDs
@@ -387,7 +394,7 @@ Feature ID：`D05-041`
 
 ### 总原则
 
-- 现有 942 单测保留为“理解旧项目预期行为”的参考，不是新契约；按新逻辑调整，彻底过时的删除。逐文件处置见 `06-test-disposition.csv`（Gate 0.5 前完成）。
+- 现有 942 单测保留为“理解旧项目预期行为”的参考，不是新契约；按新逻辑调整，彻底过时的删除。逐文件处置见 `06-test-disposition.csv`（P9-pre 前完成）。
 - 新测试必须先说明测试项和预期结果，便于用户对齐意图；关键步骤不允许错误滚雪球。
 - 仓库不提交敏感内容；能迁移到新项目做参考、或能通过 Git 查看细节的证据必须保留，避免重复测试和 IP 风控。
 - 尽量减少真实测试；必要时可用 WARP 作为中转层做少量定向测试/单独测试。
@@ -407,5 +414,69 @@ Feature ID：`D05-041`
 - **P10-Q6 凭据**：仓库已有不入库约束；`D12-015`, `D12-032`, `D12-036` 只保留脱敏形状/结论。
 - **P10-Q7 证据索引**：`D12-033` → port。
 - **P10-Q8 验收工件与文档同步**：`D12-035`, `D12-037` → port；同步 AGENT/READMEs/ARCHITECTURE/changelog。
+
+## 99c38ba 上游裁决（2026-10-27，追加；不改 P1-P10 原结论）
+
+本节只追加新裁决、标注被替代的旧表述；`archive/08-07-upstream-99c38ba-reaudit.md` 是完整影响矩阵。feature 集不变，仍为 518 行（已被 08-09 的 534 行取代）；不新增 feature 行。
+
+| 决策包 | 动作 | 裁决 |
+|---|---|---|
+| P1 Account / Auth / Paid | adopt | `AccountMeta.enabled/group`、`AccountPreset`/`presets.json`、分组/预设 CRUD 与路由（保留分组/预设；**notes 与 batchToggleGroup 按 D-13 删除**）、`get_active_account` 只回退 enabled 账号，全部采上游原生；禁用账号不入候选。 |
+| P2 Routing / Candidate / Switch / Retry | rewrite | `AccountStats` 的 `daily_models`、`resolve_tier_quota`、`tier_weights/stickiness/drip_penalty`、`required_tiers` 只作现有实例候选的排序/准入；不新增请求实例、不后台改绑、不另立并发账本。付费模型无合格账号的本地 403 fast-fail adopt；与 429→503 分开。 |
+| P3 Browser / CDP / Context / Page / Instance / Pool / Lease | adopt + rewrite | **保留 pipe watchdog（D-02，仅父进程死亡后的孤儿 Chromium 清理）**；**只保留 WebSocket ping（D-03）**，liveness checker/轮询 disable；idle 回收删除；adopt `capture._ensure_template` 的 `await session.ensure_ready()`；page prune 按 D-11 关闭所有非当前请求/非当前活跃账号的 Page/Context；drain 只在旧 Page/Context 上有界，期间不新建新页；不采用 `session.py:211` 的 blue-green `create_new_page`/`_retiring_contexts` 后台 drain。1 账号 + 1 Context + 1 Page + 1 surface、无 lease 不变。 |
+| P4 Build Surface | keep | Build 范围保持；只继承 wire/transport 修复。2026-10-28 事故记录：native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`；当前不进入 P4，不要求现在溯源/补证据；P4 实现阶段启动时先按 08-10 §4 做前期探索和可行性重试。不得把 P4-Q4 的 native 主路径当已验证事实。 |
+| P5 Generation / Protocol / Wire | adopt | `session_token`/`request_context`/`SEED=18`/`WIRE_FINISH_REASON_CONTINUING=22`/角色守卫/结构化 functionCall/functionResponse/per-chunk usage/response_id/统一 thought+signature 写回均采上游；F-01/F-04 仍用离线 fixture 证明。 |
+| P6 Keepalive / Rotation / 24h | keep + disable | 24h 回写、手动保活、429 冷却/跨天 keep；**watchdog keep（D-02）**、**WebSocket ping keep（D-03）**、**liveness checker disable**；idle 回收 disable；`active_activity` 因失去“阻止 idle 回收”的语义置 disable；无后台 stale 复活。 |
+| P7 Logs / Stats | adopt | `reasoning_tokens`、`cached_tokens`、`finish_reasons`、`account_breakdown`、`cachedContentTokenCount` 采上游；`account_breakdown` 是 stats REST 派生字段，不是事件类型；token 汇总仍不含 countTokens。 |
+| P8 API / UI | adopt + rewrite | 账号分组/预设/toggle、Dashboard 统计 UI 采上游原生；API Key 守卫按 **D-14** rewrite：单一免密开关默认关闭，空 Key ≠ 开放；管理页 `AISTUDIO_WEB_PASSWORD` 空=免密且不被 API Key 锁死；不引入 IP/CIDR；API Key 与 Web 密码互不复用；CF Tunnel 绑定不变；其余最小 UI 不重写。 |
+| P9 Boot / Config | adopt + rewrite | `rotator/paid_model_rules/tier_quotas/account_presets/defaults/config.yaml/video+imagen profile` 纳入单一 schema；删除浏览器 idle 超时键；超时默认 600；rotator 深合并默认 + 启动校验（D-07）；删除 channel registry 不变。 |
+| P10 Tests / Evidence | rewrite | 保留主 `rebuild` 80 个测试处置；99c38ba 实际 28 个测试文件（含 conftest）；`test_account_presets.py` 改 rewrite、`test_tier_preemption.py` 改 rewrite，共 86 行；**保留 watchdog 用例，删除 liveness/idle 用例**；28/28 仅文件覆盖，不等于行为覆盖。 |
+
+被本节替代/修正的旧表述：
+
+- P6-Q6 的 “active_activity 阻止 idle 回收” 与 P6 总原则的 idle 自动回收默认关闭：上游已无 idle 回收，active_activity 置 disable；`SLEEPING` 仍保留为消息唤醒状态，但只由显式释放进入。
+- 索引行随 99c38ba 调整（该轮不改 518 行集合，只改 decision/note；后由 08-09 增至 534 行）：`D01-012`、`D01-038`、`D03-035`、`D04-042` → `drop`（idle 回收/超时/监控不再存在）；`D03-004` → `keep`（保留 pipe watchdog/进程组/Job Object/atexit，D-02）；`D03-009` → `rewrite`（删 liveness checker 与轮询，保留 WebSocket ping 与页面失败即失败，D-03）；`D08-022` → `rewrite`（只保留消息唤醒 SLEEPING/UNSTARTED 与失败/stale 手动重启，idle 回收不实现）。CSV 与 ledger 已同步。
+- `archive/08-06` 基于 `4623109` 的 handoff 结论失效，只作历史；新基线为 `99c38ba`。
+- 旧 “26/26 新 worktree 测试覆盖” 修正为 `99c38ba` 28/28；26 是 `b8af406` 计数，不能与主 `rebuild` 80/80 混同。
+
+D12/lease 措辞复核：D02/D05/D06/D12 相关行已按“无 lease、`active_requests` 唯一账本、429→503 retained”执行；**该句中的“不新增 feature 行/不改变 518 行集合”已被 08-09 取代（见下节）**。
+
+## 08-09 决策闭合（2026-10-28）
+
+用户已确认 D-01..D-14（完整选择、影响与边界见 `08-09-decision-record.md` §1）；本节只记录对台账的落地结果，不复制决策正文。
+
+### 行数与桥接
+
+- feature 集由 518 行增至 **534 行**：17 个 `NO_FEATURE_ROW` 中 16 个真实功能新增独立行，N03（notes）按 D-13 删除、不新增行；tooling/build artifact 不进入 feature 数。
+- 桥接：P1 34、P2 47、P3 98、P4 44、P5 74、P6 25、P7 69、P8 42、P9 64、P10 37，总 534；`errors=0`。
+- 20 冲突 C01..C20 全部闭合；C14/C17/C18/C20 是 `ENGINEERING_DEFAULT`（可回退），C06 由 D-04 + E-07 共同闭合，其余由用户决策闭合。
+
+### 新增 feature ID
+
+| Feature ID | 来源 | 决定 | 边界 |
+|---|---|---|---|
+| `D01-063` | N17 | port | `defaults/config.yaml` 运行时引导模板；首启初始化是运行时行为。 |
+| `D01-064` | N15 | port | video_models/Veo + imagen profile；不改变实例模型。 |
+| `D02-032` | N01 | port | enabled/disabled + 候选过滤 + active 仅在 enabled 回退；禁用触发有界 rebind。 |
+| `D02-033` | N02 | port | 分组 CRUD + UI 过滤；batchToggleGroup 按 D-13 删除。 |
+| `D02-034` | N04 | port | presets.json；锁/写失败按 D-08 修复。 |
+| `D03-036` | N16 | port | CDP `$rpc/` 传输证据链。 |
+| `D05-044` | N05 | port | `quota_scope` 双口径 + tier 软配额。 |
+| `D05-045` | N06 | rewrite | 打分配置 + 深合并默认/启动校验（D-07）。 |
+| `D05-046` | N07 | port | paid_model_rules 准入；规则优先级 E-07。 |
+| `D05-047` | N08 | port | 只保留准入 + 本地 403；不请求期切号（D-04/D-06）。 |
+| `D06-071` | N11 | port | seed 仅 Gemini；其他协议接受并告警忽略（E-04）。 |
+| `D06-072` | N12 | port | ≥96KiB gzip + base64。 |
+| `D06-073` | N13 | port | wire 字段语义改名。 |
+| `D06-074` | N14 | port | finish 18/22 + 新编号表（E-03）。 |
+| `D10-033` | N09 | port | `/stats` account_breakdown。 |
+| `D10-034` | N10 | port | finish_reasons 先进 API（E-02）。 |
+
+### 对上一节（99c38ba 上游裁决）的修正
+
+- P3 的“移除 watchdog/liveness checker/CDP ping”改为：**watchdog 保留（D-02，仅孤儿进程回收）**；**只保留 WebSocket ping，删除 liveness checker/轮询（D-03）**。
+- P9 的“缺失/部分 rotator fail-fast”改为 **深合并默认 + 启动校验（D-07）**，不得静默、不得请求期 `KeyError`。
+- P8 的“API Key 守卫 rewrite 为默认拒绝、显式空 Key 才开放”改为 **D-14：API 独立免密开关（默认关闭）+ 管理页 `AISTUDIO_WEB_PASSWORD` 空值免密**；不引入 IP/CIDR/设备白名单。
+- “feature 集不变、仍为 518 行”不再成立；以本节 534 行为准。
 
 
