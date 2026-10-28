@@ -1,6 +1,6 @@
 # 06 Feature Ledger
 
-状态：已合并 12 个 domain 批次；P1-P10 已全部决定，pending=0。
+状态：已合并 12 个 domain 批次；P1-P10 已全部决定，pending=0。2026-10-28 按 08-09 追加 16 个真实功能行（17 个 `NO_FEATURE_ROW` 中 N03=out-of-scope），共 **534** 行；历史 provenance 保留。
 基线：`upstream/master`；开发范围：`upstream/master..master`（含 `p1-ark-merge` 95 个独有提交 + master 后 8 个修复提交）。
 证据优先级：代码/日志/SSE/fixture > `docs/dev/rebuild/01-05`；02/05 只作调查线索，不作事实来源。
 约束：不修代码、不合并 master、不访问真实账号/IP；每行必须有 provenance 和证据，缺失必须显式标注。全局规则：上游原生实现无必要修改则不动；UI 布局、文案、交互和细节不得无故重写或删除。
@@ -91,6 +91,8 @@
 | D01 Boot & Config | 动态日志级别（root DEBUG + handler 分级） | eed30b6 + src/aistudio_api/infrastructure/utils/logger.py:234-261 | 改造 | working | test_logging.py:68-87 | keep | keep |
 | D01 Boot & Config | dump 开关优先级与敏感字段掩码 | upstream/master..master + src/aistudio_api/infrastructure/utils/logger.py:72-227,311-337 | 原生 | working | test_logging.py:89-180,247-309 | keep | keep |
 | D01 Boot & Config | get_logger 命名空间 | upstream/master..master + src/aistudio_api/infrastructure/utils/logger.py:300-306 | 原生 | working | test_logging.py:57-66 | keep | keep |
+| D01 | defaults/config.yaml 运行时引导模板（缺失即复制、首启初始化） | 99c38ba; config.py:71-99; defaults/config.yaml:1-205; Dockerfile:92-93 | 新增 | unverified | 无直接单测；配置引导路径仅代码核对（config.py:71-99），未验证 | port | port |
+| D01 | 模型默认 profile 扩展（video_models/Veo + imagen 图像模型） | 99c38ba; model_defaults.py:279-296; config.yaml:76-84 | 新增 | unverified | upstream 无 profile 专项测试；需补 model_defaults 用例 | port | port |
 
 ### D02 Account / Auth / Paid
 
@@ -127,6 +129,9 @@
 | D02 | 账号身份校验与防错绑（verify_account_identity，不匹配拒绝回写） | 8e5e0cb; infrastructure/gateway/session_auth.py:235-363 | 改造 | working | test_session_lifecycle.py::test_verify_account_identity_does_not_rmtree（不匹配返回 False） | keep | keep |
 | D02 | Cookie 注入页面（先清 Cookie/Cache，全量注入含 accounts/OSID） | 9786b3a; session_auth.py:121-149 | 改造 | working | test_cookie_persistence.py::test_load_cookies_keeps_account_and_osid_cookies | keep | keep |
 | D02 | Cookie 回写合并（name+domain+path 键，保留未过期跨域 cookie，原子写） | 9786b3a; session_auth.py:366-437; account_store.py:45-65 | 改造 | working | test_cookie_persistence.py::test_save_cookies_merges_missing_account_cookies, test_save_cookies_preserves_cross_domain_twins, test_write_storage_state_preserves_non_cookie_fields | keep | keep |
+| D02 | 账号启用/停用状态、候选过滤与 active 仅在 enabled 回退 | 99c38ba; account_store.py:103-133,354-374; account_rotator.py:645-663 | 新增 | partial | 上游仅 store 级 test_account_presets.py；无路由级/rebind 用例 | port | port |
+| D02 | 账号分组 CRUD 与分组过滤 UI（不含批量启停） | 99c38ba; routes_accounts.py:499-521; AccountsView.vue:190-210 | 新增 | partial | 上游 test_account_presets.py 间接覆盖；无路由级/UI 用例 | port | port |
+| D02 | 账号预设 CRUD/snapshot/apply（data/accounts/presets.json） | 99c38ba; account_store.py:635-770; routes_accounts.py:524-616; config.yaml:214-232 | 新增 | partial | 上游 test_account_presets.py 3 例；锁/写失败/只读目录未覆盖 | port | port |
 
 ### D03 Browser / CDP / Context / Page
 
@@ -135,9 +140,9 @@
 | D03 | 控制面 `BrowserSession`：懒启动、`ensure_ready` 就绪门、profile dir 派生 | upstream/master(4623109); session.py:67-215,564-583 | 原生 | working | test_session_lifecycle.py:18,160；test_browser_session.py:175 | keep | keep |
 | D03 | Chromium 直接子进程启动（CloakBrowser 独占、stealth/low-mem args、fingerprint key=user_data_dir） | upstream/master(4623109); browser_engine.py:61-227,1013-1071 | 原生 | working | test_browser_engine.py:34,59,141,184 | keep | keep |
 | D03 | 遗留/孤儿 Chromium 清理、端口等待、Singleton/DevTools 锁文件删除 | upstream/master(4623109); browser_engine.py:471-680,1024 | 原生 | working | test_browser_engine.py:153,232 | keep | keep |
-| D03 | 进程守护：pipe watchdog、进程组 SIGTERM/SIGKILL、Windows Job Object、atexit/signal hook | upstream/master(4623109); browser_engine.py:683-898,931-1010 | 原生 | working | test_browser_engine.py:169,203 | keep | rewrite |
+| D03 | 进程守护：pipe watchdog、进程组 SIGTERM/SIGKILL、Windows Job Object、atexit/signal hook | upstream/master(4623109); browser_engine.py:683-898,931-1010 | 原生 | working | test_browser_engine.py:169,203 | keep | keep |
 | D03 | CDP WebSocket JSON-RPC：请求 future、事件分发、超时、断线失败全部 pending | upstream/master(4623109); cdp_client.py:93-308 | 原生 | working | test_cdp_client.py:38-93 | keep | keep |
-| D03 | `connect_page`：复用首个 page target、关闭多余 about:blank tab、3 次重试 | 4aa35cb,0fe5821; cdp_client.py:871-918 | 原生 | working | test_cdp_client.py:235-260 | keep | keep |
+| D03 | `connect_page`：复用首个 page target、关闭多余 about:blank tab、3 次重试 | 4aa35cb,0fe5821; cdp_client.py:871-918 | 原生 | working | test_cdp_client.py:235-260 | keep | rewrite |
 | D03 | page 创建/关闭：`create_new_page`、`CDPPage.close`(Page.close+WS close)、`close_target` | f110d51a,8960de9; cdp_client.py:810-819,920-939,1038-1050 | 原生 | working | test_session_blue_green_readiness.py:82；无真实 target 关闭测试，未验证 | keep | keep |
 | D03 | Inspector.detached 与 Inspector/Target.targetCrashed：标记 page closed 并立即失败 pending futures | 4aa35cb,4586271; cdp_client.py:164-198,375-396 | 原生 | working | test_cdp_client.py:200-213 | keep | keep |
 | D03 | page liveness (`Runtime.evaluate 1`) + 浏览器进程 liveness checker（发送/等待命令中轮询） | 4c39542,4aa35cb; cdp_client.py:107-117,216-276,338-350 | 原生 | working | test_cdp_client.py:184-196,216-231；test_browser_session.py:175 | keep | rewrite |
@@ -149,7 +154,7 @@
 | D03 | `PooledSession`：在指定 context 内建页、注 cookie、导航、BotGuard、快照/传输 | dd5e359; pooled_session.py:51-99 | 新增 | unverified | 无 test_pooled_session*.py；pool 测试均用 FakeSession，未验证 | keep | keep |
 | D03 | **当前事实：一 context 多 page**（同账号第二 channel 复用同一 context，chat+build 并存两页） | 79901b0,a59c885; instance_pool.py:533-606,642-687,1051-1094 | 新增 | partial | test_instance_pool.py:811-832,913-934；受 max_contexts/页预算约束，见冲突表 | port（需决定是否一 context 一 page） | drop |
 | D03 | 蓝绿 page 切换：已有 context 时 `create_new_page`，首启 `connect_page`，新页就绪后原子换 active | 4586271; session.py:221-310 | 原生 | working | test_session_blue_green_readiness.py:82-155；test_session_lifecycle.py:18 | keep | drop |
-| D03 | retiring drain：旧 context in_flight 归零或 12s 超时后关页 + close_target，不打断在途流 | 4586271; session.py:317-338; session_state.py:23-45 | 原生 | working | test_session_blue_green_readiness.py:58-78,82-155 | keep | drop |
+| D03 | retiring drain：旧 context in_flight 归零或 12s 超时后关页 + close_target，不打断在途流 | 4586271; session.py:317-338; session_state.py:23-45 | 原生 | working | test_session_blue_green_readiness.py:58-78,82-155 | keep | rewrite |
 | D03 | `SessionReadinessGate`：UNINITIALIZED/PREPARING/READY/FAILED，waiters fail-fast | 4586271; session_state.py:48-125 | 原生 | working | test_session_blue_green_readiness.py:20-54 | keep | drop |
 | D03 | BotGuard bootstrap：`say '1'` 探针、hook 安装、in-page/网络模板截获、临时 chat、恢复输入框 | 4586271,1cc634e; botguard_bootstrap.py:22-323 | 原生 | working | test_browser_session.py:516-565；真实上游未跑，未验证 | keep | keep |
 | D03 | BotGuard 捕获期间跳登录页：重新注入 cookie 后继续（upstream 4623109 曾移除，HEAD 恢复） | 4623109..HEAD; botguard_bootstrap.py:252-262 | 改造 | unverified | 无对应分支测试；仅代码路径，未验证 | keep | keep |
@@ -167,6 +172,7 @@
 | D03 | 单实例单页：全局页预算=max(1,max_contexts)，chat/build 页预算由 max_instances 派生；第二页拒绝 | 7cd6d74,9786b3a; instance_pool.py:202-255,314-363 | 改造 | working | test_instance_pool.py:938-1031 | keep | port |
 | D03 | 浏览器回收后 stale/pinned slot 复活：同账号复用原 slot 重载 context/page | 86391c8; instance_pool.py:919-961; test_instance_pool.py:1034-1058 | 新增 | working | test_instance_pool.py:1034-1058 | keep | drop |
 | D03 | 浏览器空闲回收：`browser_idle_timeout<=0` 关闭；LOADING/PREPARING 不回收；冷启动刷新时间戳 | 4aa35cb,4623109,86391c8; session.py:197-215,564-583 | 原生 | working | test_session_lifecycle.py:127-189；默认 0（86391c8 config），未验证运行时 | keep | drop |
+| D03 | CDP $rpc/ Network.loadingFailed 传输证据链 | 99c38ba; cdp_client.py:266-274; transport.py:35-95; errors.py:30-34 | 新增 | partial | test_stream_transport.py:199-358 覆盖 args 级；真实 CDP net evidence 未验证 | port | port |
 
 ### D04 Instance / Pool / Lease / Capacity
 
@@ -282,6 +288,10 @@
 | D05 | 换号规划 InstanceSwitcher.rebalance：按最受限 slot 先分配、只动 idle、逐槽 rebind | dd5e359,b59d6f3; instance_switch.py:71-137,173-199 | 新增 | working | test_instance_switch.py；与 D08 自动切号共用，真机未复跑 | keep | drop |
 | D05 | 上游错误分类：异常→(HTTP 状态, 清洗消息, Gemini status)，JSPB 嵌套消息解包 | 6a6afbe; upstream_errors.py:42-138 | 改造 | working | test_api_responses.py:77-127；`pytest` 9 passed | keep | keep |
 | D05 | 强制 429 测试钩子（`AISTUDIO_TEST_HOOKS=1` + account/model/surface/count） | ec35c8d; testing_hooks.py:35-60; generation_service.py:335-340,612-617 | 新增 | working | test_testing_hooks.py:1-25 | keep | keep |
+| D05 | 配额记账口径 quota_scope（account/account_surface）与 tier 软配额 | 99c38ba; model_defaults.py:654-739; account_rotator.py:700-706; routes_system.py:96-110; 08-09 D-01 | 新增 | unverified | 需补双口径与 429 隔离用例；当前未验证 | port | port |
+| D05 | rotator 候选打分配置（strategy/stickiness/drip_penalty/tier_weights）与默认深合并/启动校验 | 99c38ba; model_defaults.py:452-470,713-769; account_rotator.py:707-757; 08-09 D-07 | 改造 | partial | test_account_rotation_concurrency.py 覆盖部分打分；缺键/错类型/启动校验未覆盖 | rewrite | rewrite |
+| D05 | paid_model_rules 静态准入规则（contains/prefixes/exact → required_tiers） | 99c38ba; config.yaml:34-42; model_discovery.py:344-441 | 新增 | partial | test_routes_models.py 间接覆盖；无规则优先级/空规则用例 | port | port |
+| D05 | 付费模型 tier 准入与本地 403（准确 tier/model/required/current） | 99c38ba; account_orchestrator.py:172-226; 08-09 D-04/D-06 | 改造 | partial | test_tier_preemption.py 覆盖配置规则命中；403 协议体/不切号用例待补 | port | port |
 
 ### D06 Generation / Protocol / Wire
 
@@ -314,7 +324,7 @@
 | D06 | thinking／thought 文本解析（多处 flag 兼容） | `4623109` `wire_parser.py:140-153,477-482` | 原生 | working | `test_wire_parser.py:81-149`；`test_multimodal_pipeline.py:89-126` | keep | keep |
 | D06 | thinking 渲染（Gemini thought=true／OpenAI reasoning_content／Claude thinking block／Responses reasoning item） | `6a6afbe` `api_service_gemini.py:72-76`；`c0412c8` `openai_response.py:104-220`；`1375646` `claude_response.py:87-96,138-352`；`2b39b53` `responses_response.py:67-75,151-170` | 新增 | working | `test_format_openai.py:546-602`；`test_format_claude.py:621-738`；`test_format_responses.py:201-244` | port | port |
 | D06 | function_response／code execution／safety_ratings 解析 | `4623109` `wire_parser.py:187-210,467-474,497-508` | 原生 | working | `test_wire_parser.py::test_parse_response_part`；code execution 无独立用例 `未验证` | keep | keep |
-| D06 | capture：hook-first 模板＋每次实时生成 snapshot | `4623109` `src/aistudio_api/infrastructure/gateway/capture.py:40-134`；`client.py:453-491` | 原生 | working | `test_browser_session.py:389-443`（单次全量 payload）；`test_multimodal_pipeline.py:19-88` | keep | keep |
+| D06 | capture：hook-first 模板＋每次实时生成 snapshot | `4623109` `src/aistudio_api/infrastructure/gateway/capture.py:40-134`；`client.py:453-491` | 原生 | working | `test_browser_session.py:389-443`（单次全量 payload）；`test_multimodal_pipeline.py:19-88` | keep | rewrite |
 | D06 | capture 模板缓存失效（账号切换／context 变化／强制刷新） | `4623109` `capture.py:35-38,104-133`；`client.py:205-217,622-623` | 原生 | working | `test_browser_session.py:389-443` 覆盖 context 切换清空；账号切换路径 `未验证` | keep | keep |
 | D06 | replay：捕获模板原样回放（剥离 host／content-length） | `4623109` `replay.py:17-37`；`client.py:712-750` | 原生 | working | `test_browser_session.py:83-116`；`test_generation_routing.py:89-94` 仅 fake client | keep | keep |
 | D06 | XHR 非流式回放＋鉴权头刷新（SAPISIDHASH／AuthUser／Tier） | `4623109` `transport.py:32-116,181-211` | 原生 | working | `test_browser_session.py:83-116`；鉴权头分支 `未验证` | keep | keep |
@@ -357,6 +367,10 @@
 | D06 | chat 流式网关聚合（status→chunk→finish／usage，非 200 分类） | `4623109` `streaming.py:69-155` | 原生 | unverified | `test_stream_transport.py` 仅底层；网关无单测 | keep | keep |
 | D06 | 生图旧路径（size 映射＋search tool＋replay＋保存） | `4623109` `client.py:752-840`；`wire_codec.py:36-149` | 原生 | working | `test_multimodal_pipeline.py:43-88`；`test_wire_codec.py:46-133` | keep | keep |
 | D06 | 官方 API key 仅用于 countTokens 完整计数（不生成、不回显、不落日志） | 用户要求；无 Git 溯源 | 新增 | unverified | 未验证；需安全存储/脱敏/权限测试 | port | port |
+| D06 | 生成参数 seed（wire index 18；仅 Gemini 面，其他协议接受并告警忽略） | 99c38ba; wire_spec.py:60-65; wire_types.py:222-230; schemas.py:164; chat_service.py:806-812 | 新增 | partial | test_wire_codec.py 覆盖 seed→18；协议忽略/告警未覆盖 | port | port |
+| D06 | 请求体 ≥96KiB gzip + base64（浏览器内解压） | 99c38ba; scripts.py:11,42-72; hooked_request.js:3-39; streaming_init.js:47-90 | 新增 | partial | test_stream_transport.py 新增 gzip 阈值/往返；真实 transport 回放未覆盖 | port | port |
+| D06 | wire 字段语义改名（cached_content→session_token；location→request_context） | 99c38ba; wire_spec.py:21-25; wire_types.py:403-407; wire_codec.py:155-243; docs/WIRE_SPECIFICATION.md:51-56 | 新增 | working | test_wire_codec.py 覆盖改名 | port | port |
+| D06 | finish reason 18 MISSING_THOUGHT_SIGNATURE / 22 CONTINUING（非终止）+ 新编号表 | 99c38ba; wire_spec.py:122-125; api_service_gemini.py:47-64; streaming.py:116-166; docs/WIRE_SPECIFICATION.md:305-320 | 新增 | partial | test_api_responses.py、test_wire_parser.py 部分覆盖；兼容映射待补 | port | port |
 
 ### D07 Build Surface / 9998 / Signer
 
@@ -513,6 +527,8 @@
 | D10 Stats/Token/Usage | totals 聚合（跨模型，含 formats/surfaces） | `1adf3c2` `src/aistudio_api/api/routes_system.py:135-168`；`src/aistudio_api/api/state.py:102-147` | 新增 | working | `tests/unit/test_stats_routes.py:64-65` | keep | keep |
 | D10 Stats/Token/Usage | Paid 徽标与 “free 使用 Paid 模型” 异常 | `1adf3c2` `web/src/components/stats/AccountHealthPanel.vue:64-80,247-249`；`web/src/views/StatsView.vue:43-49` | 新增 | unverified | 未验证（无 UI 用例） | keep | keep |
 | D10 Stats/Token/Usage | 成功率/错误率派生指标 | `1adf3c2` `src/aistudio_api/api/response_models.py:66-95`；`web/src/components/stats/StatsOverview.vue:67-108` | 待判定 | partial | 无 rate 字段；前端是否另算未验证 | port（补派生率）或 drop | port |
+| D10 | /stats 按账号明细 account_breakdown | 99c38ba; response_models.py:67-83; routes_system.py:56-112 | 新增 | partial | 无直接测试；需补 breakdown 计算/只读无副作用 | port | port |
+| D10 | finish_reasons 聚合（stats API 先行，UI 后置） | 99c38ba; state.py:35,131-170; response_models.py:86-99; types/stats.ts:30 | 新增 | partial | 无直接测试；UI 未消费 | port | port |
 
 ### D11 API / UI
 
@@ -532,7 +548,7 @@
 | D11 API | 协议面功能开关 features.formats | `3d01ed2`,`dcb7592`,`2b39b53`; `format_errors.py:69-114`; `defaults/config.yaml:69-74` | 新增 | working | `tests/unit/test_format_error_routing.py:57-106`; `test_format_openai.py:808-815` | port | keep |
 | D11 API | 协议感知错误体映射 | `dcb7592`,`2b39b53` `1375646`; `format_errors.py:16-220` | 新增 | working | `tests/unit/test_format_error_routing.py:24-106` | port | port |
 | D11 API | 应用级异常到 HTTP 状态映射 | `0cb1b82`; `app.py:293-373` | 改造 | working | `tests/unit/test_app_error_handlers.py:13-33`; `test_format_error_routing.py` | port | port |
-| D11 API | API Key 鉴权四种取键方式 | `upstream/master` 原生；`dependencies.py:18-115` 未被本分支改写 | 原生 | working | `tests/unit/test_api_auth.py:24-126`; `test_routes_models.py:101-115` | keep | port |
+| D11 API | API Key 鉴权四种取键方式（D-14：单一免密开关默认关闭；空 Key ≠ 开放；管理页空密码=免密；不引入 IP/CIDR） | `upstream/master` 原生；`dependencies.py:18-115` 未被本分支改写 | 原生 | working | `tests/unit/test_api_auth.py:24-126`; `test_routes_models.py:101-115` | keep | port |
 | D11 API | 本地回环免鉴权 | 无实现；`dependencies.py:69-115` 仅按 Key 判定，未见 127.0.0.1 分支 | 待判定 | broken | `未验证`（全仓检索无 loopback bypass） | drop | drop |
 | D11 API | 控制台密码鉴权与 `/auth/check` | `upstream/master..master` `fa1d9d3`; `dependencies.py:47-66`; `app.py:507-512` | 原生 | working | `tests/unit/test_api_auth.py:81-126`; `test_routes_system.py:101-108` | keep | port |
 | D11 API | API Key 管理 CRUD `/api-keys` | `upstream/master` 原生；`routes_system.py:570-710` 写回 config.yaml | 原生 | unverified | `未验证`（无 tests/unit 直接覆盖） | port | port |
@@ -633,6 +649,8 @@
 6. 最终合并后必须检查：无真实邮箱、无 auth/cookie/token、无 05 追加、domain 与生命周期一致。
 
 ## 6. 冲突/缺口汇总
+
+> 本节保留历史（4623109 时期）的冲突/缺口盘点，不回改原文。99c38ba 的 20 个冲突已在 `08-09-decision-record.md` §3 逐项闭合；其中 16 个由用户决策、4 个为 `ENGINEERING_DEFAULT`（可回退），C06 由 D-04 + E-07 闭合。
 
 ### D01 Boot & Config
 
@@ -773,7 +791,7 @@
 | 手动切号 UI 断链 | `stores/system.ts:140` 定义 forceNextAccount，无任何 `.vue` 引用；后端 `/rotation/next` 存在（`routes_system.py:359-382`） | 用户无法从界面手动切号，旧能力实际不可达 | 重建时补按钮还是删除端点 |
 | 孤儿 UI 组件未清理 | 无引用：`AccountTable` 链、`AccountModeBanner`、`ActiveContextsCard`、`AvailableAccountsCard`、`InstanceDetailsPanel`、`InstanceSummaryCard` | 旧槽位/渠道策略代码继续占包体，易被误读为现行 UI | 是否在重建时物理删除 |
 | 模型列表前缀与 paid 过滤耦合 | `model_catalog.py:65-108` 对 build 渠道跳过 paid 与 chat-only 模型；`0663cf5` 同时返回裸 ID | API/UI 看到的模型集合依赖 features 与 paid 标记，文档易误读 | 是否把裸 ID 作为唯一稳定契约 |
-| 无 Key 即免密且无回环保护 | `dependencies.py:78-80` 无任何 Key 直接放行；无 127.0.0.1 分支 | 误配空 api_keys 时对外全开；也无法仅对本地免密 | 是否要求默认拒绝并显式允许 loopback |
+| 无 Key 即免密且无回环保护 | `dependencies.py:78-80` 无任何 Key 直接放行；无 127.0.0.1 分支 | 误配空 api_keys 时对外全开；也无法仅对本地免密 | 历史：不采用“无 Key 即免密”；D-14 改为 API 单一免密开关默认关闭、管理页空密码=免密；loopback 模式不再支持 |
 | error 状态与上游语义偏移 | `format_errors.py:134-154` 与 `app.py:303-334` 将策略拒绝映射 403/429/503 | 客户端按原生 429/403 重试可能失效 | 是否保持现映射并写客户端契约 |
 | 格式面默认全开与渠道默认关闭 | `defaults/config.yaml:69-73` openai/claude/responses=true；`:94-99` build.enabled=false | 用户看到四协议示例但 build 模型不可用 | 是否按渠道实际能力生成示例与开关 |
 | 文档 05 与 UI 现行口径不一致 | 05 记录 `InstanceLimitCard.vue:46` 为现行；当前 `AccountsView` 已改用 `AccountInstanceCard` | 以 05 为依据会复刻已弃用 UI | 是否以 D11 本表覆盖 05 的 UI 结论 |
@@ -792,13 +810,13 @@
 
 ## 7. 合并检查
 
-- 合并时间：2026-10-24；最后更新：2026-10-25
-- 总功能行：518
+- 合并时间：2026-10-24；最后更新：2026-10-28（08-09 追加 16 行）
+- 总功能行：534
 - Domain 数：12
 - 8 列完整性：通过（合并脚本逐行校验）
 - 末列：P1-P10 全部已填；与 `06-feature-index.csv` 一致
-- 含 `未验证` 的行：97
+- 含 `未验证` 的行：100
 - `原生/改造/新增` 为 `待判定` 的行：4
 - 证据含 `不可复跑` 的行：16
-- 行数分布：D01 62、D02 31、D03 35、D04 62、D05 43、D06 70、D07 44、D08 25、D09 35、D10 32、D11 42、D12 37
+- 行数分布：D01 64、D02 34、D03 36、D04 62、D05 47、D06 74、D07 44、D08 25、D09 35、D10 34、D11 42、D12 37（总 534）
 - 代码改动：无；未提交；未合并 master。

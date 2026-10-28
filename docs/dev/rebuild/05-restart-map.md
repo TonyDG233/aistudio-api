@@ -1,6 +1,6 @@
 # 05 Restart Map
 
-状态：2026-10-27 按 `upstream/master @ 99c38ba` 重审后修订；基线 `rebuild @ 当前 HEAD`（交接前先提交文档修复，并用 `git rev-parse HEAD` 记录实际 SHA）。P1-P10 已全部决定，D1-D8 已按 A 确认，99c38ba 上游变化由 `08-07-upstream-99c38ba-reaudit.md` 逐项裁决。当前**不是直接开工状态**：先完成 Gate 0（含 Gate 0.5 输入）的文档/索引/证据冻结与重审，再由独立 reviewer 判定是否 handoff。
+状态：2026-10-28 按 `08-08-upstream-99c38ba-full-diff-audit.md` 与 `08-09-decision-record.md` 修订；基线 `rebuild @ cabcb97`（交接前先提交文档修复，并用 `git rev-parse HEAD` 记录实际 SHA）。D-01..D-14 已由用户确认（见 08-09 §1），工程默认标 `ENGINEERING_DEFAULT` 且可回退。当前**不是直接开工状态**：Gate 0/Gate 0.5 均未通过，08-09 与 05/06/10/12/13 需先由独立 reviewer 复核，再判定是否 handoff。
 
 ## 1. 重构大方向
 
@@ -17,7 +17,7 @@
 - `paid` 模型进 Pro/paid 池；free 模型进 free 池；QQ bot 固定 free 池。
 - 请求实例固定为 `1 账号 + 1 Context + 1 Page + 1 surface`；控制面只做登录/保活，不是请求实例。
 - 不再按反代途径/channel 做第一层路由；只保留 `surface=chat/build` 和模型 tier。
-- 旧 fork 策略组、旧打分、账号 tag、quota group、死 UI 不进入新骨架；99c38ba 原生的 `tier_weights/stickiness/drip_penalty` 与软配额只作为现有实例候选的排序/准入采用（08-07）。
+- 旧 fork 策略组、旧打分、账号 tag、quota group、死 UI 不进入新骨架；99c38ba 原生的 `tier_weights/stickiness/drip_penalty` 与软配额只作为现有实例候选的排序/准入采用（08-09 D-01/D-07），配额口径由 `quota_scope` 控制。
 - 并发原语只用 `active_requests`，不引入 lease/reservation。
 - 日志页保留为原始事件流；统计页保留为聚合视图，后端使用单一事件模型。
 - Cookie 保活保留；OAuth/refresh_token 当前不存在，本轮不做。
@@ -31,9 +31,10 @@
 - `P1-P10`：决策包/移植波次，只做分组，不是事实标准。
 - 每个决定必须落到 feature ID；不能只写“某 domain 保留”。
 - AI 默认建议不是决定；未获明确确认前只能记为提案。
-- `05` 只写方向和步骤，不复制 518 行。
-- `06-feature-ledger.md` 是人类台账；`06-feature-index.csv` 是机器索引；`06-decision-log.md` 是决策记录。P2/P3 决策日志是行为权威，CSV/ledger 只是索引。
+- `05` 只写方向和步骤，不复制 534 行。
+- `06-feature-ledger.md` 是人类台账；`06-feature-index.csv` 是机器索引；`06-decision-log.md` 是决策记录。P2/P3 决策日志与 `08-09-decision-record.md` 是行为权威（99c38ba 部分以 08-09 为准），CSV/ledger 只是索引。
 - 变更 06 后必须同步重新生成/校验 index，禁止两套各改各的；方法见 `06-index-validation.md`。
+- 决策入口固定为 `08-08`（事实源）+ `08-09`（用户确认的 D-01..D-14 与冲突闭合）；`08-07` 仅历史，不得作为 handoff 依据。
 
 ### 2.1 Agent 工作模式
 
@@ -50,7 +51,7 @@
 
 1. **Account/Auth**：账号身份、tier、Cookie、expired 状态。
 2. **Instance**：账号会话 + 一个 Context + 一个 Page + 一个 surface；这是请求实例。
-3. **Pool/Router**：free/pro 池隔离；按模型 `paid` 标记选池；采用上游 sticky + `tier_weights`/`drip_penalty` 排序，但只在现有实例候选中工作，不新增实例、不后台改绑。
+3. **Pool/Router**：free/pro 池隔离；按模型 `paid` 标记选池；采用上游 sticky + `tier_weights`/`drip_penalty` 排序，但只在现有实例候选中工作，不新增实例、不后台改绑；配额记账键由 `quota_scope=account|account_surface` 决定（默认 `account`；D-01）。
 4. **Executor**：请求生命周期与 `active_requests`；不使用 lease；不承担账号选择策略。
 5. **Event Sink**：日志原始事件 + 统计聚合事件，UI 只消费稳定接口。
 
@@ -62,20 +63,20 @@ Build 是独立 surface，不是一个 pool tier。Build 页面、9998、signer 
 
 | 项 | 执行规则 |
 |---|---|
-| D2 并发原语 | 取消 lease/reservation 和 30s/15s 预算；acquire 返回 `active_requests` 句柄。成功、失败、取消、断连、流关闭都在 `finally` 释放；有 `active_requests` 时拒绝关闭/改绑。容量按实例数计算。 |
-| D3 控制面 | 控制面=登录/保活面，不算请求实例；请求实例才占池容量。账号有活动实例时 Cookie 回写走实例页，否则允许独立控制页。控制面不做蓝绿；请求实例同样禁止 blue-green 双页（上游 `session.py:211` 的“先建新页再 drain”为 rewrite，不采用）。 |
-| D4 sleep/wake/rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号。99c38ba 已移除 `browser_idle_timeout`、idle 回收、watchdog、liveness checker 与 CDP ping：不恢复这些键/任务，`SLEEPING` 只由显式释放路径进入；`active_activity`（旧语义为阻止 idle 回收）置 disable。失败/stale 才手动重启，禁止自动 stale 复活。rebind 固定为 `READY`（`active_requests==0`）→ `RETIRING` → 关闭旧 Page/Context → `CLOSED` → 新建 Context+Page → `STARTING` → `READY`；禁止先建新页再 drain、禁止 `_retiring_contexts` 后台双页、禁止 pinned/自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽 503 + 等待/管理页提示。已出正文不切号。 |
-| P9-pre | 在 P1/P3/P2 前完成 lifespan/config 装配钩子：启动/关闭顺序、manager/pool/keepalive 接线、关键配置 fail-fast。 |
-| API Key guard | 在 P9-pre 完成，P5 暴露端点前必须生效：默认拒绝，显式配置空 Key 才开放；loopback 免鉴权不保留。 |
+| D2 并发原语 | 取消 lease/reservation 和 30s/15s 预算；acquire 返回 `active_requests` 句柄。成功、失败、取消、断连、流关闭都在 `finally` 释放。**手动关闭/手动改绑**在 `active_requests>0` 时可拒绝；**禁用账号/应用预设的 rebind 不得直接拒绝**，必须进入 `RETIRING`、停止新请求、有界等待（超时强制关闭）后重建。容量按实例数计算。 |
+| D3 控制面 | 控制面=登录/保活面，不算请求实例；请求实例才占池容量。账号有活动实例时 Cookie 回写走实例页，否则允许独立控制页。控制面不做蓝绿；请求实例同样禁止 blue-green“先建新页再 drain”（上游 `session.py:211` 为 rewrite，不采用）。页面清理按 D-11：关闭所有非当前请求、非当前活跃账号的 Page/Context；drain 只发生在旧 Page/Context 上，期间不新建新页，新页在旧页关闭后创建；不得把“1 active + 1 drain”当作页预算例外。 |
+| D4 sleep/wake/rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号。99c38ba 已移除 `browser_idle_timeout` 与 idle 回收：不恢复 idle 键/任务，`SLEEPING` 只由显式释放路径进入；`active_activity`（旧语义为阻止 idle 回收）置 disable。**pipe watchdog 按 D-02 保留**（仅父进程崩溃后的孤儿 Chromium 清理，不是账号自动复活）；**CDP 只保留 WebSocket ping，按 D-03 删除 liveness checker/轮询**。失败/stale 才手动重启，禁止自动 stale 复活。常规 rebind 从 `READY`（`active_requests==0`）；禁用/应用预设允许从 `BUSY` → `RETIRING`（停止新请求，有界等待在途至 `active_requests==0` 或超时强制关闭）；手动关闭/改绑仍可拒绝。随后统一 → 关闭旧 Page/Context → `CLOSED` → 新建 Context+Page → `STARTING` → `READY`；禁止先建新页再 drain、禁止后台自动 rebind。禁用账号/应用预设按 D-05 触发同一 rebind，且不得直接拒绝：必须先 `RETIRING`、停止新请求、有界等待（超时强制关闭）、关闭旧 Page/Context，再建新页/切号；同时修复 toggle/preset 的 fallback 先于 switch。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽 503 + 等待/管理页提示。已出正文不切号。 |
+| P9-pre | 在 P1/P3/P2 前完成 lifespan/config 装配钩子：启动/关闭顺序、manager/pool/keepalive 接线、关键配置校验。`rotator` 按 D-07 深合并默认 + 启动校验，不静默、不请求期 KeyError；`quota_scope`、`presets`、`tier_quotas` 纳入同一 schema。 |
+| API Key guard | 按 D-14 拆分：API 只有一个 `security.api_allow_anonymous` 开关，默认关闭；管理页继续由 `AISTUDIO_WEB_PASSWORD` 控制（空 = 免密，不报错）。不引入 IP/CIDR/设备白名单/本机-局域网模式；管理页不被 API Key 锁死。 |
 | P7 顺序 | 日志页/导出先于统计页；统计事件 schema 基线在 Gate 0.5 冻结（`12-gate0-inputs.md` §4），P5 只扩展字段并实际记账，P7 只做聚合。 |
 | D7 PG 门槛 | P5 验收前完成 F-01、F-02、F-03、F-04 和脱敏 `[toolshape]` 摘要；F-05/06/07 后做，不阻塞 P5 最小闭环。 |
-| D8 UI/目录 | upstream Vue 原生细节优先；新 UI 做增量，不重写/删除原生布局、文案、交互。`ModelCatalog` 单一所有者。 |
+| D8 UI/目录 | upstream Vue 原生细节优先；新 UI 做增量，不重写/删除原生布局、文案、交互；新设置按 D-12 进现有 `SettingsView`/`ApiKeyManagerCard` 等卡片/表单，不重构布局/导航。`ModelCatalog` 单一所有者。 |
 
 D6 迁移边界：只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist（清单见 `docs/dev/evidence/INDEX.md`）；禁止 `-- docs` 整树。secret scan 只扫迁移集合，不扫整个 `docs`。旧 WP 归档规则与清单见 `docs/dev/evidence/p1-ark-merge-archive/README.md`，关键文档可留 `docs/dev/` 根。`docs/dev/rebuild/ledger-batches/` 是历史输入，不是事实源；迁移时排除其批次文件或保留其 `README.md` 明确标注。
 
 ## 5. 移植顺序（D5）
 
-0. **Gate 0 + Gate 0.5**：文档/索引/证据冻结、**强制**上游 fetch 与 SHA 记录、文档迁移、独立重审；Gate 0.5 产出 seam/状态机/config/event schema/测试处置/验收模板，并在迁移 worktree 基于 99c38ba 重新验证。
+0. **Gate 0 + Gate 0.5**：文档/索引/证据冻结、**强制**上游 fetch 与 SHA 记录、文档迁移、独立重审；Gate 0.5 产出 seam/状态机/config/event schema/测试处置/验收模板，并在迁移 worktree 基于 99c38ba 重新验证。行为权威为 `08-09-decision-record.md`（D-01..D-14 + 冲突闭合），事实源为 `08-08`。
 1. **P9-pre**：lifespan/config 装配钩子 + API Key guard；输入固定为 `12-gate0-inputs.md` 与 `06-test-disposition.csv`。
 2. **P1 + P3 + P2**：账号/Cookie/tier；单实例单 Context 单 Page；free/pro 池；路由/切号/重试。只用 `active_requests`。
 3. **P5**：最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；通过 D7 PG 门槛。
@@ -102,18 +103,18 @@ git remote -v
 
 ### 6.0 基线提交（先于迁移）
 
-- 先提交本轮文档修复；`git status --porcelain` 为空；执行 `git rev-parse HEAD`，把 SHA 记录到 `08-07-upstream-99c38ba-reaudit.md`、`13-gate0-execution-record.md` 与 `docs/changelog.md`；`10-handoff-prompt.md` 保持“当前 HEAD + 现查”，不写回 SHA（避免自引用）。
+- 先提交本轮文档修复；`git status --porcelain` 为空；执行 `git rev-parse HEAD`，把 SHA 记录到 `08-09-decision-record.md`、`13-gate0-execution-record.md` 与 `docs/changelog.md`；`10-handoff-prompt.md` 保持“当前 HEAD + 现查”，不写回 SHA（避免自引用）。
 - `git restore --source=rebuild` **只在文档修复已 commit 后使用**。若未 commit，禁止用 `--source=rebuild`（它读取的是旧 commit 树）；必须显式从工作区复制并记录来源，例如 `Copy-Item docs/dev/rebuild/* $new/docs/dev/rebuild -Recurse -Force`，evidence/changelog 也按 allowlist 从工作区复制，并在交接说明中写明“来源为 rebuild 工作区而非 commit”。
 - 基线只认 `rebuild @ 当前 HEAD` + `upstream/master @ 99c38ba`；不得在 05/10 写死旧 SHA 或旧基线 `4623109`。
 
 ### 6.1 冻结文档与索引
 
-- 运行 `06-index-validation.md` 的校验脚本：CSV 518 行、ledger 518 行、`ledger_line` 全部指向实际行、feature 文本/顺序/decision 一致。
-- 核对桥接行数：P1 31、P2 43、P3 97、P4 44、P5 70、P6 25、P7 67、P8 42、P9 62、P10 37，总 518。
-- 检查无 `pending`；`EXPECTED_DECISIONS` 必须覆盖 D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D05-039 drop、D07-026 keep、D08-022 rewrite。
-- 人工复核 D05-016..019、D05-021、D05-039、D06-066 等 lease/pinned/defer/rebind 冲突已按 P2/P3 改写；`06-decision-log.md` 的 P2/P3 是行为权威。
-- 复核 `08-07-upstream-99c38ba-reaudit.md` §2-§3：账号分组/预设、软配额/tier 抢占、idle 移除、wire/transport/CDP、config 新键、stats 新字段均已裁决；无 pending。
-- `06-test-disposition.csv` 为 82 行：主 `rebuild` 80/80；`upstream 99c38ba` 28/28（26 是 `b8af406` 旧计数，不等于 80/80）。
+- 运行 `06-index-validation.md` 的校验脚本：CSV 534 行、ledger 534 行、`ledger_line` 全部指向实际行、feature 文本/顺序/decision 一致。
+- 核对桥接行数：P1 34、P2 47、P3 98、P4 44、P5 74、P6 25、P7 69、P8 42、P9 64、P10 37，总 534（新增 16 行见 08-09 §2/§6）。
+- 检查无 `pending`；`EXPECTED_DECISIONS` 必须覆盖 D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D05-039 drop、D07-026 keep、D08-022 rewrite，以及 D03-004 keep（D-02）、D05-045 rewrite（D-07）、D05-044 port（D-01）。
+- 人工复核 D05-016..019、D05-021、D05-039、D06-066 等 lease/pinned/defer/rebind 冲突已按 P2/P3 改写；`06-decision-log.md` 的 P2/P3 与 08-09 是行为权威。
+- 复核 `08-08` 的 20 冲突与 17 `NO_FEATURE_ROW` 已在 `08-09` 逐项闭合：无 pending、无“其他”兜底；`08-07` 顶部已标历史/被取代。
+- `06-test-disposition.csv` 为 86 行：主 `rebuild` 80/80；`upstream 99c38ba` 28/28 只是文件覆盖，行为覆盖缺口见 08-09 C14/E-01；不得用 28/28 宣称行为通过。
 - 冻结后 `rebuild` 的 `docs/dev/rebuild` 只读参考；新分支是唯一事实源。`ledger-batches/` 只作历史输入，不是事实源。
 
 ### 6.2 Secret scan（只扫迁移集合）
@@ -185,7 +186,7 @@ Write-Output "upstream/master=$upstreamSha"
 ```
 
 - 固定 `upstream` = DeconstructedCube；计划基线为 `99c38baefc84d8cb66b05c28ede8a49ce050bfb2`（2026-10-25）。旧基线 `4623109` 只作历史。
-- fetch 后 SHA 若变化：写入 `08-07-upstream-99c38ba-reaudit.md` 的后续修订或新审计，并重跑受影响裁决；不得静默沿用旧基线。
+- fetch 后 SHA 若变化：写入 `08-09-decision-record.md` 的后续修订或新审计，并重跑受影响裁决；不得静默沿用旧基线。
 - 不访问真实账号/IP/Google；fetch 只拉 git 元数据。
 
 ### 6.4 upstream worktree（确定性命中规则）
@@ -296,6 +297,8 @@ foreach ($item in $evidenceLogs) {
 # 迁移后存在性检查（含 99c38ba 重审与 Gate0 执行记录）
 $mustExist = @($evidence + $evidenceLogs + @(
   "docs/dev/rebuild/08-07-upstream-99c38ba-reaudit.md"
+  "docs/dev/rebuild/08-08-upstream-99c38ba-full-diff-audit.md"
+  "docs/dev/rebuild/08-09-decision-record.md"
   "docs/dev/rebuild/13-gate0-execution-record.md"
 ))
 foreach ($item in $mustExist) {
@@ -336,17 +339,27 @@ foreach ($f in @(
 在进入 P9-pre 前产出并通过评审，内容全部落在 `12-gate0-inputs.md`：
 
 1. 目标 seam/五层接口：Account/Auth、Instance、Pool/Router、Executor、Event Sink；Account 权威、Context/Page 工厂、surface 解析、`active_requests`、Event Sink 接口。
-2. 实例状态表：UNSTARTED/SLEEPING/STARTING/READY/BUSY/RETIRING/CLOSED + `active_requests`；消息唤醒、无 idle 自动回收、失败/stale 手动重启、手动显式 rebind、429/503 转换。
-3. config schema：`count/surface/min_tier`、api_keys、formats、keepalive、日志路径；99c38ba 的 `rotator/paid_model_rules/tier_quotas/account_presets` 纳入同一 schema，删除浏览器 idle 超时键，超时默认 600；实例配置与全局上限分离。
-4. event schema：request/attempt/usage/error/latency/surface/paid，usage 增加 reasoning/cached，finish_reasons 归模型统计；client 与 attempt 分母分离；P5 只扩展字段，不另起账本。
-5. `06-test-disposition.csv`：逐测试文件 keep/rewrite/delete + feature ID/原因；覆盖主 rebuild 80/80 与 99c38ba 28/28；acceptance 模板含测试项、预期、命令、工件路径。
+2. 实例状态表：UNSTARTED/SLEEPING/STARTING/READY/BUSY/RETIRING/CLOSED + `active_requests`；消息唤醒、无 idle 自动回收、失败/stale 手动重启、手动/禁用/应用预设的 D-05 有界 rebind、429/403/503 转换。
+3. config schema：`count/surface/min_tier`、`api_keys`、`security.api_allow_anonymous`（默认 false）、`security.web_password`（空 = 管理页免密）、formats、keepalive、日志路径；99c38ba 的 `rotator/paid_model_rules/tier_quotas/account_presets/model_defaults` 纳入同一 schema；`quota_scope=account|account_surface`（默认 `account`）；`hash_include_code` 为诊断开关（默认 true，不进普通 UI）；删除浏览器 idle 超时键，超时默认 600；`rotator` 深合并默认 + 启动校验（D-07）；不引入 IP/CIDR/设备白名单。
+4. event schema：request/attempt/usage/error/latency/surface/paid，usage 增加 reasoning/cached，finish_reasons 归模型统计；`account_breakdown` 是 stats REST 派生视图；client 与 attempt 分母分离；P5 只扩展字段，不另起账本。
+5. `06-test-disposition.csv`（86 行）：逐测试文件 keep/rewrite/delete + feature ID/原因；覆盖主 rebuild 80/80 与 99c38ba 28/28（仅文件覆盖），并补 8 个新 REST 端点的路由级测试与行为断言（08-09 C14/E-01）；acceptance 模板含测试项、预期、命令、工件路径。
+
+Gate 0.5 重新验证项（必须在迁移 worktree 基于 99c38ba 实际执行，不得只写文档）：
+
+- rotator 缺键/部分键/错类型的启动校验；深合并后请求路径无 `KeyError`。
+- `quota_scope=account` 与 `account_surface` 两种记账键的 429/配额用例；默认 `account`。
+- API 免密默认关闭、打开后 API 可匿名、管理页空密码仍免密；API Key 不锁管理页；无 IP/CIDR 逻辑。
+- 8 个新 REST 端点（按 D-13 删除 notes 与批量分组 API 后的最终集合）有路由级测试。
+- 禁用账号/应用预设触发有界 rebind：`RETIRING` → 停在途/超时强制关 → 关旧 Page/Context → 新建；registry 与浏览器会话一致。
+- page prune 关闭所有非活跃 target；drain 只在旧 Page/Context 上且有界，drain 期间不新建新页；watchdog 仍在；CDP 只有 WS ping。
+- 模板 hash 默认包含代码 part；`hash_include_code=false` 可回退；严重路由异常时按注释优先怀疑该 hash。
 
 Gate 0.5 未通过，不得进入 P9-pre 编码。
 
 ### 6.7 重新独立审计
 
-- 修复文档后，由独立审计重新检查 05/06/07/08/09/10/12/13 与 CSV 的一致性、Gate 0/0.5 可行性、P9-pre/状态机/顺序是否可执行，并确认 `08-07-upstream-99c38ba-reaudit.md` 的裁决与 99c38ba 实际 diff 一致。
-- `08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md`、`08-02-execution-readiness-reaudit.md`、`08-06-final-readiness-audit.md` 保留为历史审计，不回改原文；新审计结论写入 `08-07`.
+- 修复文档后，由独立审计重新检查 05/06/07/08/09/10/12/13 与 CSV 的一致性、Gate 0/0.5 可行性、P9-pre/状态机/顺序是否可执行，并确认 `08-08` 的 76 文件事实、`08-09` 的 D-01..D-14/17 分类/20 冲突闭合与 99c38ba 实际 diff 一致。
+- `08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md`、`08-02-execution-readiness-reaudit.md`、`08-06-final-readiness-audit.md`、`08-07` 保留为历史审计，不回改原文；新审计结论写入 `08-09`（或其后继审计文件）。
 - 通过后，把 `10-handoff-prompt.md` 交给全新 agent；未通过不得进入 P9-pre 编码。
 
 ## 7. 索引校验
@@ -355,12 +368,12 @@ Gate 0.5 未通过，不得进入 P9-pre 编码。
 
 关键不变量：
 
-- CSV 518 行（不含表头），ledger 518 行表项；
+- CSV 534 行（不含表头），ledger 534 行表项；
 - 每个 domain 的 CSV 行数与 ledger 行数相同，顺序一致，feature 文本完全相同；
 - CSV `ledger_line` = 对应 ledger 表行号；
 - CSV `decision` = ledger 决定列；
 - 无 `pending`；
-- P1-P10 桥接行数与 CSV 实际计数一致。
+- P1-P10 桥接行数为 34/47/98/44/74/25/69/42/64/37，与 CSV 实际计数一致。
 
 ## 8. 实时对比与逐片迁移
 
@@ -385,20 +398,24 @@ git diff --name-status rebuild...HEAD -- <path>
 
 ## 9. 验收底线
 
-- Gate 0：CSV/ledger 518 行且映射 0 mismatch；桥接行数一致；无 `pending`；无 decision/feature 冲突；secret scan 只扫迁移集合且只命中占位符；`docs/BOTGUARD_VERIFICATION_CHAIN.md` 按 grandfather 处理；spikeQ4 敏感证据未进入新仓库。
+- Gate 0：CSV/ledger 534 行且映射 0 mismatch；桥接行数 34/47/98/44/74/25/69/42/64/37 一致；无 `pending`；无 decision/feature 冲突；08-09 的 17 分类/20 冲突闭合可复核；secret scan 只扫迁移集合且只命中占位符；`docs/BOTGUARD_VERIFICATION_CHAIN.md` 按 grandfather 处理；spikeQ4 敏感证据未进入新仓库。
 - 不需要真实 Google 请求即可证明：
-  - paid 只进 Pro 池；free/QQ bot 有独立池；
-  - 一个请求实例只有 1 Context + 1 Page；同账号不同时开 chat/build；rebind 先关旧 Page/Context 再建新页，任何时刻无 blue-green 双页或 `_retiring_contexts` 后台切换；
+  - paid 只进 Pro 池；free/QQ bot 有独立池；付费模型 tier 不足只返回 403，带准确 `model/required_tier/current_tier`，不触发 switch_auth；
+  - `quota_scope` 双口径：默认 `account` 共用额度，`account_surface` 分面记账；429 不跨面污染（后者）；
+  - 一个请求实例只有 1 Context + 1 Page；同账号不同时开 chat/build；rebind 先 `RETIRING`/停在途/有界等待/关旧 Page/Context 再建新页（drain 期间不建新页），任何时刻无 blue-green 双页；drain 超时强制关闭，无无限重试；
+  - page prune 关闭所有非当前请求、非当前活跃账号的 Page/Context；drain 只在旧 Page/Context 上且有界，期间不新建新页，新页在旧页关闭后创建；无页面/context 泄露。
+  - pipe watchdog 保留且只做孤儿进程回收；CDP 只有 WS ping，无 liveness 轮询；
   - 控制面不计入请求实例容量；
   - 消息可唤醒 SLEEPING/UNSTARTED 合格账号；保存消息后切实例可重试；
-  - 关闭实例不误杀其他实例；无 idle 自动回收（上游已移除该机制）；失败/stale 才手动重启；
-  - rebind 只允许手动显式关闭旧实例再重建，后台自动 rebind 不保留；
+  - 关闭实例不误杀其他实例；无 idle 自动回收；失败/stale 才手动重启；
+  - 禁用账号/应用预设触发有界 rebind，registry 与浏览器会话一致；notes/batch API 已删除；
   - 429 先同账号重试→唤醒/切现有实例→保存后重试，耗尽为 503；
   - 无 lease 断言，`active_requests` 在 finally 释放。
-- OpenAI Chat/Gemini 契约通过；API Key 默认拒绝，显式空 Key 才开放；token 口径与代码一致。
+- OpenAI Chat/Gemini 契约通过；API 免密开关默认关闭，管理页空密码仍免密；token 口径与代码一致；seed 仅 Gemini 生效，其他协议接受并告警忽略。
 - 24h 回写覆盖 chat/build-only/active；保存失败不 mark；fake clock 不真实等待。
-- 日志 SSE/1/3/7 天导出；client 与 attempt 分母分离；token 汇总不含 countTokens。
+- 日志 SSE/1/3/7 天导出；client 与 attempt 分母分离；token 汇总不含 countTokens；`finish_reasons` 先走 stats API（UI 后置）。
 - PG：F-01/F-02/F-03/F-04 离线 fixture 通过，`[toolshape]` 已脱敏；F-05/06/07 有后置计划。
+- 模板 hash 默认包含 `executable_code/code_execution_result`；`hash_include_code` 可回退，诊断开关不进普通 UI。
 - upstream 原生 UI 未被无必要重写；每片有 acceptance 工件，P10 证据索引可查。
 
 ## 10. 不做的事

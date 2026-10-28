@@ -12,6 +12,20 @@
 - 验证：命令或工件路径
 ```
 
+## 2026-10-28
+
+- 范围：`docs/dev/rebuild/05`、`06*`、`08-07`、`08-09`、`10`、`12`、`13`；`docs/changelog.md`
+- 变更：新增 `08-09-decision-record.md`，把用户确认的 D-01..D-14、17 个 `NO_FEATURE_ROW` 分类（16 feature + 1 out-of-scope）、20 个冲突闭合、`ENGINEERING_DEFAULT` 清单与 F1-F8 阶段固定为行为权威；修订 05/06/10/12/13 与 08-07 历史横幅。
+- 原因：08-08 全量审计发现 14 项待决策、17 个 `NO_FEATURE_ROW`、20 个冲突；08-07 领域级审计已被证明有 16 处漏项/错项，不能作为 handoff 依据。
+- 验证：`06-index-validation.md` 脚本输出 `OK rows=534 ledger=534 packages=34/47/98/44/74/25/69/42/64/37 total=534 errors=0`；`06-test-disposition.csv` 86 行；`git diff --stat` 仅 `docs/`。
+- 状态：未提交，不推送；Gate 0 未通过、Gate 0.5 未执行；是否可 handoff 由后续独立 reviewer 判定。
+
+- 范围：`docs/dev/rebuild/05`、`06*`、`08-09`、`10`、`12`、`13`；`docs/changelog.md`
+- 变更：按独立 reviewer BLOCKED 修复 9 项：D-14 落到 `D11-015`/`test_api_auth`；`D03-018` 改 rewrite（一次有界 drain，无后台常驻 task/第二页）；`active_requests` 区分“手动关闭可拒绝”与“禁用/预设 rebind 不得直接拒绝”；E-01 收敛为 8 个端点；drain 只在旧 Page/Context 且期间不建新页；ledger 分布改为实际 534；`D06-028` 改 rewrite（hash 代码 part + 诊断开关）；test-disposition 补 quota_scope/403 体/finish/seed/锁用例；12/10 补 SettingsView/ApiKeyManagerCard UI 验收。
+- 原因：独立 reviewer BLOCKED 的 9 项，以及 toggle/batch 措辞、F0/F3 边界、P8 D-14 注、测试理由等非阻断清理。
+- 验证：索引脚本输出 `OK rows=534 ledger=534 packages=34/47/98/44/74/25/69/42/64/37 total=534 errors=0`；`06-test-disposition.csv` 86 行；`git status --short` 仅 docs。
+- 状态：未提交；Gate 0 未通过、Gate 0.5 未执行；不宣告 handoff。
+
 ## 2026-10-27
 
 - 范围：`docs/dev/rebuild/08-08-upstream-99c38ba-full-diff-audit.md`；`docs/changelog.md`

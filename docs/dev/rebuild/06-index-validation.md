@@ -4,14 +4,15 @@
 
 ## 不变量
 
-- CSV 518 行（不含表头）；ledger 518 行表项。
+- CSV 534 行（不含表头）；ledger 534 行表项。
 - 每个 domain 的 CSV 行数、顺序、feature 文本与 ledger 完全一致。
 - CSV `ledger_line` 等于对应 ledger 表项的实际行号（1-based）。
 - CSV `decision` 等于 ledger 最后一列“决定”。
 - 无 `pending`。
-- P1-P10 行数分别为 31/43/97/44/70/25/67/42/62/37，总 518。
+- P1-P10 行数分别为 34/47/98/44/74/25/69/42/64/37，总 534。
 - D1 冲突项：D05-016..018 drop、D05-019 port、D05-021 port、D05-036..037 port、D05-039 drop、D06-066 port；相关 note 必须出现 `active_requests` 或明确“无 lease”。
 - 第二轮冲突项：D01-054..058 drop、D01-059 port、D01-060..062 keep、D03-019 drop、D04-027/028 drop、D05-026 port、D07-026 keep、D08-022 rewrite；D05-026 note 必须包含“同账号/429/503”，D05-039 note 必须区分“手动/后台”，D08-022 note 必须包含“唤醒/SLEEPING”。
+- 08-09 决策项：D03-004 keep（D-02 保留 watchdog）、D03-006 rewrite（D-11 prune）、D03-018 rewrite（D-10 有界 drain）、D06-028 rewrite（D-09 hash 代码 part）、D05-044 port（D-01 quota_scope）、D05-045 rewrite（D-07 深合并）、D05-046/047 port、D06-071..074 port、D10-033/034 port、D02-032..034 port、D03-036 port、D01-063/064 port。
 
 ## 校验脚本
 
@@ -26,8 +27,8 @@ from collections import Counter, defaultdict
 CSV = "docs/dev/rebuild/06-feature-index.csv"
 LEDGER = "docs/dev/rebuild/06-feature-ledger.md"
 EXPECTED_PACKAGES = {
-    "P1": 31, "P2": 43, "P3": 97, "P4": 44, "P5": 70,
-    "P6": 25, "P7": 67, "P8": 42, "P9": 62, "P10": 37,
+    "P1": 34, "P2": 47, "P3": 98, "P4": 44, "P5": 74,
+    "P6": 25, "P7": 69, "P8": 42, "P9": 64, "P10": 37,
 }
 EXPECTED_DECISIONS = {
     "D01-054": "drop", "D01-055": "drop", "D01-056": "drop",
@@ -39,11 +40,20 @@ EXPECTED_DECISIONS = {
     "D05-019": "port", "D05-021": "port", "D05-036": "port",
     "D05-037": "port", "D05-039": "drop", "D06-066": "port",
     "D05-026": "port", "D07-026": "keep", "D08-022": "rewrite",
+    "D03-004": "keep", "D03-006": "rewrite", "D03-018": "rewrite", "D06-028": "rewrite",
+    "D01-063": "port", "D01-064": "port",
+    "D02-032": "port", "D02-033": "port", "D02-034": "port",
+    "D03-036": "port",
+    "D05-044": "port", "D05-045": "rewrite", "D05-046": "port", "D05-047": "port",
+    "D06-071": "port", "D06-072": "port", "D06-073": "port", "D06-074": "port",
+    "D10-033": "port", "D10-034": "port",
 }
 REQUIRED_NOTES = {
     "D05-026": ("同账号", "429", "503"),
     "D05-039": ("手动", "后台"),
     "D08-022": ("唤醒", "SLEEPING"),
+    "D05-044": ("quota_scope",),
+    "D05-047": ("403",),
 }
 errors = []
 
@@ -60,10 +70,10 @@ for lineno, line in enumerate(lines, 1):
     cells = line.split("|")
     ledger[m.group(1)].append((lineno, cells[2].strip(), cells[8].strip()))
 
-if len(rows) != 518:
-    errors.append(f"CSV rows={len(rows)}, expected 518")
-if sum(len(v) for v in ledger.values()) != 518:
-    errors.append(f"ledger rows={sum(len(v) for v in ledger.values())}, expected 518")
+if len(rows) != 534:
+    errors.append(f"CSV rows={len(rows)}, expected 534")
+if sum(len(v) for v in ledger.values()) != 534:
+    errors.append(f"ledger rows={sum(len(v) for v in ledger.values())}, expected 534")
 
 by_domain = defaultdict(list)
 for row in rows:
@@ -123,13 +133,13 @@ if errors:
         print("-", error)
     sys.exit(1)
 
-print("OK rows=518 ledger=518 packages=31/43/97/44/70/25/67/42/62/37 total=518 errors=0")
+print("OK rows=534 ledger=534 packages=34/47/98/44/74/25/69/42/64/37 total=534 errors=0")
 ```
 
 预期输出：
 
 ```text
-OK rows=518 ledger=518 packages=31/43/97/44/70/25/67/42/62/37 total=518 errors=0
+OK rows=534 ledger=534 packages=34/47/98/44/74/25/69/42/64/37 total=534 errors=0
 ```
 
 ## 修复方法
