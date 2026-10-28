@@ -374,8 +374,6 @@
 
 ### D07 Build Surface / 9998 / Signer
 
-> **2026-10-28 Build 事故记录**：Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED`，首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。当前不进入 P4，不要求现在溯源；P4 实现阶段启动时先按 `08-10-build-surface-incident-20261028.md` §4 做前期探索和可行性重试。P4-Q4 的 native 主/signer 回退假设在 P4 前重新确认。
-
 | domain | feature | provenance(commits/files) | 原生/改造/新增 | 当前状态 | 测试/证据 | keep/port/drop | 决定 |
 |---|---|---|---|---|---|---|---|
 | D07 | Build app_id 解析（config `channels.build.app_url` → `AISTUDIO_APP_URL` → settings → Ark 默认） | `1cc634e`, `da6ea25`; `build_surface.py:421-446`, `model_defaults.py` channels.build.app_url | 新增 | working | `test_build_surface.py:350-393`（env/default/config/裸 id 四例） | keep | keep |

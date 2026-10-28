@@ -1,6 +1,6 @@
 # 05 Restart Map
 
-状态：2026-10-28 按 `08-08-upstream-99c38ba-full-diff-audit.md` 与 `08-09-decision-record.md` 修订；基线 `rebuild @ cabcb97`（交接前先提交文档修复，并用 `git rev-parse HEAD` 记录实际 SHA）。D-01..D-14 已由用户确认（见 08-09 §1），工程默认标 `ENGINEERING_DEFAULT` 且可回退。当前**不是直接开工状态**：Gate 0/Gate 0.5 均未通过，08-09 与 05/06/10/12/13 需先由独立 reviewer 复核，再判定是否 handoff。
+状态：2026-10-28 按 `08-08-upstream-99c38ba-full-diff-audit.md` 与 `08-09-decision-record.md` 修订；基线为 `rebuild @ 当前 HEAD`（执行时 `git rev-parse HEAD`，不写死旧 SHA），上游 `99c38ba`。D-01..D-14 已由用户确认（见 08-09 §1），工程默认标 `ENGINEERING_DEFAULT` 且可回退。当前**不是直接开工状态**：Gate 0/Gate 0.5 均未通过，08-09 与 05/06/10/12/13 需先由独立 reviewer 复核，再判定是否 handoff。
 
 ## 1. 重构大方向
 
@@ -45,6 +45,16 @@
 - **默认串行**：Gate0/Gate0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7。P1 与 P3 可在接口冻结后有限并行；P4/P8 在 API 稳定后并行。
 - 任何 agent 不得用“保持旧测试绿”为由复活旧契约；最终合并与提交只由 integrator 执行。
 
+### 2.2 编排与执行契约
+
+1. **权责**：主 agent 负责流程、Gate 边界、文档结构和工程默认；用户只对 `06-decision-log.md` 全文与 `08-09` 的 D-xx 负责。新增流程门、改 Gate、改文档结构由主 agent 决定并留下理由/回滚方式，不得反过来让用户拍板。
+2. **委派**：默认用能把最终报告返回主 agent 的 `task` 子 agent，不用无法回收的独立会话；Agent Manager 仅在用户明确要求时使用。主 agent 必须读取、记录、复核报告，不能“分出去就不管”。
+3. **reviewer**：独立 reviewer 必须是单独只读子 agent，报告 SHA、范围、PASS/BLOCKED、日期、证据；主 agent 不能自审，也不能把“有报告”当“已通过”。
+4. **上游变化**：无切片在开发时重新审计并更新基准；已有切片在开发时钉住当前 `99c38ba`，不中途 rebase，把上游差异记入后续最小实现清单，当前切片验收后再处理。
+5. **真实测试**：任何真实账号/IP/Google 测试必须先得到用户明确同意；事前报目的/方法/范围/预期，事后报命令、结果、失败项、证据。未授权只做 fixture/单元测试。
+6. **台账与完成定义**：534 行台账是硬门；代码 diff 必须映射到 `Dxx-NNN`，每个切片列出影响 ID、测试、验收；无 feature ID、无测试、无验收、无返回报告，均不算完成。出现 `NO_FEATURE_ROW` 必须停下，不得“俺寻思”。
+7. **失败处理**：dirty tree、部分同步、SHA 变化、worker 超步数、reviewer BLOCKED、测试失败、敏感信息命中，一律先停当前切片，记录触发/影响/证据；只有产品决策或真实测试授权才升级给用户，其余由主 agent 按本契约处理。
+
 ## 3. 目标骨架
 
 只保留五个稳定层：
@@ -81,9 +91,9 @@ D6 迁移边界：只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlis
 0. **Gate 0 + Gate 0.5**：文档/索引/证据冻结、**强制**上游 fetch 与 SHA 记录、文档迁移、独立重审；Gate 0.5 产出 seam/状态机/config/event schema/测试处置/验收模板，并在迁移 worktree 基于 99c38ba 重新验证。行为权威为 `08-09-decision-record.md`（D-01..D-14 + 冲突闭合），事实源为 `08-08`。
 1. **P9-pre**：lifespan/config 装配钩子 + API Key guard；输入固定为 `12-gate0-inputs.md` 与 `06-test-disposition.csv`。
 2. **P1 + P3 + P2**：账号/Cookie/tier；单实例单 Context 单 Page；free/pro 池；路由/切号/重试。只用 `active_requests`。
-3. **P5**：最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；通过 D7 PG 门槛。
-4. **P6**：凭证保活与 24h；fake clock 验证。
-5. **P7**：日志页 + 导出（D09，不含统计页）。
+3. **P6**：凭证保活与 24h；fake clock 验证。**必须在 VPS 跑 P5 前完成**，否则不能保账号。
+4. **P7**：结构化日志、错误码、请求/尝试关联、日志文件/导出（D09，不含统计页）。**必须在 P5 前完成**，否则 VPS 没有可用的 debug 证据。
+5. **P5**：最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；通过 D7 PG 门槛。
 6. **P4**：Build Surface。P4 启动时先按 08-10 §4 做前期探索/可行性重试，再实现；当前不执行，不得直接按旧 P4-Q4 实现。
 7. **P8/UI**：最小 API/UI、实例 UI；upstream Vue 原生优先。
 8. **Claude/Responses**。

@@ -22,19 +22,19 @@
 11. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
 12. docs/dev/rebuild/08-10-build-surface-incident-20261028.md（**事故记录**：Build native 400 `PROXY_GENERATION_DISABLED`；仅在 P4 Build 实现阶段启动时按 §4 做前期探索，当前不处理）
 
-本提示词只在独立 reviewer 明确判定“可 handoff”后使用；修复后须再由独立审计复核（05 §6.7）。
+本提示词用于主 agent 执行：Gate0 阶段可直接使用；进入实现前必须有独立 reviewer 的 SHA/范围/PASS-BLOCKED 记录（05 §2.2、§6.7）。
 
 Gate 0（先做，不改业务代码）：
 G0.1 基线：`git status --porcelain` 为空；`git rev-parse HEAD` 记录新 SHA；05/10 基线一致。
 G0.2 上游硬门：`git fetch upstream --prune` 必须成功；`git rev-parse upstream/master` 必须记录；若不再是 99c38ba，先按 08-08/08-09 重审并更新裁决，不得离线沿用旧 ref。
 G0.3 索引：跑 06-index-validation.md；534 行、ledger_line 全对、桥接 34/47/98/44/74/25/69/42/64/37、无 pending、errors=0。
 G0.4 决策：D-01..D-14 已确认（见 08-09 §1）；17 个 NO_FEATURE_ROW（16 feature + 1 out-of-scope）与 20 冲突（C01..C20）已闭合；EXPECTED_DECISIONS 覆盖 D03-004 keep、D03-006 rewrite、D05-044 port、D05-045 rewrite 及新增 16 行；P9-Q3 不得 drop 日志功能。不得把“已确认”写成“Gate 0 已通过”。
-G0.5 测试处置：86 行；主 rebuild 80/80；99c38ba `tests/**/*.py` 28/28（含 conftest）；无 pending；28/28 只是文件覆盖，必须补 8 个新 REST 端点的路由级测试与行为断言（C14/E-01）。
+G0.5 测试处置：只检查 `06-test-disposition.csv` 文件处置：86 行；主 rebuild 80/80；99c38ba `tests/**/*.py` 28/28（含 conftest）；无 pending。28/28 只是文件覆盖；8 个新 REST 端点路由测试与行为断言归 Gate0.5，不在 Gate0 退出项内。
 G0.6 Secret/evidence：只扫 docs/dev/rebuild + INDEX.md allowlist，不扫整个 docs；BOTGUARD 是 upstream 原生 grandfather，不复制/不改；spikeQ4-evidence.json/spikeQ4.py 不得进入新仓库。
 G0.7 worktree/迁移：先查 `git worktree list`、路径和分支。确定性命中规则见 05 §6.4：优先复用已存在且干净的 `.kilo/worktrees/rebuild-upstream`（branch `rebuild-upstream`，必须 `merge-base(HEAD,99c38ba)=99c38ba`，工作区干净），不得再次 `worktree add`；只有路径与分支都不存在时才 `git worktree add .kilo/worktrees/rebuild-upstream -b rebuild-upstream 99c38ba`（路径不存在但分支已存在时只挂载该分支）。禁止 `rebuild/upstream`（与 `refs/heads/rebuild` 冲突）。复用旧 worktree 时先删除旧 `docs/dev/rebuild/acceptance`、`config/config.example.yaml`、`config/config.schema.json`、`tests/fixtures/events/event.sample.json`、`tests/fixtures/pg/f01..f04`，再由 Gate 0.5 按 12 §5.1 重建/验证；不得沿用旧工件。旧 worktree 的 12/13 只是参考，事实源是主工作区 docs。只在文档修复已 commit 后用 `git -C $new restore --source=rebuild -- docs/dev/rebuild`；未 commit 则显式 Copy-Item 并说明。禁止 `-- docs` 整树，禁止 checkout src/tests。迁移后确认 05/06*/08-07/08-08/08-09/08-10/10/12/13、06-test-disposition.csv、docs/dev/evidence/INDEX.md、docs/changelog.md 均存在；`git add -A` + `git status -uall`。
 G0.8 归属：ledger-batches 仅历史输入（排除批次文件或保留 README 标注）；旧 WP 正文留在 rebuild，archive/INDEX/changelog 按 05 §6.5 归属。
-G0.9 Gate0.5 文档：12-gate0-inputs.md、06-test-disposition.csv 已存在；acceptance/config/fixtures 必须在迁移 worktree 由 Gate 0.5 按 12 §5.1 重新创建并验证，不得沿用旧 worktree 工件。当前 Gate 0.5 **未执行**。
-G0.10 Handoff：本提示词已更新，能独立执行；不依赖旧 08 行号。是否可交接由独立 reviewer 判定。
+G0.9 Gate0.5（独立阶段，不属于 Gate0 退出项）：12-gate0-inputs.md、06-test-disposition.csv 已存在；acceptance/config/fixtures 必须在迁移 worktree 由 Gate 0.5 按 12 §5.1 重新创建并验证，不得沿用旧 worktree 工件。当前 Gate 0.5 **未执行**；Gate0 可以在 G0.1-G0.8 闭合后结束。
+G0.10 Handoff（不属于 Gate0 退出项）：本提示词已更新，能独立执行；不依赖旧 08 行号。是否可交接由独立 reviewer 判定，Gate0 本身不以 G0.10 为退出条件。
 
 Gate 0.5（P9-pre 前，输入见 12-gate0-inputs.md；必须在迁移 worktree 重新验证）：
 1. 五层接口（Account/Auth、Instance、Pool/Router、Executor、Event Sink）与 Account 权威、Context/Page 工厂、surface 解析、active_requests、Event Sink。
@@ -50,9 +50,10 @@ Agent 工作模式（详见 05 §2.1）：
 - reviewer 只读；在 Gate0/0.5、P3 状态机、P2 路由、P5 PG、P7 统计、P4 阶段前期探索报告、最终 handoff 独立审查，不参与实现。
 - 并行仅限接口已冻结且文件域不重叠；最多 2-3 个 worker；禁止同时改 routing_pipeline.py、instance_pool.py、generation_service.py、05/06/ARCHITECTURE；禁止 F1↔F3、F3↔F4、F4↔F5、F6↔F7 同时改共享语义文件。
 - Gate0/0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7 默认串行；P8 在 API 稳定后并行；P4 当前未开始；到 P4 Build 实现阶段启动时，先按 08-10 §4 做前期探索，再写 native/transport/Q4 相关代码。
+- 主 agent 按 05 §2.2 自行分派 `task` worker/reviewer 并回收报告；用户不需要写阶段提示词。只有 `06`/`08-09 D-xx` 变更或真实测试授权才停下来问用户。
 - 不用“保持旧测试绿”复活旧契约；最终合并/提交只由 integrator 做。
 
-顺序：Gate 0 → Gate 0.5 → P9-pre 装配/鉴权 → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → **P4 Build（启动时先做 08-10 §4 前期探索）** → P8/UI → Claude/Responses → 统计页 → P10 收尾。
+顺序：Gate 0 → Gate 0.5 → P9-pre 装配/鉴权 → P1+P3+P2 → **P6 保活/24h** → **P7 日志/导出** → P5 OpenAI/Gemini → **P4 Build（启动时先做 08-10 §4 前期探索）** → P8/UI → Claude/Responses → 统计页 → P10 收尾。
 99c38ba 增量的内部顺序用 08-09 §5 的 F1-F8：F1 rotator/quota_scope → F2 协议/传输 → F3 账号域 → F4 准入/403 → F5 生命周期 → F6 统计 → F7 Web → F8 测试收口；F2 可在 F1 契约冻结后并行，其余按依赖串行。
 每片测试先写“测试项 + 预期结果”，验收通过再进下一片。
 
@@ -91,7 +92,7 @@ F-05/06/07 后做，不阻塞 P5 最小闭环；F-08..F-13 在 P5/P4 前 triage�
 
 禁止：修改测试/配置绕过契约；合并 master/rebuild；整树 checkout；离线沿用旧 upstream ref；访问真实账号/IP/Google；提交敏感内容；使用 08-07 作为行为依据；把 9998 重连当作 Build 400 修复；在 P4 阶段前期探索完成前写 native/transport/Q4 相关 Build 代码。
 
-Gate0/handoff 验收：G0.1-G0.10 全过；G1-G11 固定出处仍为 08-05 附录 A / 08-01:129-140，并由 12 §5 模板落工件；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API 免密默认关闭且管理页空密码可用；UI 验收：现有 SettingsView/ApiKeyManagerCard 中 quota_scope、API 免密开关、管理页空密码=免密均可见且可保存，不新增 IP/CIDR/本机-局域网模式，不重构布局；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过；08-09 的 F1-F8 与 20 冲突闭合有对应测试。
+Gate0 验收：G0.1-G0.8 全过；G0.9（Gate0.5）与 G0.10（handoff）不是 Gate0 退出项；G1-G11 的固定出处以 08-09/12 §5 为准，08-05 仅历史；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API 免密默认关闭且管理页空密码可用；UI 验收：现有 SettingsView/ApiKeyManagerCard 中 quota_scope、API 免密开关、管理页空密码=免密均可见且可保存，不新增 IP/CIDR/本机-局域网模式，不重构布局；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过；08-09 的 F1-F8 与 20 冲突闭合有对应测试。
 P4 验收（不属于 G0.1-G0.10，且当前不执行）：P4 启动时按 08-10 §4 完成前期探索与可行性重试；实现后证明 Build native 400 `PROXY_GENERATION_DISABLED` 有准确失败分类，无 9998 无限重试，native/signer 分别验证。
 完成后报告：修改文件、测试命令/结果、未验证项、证据路径。
 ```

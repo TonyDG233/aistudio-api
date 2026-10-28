@@ -50,7 +50,7 @@
 | D2 并发原语 | 取消 lease / reservation / lease 超时预算；只保留 `active_requests`。acquire 返回 `active_requests` 句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。**手动关闭/改绑**在有 `active_requests` 时仍可拒绝；但**禁用账号/应用预设的 rebind 不得直接拒绝**（D-05）：必须进入 `RETIRING`、停止新请求、有界等待 `active_requests=0` 或超时强制关闭，再关旧页/切号。容量按实例数计算，不再有 reservation 计数。 |
 | D3 控制面 | 控制面只负责登录与保活，不是请求实例，不占池容量。请求实例固定为 `1 账号 + 1 Context + 1 Page + 1 surface`；同账号 chat/build 不并存。账号有活动实例时，Cookie 回写走实例页；否则允许独立控制页。控制面不做蓝绿；切号必须关闭旧页再重建。 |
 | D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁用账号/应用预设触发同一控制面 rebind（D-05）：RETIRING → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
-| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。每片验收通过后才进入下一片。 |
+| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P6 保活/24h → P7 日志/导出 → P5 OpenAI/Gemini → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。VPS 运行 P5 前必须先有 P6 保活和 P7 可用的 debug 日志。每片验收通过后才进入下一片。 |
 | D6 迁移 | 只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist；禁止 `-- docs` 整树。迁移前 secret scan；旧 WP 归档到 `docs/dev/evidence/p1-ark-merge-archive/`，关键文档可留 `docs/dev/` 根。 |
 | D7 PG 修复门槛 | P5 验收前完成 F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。 |
 | D8 UI / 模型目录 | upstream Vue 原生布局、文案、交互细节不得无故重写或删除；新 UI 以原生增量为先。ModelCatalog 是模型/paid 元数据唯一所有者；日志、统计、路由只消费，不各自维护 paid map。 |
@@ -305,7 +305,7 @@ Feature ID：`D05-041`
 - **P6-Q3 metadata/tier/email**：`D08-006`, `D08-007`, `D08-023`, `D08-024` → keep/port。
 - **P6-Q4 auto switch/rebalance**：`D08-015`..`D08-018` → drop。
 - **P6-Q5 429 冷却/跨天**：`D08-020`, `D08-021` → keep。
-- **P6-Q6 active_activity/idle browser**：`D08-014`, `D08-022` → active_activity keep 可选；idle 自动回收默认关闭（不自动关），消息到达唤醒 SLEEPING/UNSTARTED，失败/stale 才手动重启。
+- **P6-Q6 active_activity/idle browser**：`D08-014`, `D08-022` → 上游已无 idle 自动回收，不实现 idle 关闭；active_activity keep 可选；消息到达唤醒 SLEEPING/UNSTARTED，失败/stale 才手动重启。
 - **P6-Q7 手动切换/触发/状态**：`D08-019`, `D08-025` → port/keep。
 - **P6-Q8 job 锁/重试**：`D08-003`..`D08-005` → port；A 方案。
 

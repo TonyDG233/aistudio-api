@@ -78,16 +78,16 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 计划/事故文档已提交且工作区干净；P4 未开始，Build 事故记录不是 Gate0 门；Gate0 其他项未闭合，不能写通过。 |
-| G0.2 上游硬门 | **通过（本次）** | fetch 成功，`upstream/master=99c38ba` 已记录。 |
-| G0.3 索引 | **历史（518）** | 当轮 `errors=0`、518/518；本轮已更新为 534/534，实际输出见 §3。 |
+| G0.1 基线 | **未通过** | 本轮 docs 修订尚未提交，工作区非干净；P4 未开始，Build 事故记录不是 Gate0 门；不能写通过。 |
+| G0.2 上游硬门 | **未复核本轮** | 沿用已有 `upstream/master=99c38ba`；进入 Gate0 时必须重新 fetch 并记录，不能把旧记录当本轮通过。 |
+| G0.3 索引 | **通过（本次）** | 实跑 `06-index-validation.md`：`OK rows=534 ledger=534 ... errors=0`；534/534，ledger_line 全对。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | D-01..D-14 已由用户确认；17 个 `NO_FEATURE_ROW` 与 20 冲突已在 08-09 逐项闭合；但尚未经独立 reviewer 复核，不得写“通过”。 |
-| G0.5 测试处置 | **未通过（行为覆盖缺口）** | 86 行；主 80/80；99c38ba 28/28 只是文件覆盖，不等于行为覆盖；8 个新 REST 端点需路由级测试；Gate 0.5 未在迁移 worktree 执行。 |
-| G0.6 Secret/evidence | **通过（本次，allowlist 完整）** | 按 05 §6.2 实际扫描 `docs/dev/rebuild` 全目录 + evidence allowlist 17 项 + 11 个 ignored `.log` + `docs/changelog.md`，missing 0；命中仅为扫描命令、header 名列表、feature 名称或历史审计说明，无真实 key/cookie/header 值。evidence 内容未改。 |
+| G0.5 测试处置 | **通过（仅文件处置）** | 86 行；主 80/80；99c38ba 28/28；无 pending。28/28 只是文件覆盖；8 个新 REST 端点行为测试归 Gate0.5，不在 Gate0 退出项内。 |
+| G0.6 Secret/evidence | **未复核本轮** | 本轮 docs 有修改，未重新执行 secret/allowlist 扫描；不得沿用上一轮“通过”。 |
 | G0.7 worktree/迁移 | **规则已冻结，未执行迁移** | 05 §6.4 优先复用现有干净 worktree（branch `rebuild-upstream`，`merge-base=99c38ba`），不再 `worktree add`；复用后必须删除旧 `acceptance/config/tests fixtures` 并由 Gate 0.5 按 12 §5.1 重建/验证。本次只改主工作区 docs，迁移由后续 agent 执行。 |
 | G0.8 归属 | **沿用历史** | ledger-batches/旧 WP 规则不变。 |
-| G0.9 Gate0.5 | **未通过** | 按新流程先删除旧 worktree 的 config/fixture/acceptance，再由 Gate 0.5 按 12 §5.1 重建/验证；当前尚未执行。 |
-| G0.10 Handoff | **未通过** | 需独立 reviewer 判定；本文件不宣告 handoff。 |
+| G0.9 Gate0.5 | **不属于 Gate0 退出项** | 独立阶段；需在迁移 worktree 删除旧 config/fixture/acceptance，再按 12 §5.1 重建/验证。当前尚未执行。 |
+| G0.10 Handoff | **不属于 Gate0 退出项** | 需独立 reviewer 判定；本文件不宣告 handoff。 |
 
 ### 2.4.1 P4 当前状态（不属于 Gate 0）
 
@@ -95,7 +95,7 @@ P4 未开始。`08-10` 是事故记录，仅要求在 P4 Build 实现阶段启�
 
 ### 2.5 明确不能声称的事
 
-- 不声称 Gate 0 已通过；G0.1 需文档提交、工作区干净且独立复审通过后才成立；P4 未开始，Build 事故记录不作为 Gate0 门，Gate0 其他项仍未闭合。
+- 不声称 Gate 0 已通过；本轮 docs 尚未提交、工作区非干净；P4 未开始，Build 事故记录不作为 Gate0 门。
 - 不声称 Gate 0.5 已通过；§4 工件需在迁移 worktree 按 99c38ba + 本文件 §3 schema 重新创建/验证。
 - 不声称 `08-06` 的“可 handoff（有条件）”仍有效；该结论基于 4623109。
 - 不声称 26/26 等于 80/80。
@@ -128,7 +128,7 @@ Gate 状态（不宣称通过）：
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 计划/事故文档已提交且工作区干净；P4 未开始，Build 事故记录不是 Gate0 门；Gate0 其他项未闭合；不得把提交存在当作 Gate0 通过。 |
+| G0.1 基线 | **未通过** | 本轮 docs 修订尚未提交，工作区非干净；P4 未开始，Build 事故记录不是 Gate0 门；不得把提交存在当作 Gate0 通过。 |
 | G0.2 上游硬门 | **未复核（本轮未 fetch）** | 沿用 99c38ba 记录，但本文件不把“未重跑”写成“通过”；进入 Gate 0 时必须重新 fetch 并记录。 |
 | G0.3 索引 | **通过（索引）** | 534/534，`errors=0`，桥接计数正确。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | 14 项已确认、17 分类/20 冲突已闭合；需独立 reviewer 复核。 |
