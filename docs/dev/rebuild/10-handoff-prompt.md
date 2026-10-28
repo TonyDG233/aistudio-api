@@ -4,9 +4,9 @@
 
 ## 接手现状
 
-- 工作分支 `rebuild`；当前 HEAD 以 `git rev-parse HEAD` 为准（A 阶段起点 `b625df9`），**未 push**；master 保持不动。
-- A 阶段文档收敛已改 6 个文件（05、10、06-decision-log、06-P8-questions、06-feature-index.csv、06-feature-ledger.md），**未提交**。
-- 目标 worktree `.kilo/worktrees/rebuild-upstream` @ 9b5cdea，工作区干净；其 src 相对基准 diff 为 0，docs 仍是旧版（未同步 A 阶段收敛）。
+- 工作分支 `rebuild`；当前 HEAD 以 `git rev-parse HEAD` 为准；A1-A6 已提交，A7 待计划审计；**未 push**；master 保持不动。
+- A5 已把旧审计/Gate/问题清单移入 `docs/dev/rebuild/archive/`；A6 已把权威 docs 同步到目标 worktree，均随 A5/A6 提交。
+- 目标 worktree `.kilo/worktrees/rebuild-upstream`（HEAD 以 `git rev-parse HEAD` 为准）；其 src 相对基准 diff 为 0，docs 为 A5/A6 同步版。
 - 实际迁移代码 **0 行**；534 行只是 feature inventory，不是迁移成果。
 - Gate0 / Gate0.5 **不再是独立门**；改为 A/B/C 阶段 + 每步审计。
 
@@ -21,28 +21,28 @@
 3. `05-restart-map.md` — 迁移边界与 agent 工作模式。
 4. `06-decision-log.md` — P2/P3 落地；与 08-09 冲突时以 08-09 为准。
 5. `06-feature-ledger.md` + `06-feature-index.csv` — inventory（534 行）。
-6. `06-test-disposition.csv` — 测试处置；seam/config/event 以 06/08-09 为准，`12-gate0-inputs.md` 归历史。
-7. `08-10-build-surface-incident-20261028.md` — 仅 C 阶段 P4 启动时读 §4。
+6. `06-test-disposition.csv` — 测试处置；seam/config/event 以 06/08-09 为准，`archive/12-gate0-inputs.md` 归历史。
+7. `domains/P5-generation/index.md` + `09-pg-toolcall-analysis.md` — P5 早期约束与 PG/toolcall/preset 详情；D7 的 F-01..F-04 是门槛。
+8. `08-10-build-surface-incident-20261028.md` — 仅 C 阶段 P4 启动时读 §4。
 
-`08-07` 仅历史，不得作为行为依据。
+`archive/08-07-upstream-99c38ba-reaudit.md` 仅历史，不得作为行为依据。
 
 D-14 指针：API 免密只由 `security.api_allow_anonymous` 控制且默认关闭；管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空=免密）；空 API Key ≠ 开放；不引入 IP/CIDR；API Key 与 Web 密码互不复用。
 
 ## 阶段与顺序
 
 - **A 文档收敛**：收 05/06/10，消除 06 内部 P6→P7→P5 与旧 P5→P6→P7 的冲突。A 经用户审计确认并 commit、且目标 worktree docs 同步后，才可进入 B。
-- **B 实现（顺序固定）**：P9-pre 装配/鉴权 → P1+P3+P2 → **P6 保活/24h** → **P7 结构化日志/错误码/请求关联** → **P5 最小 OpenAI chat（B5）**。每步先写测试项 + 预期，实现后报实际，用户审计确认后才 commit。
+- **B 实现（顺序固定）**：P9-pre 装配/鉴权 → P1+P3+P2 → **P6 保活/24h** → **P7 结构化日志/错误码/请求关联** → **B5a PG/toolcall/preset 复现** → **B5b P5 最小 OpenAI chat**。每步先写测试项 + 预期，实现后报实际，用户审计确认后才 commit。
 - **C 扩面**：P4 Build（启动时先按 08-10 §4 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。
 - 每个 Step 的范围与退出条件见 `05 §4.1`；前一 Step 审计未通过不得进入下一 Step。
 - B 内部顺序不得改回 P5→P6→P7；任何改序须单独警示用户确认。
 
-## B5 第一个集成切片
-
-B5 不是原生路径验收：99c38ba 已有 Gemini/Responses。B5 必须经过新 account/page/routing/active_requests/guard/log seam，用 1 账号 + 1 Context + 1 Page 发 1 个 OpenAI Chat 请求并收到完整回复；空 API Key 不放行，同账号仅 1 个 active Page，无 Page/Context 泄露，请求结束后 `active_requests` 归零。OpenAI Chat 是上游没有、fork 侧新增的适配器。证据：请求/响应、账号与 Page 计数、日志或测试输出。
+B5a/B5b 的范围与退出条件见 `05 §4.1`；B5a 的排查细节见 `09`。B5a 未过不得进入 B5b；B5b 不替代 B 阶段其他步骤。文档布局与每步不新建文档的规则见 `05 §5`。
 
 ## Agent 与审计规则
 
 - 主 agent 是唯一 integrator：持有目标分支/worktree、接口与提交权，负责顺序、分派、回收报告和验收。
+- worker/reviewer 的报告先原样交用户；用户审计前，主 agent 不直接改报告/代码/文档，也不自行派下一步。
 - worker 只接一个 Dxx-NNN 或明确文件域，独立 worktree；不得改 05/06/08-09/架构文档；报告必须含测试项、预期、实际。
 - reviewer 只读，在 P3 状态机、P2 路由、P5 PG、P7 统计、P4 前期探索、最终 handoff 独立审查。
 - 并行仅限接口冻结且文件域不重叠，最多 2-3 个 worker；共享语义文件禁止同时修改。
@@ -66,5 +66,5 @@ B5 不是原生路径验收：99c38ba 已有 Gemini/Responses。B5 必须经过�
 - 把 534 行 inventory 当作迁移成果，或用文档进度替代实现。
 - 为通过测试修改测试/配置/契约。
 - 把 roadmap 改回 P5→P6→P7。
-- 用 08-07 作行为依据，或把 9998 重连当作 Build 400 修复。
+- 用 `archive/08-07` 作行为依据，或把 9998 重连当作 Build 400 修复。
 - 在 P4 前期探索完成前写 native/transport/Q4 相关 Build 代码。

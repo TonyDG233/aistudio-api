@@ -2,7 +2,7 @@
 
 状态：**文档修复产物**。本文件把 `08-08-upstream-99c38ba-full-diff-audit.md` 的 14 项待决策项按用户确认结果固定下来，并逐项闭合 17 个 `NO_FEATURE_ROW` 与 20 个冲突。本轮只改 `docs/`，不改 `src/tests/config/fixtures`，不提交、不推送、不合并、不访问真实账号/IP/Google、不使用 Agent Manager、不派生子 agent。
 
-本文件是 99c38ba 修复阶段的**行为权威入口**；`08-08` 是事实源（逐文件审计），`08-07` 已降级为历史文档。Gate 0/Gate 0.5 均**未通过**，本文件不宣告 handoff。
+本文件是 99c38ba 修复阶段的**行为权威入口**；`08-08` 是事实源（逐文件审计），`archive/08-07` 已降级为历史文档。Gate 0/Gate 0.5 不再是独立门；执行按 05 的 A/B/C + 每步审计，本文件不宣告 handoff。
 
 ---
 
@@ -15,7 +15,7 @@
 | 旧基线（仅 diff 左端） | `4623109b97d14db30e304005fe1d52c29a46a7c2` |
 | 上游基线（diff 右端） | `99c38baefc84d8cb66b05c28ede8a49ce050bfb2`（= `upstream/master`） |
 | 全量审计 | `08-08-upstream-99c38ba-full-diff-audit.md`：76/76 文件、17 `NO_FEATURE_ROW`、20 冲突、14 待决策 |
-| 历史审计（不得作事实源） | `08-07-upstream-99c38ba-reaudit.md`（领域级初审，已被 08-08 指出 16 处漏项/错项） |
+| 历史审计（不得作事实源） | `archive/08-07-upstream-99c38ba-reaudit.md`（领域级初审，已被 08-08 指出 16 处漏项/错项） |
 | 旧计划文档 | `05/06/10/12/13`；本轮按 08-08/08-09 修订 |
 
 输入约束：
@@ -154,7 +154,7 @@
 
 ## 5. 修复阶段 F1-F8（更新版）
 
-顺序原则：先事实/契约，再核心账本，最后生命周期/统计/UI。任何阶段在 Gate 0.5 通过前不得进入 P9-pre 编码。
+顺序原则：先事实/契约，再核心账本，最后生命周期/统计/UI。任何阶段在 A 文档收敛与用户审计前不得进入 P9-pre 编码。
 
 | 阶段 | 内容 | 文件域 | 依赖 | 禁止并行 |
 |---|---|---|---|---|
@@ -166,7 +166,7 @@
 | F5 | 会话/生命周期：rebind 有界 drain、无 idle、`ensure_ready`、page prune（D-11）、watchdog 保留（D-02）、WS ping only（D-03）、hash 纳入代码 part + 诊断开关（D-09）。 | `infrastructure/gateway/session.py`、`session_auth.py`、`infrastructure/browser/{browser_engine.py,cdp_client.py}`、`application/{instance_switch.py,instance_manager.py}`、`pooled_session.py`、`session_state.py`、`config.py`（idle 删除/超时默认）。 | F3、F4 | 与 F4 同时改 rebind 路径；与 F2 同时改 transport/CDP；与 F6 同时改 stats 状态字段。 |
 | F6 | 统计：`/stats` breakdown、finish_reasons、reasoning/cached；只读端点去副作用；`quota_scope` 口径展示。 | `api/state.py`、`api/routes_system.py`、`api/response_models.py`、`api/responses.py`、`web/src/types/stats.ts`、`ModelStatsTable.vue`（数据消费部分）。 | F2（usage）、F3（账号元数据） | 与 F2 同时改 usage/finish schema；与 F7 同时改 Dashboard 统计组件。 |
 | F7 | Web：Accounts 预设/分组/启停、Dashboard 卡片与 breakdown、ProfileCard 修复、新设置进现有卡片/表单（D-12）。 | `web/src/views/{AccountsView,DashboardView,SettingsView}.vue`、`web/src/components/accounts/*`、`web/src/components/dashboard/*`、`web/src/components/config/*`、`static/assets/*`（重新构建产物）。 | F3、F4、F6 | 与 F6 同时改 stats 组件；与任何阶段同时提交 `static/assets`（构建产物只在该阶段末重建）。 |
-| F8 | 测试处置落地：路由级/行为级测试、acceptance、`06-test-disposition.csv`、13 记录。 | `tests/**`、`docs/dev/rebuild/06-test-disposition.csv`、`docs/dev/rebuild/13-gate0-execution-record.md`。 | F1-F7 | 与任何 src 阶段同时改测试契约；F8 只收口，不并行开新 src 改动。 |
+| F8 | 测试处置落地：路由级/行为级测试、acceptance、`06-test-disposition.csv`、archive/13 记录。 | `tests/**`、`docs/dev/rebuild/06-test-disposition.csv`、`docs/dev/rebuild/archive/13-gate0-execution-record.md`。 | F1-F7 | 与任何 src 阶段同时改测试契约；F8 只收口，不并行开新 src 改动。 |
 
 阶段红线：
 
@@ -197,8 +197,8 @@
 
 ## 7. 仍未完成 / 不得声称
 
-- **Gate 0 未通过**：计划文档与 Build 事故记录已提交，工作区干净；P4 未开始，Build 事故记录不是 Gate0 门；Gate0 其他项未闭合，G0.1 不得写通过。
-- **Gate 0.5 未执行**：config/event schema、fixture、acceptance 必须在迁移 worktree 基于 99c38ba 重新验证；本文件只冻结输入。
+- **预检状态**：A5/A6 已完成并提交；A7 agent 工作流准备材料待计划审计；P4 未开始，Build 事故记录不是门。
+- **B1 前输入未验证**：config/event schema、fixture、acceptance 必须在迁移 worktree 基于 99c38ba 重新验证；本文件只冻结输入。
 - **不宣告 handoff**：是否可交接由后续独立 reviewer 判定；本文件不自称通过。
 - 未运行上游测试套件、未访问真实账号/IP/Google、未验证 `static/assets` 本地可复现构建。
 - 未完成项：F1-F8 均未实施；`06-test-disposition.csv` 的新增行只是处置建议，不是已通过证据。

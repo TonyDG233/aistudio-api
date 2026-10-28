@@ -2,7 +2,7 @@
 
 范围：`docs/dev/rebuild/06-feature-ledger.md` 的逐包决策记录。只记录决定，不复制台账行；未确认项标 `pending`。
 
-修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序；2026-10-28 按 08-08/08-09 闭合 99c38ba 的 14 项决策、17 个 NO_FEATURE_ROW 与 20 个冲突。`08-01-execution-readiness-audit.md`、`09-pg-toolcall-analysis.md` 保留历史审计原文，不回改；修复后需重新独立审计。
+修订：2026-10-27 按 D1-D8 修复索引、状态机与顺序；2026-10-28 按 08-08/08-09 闭合 99c38ba 的 14 项决策、17 个 NO_FEATURE_ROW 与 20 个冲突。`archive/08-01-execution-readiness-audit.md` 保留历史审计原文；`domains/P5-generation/09-pg-toolcall-analysis.md` 保留为 P5 工具链路输入，不回改；修复后需重新独立审计。
 
 ## 重构大方向（2026-10-24）
 
@@ -42,7 +42,7 @@
 
 ## 执行前置 / 顺序 / 状态机（D1-D8，2026-10-27）
 
-`08-01-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
+`archive/08-01-execution-readiness-audit.md` 的 D1-D8 已全部按 A 确认。本节是执行口径；与旧 CSV 冲突时以 P2/P3 决策和本节为准。08/09 保留为历史审计，不修改其原文；修复后必须重新独立审计，再把 `10-handoff-prompt.md` 交给全新 agent。
 
 | 决策 | 执行规则 |
 |---|---|
@@ -52,7 +52,7 @@
 | D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁用账号/应用预设触发同一控制面 rebind（D-05）：RETIRING → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
 | D5 顺序 | 预检（A 文档收敛，不是独立 Gate）→ P9-pre 装配/API Key guard → P1+P3+P2 → P6 保活/24h → P7 日志/导出 → P5 OpenAI/Gemini → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。VPS 运行 P5 前必须先有 P6 保活和 P7 可用的 debug 日志。每片验收通过后才进入下一片。 |
 | D6 迁移 | 只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist；禁止 `-- docs` 整树。迁移前 secret scan；旧 WP 归档到 `docs/dev/evidence/p1-ark-merge-archive/`，关键文档可留 `docs/dev/` 根。 |
-| D7 PG 修复门槛 | P5 验收前完成 F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。 |
+| D7 PG 修复门槛 | P5 验收前先完成 **B5a**：F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。完整 F-01..F-13 与“预设把内容搬进工具通道 / pg 回退”链路见 `domains/P5-generation/index.md` 与 `domains/P5-generation/09-pg-toolcall-analysis.md`；F-08..F-13 未纳入 P5 门，不得当成已验证。B5a 未通过不得进入 B5b/P5。 |
 | D8 UI / 模型目录 | upstream Vue 原生布局、文案、交互细节不得无故重写或删除；新 UI 以原生增量为先。ModelCatalog 是模型/paid 元数据唯一所有者；日志、统计、路由只消费，不各自维护 paid map。 |
 
 ## P1 Account / Auth / Paid
@@ -417,7 +417,7 @@ Feature ID：`D05-041`
 
 ## 99c38ba 上游裁决（2026-10-27，追加；不改 P1-P10 原结论）
 
-本节只追加新裁决、标注被替代的旧表述；`08-07-upstream-99c38ba-reaudit.md` 是完整影响矩阵。feature 集不变，仍为 518 行（已被 08-09 的 534 行取代）；不新增 feature 行。
+本节只追加新裁决、标注被替代的旧表述；`archive/08-07-upstream-99c38ba-reaudit.md` 是完整影响矩阵。feature 集不变，仍为 518 行（已被 08-09 的 534 行取代）；不新增 feature 行。
 
 | 决策包 | 动作 | 裁决 |
 |---|---|---|
@@ -436,7 +436,7 @@ Feature ID：`D05-041`
 
 - P6-Q6 的 “active_activity 阻止 idle 回收” 与 P6 总原则的 idle 自动回收默认关闭：上游已无 idle 回收，active_activity 置 disable；`SLEEPING` 仍保留为消息唤醒状态，但只由显式释放进入。
 - 索引行随 99c38ba 调整（该轮不改 518 行集合，只改 decision/note；后由 08-09 增至 534 行）：`D01-012`、`D01-038`、`D03-035`、`D04-042` → `drop`（idle 回收/超时/监控不再存在）；`D03-004` → `keep`（保留 pipe watchdog/进程组/Job Object/atexit，D-02）；`D03-009` → `rewrite`（删 liveness checker 与轮询，保留 WebSocket ping 与页面失败即失败，D-03）；`D08-022` → `rewrite`（只保留消息唤醒 SLEEPING/UNSTARTED 与失败/stale 手动重启，idle 回收不实现）。CSV 与 ledger 已同步。
-- `08-06` 基于 `4623109` 的 handoff 结论失效，只作历史；新基线为 `99c38ba`。
+- `archive/08-06` 基于 `4623109` 的 handoff 结论失效，只作历史；新基线为 `99c38ba`。
 - 旧 “26/26 新 worktree 测试覆盖” 修正为 `99c38ba` 28/28；26 是 `b8af406` 计数，不能与主 `rebuild` 80/80 混同。
 
 D12/lease 措辞复核：D02/D05/D06/D12 相关行已按“无 lease、`active_requests` 唯一账本、429→503 retained”执行；**该句中的“不新增 feature 行/不改变 518 行集合”已被 08-09 取代（见下节）**。
