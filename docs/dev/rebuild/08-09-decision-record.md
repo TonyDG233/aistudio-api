@@ -197,7 +197,7 @@
 
 ## 7. 仍未完成 / 不得声称
 
-- **Gate 0 未通过**：本轮改动未提交，工作区非干净；G0.1 需提交后记录新 HEAD。
+- **Gate 0 未通过**：计划文档已提交 b3f09d1，Build 事故记录已提交 e64a4d9；P4-B0 修订提交前工作区仍非干净，G0.1 不得写通过。
 - **Gate 0.5 未执行**：config/event schema、fixture、acceptance 必须在迁移 worktree 基于 99c38ba 重新验证；本文件只冻结输入。
 - **不宣告 handoff**：是否可交接由后续独立 reviewer 判定；本文件不自称通过。
 - 未运行上游测试套件、未访问真实账号/IP/Google、未验证 `static/assets` 本地可复现构建。

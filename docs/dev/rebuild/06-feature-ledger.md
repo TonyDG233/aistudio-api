@@ -397,7 +397,7 @@
 | D07 | warmup 规格下发（经 9998 向 app 客户端下发 `__warmup__:streamGenerateContent`） | `1cc634e`, `d4ff844`; `build_surface.py:1423-1451` | 新增 | partial | 无单测；`p3-build3` 日志“已下发 warmup 规格”后 1s signer ready（不可复跑） | port | port |
 | D07 | native dispatch + SSE pump（request_id 关联 9998 会话；headers/chunk/stream_close/error 归一为 chunk/status/done/error） | `8dd6782`; `build_surface.py:819-905` | 新增 | working | `test_build_surface.py:607-634` | port | port |
 | D07 | 传输选择（默认 native；`AISTUDIO_BUILD_TRANSPORT=signer/native` 显式开关，仅在目标健康时生效） | `8dd6782`; `build_surface.py:366-377` | 新增 | working | `test_build_surface.py:585-605` | port | port |
-| D07 | native→signer 首帧前回退（下发失败或 error 且未出帧；已出帧不回退不重放） | `8dd6782`; `build_surface.py:1664-1679`, `:1693-1700` | 新增 | working | `test_build_surface.py:636-679` | port | port |
+| D07 | native→signer 首帧前回退（下发失败或 error 且未出帧；已出帧不回退不重放） | `8dd6782`; `build_surface.py:1664-1679`, `:1693-1700` | 新增 | **P4-B0 待重审**（历史 working，不能按已验证用） | `test_build_surface.py:636-679`；2026-10-28 native 400 `PROXY_GENERATION_DISABLED` 未归因 | port | port |
 | D07 | native 断线重试（请求前无连接先轻量恢复；dispatch 返回 None 再恢复重发；首帧前 error 重试一次） | `1cf3994`; `build_surface.py:1577-1579`, `:1616-1646`, `:1684-1692` | 新增 | working | `test_build_surface.py:792-900` | port | port |
 | D07 | 原地恢复 `_recover_warmup`（过门→等 9998→重发 warmup→可选等 signer，不重导航） | `1cf3994`; `build_surface.py:1248-1310` | 新增 | partial | 单测仅以 monkeypatch 替身验证调用次数（`test_build_surface.py:792-900`）；真实恢复路径 `未验证` | port | port |
 | D07 | watchdog（5s 轮询 / 断线 10s 宽限 / 后台轻量重连；`_ensure_lock` 持有时跳过，避免并发导航） | `1cf3994`, `8e5e0cb`; `build_surface.py:1312-1359` | 新增 | unverified | 无单测、无本地日志证据；且 `:1314` 无 `_realm_id` 时直接不启动 | port（需补测） | port |

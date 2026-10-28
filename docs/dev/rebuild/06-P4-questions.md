@@ -2,7 +2,7 @@
 
 P4 是 D07 原 43 行；已确认时新增 `D07-044`“失败现场截图 PNG + 页面 HTML dump”，总计 44 行。10 个问题已于 2026-10-25 确认；最终决定见 `06-decision-log.md` 的 P4。
 
-> **2026-10-28 事故重开**：Build native 流请求返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`，native 首帧前断开并进入 `9998` 重连。详见 `08-10-build-surface-incident-20261028.md`。P4-Q4 的“native 主 + signer 首帧前回退”**暂停作为实现依据**；P4 业务实现前必须先完成 08-10 §4 的重新溯源与 §5 的解决方案测试。
+> **2026-10-28 事故重开**：Build native 流请求返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`，native 首帧前断开并进入 `9998` 重连。详见 `08-10-build-surface-incident-20261028.md`。P4-Q4 的“native 主 + signer 首帧前回退”**暂停作为实现依据**；P4-B0a（实现前）必须先完成 08-10 §4 离线溯源并产出 `08-11-build-400-trace.md`，P4-B0b（实现后）再做 §5 解决方案测试与验收。signer-only 离线 spike 与非传输 P4 工作可继续。
 
 | ID | 真正的问题 | 选项 | 涉及 feature IDs | 建议 |
 |---|---|---|---|---|

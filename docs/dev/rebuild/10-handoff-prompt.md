@@ -20,7 +20,7 @@
 9. docs/dev/rebuild/13-gate0-execution-record.md（Gate0 历史 + 2026-10-28 轮次）
 10. docs/dev/rebuild/08-07-upstream-99c38ba-reaudit.md（**仅历史**，已被取代，不得作为 handoff 依据）
 11. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
-12. docs/dev/rebuild/08-10-build-surface-incident-20261028.md（**P4 前置事故门**：Build native 400 `PROXY_GENERATION_DISABLED`，先溯源再实现）
+12. docs/dev/rebuild/08-10-build-surface-incident-20261028.md（**P4 前置事故门**：Build native 400 `PROXY_GENERATION_DISABLED`；B0a 先离线溯源并提交 `08-11-build-400-trace.md`，B0b 实现后验收）
 
 本提示词只在独立 reviewer 明确判定“可 handoff”后使用；修复后须再由独立审计复核（05 §6.7）。
 
@@ -49,10 +49,10 @@ Agent 工作模式（详见 05 §2.1）：
 - worker 只接一个 Dxx-NNN 或明确文件域；独立 worktree；不得改 05/06/architecture/decision log；报告测试项+预期+实际。
 - reviewer 只读；在 Gate0/0.5、P3 状态机、P2 路由、P5 PG、P7 统计、最终 handoff 独立审查，不参与实现。
 - 并行仅限接口已冻结且文件域不重叠；最多 2-3 个 worker；禁止同时改 routing_pipeline.py、instance_pool.py、generation_service.py、05/06/ARCHITECTURE；禁止 F1↔F3、F3↔F4、F4↔F5、F6↔F7 同时改共享语义文件。
-- Gate0/0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7 默认串行；P8 在 API 稳定后并行；**P4 在 P4-B0/08-10 溯源与解决方案测试通过前不得开工**，不得与 P8 并行绕过事故门。
+- Gate0/0.5、P9-pre、P1/P3/P2 核心、P5 parser、P6→P7 默认串行；P8 在 API 稳定后并行；**P4-B0a 未完成前不得写 native/transport/Q4 相关实现**；signer-only 离线 spike 与非传输 P4 工作可继续；B0b 未通过不得进入 P4 验收。
 - 不用“保持旧测试绿”复活旧契约；最终合并/提交只由 integrator 做。
 
-顺序：Gate 0 → Gate 0.5 → P9-pre 装配/鉴权 → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → **P4-B0/08-10 Build 400 溯源与解决方案测试** → P4 Build → P8/UI → Claude/Responses → 统计页 → P10 收尾。
+顺序：Gate 0 → Gate 0.5 → P9-pre 装配/鉴权 → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → **P4-B0a Build 400 离线溯源/Q4 写回** → P4 Build 实现 → **P4-B0b 解决方案测试与验收** → P8/UI → Claude/Responses → 统计页 → P10 收尾。
 99c38ba 增量的内部顺序用 08-09 §5 的 F1-F8：F1 rotator/quota_scope → F2 协议/传输 → F3 账号域 → F4 准入/403 → F5 生命周期 → F6 统计 → F7 Web → F8 测试收口；F2 可在 F1 契约冻结后并行，其余按依赖串行。
 每片测试先写“测试项 + 预期结果”，验收通过再进下一片。
 
@@ -89,8 +89,9 @@ F-01 functionCall 缺 thoughtSignature 兜底；F-02 首事件前真实 HTTP 4xx
 上游 99c38ba 已原生修复角色守卫、结构化 functionCall/functionResponse、per-chunk usage、空 200/malformed 归错；仍须用离线 fixture 证明 F-01..F-04，不重复造轮子。
 F-05/06/07 后做，不阻塞 P5 最小闭环；F-08..F-13 在 P5/P4 前 triage。
 
-禁止：修改测试/配置绕过契约；合并 master/rebuild；整树 checkout；离线沿用旧 upstream ref；访问真实账号/IP/Google；提交敏感内容；使用 08-07 作为行为依据；把 9998 重连当作 Build 400 修复；在 P4-B0/08-10 未完成前写 Build 业务代码。
+禁止：修改测试/配置绕过契约；合并 master/rebuild；整树 checkout；离线沿用旧 upstream ref；访问真实账号/IP/Google；提交敏感内容；使用 08-07 作为行为依据；把 9998 重连当作 Build 400 修复；在 P4-B0a 未完成前写 native/transport/Q4 相关 Build 代码；B0b 未通过就进入 P4 验收。
 
-验收：G0.1-G0.10 全过；G1-G11 固定出处仍为 08-05 附录 A / 08-01:129-140，并由 12 §5 模板落工件；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API 免密默认关闭且管理页空密码可用；UI 验收：现有 SettingsView/ApiKeyManagerCard 中 quota_scope、API 免密开关、管理页空密码=免密均可见且可保存，不新增 IP/CIDR/本机-局域网模式，不重构布局；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过；08-09 的 F1-F8 与 20 冲突闭合有对应测试；**P4-B0/08-10**：Build native 400 `PROXY_GENERATION_DISABLED` 有准确失败分类，无 9998 无限重试，native/signer 分别验证，解决方案测试通过后才进入 P4 验收。
+Gate0/handoff 验收：G0.1-G0.10 全过；G1-G11 固定出处仍为 08-05 附录 A / 08-01:129-140，并由 12 §5 模板落工件；Gate0 校验 0 错误；同账号 1 Context+1 Page；chat/build 不并存；无 lease 断言；API 免密默认关闭且管理页空密码可用；UI 验收：现有 SettingsView/ApiKeyManagerCard 中 quota_scope、API 免密开关、管理页空密码=免密均可见且可保存，不新增 IP/CIDR/本机-局域网模式，不重构布局；24h fake clock；日志/导出与统计口径；PG F-01..F-04 fixture 通过；08-09 的 F1-F8 与 20 冲突闭合有对应测试。
+P4 验收（不属于 G0.1-G0.10）：P4-B0a 产出 `08-11-build-400-trace.md` 并写回 Q4；P4-B0b 证明 Build native 400 `PROXY_GENERATION_DISABLED` 有准确失败分类，无 9998 无限重试，native/signer 分别验证；B0b 通过后才进入 P4 功能验收。
 完成后报告：修改文件、测试命令/结果、未验证项、证据路径。
 ```

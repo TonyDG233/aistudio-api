@@ -78,7 +78,7 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 文档改动未提交，工作区非干净；需提交后记录新 HEAD。 |
+| G0.1 基线 | **未通过** | 历史提交 b3f09d1、e64a4d9 已存在；本轮 P4-B0 修订提交前工作区非干净，不能写通过。 |
 | G0.2 上游硬门 | **通过（本次）** | fetch 成功，`upstream/master=99c38ba` 已记录。 |
 | G0.3 索引 | **历史（518）** | 当轮 `errors=0`、518/518；本轮已更新为 534/534，实际输出见 §3。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | D-01..D-14 已由用户确认；17 个 `NO_FEATURE_ROW` 与 20 冲突已在 08-09 逐项闭合；但尚未经独立 reviewer 复核，不得写“通过”。 |
@@ -88,7 +88,13 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 | G0.8 归属 | **沿用历史** | ledger-batches/旧 WP 规则不变。 |
 | G0.9 Gate0.5 | **未通过** | 按新流程先删除旧 worktree 的 config/fixture/acceptance，再由 Gate 0.5 按 12 §5.1 重建/验证；当前尚未执行。 |
 | G0.10 Handoff | **未通过** | 需独立 reviewer 判定；本文件不宣告 handoff。 |
-| P4-B0 Build 渠道 | **阻塞，未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。P4 业务实现前必须按 `08-10-build-surface-incident-20261028.md` 重新溯源并完成解决方案测试；禁止把 9998 重连当修复。 |
+
+### 2.4.1 P4 前置门（不属于 Gate 0）
+
+| ID | 状态 | 说明 |
+|---|---|---|
+| P4-B0a | **未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。实现前必须按 `08-10-build-surface-incident-20261028.md` 完成离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4。 |
+| P4-B0b | **未开始** | P4 实现后验证 fail-fast、错误透传、native/signer 分别测试、9998 无循环重连；未通过不得进入 P4 功能验收。 |
 
 ### 2.5 明确不能声称的事
 
@@ -125,7 +131,7 @@ Gate 状态（不宣称通过）：
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| G0.1 基线 | **未通过** | 本轮文档改动未提交，工作区非干净；提交后才能记录新 HEAD。 |
+| G0.1 基线 | **未通过** | 历史提交 b3f09d1、e64a4d9 已存在；本轮 P4-B0 修订提交前工作区非干净；不得把历史提交当作本轮 Gate0 通过。 |
 | G0.2 上游硬门 | **未复核（本轮未 fetch）** | 沿用 99c38ba 记录，但本文件不把“未重跑”写成“通过”；进入 Gate 0 时必须重新 fetch 并记录。 |
 | G0.3 索引 | **通过（索引）** | 534/534，`errors=0`，桥接计数正确。 |
 | G0.4 决策 | **决策已确认，Gate 未闭合** | 14 项已确认、17 分类/20 冲突已闭合；需独立 reviewer 复核。 |
