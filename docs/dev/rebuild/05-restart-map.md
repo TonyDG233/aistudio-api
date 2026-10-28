@@ -59,6 +59,8 @@
 
 Build 是独立 surface，不是一个 pool tier。Build 页面、9998、signer 只通过明确接口接入，不反向控制 router。
 
+**P4-B0（2026-10-28 事故门）**：Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；native 首帧前断开，`9998` 重连后仍报 `NATIVE_ERROR`。P4 业务实现前必须先按 `08-10-build-surface-incident-20261028.md` 重新溯源（端点/账号/tier/代理/签名）并完成解决方案测试；不得把 9998 重连当作修复，不得假定 signer 一定可用。
+
 ## 4. 执行前置 / 状态机（D2-D8 + 交叉前置）
 
 | 项 | 执行规则 |
@@ -82,7 +84,7 @@ D6 迁移边界：只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlis
 3. **P5**：最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；通过 D7 PG 门槛。
 4. **P6**：凭证保活与 24h；fake clock 验证。
 5. **P7**：日志页 + 导出（D09，不含统计页）。
-6. **P4**：Build Surface（先 fake 9998/signer）。
+6. **P4**：Build Surface。**先完成 P4-B0/08-10 的 400 渠道溯源与解决方案测试，再决定 native/signer**；不得直接按旧 P4-Q4 实现。
 7. **P8/UI**：最小 API/UI、实例 UI；upstream Vue 原生优先。
 8. **Claude/Responses**。
 9. **统计页**（D10）。
@@ -299,6 +301,7 @@ $mustExist = @($evidence + $evidenceLogs + @(
   "docs/dev/rebuild/08-07-upstream-99c38ba-reaudit.md"
   "docs/dev/rebuild/08-08-upstream-99c38ba-full-diff-audit.md"
   "docs/dev/rebuild/08-09-decision-record.md"
+  "docs/dev/rebuild/08-10-build-surface-incident-20261028.md"
   "docs/dev/rebuild/13-gate0-execution-record.md"
 ))
 foreach ($item in $mustExist) {

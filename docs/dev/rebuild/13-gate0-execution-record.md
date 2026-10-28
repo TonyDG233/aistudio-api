@@ -88,6 +88,7 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 | G0.8 归属 | **沿用历史** | ledger-batches/旧 WP 规则不变。 |
 | G0.9 Gate0.5 | **未通过** | 按新流程先删除旧 worktree 的 config/fixture/acceptance，再由 Gate 0.5 按 12 §5.1 重建/验证；当前尚未执行。 |
 | G0.10 Handoff | **未通过** | 需独立 reviewer 判定；本文件不宣告 handoff。 |
+| P4-B0 Build 渠道 | **阻塞，未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。P4 业务实现前必须按 `08-10-build-surface-incident-20261028.md` 重新溯源并完成解决方案测试；禁止把 9998 重连当修复。 |
 
 ### 2.5 明确不能声称的事
 

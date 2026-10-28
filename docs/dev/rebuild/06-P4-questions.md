@@ -2,12 +2,14 @@
 
 P4 是 D07 原 43 行；已确认时新增 `D07-044`“失败现场截图 PNG + 页面 HTML dump”，总计 44 行。10 个问题已于 2026-10-25 确认；最终决定见 `06-decision-log.md` 的 P4。
 
+> **2026-10-28 事故重开**：Build native 流请求返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`，native 首帧前断开并进入 `9998` 重连。详见 `08-10-build-surface-incident-20261028.md`。P4-Q4 的“native 主 + signer 首帧前回退”**暂停作为实现依据**；P4 业务实现前必须先完成 08-10 §4 的重新溯源与 §5 的解决方案测试。
+
 | ID | 真正的问题 | 选项 | 涉及 feature IDs | 建议 |
 |---|---|---|---|---|
 | P4-Q1 | Build app 的默认来源怎么定？ | A 只从配置读，缺配置就报错；B 配置优先 + 保留 Ark 默认；C 继续硬编码 | `D07-001` | A |
 | P4-Q2 | Build 页面复用还是每次重建？ | A 永远复用；B 每次重建；C 健康时复用，异常/换号/断线时重建 | `D07-002,003,042` | C |
 | P4-Q3 | Build 的登录/BotGuard 怎么处理？ | A 参考项目移植 BotGuard 到 build 页；B 保留临时 chat bootstrap；C 不做 | `D07-004,005`; P3 BotGuard 行 | A |
-| P4-Q4 | Native 9998 和 signer 谁主谁备？ | A native 主 + signer 首帧前回退；B 只用 signer；C 只用 native | `D07-012..017,019..021,043` | A |
+| P4-Q4 | Native 9998 和 signer 谁主谁备？ | A native 主 + signer 首帧前回退；B 只用 signer；C 只用 native | `D07-012..017,019..021,043` | A（2026-10-28 事故后**待重审**，见 08-10） |
 | P4-Q5 | human gate / focus / 过场点击保留吗？ | A 全部保留；B 作为可选兼容层，默认按证据启用；C 全删 | `D07-006..009` | B |
 | P4-Q6 | 9998 多实例怎么隔离？ | A 单端口 + 每实例 realm；B 每实例独立端口；C 不隔离 | `D07-010,011,018,030` | A |
 | P4-Q7 | Build 页面允许多少并发请求？ | A 一个页面多请求；B 一页一请求，满了用其他 build 实例；C 可配置 | `D07-023..026,031` | B |

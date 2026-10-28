@@ -224,13 +224,20 @@ Feature ID：`D05-041`
 - **P4-Q1 Build app 来源**：`D07-001` → keep。
 - **P4-Q2 页面复用/清理**：`D07-002`, `D07-003`, `D07-042` → port。
 - **P4-Q3 BotGuard/失败现场**：`D07-004`, `D07-005`, `D07-044` → port。
-- **P4-Q4 native/signer/解析**：`D07-012`..`017`, `D07-019`..`022`, `D07-027`..`029`, `D07-032`..`037`, `D07-043` → port/keep。
+- **P4-Q4 native/signer/解析**：`D07-012`..`017`, `D07-019`..`022`, `D07-027`..`029`, `D07-032`..`037`, `D07-043` → port/keep。**2026-10-28 起暂停作为实现依据**：Build native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`，P4 必须先按 `08-10-build-surface-incident-20261028.md` 重新溯源，确认 native/signer 端点与回退条件后再实现。
 - **P4-Q5 反自动化层**：`D07-006`..`009` → keep；`D07-044` → port。
 - **P4-Q6 9998 sink/realm**：`D07-010`, `D07-011`, `D07-018`, `D07-030` → port。
 - **P4-Q7 并发/中止**：`D07-023`..`026`, `D07-031` → `D07-024` keep 作为换号/重载保护，`D07-026` keep（PAGE_CLOSED 三处检测），其余 port；不限制请求并发。
 - **P4-Q8 build-only Cookie**：`D07-040` → port；成功/关闭回写，手动重启。
 - **P4-Q9 身份/配额**：`D07-038`, `D07-039` → port；使用实例 session/scope 与实例配置。
 - **P4-Q10 非流式**：`D07-041` → port。
+
+### P4-B0 Build 渠道事故（2026-10-28，阻塞）
+
+- 日志：`build_surface:stream` native 首帧前断开；上游 `400 INVALID_ARGUMENT`，`PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；进入 `9998` 重连后仍报 `NATIVE_ERROR`。
+- 影响：Build native 端点可能被渠道/账号/代理级禁用，不能按“瞬时断线”重试；P4-Q4 的 native 主 + signer 回退假设必须重审。
+- 门：P4-B0 未完成前，P4 不得开始业务实现；必须先按 `08-10-build-surface-incident-20261028.md` 完成请求抓取、端点/tier/账号/代理归因、native/signer 分别验证、解决方案测试。
+- 验收：明确 400 时 fail-fast 或有限回退；禁止 9998 无限循环；客户端收到准确 Build 错误；保留成功样本为 fixture。
 
 ## 实现优先级（2026-10-27 按 D5 固定）
 
@@ -417,7 +424,7 @@ Feature ID：`D05-041`
 | P1 Account / Auth / Paid | adopt | `AccountMeta.enabled/group`、`AccountPreset`/`presets.json`、分组/预设 CRUD 与路由（保留分组/预设；**notes 与 batchToggleGroup 按 D-13 删除**）、`get_active_account` 只回退 enabled 账号，全部采上游原生；禁用账号不入候选。 |
 | P2 Routing / Candidate / Switch / Retry | rewrite | `AccountStats` 的 `daily_models`、`resolve_tier_quota`、`tier_weights/stickiness/drip_penalty`、`required_tiers` 只作现有实例候选的排序/准入；不新增请求实例、不后台改绑、不另立并发账本。付费模型无合格账号的本地 403 fast-fail adopt；与 429→503 分开。 |
 | P3 Browser / CDP / Context / Page / Instance / Pool / Lease | adopt + rewrite | **保留 pipe watchdog（D-02，仅父进程死亡后的孤儿 Chromium 清理）**；**只保留 WebSocket ping（D-03）**，liveness checker/轮询 disable；idle 回收删除；adopt `capture._ensure_template` 的 `await session.ensure_ready()`；page prune 按 D-11 关闭所有非当前请求/非当前活跃账号的 Page/Context；drain 只在旧 Page/Context 上有界，期间不新建新页；不采用 `session.py:211` 的 blue-green `create_new_page`/`_retiring_contexts` 后台 drain。1 账号 + 1 Context + 1 Page + 1 surface、无 lease 不变。 |
-| P4 Build Surface | keep | Build 计划不变；只继承 wire/transport 修复，不因上游变化新增 Build 范围。 |
+| P4 Build Surface | keep（P4-B0 阻塞） | Build 范围保持；只继承 wire/transport 修复。**2026-10-28 事故门 P4-B0**：native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`；未完成 08-10 §4 溯源与 §5 解决方案测试前，不得进入 P4 业务实现，不得把 P4-Q4 的 native 主路径当已验证事实。 |
 | P5 Generation / Protocol / Wire | adopt | `session_token`/`request_context`/`SEED=18`/`WIRE_FINISH_REASON_CONTINUING=22`/角色守卫/结构化 functionCall/functionResponse/per-chunk usage/response_id/统一 thought+signature 写回均采上游；F-01/F-04 仍用离线 fixture 证明。 |
 | P6 Keepalive / Rotation / 24h | keep + disable | 24h 回写、手动保活、429 冷却/跨天 keep；**watchdog keep（D-02）**、**WebSocket ping keep（D-03）**、**liveness checker disable**；idle 回收 disable；`active_activity` 因失去“阻止 idle 回收”的语义置 disable；无后台 stale 复活。 |
 | P7 Logs / Stats | adopt | `reasoning_tokens`、`cached_tokens`、`finish_reasons`、`account_breakdown`、`cachedContentTokenCount` 采上游；`account_breakdown` 是 stats REST 派生字段，不是事件类型；token 汇总仍不含 countTokens。 |

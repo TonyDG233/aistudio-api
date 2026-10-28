@@ -14,6 +14,12 @@
 
 ## 2026-10-28
 
+- 范围：`docs/dev/rebuild/06-P4-questions.md`、`06-decision-log.md`、`06-feature-ledger.md`、`05`、`08-10-build-surface-incident-20261028.md`、`10`、`12`、`13`；`docs/changelog.md`
+- 变更：记录 Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED` 的事故；新增 P4-B0 阻塞门，要求 P4 实现前按 08-10 重新做端点/账号/tier/代理/签名溯源与 native/signer 解决方案测试；禁止把 9998 重连当作修复。
+- 原因：2026-10-28 12:04:21/22 的 build_surface 日志；P4-Q4 旧“native 主 + signer 回退”不再可直接作为实现依据。
+- 验证：事故日志原文、08-10 §4/§5 清单；P4 未实现、未访问真实账号/IP/Google。
+- 状态：P4 阻塞；不宣告 Build 渠道可用或 handoff。
+
 - 范围：`docs/dev/rebuild/05`、`06*`、`08-07`、`08-09`、`10`、`12`、`13`；`docs/changelog.md`
 - 变更：新增 `08-09-decision-record.md`，把用户确认的 D-01..D-14、17 个 `NO_FEATURE_ROW` 分类（16 feature + 1 out-of-scope）、20 个冲突闭合、`ENGINEERING_DEFAULT` 清单与 F1-F8 阶段固定为行为权威；修订 05/06/10/12/13 与 08-07 历史横幅。
 - 原因：08-08 全量审计发现 14 项待决策、17 个 `NO_FEATURE_ROW`、20 个冲突；08-07 领域级审计已被证明有 16 处漏项/错项，不能作为 handoff 依据。
