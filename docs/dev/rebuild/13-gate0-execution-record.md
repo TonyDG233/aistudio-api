@@ -93,7 +93,7 @@ upstream 99c38ba tests/**/*.py = 28 (incl conftest), covered = 28/28
 
 | ID | 状态 | 说明 |
 |---|---|---|
-| P4-B0a | **未通过** | 2026-10-28 12:04 `build_surface:stream` native 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。实现前必须按 `08-10-build-surface-incident-20261028.md` 完成离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4；**须有独立 reviewer 签字后解除 B0a**。 |
+| P4-B0a | **BLOCKED（部分溯源）** | `08-11-build-400-trace.md` 已产出并经独立 reviewer 确认可归档，但仍缺 `08-11` §9 G1–G9 关键证据（app_id/model/账号 tier/实际 URL 与 headers/代理/完整 error details/9998 序列/线上 bundle/signer 快照）；未写回 Q4，未签字解除。 |
 | P4-B0b | **未开始** | P4 实现后验证 fail-fast、错误透传、native/signer 分别测试、9998 无循环重连；未通过不得进入 P4 功能验收。 |
 
 ### 2.5 明确不能声称的事

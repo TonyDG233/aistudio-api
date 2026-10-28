@@ -21,6 +21,7 @@
 10. docs/dev/rebuild/08-07-upstream-99c38ba-reaudit.md（**仅历史**，已被取代，不得作为 handoff 依据）
 11. docs/dev/evidence/INDEX.md、docs/dev/evidence/p1-ark-merge-archive/README.md、docs/changelog.md
 12. docs/dev/rebuild/08-10-build-surface-incident-20261028.md（**P4 前置事故门**：Build native 400 `PROXY_GENERATION_DISABLED`；B0a 先离线溯源并提交 `08-11-build-400-trace.md`，B0b 实现后验收）
+13. docs/dev/rebuild/08-11-build-400-trace.md（**部分溯源，B0a 仍 BLOCKED**；缺 G1–G9 证据，不得当签字/完成依据）
 
 本提示词只在独立 reviewer 明确判定“可 handoff”后使用；修复后须再由独立审计复核（05 §6.7）。
 

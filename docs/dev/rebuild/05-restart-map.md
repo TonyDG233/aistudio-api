@@ -302,6 +302,7 @@ $mustExist = @($evidence + $evidenceLogs + @(
   "docs/dev/rebuild/08-08-upstream-99c38ba-full-diff-audit.md"
   "docs/dev/rebuild/08-09-decision-record.md"
   "docs/dev/rebuild/08-10-build-surface-incident-20261028.md"
+  "docs/dev/rebuild/08-11-build-400-trace.md"
   "docs/dev/rebuild/13-gate0-execution-record.md"
 ))
 foreach ($item in $mustExist) {

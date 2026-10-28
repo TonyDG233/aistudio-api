@@ -75,7 +75,7 @@ P4 实现完成后、进入 P4 验收前必须基于当前报错完成：
 ## 7. 当前状态
 
 - 事故已记录，根因未确认。
-- **P4-B0a 未完成**：native/transport/Q4 相关实现阻塞；signer-only 离线 spike 与非传输 P4 工作可继续。
+- **P4-B0a 未完成**：`08-11-build-400-trace.md` 已产出部分溯源，但仍缺 §9 G1–G9 证据，未写回 Q4、未签字；native/transport/Q4 相关实现阻塞；signer-only 离线 spike 与非传输 P4 工作可继续。
 - **P4-B0b 未执行**：实现后验收测试尚未开始。
 - 不宣告 Build 渠道可用，也不宣告 signer 可用。
 - 未访问真实账号/IP/Google；本文只基于用户提供的日志与现有代码/文档。
