@@ -18,7 +18,7 @@
 - 变更：拆分 `P4-B0a`（实现前离线溯源，产出 `08-11-build-400-trace.md` 并写回 Q4，需独立 reviewer 签字）与 `P4-B0b`（实现后 fail-fast/错误透传/native-signer/9998 无循环重试验收）；阻塞范围限定为 native/transport/Q4 相关实现，signer-only 离线 spike 与非传输 P4 可继续。
 - 原因：独立 reviewer 指出单门“实现前/验收前”摇摆、08-11 交付物缺失、12/10 门类别混用、Q4 旧结论残留。
 - 验证：HEAD `1bc0efc`，工作区干净；仅 docs 变更；`08-11` 尚未产出，B0a 未通过。
-- 状态：P4-B0 文档仍被独立复审 BLOCKED；不宣告 Build 渠道可用或 handoff。
+- 状态：P4-B0 文档已在 b1cce0c 由独立复审 PASS；P4-B0a 尚未产出 08-11，B0b 未开始；不宣告 Build 渠道可用或 handoff。
 
 - 范围：`docs/dev/rebuild/06-P4-questions.md`、`06-decision-log.md`、`06-feature-ledger.md`、`05`、`08-10-build-surface-incident-20261028.md`、`10`、`12`、`13`；`docs/changelog.md`
 - 变更：记录 Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED` 的事故；新增 P4-B0 门（后被上一条拆分为 B0a/B0b）；禁止把 9998 重连当作修复。
