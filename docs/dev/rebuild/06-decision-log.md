@@ -50,7 +50,7 @@
 | D2 并发原语 | 取消 lease / reservation / lease 超时预算；只保留 `active_requests`。acquire 返回 `active_requests` 句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。**手动关闭/改绑**在有 `active_requests` 时仍可拒绝；但**禁用账号/应用预设的 rebind 不得直接拒绝**（D-05）：必须进入 `RETIRING`、停止新请求、有界等待 `active_requests=0` 或超时强制关闭，再关旧页/切号。容量按实例数计算，不再有 reservation 计数。 |
 | D3 控制面 | 控制面只负责登录与保活，不是请求实例，不占池容量。请求实例固定为 `1 账号 + 1 Context + 1 Page + 1 surface`；同账号 chat/build 不并存。账号有活动实例时，Cookie 回写走实例页；否则允许独立控制页。控制面不做蓝绿；切号必须关闭旧页再重建。 |
 | D4 sleep / wake / rebind | 消息到达时唤醒所有合格 SLEEPING/UNSTARTED 实例，候选包含休眠/未启动账号；不局限于存活实例。idle browser 自动回收默认关闭（默认不自动关）；失败/stale 才手动重启，禁止自动 stale 复活。rebind：后台自动 rebind 丢弃；手动显式关闭旧实例再重建允许。禁用账号/应用预设触发同一控制面 rebind（D-05）：RETIRING → 停新请求 → 有界等待/超时强制关闭 → 关旧页 → 切号，不得直接拒绝。禁止 pinned、自动 rebalance。429 先同账号重试，再唤醒/切现有实例，保存消息后切换实例再重试；耗尽返回 503 + 等待/管理页提示。已出正文不再切号。 |
-| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → P4-B0a → P4 Build → P4-B0b → P8/UI → Claude/Responses → 统计页 → P10 收尾。每片验收通过后才进入下一片。 |
+| D5 顺序 | Gate 0 → P9-pre 装配/API Key guard → P1+P3+P2 → P5 OpenAI/Gemini → P6 → P7 日志/导出 → P4 Build（启动时先按 08-10 做前期探索）→ P8/UI → Claude/Responses → 统计页 → P10 收尾。每片验收通过后才进入下一片。 |
 | D6 迁移 | 只迁移 `docs/dev/rebuild` + 脱敏 evidence 显式 allowlist；禁止 `-- docs` 整树。迁移前 secret scan；旧 WP 归档到 `docs/dev/evidence/p1-ark-merge-archive/`，关键文档可留 `docs/dev/` 根。 |
 | D7 PG 修复门槛 | P5 验收前完成 F-01（functionCall 缺 thoughtSignature 兜底）、F-02（首事件前真实 HTTP 4xx/5xx，不再 200 SSE 伪装）、F-03（finish-only/工具流终止兜底）、F-04（functionResponse/functionCall 强制 Struct）和脱敏 `[toolshape]` 摘要。F-05/06/07 后做，不阻塞 P5 最小闭环；全部离线 fixture 可验证。 |
 | D8 UI / 模型目录 | upstream Vue 原生布局、文案、交互细节不得无故重写或删除；新 UI 以原生增量为先。ModelCatalog 是模型/paid 元数据唯一所有者；日志、统计、路由只消费，不各自维护 paid map。 |
@@ -211,7 +211,7 @@ Feature ID：`D05-041`
 - `Q1 B`：Build app 配置优先，保留 Ark 默认。
 - `Q2 C`：健康时复用页面；异常、换号、断线时重建。
 - `Q3 A`：参考项目移植 BotGuard 到 build；失败时保存 PNG + 页面 HTML。
-- `Q4 A`：native 9998 主，signer 首帧前回退。**2026-10-28 P4-B0 事故后暂停作为现行实现依据**；必须先完成 `08-11-build-400-trace.md` 并重审 Q4，不能直接按本条写 native/transport 代码。
+- `Q4 A`：native 9998 主，signer 首帧前回退。**2026-10-28 事故后，在 P4 实现阶段重新确认前不得作为现行实现依据**；当前不进入 P4，不要求现在做溯源或补证据。
 - `Q5 A`：human gate、focus、过场点击全部保留；仍标未验证。
 - `Q6 A`：单 9998 端口 + 每实例 realm。
 - `Q7`：不限制 build 页并发；按均衡负载路由。`BUILD_BUSY` 只作为换号/重载保护，不是并发上限。
@@ -232,12 +232,12 @@ Feature ID：`D05-041`
 - **P4-Q9 身份/配额**：`D07-038`, `D07-039` → port；使用实例 session/scope 与实例配置。
 - **P4-Q10 非流式**：`D07-041` → port。
 
-### P4-B0 Build 渠道事故（2026-10-28，阻塞）
+### P4 Build 渠道事故记录（2026-10-28，未来 P4 阶段处理）
 
 - 日志：`build_surface:stream` native 首帧前断开；上游 `400 INVALID_ARGUMENT`，`PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`；进入 `9998` 重连后仍报 `NATIVE_ERROR`。
-- 影响：Build native 端点可能被渠道/账号/代理级禁用，不能按“瞬时断线”重试；P4-Q4 的 native 主 + signer 回退假设必须重审。
-- 门（拆两段）：**P4-B0a 实现前**只做离线/fixture 溯源并产出 `08-11-build-400-trace.md`；**P4-B0b 实现后**做 fail-fast、错误透传、native/signer 切换与 9998 无循环重试验收。B0a 未完成前不得写 native/transport/Q4 相关实现；signer-only 离线 spike 与非传输 P4 工作可继续。
-- 验收：明确 400 时 fail-fast 或有限回退；禁止 9998 无限循环；客户端收到准确 Build 错误；若当前无成功样本，必须明确“无基线”并补 native/signer 成功 fixture。
+- 影响：Build native 端点可能被渠道/账号/代理级禁用；P4-Q4 的 native 主 + signer 回退假设在 P4 实现阶段必须重新确认。
+- 当前不处理：这不是 P4 当前轮次，不要求现在溯源、补证据、改代码或写回 Q4。等到 P4 Build 实现阶段启动时，先按 `08-10-build-surface-incident-20261028.md` §4 做前期探索与功能可行性重试。
+- P4 阶段验收：明确 400 时 fail-fast 或有限回退；禁止 9998 无限循环；客户端收到准确 Build 错误；若当前无成功样本，必须明确“无基线”并补 native/signer 成功 fixture。
 
 ## 实现优先级（2026-10-27 按 D5 固定）
 
@@ -247,7 +247,7 @@ Feature ID：`D05-041`
 3. P5 最小 chat 生成 + OpenAI/Gemini + API 配置，形成最小可持续运行；P5 验收前过 PG 门槛（D7）。
 4. P6 凭证保活与 24h。
 5. P7 日志页 + 导出（D09，不含统计页）。
-6. P4 Build Surface：先 P4-B0a 溯源/Q4 写回，再实现，最后 P4-B0b 验收。
+6. P4 Build Surface：当前不执行；P4 阶段启动时先按 08-10 §4 做前期探索，再实现。
 7. P8 API/UI；upstream Vue 原生细节优先，ModelCatalog 单一所有者。
 8. Claude/Responses。
 9. P7 统计页（D10）。
@@ -424,7 +424,7 @@ Feature ID：`D05-041`
 | P1 Account / Auth / Paid | adopt | `AccountMeta.enabled/group`、`AccountPreset`/`presets.json`、分组/预设 CRUD 与路由（保留分组/预设；**notes 与 batchToggleGroup 按 D-13 删除**）、`get_active_account` 只回退 enabled 账号，全部采上游原生；禁用账号不入候选。 |
 | P2 Routing / Candidate / Switch / Retry | rewrite | `AccountStats` 的 `daily_models`、`resolve_tier_quota`、`tier_weights/stickiness/drip_penalty`、`required_tiers` 只作现有实例候选的排序/准入；不新增请求实例、不后台改绑、不另立并发账本。付费模型无合格账号的本地 403 fast-fail adopt；与 429→503 分开。 |
 | P3 Browser / CDP / Context / Page / Instance / Pool / Lease | adopt + rewrite | **保留 pipe watchdog（D-02，仅父进程死亡后的孤儿 Chromium 清理）**；**只保留 WebSocket ping（D-03）**，liveness checker/轮询 disable；idle 回收删除；adopt `capture._ensure_template` 的 `await session.ensure_ready()`；page prune 按 D-11 关闭所有非当前请求/非当前活跃账号的 Page/Context；drain 只在旧 Page/Context 上有界，期间不新建新页；不采用 `session.py:211` 的 blue-green `create_new_page`/`_retiring_contexts` 后台 drain。1 账号 + 1 Context + 1 Page + 1 surface、无 lease 不变。 |
-| P4 Build Surface | keep（P4-B0a 阻塞） | Build 范围保持；只继承 wire/transport 修复。**2026-10-28 事故门 P4-B0**：native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`；B0a 未完成（离线溯源 + `08-11-build-400-trace.md` + Q4 写回）前，不得写 native/transport/Q4 相关实现；B0b 未通过不得进入 P4 验收。不得把 P4-Q4 的 native 主路径当已验证事实。 |
+| P4 Build Surface | keep | Build 范围保持；只继承 wire/transport 修复。2026-10-28 事故记录：native `streamGenerateContent` 返回 `400 PROXY_GENERATION_DISABLED`；当前不进入 P4，不要求现在溯源/补证据；P4 实现阶段启动时先按 08-10 §4 做前期探索和可行性重试。不得把 P4-Q4 的 native 主路径当已验证事实。 |
 | P5 Generation / Protocol / Wire | adopt | `session_token`/`request_context`/`SEED=18`/`WIRE_FINISH_REASON_CONTINUING=22`/角色守卫/结构化 functionCall/functionResponse/per-chunk usage/response_id/统一 thought+signature 写回均采上游；F-01/F-04 仍用离线 fixture 证明。 |
 | P6 Keepalive / Rotation / 24h | keep + disable | 24h 回写、手动保活、429 冷却/跨天 keep；**watchdog keep（D-02）**、**WebSocket ping keep（D-03）**、**liveness checker disable**；idle 回收 disable；`active_activity` 因失去“阻止 idle 回收”的语义置 disable；无后台 stale 复活。 |
 | P7 Logs / Stats | adopt | `reasoning_tokens`、`cached_tokens`、`finish_reasons`、`account_breakdown`、`cachedContentTokenCount` 采上游；`account_breakdown` 是 stats REST 派生字段，不是事件类型；token 汇总仍不含 countTokens。 |

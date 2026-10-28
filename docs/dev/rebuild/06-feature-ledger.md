@@ -374,7 +374,7 @@
 
 ### D07 Build Surface / 9998 / Signer
 
-> **2026-10-28 P4-B0 事故**：Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`，首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。**P4-B0a** 先做离线溯源/`08-11-build-400-trace.md`/Q4 写回，之后才做 native/transport/Q4 相关实现；signer-only 离线 spike 与非传输 P4 可继续；**P4-B0b** 通过后才进入 P4 验收。P4-Q4 的 native 主/signer 回退假设暂停作为实现依据。
+> **2026-10-28 Build 事故记录**：Build native `streamGenerateContent` 返回 `400 INVALID_ARGUMENT` / `PROXY_GENERATION_DISABLED`，首帧前断开，`9998` 重连后仍 `NATIVE_ERROR`。当前不进入 P4，不要求现在溯源；P4 实现阶段启动时先按 `08-10-build-surface-incident-20261028.md` §4 做前期探索和可行性重试。P4-Q4 的 native 主/signer 回退假设在 P4 前重新确认。
 
 | domain | feature | provenance(commits/files) | 原生/改造/新增 | 当前状态 | 测试/证据 | keep/port/drop | 决定 |
 |---|---|---|---|---|---|---|---|
