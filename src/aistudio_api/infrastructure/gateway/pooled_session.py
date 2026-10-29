@@ -14,7 +14,10 @@ from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
 
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
-from aistudio_api.infrastructure.browser.scripts import SNAPSHOT_GENERATE_JS
+from aistudio_api.infrastructure.browser.scripts import (
+    DOM_GC_CLEANUP_JS,
+    SNAPSHOT_GENERATE_JS,
+)
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
     bootstrap_botguard_and_template,
 )
@@ -48,6 +51,7 @@ class PooledSession:
         self._realm_id = realm_id
         self._snapshot_lock = asyncio.Lock()
         self._in_flight = 0
+        self._stream_cleanup_count = 0
 
     @classmethod
     async def bootstrap(
@@ -121,7 +125,7 @@ class PooledSession:
             self._in_flight = max(0, self._in_flight - 1)
             self._context.decr_in_flight()
 
-    async def ensure_ready(self, timeout_s: float = 60.0) -> SessionContext:
+    async def ensure_ready(self, timeout_s: float = 120.0) -> SessionContext:
         del timeout_s
         if self._context.page.is_closed():
             raise RuntimeError(f"PooledSession {self._realm_id} page is closed")
@@ -156,7 +160,7 @@ class PooledSession:
                     snapshot = await self._context.page.evaluate(
                         SNAPSHOT_GENERATE_JS,
                         args=content_hash,
-                        timeout_s=10.0,
+                        timeout_s=25.0,
                     )
                     if isinstance(snapshot, str) and snapshot:
                         return snapshot
@@ -224,10 +228,24 @@ class PooledSession:
                 yield event
         finally:
             ctx.decr_in_flight()
+            await self.cleanup_stream_page(ctx.page)
 
     async def cleanup_stream_page(self, page: CDPPage | None = None) -> None:
-        del page
-        return
+        self._stream_cleanup_count += 1
+        target_page = page or self._context.page
+        if (
+            target_page is not None
+            and not target_page.is_closed()
+            and (self._in_flight <= 0 or (self._stream_cleanup_count % 5 == 0))
+        ):
+            with suppress(Exception):
+                await target_page.evaluate(DOM_GC_CLEANUP_JS)
+            if self._in_flight <= 0 and (self._stream_cleanup_count % 10 == 0):
+                with suppress(Exception):
+                    await target_page.collect_garbage()
+                import gc
+
+                gc.collect()
 
     async def save_current_cookies(self) -> bool:
         return await save_browser_cookies(self._context.page, self._context.auth_file)

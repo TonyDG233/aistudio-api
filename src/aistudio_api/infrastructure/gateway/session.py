@@ -203,7 +203,7 @@ class BrowserSession:
             raise RuntimeError("Session active page closed unexpectedly")
         return ctx
 
-    async def ensure_ready(self, timeout_s: float = 60.0) -> SessionContext:
+    async def ensure_ready(self, timeout_s: float = 120.0) -> SessionContext:
         """Return the single ready context, waiting for an in-progress rebind."""
         if self.is_ready and self._active_context is not None:
             return self._active_context
@@ -334,16 +334,23 @@ class BrowserSession:
     async def _drain_and_close_context(self, context: SessionContext) -> None:
         """Wait once (bounded) for the old page, then force-close it."""
         if context.in_flight > 0 and not context.page.is_closed():
-            try:
-                await asyncio.wait_for(
-                    context.drain_event.wait(), timeout=self._drain_timeout_s
-                )
-            except TimeoutError:
-                log.warning(
-                    "旧页 drain 超时 %.1fs (in_flight=%d)，强制关闭",
-                    self._drain_timeout_s,
-                    context.in_flight,
-                )
+            deadline = asyncio.get_running_loop().time() + self._drain_timeout_s
+            while context.in_flight > 0 and not context.page.is_closed():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    log.warning(
+                        "旧页 drain 超时 %.1fs (in_flight=%d)，强制关闭",
+                        self._drain_timeout_s,
+                        context.in_flight,
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(
+                        context.drain_event.wait(), timeout=min(remaining, 2.0)
+                    )
+                    break
+                except TimeoutError:
+                    continue
 
         # D03-026: 关闭前回写当前账号 cookie，避免最后一次会话状态丢失。
         with suppress(Exception):
@@ -408,7 +415,7 @@ class BrowserSession:
             for attempt in range(3):
                 try:
                     snapshot = await ctx.page.evaluate(
-                        SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=10.0
+                        SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
                     )
                     if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
                         return snapshot
@@ -600,10 +607,15 @@ class BrowserSession:
             await self._close_internal()
 
     async def _close_internal(self) -> None:
+        active_ctx = self._active_context
         self._active_context = None
         self._preparing = False
         self._last_error = None
         self._ready_event.clear()
+        if active_ctx is not None:
+            with suppress(Exception):
+                if not active_ctx.page.is_closed():
+                    await active_ctx.page.close()
         await self._stop_browser()
 
     async def _stop_browser(self) -> None:
