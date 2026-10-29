@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.application.instance_manager import InstanceError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
@@ -31,6 +32,7 @@ from aistudio_api.infrastructure.utils.logger import (
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
 from .routes_gemini import router as gemini_router
+from .routes_instances import router as instances_router
 from .routes_models import router as models_router
 from .routes_system import (
     protected_router as system_protected_router,
@@ -181,15 +183,49 @@ async def lifespan(_app: FastAPI):
 
     tier_task = asyncio.create_task(_auto_refresh_tiers())
 
-    # P3-D04/P6 接线钩子占位：真实 InstanceManager/Keepalive 在后续步骤装配
-    runtime_state.instance_manager = None
+    # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
+    from aistudio_api.application.instance_manager import InstanceManager
+    from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_instance_specs,
+        get_configured_max_contexts,
+    )
+
+    instance_pool = InstancePool(
+        client.session.ensure_cdp_client,
+        specs_provider=get_configured_instance_specs,
+        max_contexts_provider=get_configured_max_contexts,
+        on_slot_retired=lambda _realm_id: client.clear_templates(),
+    )
+    runtime_state.instance_manager = InstanceManager(
+        instance_pool,
+        account_store,
+    )
     runtime_state.keepalive = None
+
+    startup_task: asyncio.Task[object] | None = None
+
+    async def _startup_instances():
+        if warmup_task is not None:
+            try:
+                await warmup_task
+            except Exception as exc:
+                logger.debug("实例预启动前预热失败: %s", exc)
+        manager = runtime_state.instance_manager
+        if manager is None:
+            return
+        try:
+            await manager.startup()  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.warning("实例预启动失败: %s", exc)
+
+    startup_task = asyncio.create_task(_startup_instances())
 
     try:
         yield
     finally:
         logger.info("服务正在关闭")
-        await _shutdown_runtime(runtime_state, (warmup_task, tier_task))
+        await _shutdown_runtime(runtime_state, (warmup_task, tier_task, startup_task))
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
@@ -199,6 +235,9 @@ app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    instances_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 
@@ -216,6 +255,16 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
             }
         },
         headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(InstanceError)
+async def instance_exception_handler(
+    _request: Request, exc: InstanceError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": {"code": exc.code, "message": str(exc)}},
     )
 
 

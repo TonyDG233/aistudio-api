@@ -287,7 +287,7 @@ def test_shutdown_runtime_order_and_state_cleanup():
         rotator=object(),
     )
 
-    asyncio.run(app_module._shutdown_runtime(state, ()))
+    asyncio.run(app_module._shutdown_runtime(state, ()))  # type: ignore[arg-type]
 
     assert events == ["keepalive.stop", "instance_manager.close", "client.close"]
     assert state.keepalive is None
@@ -310,7 +310,7 @@ def test_shutdown_runtime_cancels_background_tasks_first():
             account_service=None,
             rotator=None,
         )
-        await app_module._shutdown_runtime(state, (task,))
+        await app_module._shutdown_runtime(state, (task,))  # type: ignore[arg-type]
         await asyncio.sleep(0)
         assert task.cancelled()
 
