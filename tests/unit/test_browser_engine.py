@@ -14,6 +14,7 @@ from aistudio_api.infrastructure.browser.browser_engine import (
     _create_windows_job_object,
     _derive_stable_fingerprint_seed,
     _is_active_api_server,
+    _spawn_process_watchdog,
     build_chromium_args,
     cleanup_stale_chromium,
     find_chromium_executable,
@@ -163,6 +164,45 @@ def test_cleanup_stale_chromium_skips_active_api_server():
     ):
         killed = cleanup_stale_chromium(port=9222)
         assert isinstance(killed, list)
+
+
+def test_spawn_process_watchdog_windows_returns_none():
+    """D-02: Windows uses Job Objects instead of the POSIX pipe watchdog."""
+    if platform.system() != "Windows":
+        pytest.skip("Windows-specific watchdog fallback")
+    assert _spawn_process_watchdog(os.getpid(), target_pgid=None) == (None, None)
+
+
+def test_spawn_process_watchdog_reaps_live_target_on_pipe_eof():
+    """P-01/P-04: closing the pipe write-end must kill a live target process."""
+    if platform.system() == "Windows":
+        pytest.skip("watchdog POSIX only")
+
+    import subprocess
+    import sys
+
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    watcher = None
+    try:
+        watcher, pipe_w = _spawn_process_watchdog(
+            dummy.pid, target_pgid=os.getpgid(dummy.pid)
+        )
+        assert watcher is not None
+        assert pipe_w is not None
+
+        os.close(pipe_w)
+        dummy.wait(timeout=5.0)
+        assert dummy.poll() is not None
+    finally:
+        if dummy.poll() is None:
+            dummy.kill()
+            dummy.wait(timeout=5.0)
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.wait(timeout=5.0)
 
 
 def test_build_chromium_args_platform_and_timezone():

@@ -247,6 +247,29 @@ def resolve_locale() -> str:
     return "en-US"
 
 
+def resolve_hash_include_code() -> bool:
+    """D-09 诊断开关：snapshot hash 是否包含代码 part（默认开启）。
+
+    仅用于诊断，不进入普通用户 UI。优先级：AISTUDIO_HASH_INCLUDE_CODE 环境变量
+    > ``diagnostics.hash_include_code`` 配置 > 默认 True。
+    """
+    env_value = _load_env("AISTUDIO_HASH_INCLUDE_CODE")
+    if env_value is not None:
+        return env_value.strip().lower() not in ("0", "false", "no", "off")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8")) or {}
+        diagnostics = raw.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            value = diagnostics.get("hash_include_code")
+            if isinstance(value, bool):
+                return value
+    except Exception:
+        pass
+    return True
+
+
 @dataclass(slots=True)
 class Settings:
     port: int = int(os.getenv("AISTUDIO_PORT", "8080"))
@@ -254,6 +277,7 @@ class Settings:
         "AISTUDIO_BROWSER_PORT", default=DEFAULT_BROWSER_PORT
     )
     browser_headless: bool = _load_bool_env("AISTUDIO_BROWSER_HEADLESS", default=True)
+    hash_include_code: bool = resolve_hash_include_code()
     browser_executable_path: str | None = os.getenv("AISTUDIO_BROWSER_EXECUTABLE")
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())

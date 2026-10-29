@@ -765,6 +765,68 @@ def _assign_process_to_job(job_handle: int | None, proc_handle: int) -> bool:
         return False
 
 
+def _spawn_process_watchdog(
+    target_pid: int, target_pgid: int | None
+) -> tuple[subprocess.Popen[bytes] | None, int | None]:
+    """Spawn a lightweight companion process that monitors parent process via pipe EOF.
+
+    When this Python parent process dies (even via SIGKILL or OOM), the kernel automatically
+    closes the pipe write-end. The companion process unblocks on EOF and sends SIGKILL
+    to the entire browser process group, leaving zero orphans.
+
+    D-02: this watchdog only reaps orphan Chromium processes. It must never be used
+    for account stale revival, automatic rebind, or restarting browser sessions.
+    """
+    if platform.system() == "Windows":
+        return None, None
+
+    try:
+        pipe_r, pipe_w = os.pipe()
+        watcher_code = (
+            "import os, sys, signal, time\n"
+            "try:\n"
+            "    r = int(sys.argv[1])\n"
+            "    t_pid = int(sys.argv[2])\n"
+            "    t_pgid = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != 'None' else None\n"
+            "    os.read(r, 1)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "if t_pgid is not None:\n"
+            "    try:\n"
+            "        os.killpg(t_pgid, signal.SIGTERM)\n"
+            "        time.sleep(0.2)\n"
+            "        os.killpg(t_pgid, signal.SIGKILL)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "try:\n"
+            "    os.kill(t_pid, signal.SIGKILL)\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+        cmd = [
+            sys.executable,
+            "-c",
+            watcher_code,
+            str(pipe_r),
+            str(target_pid),
+            str(target_pgid) if target_pgid is not None else "None",
+        ]
+        watcher = subprocess.Popen(
+            cmd,
+            pass_fds=[pipe_r],
+            # P-01: 绝不能给 watchdog 设置 PR_SET_PDEATHSIG。watchdog 必须在父进程
+            # 死亡后存活下来，读到 pipe EOF 再回收 Chromium 进程组；PDEATHSIG 会让
+            # 内核先杀掉 watchdog，孤儿 Chromium 将无人回收。
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        os.close(pipe_r)
+        return watcher, pipe_w
+    except Exception as e:
+        log.debug("创建浏览器守护进程失败: %s", e)
+        return None, None
+
 
 _ACTIVE_CHROMIUM_PROCESSES: set[ChromiumProcess] = set()
 
@@ -849,12 +911,16 @@ class ChromiumProcess:
         port: int,
         user_data_dir: str | None = None,
         *,
+        watcher: subprocess.Popen[bytes] | None = None,
+        pipe_w: int | None = None,
         pgid: int | None = None,
         job: int | None = None,
     ):
         self.process = process
         self.port = port
         self.user_data_dir = user_data_dir
+        self.watcher = watcher
+        self.pipe_w = pipe_w
         self.job = job
         try:
             self.pgid = pgid or (
@@ -870,6 +936,21 @@ class ChromiumProcess:
     def terminate(self, timeout_s: float = 3.0) -> None:
         """Terminate the Chromium subprocess tree and companion watchdog safely."""
         _ACTIVE_CHROMIUM_PROCESSES.discard(self)
+
+        # Close the write end of the pipe so the companion watchdog knows to exit cleanly
+        if self.pipe_w is not None:
+            with contextlib.suppress(Exception):
+                os.close(self.pipe_w)
+            self.pipe_w = None
+
+        if self.watcher is not None and self.watcher.poll() is None:
+            try:
+                self.watcher.terminate()
+                self.watcher.wait(timeout=1.0)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self.watcher.kill()
+            self.watcher = None
 
         # Close Windows Job Object if present (kills job processes on handle close)
         if self.job is not None:
@@ -983,10 +1064,13 @@ def launch_chromium_process(
     with contextlib.suppress(Exception):
         pgid = os.getpgid(proc.pid)
 
+    watcher, pipe_w = _spawn_process_watchdog(target_pid=proc.pid, target_pgid=pgid)
     return ChromiumProcess(
         proc,
         port,
         user_data_dir,
+        watcher=watcher,
+        pipe_w=pipe_w,
         pgid=pgid,
         job=job,
     )

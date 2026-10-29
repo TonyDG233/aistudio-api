@@ -125,8 +125,9 @@ flowchart TD
   - `js/`：浏览器端独立脚本，包含 Hook 注入、流式通信、快照签名与内存清理。
 - **网关与编解码子系统 (`gateway/`)**：
   - `client.py`：`AIStudioClient` 统一门面，组装请求重放、流式生成与会话生命周期。
-  - `session.py`：`BrowserSession` 协调核心，管理会话生命周期、蓝绿标签页平滑热切及快照签名生成。
-  - `session_state.py`：会话状态机（`SessionState`）、就绪门（`SessionReadinessGate`）及上下文描述符（`SessionContext`），支持并发请求阻塞等待与瞬时唤醒。
+  - `session.py`：`BrowserSession` 协调核心，管理单页会话生命周期、有界 rebind drain 及快照签名生成。
+  - `session_state.py`：`SessionContext` 描述符与 `in_flight`/`drain_event` 原语；不包含 readiness gate。
+  - `pooled_session.py`：隔离 `BrowserContext` 内的单页会话（注 Cookie、BotGuard、快照/传输），供后续实例池使用。
   - `session_auth.py`：Cookie 过滤清洗（剔除 `OSID`、`SIDCC` 冲突项）、登录页重定向感知、邮箱身份探测与凭据原子落盘。
   - `botguard_bootstrap.py`：BotGuard WAA 握手、基础请求模板拦截与临时会话管理。
   - `wire_spec.py`：Protobuf-over-JSON (JSPB) 字段索引枚举与 `JspbArray` 稀疏容器定义。
@@ -220,12 +221,19 @@ sequenceDiagram
 1. 率先获得 `_switch_lock` 的协程执行实质性切号与页面上下文刷新；
 2. 后续排队获得锁的协程通过双重检查（Double-Checked Locking），识别到账号已被切换至健康账号且对当前模型可用，直接复用重试，避免并发异常导致多次无谓切号；
 3. 若为单账号或备用账号全部耗尽时，系统自动对当前账号触发在位强制刷新（In-Place Refresh），清除模板缓存并重新激活会话握手 BotGuard 实现自愈。
-### 4.4 蓝绿会话平滑热切与就绪门机制 (Blue-Green Session Transition)
+### 4.4 单页会话与有界 Rebind（D-05/D-10/D-11）
 
-针对多账号并发场景，系统实现了无锁化原子就绪门（`SessionReadinessGate`）与蓝绿标签页热切：
-1. **独立新标签页隔离初始化**：当触发账号轮换时，网关在后台并发创建新 CDP 标签页，注入新账号 Cookie，导航至目标子路由 `/u/{auth_user}/` 并完成 WAA 挑战握手；
-2. **原子门禁切换**：握手就绪后，`SessionReadinessGate` 原子切换至新 `SessionContext`，状态置为 `READY`，瞬间放行排队中的新请求；
-3. **旧会话平滑排干 (Drain)**：旧账号上下文移入退休队列，在途流式请求继续在原有标签页中执行；当在途计数归零（`in_flight == 0`）触发 `drain_event` 后，再安全销毁旧标签页 CDP 资源，实现零流式阻断、零请求丢失的热切换。
+控制面与请求实例固定为 **1 账号 + 1 Page + 1 surface**，不保留蓝绿双页、readiness gate 或后台 drain task：
+1. **停止新请求**：切换开始时进入 `_preparing`；新请求等待 ready 事件，不再接触退休旧页。
+2. **一次有界 drain**：在旧 Page 上最多等待 `DRAIN_TIMEOUT_S`（默认 12 秒）；在途请求继续执行，超时则记录告警并强制关闭。
+3. **先关后建**：关闭旧 Page/Context 后才创建替代 Page，期间不新建新页；同一账号最多 1 个 active Page。
+4. **失败显式返回**：rebind 失败将错误保留到下一次显式 `switch_auth`/手动重启，不做自动 stale 复活或后台 rebind。
+
+### 4.5 Snapshot hash 诊断（D-09）
+
+- `executable_code` / `code_execution_result` 默认纳入 snapshot content hash；关闭时回退上游行为。
+- 诊断开关优先级：`AISTUDIO_HASH_INCLUDE_CODE` 环境变量 > `defaults/config.yaml` 的 `diagnostics.hash_include_code` > 默认 `true`。
+- 出现严重路由异常时优先怀疑该 hash 并临时回退；该开关不进入普通用户 UI。
 
 
 ## 5. 跨平台支持与依赖隔离

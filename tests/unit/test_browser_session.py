@@ -172,37 +172,6 @@ async def test_browser_session_send_streaming_request(mock_cdp_page):
 
 
 @pytest.mark.asyncio
-async def test_browser_session_liveness_and_auto_reconnect():
-    """Test BrowserSession detects dead page and auto-reconnects."""
-    session = BrowserSession(port=9222)
-    mock_dead_page = MagicMock(spec=CDPPage)
-    mock_dead_page.is_closed = MagicMock(return_value=False)
-    mock_dead_page.is_alive = AsyncMock(return_value=False)
-
-    mock_alive_page = MagicMock(spec=CDPPage)
-    mock_alive_page.is_closed = MagicMock(return_value=False)
-    mock_alive_page.is_alive = AsyncMock(return_value=True)
-
-    session.set_ready_context(
-        SessionContext(
-            page=mock_dead_page,
-            snap_key="test_snapshot_fn",
-            auth_user="0",
-            auth_file=None,
-            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
-        )
-    )
-    session._close_internal = AsyncMock()
-    session._ensure_browser_cdp = AsyncMock(return_value=mock_alive_page)
-
-    # ensure_context should detect dead page, close it, and reconnect to new page
-    page = await session.ensure_context()
-    assert page == mock_alive_page
-    session._close_internal.assert_called_once()
-    session._ensure_browser_cdp.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_generate_snapshot_hash_complex_tools_and_multimodal():
     """Verify that hash calculation accurately extracts parts according to _.Nv(request)."""
     session = BrowserSession(port=9222)
@@ -271,8 +240,8 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
         "What is the weather in Tokyo?",
         "iVBORw0KGgoAAAANSUhEUg==",
         "",  # function_call maps to ""
-        "",  # executable_code maps to ""
-        "",  # code_execution_result maps to ""
+        "print(1)",  # executable_code participates in the hash (D-09)
+        "1",  # code_execution_result participates in the hash (D-09)
         "",  # function_response maps to ""
         "files/sample_data_file",
     ]
@@ -281,6 +250,65 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
     snapshot = await session.generate_snapshot(contents)
     assert snapshot == "!snapshot_token_ok"
     assert passed_args == [expected_hash]
+
+
+@pytest.mark.asyncio
+async def test_generate_snapshot_hash_include_code_false_matches_upstream(
+    mock_cdp_page, monkeypatch
+):
+    """D-09: hash_include_code=false restores upstream behaviour (code parts -> "")."""
+    from aistudio_api.config import settings
+
+    monkeypatch.setattr(settings, "hash_include_code", False)
+
+    session = BrowserSession(port=9222)
+    passed_args: list[object] = []
+
+    async def fake_evaluate(expr, args=None, *a, **kw):
+        if (
+            "Promise.resolve(result)" in expr
+            or "snapQueue" in expr
+            or "service, hash" in expr
+        ):
+            passed_args.append(args)
+            return "!snapshot_token_ok"
+        return None
+
+    mock_cdp_page.evaluate.side_effect = fake_evaluate
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="snap_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+
+    contents = [
+        AistudioContent(
+            role="model",
+            parts=[
+                AistudioPart(executable_code=("PYTHON", "print(1)")),
+                AistudioPart(code_execution_result=("OUTCOME_OK", "1")),
+            ],
+        )
+    ]
+
+    assert await session.generate_snapshot(contents) == "!snapshot_token_ok"
+    assert passed_args == [sha256(b" ").hexdigest()]
+
+
+def test_browser_session_single_page_surface_contract():
+    """D-03/D-10/D-11: no readiness gate or retiring-context bookkeeping remains."""
+    from aistudio_api.infrastructure.gateway import session_state
+
+    session = BrowserSession(port=9222)
+    assert not hasattr(session, "_gate")
+    assert not hasattr(session, "_retiring_contexts")
+    assert not hasattr(session, "_background_tasks")
+    assert not hasattr(session_state, "SessionReadinessGate")
+    assert not hasattr(session_state, "SessionState")
 
 
 @pytest.mark.asyncio
