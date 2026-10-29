@@ -477,7 +477,7 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
 
 
-@protected_router.delete("/api-keys/{key_value}")
+@protected_router.delete("/api-keys/{key_value:path}")
 async def delete_api_key(key_value: str) -> dict[str, bool]:
     """在 config.yaml 中删除指定 API Key。"""
 
@@ -525,7 +525,7 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     return {"ok": True}
 
 
-@protected_router.put("/api-keys/{key_value}", response_model=ApiKeyItemModel)
+@protected_router.put("/api-keys/{key_value:path}", response_model=ApiKeyItemModel)
 async def update_api_key_name(
     key_value: str, req: UpdateApiKeyRequest
 ) -> ApiKeyItemModel:
