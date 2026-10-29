@@ -12,8 +12,15 @@ from google.genai import errors, types
 
 from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_client
+from aistudio_api.config import settings
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput
+
+
+@pytest.fixture(autouse=True)
+def configured_test_api_key(monkeypatch):
+    """SDK 以 api_key='test-key' 发起请求；测试环境下配置同名 Key。"""
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
 
 
 @pytest.fixture

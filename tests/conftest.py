@@ -6,6 +6,15 @@ import pytest
 
 _TEST_DEFAULT_CONFIG = """
 api_keys: []
+security:
+  api_allow_anonymous: false
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Free
+  - count: 1
+    surface: chat
+    min_tier: Pro
 model_defaults:
   drop_unsupported_params: false
   profiles:
@@ -59,16 +68,6 @@ paid_model_rules:
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 rotator:
   max_retries: 5
-  strategy: sticky
-  stickiness_bonus: 400.0
-  stickiness_threshold: 0.8
-  drip_penalty: 500.0
-  tier_weights:
-    Free: 0.0
-    Plus: 0.5
-    Pro: 1.0
-    Ultra: 2.0
-    Ultra_20X: 3.0
   cooldowns:
     rate_limited_short: 60
     rate_limited_drip: 300

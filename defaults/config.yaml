@@ -1,6 +1,19 @@
 # API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 接口鉴权)
 api_keys: []
 
+# 对外 API 鉴权：默认关闭免密；空 api_keys 绝不开放
+security:
+  api_allow_anonymous: false
+
+# 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Free
+  - count: 1
+    surface: chat
+    min_tier: Pro
+
 # 服务端日志与请求转储调试配置
 logging:
   level: INFO
@@ -10,16 +23,6 @@ logging:
 
 rotator:
   max_retries: 5
-  strategy: sticky
-  stickiness_bonus: 400.0
-  stickiness_threshold: 0.8
-  drip_penalty: 500.0
-  tier_weights:
-    Free: 0.0
-    Plus: 0.5
-    Pro: 1.0
-    Ultra: 2.0
-    Ultra_20X: 3.0
   cooldowns:
     rate_limited_short: 60
     rate_limited_drip: 300

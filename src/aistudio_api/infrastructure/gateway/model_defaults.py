@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -10,6 +12,7 @@ from pathlib import Path
 import yaml
 
 from aistudio_api.config import resolve_config_file
+from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
     AistudioImageOutputMode,
@@ -20,12 +23,275 @@ from .wire_types import (
 )
 
 _resolve_config_path = resolve_config_file
+logger = get_logger("config")
+
 _SAFETY_CATEGORY_ORDER = (
     ("harassment", 7),
     ("hate", 8),
     ("sexually explicit", 9),
     ("dangerous content", 10),
 )
+
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_VALID_SURFACES = ("chat", "build")
+_VALID_MIN_TIERS = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
+_INSTANCE_TIER_LOOKUP = {tier.lower(): tier for tier in _VALID_MIN_TIERS}
+
+
+class ConfigValidationError(ValueError):
+    """配置文件关键块类型或必填项非法。"""
+
+
+def _deep_merge(base: object, override: object) -> object:
+    """递归合并字典；列表与标量整体覆盖。"""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged: dict[str, object] = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return override
+
+
+def _describe_type(value: object) -> str:
+    return type(value).__name__
+
+
+def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]:
+    """非关键项非法时回退默认值并显式记录 warning。"""
+    defaults = _default_config()
+
+    raw_logging = config.get("logging")
+    if not isinstance(raw_logging, dict):
+        logger.warning(
+            "配置 logging 必须为字典（当前类型 %s），已回退默认 logging 块",
+            _describe_type(raw_logging),
+        )
+        default_logging = defaults.get("logging")
+        config["logging"] = (
+            dict(default_logging) if isinstance(default_logging, dict) else {}
+        )
+    else:
+        raw_level = raw_logging.get("level")
+        level = raw_level.strip().upper() if isinstance(raw_level, str) else ""
+        if level not in _VALID_LOG_LEVELS:
+            logger.warning(
+                "配置 logging.level 非法（%r），已回退默认值 INFO", raw_level
+            )
+            raw_logging["level"] = "INFO"
+        else:
+            raw_logging["level"] = level
+
+    raw_security = config.get("security")
+    if not isinstance(raw_security, dict):
+        logger.warning(
+            "配置 security 必须为字典（当前类型 %s），已回退默认 security 块",
+            _describe_type(raw_security),
+        )
+        default_security = defaults.get("security")
+        config["security"] = (
+            dict(default_security) if isinstance(default_security, dict) else {}
+        )
+    else:
+        allow_anonymous = raw_security.get("api_allow_anonymous", False)
+        if not isinstance(allow_anonymous, bool):
+            logger.warning(
+                "配置 security.api_allow_anonymous 非法（%r），已回退默认值 false",
+                allow_anonymous,
+            )
+            raw_security["api_allow_anonymous"] = False
+        else:
+            raw_security["api_allow_anonymous"] = allow_anonymous
+
+    return config
+
+
+def _require_mapping(config: dict[str, object], key: str) -> dict[str, object]:
+    value = config.get(key)
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            f"配置校验失败：{key} 必须为字典，当前类型为 {_describe_type(value)}"
+        )
+    return value
+
+
+def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
+    """归一化 instances 配置：坏项丢弃、同 surface/min_tier 合并 count。"""
+    if not isinstance(raw_instances, list):
+        raise ConfigValidationError(
+            "配置校验失败：instances 必须为列表，"
+            f"当前类型为 {_describe_type(raw_instances)}"
+        )
+
+    merged_counts: dict[tuple[str, str], int] = {}
+    order: list[tuple[str, str]] = []
+    for index, item in enumerate(raw_instances):
+        if not isinstance(item, dict):
+            logger.warning("忽略非法实例配置 #%d：必须为字典", index)
+            continue
+
+        count = item.get("count")
+        raw_surface = item.get("surface")
+        raw_min_tier = item.get("min_tier")
+
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            logger.warning("忽略非法实例配置 #%d：count 必须为正整数", index)
+            continue
+
+        surface = raw_surface.strip().lower() if isinstance(raw_surface, str) else ""
+        if surface not in _VALID_SURFACES:
+            logger.warning("忽略非法实例配置 #%d：surface 只允许 chat/build", index)
+            continue
+
+        min_tier = (
+            _INSTANCE_TIER_LOOKUP.get(raw_min_tier.strip().lower())
+            if isinstance(raw_min_tier, str)
+            else None
+        )
+        if min_tier is None:
+            logger.warning(
+                "忽略非法实例配置 #%d：min_tier 只允许 %s",
+                index,
+                "/".join(_VALID_MIN_TIERS),
+            )
+            continue
+
+        key = (surface, min_tier)
+        if key in merged_counts:
+            merged_counts[key] += count
+        else:
+            merged_counts[key] = count
+            order.append(key)
+
+    if not merged_counts:
+        raise ConfigValidationError("配置校验失败：instances 未包含任何有效实例配置")
+
+    return [
+        {"count": merged_counts[key], "surface": key[0], "min_tier": key[1]}
+        for key in order
+    ]
+
+
+def validate_config_mapping(raw_dict: object) -> dict[str, object]:
+    """校验合并后的配置映射，返回应用了非关键回退的配置副本。"""
+    if raw_dict is None:
+        raw_dict = {}
+    if not isinstance(raw_dict, dict):
+        raise ConfigValidationError(
+            f"配置校验失败：配置顶层必须为字典，当前类型为 {_describe_type(raw_dict)}"
+        )
+
+    config = _deep_merge(_default_config(), raw_dict)
+    assert isinstance(config, dict)
+    _apply_noncritical_fallbacks(config)
+
+    rotator = _require_mapping(config, "rotator")
+    max_retries = rotator.get("max_retries")
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
+        raise ConfigValidationError(
+            "配置校验失败：rotator.max_retries 必须为非负整数，"
+            f"当前值为 {max_retries!r}"
+        )
+
+    cooldowns = rotator.get("cooldowns")
+    if not isinstance(cooldowns, dict):
+        raise ConfigValidationError(
+            "配置校验失败：rotator.cooldowns 必须为字典，"
+            f"当前类型为 {_describe_type(cooldowns)}"
+        )
+    for key in (
+        "rate_limited_short",
+        "rate_limited_drip",
+        "rate_limited_drip_extended",
+        "auth_error",
+    ):
+        value = cooldowns.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigValidationError(
+                f"配置校验失败：rotator.cooldowns.{key} 必须为数值，当前值为 {value!r}"
+            )
+
+    paid_rules = _require_mapping(config, "paid_model_rules")
+    for name, rule in paid_rules.items():
+        if not isinstance(rule, dict):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name} 必须为字典，"
+                f"当前类型为 {_describe_type(rule)}"
+            )
+        contains = rule.get("contains")
+        required_tiers = rule.get("required_tiers")
+        if not isinstance(contains, list):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name}.contains 必须为列表，"
+                f"当前类型为 {_describe_type(contains)}"
+            )
+        if not isinstance(required_tiers, list):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name}.required_tiers 必须为列表，"
+                f"当前类型为 {_describe_type(required_tiers)}"
+            )
+
+    _require_mapping(config, "tier_quotas")
+
+    presets = config.get("account_presets")
+    if not isinstance(presets, list):
+        raise ConfigValidationError(
+            "配置校验失败：account_presets 必须为字典列表，"
+            f"当前值为 {_describe_type(presets)}"
+        )
+    for index, preset in enumerate(presets):
+        if not isinstance(preset, dict):
+            raise ConfigValidationError(
+                f"配置校验失败：第 {index + 1} 个 preset 必须为字典，"
+                f"当前类型为 {_describe_type(preset)}"
+            )
+        for preset_field in ("id", "action"):
+            value = preset.get(preset_field)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个 preset 缺少非空字符串字段 {preset_field}"
+                )
+
+    model_defaults = _require_mapping(config, "model_defaults")
+    profiles = model_defaults.get("profiles")
+    if not isinstance(profiles, list):
+        raise ConfigValidationError(
+            "配置校验失败：model_defaults.profiles 必须为列表，"
+            f"当前类型为 {_describe_type(profiles)}"
+        )
+    models = model_defaults.get("models")
+    if not isinstance(models, dict):
+        raise ConfigValidationError(
+            "配置校验失败：model_defaults.models 必须为字典，"
+            f"当前类型为 {_describe_type(models)}"
+        )
+
+    _normalize_instance_specs(config.get("instances"))
+
+    api_keys = config.get("api_keys")
+    if not isinstance(api_keys, (list, str)):
+        raise ConfigValidationError(
+            "配置校验失败：api_keys 必须为列表或字符串，"
+            f"当前类型为 {_describe_type(api_keys)}"
+        )
+
+    return config
+
+
+def validate_config(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """启动时校验合并后的配置；关键块非法会立即抛出 ConfigValidationError。"""
+    resolved_path = _resolve_config_path(config_path)
+    merged = _load_yaml_config(resolved_path)
+    return validate_config_mapping(merged)
 
 
 @dataclass(frozen=True)
@@ -270,6 +536,7 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
 
 def _default_config() -> dict[str, object]:
     return {
+        "api_keys": [],
         "logging": {
             "level": "INFO",
             "dump_requests": False,
@@ -320,17 +587,6 @@ def _default_config() -> dict[str, object]:
         },
         "rotator": {
             "max_retries": 5,
-            "strategy": "sticky",
-            "stickiness_bonus": 400.0,
-            "stickiness_threshold": 0.8,
-            "drip_penalty": 500.0,
-            "tier_weights": {
-                "Free": 0.0,
-                "Plus": 0.5,
-                "Pro": 1.0,
-                "Ultra": 2.0,
-                "Ultra_20X": 3.0,
-            },
             "cooldowns": {
                 "rate_limited_short": 60,
                 "rate_limited_drip": 300,
@@ -384,6 +640,13 @@ def _default_config() -> dict[str, object]:
             },
             "overrides": {},
         },
+        "security": {
+            "api_allow_anonymous": False,
+        },
+        "instances": [
+            {"count": 1, "surface": "chat", "min_tier": "Free"},
+            {"count": 1, "surface": "chat", "min_tier": "Pro"},
+        ],
         "account_presets": [
             {
                 "id": "preset_all",
@@ -440,6 +703,48 @@ def invalidate_config_cache() -> None:
     _compiled_model_overrides.cache_clear()
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """同目录临时文件 + fsync + os.replace 原子写回。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)  # noqa: PTH105 - 原子写回要求使用 os.replace
+    except BaseException:
+        with contextlib.suppress(OSError):
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def write_config_text(
+    content: str,
+    config_path: str | os.PathLike[str] | None = None,
+) -> Path:
+    """校验合并配置后原子写回配置文件，并刷新缓存。"""
+    try:
+        parsed = yaml.safe_load(content) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(f"配置校验失败：YAML 语法错误：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ConfigValidationError("配置校验失败：YAML 顶层必须为字典结构")
+    for block_name in ("logging", "security"):
+        if block_name in parsed and not isinstance(parsed[block_name], dict):
+            raise ConfigValidationError(
+                f"配置校验失败：{block_name} 必须为字典，"
+                f"当前类型为 {_describe_type(parsed[block_name])}"
+            )
+    validate_config_mapping(parsed)
+    resolved_path = _resolve_config_path(config_path)
+    _atomic_write_text(resolved_path, content)
+    invalidate_config_cache()
+    return resolved_path
+
+
 def _load_yaml_config(config_path: Path) -> dict[str, object]:
     if not config_path.exists():
         return _default_config()
@@ -457,16 +762,9 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(loaded, dict):
         loaded = {}
-    merged: dict[str, object] = _default_config()
-    merged.update(loaded)
-    raw_merged_defaults = merged.get("model_defaults")
-    raw_loaded_defaults = loaded.get("model_defaults")
-    if isinstance(raw_merged_defaults, dict) and isinstance(raw_loaded_defaults, dict):
-        def_config = _default_config()
-        def_md = def_config.get("model_defaults")
-        merged_model_defaults = dict(def_md if isinstance(def_md, dict) else {})
-        merged_model_defaults.update(raw_loaded_defaults)
-        merged["model_defaults"] = merged_model_defaults
+    merged = _deep_merge(_default_config(), loaded)
+    assert isinstance(merged, dict)
+    merged = _apply_noncritical_fallbacks(merged)
     _CONFIG_CACHE[path_key] = (mtime, merged)
     return merged
 
@@ -642,12 +940,11 @@ def update_configured_logging_settings(
         logging_dict["dump_dir"] = dump_dir
 
     parsed["logging"] = logging_dict
-    resolved_path.write_text(
+    write_config_text(
         yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+        config_path=config_path,
     )
-    invalidate_config_cache()
-    return logging_dict
+    return get_configured_logging_settings(config_path)
 
 
 # ─── 订阅层级每日软额度 (Tier Quotas) 与预设方案 (Presets) ───
@@ -756,7 +1053,7 @@ def get_configured_presets(
 def get_configured_rotator_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """获取 config.yaml 中配置的 rotator 调度策略、打分权重与冷却时间，若缺失安全回退至系统默认配置。"""
+    """获取 config.yaml 中配置的 rotator 重试与冷却时间，若缺失安全回退至系统默认配置。"""
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
     raw_rotator = config.get("rotator")
@@ -781,4 +1078,34 @@ def get_configured_paid_model_rules(
     if isinstance(def_rules, dict):
         return def_rules
     return {}
-    return raw_rules
+
+
+def get_configured_security_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> bool:
+    """获取 security.api_allow_anonymous；缺失或非法时返回 False。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_security = config.get("security")
+    if not isinstance(raw_security, dict):
+        logger.warning(
+            "配置 security 非法（%r），API 免密开关回退 false",
+            _describe_type(raw_security),
+        )
+        return False
+    allow_anonymous = raw_security.get("api_allow_anonymous", False)
+    if isinstance(allow_anonymous, bool):
+        return allow_anonymous
+    logger.warning(
+        "配置 security.api_allow_anonymous 非法（%r），回退 false", allow_anonymous
+    )
+    return False
+
+
+def get_configured_instance_specs(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, object]]:
+    """归一化 instances 配置：坏项丢弃、同 surface/min_tier 合并 count。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    return _normalize_instance_specs(config.get("instances"))

@@ -70,23 +70,38 @@ def require_api_key(request: Request) -> None:
     """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_api_keys,
+        get_configured_security_settings,
     )
+
+    if get_configured_security_settings():
+        return
 
     configured_keys = get_configured_api_keys()
     all_valid_keys = configured_keys | settings.api_keys
+    client_ip = request.client.host if request.client else "unknown"
 
-    # 如果 config.yaml 与环境变量均未配置任何 Key，则 API 免密开放
+    # 空 Key 绝不开放：未配置 Key 且免密开关关闭时一律拒绝
     if not all_valid_keys:
-        return
+        logger.warning(
+            "API 鉴权失败: 未配置 API Key 且免密开关关闭，拒绝来自 %s 的请求",
+            client_ip,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "message": "未配置 API Key 且免密开关（security.api_allow_anonymous）未开启，已拒绝请求",
+                "type": "authentication_error",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = _extract_request_token(request)
     if not token:
-        client_ip = request.client.host if request.client else "unknown"
         logger.warning("API 鉴权失败: 来自 %s 的请求缺少 API Key", client_ip)
         raise HTTPException(
             status_code=401,
             detail={
-                "message": "Invalid or missing API key. Pass via 'x-goog-api-key' header, 'key' query parameter, or 'Authorization: Bearer <key>'",
+                "message": "缺少 API Key，请通过 'x-goog-api-key'、'x-api-key'、'key' 查询参数或 'Authorization: Bearer <key>' 提供",
                 "type": "authentication_error",
             },
             headers={"WWW-Authenticate": "Bearer"},
@@ -95,20 +110,11 @@ def require_api_key(request: Request) -> None:
     if token in all_valid_keys:
         return
 
-    # 匹配管理密码（管理员具备超级 API 访问权限）
-    if (
-        token
-        and settings.web_password
-        and settings.web_password.strip()
-        and secrets.compare_digest(token, settings.web_password)
-    ):
-        return
-    client_ip = request.client.host if request.client else "unknown"
     logger.warning("API 鉴权失败: 来自 %s 的 API Key 无效", client_ip)
     raise HTTPException(
         status_code=401,
         detail={
-            "message": "Invalid API key provided",
+            "message": "提供的 API Key 无效",
             "type": "authentication_error",
         },
         headers={"WWW-Authenticate": "Bearer"},

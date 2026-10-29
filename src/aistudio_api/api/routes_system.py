@@ -18,10 +18,18 @@ from aistudio_api.api.response_models import (
     StatsTotalsResponse,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
+    ConfigValidationError,
     _resolve_config_path,
-    invalidate_config_cache,
+    get_configured_logging_settings,
+    write_config_text,
 )
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    set_dump_dir,
+    set_dump_requests,
+    set_dump_to_file,
+    set_log_level,
+)
 
 logger = get_logger("routes.system")
 
@@ -290,33 +298,24 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
-    config_yaml_path = _resolve_config_path(None)
     try:
-        config_yaml_path.write_text(req.yaml_content, encoding="utf-8")
-        invalidate_config_cache()
-
-        if isinstance(parsed, dict) and "logging" in parsed:
-            raw_logging = parsed["logging"]
-            if isinstance(raw_logging, dict):
-                from aistudio_api.infrastructure.utils.logger import (
-                    set_dump_dir,
-                    set_dump_requests,
-                    set_dump_to_file,
-                    set_log_level,
-                )
-
-                if "level" in raw_logging:
-                    set_log_level(str(raw_logging["level"]))
-                if "dump_requests" in raw_logging:
-                    set_dump_requests(bool(raw_logging["dump_requests"]))
-                if "dump_to_file" in raw_logging:
-                    set_dump_to_file(bool(raw_logging["dump_to_file"]))
-                if "dump_dir" in raw_logging:
-                    set_dump_dir(str(raw_logging["dump_dir"]))
-        logger.info("配置文件 config.yaml 已更新并重新加载")
-        return {"ok": True, "message": "配置已保存并重载"}
-    except Exception as e:
+        write_config_text(req.yaml_content)
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        if isinstance(parsed, dict) and "logging" in parsed:
+            normalized_logging = get_configured_logging_settings()
+            set_log_level(str(normalized_logging.get("level", "INFO")))
+            set_dump_requests(bool(normalized_logging.get("dump_requests", False)))
+            set_dump_to_file(bool(normalized_logging.get("dump_to_file", False)))
+            set_dump_dir(str(normalized_logging.get("dump_dir", "dumps")))
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+    logger.info("配置文件 config.yaml 已更新并重新加载")
+    return {"ok": True, "message": "配置已保存并重载"}
 
 
 class LoggingConfigRequest(BaseModel):
@@ -453,10 +452,15 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     new_list.append({"name": name, "key": new_key, "created_at": created_at})
     parsed["api_keys"] = new_list
 
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     logger.info("已创建新 API Key: 备注=%s, 密钥=%s", name, new_key[:8] + "...")
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
@@ -496,10 +500,15 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
         raise HTTPException(404, detail="未找到该 API Key")
 
     parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     logger.info("已删除 API Key: %s", key_value[:8] + "...")
     return {"ok": True}
@@ -545,10 +554,15 @@ async def update_api_key_name(
         raise HTTPException(404, detail="未找到该 API Key")
 
     parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
     logger.info("API Key 备注名已更新: %s -> %s", key_value[:8] + "...", new_name)
 
     return updated_item
