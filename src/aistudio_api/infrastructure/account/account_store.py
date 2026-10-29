@@ -715,6 +715,68 @@ class AccountStore:
         self._save_registry(registry)
         return True
 
+    def update_account_keepalive(
+        self,
+        account_id: str,
+        *,
+        auth_saved_at: object = _UNSET,
+        last_refresh_attempt_at: object = _UNSET,
+        last_refresh_error: object = _UNSET,
+    ) -> bool:
+        """更新保活字段（auth 回写时间/刷新尝试/错误），返回是否有改动。"""
+        registry = self._load_registry()
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None:
+            return False
+
+        changed = False
+        if auth_saved_at is not _UNSET:
+            new_saved = None if auth_saved_at is None else str(auth_saved_at)
+            if acc.auth_saved_at != new_saved:
+                acc.auth_saved_at = new_saved
+                changed = True
+        if last_refresh_attempt_at is not _UNSET:
+            new_attempt = (
+                None
+                if last_refresh_attempt_at is None
+                else str(last_refresh_attempt_at)
+            )
+            if acc.last_refresh_attempt_at != new_attempt:
+                acc.last_refresh_attempt_at = new_attempt
+                changed = True
+        if last_refresh_error is not _UNSET:
+            new_error = None if last_refresh_error is None else str(last_refresh_error)
+            if acc.last_refresh_error != new_error:
+                acc.last_refresh_error = new_error
+                changed = True
+
+        if not changed:
+            return False
+
+        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def mark_auth_saved(self, account_id: str, *, at: str | None = None) -> bool:
+        """记录凭证回写成功时间。"""
+        return self.update_account_keepalive(
+            account_id,
+            auth_saved_at=at or datetime.now(UTC).isoformat(),
+        )
+
+    def mark_refresh_attempt(
+        self, account_id: str, *, error: str | None = None, at: str | None = None
+    ) -> bool:
+        """记录一次账号信息刷新尝试及其错误。"""
+        return self.update_account_keepalive(
+            account_id,
+            last_refresh_attempt_at=at or datetime.now(UTC).isoformat(),
+            last_refresh_error=error,
+        )
+
     def get_auth_path(self, account_id: str) -> Path | None:
         """获取指定账号的 auth.json 路径。"""
         return self.get_auth_path_optional(account_id, require_exists=True)

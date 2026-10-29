@@ -37,6 +37,40 @@ _VALID_SURFACES = ("chat", "build")
 _VALID_MIN_TIERS = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
 _INSTANCE_TIER_LOOKUP = {tier.lower(): tier for tier in _VALID_MIN_TIERS}
 
+_LEGACY_KEEPALIVE_KEYS = (
+    "auto_switch",
+    "auto_switch_interval_hours",
+    "keepalive_auth_update",
+    "keepalive_auth_update_hours",
+    "keepalive_metadata_refresh",
+    "keepalive_metadata_refresh_hours",
+    "keepalive_metadata_refresh_on_startup",
+    "keepalive_active_activity",
+    "keepalive_active_activity_seconds",
+)
+_KEEPALIVE_BOOL_KEYS = (
+    "auth_update",
+    "metadata_refresh",
+    "metadata_refresh_on_startup",
+    "active_activity",
+)
+_KEEPALIVE_FLOAT_KEYS = (
+    "auth_update_hours",
+    "metadata_refresh_hours",
+    "active_activity_seconds",
+)
+_KEEPALIVE_DEFAULT_BOOLS = {
+    "auth_update": True,
+    "metadata_refresh": True,
+    "metadata_refresh_on_startup": True,
+    "active_activity": False,
+}
+_KEEPALIVE_DEFAULT_FLOATS = {
+    "auth_update_hours": 24.0,
+    "metadata_refresh_hours": 24.0,
+    "active_activity_seconds": 60.0,
+}
+
 
 class ConfigValidationError(ValueError):
     """配置文件关键块类型或必填项非法。"""
@@ -126,6 +160,16 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
             dict(default_features) if isinstance(default_features, dict) else {}
         )
     else:
+        legacy_keys = [key for key in _LEGACY_KEEPALIVE_KEYS if key in raw_features]
+        if legacy_keys:
+            logger.warning(
+                "检测到旧版 keepalive 配置键（%s）；已忽略，请迁移到 "
+                "features.keepalive",
+                ", ".join(legacy_keys),
+            )
+            for key in legacy_keys:
+                raw_features.pop(key, None)
+
         raw_routing = raw_features.get("routing")
         if not isinstance(raw_routing, dict):
             logger.warning(
@@ -153,6 +197,50 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     max_switches,
                 )
                 raw_routing["max_switches"] = 2
+
+        default_features = defaults.get("features")
+        default_keepalive = (
+            default_features.get("keepalive")
+            if isinstance(default_features, dict)
+            else None
+        )
+        fallback_keepalive = (
+            dict(default_keepalive) if isinstance(default_keepalive, dict) else {}
+        )
+        raw_keepalive = raw_features.get("keepalive")
+        if not isinstance(raw_keepalive, dict):
+            logger.warning(
+                "配置 features.keepalive 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_keepalive),
+            )
+            raw_features["keepalive"] = fallback_keepalive
+        else:
+            for key in _KEEPALIVE_BOOL_KEYS:
+                value = raw_keepalive.get(key, fallback_keepalive.get(key))
+                if not isinstance(value, bool):
+                    logger.warning(
+                        "配置 features.keepalive.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        _KEEPALIVE_DEFAULT_BOOLS[key],
+                    )
+                    value = _KEEPALIVE_DEFAULT_BOOLS[key]
+                raw_keepalive[key] = value
+            for key in _KEEPALIVE_FLOAT_KEYS:
+                value = raw_keepalive.get(key, fallback_keepalive.get(key))
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or float(value) <= 0
+                ):
+                    logger.warning(
+                        "配置 features.keepalive.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        _KEEPALIVE_DEFAULT_FLOATS[key],
+                    )
+                    value = _KEEPALIVE_DEFAULT_FLOATS[key]
+                raw_keepalive[key] = float(value)
 
     return config
 
@@ -672,6 +760,15 @@ def _default_config() -> dict[str, object]:
         "features": {
             "routing": {
                 "max_switches": 2,
+            },
+            "keepalive": {
+                "auth_update": True,
+                "auth_update_hours": 24.0,
+                "metadata_refresh": True,
+                "metadata_refresh_hours": 24.0,
+                "metadata_refresh_on_startup": True,
+                "active_activity": False,
+                "active_activity_seconds": 60.0,
             },
         },
         "paid_model_rules": {
@@ -1207,6 +1304,28 @@ def get_configured_routing_settings(
         )
         return {"max_switches": 2}
     return {"max_switches": raw_switches}
+
+
+def get_configured_keepalive_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """返回 features.keepalive 配置；缺失/非法时回退 24h auth/metadata 默认值。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    raw_keepalive = (
+        raw_features.get("keepalive") if isinstance(raw_features, dict) else None
+    )
+    if not isinstance(raw_keepalive, dict):
+        logger.warning(
+            "配置 features.keepalive 非法（%r），回退默认值",
+            _describe_type(raw_keepalive),
+        )
+        return {
+            **_KEEPALIVE_DEFAULT_BOOLS,
+            **_KEEPALIVE_DEFAULT_FLOATS,
+        }
+    return dict(raw_keepalive)
 
 
 def resolve_quota_scope(

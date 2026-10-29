@@ -44,6 +44,15 @@ rotator:
 features:
   routing:
     max_switches: 2
+  # P6 保活：auth/metadata 默认 24h；active_activity 默认关闭（不启用 idle 回收）。
+  keepalive:
+    auth_update: true
+    auth_update_hours: 24
+    metadata_refresh: true
+    metadata_refresh_hours: 24
+    metadata_refresh_on_startup: true
+    active_activity: false
+    active_activity_seconds: 60
 
 paid_model_rules:
   ultra_required:
