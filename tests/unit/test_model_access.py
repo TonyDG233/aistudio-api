@@ -7,6 +7,7 @@ import pytest
 from aistudio_api.application.model_access import (
     account_is_paid,
     clear_paid_models,
+    instance_lane_for_tier,
     is_chat_only_model,
     is_paid_model,
     model_account_requirement,
@@ -51,6 +52,8 @@ def test_account_tier_paid_eligibility() -> None:
     assert account_is_paid("Pro") is True
     assert account_is_paid("Ultra") is True
     assert account_is_paid("Plus") is True
+    assert account_is_paid("Ultra_20X") is True
+    assert instance_lane_for_tier("Ultra_20X") == "paid"
     assert account_is_paid("Free") is False
     assert account_is_paid(None) is False
 

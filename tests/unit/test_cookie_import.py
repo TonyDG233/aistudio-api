@@ -371,6 +371,7 @@ def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.account.cookie_parser import (
         get_tier_header_value,
+        normalize_benefit_tier,
         parse_benefit_tier_response,
     )
 
@@ -384,6 +385,9 @@ def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     assert get_tier_header_value("Free") is None
     assert get_tier_header_value("Pro") == "TIER1"
     assert get_tier_header_value("Ultra") == "TIER2"
+    assert get_tier_header_value("Ultra_20X") == "TIER2"
+    assert get_tier_header_value("ultra_20x") == "TIER2"
+    assert normalize_benefit_tier("ultra_20x") == "Ultra_20X"
     assert get_tier_header_value("Plus") == "TIER0"
 
     store = AccountStore(accounts_dir=tmp_path / "accounts_tier_test")

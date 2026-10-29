@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
 from aistudio_api.infrastructure.browser.scripts import INSTALL_HOOKS_JS
@@ -81,8 +83,8 @@ async def test_login_redirect_reloads_cookies_returns_to_aistudio_and_captures()
         return True
 
     snap_key, template = await bootstrap_botguard_and_template(
-        page,
-        reload_cookies_cb=reload_cookies,
+        cast(Any, page),
+        reload_cookies_cb=cast(Any, reload_cookies),
         max_wait_seconds=3,
     )
 

@@ -561,6 +561,13 @@ class BrowserSession:
                 target, auth_file=auth_file or self._auth_file, cookies=cookies
             )
 
+    async def ensure_cdp_client(self) -> CDPClient:
+        """Return the browser-level CDP client without opening a control page."""
+        await self._ensure_browser_cdp(connect_page=False)
+        if self._cdp_client is None:
+            raise RuntimeError("CDP client unavailable")
+        return self._cdp_client
+
     async def _ensure_browser_cdp(self, *, connect_page: bool = True) -> CDPPage | None:
         """Ensure browser process/CDP exists.
 

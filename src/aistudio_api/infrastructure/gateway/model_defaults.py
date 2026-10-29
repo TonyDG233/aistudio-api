@@ -174,6 +174,30 @@ def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
     ]
 
 
+_MAX_CONTEXTS_LIMIT = 16
+
+
+def _normalize_max_contexts(
+    config: dict[str, object], specs: list[dict[str, object]]
+) -> int:
+    """Global instance/context upper bound; defaults to the configured spec sum."""
+    raw = config.get("max_contexts")
+    if raw is None:
+        return max(1, sum(int(str(item.get("count", 0))) for item in specs))
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ConfigValidationError(
+            f"配置校验失败：max_contexts 必须为正整数，当前值为 {raw!r}"
+        )
+    if raw > _MAX_CONTEXTS_LIMIT:
+        logger.warning(
+            "配置 max_contexts=%d 超出上限 %d，已回退上限",
+            raw,
+            _MAX_CONTEXTS_LIMIT,
+        )
+        return _MAX_CONTEXTS_LIMIT
+    return raw
+
+
 def validate_config_mapping(raw_dict: object) -> dict[str, object]:
     """校验合并后的配置映射，返回应用了非关键回退的配置副本。"""
     if raw_dict is None:
@@ -273,7 +297,8 @@ def validate_config_mapping(raw_dict: object) -> dict[str, object]:
             f"当前类型为 {_describe_type(models)}"
         )
 
-    _normalize_instance_specs(config.get("instances"))
+    specs = _normalize_instance_specs(config.get("instances"))
+    _normalize_max_contexts(config, specs)
 
     api_keys = config.get("api_keys")
     if not isinstance(api_keys, (list, str)):
@@ -647,6 +672,7 @@ def _default_config() -> dict[str, object]:
             {"count": 1, "surface": "chat", "min_tier": "Free"},
             {"count": 1, "surface": "chat", "min_tier": "Pro"},
         ],
+        "max_contexts": 2,
         "account_presets": [
             {
                 "id": "preset_all",
@@ -1109,3 +1135,13 @@ def get_configured_instance_specs(
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
     return _normalize_instance_specs(config.get("instances"))
+
+
+def get_configured_max_contexts(
+    config_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """全局实例/Context 上限；缺省为 instances count 之和，上限 16。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    specs = _normalize_instance_specs(config.get("instances"))
+    return _normalize_max_contexts(config, specs)

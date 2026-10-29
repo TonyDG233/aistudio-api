@@ -29,8 +29,24 @@ BENEFIT_TIER_TO_NAME: dict[int, str] = {
 BENEFIT_TIER_TO_HEADER: dict[str, str] = {
     "Pro": "TIER1",
     "Ultra": "TIER2",
+    "Ultra_20X": "TIER2",
     "Plus": "TIER0",
 }
+
+_CANONICAL_TIERS: dict[str, str] = {
+    "free": "Free",
+    "plus": "Plus",
+    "pro": "Pro",
+    "ultra": "Ultra",
+    "ultra_20x": "Ultra_20X",
+}
+
+
+def normalize_benefit_tier(tier: str | None) -> str:
+    """Normalize benefit tier string into canonical name (Free / Plus / Pro / Ultra / Ultra_20X)."""
+    if not tier:
+        return "Free"
+    return _CANONICAL_TIERS.get(tier.strip().lower(), "Free")
 
 
 def parse_benefit_tier_response(raw_data: object) -> str:
@@ -57,7 +73,7 @@ def get_tier_header_value(tier: str | None) -> str | None:
     """根据账号权益等级返回对应的 X-AIStudio-G1-Tier 请求头取值。"""
     if not tier:
         return None
-    clean = tier.strip().capitalize()
+    clean = normalize_benefit_tier(tier)
     return BENEFIT_TIER_TO_HEADER.get(clean)
 
 

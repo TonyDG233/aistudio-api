@@ -26,7 +26,19 @@ _DEFAULT_PAID_MODELS = {
     "veo-3.1-generate-preview",
 }
 
-PAID_TIERS = frozenset({"pro", "ultra", "plus", "paid"})
+PAID_TIERS = frozenset({"pro", "ultra", "plus", "paid", "ultra_20x"})
+
+# Instance lanes are derived from account tier, never from the model name.
+_TIER_RANK = {
+    "free": 0,
+    "plus": 1,
+    "pro": 2,
+    "ultra": 3,
+    "ultra_20x": 4,
+    "paid": 2,
+}
+_INSTANCE_LANE_FREE = "free"
+_INSTANCE_LANE_PAID = "paid"
 
 _PAID_MODELS: set[str] = set(_DEFAULT_PAID_MODELS)
 _LOCK = RLock()
@@ -92,6 +104,24 @@ def account_is_paid(tier: object) -> bool:
     return str(tier or "").strip().lower() in PAID_TIERS
 
 
+def tier_rank(tier: object) -> int:
+    """Numeric rank for tier comparisons (unknown tiers behave like Free)."""
+    key = str(tier or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return _TIER_RANK.get(key, 0)
+
+
+def instance_lane_for_tier(tier: object) -> str:
+    """Free accounts use the Free lane; paid accounts use the paid lane."""
+    return _INSTANCE_LANE_PAID if account_is_paid(tier) else _INSTANCE_LANE_FREE
+
+
+def tier_satisfies_min(account_tier: object, min_tier: object) -> bool:
+    """True when an account may occupy an instance whose spec requires min_tier."""
+    if instance_lane_for_tier(account_tier) != instance_lane_for_tier(min_tier):
+        return False
+    return tier_rank(account_tier) >= tier_rank(min_tier)
+
+
 def surface_capability(
     model_path: object,
     enabled_surfaces: tuple[str, ...] | list[str],
@@ -109,6 +139,7 @@ __all__ = [
     "PAID_TIERS",
     "account_is_paid",
     "clear_paid_models",
+    "instance_lane_for_tier",
     "is_chat_only_model",
     "is_paid_model",
     "model_account_requirement",
@@ -116,4 +147,6 @@ __all__ = [
     "normalize_model_key",
     "set_paid_models",
     "surface_capability",
+    "tier_rank",
+    "tier_satisfies_min",
 ]

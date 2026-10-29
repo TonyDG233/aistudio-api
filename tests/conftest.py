@@ -15,6 +15,7 @@ instances:
   - count: 1
     surface: chat
     min_tier: Pro
+max_contexts: 4
 model_defaults:
   drop_unsupported_params: false
   profiles:

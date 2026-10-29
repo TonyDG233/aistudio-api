@@ -12,6 +12,11 @@ from aistudio_api.api.dependencies import (
     get_account_service,
     get_runtime_state,
 )
+from aistudio_api.application.instance_manager import (
+    InstanceError,
+    InstanceRebindError,
+    InstanceRebindTargetError,
+)
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
     RefreshInProgressError,
@@ -65,9 +70,52 @@ class AccountResponse(BaseModel):
     enabled: bool = True
     group: str = "default"
     rebind_required: bool = False
+    rebind_status: str = "not_required"
     previous_active_account_id: str | None = None
     active_account_id: str | None = None
     target_account: AccountResponse | None = None
+
+
+async def _run_control_rebind(
+    runtime_state: RuntimeState,
+    *,
+    previous_account_id: str,
+    target_account_id: str | None,
+    reason: str,
+) -> tuple[bool, str]:
+    """D-05：把 registry rebind 信号接到实例控制面。
+
+    返回 ``(rebind_required, rebind_status)``。实例池未接线时显式返回
+    ``unsupported``，不得静默假装已切换；切换失败必须抛错并由调用方回滚
+    enabled 状态，active 只在浏览器切换成功后改写。
+    """
+    if target_account_id is None:
+        raise InstanceRebindTargetError(
+            "没有可切换的 enabled 账号，账号已停用但 rebind 目标为空"
+        )
+    manager = runtime_state.instance_manager
+    if manager is None:
+        log.warning(
+            "实例池未初始化，D-05 rebind 未执行（显式 fallback）: %s -> %s",
+            previous_account_id,
+            target_account_id,
+        )
+        return True, "unsupported"
+    try:
+        await manager.rebind_account(  # type: ignore[attr-defined]
+            target_account_id,
+            previous_account_id=previous_account_id,
+            reason=reason,
+        )
+    except Exception as exc:
+        log.error(
+            "D-05 rebind 失败 %s -> %s: %s",
+            previous_account_id,
+            target_account_id,
+            exc,
+        )
+        raise InstanceRebindError(f"账号 rebind 失败: {exc}") from exc
+    return False, "applied"
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -171,6 +219,7 @@ class ApplyPresetResponse(BaseModel):
     enabled_account_ids: list[str]
     disabled_account_ids: list[str]
     rebind_required: bool = False
+    rebind_status: str = "not_required"
     previous_active_account_id: str | None = None
     active_account_id: str | None = None
     target_account: AccountResponse | None = None
@@ -603,13 +652,16 @@ async def toggle_account(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: ToggleAccountRequest = Body(default_factory=ToggleAccountRequest),
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
     """切换单个账号的使能状态 (Enabled/Disabled)。
 
-    D-05：在改写 enabled 前捕获旧 active；若旧 active 被禁用，返回显式
-    rebind 信号与目标账号，不在本步骤直接改写 active 或切浏览器。
+    D-05：禁用当前 active 时进入有界 RETIRING rebind；先 drain/关旧页，再切到
+    新 enabled 账号，最后才改写 active。失败显式 409 并回滚 enabled。
     """
     previous_active = account_service.get_active_account()
+    before = account_service.get_account(account_id)
+    previous_enabled = bool(before.enabled) if before is not None else True
     account = account_service.toggle_account_enabled(account_id, req.enabled)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -621,17 +673,29 @@ async def toggle_account(
         and not account.enabled
     ):
         target = account_service.select_active_candidate(exclude={account.id})
-        response.rebind_required = True
+        try:
+            required, status = await _run_control_rebind(
+                runtime_state,
+                previous_account_id=previous_active.id,
+                target_account_id=target.id if target is not None else None,
+                reason="toggle",
+            )
+        except InstanceError:
+            account_service.toggle_account_enabled(account.id, previous_enabled)
+            raise
+        response.rebind_required = required
+        response.rebind_status = status
         response.previous_active_account_id = previous_active.id
         response.active_account_id = target.id if target is not None else None
         response.target_account = (
             to_account_response(target) if target is not None else None
         )
         log.info(
-            "账号 %s 已停用，等待有界 rebind: %s -> %s",
+            "账号 %s 已停用，有界 rebind %s -> %s (%s)",
             account.id,
             previous_active.id,
             target.id if target is not None else None,
+            status,
         )
 
     log.info(
@@ -729,25 +793,45 @@ async def delete_preset(
 async def apply_preset(
     preset_id: str,
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ApplyPresetResponse:
     """一键应用预设方案。
 
-    D-05：在改写 enabled 前捕获旧 active；若旧 active 被禁用，返回显式
-    rebind 信号与目标账号，不在此步骤直接改写 active 或切浏览器。
+    D-05：若预设禁用当前 active，进入有界 RETIRING rebind；失败时恢复整份
+    enabled 快照并显式 409，不在 rebind 前改写 active。
     """
+    enabled_before = {
+        account.id: account.enabled for account in account_service.list_accounts()
+    }
     try:
         result = account_service.apply_preset(preset_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
+    rebind_required = result.rebind_required
+    rebind_status = "not_required"
+    target = result.target_account
+    if result.rebind_required:
+        try:
+            rebind_required, rebind_status = await _run_control_rebind(
+                runtime_state,
+                previous_account_id=result.previous_active_account_id or "",
+                target_account_id=result.active_account_id,
+                reason="preset",
+            )
+        except InstanceError:
+            for account_id, enabled in enabled_before.items():
+                account_service.toggle_account_enabled(account_id, enabled)
+            raise
+
     log.info(
-        "已应用预设方案 '%s': 启用 %d 个, 停用 %d 个, rebind=%s",
+        "已应用预设方案 '%s': 启用 %d 个, 停用 %d 个, rebind=%s (%s)",
         result.preset.name,
         len(result.enabled_account_ids),
         len(result.disabled_account_ids),
-        result.rebind_required,
+        rebind_required,
+        rebind_status,
     )
-    target = result.target_account
     return ApplyPresetResponse(
         ok=True,
         preset_id=result.preset.id,
@@ -756,7 +840,8 @@ async def apply_preset(
         disabled_count=len(result.disabled_account_ids),
         enabled_account_ids=result.enabled_account_ids,
         disabled_account_ids=result.disabled_account_ids,
-        rebind_required=result.rebind_required,
+        rebind_required=rebind_required,
+        rebind_status=rebind_status,
         previous_active_account_id=result.previous_active_account_id,
         active_account_id=result.active_account_id,
         target_account=to_account_response(target) if target is not None else None,

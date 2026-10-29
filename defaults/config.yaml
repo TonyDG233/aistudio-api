@@ -14,6 +14,9 @@ instances:
     surface: chat
     min_tier: Pro
 
+# 全局实例/Context 上限（1-16）；缺省等于 instances count 之和。
+max_contexts: 2
+
 # 诊断开关（D-09）：snapshot hash 是否包含 executable_code / code_execution_result。
 # 默认开启；出现严重路由异常时优先怀疑该 hash，可临时置 false 回退上游行为。
 # 仅诊断用，不进入普通用户 UI；也可用 AISTUDIO_HASH_INCLUDE_CODE 环境变量覆盖。
