@@ -34,6 +34,7 @@ from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
 from .routes_gemini import router as gemini_router
 from .routes_instances import router as instances_router
+from .routes_keepalive import router as keepalive_router
 from .routes_models import router as models_router
 from .routes_system import (
     protected_router as system_protected_router,
@@ -89,6 +90,7 @@ async def _shutdown_runtime(
 async def lifespan(_app: FastAPI):
     validate_config()
 
+    from aistudio_api.application.account_keepalive import AccountKeepaliveService
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_info_refresher import (
@@ -110,8 +112,9 @@ async def lifespan(_app: FastAPI):
     account_store = AccountStore()
     account_service = AccountService(account_store)
     runtime_state.account_service = account_service
-    # P1 只做接线：刷新器供手动 /refresh 与后续 P6 调度复用，不启动 24h 任务。
-    runtime_state.account_refresher = AccountInfoRefresher(account_store)
+    # P1 接线刷新器；P6 由 keepalive metadata_refresh 统一调度 tier/email。
+    account_refresher = AccountInfoRefresher(account_store)
+    runtime_state.account_refresher = account_refresher
 
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
@@ -138,52 +141,6 @@ async def lifespan(_app: FastAPI):
                 logger.warning("浏览器预热失败: %s", e)
 
     warmup_task = asyncio.create_task(_warmup())
-
-    tier_task = None
-
-    async def _auto_refresh_tiers():
-        import json
-
-        from aistudio_api.infrastructure.account.cookie_parser import (
-            probe_account_benefit_tier,
-            probe_account_email,
-        )
-
-        for a in account_store.list_accounts():
-            if not a.email or a.tier == "Free":
-                apath = account_store.get_auth_path(a.id)
-                if apath and apath.is_file():
-                    try:
-                        adata = json.loads(apath.read_text(encoding="utf-8"))
-                        rcookies = adata.get("cookies") or []
-                        cdict = {
-                            str(c.get("name") or ""): str(c.get("value") or "")
-                            for c in rcookies
-                            if isinstance(c, dict) and c.get("name")
-                        }
-                        if cdict:
-                            if not a.email:
-                                em = await probe_account_email(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if em:
-                                    account_store.update_account_email(a.id, em)
-                            if a.tier == "Free":
-                                t = await probe_account_benefit_tier(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if t and t != "Free":
-                                    account_store.update_account_tier(a.id, t)
-                                    logger.info(
-                                        "启动自动校验并升级账号 %s (u/%s) 订阅等级: %s",
-                                        a.id,
-                                        a.auth_user,
-                                        t,
-                                    )
-                    except Exception:
-                        pass
-
-    tier_task = asyncio.create_task(_auto_refresh_tiers())
 
     # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
     from aistudio_api.application.instance_manager import InstanceManager
@@ -212,7 +169,15 @@ async def lifespan(_app: FastAPI):
         account_store=account_store,
         rotator=rotator,
     )
-    runtime_state.keepalive = None
+
+    keepalive = AccountKeepaliveService(
+        account_store,
+        client,
+        account_refresher,
+        instance_manager=instance_manager,
+    )
+    runtime_state.keepalive = keepalive
+    await keepalive.start()
 
     startup_task: asyncio.Task[object] | None = None
 
@@ -236,7 +201,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         logger.info("服务正在关闭")
-        await _shutdown_runtime(runtime_state, (warmup_task, tier_task, startup_task))
+        await _shutdown_runtime(runtime_state, (warmup_task, startup_task))
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
@@ -248,6 +213,9 @@ app.include_router(
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     instances_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
+app.include_router(
+    keepalive_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])

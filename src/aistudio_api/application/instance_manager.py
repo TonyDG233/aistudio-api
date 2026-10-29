@@ -599,6 +599,11 @@ class InstanceManager:
         record = self._records.get(self._current_id or "")
         return record.account_id if record is not None else None
 
+    def pool_slots(self) -> tuple[Any, ...]:
+        """Expose pooled runtime slots for keepalive cookie write-back."""
+        self._sync_records()
+        return tuple(self._pool.slots())
+
     def active_account_ids(self) -> set[str]:
         return {
             record.account_id
