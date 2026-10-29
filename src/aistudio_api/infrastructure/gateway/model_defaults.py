@@ -105,6 +105,55 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
         else:
             raw_security["api_allow_anonymous"] = allow_anonymous
 
+    raw_rotator = config.get("rotator")
+    if isinstance(raw_rotator, dict):
+        quota_scope = raw_rotator.get("quota_scope", "account")
+        if quota_scope not in ("account", "account_surface"):
+            logger.warning(
+                "配置 rotator.quota_scope 非法（%r），已回退默认值 account",
+                quota_scope,
+            )
+            raw_rotator["quota_scope"] = "account"
+
+    raw_features = config.get("features")
+    if not isinstance(raw_features, dict):
+        logger.warning(
+            "配置 features 必须为字典（当前类型 %s），已回退默认 features 块",
+            _describe_type(raw_features),
+        )
+        default_features = defaults.get("features")
+        config["features"] = (
+            dict(default_features) if isinstance(default_features, dict) else {}
+        )
+    else:
+        raw_routing = raw_features.get("routing")
+        if not isinstance(raw_routing, dict):
+            logger.warning(
+                "配置 features.routing 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_routing),
+            )
+            default_features = defaults.get("features")
+            default_routing = (
+                default_features.get("routing")
+                if isinstance(default_features, dict)
+                else None
+            )
+            raw_features["routing"] = (
+                dict(default_routing) if isinstance(default_routing, dict) else {}
+            )
+        else:
+            max_switches = raw_routing.get("max_switches", 2)
+            if (
+                isinstance(max_switches, bool)
+                or not isinstance(max_switches, int)
+                or max_switches < 0
+            ):
+                logger.warning(
+                    "配置 features.routing.max_switches 非法（%r），已回退默认值 2",
+                    max_switches,
+                )
+                raw_routing["max_switches"] = 2
+
     return config
 
 
@@ -612,11 +661,17 @@ def _default_config() -> dict[str, object]:
         },
         "rotator": {
             "max_retries": 5,
+            "quota_scope": "account",
             "cooldowns": {
                 "rate_limited_short": 60,
                 "rate_limited_drip": 300,
                 "rate_limited_drip_extended": 600,
                 "auth_error": 300,
+            },
+        },
+        "features": {
+            "routing": {
+                "max_switches": 2,
             },
         },
         "paid_model_rules": {
@@ -1122,6 +1177,50 @@ def get_configured_paid_model_rules(
     if isinstance(def_rules, dict):
         return def_rules
     return {}
+
+
+def get_configured_routing_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """返回 features.routing 配置；缺失/非法时回退 max_switches=2。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    raw_routing = (
+        raw_features.get("routing") if isinstance(raw_features, dict) else None
+    )
+    if not isinstance(raw_routing, dict):
+        logger.warning(
+            "配置 features.routing 非法（%r），回退默认 max_switches=2",
+            _describe_type(raw_routing),
+        )
+        return {"max_switches": 2}
+    raw_switches = raw_routing.get("max_switches", 2)
+    if (
+        isinstance(raw_switches, bool)
+        or not isinstance(raw_switches, int)
+        or raw_switches < 0
+    ):
+        logger.warning(
+            "配置 features.routing.max_switches 非法（%r），回退默认 2",
+            raw_switches,
+        )
+        return {"max_switches": 2}
+    return {"max_switches": raw_switches}
+
+
+def resolve_quota_scope(
+    config_path: str | os.PathLike[str] | None = None,
+) -> str:
+    """D-01: ``account``（默认）或 ``account_surface``；非法值回退 account。"""
+    rotator = get_configured_rotator_settings(config_path)
+    raw_scope = rotator.get("quota_scope", "account")
+    if raw_scope in ("account", "account_surface"):
+        return str(raw_scope)
+    logger.warning(
+        "配置 rotator.quota_scope 非法（%r），回退默认 account", raw_scope
+    )
+    return "account"
 
 
 def get_configured_security_settings(

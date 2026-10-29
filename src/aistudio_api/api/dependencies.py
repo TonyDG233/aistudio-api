@@ -130,6 +130,23 @@ def get_client() -> AIStudioClient:
     return runtime_state.client
 
 
+def get_routing_pipeline():
+    from typing import cast
+
+    from aistudio_api.application.routing_pipeline import RoutingPipeline
+
+    pipeline = runtime_state.routing_pipeline
+    if pipeline is None:
+        raise HTTPException(
+            503,
+            detail={
+                "message": "路由管线未初始化",
+                "type": "service_unavailable",
+            },
+        )
+    return cast(RoutingPipeline, pipeline)
+
+
 def get_account_service():
     if runtime_state.account_service is None:
         raise HTTPException(

@@ -1,174 +1,114 @@
-"""Unit tests for tier preemption and paid model fast-fail."""
+"""D-04/D-06: tier admission rejects locally and never preempts at request time."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import pytest
-from fastapi import HTTPException
 
-from aistudio_api.api.state import runtime_state
-from aistudio_api.application.account_orchestrator import ensure_active_account
-from aistudio_api.application.account_rotator import AccountRotator
-from aistudio_api.application.account_service import AccountService
-from aistudio_api.infrastructure.account.account_store import AccountMeta
+from aistudio_api.application.routing_pipeline import RoutingPipeline
+from aistudio_api.domain.errors import AuthError, TierRequiredError
+from aistudio_api.domain.instances import InstanceState
+from tests.unit.routing_fakes import (
+    FakeManager,
+    make_context,
+    make_instance,
+)
+
+
+def _pipeline(manager: FakeManager) -> RoutingPipeline:
+    return RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
 
 
 @pytest.mark.asyncio
-async def test_free_account_requesting_paid_model_preempts_to_pro_account():
-    """当当前账号为 Free 等级但收到付费模型（如生图/Argon）时，本地直接主动抢切 Pro/Ultra 账号。"""
-    mock_rotator = MagicMock(spec=AccountRotator)
-    mock_service = MagicMock(spec=AccountService)
-    mock_client = MagicMock()
-    mock_client.session = MagicMock()
-
-    free_acc = AccountMeta(
-        id="acc_free",
-        name="Free Account",
-        email="free@gmail.com",
-        tier="Free",
-        created_at="2026-01-01",
+async def test_free_only_pool_rejects_paid_model_without_switching() -> None:
+    manager = FakeManager(
+        [make_instance("inst-free", account_id="free", tier="Free")]
     )
-    pro_acc = AccountMeta(
-        id="acc_pro",
-        name="Pro Account",
-        email="pro@gmail.com",
-        tier="Pro",
-        created_at="2026-01-01",
+    with pytest.raises(TierRequiredError) as info:
+        await _pipeline(manager).begin(model_path="gemini-4-argon")
+
+    error = info.value
+    assert error.model == "gemini-4-argon"
+    assert error.required_tier == "Pro"
+    assert error.current_tier == "Free"
+    assert error.tier == "Pro"
+    assert error.as_fields() == {
+        "tier": "Pro",
+        "model": "gemini-4-argon",
+        "required_tier": "Pro",
+        "current_tier": "Free",
+    }
+    assert manager.begin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_plus_pool_is_paid_lane_but_below_pro_requirement() -> None:
+    manager = FakeManager(
+        [
+            make_instance(
+                "inst-plus",
+                account_id="plus",
+                tier="Plus",
+                state=InstanceState.ACTIVE,
+            )
+        ]
     )
+    with pytest.raises(TierRequiredError) as info:
+        await _pipeline(manager).begin(model_path="gemini-4-argon")
 
-    mock_service.get_active_account.return_value = free_acc
-    mock_service.activate_account = AsyncMock(return_value=pro_acc)
-    mock_rotator.get_next_account = AsyncMock(return_value=pro_acc)
-    mock_rotator.clear_cooldown = MagicMock()
+    assert info.value.current_tier == "Plus"
+    assert info.value.required_tier == "Pro"
+    assert manager.begin_calls == []
 
-    with (
-        patch.object(runtime_state, "rotator", mock_rotator),
-        patch.object(runtime_state, "account_service", mock_service),
-        patch.object(runtime_state, "client", mock_client),
-    ):
-        # 请求付费生图模型
-        await ensure_active_account(attempt=0, model="gemini-3.1-flash-image-preview")
 
-        # 验证主动抢切被触发，并且传入了所需付费层级
-        mock_rotator.get_next_account.assert_awaited_once()
-        kwargs = mock_rotator.get_next_account.call_args[1]
-        assert "Pro" in kwargs["required_tiers"] and "Ultra" in kwargs["required_tiers"]
-        mock_service.activate_account.assert_awaited_once_with(
-            "acc_pro", mock_client.session
+@pytest.mark.asyncio
+async def test_ultra_only_model_rejects_pro_instance() -> None:
+    manager = FakeManager(
+        [make_instance("inst-pro", account_id="pro", tier="Pro")]
+    )
+    with pytest.raises(TierRequiredError) as info:
+        await _pipeline(manager).begin(model_path="veo-2.0-generate-001")
+
+    assert info.value.required_tier == "Ultra"
+    assert info.value.current_tier == "Pro"
+    assert manager.begin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_paid_model_without_rule_requires_pro_not_ultra() -> None:
+    """An empty rule must not be interpreted as Ultra-only (C06/E-07)."""
+    manager = FakeManager(
+        [make_instance("inst-pro", account_id="pro", tier="Pro")]
+    )
+    context = await _pipeline(manager).begin(model_path="gemini-3-flash-preview")
+    assert context.route.paid is True
+    assert context.route.required_tier == "Pro"
+    assert context.candidates[0].instance_id == "inst-pro"
+
+
+@pytest.mark.asyncio
+async def test_upstream_auth_403_on_wrong_tier_never_switches() -> None:
+    manager = FakeManager(
+        [
+            make_instance("plus-inst", account_id="plus", tier="Plus", number=1),
+            make_instance("pro-inst", account_id="pro", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = make_context(
+        [make_instance("plus-inst", account_id="plus", tier="Plus")],
+        paid=True,
+        required_tiers=("Pro",),
+    )
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    with pytest.raises(TierRequiredError) as info:
+        await pipeline.handle_error(
+            context, attempt, AuthError("upstream tier 403")
         )
-
-
-@pytest.mark.asyncio
-async def test_free_account_requesting_paid_model_fast_fails_when_no_pro_account():
-    """当请求付费模型但账号池中没有任何 Pro/Ultra 账号时，本地直接友好报 403 Fast-Fail，不上报上游。"""
-    mock_rotator = MagicMock(spec=AccountRotator)
-    mock_service = MagicMock(spec=AccountService)
-    mock_client = MagicMock()
-    mock_client.session = MagicMock()
-
-    free_acc = AccountMeta(
-        id="acc_free",
-        name="Free Account",
-        email="free@gmail.com",
-        tier="Free",
-        created_at="2026-01-01",
-    )
-
-    mock_service.get_active_account.return_value = free_acc
-    # 没有可用的 Pro 账号，返回 None
-    mock_rotator.get_next_account = AsyncMock(return_value=None)
-
-    with (
-        patch.object(runtime_state, "rotator", mock_rotator),
-        patch.object(runtime_state, "account_service", mock_service),
-        patch.object(runtime_state, "client", mock_client),
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            await ensure_active_account(attempt=0, model="gemini-3.1-flash-image-preview")
-
-        assert exc_info.value.status_code == 403
-        assert "需要 Google AI Studio Pro" in str(exc_info.value.detail)
-        mock_service.activate_account.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_plus_account_requesting_pro_model_preempts_to_pro_account():
-    """当当前账号为 Plus 等级但收到 Pro 独占模型时，主动抢切 Pro/Ultra 账号。"""
-    mock_rotator = MagicMock(spec=AccountRotator)
-    mock_service = MagicMock(spec=AccountService)
-    mock_client = MagicMock()
-    mock_client.session = MagicMock()
-
-    plus_acc = AccountMeta(
-        id="acc_plus",
-        name="Plus Account",
-        email="plus@gmail.com",
-        tier="Plus",
-        created_at="2026-01-01",
-    )
-    pro_acc = AccountMeta(
-        id="acc_pro",
-        name="Pro Account",
-        email="pro@gmail.com",
-        tier="Pro",
-        created_at="2026-01-01",
-    )
-
-    mock_service.get_active_account.return_value = plus_acc
-    mock_service.activate_account = AsyncMock(return_value=pro_acc)
-    mock_rotator.get_next_account = AsyncMock(return_value=pro_acc)
-    mock_rotator.clear_cooldown = MagicMock()
-
-    with (
-        patch.object(runtime_state, "rotator", mock_rotator),
-        patch.object(runtime_state, "account_service", mock_service),
-        patch.object(runtime_state, "client", mock_client),
-    ):
-        await ensure_active_account(attempt=0, model="gemini-3.1-flash-image-preview")
-
-        mock_rotator.get_next_account.assert_awaited_once()
-        kwargs = mock_rotator.get_next_account.call_args[1]
-        assert "Pro" in kwargs["required_tiers"]
-        mock_service.activate_account.assert_awaited_once_with("acc_pro", mock_client.session)
-
-
-@pytest.mark.asyncio
-async def test_pro_account_requesting_ultra_model_preempts_to_ultra_account():
-    """当当前账号为 Pro 等级但收到 Veo (Ultra 独占) 模型时，主动抢切 Ultra 账号。"""
-    mock_rotator = MagicMock(spec=AccountRotator)
-    mock_service = MagicMock(spec=AccountService)
-    mock_client = MagicMock()
-    mock_client.session = MagicMock()
-
-    pro_acc = AccountMeta(
-        id="acc_pro",
-        name="Pro Account",
-        email="pro@gmail.com",
-        tier="Pro",
-        created_at="2026-01-01",
-    )
-    ultra_acc = AccountMeta(
-        id="acc_ultra",
-        name="Ultra Account",
-        email="ultra@gmail.com",
-        tier="Ultra",
-        created_at="2026-01-01",
-    )
-
-    mock_service.get_active_account.return_value = pro_acc
-    mock_service.activate_account = AsyncMock(return_value=ultra_acc)
-    mock_rotator.get_next_account = AsyncMock(return_value=ultra_acc)
-    mock_rotator.clear_cooldown = MagicMock()
-
-    with (
-        patch.object(runtime_state, "rotator", mock_rotator),
-        patch.object(runtime_state, "account_service", mock_service),
-        patch.object(runtime_state, "client", mock_client),
-    ):
-        await ensure_active_account(attempt=0, model="veo-2.0-generate-001")
-
-        mock_rotator.get_next_account.assert_awaited_once()
-        kwargs = mock_rotator.get_next_account.call_args[1]
-        assert "Ultra" in kwargs["required_tiers"] and "Pro" not in kwargs["required_tiers"]
-        mock_service.activate_account.assert_awaited_once_with("acc_ultra", mock_client.session)
+    assert info.value.required_tier == "Pro"
+    assert info.value.current_tier == "Plus"
+    assert context.budget.switches == 0
+    assert manager.begin_calls == ["plus-inst"]

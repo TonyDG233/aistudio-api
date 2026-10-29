@@ -425,6 +425,7 @@ class InstancePool:
             slot.context_id = context_id
             slot.session = session
             slot.generation = next_generation
+            session.active_context.tier = slot.tier
             return
         raise last_error or RuntimeError("session bootstrap failed")
 

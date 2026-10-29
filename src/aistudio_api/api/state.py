@@ -47,6 +47,7 @@ class RuntimeState:
     account_refresher: AccountInfoRefresher | None = None
     rotator: AccountRotator | None = None
     instance_manager: object | None = None
+    routing_pipeline: object | None = None
     keepalive: object | None = None
     model_stats: dict[str, ModelStatsItem] = field(
         default_factory=lambda: defaultdict(ModelStatsItem)

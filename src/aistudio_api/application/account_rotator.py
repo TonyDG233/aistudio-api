@@ -60,6 +60,39 @@ def normalize_model_key(model: str | None) -> str | None:
     return model.removeprefix("models/").lower()
 
 
+def split_quota_key(key: str) -> tuple[str | None, str]:
+    """Split a D-01 accounting key into ``(surface, model)``.
+
+    ``quota_scope=account`` stores plain ``model`` keys; ``account_surface``
+    stores ``surface::model``.
+    """
+    surface, separator, model = key.partition("::")
+    if separator and surface in ("chat", "build") and model:
+        return surface, model
+    return None, key
+
+
+def quota_key(
+    model: str | None, *, surface: str | None = None, scope: str = "account"
+) -> str:
+    """Build the accounting key selected by ``quota_scope`` (D-01)."""
+    norm_model = normalize_model_key(model) or "general"
+    if scope == "account_surface" and surface in ("chat", "build"):
+        return f"{surface}::{norm_model}"
+    return norm_model
+
+
+def quota_keys(
+    model: str | None, *, surface: str | None = None, scope: str = "account"
+) -> tuple[str, ...]:
+    """Primary key plus the legacy unscoped key for readability/migration."""
+    primary = quota_key(model, surface=surface, scope=scope)
+    legacy = normalize_model_key(model) or "general"
+    if primary == legacy:
+        return (primary,)
+    return (primary, legacy)
+
+
 @dataclass(slots=True)
 class AccountModelDailyStats:
     """单账号在特定模型当天的统计数据。"""
@@ -115,6 +148,7 @@ class AccountStats:
     """账号多维透视与运行调度统计（按 Account x Model x Date 原生划分）。"""
 
     account_id: str
+    quota_scope: str = "account"
     total_requests: int = 0
     total_success: int = 0
     total_rate_limited: int = 0
@@ -171,17 +205,34 @@ class AccountStats:
             self.daily_models.clear()
             self.daily_date_la = current_la
 
-    def get_model_daily(self, model: str | None) -> AccountModelDailyStats:
+    def get_model_daily(
+        self, model: str | None, *, surface: str | None = None
+    ) -> AccountModelDailyStats:
         """获取或创建指定模型在当天的统计对象。"""
         current_la = get_pacific_date_key()
         self._check_date_reset(current_la)
-        norm_m = normalize_model_key(model) or "general"
-        if norm_m not in self.daily_models:
-            self.daily_models[norm_m] = AccountModelDailyStats()
-        return self.daily_models[norm_m]
+        key = quota_key(model, surface=surface, scope=self.quota_scope)
+        if key not in self.daily_models:
+            self.daily_models[key] = AccountModelDailyStats()
+        return self.daily_models[key]
+
+    def model_requests_total(self, model: str | None) -> int:
+        """Sum today's requests across every quota-scoped key for one model."""
+        target = normalize_model_key(model)
+        if not target:
+            return 0
+        return sum(
+            daily.requests
+            for key, daily in self.daily_models.items()
+            if split_quota_key(key)[1] == target
+        )
 
     def is_available(
-        self, model: str | None = None, *, ignore_auth_cooldown: bool = False
+        self,
+        model: str | None = None,
+        *,
+        surface: str | None = None,
+        ignore_auth_cooldown: bool = False,
     ) -> bool:
         """检查账号在指定模型下是否可用（软限额超标不禁用，仅上游真 429 冷却与登录态失效不可用）。"""
         now = time.time()
@@ -193,31 +244,42 @@ class AccountStats:
         self._check_date_reset(current_la)
 
         if model:
-            norm_m = normalize_model_key(model)
-            if norm_m and norm_m in self.daily_models:
-                m_stats = self.daily_models[norm_m]
-                if m_stats.cooldown_until > now:
+            for key in quota_keys(
+                model, surface=surface, scope=self.quota_scope
+            ):
+                m_stats = self.daily_models.get(key)
+                if m_stats is not None and m_stats.cooldown_until > now:
                     return False
 
         return True
 
-    def get_cooldown_remaining(self, model: str | None = None) -> float:
+    def get_cooldown_remaining(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> float:
         """获取距离配额刷新的剩余秒数。"""
-        if self.is_available(model):
+        if self.is_available(model, surface=surface):
             return 0.0
         now = time.time()
         if self.auth_cooldown > now:
             return max(0.0, self.auth_cooldown - now)
         if model:
-            norm_m = normalize_model_key(model)
-            if norm_m and norm_m in self.daily_models:
-                cd = self.daily_models[norm_m].cooldown_until
-                if cd > now:
-                    return max(0.0, cd - now)
+            remaining = 0.0
+            for key in quota_keys(
+                model, surface=surface, scope=self.quota_scope
+            ):
+                m_stats = self.daily_models.get(key)
+                if m_stats is not None and m_stats.cooldown_until > now:
+                    remaining = max(remaining, m_stats.cooldown_until - now)
+            if remaining > 0:
+                return remaining
         return get_seconds_until_pacific_midnight()
 
     def record_success(
-        self, model: str | None = None, usage: dict[str, object] | None = None
+        self,
+        model: str | None = None,
+        usage: dict[str, object] | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         now = time.time()
         self.total_requests += 1
@@ -226,7 +288,7 @@ class AccountStats:
         self.auth_errors = 0
         self.auth_cooldown = 0.0
 
-        m_stats = self.get_model_daily(model)
+        m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.success += 1
         m_stats.last_used = now
@@ -249,14 +311,16 @@ class AccountStats:
             m_stats.cached_tokens += cached
             m_stats.total_tokens += tt if tt else (pt + ct)
 
-    def record_rate_limited(self, model: str | None = None) -> None:
+    def record_rate_limited(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> None:
         now = time.time()
         self.total_requests += 1
         self.total_rate_limited += 1
         self.last_rate_limited = now
         cooldown_seconds = get_seconds_until_pacific_midnight()
 
-        m_stats = self.get_model_daily(model)
+        m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.rate_limited += 1
         m_stats.last_used = now
@@ -286,17 +350,23 @@ class AccountStats:
         effective_cooldown = min(cooldown_duration, max(60.0, cooldown_seconds))
         m_stats.cooldown_until = now + effective_cooldown
 
-    def record_error(self, model: str | None = None) -> None:
+    def record_error(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> None:
         self.total_requests += 1
         self.total_errors += 1
         self.last_used = time.time()
-        m_stats = self.get_model_daily(model)
+        m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.errors += 1
         m_stats.last_used = time.time()
 
     def record_auth_error(
-        self, model: str | None = None, cooldown_seconds: float | None = None
+        self,
+        model: str | None = None,
+        cooldown_seconds: float | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         now = time.time()
         self.total_requests += 1
@@ -315,11 +385,13 @@ class AccountStats:
                 raise RuntimeError("rotator 配置缺少 cooldowns 配置块")
             cooldown_seconds = float(str(cooldowns["auth_error"]))
         self.auth_cooldown = now + cooldown_seconds
-        m_stats = self.get_model_daily(model)
+        m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.errors += 1
 
-    def record_session_expired(self, model: str | None = None) -> None:
+    def record_session_expired(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> None:
         now = time.time()
         self.total_requests += 1
         self.total_errors += 1
@@ -329,23 +401,27 @@ class AccountStats:
         self.last_auth_error = now
         self.last_used = now
         self.auth_cooldown = now + 86400.0
-        m_stats = self.get_model_daily(model)
+        m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.errors += 1
 
-    def clear_cooldown(self, model: str | None = None) -> None:
+    def clear_cooldown(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> None:
         """清除冷却与 429/403/失效锁定。"""
         self.auth_cooldown = 0.0
         self.auth_errors = 0
         self.session_expired = False
         self.last_session_expired = 0.0
         if model:
-            norm_m = normalize_model_key(model)
-            if norm_m and norm_m in self.daily_models:
-                st = self.daily_models[norm_m]
-                st.cooldown_until = 0.0
-                st.rate_limited = 0
-                st.drip_mode = False
+            for key in quota_keys(
+                model, surface=surface, scope=self.quota_scope
+            ):
+                st = self.daily_models.get(key)
+                if st is not None:
+                    st.cooldown_until = 0.0
+                    st.rate_limited = 0
+                    st.drip_mode = False
         else:
             for st in self.daily_models.values():
                 st.cooldown_until = 0.0
@@ -355,6 +431,7 @@ class AccountStats:
     def to_dict(self) -> dict[str, object]:
         return {
             "account_id": self.account_id,
+            "quota_scope": self.quota_scope,
             "total_requests": self.total_requests,
             "total_success": self.total_success,
             "total_rate_limited": self.total_rate_limited,
@@ -373,7 +450,9 @@ class AccountStats:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, object]) -> AccountStats:
+    def from_dict(
+        cls, data: dict[str, object], *, quota_scope: str | None = None
+    ) -> AccountStats:
         def _as_int(v: object) -> int:
             try:
                 return int(str(v)) if v is not None else 0
@@ -435,6 +514,10 @@ class AccountStats:
                 )
         return cls(
             account_id=str(data.get("account_id") or ""),
+            quota_scope=(
+                quota_scope
+                or str(data.get("quota_scope") or "account")
+            ),
             total_requests=tot_req,
             total_success=tot_succ,
             total_rate_limited=tot_limit,
@@ -455,13 +538,20 @@ class AccountRotator:
     """账号调度管理器。
 
     核心流程：
-    1. 候选过滤（使能开关、登录态、分组、订阅要求、429 冷却）；
+    1. 候选过滤（使能开关、登录态、订阅要求、429 冷却）；
     2. 当前健康账号优先（sticky），否则按最少使用与 LRU 选择；
-    3. 业务分组与方案预设。
+    3. D-01 quota_scope 记账口径（account / account_surface）。
     """
+
+    quota_scope: str = "account"
 
     def __init__(self, account_store: AccountStore) -> None:
         self._store = account_store
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            resolve_quota_scope,
+        )
+
+        self.quota_scope = resolve_quota_scope()
         self._stats: dict[str, AccountStats] = {}
         self._lock = asyncio.Lock()
         self._last_saved_time: float = 0.0
@@ -470,7 +560,9 @@ class AccountRotator:
         self.cleanup_ghost_accounts()
         for account in self._store.list_accounts():
             if account.id not in self._stats:
-                self._stats[account.id] = AccountStats(account_id=account.id)
+                self._stats[account.id] = AccountStats(
+                    account_id=account.id, quota_scope=self.quota_scope
+                )
 
     def load_state(self) -> None:
         """从持久化文件恢复账号统计状态。"""
@@ -485,7 +577,9 @@ class AccountRotator:
             if isinstance(data, dict):
                 for acc_id, item in data.items():
                     if isinstance(item, dict):
-                        self._stats[str(acc_id)] = AccountStats.from_dict(item)
+                        self._stats[str(acc_id)] = AccountStats.from_dict(
+                            item, quota_scope=self.quota_scope
+                        )
                 logger.info(
                     "已从 %s 恢复 %d 个账号的统计状态",
                     state_file,
@@ -535,17 +629,23 @@ class AccountRotator:
         if stats is None and any(
             a.id == account_id for a in self._store.list_accounts()
         ):
-            stats = AccountStats(account_id=account_id)
+            stats = AccountStats(account_id=account_id, quota_scope=self.quota_scope)
             self._stats[account_id] = stats
         return stats
 
-    def is_account_available(self, account_id: str, model: str | None = None) -> bool:
-        """检查指定账号在特定模型下是否可用（遵循使能开关、登录态与真 429 冷却）。"""
+    def is_account_available(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str | None = None,
+    ) -> bool:
+        """检查指定账号在特定模型下是否可用（使能、登录态与真 429 冷却）。"""
         account = self._store.get_account(account_id)
         if not account or not account.enabled or getattr(account, "expired", False):
             return False
         stats = self.get_account_stats(account_id)
-        return bool(stats and stats.is_available(model))
+        return bool(stats and stats.is_available(model, surface=surface))
 
     def get_all_stats(self) -> dict[str, dict[str, object]]:
         """获取所有账号的运行透视与配额状态。"""
@@ -569,7 +669,8 @@ class AccountRotator:
             for m_key, m_stats in stats.daily_models.items():
                 today_total_requests += m_stats.requests
                 today_total_tokens += m_stats.total_tokens
-                quota = resolve_tier_quota(tier_str, m_key)
+                _surface, clean_model = split_quota_key(m_key)
+                quota = resolve_tier_quota(tier_str, clean_model)
                 rem_cd = (
                     max(0, int(m_stats.cooldown_until - time.time()))
                     if m_stats.cooldown_until > time.time()
@@ -602,6 +703,7 @@ class AccountRotator:
                 "email": account.email,
                 "auth_user": account.auth_user,
                 "tier": tier_str,
+                "quota_scope": self.quota_scope,
                 "enabled": account.enabled,
                 "group": account.group,
                 "requests": stats.total_requests,
@@ -650,52 +752,30 @@ class AccountRotator:
         self,
         model: str | None = None,
         required_tiers: tuple[str, ...] | list[str] | None = None,
-        active_groups: tuple[str, ...] | list[str] | None = None,
-        *,
-        ignore_auth_cooldown: bool = False,
+        surface: str | None = None,
     ) -> list[tuple[AccountMeta, AccountStats]]:
-        """过滤可用账号候选（使能开关、登录态、分组、订阅准入、429 冷却）。"""
+        """Filter usable accounts (enabled, session, required tiers, cooldowns).
+
+        There is no group filter, no quota-pool narrowing and no model-discovery
+        fail-open here: P2 admission lives in ``routing_eligibility``.
+        """
         accounts = self._store.list_accounts()
         candidates: list[tuple[AccountMeta, AccountStats]] = []
 
         for account in accounts:
-            # 1. 主开关与凭据过期门禁
             if not account.enabled or getattr(account, "expired", False):
                 continue
-            # 2. 业务分组过滤
-            if active_groups and account.group not in active_groups:
-                continue
-            # 3. 目标模型显式要求订阅过滤 (如 Pro/Ultra 抢切)
             if required_tiers and account.tier not in required_tiers:
                 continue
 
             stats = self._stats.setdefault(
-                account.id, AccountStats(account_id=account.id)
+                account.id,
+                AccountStats(account_id=account.id, quota_scope=self.quota_scope),
             )
-            # 4. 登录态与真 429/403 冷却检查
-            if not stats.is_available(model, ignore_auth_cooldown=ignore_auth_cooldown):
+            if not stats.is_available(model, surface=surface):
                 continue
 
             candidates.append((account, stats))
-
-        # 5. 上游模型能力要求过滤 (如果未传 required_tiers，按模型自身 accessModes 过滤)
-        if model and candidates and not required_tiers:
-            try:
-                from aistudio_api.infrastructure.gateway.model_discovery import (
-                    model_discovery,
-                )
-
-                tier_matched = [
-                    (acc, st)
-                    for acc, st in candidates
-                    if model_discovery.is_model_allowed_for_tier(
-                        model, getattr(acc, "tier", "Free")
-                    )
-                ]
-                if tier_matched:
-                    return tier_matched
-            except Exception:
-                pass
 
         return candidates
 
@@ -708,7 +788,7 @@ class AccountRotator:
         _account, stats = item
         return (
             stats.total_requests,
-            stats.get_model_daily(model).requests,
+            stats.model_requests_total(model),
             stats.last_used,
         )
 
@@ -718,58 +798,39 @@ class AccountRotator:
         current_account_id: str | None = None,
         failed_account_id: str | None = None,
         required_tiers: tuple[str, ...] | list[str] | None = None,
-        active_groups: tuple[str, ...] | list[str] | None = None,
-        *,
-        is_session_expired: bool = False,
+        surface: str | None = None,
     ) -> AccountMeta | None:
-        """通过硬性过滤与最少使用/黏性规则挑选最佳就绪账号。"""
+        """Pick the best ready account: sticky, then least-used/LRU, then FIFO.
+
+        Request-time switching is owned by the routing pipeline; this method is
+        kept for the manual ``/rotation/next`` control-plane action.
+        """
         async with self._lock:
             candidates = self._get_eligible_candidates(
                 model=model,
                 required_tiers=required_tiers,
-                active_groups=active_groups,
+                surface=surface,
             )
-            if not candidates:
-                # 保底：若所有账号都处于 auth_cooldown 中，允许 fallback 尝试恢复
-                candidates = self._get_eligible_candidates(
-                    model=model,
-                    required_tiers=required_tiers,
-                    active_groups=active_groups,
-                    ignore_auth_cooldown=True,
-                )
-                if not candidates:
-                    return None
-
-            # 过滤失败账号
             valid_candidates = [
                 (a, s)
                 for a, s in candidates
                 if not (failed_account_id and a.id == failed_account_id)
             ]
             if not valid_candidates:
-                if is_session_expired:
-                    return None
-                # 单账号在位自愈场景
-                if failed_account_id:
-                    for a, _ in candidates:
-                        if a.id == failed_account_id:
-                            return a
-                return candidates[0][0]
+                return None
 
-            # 优先保持当前健康账号（sticky）
             if current_account_id:
                 for account, _stats in valid_candidates:
                     if account.id == current_account_id:
                         return account
 
-            # 当前账号不可用/失败账号时，按最少使用与 LRU 选择
             best_account, _ = min(
                 valid_candidates,
                 key=lambda item: self._least_used_key(item, model),
             )
             if current_account_id and best_account.id != current_account_id:
                 logger.info(
-                    "账号智能切换: %s -> %s (model=%s, tier=%s)",
+                    "账号切换: %s -> %s (model=%s, tier=%s)",
                     current_account_id,
                     best_account.id,
                     model,
@@ -782,27 +843,43 @@ class AccountRotator:
         account_id: str,
         model: str | None = None,
         usage: dict[str, object] | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_success(model, usage=usage)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].record_success(model, usage=usage, surface=surface)
         self._schedule_debounced_save()
 
     def record_rate_limited(
         self,
         account_id: str,
         model: str | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_rate_limited(model)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].record_rate_limited(model, surface=surface)
         logger.warning("账号 %s 在模型 %s 触发真实上游 429", account_id, model or "all")
         self.save_state()
 
-    def record_error(self, account_id: str, model: str | None = None) -> None:
+    def record_error(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str | None = None,
+    ) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_error(model)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].record_error(model, surface=surface)
         self.save_state()
 
     def record_auth_error(
@@ -810,11 +887,15 @@ class AccountRotator:
         account_id: str,
         model: str | None = None,
         cooldown_seconds: float | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
         self._stats[account_id].record_auth_error(
-            model, cooldown_seconds=cooldown_seconds
+            model, cooldown_seconds=cooldown_seconds, surface=surface
         )
         logger.warning(
             "账号 %s 遇到 403 权限拒绝，暂停使用并切换备用账号",
@@ -826,18 +907,30 @@ class AccountRotator:
         self,
         account_id: str,
         model: str | None = None,
+        *,
+        surface: str | None = None,
     ) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].record_session_expired(model)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].record_session_expired(model, surface=surface)
         logger.error("账号 %s 登录态失效，已被永久禁用直至重新导入凭据", account_id)
         self.save_state()
 
-    def clear_cooldown(self, account_id: str, model: str | None = None) -> None:
+    def clear_cooldown(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str | None = None,
+    ) -> None:
         """清除指定账号的 429 锁定。"""
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
-        self._stats[account_id].clear_cooldown(model)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].clear_cooldown(model, surface=surface)
         logger.info("已手动清除账号 %s 锁定 (model=%s)", account_id, model)
         self.save_state()
 
@@ -850,7 +943,9 @@ class AccountRotator:
 
     def add_account(self, account_id: str) -> None:
         if account_id not in self._stats:
-            self._stats[account_id] = AccountStats(account_id=account_id)
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
         self.save_state()
 
     def remove_account(self, account_id: str) -> None:

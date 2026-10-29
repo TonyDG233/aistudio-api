@@ -21,6 +21,141 @@ class UsageLimitExceeded(AistudioError):
     pass
 
 
+class TierRequiredError(AistudioError):
+    """付费模型 tier 不足（D-04/D-06）。
+
+    This is an application-layer domain error; it never carries FastAPI types.
+    The API adapter maps it to HTTP 403 and preserves the four frozen fields
+    ``tier/model/required_tier/current_tier``.
+    """
+
+    status_code = 403
+    code = "tier_required"
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        tier: str,
+        required_tier: str,
+        current_tier: str,
+        message: str | None = None,
+    ) -> None:
+        self.model = model
+        self.tier = tier
+        self.required_tier = required_tier
+        self.current_tier = current_tier
+        super().__init__(
+            message
+            or (
+                f"模型 '{model}' 需要 {required_tier} 及以上订阅，"
+                f"当前账号为 {current_tier}。"
+            )
+        )
+
+    def as_fields(self) -> dict[str, str]:
+        return {
+            "tier": self.tier,
+            "model": self.model,
+            "required_tier": self.required_tier,
+            "current_tier": self.current_tier,
+        }
+
+
+class RoutingError(AistudioError):
+    """Rejected request routing (capacity or exhausted switching)."""
+
+    status_code = 503
+    code = "surface_unavailable"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        surface: str | None = None,
+        advice: str | None = None,
+    ) -> None:
+        self.surface = surface
+        self.advice = advice or "请稍后重试，或前往管理页检查账号/实例状态。"
+        if code:
+            self.code = code
+        super().__init__(message)
+
+    def as_fields(self) -> dict[str, str]:
+        fields = {"type": self.code, "reason": self.code}
+        if self.surface:
+            fields["surface"] = self.surface
+        if self.advice:
+            fields["advice"] = self.advice
+        return fields
+
+
+class SurfaceCapacityError(RoutingError):
+    """No instance capacity in the model's lane/surface."""
+
+    def __init__(
+        self,
+        *,
+        surface: str,
+        message: str | None = None,
+        advice: str | None = None,
+    ) -> None:
+        code = (
+            "surface_instance_busy" if surface == "build" else "surface_quota_exceeded"
+        )
+        super().__init__(
+            message
+            or (
+                f"渠道 '{surface}' 实例容量已满，当前请求未分配实例；"
+                "请稍后重试或前往管理页检查实例。"
+            ),
+            code=code,
+            surface=surface,
+            advice=advice,
+        )
+
+
+class SurfaceSwitchExhaustedError(RoutingError):
+    """429 switch budget/candidates exhausted (must be 503, never 429)."""
+
+    def __init__(
+        self,
+        *,
+        surface: str,
+        message: str | None = None,
+        advice: str | None = None,
+    ) -> None:
+        super().__init__(
+            message
+            or (
+                "所有合格实例均达到配额上限，本轮切换已耗尽；"
+                "请等待额度刷新（美西午夜）或前往管理页检查账号。"
+            ),
+            code="surface_switch_exhausted",
+            surface=surface,
+            advice=advice,
+        )
+
+
+class SurfaceUnavailableError(RoutingError):
+    """The requested surface is not implemented/enabled yet."""
+
+    def __init__(
+        self,
+        *,
+        surface: str,
+        message: str | None = None,
+        advice: str | None = None,
+    ) -> None:
+        super().__init__(
+            message or f"渠道 '{surface}' 当前不可用。",
+            code="surface_unavailable",
+            surface=surface,
+            advice=advice,
+        )
+
+
 class RequestError(AistudioError):
     def __init__(self, status: int, message: str = ""):
         self.status = status

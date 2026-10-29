@@ -32,11 +32,18 @@ logging:
 
 rotator:
   max_retries: 5
+  # D-01 配额记账口径：account（默认，chat/build 共用额度）或 account_surface（分开）
+  quota_scope: account
   cooldowns:
     rate_limited_short: 60
     rate_limited_drip: 300
     rate_limited_drip_extended: 600
     auth_error: 300
+
+# P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）
+features:
+  routing:
+    max_switches: 2
 
 paid_model_rules:
   ultra_required:

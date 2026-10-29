@@ -71,6 +71,7 @@ class AccountBreakdownItem(BaseModel):
     email: str | None = None
     tier: str = "Free"
     group: str = "default"
+    surface: str | None = None
     enabled: bool = True
     today_requests: int = 0
     today_success: int = 0
@@ -114,6 +115,7 @@ class StatsTotalsResponse(BaseModel):
 class StatsResponse(BaseModel):
     models: dict[str, ModelStatsResponse]
     totals: StatsTotalsResponse
+    quota_scope: str = "account"
 
 
 class GeminiModelResponse(BaseModel):
