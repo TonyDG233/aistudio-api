@@ -51,7 +51,7 @@ async def run_keepalive_task(
         raise HTTPException(status_code=503, detail="保活服务未初始化")
     result = await cast(Any, service).run_now(req.task, trigger="api")
     if result.get("reason") == "busy":
-        raise HTTPException(status_code=409, detail="淇濇椿浠诲姟姝ｅ湪杩愯")
+        raise HTTPException(status_code=409, detail="保活任务正在运行")
     if result.get("reason") == "exception":
         raise HTTPException(
             status_code=500,
