@@ -74,6 +74,16 @@ def test_invalid_rotator_type_fails_startup_validation(tmp_path):
         validate_config(path)
 
 
+def test_invalid_rotator_cooldown_value_fails_startup_validation(tmp_path):
+    path = _write_config(
+        tmp_path,
+        "rotator:\n  cooldowns:\n    rate_limited_short: not-a-number\n",
+    )
+
+    with pytest.raises(ConfigValidationError, match=r"rotator\.cooldowns"):
+        validate_config(path)
+
+
 def test_security_anonymous_flag_defaults_false_and_accepts_true(tmp_path):
     default_path = _write_config(tmp_path, "logging:\n  level: INFO\n")
     assert get_configured_security_settings(default_path) is False

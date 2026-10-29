@@ -21,9 +21,11 @@ from aistudio_api.infrastructure.browser.scripts import (
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
     bootstrap_botguard_and_template,
 )
+from aistudio_api.infrastructure.gateway.capture import RequestCaptureService
 from aistudio_api.infrastructure.gateway.session import build_snapshot_hash_parts
 from aistudio_api.infrastructure.gateway.session_auth import (
     get_auth_user_from_meta,
+    get_tier_from_meta,
     load_cookies_to_page,
     navigate_to_aistudio,
     save_browser_cookies,
@@ -52,6 +54,11 @@ class PooledSession:
         self._snapshot_lock = asyncio.Lock()
         self._in_flight = 0
         self._stream_cleanup_count = 0
+        self._capture_service = RequestCaptureService(self)
+
+    @property
+    def capture_service(self) -> RequestCaptureService:
+        return self._capture_service
 
     @classmethod
     async def bootstrap(
@@ -94,6 +101,7 @@ class PooledSession:
             auth_user=target_auth_user,
             auth_file=auth_file,
             base_template=base_template,
+            tier=get_tier_from_meta(auth_file),
         )
         log.info(
             "PooledSession 就绪: realm=%s account=%s auth_user=%s",
@@ -251,5 +259,6 @@ class PooledSession:
         return await save_browser_cookies(self._context.page, self._context.auth_file)
 
     async def close(self) -> None:
+        self._capture_service.clear_templates()
         with suppress(Exception):
             await self._context.page.close()

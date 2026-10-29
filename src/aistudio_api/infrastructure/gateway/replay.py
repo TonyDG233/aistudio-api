@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest
-from aistudio_api.infrastructure.gateway.session import BrowserSession
+from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("replay")
 
 
 class RequestReplayService:
-    def __init__(self, session: BrowserSession):
+    def __init__(self, session: RequestSession):
         self._session = session
 
     async def replay(

@@ -384,32 +384,13 @@ class ModelDiscoveryService:
         return None
 
     def is_model_allowed_for_tier(self, model_id: str, tier: str | None) -> bool:
-        """根据 config.yaml 付费规则以及缓存的 ListModels accessModes 判断指定订阅等级是否可访问该模型。"""
+        """根据 paid_model_rules 与缓存 accessModes 判断指定订阅等级是否可访问该模型。"""
+        from aistudio_api.application.model_access import tier_satisfies_required
+
         req_tiers = self.get_required_tiers(model_id)
         if req_tiers:
-            norm_tier = (tier or "Free").strip()
-            return norm_tier in req_tiers
-
-        info = self.get_cached_model_info(model_id)
-        if not info:
-            return True
-        raw_modes = info.get("accessModes")
-        if not isinstance(raw_modes, list) or not raw_modes:
-            return True
-        norm_tier = (tier or "Free").strip().lower()
-        is_high_tier = (
-            norm_tier in ("plus", "pro", "ultra")
-            or "ultra" in norm_tier
-            or "pro" in norm_tier
-        )
-        is_ultra_tier = "ultra" in norm_tier
-        for mode in raw_modes:
-            if mode == 3 and is_high_tier:
-                return True
-            if mode == 4 and is_ultra_tier:
-                return True
-        # 如果 accessModes 只包含 1 (Paid API key) 且不含 3/4，对所有网页端等级放行尝试
-        return all(m not in (3, 4) for m in raw_modes)
+            return tier_satisfies_required(tier or "Free", req_tiers)
+        return True
 
     def is_paid_model(self, model_id: str) -> bool:
         """判定目标模型是否为付费模型（唯一来源：application.model_access）。"""
@@ -417,19 +398,19 @@ class ModelDiscoveryService:
 
     def get_required_tier(self, model_id: str) -> str:
         """获取目标模型所需的最低账号层级（兼容现有单层级调用）。"""
+        from aistudio_api.application.model_access import minimum_required_tier
+
         tiers = self.get_required_tiers(model_id)
-        if not tiers:
-            return "Free"
-        return tiers[0]
+        return minimum_required_tier(tiers) or "Free"
 
     def get_required_tiers(self, model_id: str) -> list[str]:
-        """获取目标模型所允许调用的账号层级列表（由 upstream accessModes 与 config.yaml 共同驱动）。"""
+        """Resolve allowed tiers: config rules -> accessModes -> paid/capability.
+
+        An empty rule set must never fall back to "Ultra only".  Only an
+        explicit accessModes Ultra bit (4 without 3) or a Paid model marker can
+        require Pro+/Ultra; otherwise the model has no tier restriction.
+        """
         clean_m = model_id.removeprefix("models/").lower()
-        info = self.get_cached_model_info(clean_m)
-        if info:
-            modes = info.get("accessModes")
-            if isinstance(modes, list) and 4 in modes and 3 not in modes:
-                return ["Ultra", "Ultra_20X"]
 
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,
@@ -463,10 +444,19 @@ class ModelDiscoveryService:
                 if isinstance(req, list) and req:
                     return [str(t) for t in req]
 
+        info = self.get_cached_model_info(clean_m)
         if info:
             modes = info.get("accessModes")
-            if isinstance(modes, list) and 3 in modes:
+            if isinstance(modes, list):
+                if 4 in modes and 3 not in modes:
+                    return ["Ultra", "Ultra_20X"]
+                if 3 in modes:
+                    return ["Pro", "Ultra", "Ultra_20X"]
+            if bool(info.get("paid")):
                 return ["Pro", "Ultra", "Ultra_20X"]
+
+        if _is_paid_model(clean_m):
+            return ["Pro", "Ultra", "Ultra_20X"]
         return []
 
     async def _fetch_via_page(self, page: CDPPage) -> list[dict[str, object]]:

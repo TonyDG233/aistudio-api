@@ -1,12 +1,17 @@
-"""Gemini-compatible application service handlers."""
+"""Gemini-compatible application service handlers.
+
+The request path is protocol-neutral: routing, instance acquisition, retry and
+tier admission live in :mod:`routing_pipeline`.  This module only builds Gemini
+requests/responses and translates domain errors into Gemini payloads.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
-from fastapi import HTTPException
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 
 from aistudio_api.api.response_models import (
@@ -16,28 +21,25 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.api.state import runtime_state
-from aistudio_api.application.account_orchestrator import (
-    MAX_RETRIES,
-    ensure_active_account,
-    record_rotator_event,
-    try_switch_account,
+from aistudio_api.application.chat_service import normalize_gemini_request
+from aistudio_api.application.routing_pipeline import (
+    RouteAttempt,
+    RouteContext,
+    RoutingPipelineProtocol,
 )
-from aistudio_api.application.chat_service import (
-    normalize_gemini_request,
-)
+from aistudio_api.application.testing_hooks import forced_429
 from aistudio_api.domain.errors import (
     AistudioError,
     AuthError,
     BrowserTransportError,
     RequestError,
+    RoutingError,
     SessionExpiredError,
+    SurfaceSwitchExhaustedError,
+    TierRequiredError,
     UsageLimitExceeded,
-    is_browser_session_hang_error,
-    is_transient_rpc_error,
     parse_upstream_grpc_error,
 )
-from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
@@ -91,7 +93,13 @@ def clean_upstream_error_message(raw_msg: str) -> str:
 
 
 def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
-    """Extract standard Gemini HTTP status code, message, and status string from an exception."""
+    """Extract standard Gemini HTTP status code, message, and status string."""
+    if isinstance(exc, TierRequiredError):
+        return 403, str(exc), "PERMISSION_DENIED"
+    if isinstance(exc, RoutingError):
+        status = int(getattr(exc, "status_code", 503))
+        status_text = "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
+        return status, str(exc), status_text
     if isinstance(exc, SessionExpiredError):
         return (
             401,
@@ -102,29 +110,8 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
         return 403, str(exc), "PERMISSION_DENIED"
     if isinstance(exc, UsageLimitExceeded):
         return 429, str(exc), "RESOURCE_EXHAUSTED"
-    if isinstance(exc, (ValueError, RequestValidationError)):
+    if isinstance(exc, ValueError):
         return 400, str(exc), "INVALID_ARGUMENT"
-    if isinstance(exc, HTTPException):
-        status = exc.status_code
-        detail = exc.detail
-        raw_msg = detail.get("message") if isinstance(detail, dict) else detail
-        msg = str(raw_msg) if raw_msg is not None else ""
-        clean_msg = clean_upstream_error_message(msg)
-        status_map = {
-            400: "INVALID_ARGUMENT",
-            401: "UNAUTHENTICATED",
-            403: "PERMISSION_DENIED",
-            404: "NOT_FOUND",
-            429: "RESOURCE_EXHAUSTED",
-            500: "INTERNAL",
-            502: "UNAVAILABLE",
-            503: "UNAVAILABLE",
-        }
-        return (
-            status,
-            clean_msg,
-            status_map.get(status, "INTERNAL" if status >= 500 else "UNKNOWN"),
-        )
     if isinstance(exc, RequestError):
         status = exc.status if exc.status > 0 else 500
         clean_msg = clean_upstream_error_message(str(exc))
@@ -150,221 +137,131 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
     return 500, str(exc), "INTERNAL"
 
 
-async def handle_attempt_exception(
+@dataclass
+class _StreamState:
+    final_usage: dict[str, object] | None = None
+    final_finish_reason: str = "STOP"
+    latest_response_id: str | None = None
+    buffered_thought_sig: str | None = None
+    has_yielded_data: bool = False
+
+    def reset(self) -> None:
+        self.final_usage = None
+        self.final_finish_reason = "STOP"
+        self.latest_response_id = None
+        self.buffered_thought_sig = None
+        self.has_yielded_data = False
+
+
+async def _consume_action(
+    pipeline: RoutingPipelineProtocol,
+    context: RouteContext,
+    attempt: RouteAttempt,
     exc: Exception,
     *,
-    attempt: int,
-    model_path: str,
-    normalized_model: str | None,
-    client: AIStudioClient,
-    has_yielded_data: bool = False,
-) -> bool:
-    """Handle per-attempt error classification and account switching.
+    has_yielded_data: bool,
+) -> tuple[str, RouteAttempt | None]:
+    action = await pipeline.handle_error(
+        context, attempt, exc, has_yielded_data=has_yielded_data
+    )
+    if action == "switch":
+        await pipeline.release(attempt)
+        return action, None
+    return action, attempt
 
-    Returns True if the operation should be retried, or raises HTTPException / re-raises.
-    """
-    target_model = normalized_model or model_path
-    account_svc = runtime_state.account_service
-    active_acc = account_svc.get_active_account() if account_svc else None
-    failed_id = active_acc.id if active_acc else None
 
-    if isinstance(exc, ValueError):
-        raise HTTPException(
-            400, detail={"message": str(exc), "type": "bad_request"}
-        ) from exc
-
-    if isinstance(exc, SessionExpiredError):
-        logger.warning("账号会话失效，已被重定向到登录页: %s", exc)
-        client.clear_templates()
-        if not has_yielded_data and await try_switch_account(
-            model=target_model,
-            failed_account_id=failed_id,
-            is_auth_error=True,
-            is_session_expired=True,
-        ):
-            logger.info(
-                "已切换至其他可用健康账号重试 (%d/%d)", attempt + 1, MAX_RETRIES
-            )
-            return True
-        raise HTTPException(
-            401,
-            detail={
-                "message": "All accounts encountered login redirect or expired sessions. Please import fresh cookies.",
-                "type": "auth_error",
-            },
-        ) from exc
-
-    if isinstance(exc, AuthError):
-        logger.warning("账号 403 权限拒绝: %s", exc)
-        client.clear_templates()
-        record_rotator_event("auth_error", model=target_model)
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id, is_auth_error=True
-        ):
-            logger.info("切换至可用账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
-            return True
-        raise HTTPException(
-            403, detail={"message": str(exc), "type": "auth_error"}
-        ) from exc
-
-    if isinstance(exc, UsageLimitExceeded):
-        runtime_state.record(target_model, "rate_limited")
-        record_rotator_event("rate_limited", model=target_model)
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id
-        ):
-            logger.info(
-                "429 触发限额，切换账号 (%d/%d): model=%s",
-                attempt + 1,
-                MAX_RETRIES,
-                target_model,
-            )
-            return True
-        logger.warning("全部账号在模型 %s 上均处于冷却状态", target_model)
-        raise HTTPException(
-            429,
-            detail={
-                "message": f"All accounts reached daily quota for model '{target_model}'. Quota resets at 00:00 PST.",
-                "type": "rate_limit_exceeded",
-            },
-        ) from exc
-
-    if (
-        isinstance(exc, RequestError)
-        and exc.status == 204
-        and attempt == 0
-        and not has_yielded_data
-    ):
-        logger.warning("Gemini 收到 204，清理模板缓存后重试一次")
-        client.clear_templates()
-        return True
-
-    # 针对 Google 上游偶发且完全随机的 RPC 路由 404 (Ambiguous request for service '' and method '/GenerativeService.*')：
-    # 此报错为上游端点偶发抖动，在未产生输出时当场立即重试（严禁切号以防浪费配额，其他 404 严格按原样报错抛出）
-    if (
-        is_transient_rpc_error(exc)
-        and not has_yielded_data
-        and attempt < MAX_RETRIES - 1
-    ):
-        logger.warning(
-            "检测到 Google 上游偶发 404 (Ambiguous RPC method)，当场立即重试 (%d/%d): %s",
-            attempt + 1,
-            MAX_RETRIES,
-            clean_upstream_error_message(str(exc)),
-        )
-        client.clear_templates()
-        return True
-
-    if is_browser_session_hang_error(exc):
-        logger.warning(
-            "模板或 BotGuard 捕获超时 (%d/%d): %s，切换账号重试",
-            attempt + 1,
-            MAX_RETRIES,
-            exc,
-        )
-        client.clear_templates()
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id, is_auth_error=False
-        ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
-            return True
-        if (
-            attempt < 2
-            and not has_yielded_data
-            and client._session is not None
-            and client._session._in_flight <= 1
-        ):
-            await client._session._close_internal()
-            return True
-        if isinstance(exc, BrowserTransportError):
-            runtime_state.record(target_model, "errors")
-            record_rotator_event("error", model=target_model)
-            logger.warning("Gemini 浏览器传输层中断 (502): %s", exc)
-            raise HTTPException(
-                502, detail={"message": str(exc), "type": "upstream_error"}
-            ) from exc
-    if isinstance(exc, RequestError):
-        clean_msg = clean_upstream_error_message(str(exc))
-        status_code = exc.status if exc.status > 0 else 500
-        error_type = (
-            "bad_request"
-            if status_code == 400
-            else "not_found"
-            if status_code == 404
-            else "upstream_error"
-        )
-        logger.warning("Gemini 上游请求错误 (%d): %s", status_code, clean_msg)
-        raise HTTPException(
-            status_code, detail={"message": clean_msg, "type": error_type}
-        ) from exc
-
-    if isinstance(exc, AistudioError):
-        runtime_state.record(target_model, "errors")
-        record_rotator_event("error", model=target_model)
-        logger.warning("Gemini 服务端异常: %s", exc)
-        raise HTTPException(
-            500, detail={"message": str(exc), "type": "server_error"}
-        ) from exc
-
-    runtime_state.record(target_model, "errors")
-    record_rotator_event("error", model=target_model)
-    logger.error("Gemini 未知严重异常: %s", exc)
-    logger.debug("Gemini 异常堆栈详情:", exc_info=True)
-    raise HTTPException(
-        500, detail={"message": str(exc), "type": "server_error"}
-    ) from exc
+def _normalized_or_400(req: GeminiGenerateContentRequest, model_path: str):
+    try:
+        return normalize_gemini_request(req, model_path)
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
 
 
 async def handle_gemini_generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
-    client: AIStudioClient,
     *,
     stream: bool,
+    pipeline: RoutingPipelineProtocol,
 ):
+    context = await pipeline.begin(model_path=model_path)
     if stream:
         return _build_gemini_streaming_response(
-            client=client, req=req, model_path=model_path
+            pipeline=pipeline, context=context, req=req
         )
+    return await _generate_non_streaming(
+        pipeline=pipeline, context=context, req=req
+    )
 
+
+async def _generate_non_streaming(
+    *,
+    pipeline: RoutingPipelineProtocol,
+    context: RouteContext,
+    req: GeminiGenerateContentRequest,
+) -> GeminiGenerateContentResponse:
+    attempt: RouteAttempt | None = None
     last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
-        await ensure_active_account(attempt, model=model_path)
-        normalized = None
-        try:
-            normalized = normalize_gemini_request(req, model_path)
-            logger.info(
-                "Gemini 生成请求: model=%s, 对话轮数=%s, 流式=否, 尝试第 %d 次",
-                normalized.model,
-                len(req.contents),
-                attempt + 1,
-            )
-            output = await client.generate_content(
+    try:
+        while True:
+            if attempt is None:
+                attempt = await pipeline.acquire(context)
+                if attempt is None:
+                    break
+            normalized = _normalized_or_400(req, context.route.model)
+            if forced_429(
+                account_id=attempt.account_id,
                 model=normalized.model,
-                capture_prompt=normalized.capture_prompt,
-                capture_images=normalized.capture_images,
-                contents=normalized.contents,
-                system_instruction_content=normalized.system_instruction,
-                tools=normalized.tools,
-                tool_config=normalized.tool_config,
-                safety_settings=normalized.safety_settings,
-                temperature=normalized.temperature,
-                top_p=normalized.top_p,
-                top_k=normalized.top_k,
-                max_tokens=normalized.max_tokens,
-                generation_config_overrides=normalized.generation_config_overrides,
-                sanitize_plain_text=False,
-            )
-
+                surface=context.route.surface,
+            ):
+                exc = UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
+                last_error = exc
+                action, attempt = await _consume_action(
+                    pipeline, context, attempt, exc, has_yielded_data=False
+                )
+                if action == "retry_same":
+                    continue
+                if action == "switch":
+                    continue
+                raise exc
+            try:
+                output = await attempt.client.generate_content(
+                    model=normalized.model,
+                    capture_prompt=normalized.capture_prompt,
+                    capture_images=normalized.capture_images,
+                    contents=normalized.contents,
+                    system_instruction_content=normalized.system_instruction,
+                    tools=normalized.tools,
+                    tool_config=normalized.tool_config,
+                    safety_settings=normalized.safety_settings,
+                    temperature=normalized.temperature,
+                    top_p=normalized.top_p,
+                    top_k=normalized.top_k,
+                    max_tokens=normalized.max_tokens,
+                    generation_config_overrides=normalized.generation_config_overrides,
+                    sanitize_plain_text=False,
+                    force_refresh_capture=attempt.same_retries > 0,
+                )
+            except Exception as exc:
+                last_error = exc
+                action, attempt = await _consume_action(
+                    pipeline, context, attempt, exc, has_yielded_data=False
+                )
+                if action == "retry_same":
+                    continue
+                if action == "switch":
+                    continue
+                raise
             final_fr = to_gemini_finish_reason(
                 output.candidates[0].finish_reason if output.candidates else None
             )
-            record_rotator_event("success", model=normalized.model, usage=output.usage)
-            runtime_state.record(
+            pipeline.record_success(
+                context, attempt, usage=output.usage, finish_reason=final_fr
+            )
+            logger.info(
+                "Gemini 生成完成: model=%s, instance=%s",
                 normalized.model,
-                "success",
-                usage=output.usage,
-                finish_reason=final_fr,
+                attempt.instance_id,
             )
             return GeminiGenerateContentResponse(
                 candidates=[
@@ -391,25 +288,17 @@ async def handle_gemini_generate_content(
                 modelVersion=normalized.model,
                 responseId=output.response_id or None,
             )
-        except Exception as exc:
-            last_error = exc
-            if await handle_attempt_exception(
-                exc,
-                attempt=attempt,
-                model_path=model_path,
-                normalized_model=normalized.model if normalized else None,
-                client=client,
-            ):
-                continue
-            raise
+    finally:
+        if attempt is not None:
+            await pipeline.release(attempt)
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{model_path}'. Quota resets at 00:00 PST.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    if isinstance(last_error, UsageLimitExceeded):
+        raise SurfaceSwitchExhaustedError(
+            surface=context.route.surface
+        ) from last_error
+    if last_error is not None:
+        raise last_error
+    raise SurfaceSwitchExhaustedError(surface=context.route.surface)
 
 
 def format_sse_event(
@@ -508,52 +397,55 @@ def format_sse_usage(
 def format_sse_error(exc: Exception) -> str:
     """Format exception into standard Gemini SSE error chunk."""
     code, msg, status_str = classify_gemini_error_payload(exc)
+    error: dict[str, object] = {
+        "code": code,
+        "message": msg,
+        "status": status_str,
+    }
+    if isinstance(exc, (TierRequiredError, RoutingError)):
+        error.update(exc.as_fields())
     return (
         "data: "
-        + json.dumps(
-            {
-                "error": {
-                    "code": code,
-                    "message": msg,
-                    "status": status_str,
-                }
-            },
-            ensure_ascii=False,
-        )
+        + json.dumps({"error": error}, ensure_ascii=False)
         + "\n\n"
     )
 
 
 def _build_gemini_streaming_response(
     *,
-    client: AIStudioClient,
+    pipeline: RoutingPipelineProtocol,
+    context: RouteContext,
     req: GeminiGenerateContentRequest,
-    model_path: str,
 ) -> StreamingResponse:
-    async def stream_response():
+    async def stream_response() -> AsyncGenerator[str, None]:
+        attempt: RouteAttempt | None = None
+        last_error: Exception | None = None
         normalized = None
+        state = _StreamState()
+        stream_completed = False
         try:
-            logger.info(
-                "Gemini 流式请求: model=%s, 对话轮数=%s",
-                model_path,
-                len(req.contents),
-            )
-            final_usage: dict[str, object] | None = None
-            final_finish_reason: str = "STOP"
-            latest_response_id: str | None = None
-            buffered_thought_sig: str | None = None
-            stream_completed = False
-            last_stream_error: Exception | None = None
-            for stream_attempt in range(MAX_RETRIES):
-                has_yielded_data = False
-                final_usage = None
-                final_finish_reason = "STOP"
-                latest_response_id = None
-                buffered_thought_sig = None
-                await ensure_active_account(stream_attempt, model=model_path)
-                normalized = normalize_gemini_request(req, model_path)
+            while True:
+                if attempt is None:
+                    attempt = await pipeline.acquire(context)
+                    if attempt is None:
+                        break
+                normalized = _normalized_or_400(req, context.route.model)
+                state.reset()
+                if forced_429(
+                    account_id=attempt.account_id,
+                    model=normalized.model,
+                    surface=context.route.surface,
+                ):
+                    exc = UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
+                    last_error = exc
+                    action, attempt = await _consume_action(
+                        pipeline, context, attempt, exc, has_yielded_data=False
+                    )
+                    if action in ("retry_same", "switch"):
+                        continue
+                    raise exc
                 try:
-                    async for event_type, text in client.stream_generate_content(
+                    async for event_type, text in attempt.client.stream_generate_content(
                         model=normalized.model,
                         capture_prompt=normalized.capture_prompt,
                         capture_images=normalized.capture_images,
@@ -568,69 +460,90 @@ def _build_gemini_streaming_response(
                         max_tokens=normalized.max_tokens,
                         generation_config_overrides=normalized.generation_config_overrides,
                         sanitize_plain_text=False,
-                        force_refresh_capture=stream_attempt > 0,
+                        force_refresh_capture=attempt.same_retries > 0,
                     ):
                         if event_type == "usage":
-                            final_usage = text if isinstance(text, dict) else None
+                            state.final_usage = text if isinstance(text, dict) else None
                         elif event_type == "finish_reason":
-                            final_finish_reason = (
+                            state.final_finish_reason = (
                                 to_gemini_finish_reason(text)
                                 if isinstance(text, int)
                                 else str(text)
                             )
                         elif event_type == "response_id":
-                            latest_response_id = str(text)
+                            state.latest_response_id = str(text)
                         elif event_type == "thought_signature":
-                            buffered_thought_sig = str(text)
+                            state.buffered_thought_sig = str(text)
                         else:
                             chunk = format_sse_event(
                                 event_type,
                                 text,
                                 model_version=normalized.model,
-                                response_id=latest_response_id,
-                                thought_signature=buffered_thought_sig,
+                                response_id=state.latest_response_id,
+                                thought_signature=state.buffered_thought_sig,
                             )
-                            buffered_thought_sig = None
+                            state.buffered_thought_sig = None
                             if chunk:
-                                has_yielded_data = True
+                                state.has_yielded_data = True
                                 yield chunk
-                    stream_completed = True
-                    break
                 except Exception as exc:
-                    last_stream_error = exc
-                    if await handle_attempt_exception(
+                    last_error = exc
+                    action, attempt = await _consume_action(
+                        pipeline,
+                        context,
+                        attempt,
                         exc,
-                        attempt=stream_attempt,
-                        model_path=model_path,
-                        normalized_model=normalized.model if normalized else None,
-                        client=client,
-                        has_yielded_data=has_yielded_data,
-                    ):
+                        has_yielded_data=state.has_yielded_data,
+                    )
+                    if action == "retry_same":
+                        continue
+                    if action == "switch":
                         continue
                     raise
+                stream_completed = True
+                break
 
-            if not stream_completed and last_stream_error is not None:
-                raise last_stream_error
-            target_model = normalized.model if normalized else model_path
-            record_rotator_event("success", model=target_model, usage=final_usage)
-            if normalized is not None:
-                runtime_state.record(
-                    normalized.model,
-                    "success",
-                    usage=final_usage,
-                    finish_reason=final_finish_reason,
+            if not stream_completed:
+                if isinstance(last_error, UsageLimitExceeded):
+                    raise SurfaceSwitchExhaustedError(
+                        surface=context.route.surface
+                    ) from last_error
+                if last_error is not None:
+                    raise last_error
+                raise SurfaceSwitchExhaustedError(surface=context.route.surface)
+            target_model = normalized.model if normalized else context.route.model
+            if attempt is not None:
+                pipeline.record_success(
+                    context,
+                    attempt,
+                    usage=state.final_usage,
+                    finish_reason=state.final_finish_reason,
                 )
             yield format_sse_usage(
-                final_usage,
-                finish_reason=final_finish_reason,
+                state.final_usage,
+                finish_reason=state.final_finish_reason,
                 model_version=target_model,
-                response_id=latest_response_id,
+                response_id=state.latest_response_id,
             )
         except Exception as exc:
             yield format_sse_error(exc)
+        finally:
+            if attempt is not None:
+                await pipeline.release(attempt)
 
     return StreamingResponse(
         stream_response(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+__all__ = [
+    "classify_gemini_error_payload",
+    "clean_upstream_error_message",
+    "format_sse_error",
+    "format_sse_event",
+    "format_sse_usage",
+    "handle_gemini_generate_content",
+    "to_gemini_finish_reason",
+]

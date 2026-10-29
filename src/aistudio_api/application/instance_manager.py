@@ -228,13 +228,17 @@ class InstanceManager:
             instances=instances,
         )
 
-    def eligible_instances(self, *, paid: bool) -> tuple[Instance, ...]:
+    def eligible_instances(
+        self, *, paid: bool, surface: str | None = None
+    ) -> tuple[Instance, ...]:
         """Candidates for a model lane; sleeping/unstarted instances included."""
+        self._sync_records()
         lane = "paid" if paid else "free"
         return tuple(
             self._view(record)
             for record in sorted(self._records.values(), key=lambda item: item.number)
             if record.lane == lane
+            and (surface is None or record.surface == surface)
             and record.state
             in (
                 InstanceState.UNSTARTED,
@@ -243,6 +247,24 @@ class InstanceManager:
                 InstanceState.ACTIVE,
             )
         )
+
+    def lane_instances(self, *, paid: bool) -> tuple[Instance, ...]:
+        """All records in one lane, including invalid/retiring ones."""
+        self._sync_records()
+        lane = "paid" if paid else "free"
+        return tuple(
+            self._view(record)
+            for record in sorted(self._records.values(), key=lambda item: item.number)
+            if record.lane == lane
+        )
+
+    @property
+    def configured_surfaces(self) -> frozenset[str]:
+        return frozenset(record.surface for record in self._records.values())
+
+    @property
+    def current_instance_id(self) -> str | None:
+        return self._current_id
 
     async def create(self, account_id: str, surface: str | None = None) -> Instance:
         account = self._validate_account(account_id)
@@ -867,7 +889,7 @@ class InstanceManager:
 
     @staticmethod
     def _normalize_surface(surface: str | None) -> str:
-        if surface in (None, "", "chat", "pg"):
+        if surface in (None, "", "chat"):
             return "chat"
         if surface == "build":
             return "build"
@@ -917,6 +939,8 @@ class InstanceManager:
             min_tier=record.min_tier,
             in_flight=in_flight,
             latest=record.id == self._latest_id,
+            tier=slot.tier if slot is not None else "",
+            last_used=slot.last_used if slot is not None else 0.0,
         )
 
     def _select_current_for_active_account(self, active: AccountMeta | None) -> None:

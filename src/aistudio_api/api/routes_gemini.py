@@ -6,10 +6,10 @@ from fastapi import APIRouter, Depends
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
-from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.infrastructure.utils.logger import get_logger
 
-from .dependencies import get_client
+from .dependencies import get_routing_pipeline
 from .schemas import GeminiGenerateContentRequest
 
 logger = get_logger("routes.gemini")
@@ -23,17 +23,21 @@ router = APIRouter()
 async def generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
-    client: AIStudioClient = Depends(get_client),
+    pipeline: RoutingPipeline = Depends(get_routing_pipeline),
 ):
     logger.info("收到 Gemini generateContent 请求: model=%s", model_path)
-    return await handle_gemini_generate_content(model_path, req, client, stream=False)
+    return await handle_gemini_generate_content(
+        model_path, req, stream=False, pipeline=pipeline
+    )
 
 
 @router.post("/v1beta/{model_path:path}:streamGenerateContent")
 async def stream_generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
-    client: AIStudioClient = Depends(get_client),
+    pipeline: RoutingPipeline = Depends(get_routing_pipeline),
 ):
     logger.info("收到 Gemini streamGenerateContent 流式请求: model=%s", model_path)
-    return await handle_gemini_generate_content(model_path, req, client, stream=True)
+    return await handle_gemini_generate_content(
+        model_path, req, stream=True, pipeline=pipeline
+    )

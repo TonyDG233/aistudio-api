@@ -15,8 +15,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.api.error_mapping import error_payload
 from aistudio_api.application.instance_manager import InstanceError
+from aistudio_api.domain.errors import AistudioError, RoutingError, TierRequiredError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
@@ -77,6 +78,7 @@ async def _shutdown_runtime(
 
     state.keepalive = None
     state.instance_manager = None
+    state.routing_pipeline = None
     state.client = None
     state.account_service = None
     state.account_refresher = None
@@ -197,9 +199,18 @@ async def lifespan(_app: FastAPI):
         max_contexts_provider=get_configured_max_contexts,
         on_slot_retired=lambda _realm_id: client.clear_templates(),
     )
-    runtime_state.instance_manager = InstanceManager(
+    instance_manager = InstanceManager(
         instance_pool,
         account_store,
+    )
+    runtime_state.instance_manager = instance_manager
+
+    from aistudio_api.application.routing_pipeline import RoutingPipeline
+
+    runtime_state.routing_pipeline = RoutingPipeline(
+        instance_manager=instance_manager,
+        account_store=account_store,
+        rotator=rotator,
     )
     runtime_state.keepalive = None
 
@@ -242,9 +253,40 @@ app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 
 
+@app.exception_handler(TierRequiredError)
+@app.exception_handler(RoutingError)
+async def routing_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """D-04/D-06: tier 403 and routing 503 are rendered by the protocol adapter."""
+    status, body = error_payload(exc, "gemini")
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(AistudioError)
+async def aistudio_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    status, body = error_payload(exc, "gemini")
+    return JSONResponse(status_code=status, content=body)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    code, msg, status_str = classify_gemini_error_payload(exc)
+    detail = exc.detail
+    if isinstance(detail, dict):
+        msg = str(detail.get("message") or detail)
+    else:
+        msg = str(detail)
+    status_map = {
+        400: "INVALID_ARGUMENT",
+        401: "UNAUTHENTICATED",
+        403: "PERMISSION_DENIED",
+        404: "NOT_FOUND",
+        409: "ABORTED",
+        429: "RESOURCE_EXHAUSTED",
+        503: "UNAVAILABLE",
+    }
+    code = exc.status_code
+    status_str = status_map.get(
+        code, "INTERNAL" if code >= 500 else "UNKNOWN"
+    )
     return JSONResponse(
         status_code=code,
         content={

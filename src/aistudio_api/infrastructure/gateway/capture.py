@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
-from aistudio_api.infrastructure.gateway.session import BrowserSession
+from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.gateway.wire_codec import modify_body
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -26,7 +26,7 @@ class CapturedRequest:
 class RequestCaptureService:
     """Single-page hook flow modeled after camoufox-api."""
 
-    def __init__(self, session: BrowserSession):
+    def __init__(self, session: RequestSession):
         self._session = session
         self._templates: dict[str, CapturedRequest] = {}
         self._active_ctx_id: int | None = None

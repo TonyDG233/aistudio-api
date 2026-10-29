@@ -73,17 +73,24 @@ def stats_response() -> StatsResponse:
         breakdown: list[AccountBreakdownItem] = []
 
         if rotator:
-            from aistudio_api.application.account_rotator import get_pacific_date_key
+            from aistudio_api.application.account_rotator import (
+                get_pacific_date_key,
+                split_quota_key,
+            )
 
             current_la = get_pacific_date_key()
             for acc in accounts_list:
                 st = rotator.get_account_stats(acc.id)
                 if st:
                     st._check_date_reset(current_la)
-                    if clean_m in st.daily_models:
-                        m_daily = st.daily_models[clean_m]
-                        quota = resolve_tier_quota(acc.tier, clean_m)
-                        used_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
+                    for quota_key_name, m_daily in st.daily_models.items():
+                        surface, daily_model = split_quota_key(quota_key_name)
+                        if daily_model != clean_m:
+                            continue
+                        quota = resolve_tier_quota(acc.tier, daily_model)
+                        used_pct = round(
+                            (m_daily.requests / max(1, quota)) * 100, 1
+                        )
                         cd_rem = (
                             max(0, int(m_daily.cooldown_until - time.time()))
                             if m_daily.cooldown_until > time.time()
@@ -97,6 +104,7 @@ def stats_response() -> StatsResponse:
                                 email=acc.email,
                                 tier=acc.tier,
                                 group=acc.group,
+                                surface=surface,
                                 enabled=acc.enabled,
                                 today_requests=m_daily.requests,
                                 today_success=m_daily.success,
@@ -130,7 +138,11 @@ def stats_response() -> StatsResponse:
             paid=is_paid_model(name),
             account_breakdown=breakdown,
         )
-    return StatsResponse(models=models, totals=totals)
+    return StatsResponse(
+        models=models,
+        totals=totals,
+        quota_scope=rotator.quota_scope if rotator else "account",
+    )
 
 
 @public_router.get("/health", response_model=HealthResponse)
@@ -168,6 +180,7 @@ async def get_rotation_status(
     return {
         "enabled": True,
         "mode": "sticky",
+        "quota_scope": rotator.quota_scope,
         "accounts": rotator.get_all_stats(),
     }
 

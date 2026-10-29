@@ -88,6 +88,10 @@ def is_paid_model(model_path: object) -> bool:
 
 def is_chat_only_model(model_path: object) -> bool:
     """Paid models may only run on the ``chat`` surface."""
+    # [ROUTING-RULE: PAID_CHAT_ONLY]
+    # 因当前 Build 渠道暂无法正常使用 Paid 模型（非正价 Pro/Ultra 不可用
+    # 且正价额度极少），此处硬编码限制 Paid 模型仅允许走 chat 渠道。
+    # 若未来上游放开或路由策略调整，在此处修改解绑。
     return is_paid_model(model_path)
 
 
@@ -122,6 +126,39 @@ def tier_satisfies_min(account_tier: object, min_tier: object) -> bool:
     return tier_rank(account_tier) >= tier_rank(min_tier)
 
 
+def minimum_required_tier(required_tiers: Iterable[object]) -> str | None:
+    """Return the canonical label of the lowest tier allowed by a requirement."""
+    labels = [
+        str(tier).strip()
+        for tier in required_tiers
+        if str(tier or "").strip()
+    ]
+    if not labels:
+        return None
+    return min(labels, key=tier_rank)
+
+
+def tier_satisfies_required(account_tier: object, required_tiers: Iterable[object]) -> bool:
+    """True when the account tier reaches at least one allowed requirement tier.
+
+    ``paid_model_rules`` / ``accessModes`` list the allowed tiers; the lowest
+    entry is the minimum capability (e.g. Pro allows Pro/Ultra/Ultra_20X but not
+    Plus). An empty requirement means no tier restriction.
+    """
+    minimum = minimum_required_tier(required_tiers)
+    if minimum is None:
+        return True
+    return tier_rank(account_tier) >= tier_rank(minimum)
+
+
+def best_tier(tiers: Iterable[object]) -> str:
+    """Return the highest-ranked tier label, defaulting to Free."""
+    labels = [str(tier).strip() for tier in tiers if str(tier or "").strip()]
+    if not labels:
+        return "Free"
+    return max(labels, key=tier_rank)
+
+
 def surface_capability(
     model_path: object,
     enabled_surfaces: tuple[str, ...] | list[str],
@@ -138,10 +175,12 @@ def surface_capability(
 __all__ = [
     "PAID_TIERS",
     "account_is_paid",
+    "best_tier",
     "clear_paid_models",
     "instance_lane_for_tier",
     "is_chat_only_model",
     "is_paid_model",
+    "minimum_required_tier",
     "model_account_requirement",
     "model_requires_paid_account",
     "normalize_model_key",
@@ -149,4 +188,5 @@ __all__ = [
     "surface_capability",
     "tier_rank",
     "tier_satisfies_min",
+    "tier_satisfies_required",
 ]

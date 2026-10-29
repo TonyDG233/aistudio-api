@@ -27,6 +27,8 @@ class Instance:
     min_tier: str
     in_flight: int = 0
     latest: bool = False
+    tier: str = ""
+    last_used: float = 0.0
 
 
 @dataclass(frozen=True)
