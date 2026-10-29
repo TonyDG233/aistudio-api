@@ -4,6 +4,8 @@ import pytest
 from aistudio_api.api.app import app
 from aistudio_api.config import settings
 
+_AUTH_HEADERS = {"x-goog-api-key": "test-key"}
+
 
 def _build_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -13,9 +15,9 @@ def _build_client() -> httpx.AsyncClient:
 
 @pytest.mark.asyncio
 async def test_list_models_returns_gemini_format(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models")
+        response = await client.get("/v1beta/models", headers=_AUTH_HEADERS)
         assert response.status_code == 200
         data = response.json()
         assert "models" in data
@@ -31,9 +33,11 @@ async def test_list_models_returns_gemini_format(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_single_model_returns_model_object(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models/gemini-3.7-flash")
+        response = await client.get(
+            "/v1beta/models/gemini-3.7-flash", headers=_AUTH_HEADERS
+        )
         assert response.status_code == 200
         data = response.json()
         assert data["name"] == "models/gemini-3.7-flash"
@@ -43,9 +47,9 @@ async def test_get_single_model_returns_model_object(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_v1_models_endpoint_is_removed(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1/models")
+        response = await client.get("/v1/models", headers=_AUTH_HEADERS)
         assert response.status_code == 404
 
 
@@ -65,9 +69,11 @@ async def test_models_endpoint_accepts_query_param_key(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_single_model_not_found_returns_404(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models/non-existent-unknown-model-12345")
+        response = await client.get(
+            "/v1beta/models/non-existent-unknown-model-12345", headers=_AUTH_HEADERS
+        )
         assert response.status_code == 404
         data = response.json()
         assert "error" in data

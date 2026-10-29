@@ -76,6 +76,96 @@ async def test_update_config_yaml_validation():
 
 
 @pytest.mark.asyncio
+async def test_update_config_yaml_rejects_invalid_rotator_type():
+    from aistudio_api.infrastructure.gateway.model_defaults import _resolve_config_path
+
+    config_path = _resolve_config_path(None)
+    original = config_path.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        resp = await client.put("/config/yaml", json={"yaml_content": "rotator: []\n"})
+
+    assert resp.status_code == 400
+    assert "rotator 必须为字典" in resp.json()["error"]["message"]
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_update_config_yaml_rejects_non_dict_logging_block():
+    from aistudio_api.infrastructure.gateway.model_defaults import _resolve_config_path
+
+    config_path = _resolve_config_path(None)
+    original = config_path.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        resp = await client.put("/config/yaml", json={"yaml_content": "logging: []\n"})
+
+    assert resp.status_code == 400
+    assert "logging 必须为字典" in resp.json()["error"]["message"]
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_update_config_yaml_applies_normalized_logging(monkeypatch):
+    import aistudio_api.api.routes_system as routes_system
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        _resolve_config_path,
+        invalidate_config_cache,
+    )
+
+    config_path = _resolve_config_path(None)
+    original = config_path.read_text(encoding="utf-8")
+    applied_levels: list[str] = []
+    monkeypatch.setattr(
+        routes_system, "set_log_level", lambda level: applied_levels.append(level)
+    )
+
+    try:
+        async with _client() as client:
+            resp = await client.put(
+                "/config/yaml",
+                json={"yaml_content": "logging:\n  level: verbose\n"},
+            )
+
+        assert resp.status_code == 200
+        assert applied_levels == ["INFO"]
+    finally:
+        config_path.write_text(original, encoding="utf-8")
+        invalidate_config_cache()
+
+
+@pytest.mark.asyncio
+async def test_create_api_key_write_oserror_returns_500(monkeypatch):
+    import aistudio_api.api.routes_system as routes_system
+
+    def raise_os_error(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(routes_system, "write_config_text", raise_os_error)
+
+    async with _client() as client:
+        resp = await client.post("/api-keys", json={"name": "test", "key": "k-1"})
+
+    assert resp.status_code == 500
+    assert "写入配置文件失败" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_update_config_yaml_success_writes_atomically():
+    from aistudio_api.infrastructure.gateway.model_defaults import _resolve_config_path
+
+    config_path = _resolve_config_path(None)
+    original = config_path.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        resp = await client.put("/config/yaml", json={"yaml_content": original})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
 async def test_rotation_status_and_clear_cooldown():
     from unittest.mock import MagicMock
 

@@ -11,6 +11,8 @@ build/
 
 /data/
 /tmp/
+# 本地运行时配置：默认模板为 defaults/config.yaml，根 config.yaml 不入库
+/config.yaml
 stream_response.txt
 dumps/
 .vscode/

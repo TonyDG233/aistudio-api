@@ -412,7 +412,7 @@ class AccountStats:
             all_keys: set[str] = set()
             for source in (old_model_reqs, old_model_cds, old_model_rates, old_model_drips):
                 if isinstance(source, dict):
-                    all_keys.update(str(k) for k in source.keys())
+                    all_keys.update(str(k) for k in source)
             for m_k in all_keys:
                 daily_models[str(m_k)] = AccountModelDailyStats(
                     requests=_as_int(old_model_reqs.get(m_k)) if isinstance(old_model_reqs, dict) else 0,
@@ -443,7 +443,7 @@ class AccountRotator:
 
     核心流程：
     1. 候选过滤（使能开关、登录态、分组、订阅要求、429 冷却）；
-    2. 基于配额消耗比与订阅保护的打分择优；
+    2. 当前健康账号优先（sticky），否则按最少使用与 LRU 选择；
     3. 业务分组与方案预设。
     """
 
@@ -685,75 +685,17 @@ class AccountRotator:
 
         return candidates
 
-    def _score_candidate(
+    def _least_used_key(
         self,
-        account: AccountMeta,
-        stats: AccountStats,
+        item: tuple[AccountMeta, AccountStats],
         model: str | None,
-        current_account_id: str | None,
-    ) -> float:
-        """阶段二：多维软权重评分引擎（配额消耗比、高低配节约、黏性奖励、空闲衰减）。"""
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            resolve_tier_quota,
-        )
-
-        quota = resolve_tier_quota(account.tier, model)
-        m_stats = stats.get_model_daily(model)
-        req_today = m_stats.requests
-
-        # 1. 配额消耗比 (0.0 ~ 1.0+，超额不禁用，仅增加成本分)
-        exhaustion_rate = req_today / max(1, quota)
-
-        # 2. 调度配置与加权读取 (严格由 config.yaml 驱动，禁止硬编码与 fallback)
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_configured_rotator_settings,
-        )
-
-        rot_cfg = get_configured_rotator_settings()
-        raw_weights = rot_cfg["tier_weights"]
-        if not isinstance(raw_weights, dict):
-            raise RuntimeError("rotator 配置缺少 tier_weights 配置块")
-        tier_clean = (account.tier or "Free").strip()
-        matched_weight = None
-        for k, v in raw_weights.items():
-            if str(k).lower() == tier_clean.lower():
-                matched_weight = float(str(v))
-                break
-        if matched_weight is None:
-            matched_weight = float(str(raw_weights.get("Free", 0.0)))
-        tier_weight = matched_weight
-
-        strategy = str(rot_cfg.get("strategy") or "sticky").strip().lower()
-        bonus_val = float(str(rot_cfg["stickiness_bonus"]))
-        stick_threshold = float(str(rot_cfg["stickiness_threshold"]))
-        drip_val = float(str(rot_cfg["drip_penalty"]))
-
-        # 3. 黏性奖励：若启用 sticky 策略且当前账号为活跃账号且未超设定配额阈值，给予减分奖励
-        stickiness_bonus = (
-            -bonus_val
-            if (
-                strategy == "sticky"
-                and account.id == current_account_id
-                and exhaustion_rate < stick_threshold
-            )
-            else 0.0
-        )
-        drip_penalty = drip_val if m_stats.drip_mode else 0.0
-
-        # 5. 错误与空闲时间
-        now = time.time()
-        idle_minutes = max(0.0, (now - stats.last_used) / 60.0)
-
-        # 综合成本分：得分越低越优先选派
+    ) -> tuple[int, int, float]:
+        """最少总请求数 → 该模型今日请求数 → last_used 最久（LRU/FIFO）。"""
+        _account, stats = item
         return (
-            (exhaustion_rate * 1000.0)
-            + (tier_weight * 150.0)
-            + (req_today * 5.0)
-            + (stats.auth_errors * 200.0)
-            + (stats.total_errors * 20.0)
-            + drip_penalty
-            + stickiness_bonus
-            - min(100.0, idle_minutes * 0.5)
+            stats.total_requests,
+            stats.get_model_daily(model).requests,
+            stats.last_used,
         )
 
     async def get_next_account(
@@ -766,7 +708,7 @@ class AccountRotator:
         *,
         is_session_expired: bool = False,
     ) -> AccountMeta | None:
-        """通过硬性过滤与软配额打分挑选最佳就绪账号。"""
+        """通过硬性过滤与最少使用/黏性规则挑选最佳就绪账号。"""
         async with self._lock:
             candidates = self._get_eligible_candidates(
                 model=model,
@@ -800,12 +742,16 @@ class AccountRotator:
                             return a
                 return candidates[0][0]
 
-            # 多维软打分选优
+            # 优先保持当前健康账号（sticky）
+            if current_account_id:
+                for account, _stats in valid_candidates:
+                    if account.id == current_account_id:
+                        return account
+
+            # 当前账号不可用/失败账号时，按最少使用与 LRU 选择
             best_account, _ = min(
                 valid_candidates,
-                key=lambda item: self._score_candidate(
-                    item[0], item[1], model, current_account_id
-                ),
+                key=lambda item: self._least_used_key(item, model),
             )
             if current_account_id and best_account.id != current_account_id:
                 logger.info(

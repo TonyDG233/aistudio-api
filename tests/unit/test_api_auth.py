@@ -1,3 +1,7 @@
+"""API Key 与 Web 管理页鉴权分离（D-14）。"""
+
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import httpx
@@ -8,7 +12,7 @@ from aistudio_api.api.dependencies import require_api_key, require_web_auth
 from aistudio_api.config import settings
 
 
-def _build_client() -> httpx.AsyncClient:
+def _build_api_client() -> httpx.AsyncClient:
     app = FastAPI()
 
     @app.get("/protected", dependencies=[Depends(require_api_key)])
@@ -20,108 +24,131 @@ def _build_client() -> httpx.AsyncClient:
     )
 
 
+def _mock_request(*, headers: dict[str, str] | None = None) -> MagicMock:
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.headers = headers or {}
+    request.query_params = {}
+    request.client = MagicMock()
+    request.client.host = "127.0.0.1"
+    return request
+
+
 @pytest.mark.asyncio
-async def test_auth_is_disabled_when_no_api_key_is_configured(monkeypatch):
+async def test_empty_api_keys_and_anonymous_disabled_returns_401(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset())
-    async with _build_client() as client:
+    async with _build_api_client() as client:
         response = await client.get("/protected")
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
+
+    assert response.status_code == 401
+    assert "未配置 API Key" in response.json()["detail"]["message"]
+    assert response.headers["www-authenticate"] == "Bearer"
 
 
 @pytest.mark.asyncio
-async def test_bearer_token_is_accepted(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
-    async with _build_client() as client:
-        response = await client.get(
-            "/protected", headers={"Authorization": "Bearer secret-token"}
-        )
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
+async def test_anonymous_switch_allows_request_without_key(monkeypatch):
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults.get_configured_security_settings",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+
+    async with _build_api_client() as client:
+        response = await client.get("/protected")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
 
 
 @pytest.mark.asyncio
-async def test_x_api_key_is_accepted(monkeypatch):
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"headers": {"Authorization": "Bearer secret-token"}},
+        {"headers": {"X-API-Key": "secret-token"}},
+        {"headers": {"x-goog-api-key": "secret-token"}},
+    ],
+)
+async def test_valid_api_key_is_accepted(monkeypatch, kwargs):
     monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
-    async with _build_client() as client:
-        response = await client.get("/protected", headers={"X-API-Key": "secret-token"})
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
+    async with _build_api_client() as client:
+        response = await client.get("/protected", **kwargs)
 
-
-@pytest.mark.asyncio
-async def test_x_goog_api_key_is_accepted(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
-    async with _build_client() as client:
-        response = await client.get(
-            "/protected", headers={"x-goog-api-key": "secret-token"}
-        )
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
 
 
 @pytest.mark.asyncio
 async def test_query_param_key_is_accepted(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
-    async with _build_client() as client:
+    async with _build_api_client() as client:
         response = await client.get("/protected?key=secret-token")
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
+
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_missing_or_invalid_api_key_returns_401(monkeypatch):
+async def test_missing_api_key_returns_401(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
-    async with _build_client() as client:
+    async with _build_api_client() as client:
         response = await client.get("/protected")
-        assert response.status_code == 401
-        assert response.headers["www-authenticate"] == "Bearer"
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["type"] == "authentication_error"
 
 
-def test_dependencies_timing_safe_auth(monkeypatch):
-    """Verify constant-time comparison and empty password guard."""
+@pytest.mark.asyncio
+async def test_invalid_api_key_returns_401(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
+    async with _build_api_client() as client:
+        response = await client.get("/protected?key=wrong-token")
+
+    assert response.status_code == 401
+
+
+def test_web_password_is_not_accepted_as_api_key(monkeypatch):
     monkeypatch.setattr(settings, "web_password", "super_secret_admin_pass")
     monkeypatch.setattr(settings, "api_keys", frozenset({"key123"}))
 
-    # require_web_auth with correct password
-    req_good = MagicMock(spec=Request)
-    req_good.method = "POST"
-    req_good.headers = {"authorization": "Bearer super_secret_admin_pass"}
-    req_good.query_params = {}
-    require_web_auth(req_good)
-
-    # require_web_auth with wrong password
-    req_bad = MagicMock(spec=Request)
-    req_bad.method = "POST"
-    req_bad.headers = {"authorization": "Bearer wrong"}
-    req_bad.query_params = {}
+    request = _mock_request(headers={"x-api-key": "super_secret_admin_pass"})
     with pytest.raises(HTTPException) as exc_info:
-        require_web_auth(req_bad)
+        require_api_key(request)
     assert exc_info.value.status_code == 401
 
-    # require_api_key matching admin web_password
-    req_admin_api = MagicMock(spec=Request)
-    req_admin_api.headers = {"x-api-key": "super_secret_admin_pass"}
-    req_admin_api.query_params = {}
-    require_api_key(req_admin_api)
 
-    # Empty web_password guard
+def test_api_key_cannot_unlock_web_console(monkeypatch):
+    monkeypatch.setattr(settings, "web_password", "super_secret_admin_pass")
+    monkeypatch.setattr(settings, "api_keys", frozenset({"key123"}))
+
+    request = _mock_request(headers={"x-api-key": "key123"})
+    with pytest.raises(HTTPException) as exc_info:
+        require_web_auth(request)
+    assert exc_info.value.status_code == 401
+
+
+def test_web_console_empty_password_stays_open(monkeypatch):
     monkeypatch.setattr(settings, "web_password", "")
-    req_empty_pass = MagicMock(spec=Request)
-    req_empty_pass.headers = {"x-api-key": ""}
-    req_empty_pass.query_params = {}
-    with pytest.raises(HTTPException):
-        require_api_key(req_empty_pass)
+
+    require_web_auth(_mock_request())
+
+
+def test_web_console_accepts_only_its_own_password(monkeypatch):
+    monkeypatch.setattr(settings, "web_password", "super_secret_admin_pass")
+
+    require_web_auth(
+        _mock_request(headers={"authorization": "Bearer super_secret_admin_pass"})
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_web_auth(_mock_request(headers={"authorization": "Bearer wrong"}))
+    assert exc_info.value.status_code == 401
 
 
 def test_require_web_auth_rejects_html_accept_spoofing(monkeypatch):
-    """验证客户端伪造 Accept: text/html 无法绕过管理控制台密码校验。"""
     monkeypatch.setattr(settings, "web_password", "super_secret_admin_pass")
 
-    req_spoof = MagicMock(spec=Request)
-    req_spoof.method = "GET"
-    req_spoof.headers = {"accept": "text/html,application/xhtml+xml"}
-    req_spoof.query_params = {}
+    request = _mock_request()
+    request.headers = {"accept": "text/html,application/xhtml+xml"}
     with pytest.raises(HTTPException) as exc_info:
-        require_web_auth(req_spoof)
+        require_web_auth(request)
     assert exc_info.value.status_code == 401

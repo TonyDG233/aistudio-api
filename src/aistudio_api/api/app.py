@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from aistudio_api.application.api_service_gemini import classify_gemini_error_pa
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
+    validate_config,
 )
 from aistudio_api.infrastructure.utils.logger import (
     dump_request_exchange,
@@ -34,15 +36,54 @@ from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
 )
-from .state import runtime_state
+from .state import RuntimeState, runtime_state
 
 _log_cfg = get_configured_logging_settings()
 setup_logging(str(_log_cfg.get("level", "INFO")))
 logger = get_logger("server")
 
 
+async def _call_lifecycle_method(target: object | None, method_name: str) -> None:
+    """调用可选组件的 stop/close，兼容同步与异步实现。"""
+    if target is None:
+        return
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        return
+    try:
+        result = method()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        logger.debug(
+            "生命周期方法 %s.%s 失败: %s", type(target).__name__, method_name, exc
+        )
+
+
+async def _shutdown_runtime(
+    state: RuntimeState,
+    tasks: tuple[asyncio.Task[object] | None, ...] = (),
+) -> None:
+    """固定关闭顺序：取消后台任务 → keepalive → instance_manager → client。"""
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+
+    await _call_lifecycle_method(state.keepalive, "stop")
+    await _call_lifecycle_method(state.instance_manager, "close")
+    await _call_lifecycle_method(state.client, "close")
+
+    state.keepalive = None
+    state.instance_manager = None
+    state.client = None
+    state.account_service = None
+    state.rotator = None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    validate_config()
+
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
@@ -133,20 +174,15 @@ async def lifespan(_app: FastAPI):
                         pass
     tier_task = asyncio.create_task(_auto_refresh_tiers())
 
-    yield
-    logger.info("服务正在关闭")
-    if warmup_task and not warmup_task.done():
-        warmup_task.cancel()
-    if tier_task and not tier_task.done():
-        tier_task.cancel()
-    if client:
-        try:
-            await client.close()
-        except Exception as e:
-            logger.debug("关闭客户端失败: %s", e)
-    runtime_state.client = None
-    runtime_state.account_service = None
-    runtime_state.rotator = None
+    # P3-D04/P6 接线钩子占位：真实 InstanceManager/Keepalive 在后续步骤装配
+    runtime_state.instance_manager = None
+    runtime_state.keepalive = None
+
+    try:
+        yield
+    finally:
+        logger.info("服务正在关闭")
+        await _shutdown_runtime(runtime_state, (warmup_task, tier_task))
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
