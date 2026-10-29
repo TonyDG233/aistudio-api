@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +10,8 @@ import pytest
 
 from aistudio_api.infrastructure.browser.cdp_client import (
     BLOCKED_URL_PATTERNS,
+    BUILD_SURFACE_BLOCKED_URL_PATTERNS,
+    EDITOR_LIBRARY_BLOCKED_URL_PATTERNS,
     CDPConnection,
     CDPError,
     CDPPage,
@@ -24,6 +27,41 @@ def test_blocked_url_patterns_coverage():
     assert "*play.google.com/log*" in BLOCKED_URL_PATTERNS
     assert "*SavePrompt*" in BLOCKED_URL_PATTERNS
     assert "*CreatePrompt*" in BLOCKED_URL_PATTERNS
+
+
+def test_build_surface_blocked_patterns_exclude_editor_libraries():
+    """D03-010: chat blocks editors, build lets monaco/codemirror/vs/mathjax/katex load."""
+    for pattern in EDITOR_LIBRARY_BLOCKED_URL_PATTERNS:
+        assert pattern in BLOCKED_URL_PATTERNS
+        assert pattern not in BUILD_SURFACE_BLOCKED_URL_PATTERNS
+    assert "*.png" in BUILD_SURFACE_BLOCKED_URL_PATTERNS
+
+
+@pytest.mark.asyncio
+async def test_cdp_connection_uses_websocket_ping_without_liveness_checker():
+    """D-03: keep WS ping, and never restore liveness checker / Runtime.evaluate polling."""
+    assert not hasattr(CDPConnection, "set_liveness_checker")
+    assert not hasattr(CDPPage, "set_liveness_checker")
+
+    fake_ws = AsyncMock()
+    fake_ws.recv = AsyncMock(side_effect=asyncio.CancelledError)
+    captured: dict[str, object] = {}
+
+    async def fake_connect(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_ws
+
+    conn = CDPConnection("ws://127.0.0.1:9222/devtools/page/test")
+    with patch(
+        "aistudio_api.infrastructure.browser.cdp_client.websockets.connect",
+        side_effect=fake_connect,
+    ):
+        await conn.connect()
+        await conn.close()
+
+    assert captured["ping_interval"] == 5
+    assert captured["ping_timeout"] == 5
+    assert not hasattr(conn, "_liveness_checker")
 
 
 @pytest.mark.asyncio
@@ -255,4 +293,8 @@ async def test_cdp_client_connect_page_success_and_prune():
         ):
             page = await client.connect_page(block_assets=True)
             assert page.target_id == "t1"
-            client.close_target.assert_awaited_once_with("t2")
+            # D-11: every non-current target is closed, not just blank tabs.
+            assert [call.args[0] for call in client.close_target.await_args_list] == [
+                "t2",
+                "t3",
+            ]

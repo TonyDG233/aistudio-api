@@ -13,6 +13,7 @@ import pytest
 import aistudio_api.api.app as app_module
 import aistudio_api.infrastructure.gateway.model_defaults as model_defaults
 from aistudio_api.application.account_rotator import AccountStats
+from aistudio_api.config import resolve_hash_include_code
 from aistudio_api.infrastructure.gateway.model_defaults import (
     ConfigValidationError,
     get_configured_instance_specs,
@@ -52,6 +53,18 @@ def test_partial_rotator_block_deep_merges_with_defaults(tmp_path, monkeypatch):
     stats = AccountStats(account_id="acc_1")
     stats.record_rate_limited(model="gemini-2.5-pro")
     assert stats.get_cooldown_remaining("gemini-2.5-pro") > 0
+
+
+def test_hash_include_code_defaults_true_and_env_overrides_yaml(tmp_path, monkeypatch):
+    """D-09: diagnostic switch comes from config/env, defaults to true."""
+    path = tmp_path / "config.yaml"
+    path.write_text("diagnostics:\n  hash_include_code: false\n", encoding="utf-8")
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(path))
+    monkeypatch.delenv("AISTUDIO_HASH_INCLUDE_CODE", raising=False)
+    assert resolve_hash_include_code() is False
+
+    monkeypatch.setenv("AISTUDIO_HASH_INCLUDE_CODE", "1")
+    assert resolve_hash_include_code() is True
 
 
 def test_invalid_rotator_type_fails_startup_validation(tmp_path):

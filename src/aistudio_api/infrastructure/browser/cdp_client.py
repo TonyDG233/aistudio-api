@@ -21,6 +21,18 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("cdp")
 
+# 编辑器/公式库组：Build 应用宿主页需要 Monaco 等编辑器主包，故 chat 面拦截、
+# build 面放行（见 BUILD_SURFACE_BLOCKED_URL_PATTERNS）。
+EDITOR_LIBRARY_BLOCKED_URL_PATTERNS: list[str] = [
+    "*monaco-editor*",
+    "*codemirror*",
+    "*vs/editor*",
+    "*vs/base*",
+    "*mathjax*",
+    "*katex*",
+]
+
+# 全量清单（chat 面）：基础组 + 编辑器库组，内容与顺序保持既有行为不变。
 BLOCKED_URL_PATTERNS: list[str] = [
     "*.png",
     "*.jpg",
@@ -58,6 +70,13 @@ BLOCKED_URL_PATTERNS: list[str] = [
     "*google.com/recaptcha*",
     "*SavePrompt*",
     "*CreatePrompt*",
+]
+
+# Build 宿主页面：基础组（去掉编辑器库组），避免误伤 Monaco/vs 等应用主包。
+BUILD_SURFACE_BLOCKED_URL_PATTERNS: list[str] = [
+    pattern
+    for pattern in BLOCKED_URL_PATTERNS
+    if pattern not in EDITOR_LIBRARY_BLOCKED_URL_PATTERNS
 ]
 
 
@@ -98,8 +117,9 @@ class CDPConnection:
             websockets.connect(
                 self.ws_url,
                 max_size=None,
-                ping_interval=None,
-                ping_timeout=None,
+                # D-03：只保留 WebSocket ping 作为半开连接探测；不做 liveness 轮询。
+                ping_interval=5,
+                ping_timeout=5,
             ),
             timeout=timeout_s,
         )
@@ -782,6 +802,9 @@ class CDPClient:
         self.host = host
         self.base_url = f"http://{host}:{port}"
         self.page: CDPPage | None = None
+        self._browser_conn: CDPConnection | None = None
+        # Target.createBrowserContext 是浏览器级命令，进程内串行化避免并发建/删竞态。
+        self._context_lock = asyncio.Lock()
 
     async def get_version(self) -> dict[str, object]:
         """Fetch /json/version info."""
@@ -836,10 +859,11 @@ class CDPClient:
                 page_target = None
                 if page_targets:
                     page_target = page_targets[0]
-                    # Only blank spare tabs are disposable; another account may still be draining.
+                    # D-11：关闭所有非当前 target（含空白页），不允许 Page 泄露。
+                    # drain 只发生在显式 rebind 的旧 Page 上，由会话层有界处理。
                     for spare in page_targets[1:]:
                         spare_id = str(spare.get("id") or "")
-                        if spare_id and spare.get("url") == "about:blank":
+                        if spare_id:
                             await self.close_target(spare_id)
                 if not page_target:
                     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -887,6 +911,107 @@ class CDPClient:
             await self.close_target(target_id)
             raise
 
+    async def _browser_connection(self) -> CDPConnection:
+        """Lazy browser-level CDP connection (for Target.* browser commands)."""
+        conn = self._browser_conn
+        if conn is not None and conn.ws is not None and not conn._closed:
+            return conn
+        version = await self.get_version()
+        ws_url = str(version.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            raise RuntimeError("CDP /json/version did not expose webSocketDebuggerUrl")
+        conn = CDPConnection(ws_url)
+        await conn.connect()
+        self._browser_conn = conn
+        return conn
+
+    async def create_browser_context(self) -> str:
+        """Create an isolated BrowserContext (cookie jar) and return its id."""
+        async with self._context_lock:
+            conn = await self._browser_connection()
+            result = await conn.send(
+                "Target.createBrowserContext",
+                {"disposeOnDetach": True},
+                timeout_s=10.0,
+            )
+            context_id = str(result.get("browserContextId") or "")
+            if not context_id:
+                raise RuntimeError("Target.createBrowserContext returned no context id")
+            log.info("已创建 BrowserContext: %s", context_id)
+            return context_id
+
+    async def dispose_browser_context(self, context_id: str) -> None:
+        """Dispose one BrowserContext; missing or already-disposed contexts are ignored."""
+        if not context_id:
+            return
+        with contextlib.suppress(Exception):
+            conn = await self._browser_connection()
+            await conn.send(
+                "Target.disposeBrowserContext",
+                {"browserContextId": context_id},
+                timeout_s=10.0,
+            )
+            log.info("已释放 BrowserContext: %s", context_id)
+
+    async def create_page_in_context(
+        self,
+        context_id: str,
+        *,
+        block_assets: bool = True,
+        timeout_s: float = 10.0,
+    ) -> CDPPage:
+        """Create and connect a page inside the given BrowserContext."""
+        await self.wait_until_ready()
+        conn = await self._browser_connection()
+        result = await conn.send(
+            "Target.createTarget",
+            {"url": "about:blank", "browserContextId": context_id},
+            timeout_s=timeout_s,
+        )
+        target_id = str(result.get("targetId") or "")
+        if not target_id:
+            raise RuntimeError("Target.createTarget returned no targetId")
+
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        target: dict[str, object] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            for item in await self.get_targets():
+                if str(item.get("id") or "") == target_id:
+                    target = item
+                    break
+            if target is not None:
+                break
+            await asyncio.sleep(0.1)
+        if target is None:
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
+            raise TimeoutError(
+                f"BrowserContext page target {target_id} did not appear in /json/list"
+            )
+
+        ws_url = str(target.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
+            raise RuntimeError(f"Target {target_id} has no webSocketDebuggerUrl")
+        page_conn = CDPConnection(ws_url)
+        try:
+            await page_conn.connect()
+            page = CDPPage(page_conn, target_id)
+            await page.init_domains(block_assets=block_assets)
+            return page
+        except Exception:
+            await page_conn.close()
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
+            raise
+
     async def close_target(self, target_id: str) -> None:
         """Close a specific target ID via /json/close/{target_id}."""
         with contextlib.suppress(Exception):
@@ -898,3 +1023,6 @@ class CDPClient:
         if self.page:
             await self.page.close()
             self.page = None
+        if self._browser_conn is not None:
+            await self._browser_conn.close()
+            self._browser_conn = None

@@ -1,4 +1,10 @@
-"""Shared browser session management for gateway operations."""
+"""Shared browser session management for gateway operations.
+
+D-05/D-10/D-11: the control session owns exactly one account, one Page and one
+surface at a time. Rebind drains the old Page once (bounded), closes it, and only
+then creates the replacement page. No blue-green window and no background drain
+task exists here.
+"""
 
 from __future__ import annotations
 
@@ -36,11 +42,7 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     navigate_to_aistudio,
     save_browser_cookies,
 )
-from aistudio_api.infrastructure.gateway.session_state import (
-    SessionContext,
-    SessionReadinessGate,
-    SessionState,
-)
+from aistudio_api.infrastructure.gateway.session_state import SessionContext
 from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -49,6 +51,39 @@ log = get_logger("session")
 
 _is_login_page_url = is_login_page_url
 _is_aistudio_page_url = is_aistudio_page_url
+
+# 旧 Page 只允许一次有界等待；超时后强制关闭（D-10）。
+DRAIN_TIMEOUT_S = 12.0
+
+
+def build_snapshot_hash_parts(
+    contents: list[AistudioContent], *, include_code: bool | None = None
+) -> list[str]:
+    """Build snapshot hash parts.
+
+    D-09: executable_code / code_execution_result participate in the hash by
+    default. 若出现严重路由异常（例如同一输入被路由到错误模型/工具面），
+    优先怀疑该 hash 并可用 ``hash_include_code=false`` 回退到上游行为。
+    """
+    if include_code is None:
+        include_code = bool(getattr(settings, "hash_include_code", True))
+    hash_parts: list[str] = []
+    for content in contents:
+        for part in content.parts:
+            if part.text is not None:
+                hash_parts.append(str(part.text))
+            elif part.inline_data is not None:
+                hash_parts.append(str(part.inline_data[1]))
+            elif part.file_id is not None:
+                hash_parts.append(str(part.file_id))
+            elif include_code and part.executable_code is not None:
+                hash_parts.append(str(part.executable_code[1]))
+            elif include_code and part.code_execution_result is not None:
+                hash_parts.append(str(part.code_execution_result[1]))
+            else:
+                hash_parts.append("")
+    return hash_parts
+
 
 DEFAULT_BOOTSTRAP_TEMPLATE: dict[str, object] = {
     "url": "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",
@@ -64,7 +99,7 @@ DEFAULT_BOOTSTRAP_TEMPLATE: dict[str, object] = {
 
 
 class BrowserSession:
-    """Coordinates browser lifecycle, readiness gate, and blue-green tab transitions."""
+    """Coordinates one browser process and one active Page at a time."""
 
     def __init__(self, port: int):
         self.port = port
@@ -75,144 +110,172 @@ class BrowserSession:
         self._proc: ChromiumProcess | None = None
         self._cdp_client: CDPClient | None = None
 
-        self._gate = SessionReadinessGate()
+        self._active_context: SessionContext | None = None
+        self._ready_event = asyncio.Event()
+        self._preparing = False
+        self._last_error: Exception | None = None
+        self._drain_timeout_s = DRAIN_TIMEOUT_S
         self._transition_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
         self._transport = XHRStreamTransport()
-        self._retiring_contexts: list[SessionContext] = []
-        self._background_tasks: set[asyncio.Task[object]] = set()
         self._in_flight: int = 0
         self._stream_cleanup_count: int = 0
 
     @property
-    def state(self) -> SessionState:
-        return self._gate.state
-
-    @property
     def is_ready(self) -> bool:
-        return self._gate.is_ready()
+        return self._active_context is not None and self._active_context.is_usable()
 
     @property
     def active_context(self) -> SessionContext | None:
-        return self._gate.active_context
+        return self._active_context
 
     @property
     def page(self) -> CDPPage | None:
-        return self._gate.active_context.page if self._gate.active_context else None
+        return self._active_context.page if self._active_context else None
 
     @property
     def snap_key(self) -> str | None:
-        return self._gate.active_context.snap_key if self._gate.active_context else None
+        return self._active_context.snap_key if self._active_context else None
 
     @property
     def base_template(self) -> dict[str, object] | None:
-        return (
-            self._gate.active_context.base_template
-            if self._gate.active_context
-            else None
-        )
+        return self._active_context.base_template if self._active_context else None
 
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
-        self._gate.set_ready(context)
+        self._active_context = context
+        self._preparing = False
+        self._last_error = None
+        self._ready_event.set()
 
     def get_current_auth_user(self) -> str:
         """获取当前活跃账号的 auth_user 编号（0, 1, 2...）。"""
         if self._auth_user is not None:
             return self._auth_user
-        if self._gate.active_context is not None:
-            return self._gate.active_context.auth_user
+        if self._active_context is not None:
+            return self._active_context.auth_user
         return get_auth_user_from_meta(self._auth_file)
 
     def get_current_tier(self) -> str:
         """获取当前活跃账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
-        if self._gate.active_context is not None and self._gate.active_context.tier:
-            return self._gate.active_context.tier
+        if self._active_context is not None and self._active_context.tier:
+            return self._active_context.tier
         if self._tier is not None:
             return self._tier
         return get_tier_from_meta(self._auth_file)
 
     @asynccontextmanager
     async def request_scope(self):
-        """追踪活动请求。"""
-        self._in_flight += 1
-        ctx = self.active_context
+        """Account for one active request on the current page.
+
+        New requests wait for an in-progress rebind instead of touching the
+        retiring page; existing requests keep the old context until they finish.
+        """
+        ctx = self._active_context
+        if self._preparing:
+            ctx = await self._wait_ready_context(60.0)
+        elif ctx is not None and not ctx.is_usable():
+            ctx = None
         if ctx is not None:
-            ctx.in_flight += 1
+            self._in_flight += 1
+            ctx.incr_in_flight()
         try:
             yield ctx
         finally:
-            self._in_flight = max(0, self._in_flight - 1)
             if ctx is not None:
+                self._in_flight = max(0, self._in_flight - 1)
                 ctx.decr_in_flight()
 
+    async def _wait_ready_context(self, timeout_s: float) -> SessionContext:
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout_s)
+        except TimeoutError as err:
+            raise TimeoutError(
+                f"Timed out waiting for session readiness after {timeout_s}s"
+            ) from err
+
+        if self._last_error is not None:
+            raise RuntimeError(
+                f"Session transition failed: {self._last_error}"
+            ) from self._last_error
+        ctx = self._active_context
+        if ctx is None or not ctx.is_usable():
+            raise RuntimeError("Session active page closed unexpectedly")
+        return ctx
+
     async def ensure_ready(self, timeout_s: float = 60.0) -> SessionContext:
-        """Wait until session is 100% READY."""
-        if self._gate.is_ready() and self._gate.active_context is not None:
-            return self._gate.active_context
+        """Return the single ready context, waiting for an in-progress rebind."""
+        if self.is_ready and self._active_context is not None:
+            return self._active_context
 
-        if self._gate.state == SessionState.UNINITIALIZED:
-            await self.transition_to_account(self._auth_file, force_refresh=False)
+        if self._last_error is not None:
+            raise RuntimeError(f"Session transition failed: {self._last_error}")
 
-        return await self._gate.wait_ready(timeout_s=timeout_s)
+        if not self._preparing:
+            # Serialized inside transition_to_account; concurrent callers reuse it.
+            return await self.transition_to_account(
+                self._auth_file, force_refresh=False
+            )
 
-    async def ensure_context(self) -> CDPPage:
-        """Ensure active verified CDPPage is available, auto-reconnecting if dropped."""
-        page = self.page
-        if page is not None and not page.is_closed():
-            if await page.is_alive(timeout_s=1.0):
-                return page
-            log.warning("浏览器页面无响应，重新连接...")
-        await self._close_internal()
-        res = await self._ensure_browser_cdp()
-        return res or (await self.ensure_ready()).page
-
-    async def is_alive(self, timeout_s: float = 1.5) -> bool:
-        if self._proc is not None and not self._proc.is_alive():
-            return False
-        page = self.page
-        if page is None or page.is_closed():
-            return False
-        return await page.is_alive(timeout_s=timeout_s)
+        # An already-running request may reach this point after the rebind started;
+        # let it finish on the old page. The bounded drain in the transition waits
+        # for it and force-closes on timeout.
+        ctx = self._active_context
+        if ctx is not None and ctx.is_usable():
+            return ctx
+        return await self._wait_ready_context(timeout_s)
 
     async def switch_auth(self, auth_file: str | None) -> None:
-        """Switch auth using blue-green transition without killing in-flight streams."""
+        """Switch auth with a bounded single-page rebind (no blue-green)."""
         await self.transition_to_account(auth_file, force_refresh=True)
 
     async def transition_to_account(
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
-        """Execute atomic session transition to target auth file."""
+        """Execute one bounded single-page transition to the target auth file."""
         async with self._transition_lock:
             if (
                 not force_refresh
-                and self._gate.is_ready()
-                and self._gate.active_context is not None
-                and self._gate.active_context.auth_file == auth_file
+                and self.is_ready
+                and self._active_context is not None
+                and self._active_context.auth_file == auth_file
             ):
-                return self._gate.active_context
+                return self._active_context
+            if not force_refresh and self._last_error is not None:
+                raise RuntimeError(
+                    f"Session transition failed: {self._last_error}"
+                ) from self._last_error
 
-            self._gate.set_preparing()
-            old_context = self._gate.active_context
+            old_context = self._active_context
+            self._preparing = True
+            self._ready_event.clear()
+            self._last_error = None
             target_auth_user = get_auth_user_from_meta(auth_file)
             target_tier = get_tier_from_meta(auth_file)
             self._auth_file = auth_file
             self._auth_user = target_auth_user
             self._tier = target_tier
             self._profile_dir = derive_profile_dir(auth_file)
+            new_page: CDPPage | None = None
             try:
-                # Real browser mode
+                # 旧页先有界 drain 并关闭；期间不创建新页（D-05/D-10/D-11）。
+                if old_context is not None:
+                    await self._drain_and_close_context(old_context)
+                self._active_context = None
+
                 if self._proc is None or not self._proc.is_alive():
-                    await self._close_internal()
-                    await self._ensure_browser_cdp()
+                    await self._stop_browser()
+                    # P-02: 只恢复进程/CDP，不提前 connect_page；否则随后的
+                    # create_new_page 会留下第二个 Page（D-11）。
+                    await self._ensure_browser_cdp(connect_page=False)
 
                 assert self._cdp_client is not None
 
-                # Blue-Green: always create a dedicated new tab when transitioning from an existing account
                 if old_context is not None:
                     new_page = await self._cdp_client.create_new_page(block_assets=True)
                 else:
                     new_page = await self._cdp_client.connect_page(block_assets=True)
+                new_page.account_auth_file = auth_file
 
                 await load_cookies_to_page(new_page, auth_file)
                 await navigate_to_aistudio(
@@ -242,22 +305,9 @@ class BrowserSession:
                     base_template=base_template,
                     tier=target_tier,
                 )
-
-                if (
-                    old_context is not None
-                    and old_context.page.target_id != new_page.target_id
-                    and not old_context.page.is_closed()
-                ):
-                    self._retiring_contexts.append(old_context)
-                    drain_task = asyncio.create_task(
-                        self._drain_retiring_context(
-                            old_context, active_target_id=new_page.target_id
-                        ),
-                        name=f"drain_{old_context.auth_user}",
-                    )
-                    self._background_tasks.add(drain_task)
-                    drain_task.add_done_callback(self._background_tasks.discard)
-                self._gate.set_ready(new_context)
+                self._active_context = new_context
+                self._preparing = False
+                self._ready_event.set()
                 log.info(
                     "会话切换完成: auth_file=%s, u/%s (活跃在途=%d)",
                     auth_file,
@@ -267,33 +317,42 @@ class BrowserSession:
                 return new_context
 
             except Exception as exc:
-                self._gate.set_failed(exc)
+                if new_page is not None:
+                    with suppress(Exception):
+                        if not new_page.is_closed():
+                            await new_page.close()
+                    if self._cdp_client is not None and new_page.target_id:
+                        with suppress(Exception):
+                            await self._cdp_client.close_target(new_page.target_id)
+                self._active_context = None
+                self._preparing = False
+                self._last_error = exc
+                self._ready_event.set()
                 log.error("会话切换失败: %s", exc)
                 raise
 
-    async def _drain_retiring_context(
-        self,
-        context: SessionContext,
-        active_target_id: str | None = None,
-        max_wait_s: float = 12.0,
-    ) -> None:
-        while context.in_flight > 0:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(context.drain_event.wait(), timeout=max_wait_s)
-                break
-            if context.page.is_closed():
-                break
+    async def _drain_and_close_context(self, context: SessionContext) -> None:
+        """Wait once (bounded) for the old page, then force-close it."""
+        if context.in_flight > 0 and not context.page.is_closed():
+            try:
+                await asyncio.wait_for(
+                    context.drain_event.wait(), timeout=self._drain_timeout_s
+                )
+            except TimeoutError:
+                log.warning(
+                    "旧页 drain 超时 %.1fs (in_flight=%d)，强制关闭",
+                    self._drain_timeout_s,
+                    context.in_flight,
+                )
 
+        # D03-026: 关闭前回写当前账号 cookie，避免最后一次会话状态丢失。
         with suppress(Exception):
-            if context in self._retiring_contexts:
-                self._retiring_contexts.remove(context)
+            await save_browser_cookies(context.page, auth_file=context.auth_file)
+        with suppress(Exception):
             if not context.page.is_closed():
                 await context.page.close()
-            if (
-                self._cdp_client
-                and context.page.target_id
-                and context.page.target_id != active_target_id
-            ):
+        if self._cdp_client is not None and context.page.target_id:
+            with suppress(Exception):
                 await self._cdp_client.close_target(context.page.target_id)
 
     async def ensure_botguard_service(self, force_refresh: bool = False) -> CDPPage:
@@ -303,7 +362,7 @@ class BrowserSession:
             raise RuntimeError(
                 f"Google AI Studio 地区限制: 访问被重定向至 available-regions ({curr_url})"
             )
-        if force_refresh or not self._gate.is_ready():
+        if force_refresh or not self.is_ready:
             await self.transition_to_account(
                 self._auth_file, force_refresh=force_refresh
             )
@@ -314,7 +373,12 @@ class BrowserSession:
             raise RuntimeError("Browser process died during template capture")
 
         ctx = self.active_context
-        base = dict(ctx.base_template if ctx else DEFAULT_BOOTSTRAP_TEMPLATE)
+        if ctx is None or not ctx.base_template:
+            ctx = await self.ensure_ready()
+        base = dict(ctx.base_template)
+        raw_body = base.get("body")
+        if not isinstance(raw_body, str) or not raw_body:
+            raise RuntimeError("template body missing from ready context")
         normalized_model = model if model.startswith("models/") else f"models/{model}"
         try:
             body_val = base.get("body")
@@ -336,18 +400,9 @@ class BrowserSession:
 
     async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
         ctx = await self.ensure_ready()
-        hash_parts: list[str] = []
-        for content in contents:
-            for part in content.parts:
-                if part.text is not None:
-                    hash_parts.append(str(part.text))
-                elif part.inline_data is not None:
-                    hash_parts.append(str(part.inline_data[1]))
-                elif part.file_id is not None:
-                    hash_parts.append(str(part.file_id))
-                else:
-                    hash_parts.append("")
-        content_hash = sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
+        content_hash = sha256(
+            " ".join(build_snapshot_hash_parts(contents)).encode("utf-8")
+        ).hexdigest()
 
         async with self._snapshot_lock:
             for attempt in range(3):
@@ -408,7 +463,7 @@ class BrowserSession:
             if isinstance(hdrs_val, dict)
             else {}
         )
-        ctx.in_flight += 1
+        ctx.incr_in_flight()
         try:
             async for event in self._transport.send_streaming_request(
                 ctx.page,
@@ -427,7 +482,7 @@ class BrowserSession:
     async def cleanup_stream_page(self, page: CDPPage | None = None) -> None:
         self._stream_cleanup_count += 1
         target_page = page or (
-            self.active_context.page if self.active_context else None
+            self._active_context.page if self._active_context else None
         )
         if (
             target_page is not None
@@ -455,8 +510,9 @@ class BrowserSession:
         if not target_auth:
             return len(pw_cookies)
 
-        await self._ensure_browser_cdp()
+        await self._ensure_browser_cdp(connect_page=False)
         assert self._cdp_client is not None
+        # D03-025: 控制面 cookie 导入使用临时页，完成后立即关闭。
         page = await self._cdp_client.create_new_page(block_assets=False)
         try:
             await page.set_cookies(pw_cookies)
@@ -474,17 +530,24 @@ class BrowserSession:
                 await self._cdp_client.close_target(page.target_id)
 
     async def extract_account_email(self, page: CDPPage | None = None) -> str | None:
-        target = page or (self.active_context.page if self.active_context else None)
+        target = page or (self._active_context.page if self._active_context else None)
         return await extract_account_email(target)
 
     async def extract_account_tier(self, page: CDPPage | None = None) -> str | None:
-        target = page or (self.active_context.page if self.active_context else None)
+        target = page or (self._active_context.page if self._active_context else None)
         auth_user = self.get_current_auth_user()
         return await extract_account_tier(target, auth_user=auth_user)
 
     async def reload_current_account_cookies(self, page: CDPPage | None = None) -> bool:
-        target = page or (self.active_context.page if self.active_context else None)
+        target = page or (self._active_context.page if self._active_context else None)
         return bool(target and await load_cookies_to_page(target, self._auth_file))
+
+    async def save_current_cookies(self) -> bool:
+        """D03-026: 关闭前把当前活跃页面的 cookies 回写到当前账号 auth.json。"""
+        target = self.page
+        if target is None or target.is_closed() or not self._auth_file:
+            return False
+        return await save_browser_cookies(target, auth_file=self._auth_file)
 
     async def _save_cookies(
         self,
@@ -498,7 +561,12 @@ class BrowserSession:
                 target, auth_file=auth_file or self._auth_file, cookies=cookies
             )
 
-    async def _ensure_browser_cdp(self) -> CDPPage | None:
+    async def _ensure_browser_cdp(self, *, connect_page: bool = True) -> CDPPage | None:
+        """Ensure browser process/CDP exists.
+
+        ``connect_page=False`` only guarantees the process and CDP endpoint; the
+        caller then creates exactly one page for the new session context.
+        """
         if self._proc is not None and self._proc.is_alive() and self._cdp_client:
             return None
 
@@ -514,16 +582,24 @@ class BrowserSession:
 
         self._cdp_client = CDPClient(port=self.port)
         await self._cdp_client.wait_until_ready()
+        if not connect_page:
+            return None
         return await self._cdp_client.connect_page(block_assets=True)
 
     async def close(self) -> None:
         async with self._transition_lock:
+            with suppress(Exception):
+                await self.save_current_cookies()
             await self._close_internal()
 
     async def _close_internal(self) -> None:
-        self._gate.reset()
-        self._retiring_contexts.clear()
+        self._active_context = None
+        self._preparing = False
+        self._last_error = None
+        self._ready_event.clear()
+        await self._stop_browser()
 
+    async def _stop_browser(self) -> None:
         if self._cdp_client is not None:
             with suppress(Exception):
                 await self._cdp_client.close()
@@ -538,7 +614,9 @@ class BrowserSession:
 __all__ = [
     "BOTGUARD_BOOTSTRAP_PROMPT",
     "DEFAULT_BOOTSTRAP_TEMPLATE",
+    "DRAIN_TIMEOUT_S",
     "BrowserSession",
     "_is_aistudio_page_url",
     "_is_login_page_url",
+    "build_snapshot_hash_parts",
 ]

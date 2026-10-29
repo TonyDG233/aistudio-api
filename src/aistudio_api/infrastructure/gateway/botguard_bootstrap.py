@@ -20,6 +20,7 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 log = get_logger("session.botguard")
 
 BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
+AISTUDIO_HOME_URL = "https://aistudio.google.com/"
 
 
 async def install_page_hooks(page: CDPPage) -> str:
@@ -243,6 +244,7 @@ async def bootstrap_botguard_and_template(
                 "failed to trigger run button while capturing BotGuardService"
             )
 
+        recovery_attempts = 0
         for i in range(max_wait_seconds):
             if is_proc_alive_cb and not is_proc_alive_cb():
                 raise RuntimeError("Browser process died during BotGuard capture")
@@ -251,6 +253,46 @@ async def bootstrap_botguard_and_template(
 
             curr_url = getattr(page, "url", "") or ""
             if is_login_page_url(curr_url):
+                # D03-021: 捕获期间跳登录页时先重新注入 cookie 再继续一次。
+                log.warning(
+                    "BotGuard 捕获期间检测到登录页重定向: %s，尝试重新注入 Cookie...",
+                    curr_url,
+                )
+                recovery_attempts += 1
+                if recovery_attempts > 2:
+                    raise SessionExpiredError(
+                        f"Cookie 认证失效，登录页重注入已达到上限: {curr_url}"
+                    )
+                if reload_cookies_cb and await reload_cookies_cb(page):
+                    # P-03: reload 后重新导航回 AI Studio，并继续轮询捕获；
+                    # 只在有界等待窗口内重试，避免无限循环。
+                    with suppress(Exception):
+                        await page.goto(AISTUDIO_HOME_URL)
+                    for _ in range(10):
+                        await page.wait_for_timeout(500)
+                        recovered_url = getattr(page, "url", "") or ""
+                        if (
+                            recovered_url
+                            and not is_login_page_url(recovered_url)
+                            and "aistudio.google.com" in recovered_url
+                        ):
+                            break
+                    else:
+                        raise SessionExpiredError(
+                            "Cookie 重注入后仍未回到 AI Studio: "
+                            f"{getattr(page, 'url', '') or curr_url}"
+                        )
+                    # 导航会重建页面上下文，必须重新挂 Hook 并再次触发探测。
+                    snap_key = await install_page_hooks(page)
+                    await page.wait_for_selector("textarea", timeout_s=15.0)
+                    await page.fill("textarea", BOTGUARD_BOOTSTRAP_PROMPT)
+                    await page.wait_for_timeout(600)
+                    await page.evaluate(DIALOG_CLEANUP_JS)
+                    if not await click_run_button(page):
+                        raise RuntimeError(
+                            "failed to re-trigger run button after cookie reload"
+                        )
+                    continue
                 raise SessionExpiredError(
                     f"Cookie 认证失效，已跳转至登录页: {curr_url}"
                 )
