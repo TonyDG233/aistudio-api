@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -52,11 +53,18 @@ class FakeClock:
 
 
 class FakeControlSession:
-    def __init__(self, *, page_open: bool = False, saved: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        page_open: bool = False,
+        saved: bool = True,
+        auth_file: Path | None = None,
+    ) -> None:
         self.page = (
             SimpleNamespace(is_closed=lambda: not page_open) if page_open else None
         )
         self._saved = saved
+        self._auth_file = auth_file
         self.calls = 0
 
     async def save_current_cookies(self) -> bool:
@@ -93,6 +101,7 @@ class FakeSlot:
         raises: bool = False,
         session: object | None = None,
         in_flight: int = 0,
+        lifecycle_lock: object | None = None,
     ) -> None:
         self.slot_id = slot_id
         self.account_id = account_id
@@ -103,6 +112,36 @@ class FakeSlot:
             else FakeSlotSession(saved=saved, raises=raises)
         )
         self.active_requests = in_flight
+        self.lifecycle_lock = lifecycle_lock
+
+
+class TrackingLifecycleLock:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.held = False
+        self.acquired = 0
+
+    async def __aenter__(self) -> TrackingLifecycleLock:
+        await self._lock.acquire()
+        self.held = True
+        self.acquired += 1
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.held = False
+        self._lock.release()
+        return False
+
+
+class LockCheckingSlotSession:
+    def __init__(self, lock: TrackingLifecycleLock) -> None:
+        self._lock = lock
+        self.calls = 0
+
+    async def save_current_cookies(self) -> bool:
+        self.calls += 1
+        assert self._lock.held, "save_current_cookies must run inside lifecycle_lock"
+        return True
 
 
 class FakeManager:
@@ -226,6 +265,24 @@ async def test_start_schedules_metadata_and_auth_immediately(tmp_path):
         await service.stop()
 
 
+def test_status_hides_next_due_for_disabled_jobs(tmp_path):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    service = _service(store, clock=FakeClock(2_500.0))
+    service._next_due = {
+        "auth_update": 2_500.0,
+        "metadata_refresh": 2_500.0,
+        "active_activity": 2_560.0,
+    }
+
+    status = _status(service)
+
+    assert status["enabled"]["active_activity"] is False
+    assert status["next_due"]["active_activity"] is None
+    assert status["next_due"]["auth_update"] == _iso(2_500.0)
+    assert status["next_due"]["metadata_refresh"] == _iso(2_500.0)
+
+
 @pytest.mark.asyncio
 async def test_auth_update_writes_all_pool_slots_including_build_only(tmp_path):
     store = AccountStore(tmp_path)
@@ -299,6 +356,28 @@ async def test_auth_update_does_not_let_one_slot_mask_same_account_failure(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_auth_update_saves_pool_slot_under_lifecycle_lock(tmp_path):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    lock = TrackingLifecycleLock()
+    session = LockCheckingSlotSession(lock)
+    manager = FakeManager(
+        [FakeSlot("slot-a", "acc_a", session=session, lifecycle_lock=lock)]
+    )
+    service = _service(store, manager=manager)
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["ok"] is True
+    assert result["accounts"] == ["acc_a"]
+    assert session.calls == 1
+    assert lock.acquired == 1
+    assert lock.held is False
+    account = store.get_account("acc_a")
+    assert account is not None and account.auth_saved_at is not None
+
+
+@pytest.mark.asyncio
 async def test_auth_update_marks_control_session_account(tmp_path):
     store = AccountStore(tmp_path)
     _account(store, "acc_control", "control@example.com")
@@ -313,6 +392,28 @@ async def test_auth_update_marks_control_session_account(tmp_path):
     assert control.calls == 1
     account = store.get_account("acc_control")
     assert account is not None and account.auth_saved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_control_session_marks_auth_file_owner_not_active_account(tmp_path):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_owner", "owner@example.com")
+    _account(store, "acc_active", "active@example.com")
+    auth_file = store.get_auth_path_optional("acc_owner")
+    assert auth_file is not None
+    store.set_active_account("acc_active")
+    control = FakeControlSession(page_open=True, saved=True, auth_file=auth_file)
+    service = _service(store, client=FakeClient(control))
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["ok"] is True
+    assert result["reason"] == "saved"
+    assert result["accounts"] == ["acc_owner"]
+    owner = store.get_account("acc_owner")
+    active = store.get_account("acc_active")
+    assert owner is not None and owner.auth_saved_at is not None
+    assert active is not None and active.auth_saved_at is None
 
 
 @pytest.mark.asyncio

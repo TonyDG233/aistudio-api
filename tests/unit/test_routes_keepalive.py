@@ -88,6 +88,23 @@ async def test_keepalive_run_maps_busy_to_409():
 
 
 @pytest.mark.asyncio
+async def test_keepalive_run_maps_internal_exception_to_500():
+    original = runtime_state.keepalive
+    runtime_state.keepalive = FakeKeepalive(  # type: ignore[assignment]
+        {"ok": False, "reason": "exception", "error": "boom"}
+    )
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/keepalive/run", json={"task": "auth_update"})
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["error"]["code"] == 500
+        assert body["error"]["message"] == "boom"
+    finally:
+        runtime_state.keepalive = original
+
+
+@pytest.mark.asyncio
 async def test_keepalive_run_returns_result():
     original = runtime_state.keepalive
     runtime_state.keepalive = FakeKeepalive({"ok": True, "reason": "saved"})  # type: ignore[assignment]

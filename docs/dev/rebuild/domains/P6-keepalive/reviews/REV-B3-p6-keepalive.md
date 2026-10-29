@@ -218,3 +218,16 @@ B3 的 8 项审查重点全部成立：生命周期接线与关闭顺序正确�
 - **N-03**：`status().next_due` 对 `enabled=False` 的 job 返回 `None`（如默认关闭的 active_activity）。
 - 实测：`472 passed / 2 failed / 1 skipped`（2 个既有 Windows 差异）；`ruff check src tests` 全绿；`pyright src tests` 0 errors；`git diff --check` 通过。
 - 复核结论：**PASS**；N-01/N-03/N-05/N-08 已完成，无新增阻塞。B3 等待提交。
+
+## 7. B3 收尾补强记录（2026-10-29）
+
+- **mojibake 修复**：`src/aistudio_api/api/routes_keepalive.py` 的 409 detail 中文乱码修正为「保活任务正在运行」；全文件复扫无替换字符/私有区字符，其余中文文案正常。
+- **定向断言补齐**（只新增断言，不放宽或重写既有测试）：
+  - N-05：`test_auth_update_saves_pool_slot_under_lifecycle_lock`，用带 `__aenter__/__aexit__` 的 `TrackingLifecycleLock` 与在 `save_current_cookies()` 内断言 `lock.held` 的会话，断言锁获取 1 次、退出后释放、slot 实际写入并记账；未持锁/未用锁即失败。
+  - N-08：`test_keepalive_run_maps_internal_exception_to_500`，伪服务返回 `reason="exception"`，断言 HTTP 500 且错误体 `code=500`、`message="boom"`。
+  - N-01：`test_control_session_marks_auth_file_owner_not_active_account`，令 active 账号与 `session._auth_file` 归属账号不同，断言只给 auth_file 归属账号 `mark_auth_saved`，active 账号保持未记账。
+  - N-03：`test_status_hides_next_due_for_disabled_jobs`，即使 `_next_due` 内含 `active_activity`，`status()["next_due"]["active_activity"]` 仍为 `None`；已启用 job 保持 ISO 字符串。
+- **最终实测**：`pytest -q` → **476 passed, 2 failed, 1 skipped**（2 failed 仍为既有 Windows 平台差异：`test_find_chromium_executable_strictly_requires_cloakbrowser`、`test_evaluate_wrapper_expressions_parse_cleanly`；1 skipped 为 POSIX-only）；较收尾前新增 4 例定向测试，无新增失败。
+- **门禁**：`uv run ruff check src tests` → `All checks passed!`；`uv run pyright src tests` → `0 errors, 0 warnings, 0 informations`；`git diff --check` → 退出码 0（仅 `routes_keepalive.py`、`test_routes_keepalive.py` 的 LF→CRLF 提示）。
+- **范围**：代码/测试改动仅 `src/aistudio_api/api/routes_keepalive.py`、`tests/unit/test_account_keepalive.py`、`tests/unit/test_routes_keepalive.py`（均未提交），另同步更新本报告两份副本；未改 05/06/08-09/归档，未新增/跟踪根 `config.yaml`。
+- 复核结论：**PASS**；N-01/N-03/N-05/N-08 收尾完成，无新增阻塞。
