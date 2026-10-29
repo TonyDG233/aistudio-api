@@ -1,15 +1,11 @@
 # 05 Restart Map
-
 状态：收敛版地图；骨架 `99c38ba`；当前分支 `rebuild`（执行时用 `git rev-parse HEAD`，不写死旧 SHA）；目标 worktree `.kilo/worktrees/rebuild-upstream`；当前不是 handoff-ready。
-
 ## 1. 目标与边界
-
 - 以 `99c38ba` 为骨架建独立 worktree，不合并 `master`/`rebuild`；旧 fork 只作参考与失败样本。
 - 请求实例固定 `1 账号 + 1 Context + 1 Page + 1 surface`；同账号 chat/build 不并存。
 - 并发原语只用 `active_requests`；不恢复 lease/pinned/自动 rebind/defer。
 - 控制面只做登录与保活，不占请求容量。
 - 不访问真实账号/IP/Google，除非用户明确授权。
-
 ## 2. 权威与文档职责
 
 | 文档 | 职责 |
@@ -38,9 +34,9 @@
 
 - Gate0/G0.x 不再作为独立体系，改为 A/B/C 阶段 + 每步审计。
 - A 文档收敛：A1 `06` 顺序 → A2 D-14 → A3 05 → A4 10 → A5 归档旧审计 → A6 同步目标 docs → A7 agent 工作流准备。
-- B 实现：P9-pre → P1+P3+P2 → P6 → P7 → B5a PG/toolcall 复现 → B5b P5 OpenAI。
+- B 实现：P9-pre → B0 目标 `AGENT.md` → P1 → P3-D03 → P3-D04 → P2 → P6 → P7 → B5a → B5b。
 - C 扩展：P4 Build（先按 `INC-20261028-01` §4 探索）→ P8/UI → Claude/Responses → 统计页 → P10。
-- 顺序 P6 → P7 → P5 固定；每阶段前一步审计通过才进下一步。
+- 顺序 P6 → P7 → B5a → B5b 固定；每阶段前一步审计通过才进下一步。
 
 ### 4.1 步骤详情
 
@@ -54,7 +50,10 @@
 | A6 | 同步目标 worktree | 目标 docs 与 A1-A5 一致；`src` diff 仍为 0 |
 | A7 | agent 工作流准备 | 任务包 8 字段、A→B 检查、incident 规则、真实测试闸门可执行；不写 AGENT.md |
 | B1 | P9-pre 装配/配置/API guard | 启停/配置校验通过；空 Key 拒绝；不写业务逻辑 |
-| B2 | P1+P3+P2 账号/页面/路由 | 1 账号 1 Context 1 Page；`active_requests`；路由/重试测试 |
+| B2-1 | P1(D02) 账号/Cookie/预设/Paid | 账号注册表、Cookie 跨域保真、D-08、D-13、Paid 识别/资格；`active_requests` |
+| B2-2 | P3-D03 浏览器/CDP/Context | PooledSession、watchdog D-02、WS ping D-03、关闭多余 Page D-11、去控制面蓝绿/无限 drain D-10 |
+| B2-3 | P3-D04 多实例池 | 1 账号+1 Context+1 Page+1 surface；去 lease/defer/borrow/pinned/自动 rebind；只留 `active_requests`；D-05 有界 RETIRING |
+| B2-4 | P2(D05) 路由 | Free/Pro 分流；403 不切号 D-04/D-06；`quota_scope` D-01；429 同号重试→切现有实例→503 |
 | B3 | P6 保活/24h | 凭证回写覆盖 chat/build-only；fake clock；VPS 可用 |
 | B4 | P7 日志/错误关联 | 日志页/导出；请求-尝试关联；不含统计页 |
 | B5a | PG/toolcall/preset 复现 | 见 `domains/P5-generation/index.md` |
@@ -78,12 +77,13 @@
 - 文档布局：根只放稳定入口；域细节进 `domains/Px/`，事故进 `incidents/`，历史进 `archive/`，证据进 `docs/dev/evidence/`；每 Step 不新建文档。
 - B5a 详情只放 `domains/P5-generation/09-pg-toolcall-analysis.md`；`05` 一行步骤，`10` 一个指针。
 - worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改。
+- 不再预写纸面 PKG；直接依据 `06`/`08-09`/台账/测试表，参考主仓 `rebuild` 移植代码并跑通 `pytest`；单步审查发现问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。旧纸面批次草稿与初审已归档至 `archive/batch-drafts-20261029/`，仅作历史留底，严禁作为施工依据；B 阶段每步真实代码施工后的审查报告写入对应 `domains/Px/reviews/`。
 
 ## 6. 停止条件
 
 - 文档超过一页，或开始重复 05/06/08-09。
 - 某步需要新增 D-xx、Gate、顺序或范围。
-- 目标 worktree 的 `src` diff 不再为 0。
+- A 阶段要求目标 worktree 的 `src` diff 为 0；进入 B 阶段后按批准步骤修改代码。
 - B5a/B5b 无法形成可运行请求且没有明确错误证据。
 - 上游 `99c38ba` 变化但未重新对账。
 - 再次用文档/审计替代代码、测试、日志。
