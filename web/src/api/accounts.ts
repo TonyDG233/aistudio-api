@@ -90,22 +90,8 @@ export const accountsApi = {
     })
   },
 
-  updateNotes(id: string, notes: string): Promise<Account> {
-    return request<Account>(`/api/accounts/${id}/notes`, {
-      method: 'PUT',
-      body: JSON.stringify({ notes }),
-    })
-  },
-
   listGroups(): Promise<string[]> {
     return request<string[]>('/api/accounts/groups/list')
-  },
-
-  batchToggleGroup(group: string, enabled: boolean): Promise<{ ok: boolean; count: number; group: string; enabled: boolean }> {
-    return request(`/api/accounts/groups/${encodeURIComponent(group)}/toggle`, {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
   },
 
   listPresets(): Promise<AccountPreset[]> {

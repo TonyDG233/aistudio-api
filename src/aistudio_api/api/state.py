@@ -14,6 +14,9 @@ from aistudio_api.infrastructure.utils.common import atomic_write_json
 if TYPE_CHECKING:
     from aistudio_api.application.account_rotator import AccountRotator
     from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        AccountInfoRefresher,
+    )
     from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -35,11 +38,13 @@ class ModelStatsItem:
     finish_reasons: dict[str, int] = field(default_factory=dict)
     last_used: str | None = None
 
+
 @dataclass
 class RuntimeState:
     client: AIStudioClient | None = None
     browser_port: int = 9222
     account_service: AccountService | None = None
+    account_refresher: AccountInfoRefresher | None = None
     rotator: AccountRotator | None = None
     instance_manager: object | None = None
     keepalive: object | None = None
@@ -173,5 +178,6 @@ class RuntimeState:
             self.save_stats()
         else:
             self._schedule_debounced_save()
+
 
 runtime_state = RuntimeState()

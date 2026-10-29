@@ -165,6 +165,23 @@ async def test_update_config_yaml_success_writes_atomically():
     assert config_path.read_text(encoding="utf-8") == original
 
 
+def test_stats_response_exposes_paid_marker_from_model_access():
+    from aistudio_api.api.routes_system import stats_response
+    from aistudio_api.api.state import ModelStatsItem, runtime_state
+
+    original = dict(runtime_state.model_stats)
+    try:
+        runtime_state.model_stats.clear()
+        runtime_state.model_stats["gemini-4-argon"] = ModelStatsItem(requests=1)
+        runtime_state.model_stats["gemini-3.8-flash"] = ModelStatsItem(requests=1)
+        result = stats_response()
+        assert result.models["gemini-4-argon"].paid is True
+        assert result.models["gemini-3.8-flash"].paid is False
+    finally:
+        runtime_state.model_stats.clear()
+        runtime_state.model_stats.update(original)
+
+
 @pytest.mark.asyncio
 async def test_rotation_status_and_clear_cooldown():
     from unittest.mock import MagicMock

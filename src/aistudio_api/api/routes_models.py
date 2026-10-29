@@ -76,6 +76,7 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelListResponse:
+    """Return bare model IDs; discovery owns model/paid metadata."""
     session = runtime_state.client._session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 

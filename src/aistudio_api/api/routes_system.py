@@ -47,6 +47,7 @@ def health_response() -> HealthResponse:
 def stats_response() -> StatsResponse:
     from aistudio_api.api.response_models import AccountBreakdownItem
     from aistudio_api.api.state import runtime_state
+    from aistudio_api.application.model_access import is_paid_model
     from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
 
     stats = dict(runtime_state.model_stats)
@@ -83,7 +84,11 @@ def stats_response() -> StatsResponse:
                         m_daily = st.daily_models[clean_m]
                         quota = resolve_tier_quota(acc.tier, clean_m)
                         used_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
-                        cd_rem = max(0, int(m_daily.cooldown_until - time.time())) if m_daily.cooldown_until > time.time() else 0
+                        cd_rem = (
+                            max(0, int(m_daily.cooldown_until - time.time()))
+                            if m_daily.cooldown_until > time.time()
+                            else 0
+                        )
                         breakdown.append(
                             AccountBreakdownItem(
                                 account_id=acc.id,
@@ -100,7 +105,12 @@ def stats_response() -> StatsResponse:
                                 today_reasoning_tokens=m_daily.reasoning_tokens,
                                 configured_quota=quota,
                                 quota_used_percent=used_pct,
-                                is_available=acc.enabled and cd_rem == 0 and not st.session_expired,
+                                is_available=(
+                                    acc.enabled
+                                    and not acc.expired
+                                    and cd_rem == 0
+                                    and not st.session_expired
+                                ),
                                 cooldown_remaining=cd_rem,
                             )
                         )
@@ -117,6 +127,7 @@ def stats_response() -> StatsResponse:
             total_tokens=s.total_tokens,
             finish_reasons=dict(s.finish_reasons),
             last_used=s.last_used,
+            paid=is_paid_model(name),
             account_breakdown=breakdown,
         )
     return StatsResponse(models=models, totals=totals)

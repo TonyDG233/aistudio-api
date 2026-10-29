@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
     from aistudio_api.infrastructure.gateway.session import BrowserSession
 
+from aistudio_api.application.model_access import (
+    is_paid_model as _is_paid_model,
+    set_paid_models,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
     DEFAULT_API_KEY,
     DEFAULT_EXT_BIN,
@@ -171,6 +175,55 @@ class ModelDiscoveryService:
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
         self._lock = asyncio.Lock()
+        self._load_snapshot()
+
+    @property
+    def cache_ttl(self) -> int:
+        return self._cache_ttl
+
+    def _snapshot_path(self) -> Path:
+        from aistudio_api.config import settings
+
+        return Path(settings.model_cache_file)
+
+    def _load_snapshot(self) -> None:
+        try:
+            path = self._snapshot_path()
+            if not path.is_file():
+                return
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            models = payload.get("models") if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                return
+            loaded = [dict(item) for item in models if isinstance(item, dict)]
+            fetched_at = (
+                payload.get("fetched_at") if isinstance(payload, dict) else None
+            )
+            self._cached_models = loaded
+            self._last_fetched_at = (
+                float(fetched_at) if isinstance(fetched_at, (int, float)) else 0.0
+            )
+            set_paid_models(loaded)
+            logger.info("从快照加载了 %d 个模型", len(loaded))
+        except Exception as e:
+            logger.warning("读取模型快照失败: %s", e)
+
+    def _save_snapshot(self, models: list[dict[str, object]]) -> None:
+        if not models:
+            return
+        try:
+            from aistudio_api.infrastructure.utils.common import atomic_write_json
+
+            atomic_write_json(
+                self._snapshot_path(),
+                {
+                    "version": 1,
+                    "fetched_at": time.time(),
+                    "models": models,
+                },
+            )
+        except Exception as e:
+            logger.warning("写入模型快照失败: %s", e)
 
     async def get_models(
         self,
@@ -208,6 +261,8 @@ class ModelDiscoveryService:
                         models = await self._fetch_via_page(page)
                         if models:
                             self._cached_models = models
+                            set_paid_models(models)
+                            self._save_snapshot(models)
                             self._last_fetched_at = time.time()
                             logger.info(
                                 "通过 Page XHR 动态更新了 %d 个模型", len(models)
@@ -270,6 +325,8 @@ class ModelDiscoveryService:
                     )
                     if models:
                         self._cached_models = models
+                        set_paid_models(models)
+                        self._save_snapshot(models)
                         self._last_fetched_at = time.time()
                         logger.info("通过 HTTP RPC 动态更新了 %d 个模型", len(models))
                         return models
@@ -278,6 +335,15 @@ class ModelDiscoveryService:
             # 3. 保底返回本地默认模型列表
             if not self._cached_models:
                 self._cached_models = [dict(m) for m in _FALLBACK_MODELS]
+                set_paid_models(
+                    [
+                        {
+                            "id": str(m.get("id") or ""),
+                            "paid": _is_paid_model(str(m.get("id") or "")),
+                        }
+                        for m in self._cached_models
+                    ]
+                )
                 self._last_fetched_at = time.time()
 
             return self._cached_models
@@ -331,7 +397,11 @@ class ModelDiscoveryService:
         if not isinstance(raw_modes, list) or not raw_modes:
             return True
         norm_tier = (tier or "Free").strip().lower()
-        is_high_tier = norm_tier in ("plus", "pro", "ultra") or "ultra" in norm_tier or "pro" in norm_tier
+        is_high_tier = (
+            norm_tier in ("plus", "pro", "ultra")
+            or "ultra" in norm_tier
+            or "pro" in norm_tier
+        )
         is_ultra_tier = "ultra" in norm_tier
         for mode in raw_modes:
             if mode == 3 and is_high_tier:
@@ -342,49 +412,8 @@ class ModelDiscoveryService:
         return all(m not in (3, 4) for m in raw_modes)
 
     def is_paid_model(self, model_id: str) -> bool:
-        """判定目标模型是否为付费模型（由 config.yaml 的 paid_model_rules 严格驱动，结合 upstream accessModes）。"""
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_configured_paid_model_rules,
-        )
-
-        clean_m = model_id.removeprefix("models/").lower()
-        rules = get_configured_paid_model_rules()
-        for rule_cfg in rules.values():
-            if not isinstance(rule_cfg, dict):
-                continue
-            contains = [
-                str(c).lower()
-                for c in (rule_cfg.get("contains") or [])
-                if isinstance(c, str)
-            ]
-            prefixes = [
-                str(p).lower()
-                for p in (rule_cfg.get("prefixes") or [])
-                if isinstance(p, str)
-            ]
-            exact = [
-                str(e).removeprefix("models/").lower()
-                for e in (rule_cfg.get("exact") or [])
-                if isinstance(e, str)
-            ]
-            if (
-                (exact and clean_m in exact)
-                or any(clean_m.startswith(p) for p in prefixes)
-                or any(c in clean_m for c in contains)
-            ):
-                return True
-
-        info = self.get_cached_model_info(clean_m)
-        if info:
-            if info.get("paid") is True:
-                return True
-            modes = info.get("accessModes")
-            if isinstance(modes, list) and modes and all(m in (3, 4) for m in modes):
-                return True
-            codes = info.get("capabilityCodes")
-            if isinstance(codes, list) and 20 in codes:
-                return True
-        return False
+        """判定目标模型是否为付费模型（唯一来源：application.model_access）。"""
+        return _is_paid_model(model_id)
 
     def get_required_tier(self, model_id: str) -> str:
         """获取目标模型所需的最低账号层级（兼容现有单层级调用）。"""
@@ -588,7 +617,10 @@ class ModelDiscoveryService:
                     default_thinking_level = t_cfg[5]
                 if len(t_cfg) > 6:
                     thinking_levels = _extract_int_list(t_cfg[6])
-            paid = bool(len(item) > 77 and item[77] == 2)
+            # ListModels item[77] maps to protobuf field 78: 2 = Paid (Pro-only).
+            access_tier = (
+                item[77] if len(item) > 77 and isinstance(item[77], int) else None
+            )
             access_modes = _extract_int_list(item[82]) if len(item) > 82 else []
 
             # 过滤支持内容生成的模型
@@ -645,7 +677,8 @@ class ModelDiscoveryService:
                     "capabilityCodes": capability_codes,
                     "defaultThinkingLevel": default_thinking_level,
                     "thinkingLevels": thinking_levels,
-                    "paid": paid,
+                    "paid": access_tier == 2,
+                    "access_tier": access_tier,
                     "accessModes": access_modes,
                     "is_image_model": is_image,
                     "is_video_model": is_video,

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
         AccountMeta,
         AccountPreset,
         AccountStore,
+        PresetApplyResult,
     )
     from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -25,6 +26,11 @@ class AccountService:
         account_store: AccountStore,
     ) -> None:
         self._store = account_store
+
+    @property
+    def store(self) -> AccountStore:
+        """底层账号存储（供账号信息刷新器等复用同一注册表）。"""
+        return self._store
 
     def list_accounts(self) -> list[AccountMeta]:
         """列出所有账号。"""
@@ -92,7 +98,6 @@ class AccountService:
         tier: str = "Free",
         enabled: bool = True,
         group: str = "default",
-        notes: str = "",
     ) -> AccountMeta:
         """从 Cookie 存储状态保存新账号。"""
         return self._store.save_account(
@@ -105,7 +110,6 @@ class AccountService:
             tier=tier,
             enabled=enabled,
             group=group,
-            notes=notes,
         )
 
     def batch_import_accounts(
@@ -154,17 +158,19 @@ class AccountService:
         """更新账号所属分组。"""
         return self._store.update_account_group(account_id, group)
 
-    def update_account_notes(self, account_id: str, notes: str) -> AccountMeta | None:
-        """更新账号运维备注。"""
-        return self._store.update_account_notes(account_id, notes)
-
     def list_groups(self) -> list[str]:
         """列出当前存在的所有分组。"""
         return self._store.list_groups()
 
-    def batch_toggle_group(self, group: str, enabled: bool) -> list[AccountMeta]:
-        """按分组批量切换使能状态。"""
-        return self._store.batch_toggle_group(group, enabled)
+    def select_active_candidate(
+        self, *, exclude: set[str] | None = None
+    ) -> AccountMeta | None:
+        """选择首个 enabled 且未过期的账号作为 rebind 目标（不改写 active）。"""
+        return self._store.select_active_candidate(exclude=exclude)
+
+    def refresh_duplicate_flags(self) -> int:
+        """重算同邮箱重复账号标记。"""
+        return self._store.refresh_duplicate_flags()
 
     def list_presets(self) -> list[AccountPreset]:
         """列出所有预设方案。"""
@@ -186,8 +192,6 @@ class AccountService:
         """快照保存当前所有已启用账号。"""
         return self._store.create_snapshot_preset(name, description)
 
-    def apply_preset(
-        self, preset_id: str
-    ) -> tuple[AccountPreset, list[str], list[str]]:
-        """一键应用预设方案。"""
+    def apply_preset(self, preset_id: str) -> PresetApplyResult:
+        """一键应用预设方案（返回 rebind 信号，不提前改写 active）。"""
         return self._store.apply_preset(preset_id)

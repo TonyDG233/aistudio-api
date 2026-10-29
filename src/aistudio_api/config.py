@@ -43,6 +43,7 @@ def _load_int_env(*names: str, default: int) -> int:
         return default
     return int(value)
 
+
 def _load_web_password() -> str | None:
     return os.getenv("AISTUDIO_WEB_PASSWORD") or os.getenv("AISTUDIO_ADMIN_PASSWORD")
 
@@ -64,6 +65,7 @@ def _load_dump_to_file_env() -> bool:
     if val is None:
         return False
     return val.strip().lower() in ("1", "true", "yes", "on", "dump", "y", "t")
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
@@ -131,6 +133,16 @@ def resolve_rotator_state_file() -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
     return resolve_data_dir() / "rotator_state.json"
+
+
+def resolve_model_cache_file() -> Path:
+    """解析最后一次模型发现快照路径（优先使用 AISTUDIO_MODEL_CACHE_FILE）。"""
+    override = os.getenv("AISTUDIO_MODEL_CACHE_FILE")
+    if override:
+        path = Path(override).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    return resolve_data_dir() / "models_cache.json"
 
 
 _AUTH_SEARCH_ROOTS = [
@@ -264,6 +276,7 @@ class Settings:
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
     stats_file: str = str(resolve_stats_file())
     rotator_state_file: str = str(resolve_rotator_state_file())
+    model_cache_file: str = str(resolve_model_cache_file())
     config_file: str = str(resolve_config_file())
     persist_stats: bool = _load_bool_env("AISTUDIO_PERSIST_STATS", default=True)
     persist_rotator: bool = _load_bool_env("AISTUDIO_PERSIST_ROTATOR", default=True)

@@ -95,6 +95,7 @@ class ModelStatsResponse(BaseModel):
     total_tokens: int
     finish_reasons: dict[str, int] = {}
     last_used: str | None = None
+    paid: bool = False
     account_breakdown: list[AccountBreakdownItem] = []
 
 
@@ -113,6 +114,7 @@ class StatsTotalsResponse(BaseModel):
 class StatsResponse(BaseModel):
     models: dict[str, ModelStatsResponse]
     totals: StatsTotalsResponse
+
 
 class GeminiModelResponse(BaseModel):
     name: str

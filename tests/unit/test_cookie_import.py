@@ -159,6 +159,125 @@ def test_domain_overrides_scopes_osid_strictly_to_aistudio():
     assert ".google.com" not in _DOMAIN_OVERRIDES["__Secure-OSID"]
 
 
+def test_parse_storage_state_preserves_cross_domain_google_cookies():
+    raw = (
+        '[{"name":"LSID","value":"account","domain":"accounts.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"LSID","value":"root","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"OSID","value":"studio","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800}]'
+    )
+    state = parse_cookie_string(raw, discard_transient=False)
+    raw_state_cookies = state.get("cookies")
+    assert isinstance(raw_state_cookies, list)
+    values = {
+        (cookie["name"], cookie["domain"]): cookie["value"]
+        for cookie in raw_state_cookies
+        if isinstance(cookie, dict)
+    }
+    assert values[("LSID", "accounts.google.com")] == "account"
+    assert values[("LSID", ".google.com")] == "root"
+    assert values[("OSID", "aistudio.google.com")] == "studio"
+
+
+def test_parse_storage_state_external_import_discards_transient_cookies():
+    raw = (
+        '{"cookies":['
+        '{"name":"LSID","value":"account","domain":"accounts.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"LSID","value":"root","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"OSID","value":"studio","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"__Secure-OSID","value":"secure","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"SIDCC","value":"sidcc","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"_ga","value":"ga","domain":".google.com",'
+        '"path":"/","expires":4102444800}],'
+        '"origins":[{"origin":"https://aistudio.google.com","items":[]}]}'
+    )
+    state = parse_cookie_string(raw, discard_transient=True)
+    raw_state_cookies = state.get("cookies")
+    assert isinstance(raw_state_cookies, list)
+    keys = {
+        (cookie["name"], cookie["domain"])
+        for cookie in raw_state_cookies
+        if isinstance(cookie, dict)
+    }
+    assert keys == {
+        ("LSID", "accounts.google.com"),
+        ("LSID", ".google.com"),
+    }
+    assert state["origins"] == [{"origin": "https://aistudio.google.com", "items": []}]
+
+
+def test_parse_raw_cookies_prefers_canonical_domain_over_regional():
+    from aistudio_api.infrastructure.account.cookie_parser import parse_raw_cookies
+
+    raw = [
+        {"name": "SID", "value": "regional", "domain": ".google.com.sg"},
+        {"name": "SID", "value": "canonical", "domain": ".google.com"},
+    ]
+    assert parse_raw_cookies(raw)["SID"] == "canonical"
+
+
+def test_load_cookies_from_string_preserves_storage_state_without_refresh(
+    monkeypatch,
+):
+    def _fail(_: dict[str, str]) -> dict[str, str]:
+        raise AssertionError("storage-state 导入不得走 curl_cffi 刷新")
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_refresher._refresh_session_cookies",
+        _fail,
+    )
+    raw = (
+        '[{"name":"LSID","value":"account","domain":"accounts.google.com"},'
+        '{"name":"LSID","value":"root","domain":".google.com"}]'
+    )
+    cookies = load_cookies_from_string(raw)
+    by_key = {(cookie["name"], cookie["domain"]): cookie["value"] for cookie in cookies}
+    assert by_key[("LSID", "accounts.google.com")] == "account"
+    assert by_key[("LSID", ".google.com")] == "root"
+
+
+@pytest.mark.asyncio
+async def test_import_cookies_uses_monkeypatched_probes(tmp_path, monkeypatch):
+    """单份导入的 email/tier 探测必须可 monkeypatch，测试不访问真实网络。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.api import routes_accounts
+    from aistudio_api.api.routes_accounts import (
+        ImportCookiesRequest,
+        import_cookies,
+    )
+    from aistudio_api.api.state import RuntimeState
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    email_probe = AsyncMock(return_value="probed@example.com")
+    tier_probe = AsyncMock(return_value="Pro")
+    monkeypatch.setattr(routes_accounts, "probe_account_email", email_probe)
+    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", tier_probe)
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_import_probe")
+    svc = AccountService(store)
+    state = RuntimeState(account_service=svc, client=None, rotator=MagicMock())
+
+    response = await import_cookies(
+        ImportCookiesRequest(cookies="SID=sid; SAPISID=sapisid"),
+        account_service=svc,
+        runtime_state=state,
+    )
+    assert response.name
+    assert email_probe.await_count == 1
+    assert tier_probe.await_count == 1
+    assert store.get_account(response.account_id).tier == "Pro"  # type: ignore[union-attr]
+    assert store.get_account(response.account_id).email == "probed@example.com"  # type: ignore[union-attr]
+
+
 @pytest.mark.asyncio
 async def test_import_bundle_flow(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
@@ -172,7 +291,9 @@ async def test_import_bundle_flow(tmp_path, monkeypatch):
         routes_accounts, "probe_account_benefit_tier", AsyncMock(return_value="Free")
     )
     monkeypatch.setattr(
-        routes_accounts, "probe_account_email", AsyncMock(return_value="mock@example.com")
+        routes_accounts,
+        "probe_account_email",
+        AsyncMock(return_value="mock@example.com"),
     )
     store = AccountStore(accounts_dir=tmp_path / "accounts")
     svc = AccountService(store)

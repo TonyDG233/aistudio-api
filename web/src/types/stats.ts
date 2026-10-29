@@ -29,6 +29,7 @@ export interface ModelStatItem {
   total_tokens: number
   finish_reasons?: Record<string, number>
   last_used?: string | null
+  paid?: boolean
   account_breakdown?: AccountBreakdownItem[]
 }
 

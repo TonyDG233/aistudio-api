@@ -410,15 +410,28 @@ class AccountStats:
             or isinstance(old_model_drips, dict)
         ):
             all_keys: set[str] = set()
-            for source in (old_model_reqs, old_model_cds, old_model_rates, old_model_drips):
+            for source in (
+                old_model_reqs,
+                old_model_cds,
+                old_model_rates,
+                old_model_drips,
+            ):
                 if isinstance(source, dict):
                     all_keys.update(str(k) for k in source)
             for m_k in all_keys:
                 daily_models[str(m_k)] = AccountModelDailyStats(
-                    requests=_as_int(old_model_reqs.get(m_k)) if isinstance(old_model_reqs, dict) else 0,
-                    rate_limited=_as_int(old_model_rates.get(m_k)) if isinstance(old_model_rates, dict) else 0,
-                    cooldown_until=_as_float(old_model_cds.get(m_k)) if isinstance(old_model_cds, dict) else 0.0,
-                    drip_mode=bool(old_model_drips.get(m_k)) if isinstance(old_model_drips, dict) else False,
+                    requests=_as_int(old_model_reqs.get(m_k))
+                    if isinstance(old_model_reqs, dict)
+                    else 0,
+                    rate_limited=_as_int(old_model_rates.get(m_k))
+                    if isinstance(old_model_rates, dict)
+                    else 0,
+                    cooldown_until=_as_float(old_model_cds.get(m_k))
+                    if isinstance(old_model_cds, dict)
+                    else 0.0,
+                    drip_mode=bool(old_model_drips.get(m_k))
+                    if isinstance(old_model_drips, dict)
+                    else False,
                 )
         return cls(
             account_id=str(data.get("account_id") or ""),
@@ -529,7 +542,7 @@ class AccountRotator:
     def is_account_available(self, account_id: str, model: str | None = None) -> bool:
         """检查指定账号在特定模型下是否可用（遵循使能开关、登录态与真 429 冷却）。"""
         account = self._store.get_account(account_id)
-        if not account or not account.enabled:
+        if not account or not account.enabled or getattr(account, "expired", False):
             return False
         stats = self.get_account_stats(account_id)
         return bool(stats and stats.is_available(model))
@@ -591,7 +604,6 @@ class AccountRotator:
                 "tier": tier_str,
                 "enabled": account.enabled,
                 "group": account.group,
-                "notes": account.notes,
                 "requests": stats.total_requests,
                 "success": stats.total_success,
                 "rate_limited": stats.total_rate_limited,
@@ -608,7 +620,11 @@ class AccountRotator:
                     if stats.last_rate_limited
                     else None
                 ),
-                "is_available": account.enabled and stats.is_available(),
+                "is_available": (
+                    account.enabled
+                    and not getattr(account, "expired", False)
+                    and stats.is_available()
+                ),
                 "session_expired": stats.session_expired,
                 "auth_cooldown": max(0, int(stats.auth_cooldown - time.time()))
                 if stats.auth_cooldown > time.time()
@@ -643,8 +659,8 @@ class AccountRotator:
         candidates: list[tuple[AccountMeta, AccountStats]] = []
 
         for account in accounts:
-            # 1. 主开关门禁
-            if not account.enabled:
+            # 1. 主开关与凭据过期门禁
+            if not account.enabled or getattr(account, "expired", False):
                 continue
             # 2. 业务分组过滤
             if active_groups and account.group not in active_groups:
@@ -657,9 +673,7 @@ class AccountRotator:
                 account.id, AccountStats(account_id=account.id)
             )
             # 4. 登录态与真 429/403 冷却检查
-            if not stats.is_available(
-                model, ignore_auth_cooldown=ignore_auth_cooldown
-            ):
+            if not stats.is_available(model, ignore_auth_cooldown=ignore_auth_cooldown):
                 continue
 
             candidates.append((account, stats))
@@ -852,9 +866,7 @@ class AccountRotator:
         for gid in ghost_ids:
             self._stats.pop(gid, None)
         if ghost_ids:
-            logger.info(
-                "已清理 %d 个幽灵账号残留状态: %s", len(ghost_ids), ghost_ids
-            )
+            logger.info("已清理 %d 个幽灵账号残留状态: %s", len(ghost_ids), ghost_ids)
             self.save_state()
         return ghost_ids
 
@@ -866,4 +878,3 @@ def init_rotator(account_store: AccountStore) -> AccountRotator:
     global _rotator
     _rotator = AccountRotator(account_store)
     return _rotator
-

@@ -12,6 +12,10 @@ from aistudio_api.api.dependencies import (
     get_account_service,
     get_runtime_state,
 )
+from aistudio_api.infrastructure.account.account_info_refresher import (
+    AccountInfoRefresher,
+    RefreshInProgressError,
+)
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.account.cookie_parser import (
     parse_cookie_string,
@@ -29,6 +33,22 @@ log = get_logger("accounts")
 
 router = APIRouter(prefix="/accounts")
 
+# 账号信息刷新器单例（进程内互斥标志由刷新器自身持有）。
+_refresher_singleton: AccountInfoRefresher | None = None
+
+
+def get_account_info_refresher(
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> AccountInfoRefresher:
+    """优先复用 lifespan 创建的共享刷新器，测试可依赖覆盖。"""
+    global _refresher_singleton
+    if isinstance(runtime_state.account_refresher, AccountInfoRefresher):
+        return runtime_state.account_refresher
+    if _refresher_singleton is None:
+        _refresher_singleton = AccountInfoRefresher(account_service.store)
+    return _refresher_singleton
+
 
 class AccountResponse(BaseModel):
     id: str
@@ -39,9 +59,15 @@ class AccountResponse(BaseModel):
     auth_user: str = "0"
     cookie_id: str | None = None
     tier: str = "Free"
+    tier_checked_at: str | None = None
+    expired: bool = False
+    duplicate_of: str | None = None
     enabled: bool = True
     group: str = "default"
-    notes: str = ""
+    rebind_required: bool = False
+    previous_active_account_id: str | None = None
+    active_account_id: str | None = None
+    target_account: AccountResponse | None = None
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -59,9 +85,11 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         auth_user=getattr(account, "auth_user", "0") or "0",
         cookie_id=cid,
         tier=getattr(account, "tier", "Free") or "Free",
+        tier_checked_at=getattr(account, "tier_checked_at", None),
+        expired=bool(getattr(account, "expired", False)),
+        duplicate_of=getattr(account, "duplicate_of", None),
         enabled=getattr(account, "enabled", True),
         group=getattr(account, "group", "default") or "default",
-        notes=getattr(account, "notes", "") or "",
     )
 
 
@@ -73,12 +101,38 @@ class UpdateGroupRequest(BaseModel):
     group: str
 
 
-class UpdateNotesRequest(BaseModel):
-    notes: str
-
-
 class ToggleAccountRequest(BaseModel):
     enabled: bool | None = None
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
+class BatchDeleteResponse(BaseModel):
+    deleted: int
+
+
+class RefreshAccountsRequest(BaseModel):
+    account_ids: list[str] | None = None
+    all: bool = False
+    refresh_email: bool = True
+
+
+class RefreshAccountResult(BaseModel):
+    id: str
+    ok: bool
+    tier: str | None = None
+    expired: bool | None = None
+    email: str | None = None
+    error: str | None = None
+    checked_at: str | None = None
+
+
+class RefreshAccountsResponse(BaseModel):
+    results: list[RefreshAccountResult]
+    refreshed_count: int
+    expired_count: int
 
 
 class PresetResponse(BaseModel):
@@ -116,6 +170,11 @@ class ApplyPresetResponse(BaseModel):
     disabled_count: int
     enabled_account_ids: list[str]
     disabled_account_ids: list[str]
+    rebind_required: bool = False
+    previous_active_account_id: str | None = None
+    active_account_id: str | None = None
+    target_account: AccountResponse | None = None
+
 
 class ImportCookiesRequest(BaseModel):
     cookies: str
@@ -184,6 +243,71 @@ async def get_active_account(
     if account is None:
         raise HTTPException(status_code=404, detail="没有活跃账号")
     return to_account_response(account)
+
+
+@router.post("/refresh", response_model=RefreshAccountsResponse)
+async def refresh_accounts(
+    req: RefreshAccountsRequest = Body(...),
+    account_service: AccountService = Depends(get_account_service),
+    refresher: AccountInfoRefresher = Depends(get_account_info_refresher),
+) -> RefreshAccountsResponse:
+    """刷新账号信息（tier/过期/邮箱）。"""
+    requested = [str(a) for a in (req.account_ids or []) if str(a).strip()]
+    if not req.all and not requested:
+        raise HTTPException(
+            status_code=400,
+            detail="必须提供 account_ids 或设置 all=true",
+        )
+
+    if req.all:
+        targets = account_service.list_accounts()
+        ordered_ids = [account.id for account in targets]
+    else:
+        ordered_ids = requested
+        targets = []
+        for account_id in ordered_ids:
+            account = account_service.get_account(account_id)
+            if account is not None:
+                targets.append(account)
+
+    try:
+        refreshed = await refresher.refresh_accounts(
+            targets, refresh_email=req.refresh_email
+        )
+    except RefreshInProgressError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"账号信息刷新正在进行中，请稍后再试: {e}",
+        ) from e
+
+    by_id = {result.account_id: result for result in refreshed}
+    results: list[RefreshAccountResult] = []
+    for account_id in ordered_ids:
+        result = by_id.get(account_id)
+        if result is None:
+            results.append(
+                RefreshAccountResult(id=account_id, ok=False, error="账号不存在")
+            )
+        else:
+            results.append(
+                RefreshAccountResult(
+                    id=result.account_id,
+                    ok=result.ok,
+                    tier=result.tier,
+                    expired=result.expired,
+                    email=result.email,
+                    error=result.error,
+                    checked_at=result.checked_at,
+                )
+            )
+
+    expired_count = sum(1 for r in results if r.expired is True)
+    log.info("账号信息刷新完成: 目标 %d 个, 过期 %d 个", len(results), expired_count)
+    return RefreshAccountsResponse(
+        results=results,
+        refreshed_count=len(results),
+        expired_count=expired_count,
+    )
 
 
 @router.post("/{account_id}/activate", response_model=AccountResponse)
@@ -364,8 +488,7 @@ async def delete_account(
     if runtime_state.rotator:
         runtime_state.rotator.remove_account(account_id)
     if is_active:
-        remaining_accounts = account_service.list_accounts()
-        new_active = remaining_accounts[0] if remaining_accounts else None
+        new_active = account_service.select_active_candidate()
         browser_session = (
             runtime_state.client._session if runtime_state.client else None
         )
@@ -382,6 +505,39 @@ async def delete_account(
 
     log.info("已删除账号: %s", account_id)
     return {"ok": True}
+
+
+@router.post("/batch-delete", response_model=BatchDeleteResponse)
+async def batch_delete_accounts(
+    req: BatchDeleteRequest,
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> BatchDeleteResponse:
+    """批量删除账号（去重），并在删除活跃账号后显式迁移。"""
+    active = account_service.get_active_account()
+    active_id = active.id if active is not None else None
+    deleted_ids: list[str] = []
+    for account_id in dict.fromkeys(str(i) for i in req.ids if str(i).strip()):
+        if account_service.delete_account(account_id):
+            deleted_ids.append(account_id)
+            if runtime_state.rotator:
+                runtime_state.rotator.remove_account(account_id)
+    if active_id in deleted_ids:
+        new_active = account_service.select_active_candidate()
+        browser_session = (
+            runtime_state.client._session if runtime_state.client else None
+        )
+        if new_active is not None:
+            account_service.set_active_account(new_active.id)
+            if browser_session is not None:
+                new_auth_path = account_service.get_account_auth_path(new_active.id)
+                await browser_session.switch_auth(
+                    str(new_auth_path) if new_auth_path else None
+                )
+        elif browser_session is not None:
+            await browser_session.switch_auth(None)
+    log.info("批量删除账号完成: %d 个", len(deleted_ids))
+    return BatchDeleteResponse(deleted=len(deleted_ids))
 
 
 @router.delete("/group/{cookie_id}")
@@ -410,8 +566,7 @@ async def delete_cookie_group(
                 log.info("已删除组 %s 下的子账号 %s", cookie_id, a.id)
 
     if active_deleted:
-        remaining_accounts = account_service.list_accounts()
-        new_active = remaining_accounts[0] if remaining_accounts else None
+        new_active = account_service.select_active_candidate()
         browser_session = (
             runtime_state.client._session if runtime_state.client else None
         )
@@ -449,24 +604,42 @@ async def toggle_account(
     req: ToggleAccountRequest = Body(default_factory=ToggleAccountRequest),
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
-    """切换单个账号的使能状态 (Enabled/Disabled)。"""
+    """切换单个账号的使能状态 (Enabled/Disabled)。
+
+    D-05：在改写 enabled 前捕获旧 active；若旧 active 被禁用，返回显式
+    rebind 信号与目标账号，不在本步骤直接改写 active 或切浏览器。
+    """
+    previous_active = account_service.get_active_account()
     account = account_service.toggle_account_enabled(account_id, req.enabled)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    # 如果刚好关闭了当前活跃账号，顺延切到下一个可用账号
-    active_acc = account_service.get_active_account()
-    if active_acc and active_acc.id == account_id and not account.enabled:
-        from aistudio_api.application.account_orchestrator import try_switch_account
-
-        await try_switch_account(failed_account_id=account_id)
+    response = to_account_response(account)
+    if (
+        previous_active is not None
+        and previous_active.id == account.id
+        and not account.enabled
+    ):
+        target = account_service.select_active_candidate(exclude={account.id})
+        response.rebind_required = True
+        response.previous_active_account_id = previous_active.id
+        response.active_account_id = target.id if target is not None else None
+        response.target_account = (
+            to_account_response(target) if target is not None else None
+        )
+        log.info(
+            "账号 %s 已停用，等待有界 rebind: %s -> %s",
+            account.id,
+            previous_active.id,
+            target.id if target is not None else None,
+        )
 
     log.info(
         "账号使能状态已切换: %s -> %s",
         account.id,
         "启用" if account.enabled else "停用",
     )
-    return to_account_response(account)
+    return response
 
 
 @router.put("/{account_id}/group", response_model=AccountResponse)
@@ -483,41 +656,12 @@ async def update_account_group(
     return to_account_response(account)
 
 
-@router.put("/{account_id}/notes", response_model=AccountResponse)
-async def update_account_notes(
-    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
-    req: UpdateNotesRequest = Body(...),
-    account_service: AccountService = Depends(get_account_service),
-) -> AccountResponse:
-    """更新账号备注。"""
-    account = account_service.update_account_notes(account_id, req.notes)
-    if account is None:
-        raise HTTPException(status_code=404, detail="账号不存在")
-    return to_account_response(account)
-
-
 @router.get("/groups/list", response_model=list[str])
 async def list_groups(
     account_service: AccountService = Depends(get_account_service),
 ) -> list[str]:
     """列出当前存在的所有分组名称。"""
     return account_service.list_groups()
-
-
-@router.post("/groups/{group_name}/toggle")
-async def batch_toggle_group(
-    group_name: str,
-    enabled: bool = Body(..., embed=True),
-    account_service: AccountService = Depends(get_account_service),
-) -> dict[str, object]:
-    """按分组批量启用或停用账号。"""
-    updated = account_service.batch_toggle_group(group_name, enabled)
-    active_acc = account_service.get_active_account()
-    if active_acc and active_acc.group == group_name and not enabled:
-        from aistudio_api.application.account_orchestrator import try_switch_account
-
-        await try_switch_account(failed_account_id=active_acc.id)
-    return {"ok": True, "count": len(updated), "group": group_name, "enabled": enabled}
 
 
 # ─── 预设方案 (Presets) REST 路由 ───
@@ -586,35 +730,37 @@ async def apply_preset(
     preset_id: str,
     account_service: AccountService = Depends(get_account_service),
 ) -> ApplyPresetResponse:
-    """一键应用预设方案，原子切换账号使能状态。"""
+    """一键应用预设方案。
+
+    D-05：在改写 enabled 前捕获旧 active；若旧 active 被禁用，返回显式
+    rebind 信号与目标账号，不在此步骤直接改写 active 或切浏览器。
+    """
     try:
-        preset, en_ids, dis_ids = account_service.apply_preset(preset_id)
-        # 检查当前活跃账号是否有效，若失效则顺延切换
-        active_acc = account_service.get_active_account()
-        from aistudio_api.application.account_orchestrator import try_switch_account
-
-        if not active_acc or not active_acc.enabled or active_acc.id in dis_ids:
-            await try_switch_account(failed_account_id=active_acc.id if active_acc else None)
-        else:
-            await try_switch_account()
-
-        log.info(
-            "已应用预设方案 '%s': 启用 %d 个, 停用 %d 个",
-            preset.name,
-            len(en_ids),
-            len(dis_ids),
-        )
-        return ApplyPresetResponse(
-            ok=True,
-            preset_id=preset.id,
-            preset_name=preset.name,
-            enabled_count=len(en_ids),
-            disabled_count=len(dis_ids),
-            enabled_account_ids=en_ids,
-            disabled_account_ids=dis_ids,
-        )
+        result = account_service.apply_preset(preset_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+    log.info(
+        "已应用预设方案 '%s': 启用 %d 个, 停用 %d 个, rebind=%s",
+        result.preset.name,
+        len(result.enabled_account_ids),
+        len(result.disabled_account_ids),
+        result.rebind_required,
+    )
+    target = result.target_account
+    return ApplyPresetResponse(
+        ok=True,
+        preset_id=result.preset.id,
+        preset_name=result.preset.name,
+        enabled_count=len(result.enabled_account_ids),
+        disabled_count=len(result.disabled_account_ids),
+        enabled_account_ids=result.enabled_account_ids,
+        disabled_account_ids=result.disabled_account_ids,
+        rebind_required=result.rebind_required,
+        previous_active_account_id=result.previous_active_account_id,
+        active_account_id=result.active_account_id,
+        target_account=to_account_response(target) if target is not None else None,
+    )
 
 
 @router.post("/import-cookies", response_model=ImportCookiesResponse)
