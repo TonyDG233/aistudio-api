@@ -77,6 +77,7 @@ async def _shutdown_runtime(
     state.instance_manager = None
     state.client = None
     state.account_service = None
+    state.account_refresher = None
     state.rotator = None
 
 
@@ -86,6 +87,9 @@ async def lifespan(_app: FastAPI):
 
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        AccountInfoRefresher,
+    )
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.browser.browser_engine import (
         install_process_cleanup_handlers,
@@ -102,6 +106,8 @@ async def lifespan(_app: FastAPI):
     account_store = AccountStore()
     account_service = AccountService(account_store)
     runtime_state.account_service = account_service
+    # P1 只做接线：刷新器供手动 /refresh 与后续 P6 调度复用，不启动 24h 任务。
+    runtime_state.account_refresher = AccountInfoRefresher(account_store)
 
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
@@ -172,6 +178,7 @@ async def lifespan(_app: FastAPI):
                                     )
                     except Exception:
                         pass
+
     tier_task = asyncio.create_task(_auto_refresh_tiers())
 
     # P3-D04/P6 接线钩子占位：真实 InstanceManager/Keepalive 在后续步骤装配
@@ -188,7 +195,9 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
-app.include_router(accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)])
+app.include_router(
+    accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
@@ -246,7 +255,9 @@ async def logging_and_dump_middleware(request, call_next):
     if dump_enabled:
         req_id = f"req_{secrets.token_hex(4)}"
         client_str = (
-            f"{request.client.host}:{request.client.port}" if request.client else "unknown"
+            f"{request.client.host}:{request.client.port}"
+            if request.client
+            else "unknown"
         )
         headers_dict = dict(request.headers)
         query_dict = dict(request.query_params)
@@ -378,7 +389,9 @@ async def spa_navigation_middleware(request: Request, call_next):
     if is_html_nav and (is_accounts_spa or not is_api) and index_html_path.is_file():
         response = FileResponse(index_html_path)
         response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
         return response
 
     response = await call_next(request)
@@ -390,7 +403,9 @@ async def spa_navigation_middleware(request: Request, call_next):
                 response.headers["Vary"] = f"{existing_vary}, Accept"
         else:
             response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
 
     return response
 
@@ -401,7 +416,9 @@ async def root_index():
     if index_html_path.is_file():
         response = FileResponse(index_html_path)
         response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
         return response
     return JSONResponse({"message": "AI Studio API Web UI"})
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from aistudio_api.domain.errors import SessionExpiredError
+from aistudio_api.infrastructure.account.account_store import write_storage_state
 from aistudio_api.infrastructure.account.cookie_parser import (
     DEFAULT_API_KEY,
     DEFAULT_EXT_BIN,
@@ -117,10 +119,14 @@ def get_aistudio_urls(
 
 
 async def load_cookies_to_page(page: CDPPage, auth_file: str | None) -> bool:
-    """Inject cookies from auth_file into target page with session-conflict filtering."""
+    """Inject the account's full cookie set from auth_file into the target page.
+
+    Generation authorization needs the account-scoped cookies (accounts.google.com
+    and OSID/__Secure-OSID). Filtering them out leaves a page that looks logged in
+    but gets ``The caller does not have permission`` from the upstream RPC.
+    """
     if not auth_file or not Path(auth_file).is_file():
         return False
-    page.account_auth_file = auth_file
     try:
         with suppress(Exception):
             await page.cdp.send("Network.clearBrowserCookies")
@@ -131,22 +137,10 @@ async def load_cookies_to_page(page: CDPPage, auth_file: str | None) -> bool:
         if not cookies:
             return False
 
-        cleaned_cookies = [
-            c
-            for c in cookies
-            if str(c.get("name") or "")
-            not in {
-                "OSID",
-                "__Secure-OSID",
-                "SIDCC",
-                "__Secure-1PSIDCC",
-                "__Secure-3PSIDCC",
-            }
-        ]
-        await page.set_cookies(cleaned_cookies or cookies)
+        await page.set_cookies(cookies)
         log.info(
             "已向页面载入 %d 个 Cookie (auth_file=%s)",
-            len(cleaned_cookies or cookies),
+            len(cookies),
             auth_file,
         )
         return True
@@ -363,32 +357,75 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
     return is_verified
 
 
+def _cookie_key(cookie: dict[str, object]) -> tuple[str, str, str]:
+    """Identify a cookie by name + domain + path so cross-domain twins survive."""
+    return (
+        str(cookie.get("name") or ""),
+        str(cookie.get("domain") or ""),
+        str(cookie.get("path") or "/"),
+    )
+
+
+def _is_expired(cookie: dict[str, object]) -> bool:
+    expires = cookie.get("expires")
+    return isinstance(expires, (int, float)) and 0 < expires < time.time()
+
+
+def _merge_cookies(
+    existing: list[dict[str, object]],
+    current: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Merge page cookies into the stored set instead of replacing it.
+
+    ``page.get_cookies()`` can omit cookies that do not apply to the current page
+    (notably accounts.google.com and OSID). Replacing the auth file with that
+    reduced set permanently drops the cookies required for upstream authorization.
+    Current page values win for the same identity; non-expired stored cookies are
+    retained.
+    """
+    merged: dict[tuple[str, str, str], dict[str, object]] = {}
+    for cookie in existing:
+        if isinstance(cookie, dict) and not _is_expired(cookie):
+            merged[_cookie_key(cookie)] = cookie
+    for cookie in current:
+        if isinstance(cookie, dict):
+            merged[_cookie_key(cookie)] = cookie
+    return list(merged.values())
+
+
 async def save_browser_cookies(
     page: CDPPage,
     auth_file: str | None,
     cookies: list[dict[str, object]] | None = None,
-) -> None:
+) -> bool:
     """Save browser cookies back to auth_file JSON atomically."""
     if not auth_file:
-        return
+        return False
     try:
         current_cookies = cookies
         if current_cookies is None:
             if page.is_closed():
-                return
+                return False
             current_cookies = await page.get_cookies()
         if not current_cookies:
-            return
+            return False
+        existing_cookies: list[dict[str, object]] = []
         auth_path = Path(auth_file)
-        origins = []
-        if auth_path.exists():
+        if auth_path.is_file():
             with suppress(Exception):
-                existing = json.loads(auth_path.read_text(encoding="utf-8"))
-                origins = existing.get("origins", [])
-        atomic_write_json(auth_path, {"cookies": current_cookies, "origins": origins})
-        log.info("已保存 %d 个 Cookie 至 %s", len(current_cookies), auth_file)
+                stored = json.loads(auth_path.read_text(encoding="utf-8"))
+                raw_cookies = stored.get("cookies")
+                if isinstance(raw_cookies, list):
+                    existing_cookies = [
+                        cookie for cookie in raw_cookies if isinstance(cookie, dict)
+                    ]
+        merged_cookies = _merge_cookies(existing_cookies, current_cookies)
+        write_storage_state(auth_file, cookies=merged_cookies)
+        log.info("已保存 %d 个 Cookie 至 %s", len(merged_cookies), auth_file)
+        return True
     except Exception as e:
         log.debug("保存 Cookie 失败: %s", e)
+        return False
 
 
 async def bootstrap_google_session(page: CDPPage) -> None:

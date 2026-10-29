@@ -9,9 +9,15 @@ export interface Account {
   auth_user: string
   cookie_id?: string | null
   tier?: string
+  tier_checked_at?: string | null
+  expired?: boolean
+  duplicate_of?: string | null
   enabled: boolean
   group: string
-  notes?: string
+  rebind_required?: boolean
+  previous_active_account_id?: string | null
+  active_account_id?: string | null
+  target_account?: Account | null
 }
 
 export type AccountWithStats = Omit<Account, 'last_used' | 'auth_user' | 'email'> &
@@ -56,6 +62,10 @@ export interface ApplyPresetResponse {
   disabled_count: number
   enabled_account_ids: string[]
   disabled_account_ids: string[]
+  rebind_required?: boolean
+  previous_active_account_id?: string | null
+  active_account_id?: string | null
+  target_account?: Account | null
 }
 
 export interface ImportCookiesRequest {

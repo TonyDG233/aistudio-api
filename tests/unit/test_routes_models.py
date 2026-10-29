@@ -29,6 +29,8 @@ async def test_list_models_returns_gemini_format(monkeypatch):
         assert "displayName" in first
         assert "supportedGenerationMethods" in first
         assert "generateContent" in first["supportedGenerationMethods"]
+        assert "paid" not in first
+        assert "access_tier" not in first
 
 
 @pytest.mark.asyncio
@@ -169,6 +171,7 @@ async def test_model_discovery_extended_fields_and_aliases():
     assert "google_maps" in caps
     assert "url_context" in caps
     assert m["paid"] is True
+    assert m["access_tier"] == 2
     assert m["accessModes"] == [4]
 
     svc._cached_models = parsed

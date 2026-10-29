@@ -22,7 +22,6 @@ export interface AccountRotationStats {
   tier?: string
   enabled?: boolean
   group?: string
-  notes?: string
   requests: number
   success: number
   rate_limited: number
