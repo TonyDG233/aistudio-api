@@ -294,7 +294,7 @@ class Settings:
         "True",
     )
     dump_raw_response_dir: str = os.getenv(
-        "AISTUDIO_DUMP_RAW_RESPONSE_DIR", tempfile.gettempdir()
+        "AISTUDIO_DUMP_RAW_RESPONSE_DIR", str(resolve_data_dir() / "dumps")
     )
     data_dir: str = str(resolve_data_dir())
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
@@ -306,7 +306,9 @@ class Settings:
     persist_rotator: bool = _load_bool_env("AISTUDIO_PERSIST_ROTATOR", default=True)
     dump_requests: bool = _load_dump_requests_env()
     dump_to_file: bool = _load_dump_to_file_env()
-    dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", str(_PROJECT_ROOT / "dumps"))
+    dump_dir: str = os.getenv(
+        "AISTUDIO_DUMP_DIR", str(resolve_data_dir() / "dumps")
+    )
     log_level: str = "INFO"
 
     @property

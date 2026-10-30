@@ -7,6 +7,7 @@ variable or web configuration.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -16,8 +17,51 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aistudio_api.infrastructure.utils.log_broadcast import (
+    BroadcastHandler,
+    DailyLogFileHandler,
+    cleanup_old_logs,
+    sanitize_log_message,
+)
+
 _UNIFIED_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 _UNIFIED_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Third-party / transport namespaces whose DEBUG output drowns the log bus.
+# ``get_logger("cdp")`` resolves to ``aistudio.cdp``, so every noisy namespace
+# must be listed in both its literal and ``aistudio.``-prefixed forms, and
+# matching is prefix-based so future children inherit the suppression.
+_NOISY_LOGGER_PREFIXES = (
+    "websockets",
+    "httpx",
+    "httpcore",
+    "uvicorn.access",
+    "playwright",
+    "warp",
+    "tunnel",
+    "cdp",
+    "aistudio.warp",
+    "aistudio.tunnel",
+    "aistudio.cdp",
+    "aistudio.browser.cdp",
+)
+
+
+def _is_noisy_logger(name: str) -> bool:
+    """Return True when ``name`` is a noisy namespace or one of its children."""
+    return any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for prefix in _NOISY_LOGGER_PREFIXES
+    )
+
+
+class NoisyLoggerFilter(logging.Filter):
+    """Drop below-WARNING records from noisy namespaces at the sink level."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.levelno < logging.WARNING and _is_noisy_logger(record.name)
+        )
 
 # ANSI Color codes for TTY output
 _COLORS = {
@@ -54,10 +98,24 @@ class UnifiedFormatter(logging.Formatter):
 
 
 _root_handler: logging.Handler | None = None
+_broadcast_handler: BroadcastHandler | None = None
+_file_handler: DailyLogFileHandler | None = None
 _current_level: str = "INFO"
 _dump_requests_override: bool | None = None
 _dump_to_file_override: bool | None = None
 _dump_dir_override: str | None = None
+_noisy_filter = NoisyLoggerFilter()
+
+
+def _resolve_dump_path(value: str | Path) -> Path:
+    """Resolve a dump directory, keeping relative paths under the data dir."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        from aistudio_api.config import resolve_data_dir
+
+        path = resolve_data_dir() / path
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def is_dump_to_file_enabled() -> bool:
@@ -107,18 +165,17 @@ def set_dump_to_file(enabled: bool | None) -> None:
 
 
 def get_dump_dir() -> Path:
-    """获取或创建请求转储文件存放目录。"""
-    global _dump_dir_override
+    """获取或创建请求转储文件存放目录。
+
+    默认与相对路径最终都落在 ``resolve_data_dir()/dumps`` 下，绝不落到
+    ``src/dumps`` 或仓库根目录。
+    """
     if _dump_dir_override:
-        p = Path(_dump_dir_override)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return _resolve_dump_path(_dump_dir_override)
 
     val = os.getenv("AISTUDIO_DUMP_DIR")
     if val and val.strip():
-        p = Path(val.strip())
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return _resolve_dump_path(val.strip())
 
     try:
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -128,23 +185,13 @@ def get_dump_dir() -> Path:
         cfg = get_configured_logging_settings()
         custom_dir = str(cfg.get("dump_dir") or "").strip()
         if custom_dir:
-            p = Path(custom_dir)
-            p.mkdir(parents=True, exist_ok=True)
-            return p
+            return _resolve_dump_path(custom_dir)
     except Exception:
         pass
 
-    from aistudio_api.config import settings
+    from aistudio_api.config import resolve_data_dir
 
-    cfg_dir = getattr(settings, "dump_dir", None)
-    if cfg_dir and str(cfg_dir).strip():
-        p = Path(str(cfg_dir).strip())
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    default_dir = Path(__file__).resolve().parents[3] / "dumps"
-    default_dir.mkdir(parents=True, exist_ok=True)
-    return default_dir
+    return _resolve_dump_path(resolve_data_dir() / "dumps")
 
 
 def set_dump_dir(dump_dir: str | Path | None) -> None:
@@ -234,32 +281,59 @@ def set_log_level(level: str | int) -> None:
     _current_level = level_name
 
     root = logging.getLogger()
-    root.setLevel(numeric_level)
+    # root/aistudio 固定 DEBUG：广播与归档 sink 需要完整日志；stderr 单独过滤。
+    root.setLevel(logging.DEBUG)
 
     aistudio_logger = logging.getLogger("aistudio")
-    aistudio_logger.setLevel(numeric_level)
+    aistudio_logger.setLevel(logging.DEBUG)
 
     # 同步更新已挂载的 handler 级别
     if _root_handler:
         _root_handler.setLevel(numeric_level)
+    if _broadcast_handler:
+        _broadcast_handler.setLevel(logging.DEBUG)
+    if _file_handler:
+        _file_handler.setLevel(logging.DEBUG)
 
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         logging.getLogger(logger_name).setLevel(numeric_level)
+    logging.getLogger("uvicorn.access").setLevel(numeric_level)
+
+    # D09-035：三方/传输噪音固定 WARNING，root 仍保留 DEBUG。
+    for logger_name in _NOISY_LOGGER_PREFIXES:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def setup_logging(level: str | int = "INFO") -> None:
-    """初始化全局日志系统并统一所有子系统的格式与输出。"""
-    global _root_handler
+    """初始化全局日志系统：stderr + broadcast + daily file 三 sink。"""
+    global _root_handler, _broadcast_handler, _file_handler
     formatter = UnifiedFormatter()
 
     if _root_handler is None:
         _root_handler = logging.StreamHandler(sys.stderr)
-        _root_handler.setFormatter(formatter)
-        root = logging.getLogger()
-        root.handlers.clear()
-        root.addHandler(_root_handler)
-    else:
-        _root_handler.setFormatter(formatter)
+    _root_handler.setFormatter(formatter)
+
+    if _broadcast_handler is None:
+        _broadcast_handler = BroadcastHandler()
+    if _file_handler is None:
+        _file_handler = DailyLogFileHandler()
+
+    # 保底过滤：即使某个噪音子 logger 被显式设为 DEBUG，也不让其低于
+    # WARNING 的记录进入 stderr / ring / 每日归档。
+    for handler in (_root_handler, _broadcast_handler, _file_handler):
+        if _noisy_filter not in handler.filters:
+            handler.addFilter(_noisy_filter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(_root_handler)
+    root.addHandler(_broadcast_handler)
+    root.addHandler(_file_handler)
+    root.setLevel(logging.DEBUG)
+
+    # 启动时清理超过 7 天的归档；跨天切换时由文件 handler 再次清理。
+    with contextlib.suppress(OSError):
+        cleanup_old_logs()
 
     # 将 uvicorn 的日志器也接入统一格式
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
@@ -284,18 +358,19 @@ def get_logger(name: str = "aistudio") -> logging.Logger:
 dump_logger = get_logger("dump")
 
 _SENSITIVE_FIELD_RE = re.compile(
-    r"(?i)(authorization|api[_-]?key|cookie|set-cookie|token|secret|password|auth)"
+    r"(?i)(authorization|api[_-]?key|cookie|set-cookie|token|secret|password|auth|credential)"
 )
+_SENSITIVE_EXACT_KEYS = frozenset({"key", "api-key", "apikey", "x-goog-api-key"})
 
 
 def _mask_sensitive_value(key: str, val: str) -> str:
     if not val:
         return "***"
     k_lower = key.lower()
-    if "authorization" in k_lower:
-        return val[:12] + "..." if len(val) > 12 else "***"
-    if _SENSITIVE_FIELD_RE.search(k_lower):
-        return val[:6] + "..." if len(val) > 6 else "***"
+    if k_lower in _SENSITIVE_EXACT_KEYS or _SENSITIVE_FIELD_RE.search(k_lower):
+        if "authorization" in k_lower and val.lower().startswith("bearer"):
+            return "Bearer ***"
+        return "***"
     return val
 
 
@@ -309,6 +384,60 @@ def _mask_query_params(qp: dict[str, str] | None) -> dict[str, str]:
     if not qp:
         return {}
     return {k: _mask_sensitive_value(k, str(v)) for k, v in qp.items()}
+
+
+def _sanitize_payload_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "***"
+                if _is_sensitive_key(str(key))
+                else _sanitize_payload_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_payload_value(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_log_message(value)
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return (
+        lowered in _SENSITIVE_EXACT_KEYS
+        or _SENSITIVE_FIELD_RE.search(lowered) is not None
+    )
+
+
+def safe_json_payload(text: str | None) -> object:
+    """Return a credential-sanitized JSON value (or sanitized text)."""
+    if text is None:
+        return None
+    safe_text = sanitize_log_message(text)
+    try:
+        parsed = json.loads(safe_text)
+    except (TypeError, ValueError):
+        return safe_text
+    return _sanitize_payload_value(parsed)
+
+
+def _safe_pretty_payload(text: str | None, *, limit: int = 4000) -> str:
+    """Render a body for the console dump with credential fields masked."""
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        pretty = sanitize_log_message(text)
+    else:
+        pretty = json.dumps(
+            _sanitize_payload_value(parsed), ensure_ascii=False, indent=2
+        )
+    if len(pretty) > limit:
+        pretty = pretty[:limit] + f"\n... [truncated, total {len(text)} chars]"
+    return pretty
 
 
 def dump_request_exchange(
@@ -329,39 +458,21 @@ def dump_request_exchange(
     """转储单次完整请求与响应详细信息。"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    safe_url = sanitize_log_message(url)
     safe_headers = _mask_headers(headers)
     safe_query_params = _mask_query_params(query_params)
     header_lines = "\n".join(f"    {k}: {v}" for k, v in safe_headers.items())
 
     # 格式化请求体
-    pretty_body = ""
-    if body_text:
-        try:
-            parsed = json.loads(body_text)
-            pretty_body = json.dumps(parsed, ensure_ascii=False, indent=2)
-        except Exception:
-            pretty_body = body_text
-        if len(pretty_body) > 4000:
-            pretty_body = (
-                pretty_body[:4000] + f"\n... [truncated, total {len(body_text)} chars]"
-            )
-    else:
-        pretty_body = "(空请求体)"
+    pretty_body = (
+        _safe_pretty_payload(body_text) if body_text else "(空请求体)"
+    )
     # 格式化响应体
     pretty_resp = ""
     if is_stream:
         pretty_resp = f"(流式传输中，已开始分发，截至首包耗时 {elapsed_ms:.1f}ms)"
     elif response_text:
-        try:
-            parsed = json.loads(response_text)
-            pretty_resp = json.dumps(parsed, ensure_ascii=False, indent=2)
-        except Exception:
-            pretty_resp = response_text
-        if len(pretty_resp) > 4000:
-            pretty_resp = (
-                pretty_resp[:4000]
-                + f"\n... [truncated, total {len(response_text)} chars]"
-            )
+        pretty_resp = _safe_pretty_payload(response_text)
     else:
         pretty_resp = "(空响应体)"
     safe_resp_headers = _mask_headers(response_headers)
@@ -372,6 +483,9 @@ def dump_request_exchange(
             + "\n".join(f"    {k}: {v}" for k, v in safe_resp_headers.items())
             + "\n"
         )
+    # 控制台可读报文也必须脱敏，避免旁路 stderr 泄露原始凭据。
+    pretty_body = sanitize_log_message(pretty_body)
+    pretty_resp = sanitize_log_message(pretty_resp)
     dump_file_path: Path | None = None
     if is_dump_to_file_enabled():
         try:
@@ -379,40 +493,25 @@ def dump_request_exchange(
             clean_id = re.sub(r"[^\w\-.]", "_", req_id)
             dump_file_path = dump_folder / f"{clean_id}.json"
 
-            parsed_body = None
-            if body_text:
-                try:
-                    parsed_body = json.loads(body_text)
-                except Exception:
-                    parsed_body = body_text
+            safe_body = safe_json_payload(body_text)
+            safe_response_body = None if is_stream else safe_json_payload(response_text)
 
-            parsed_resp = None
-            if response_text:
-                try:
-                    parsed_resp = json.loads(response_text)
-                except Exception:
-                    parsed_resp = response_text
-
+            # 只落 safe_* 字段；禁止出现 headers/raw_body/response_body 等原始键。
             record_data = {
                 "req_id": req_id,
                 "timestamp": timestamp,
                 "iso_timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "method": method,
-                "url": url,
+                "url": safe_url,
                 "client": client,
-                "headers": headers,
                 "safe_headers": safe_headers,
-                "query_params": query_params,
                 "safe_query_params": safe_query_params,
-                "body": parsed_body,
-                "raw_body": body_text,
+                "safe_body": safe_body,
                 "status_code": status_code,
                 "elapsed_ms": elapsed_ms,
                 "is_stream": is_stream,
-                "response_headers": response_headers if response_headers else {},
                 "safe_response_headers": safe_resp_headers if response_headers else {},
-                "response_body": parsed_resp,
-                "raw_response_body": response_text,
+                "safe_response_body": safe_response_body,
             }
 
             serialized = json.dumps(record_data, ensure_ascii=False, indent=2)
@@ -428,7 +527,7 @@ def dump_request_exchange(
         f"\n==================== [请求报文转储: {req_id}] ====================\n"
         f"记录时间:     {timestamp}\n"
         f"客户端:       {client}\n"
-        f"请求接口:     {method} {url}\n"
+        f"请求接口:     {method} {safe_url}\n"
         f"{file_line}"
         f"查询参数:     {safe_query_params if safe_query_params else '(无)'}\n"
         f"请求头:\n{header_lines}\n"
