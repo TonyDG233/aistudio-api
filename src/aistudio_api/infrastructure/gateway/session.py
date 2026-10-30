@@ -412,7 +412,7 @@ class BrowserSession:
         ).hexdigest()
 
         async with self._snapshot_lock:
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     snapshot = await ctx.page.evaluate(
                         SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
@@ -421,8 +421,8 @@ class BrowserSession:
                         return snapshot
                 except Exception as e:
                     log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
-                    if attempt < 2:
-                        await ctx.page.wait_for_timeout(100)
+                if attempt < 4:
+                    await ctx.page.wait_for_timeout(250)
 
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
@@ -432,7 +432,6 @@ class BrowserSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes]:
@@ -449,7 +448,6 @@ class BrowserSession:
             url=captured_url,
             headers=captured_headers,
             body=body,
-            timeout_ms=timeout_ms,
             auth_user=ctx.auth_user,
             tier=ctx.tier,
         )
@@ -458,7 +456,6 @@ class BrowserSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
@@ -477,7 +474,6 @@ class BrowserSession:
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
-                timeout_ms=timeout_ms,
                 auth_user=ctx.auth_user,
                 tier=ctx.tier,
             ):

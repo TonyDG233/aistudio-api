@@ -25,7 +25,6 @@ class RequestSession(Protocol):
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes]: ...
@@ -34,7 +33,6 @@ class RequestSession(Protocol):
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]: ...

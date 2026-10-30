@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -10,6 +12,7 @@ from aistudio_api.config import (
     DEFAULT_BROWSER_PORT,
     DEFAULT_IMAGE_MODEL,
     DEFAULT_TEXT_MODEL,
+    resolve_data_dir,
     settings,
 )
 from aistudio_api.domain.errors import (
@@ -35,9 +38,28 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
     parse_text_output,
 )
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    safe_json_payload,
+    sanitize_log_message,
+)
 
 logger = get_logger("client")
+
+_SAFE_MODEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _sanitize_model_component(model: str) -> str:
+    """Return a filename-safe model token with no separators or traversal."""
+    sanitized = "".join(
+        char if char in _SAFE_MODEL_CHARS else "_" for char in model
+    )
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "._")
+    sanitized = sanitized.strip(".")
+    return sanitized or "model"
 
 
 class AIStudioClient:
@@ -108,20 +130,31 @@ class AIStudioClient:
         if not settings.dump_raw_response:
             return
 
-        out_dir = Path(settings.dump_raw_response_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe_model = model.replace("/", "_")
-        timestamp = __import__("time").strftime("%Y%m%d_%H%M%S")
-        payload = {
-            "kind": kind,
-            "model": model,
-            "capture_prompt": capture_prompt,
-            "modified_body": json.loads(modified_body),
-            "raw_response": raw_response,
-        }
-        path = out_dir / f"aistudio_{kind}_{safe_model}_{timestamp}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-        logger.info("已落盘原始请求/响应: %s", path)
+        try:
+            raw_dir = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR") or (
+                settings.dump_raw_response_dir
+            )
+            out_dir = Path(raw_dir).expanduser()
+            if not out_dir.is_absolute():
+                out_dir = resolve_data_dir() / out_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_model = _sanitize_model_component(model)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            payload = {
+                "kind": kind,
+                "model": model,
+                "safe_prompt": sanitize_log_message(capture_prompt),
+                "safe_request_body": safe_json_payload(modified_body),
+                "safe_response": sanitize_log_message(raw_response),
+            }
+            path = out_dir / f"aistudio_{kind}_{safe_model}_{timestamp}.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info("已落盘原始请求/响应: %s", path)
+        except Exception as exc:
+            logger.debug("原始请求落盘失败: %s", exc)
 
     async def capture_request(
         self,

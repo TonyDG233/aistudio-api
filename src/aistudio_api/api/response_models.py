@@ -118,6 +118,7 @@ class StatsResponse(BaseModel):
     quota_scope: str = "account"
 
 
+
 class GeminiModelResponse(BaseModel):
     name: str
     version: str | None = "001"

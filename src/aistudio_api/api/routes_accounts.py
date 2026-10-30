@@ -225,6 +225,7 @@ class ApplyPresetResponse(BaseModel):
     target_account: AccountResponse | None = None
 
 
+
 class ImportCookiesRequest(BaseModel):
     cookies: str
     name: str | None = None

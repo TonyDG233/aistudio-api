@@ -163,7 +163,7 @@ class PooledSession:
             " ".join(build_snapshot_hash_parts(contents)).encode("utf-8")
         ).hexdigest()
         async with self._snapshot_lock:
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     snapshot = await self._context.page.evaluate(
                         SNAPSHOT_GENERATE_JS,
@@ -174,8 +174,8 @@ class PooledSession:
                         return snapshot
                 except Exception as exc:
                     log.debug("PooledSession 快照第 %d 次失败: %s", attempt + 1, exc)
-                    if attempt < 2:
-                        await self._context.page.wait_for_timeout(100)
+                if attempt < 4:
+                    await self._context.page.wait_for_timeout(250)
         raise RuntimeError(
             f"PooledSession snapshot generation failed for {content_hash[:8]}"
         )
@@ -184,7 +184,6 @@ class PooledSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes]:
@@ -201,7 +200,6 @@ class PooledSession:
             url=captured_url,
             headers=captured_headers,
             body=body,
-            timeout_ms=timeout_ms,
             auth_user=ctx.auth_user,
             tier=ctx.tier,
         )
@@ -210,7 +208,6 @@ class PooledSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
@@ -229,7 +226,6 @@ class PooledSession:
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
-                timeout_ms=timeout_ms,
                 auth_user=ctx.auth_user,
                 tier=ctx.tier,
             ):
