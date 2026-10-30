@@ -761,6 +761,31 @@ def _default_config() -> dict[str, object]:
             "routing": {
                 "max_switches": 2,
             },
+            "formats": {
+                "openai": True,
+                "claude": False,
+                "responses": False,
+                "media": {"allow_private_urls": False},
+            },
+            "atg": {
+                "mode": "off",
+                "mode_by_format": {
+                    "gemini": "inherit",
+                    "openai": "inherit",
+                    "claude": "inherit",
+                    "responses": "inherit",
+                },
+                "tool_prefix": "atg_emit_",
+                "control_position": "tail",
+                "strict": False,
+                "empty_retries": 2,
+                "recovery": "repair",
+                "side_buffer_bytes": 0,
+                "client_synthetic_guard": True,
+                "max_response_bytes": 16 * 1024 * 1024,
+                "text_model_pattern": "",
+                "non_text_model_pattern": "",
+            },
             "keepalive": {
                 "auth_update": True,
                 "auth_update_hours": 24.0,
@@ -1274,6 +1299,26 @@ def get_configured_paid_model_rules(
     if isinstance(def_rules, dict):
         return def_rules
     return {}
+
+
+def get_features_config(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Return the merged ``features`` block (hot-reloadable via mtime cache)."""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    if isinstance(raw_features, dict):
+        return raw_features
+    defaults = _default_config().get("features")
+    return dict(defaults) if isinstance(defaults, dict) else {}
+
+
+def get_configured_formats(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    formats = get_features_config(config_path).get("formats")
+    return dict(formats) if isinstance(formats, dict) else {}
 
 
 def get_configured_routing_settings(

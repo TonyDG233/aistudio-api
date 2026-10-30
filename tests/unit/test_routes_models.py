@@ -48,11 +48,18 @@ async def test_get_single_model_returns_model_object(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_v1_models_endpoint_is_removed(monkeypatch):
+async def test_v1_models_endpoint_is_available_with_openai_shape(monkeypatch):
     monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
+        unauthorized = await client.get("/v1/models")
+        assert unauthorized.status_code == 401
+
         response = await client.get("/v1/models", headers=_AUTH_HEADERS)
-        assert response.status_code == 404
+        assert response.status_code == 200
+        data = response.json()
+        assert data["object"] == "list"
+        assert isinstance(data["data"], list)
+        assert data["data"][0]["object"] == "model"
 
 
 @pytest.mark.asyncio

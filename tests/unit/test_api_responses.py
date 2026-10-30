@@ -223,10 +223,9 @@ async def test_build_gemini_streaming_response_passes_requested_model():
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])]
     )
-    context = await pipeline.begin(model_path="gemini-2.5-pro")
     resp = await _build_gemini_streaming_response(
         pipeline=pipeline,
-        context=context,
+        model_path="gemini-2.5-pro",
         req=req,
     )
 
@@ -283,9 +282,8 @@ async def test_streaming_metadata_event_does_not_block_same_account_retry():
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])]
     )
-    context = await pipeline.begin(model_path="gemini-3.7-flash")
     resp = await _build_gemini_streaming_response(
-        pipeline=pipeline, context=context, req=req
+        pipeline=pipeline, model_path="gemini-3.7-flash", req=req
     )
 
     chunks = [chunk async for chunk in resp.body_iterator]

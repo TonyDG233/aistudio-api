@@ -683,6 +683,19 @@ def _toolshape_summary(
     }
 
 
+def _request_has_tool_activity(req: GeminiGenerateContentRequest) -> bool:
+    """True only when the client actually sent tools or tool history."""
+    if req.tools:
+        return True
+    if getattr(req, "toolConfig", None) is not None:
+        return True
+    return any(
+        part.functionCall is not None or part.functionResponse is not None
+        for content in req.contents
+        for part in content.parts
+    )
+
+
 def _emit_toolshape(
     req: GeminiGenerateContentRequest,
     *,
@@ -728,6 +741,7 @@ def normalize_gemini_request(
     api_format: str = "gemini",
     channel: str | None = None,
     surface: str | None = None,
+    emit_toolshape: bool = True,
 ) -> NormalizedGeminiRequest:
     if not req.contents:
         raise ValueError("contents is required")
@@ -1016,13 +1030,14 @@ def normalize_gemini_request(
                     drop_unsupported=model_defaults.drop_unsupported_params,
                 )
             )
-    _emit_toolshape(
-        req,
-        model=model,
-        api_format=api_format,
-        channel=channel,
-        surface=surface,
-    )
+    if emit_toolshape and _request_has_tool_activity(req):
+        _emit_toolshape(
+            req,
+            model=model,
+            api_format=api_format,
+            channel=channel,
+            surface=surface,
+        )
 
     return NormalizedGeminiRequest(
         model=model,

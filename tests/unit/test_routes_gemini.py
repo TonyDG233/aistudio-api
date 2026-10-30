@@ -12,6 +12,7 @@ import pytest
 
 from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_routing_pipeline
+from aistudio_api.application.atg.extractor import SyntheticRequiredError
 from aistudio_api.config import settings
 from aistudio_api.domain.errors import (
     RequestError,
@@ -99,6 +100,42 @@ async def test_capacity_maps_to_http_503_with_code() -> None:
     error = response.json()["error"]
     assert error["status"] == "UNAVAILABLE"
     assert error["type"] == "surface_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_synthetic_required_non_stream_maps_to_http_502_json() -> None:
+    app.dependency_overrides[get_routing_pipeline] = lambda: _RaisingPipeline(
+        SyntheticRequiredError("synthetic tool call required")
+    )
+    async with _client() as client:
+        response = await client.post(
+            "/v1beta/gemini-3.7-flash:generateContent",
+            headers=_HEADERS,
+            json=_BODY,
+        )
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["code"] == 502
+    assert error["status"] == "UNAVAILABLE"
+    assert "synthetic tool call required" in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_synthetic_required_pre_stream_maps_to_http_502_json() -> None:
+    app.dependency_overrides[get_routing_pipeline] = lambda: _RaisingPipeline(
+        SyntheticRequiredError("synthetic tool call required")
+    )
+    async with _client() as client:
+        response = await client.post(
+            "/v1beta/gemini-3.7-flash:streamGenerateContent",
+            headers=_HEADERS,
+            json=_BODY,
+        )
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["code"] == 502
+    assert error["status"] == "UNAVAILABLE"
+    assert "synthetic tool call required" in error["message"]
 
 
 @pytest.mark.asyncio

@@ -54,6 +54,36 @@ features:
     active_activity: false
     active_activity_seconds: 60
 
+  # Protocol faces. OpenAI Chat Completions is part of P5; Claude/Responses
+  # stay disabled until C3.
+  formats:
+    openai: true
+    claude: false
+    responses: false
+    media:
+      allow_private_urls: false
+
+  # Anti-Truncation Gateway (synthetic tool transport). Default off; prefer
+  # falls back to plain text, required fails explicitly when the synthetic call
+  # is absent. mode_by_format overrides one protocol face.
+  atg:
+    mode: off
+    mode_by_format:
+      gemini: inherit
+      openai: inherit
+      claude: inherit
+      responses: inherit
+    tool_prefix: atg_emit_
+    control_position: tail
+    strict: false
+    empty_retries: 2
+    recovery: repair
+    side_buffer_bytes: 0
+    client_synthetic_guard: true
+    max_response_bytes: 16777216
+    text_model_pattern: ""
+    non_text_model_pattern: ""
+
 paid_model_rules:
   ultra_required:
     contains: ["veo", "ultra"]
