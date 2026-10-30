@@ -160,3 +160,48 @@ async def test_forced_429_hook_retries_same_instance(monkeypatch) -> None:
     assert fake_client.generate_content.await_count == 1
     assert isinstance(response, GeminiGenerateContentResponse)
     assert response.candidates[0].content.parts[0].text == "hook ok"
+
+
+@pytest.mark.asyncio
+async def test_pg02_metadata_only_attempt_switches_before_first_sse_event() -> None:
+    async def first_stream(**_kwargs):
+        yield (
+            "usage",
+            {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+        )
+        raise RequestError(503, "upstream unavailable")
+
+    async def second_stream(**_kwargs):
+        yield ("body", "recovered")
+        yield ("finish_reason", 1)
+        yield (
+            "usage",
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        )
+
+    first_client = MagicMock()
+    first_client.stream_generate_content = first_stream
+    second_client = MagicMock()
+    second_client.stream_generate_content = second_stream
+    first = make_attempt(first_client, instance_id="inst-1")
+    second = make_attempt(second_client, instance_id="inst-2")
+    pipeline = ScriptedPipeline(
+        [first, second], actions=["switch"], context=make_context()
+    )
+
+    response = await handle_gemini_generate_content(
+        "gemini-3.7-flash", _request(), stream=True, pipeline=pipeline
+    )
+
+    assert isinstance(response, StreamingResponse)
+    chunks = [
+        chunk
+        async for chunk in cast(AsyncIterator[str], response.body_iterator)
+    ]
+    assert any("recovered" in str(chunk) for chunk in chunks)
+    assert any('"finishReason": "STOP"' in str(chunk) for chunk in chunks)
+    assert isinstance(first.handle, FakeHandle)
+    assert first.handle.released is True
+    assert isinstance(second.handle, FakeHandle)
+    assert second.handle.released is True
+    assert pipeline.attempts == []

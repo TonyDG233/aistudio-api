@@ -124,4 +124,5 @@ class JspbArray(list):
         return res
 
 
+WIRE_FINISH_REASON_STOP = 1
 WIRE_FINISH_REASON_CONTINUING = 22

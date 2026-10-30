@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -319,6 +320,56 @@ class AistudioPart:
             return wire.compact()
         wire[PartIndex.TEXT] = self.text
         return wire.compact()
+
+
+def _decode_json_object(text: str) -> dict[str, object] | None:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def coerce_function_call_args(value: object) -> dict[str, object]:
+    """Force ``functionCall.args`` into a legal Struct payload.
+
+    Dicts pass through.  Strings that decode to a JSON object become that
+    object; every other shape (plain string, list, scalar) is wrapped under
+    ``content`` so the wire encoder always sees a Struct.  ``None`` becomes an
+    empty Struct.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = _decode_json_object(value)
+        if parsed is not None:
+            return parsed
+        return {"content": value}
+    return {"content": value}
+
+
+def coerce_function_response(value: object) -> dict[str, object]:
+    """Force ``functionResponse.response`` into a legal Struct payload.
+
+    Dicts pass through.  Strings that decode to a JSON object become that
+    object; list/scalar/plain-string values are wrapped under ``result`` (the
+    OpenAI/Claude adapter convention).  ``None`` becomes an empty Struct.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = _decode_json_object(value)
+        if parsed is not None:
+            return parsed
+        return {"result": value}
+    return {"result": value}
 
 
 def _encode_wire_args(value):

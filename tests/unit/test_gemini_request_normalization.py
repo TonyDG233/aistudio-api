@@ -1,3 +1,8 @@
+import json
+import logging
+from pathlib import Path
+from typing import Any, cast
+
 import pytest
 
 from aistudio_api.api.schemas import (
@@ -7,7 +12,21 @@ from aistudio_api.api.schemas import (
     GeminiPart,
 )
 from aistudio_api.application.chat_service import normalize_gemini_request
+from aistudio_api.application.signature_cache import (
+    DUMMY_THOUGHT_SIGNATURE,
+    signature_cache,
+)
 from aistudio_api.infrastructure.gateway.wire_types import AistudioImageOutputMode
+
+PG_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "pg"
+
+
+def _load_pg_fixture(name: str) -> dict[str, object]:
+    return json.loads((PG_FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _wire(part: Any) -> list[Any]:
+    return cast(list[Any], part.to_wire())
 
 
 def test_normalize_gemini_request_exposes_generation_config_overrides():
@@ -842,3 +861,233 @@ def test_normalize_gemini_request_deduplicates_and_covers_builtin_tools():
     assert len(normalized.tools) == 2
     assert [[]] in normalized.tools
     assert [None, None, None, [None, [[]]]] in normalized.tools
+
+
+def test_pg01_missing_signature_fixture_injects_dummy_on_model_function_call():
+    data = _load_pg_fixture("f01_missing_signature.json")
+    request = data["request"]
+    assert isinstance(request, dict)
+    req = GeminiGenerateContentRequest.model_validate(request)
+
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+
+    model_content = normalized.contents[1]
+    assert model_content.role == "model"
+    fc_wire = _wire(model_content.parts[0])
+    assert fc_wire[10][0] == "get_weather"
+    assert fc_wire[14] == DUMMY_THOUGHT_SIGNATURE
+
+    response_wire = _wire(normalized.contents[2].parts[0])
+    assert response_wire[11][0] == "get_weather"
+    assert len(response_wire) <= 14
+
+
+def test_pg01_cached_signature_precedes_dummy(tmp_path):
+    signature_cache.configure_path(tmp_path / "signature_cache.json")
+    try:
+        signature_cache.put("call_cached", "real_signature_from_upstream")
+        req = GeminiGenerateContentRequest.model_validate(
+            {
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "get_weather",
+                                    "args": {"city": "Paris"},
+                                    "id": "call_cached",
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+        wire = _wire(normalized.contents[0].parts[0])
+        assert wire[10][0] == "get_weather"
+        assert wire[14] == "real_signature_from_upstream"
+    finally:
+        signature_cache.configure_path(None)
+        signature_cache.clear()
+
+
+def test_pg01_does_not_sign_plain_text_or_function_response():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {"role": "model", "parts": [{"text": "plain answer"}]},
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "get_weather",
+                                "response": {"ok": True},
+                            }
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+    assert normalized.contents[0].parts[0].thought_signature is None
+    assert normalized.contents[1].parts[0].thought_signature is None
+
+
+def test_pg04_string_function_response_becomes_result_struct():
+    data = _load_pg_fixture("f04_string_response.json")
+    request = data["request"]
+    assert isinstance(request, dict)
+    req = GeminiGenerateContentRequest.model_validate(request)
+
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+
+    wire = _wire(normalized.contents[0].parts[0])
+    assert wire[11] == [
+        "emit_complete_response_x",
+        [[["result", [None, None, "user text"]]]],
+    ]
+
+
+def test_pg04_function_response_shapes_are_forced_to_struct():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "tool_a",
+                                "response": '{"ok": true, "count": 2}',
+                            }
+                        },
+                        {
+                            "functionResponse": {
+                                "name": "tool_b",
+                                "response": ["a", "b"],
+                            }
+                        },
+                        {"functionResponse": {"name": "tool_c", "response": 7}},
+                        {"functionResponse": {"name": "tool_d", "response": None}},
+                    ],
+                }
+            ]
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+
+    json_object = _wire(normalized.contents[0].parts[0])[11][1]
+    assert dict(json_object[0])["ok"] == [None, None, None, True]
+    list_value = _wire(normalized.contents[0].parts[1])[11][1]
+    assert [pair[0] for pair in list_value[0]] == ["result"]
+    scalar_value = _wire(normalized.contents[0].parts[2])[11][1]
+    assert dict(scalar_value[0])["result"] == [None, 7]
+    empty_value = _wire(normalized.contents[0].parts[3])[11][1]
+    assert empty_value == [[]]
+
+
+def test_pg04_function_call_args_strings_and_scalars_are_coerced():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "emit_complete_response_x",
+                                "args": '{"content": "hello"}',
+                            }
+                        },
+                        {
+                            "functionCall": {
+                                "name": "emit_plain",
+                                "args": "plain text",
+                            }
+                        },
+                        {
+                            "functionCall": {
+                                "name": "emit_scalar",
+                                "args": 5,
+                            }
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+
+    json_object = _wire(normalized.contents[0].parts[0])[10][1]
+    assert dict(json_object[0])["content"] == [None, None, "hello"]
+    plain = _wire(normalized.contents[0].parts[1])[10][1]
+    assert dict(plain[0])["content"] == [None, None, "plain text"]
+    scalar = _wire(normalized.contents[0].parts[2])[10][1]
+    assert dict(scalar[0])["content"] == [None, 5]
+
+
+def test_pg04_toolshape_diagnostic_redacts_plaintext_values(caplog):
+    secret = "TOP_SECRET_PROMPT_AND_ARGUMENT_VALUE"
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": secret}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "emit_complete_response_x",
+                                "args": {"secret_key": secret},
+                                "id": "call_secret",
+                            }
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "emit_complete_response_x",
+                                "response": secret,
+                            }
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "emit_complete_response_x",
+                            "parameters": {"type": "object"},
+                        }
+                    ]
+                }
+            ],
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+        }
+    )
+
+    caplog.set_level(
+        logging.INFO, logger="aistudio.application.chat_service"
+    )
+    normalize_gemini_request(req, "gemini-3.7-flash")
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "[toolshape]" in record.getMessage()
+    ]
+    assert messages
+    joined = "\n".join(messages)
+    assert secret not in joined
+    assert "args_type" in joined
+    assert "has_signature" in joined
+    assert "schema_key" in joined
+    assert "parameters" in joined
