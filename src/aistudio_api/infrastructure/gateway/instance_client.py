@@ -8,11 +8,12 @@ Page belonging to a single ``InstanceSlot``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
+from aistudio_api.config import DEFAULT_TEXT_MODEL, resolve_data_dir, settings
 from aistudio_api.domain.errors import (
     BrowserTransportError,
     RequestError,
@@ -25,9 +26,28 @@ from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
 from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    safe_json_payload,
+    sanitize_log_message,
+)
 
 logger = get_logger("instance-client")
+
+_SAFE_MODEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _sanitize_model_component(model: str) -> str:
+    """Return a filename-safe model token with no separators or traversal."""
+    sanitized = "".join(
+        char if char in _SAFE_MODEL_CHARS else "_" for char in model
+    )
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "._")
+    sanitized = sanitized.strip(".")
+    return sanitized or "model"
 
 
 class InstanceRequestClient:
@@ -69,18 +89,23 @@ class InstanceRequestClient:
         if not settings.dump_raw_response:
             return
         try:
-            out_dir = Path(settings.dump_raw_response_dir)
+            raw_dir = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR") or (
+                settings.dump_raw_response_dir
+            )
+            out_dir = Path(raw_dir).expanduser()
+            if not out_dir.is_absolute():
+                out_dir = resolve_data_dir() / out_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            safe_model = model.replace("/", "_")
+            safe_model = _sanitize_model_component(model)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             payload = {
                 "kind": kind,
                 "instance": self.account_id,
                 "surface": self.surface,
                 "model": model,
-                "capture_prompt": capture_prompt,
-                "modified_body": json.loads(modified_body),
-                "raw_response": raw_response,
+                "safe_prompt": sanitize_log_message(capture_prompt),
+                "safe_request_body": safe_json_payload(modified_body),
+                "safe_response": sanitize_log_message(raw_response),
             }
             (out_dir / f"aistudio_{kind}_{safe_model}_{timestamp}.json").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),

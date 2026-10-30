@@ -35,6 +35,7 @@ from .routes_accounts import router as accounts_router
 from .routes_gemini import router as gemini_router
 from .routes_instances import router as instances_router
 from .routes_keepalive import router as keepalive_router
+from .routes_logs import protected_router as logs_protected_router
 from .routes_models import router as models_router
 from .routes_system import (
     protected_router as system_protected_router,
@@ -219,6 +220,10 @@ app.include_router(
 )
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
+app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 
 
 @app.exception_handler(TierRequiredError)
@@ -442,10 +447,16 @@ async def spa_navigation_middleware(request: Request, call_next):
             "/rotation",
             "/config",
             "/api-keys",
+            "/logs",
         )
     )
     is_accounts_spa = request.url.path in ("/accounts", "/accounts/")
-    if is_html_nav and (is_accounts_spa or not is_api) and index_html_path.is_file():
+    is_logs_spa = request.url.path in ("/logs", "/logs/")
+    if (
+        is_html_nav
+        and (is_accounts_spa or is_logs_spa or not is_api)
+        and index_html_path.is_file()
+    ):
         response = FileResponse(index_html_path)
         response.headers["Vary"] = "Accept"
         response.headers["Cache-Control"] = (
