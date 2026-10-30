@@ -1,8 +1,9 @@
 """Gemini-compatible application service handlers.
 
-The request path is protocol-neutral: routing, instance acquisition, retry and
-tier admission live in :mod:`routing_pipeline`.  This module only builds Gemini
-requests/responses and translates domain errors into Gemini payloads.
+The protocol-neutral generation chain (routing, instance acquisition, retry,
+ATG wrapping/unwrapping and signature production) lives in
+:mod:`aistudio_api.application.generation_service`; this module only renders
+Gemini wire shapes and translates domain errors into Gemini payloads.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
 
 from fastapi.responses import StreamingResponse
 
@@ -21,13 +21,10 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.application.chat_service import normalize_gemini_request
-from aistudio_api.application.routing_pipeline import (
-    RouteAttempt,
-    RouteContext,
-    RoutingPipelineProtocol,
-)
-from aistudio_api.application.testing_hooks import forced_429
+from aistudio_api.application import generation_service
+from aistudio_api.application.atg.extractor import AtgError
+from aistudio_api.application.generation_service import StreamEvent
+from aistudio_api.application.routing_pipeline import RoutingPipelineProtocol
 from aistudio_api.domain.errors import (
     AistudioError,
     AuthError,
@@ -35,15 +32,10 @@ from aistudio_api.domain.errors import (
     RequestError,
     RoutingError,
     SessionExpiredError,
-    SurfaceSwitchExhaustedError,
     TierRequiredError,
     UsageLimitExceeded,
     parse_upstream_grpc_error,
 )
-from aistudio_api.infrastructure.utils.logger import get_logger
-
-logger = get_logger("api.gemini")
-
 
 WIRE_TO_GEMINI_FINISH_REASON: dict[int, str] = {
     0: "FINISH_REASON_UNSPECIFIED",
@@ -132,60 +124,11 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
         )
     if isinstance(exc, BrowserTransportError):
         return 502, str(exc), "UNAVAILABLE"
+    if isinstance(exc, AtgError):
+        return 502, str(exc), "UNAVAILABLE"
     if isinstance(exc, AistudioError):
         return 500, str(exc), "INTERNAL"
     return 500, str(exc), "INTERNAL"
-
-
-@dataclass
-class _StreamState:
-    final_usage: dict[str, object] | None = None
-    final_finish_reason: str = "STOP"
-    latest_response_id: str | None = None
-    buffered_thought_sig: str | None = None
-    has_yielded_data: bool = False
-
-    def reset(self) -> None:
-        self.final_usage = None
-        self.final_finish_reason = "STOP"
-        self.latest_response_id = None
-        self.buffered_thought_sig = None
-        self.has_yielded_data = False
-
-
-async def _consume_action(
-    pipeline: RoutingPipelineProtocol,
-    context: RouteContext,
-    attempt: RouteAttempt,
-    exc: Exception,
-    *,
-    has_yielded_data: bool,
-) -> tuple[str, RouteAttempt | None]:
-    action = await pipeline.handle_error(
-        context, attempt, exc, has_yielded_data=has_yielded_data
-    )
-    if action == "switch":
-        await pipeline.release(attempt)
-        return action, None
-    return action, attempt
-
-
-def _normalized_or_400(
-    req: GeminiGenerateContentRequest,
-    model_path: str,
-    *,
-    surface: str | None = None,
-):
-    try:
-        return normalize_gemini_request(
-            req,
-            model_path,
-            api_format="gemini",
-            channel=surface,
-            surface=surface,
-        )
-    except ValueError as exc:
-        raise RequestError(400, str(exc)) from exc
 
 
 async def handle_gemini_generate_content(
@@ -195,123 +138,42 @@ async def handle_gemini_generate_content(
     stream: bool,
     pipeline: RoutingPipelineProtocol,
 ):
-    context = await pipeline.begin(model_path=model_path)
     if stream:
         return await _build_gemini_streaming_response(
-            pipeline=pipeline, context=context, req=req
+            pipeline=pipeline, req=req, model_path=model_path
         )
-    return await _generate_non_streaming(
-        pipeline=pipeline, context=context, req=req
-    )
 
-
-async def _generate_non_streaming(
-    *,
-    pipeline: RoutingPipelineProtocol,
-    context: RouteContext,
-    req: GeminiGenerateContentRequest,
-) -> GeminiGenerateContentResponse:
-    attempt: RouteAttempt | None = None
-    last_error: Exception | None = None
     try:
-        while True:
-            if attempt is None:
-                attempt = await pipeline.acquire(context)
-                if attempt is None:
-                    break
-            normalized = _normalized_or_400(
-                req, context.route.model, surface=context.route.surface
+        outcome = await generation_service.generate(
+            model_path=model_path,
+            req=req,
+            pipeline=pipeline,
+            api_format="gemini",
+        )
+    except AtgError as exc:
+        raise RequestError(502, str(exc)) from exc
+    output = outcome.output
+    return GeminiGenerateContentResponse(
+        candidates=[
+            GeminiCandidateResponse(
+                content=GeminiContentResponse(
+                    parts=to_gemini_parts(
+                        output.text,
+                        function_calls=output.function_calls,
+                        function_responses=output.function_responses,
+                        thinking=output.thinking,
+                        images=output.images,
+                        reasoning_images=output.reasoning_images,
+                    ),
+                ),
+                finishReason=outcome.finish_reason,
+                index=0,
             )
-            if forced_429(
-                account_id=attempt.account_id,
-                model=normalized.model,
-                surface=context.route.surface,
-            ):
-                exc = UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
-                last_error = exc
-                action, attempt = await _consume_action(
-                    pipeline, context, attempt, exc, has_yielded_data=False
-                )
-                if action == "retry_same":
-                    continue
-                if action == "switch":
-                    continue
-                raise exc
-            try:
-                output = await attempt.client.generate_content(
-                    model=normalized.model,
-                    capture_prompt=normalized.capture_prompt,
-                    capture_images=normalized.capture_images,
-                    contents=normalized.contents,
-                    system_instruction_content=normalized.system_instruction,
-                    tools=normalized.tools,
-                    tool_config=normalized.tool_config,
-                    safety_settings=normalized.safety_settings,
-                    temperature=normalized.temperature,
-                    top_p=normalized.top_p,
-                    top_k=normalized.top_k,
-                    max_tokens=normalized.max_tokens,
-                    generation_config_overrides=normalized.generation_config_overrides,
-                    sanitize_plain_text=False,
-                    force_refresh_capture=attempt.same_retries > 0,
-                )
-            except Exception as exc:
-                last_error = exc
-                action, attempt = await _consume_action(
-                    pipeline, context, attempt, exc, has_yielded_data=False
-                )
-                if action == "retry_same":
-                    continue
-                if action == "switch":
-                    continue
-                raise
-            final_fr = to_gemini_finish_reason(
-                output.candidates[0].finish_reason if output.candidates else None
-            )
-            pipeline.record_success(
-                context, attempt, usage=output.usage, finish_reason=final_fr
-            )
-            logger.info(
-                "Gemini 生成完成: model=%s, instance=%s",
-                normalized.model,
-                attempt.instance_id,
-            )
-            return GeminiGenerateContentResponse(
-                candidates=[
-                    GeminiCandidateResponse(
-                        content=GeminiContentResponse(
-                            parts=to_gemini_parts(
-                                output.text,
-                                function_calls=output.function_calls,
-                                function_responses=output.function_responses,
-                                thinking=output.thinking,
-                                images=output.images,
-                                reasoning_images=output.reasoning_images,
-                            ),
-                        ),
-                        finishReason=to_gemini_finish_reason(
-                            output.candidates[0].finish_reason
-                            if output.candidates
-                            else None
-                        ),
-                        index=0,
-                    )
-                ],
-                usageMetadata=to_gemini_usage_metadata(output.usage),
-                modelVersion=normalized.model,
-                responseId=output.response_id or None,
-            )
-    finally:
-        if attempt is not None:
-            await pipeline.release(attempt)
-
-    if isinstance(last_error, UsageLimitExceeded):
-        raise SurfaceSwitchExhaustedError(
-            surface=context.route.surface
-        ) from last_error
-    if last_error is not None:
-        raise last_error
-    raise SurfaceSwitchExhaustedError(surface=context.route.surface)
+        ],
+        usageMetadata=to_gemini_usage_metadata(output.usage),
+        modelVersion=outcome.model,
+        responseId=outcome.response_id,
+    )
 
 
 def format_sse_event(
@@ -424,140 +286,43 @@ def format_sse_error(exc: Exception) -> str:
     )
 
 
-async def _stream_gemini_events(
-    *,
-    pipeline: RoutingPipelineProtocol,
-    context: RouteContext,
-    req: GeminiGenerateContentRequest,
-) -> AsyncGenerator[str, None]:
-    """Yield SSE chunks; raise domain errors instead of formatting them.
-
-    The caller pre-reads the first chunk so errors raised before any data can
-    become real HTTP statuses instead of a 200 SSE body.
-    """
-    attempt: RouteAttempt | None = None
-    last_error: Exception | None = None
-    normalized = None
-    state = _StreamState()
-    stream_completed = False
-    try:
-        while True:
-            if attempt is None:
-                attempt = await pipeline.acquire(context)
-                if attempt is None:
-                    break
-            normalized = _normalized_or_400(
-                req, context.route.model, surface=context.route.surface
-            )
-            state.reset()
-            if forced_429(
-                account_id=attempt.account_id,
-                model=normalized.model,
-                surface=context.route.surface,
-            ):
-                exc = UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
-                last_error = exc
-                action, attempt = await _consume_action(
-                    pipeline, context, attempt, exc, has_yielded_data=False
-                )
-                if action in ("retry_same", "switch"):
-                    continue
-                raise exc
-            try:
-                async for event_type, text in attempt.client.stream_generate_content(
-                    model=normalized.model,
-                    capture_prompt=normalized.capture_prompt,
-                    capture_images=normalized.capture_images,
-                    contents=normalized.contents,
-                    system_instruction_content=normalized.system_instruction,
-                    tools=normalized.tools,
-                    tool_config=normalized.tool_config,
-                    safety_settings=normalized.safety_settings,
-                    temperature=normalized.temperature,
-                    top_p=normalized.top_p,
-                    top_k=normalized.top_k,
-                    max_tokens=normalized.max_tokens,
-                    generation_config_overrides=normalized.generation_config_overrides,
-                    sanitize_plain_text=False,
-                    force_refresh_capture=attempt.same_retries > 0,
-                ):
-                    if event_type == "usage":
-                        state.final_usage = text if isinstance(text, dict) else None
-                    elif event_type == "finish_reason":
-                        state.final_finish_reason = (
-                            to_gemini_finish_reason(text)
-                            if isinstance(text, int)
-                            else str(text)
-                        )
-                    elif event_type == "response_id":
-                        state.latest_response_id = str(text)
-                    elif event_type == "thought_signature":
-                        state.buffered_thought_sig = str(text)
-                    else:
-                        chunk = format_sse_event(
-                            event_type,
-                            text,
-                            model_version=normalized.model,
-                            response_id=state.latest_response_id,
-                            thought_signature=state.buffered_thought_sig,
-                        )
-                        state.buffered_thought_sig = None
-                        if chunk:
-                            state.has_yielded_data = True
-                            yield chunk
-            except Exception as exc:
-                last_error = exc
-                action, attempt = await _consume_action(
-                    pipeline,
-                    context,
-                    attempt,
-                    exc,
-                    has_yielded_data=state.has_yielded_data,
-                )
-                if action == "retry_same":
-                    continue
-                if action == "switch":
-                    continue
-                raise
-            stream_completed = True
-            break
-
-        if not stream_completed:
-            if isinstance(last_error, UsageLimitExceeded):
-                raise SurfaceSwitchExhaustedError(
-                    surface=context.route.surface
-                ) from last_error
-            if last_error is not None:
-                raise last_error
-            raise SurfaceSwitchExhaustedError(surface=context.route.surface)
-        target_model = normalized.model if normalized else context.route.model
-        if attempt is not None:
-            pipeline.record_success(
-                context,
-                attempt,
-                usage=state.final_usage,
-                finish_reason=state.final_finish_reason,
-            )
-        yield format_sse_usage(
-            state.final_usage,
-            finish_reason=state.final_finish_reason,
-            model_version=target_model,
-            response_id=state.latest_response_id,
+def _render_stream_event(event: StreamEvent) -> str | None:
+    if event.kind == "routing_wait":
+        return None
+    if event.kind == "usage":
+        usage = event.payload if isinstance(event.payload, dict) else None
+        return format_sse_usage(
+            usage,
+            finish_reason=event.finish_reason or "STOP",
+            model_version=event.model,
+            response_id=event.response_id,
         )
-    finally:
-        if attempt is not None:
-            await pipeline.release(attempt)
+    return format_sse_event(
+        event.kind,
+        event.payload,
+        model_version=event.model,
+        response_id=event.response_id,
+        thought_signature=event.thought_signature,
+    )
 
 
 async def _build_gemini_streaming_response(
     *,
     pipeline: RoutingPipelineProtocol,
-    context: RouteContext,
     req: GeminiGenerateContentRequest,
+    model_path: str,
 ) -> StreamingResponse:
-    events = _stream_gemini_events(pipeline=pipeline, context=context, req=req)
+    events = generation_service.stream_generation(
+        model_path=model_path,
+        req=req,
+        pipeline=pipeline,
+        api_format="gemini",
+    )
+    first_chunk: str | None = None
     try:
-        first_chunk = await events.__anext__()
+        while first_chunk is None:
+            event = await events.__anext__()
+            first_chunk = _render_stream_event(event)
     except StopAsyncIteration:
         await events.aclose()
 
@@ -573,15 +338,22 @@ async def _build_gemini_streaming_response(
     except BrowserTransportError as exc:
         await events.aclose()
         raise RequestError(502, str(exc)) from exc
+    except AtgError as exc:
+        await events.aclose()
+        raise RequestError(502, str(exc)) from exc
     except Exception:
         await events.aclose()
         raise
 
+    assert first_chunk is not None
+
     async def body() -> AsyncGenerator[str, None]:
         try:
             yield first_chunk
-            async for chunk in events:
-                yield chunk
+            async for event in events:
+                chunk = _render_stream_event(event)
+                if chunk:
+                    yield chunk
         except Exception as exc:
             yield format_sse_error(exc)
         finally:

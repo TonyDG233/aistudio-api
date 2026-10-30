@@ -157,8 +157,32 @@ class ThoughtSignatureCache:
 
 signature_cache = ThoughtSignatureCache()
 
+
+def record_function_call_signatures(function_calls: object) -> None:
+    """Persist real thought signatures keyed by tool-call id.
+
+    Never logs the signature or any tool content.  Empty ids/signatures are
+    ignored so a synthetic/nameless call cannot pollute the cache.
+    """
+    if not isinstance(function_calls, list):
+        return
+    for call in function_calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id") or call.get("call_id")
+        signature = call.get("thought_signature") or call.get("thoughtSignature")
+        if (
+            isinstance(call_id, str)
+            and call_id
+            and isinstance(signature, str)
+            and signature
+        ):
+            signature_cache.put(call_id, signature)
+
+
 __all__ = [
     "DUMMY_THOUGHT_SIGNATURE",
     "ThoughtSignatureCache",
+    "record_function_call_signatures",
     "signature_cache",
 ]

@@ -16,7 +16,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.api.error_mapping import error_payload
+from aistudio_api.api.format_errors import format_for_path
 from aistudio_api.application.instance_manager import InstanceError
+from aistudio_api.application.signature_cache import signature_cache
+from aistudio_api.config import resolve_data_dir
 from aistudio_api.domain.errors import AistudioError, RoutingError, TierRequiredError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -37,6 +40,7 @@ from .routes_instances import router as instances_router
 from .routes_keepalive import router as keepalive_router
 from .routes_logs import protected_router as logs_protected_router
 from .routes_models import router as models_router
+from .routes_openai import router as openai_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -90,6 +94,7 @@ async def _shutdown_runtime(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     validate_config()
+    signature_cache.configure_path(resolve_data_dir() / "signature_cache.json")
 
     from aistudio_api.application.account_keepalive import AccountKeepaliveService
     from aistudio_api.application.account_rotator import init_rotator
@@ -227,28 +232,39 @@ app.include_router(
 )
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
+app.include_router(openai_router, dependencies=[Depends(require_api_key)])
 app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
 
 
+def _is_openai_path(request: Request) -> bool:
+    return format_for_path(request.url.path) == "openai"
+
+
 @app.exception_handler(TierRequiredError)
 @app.exception_handler(RoutingError)
-async def routing_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+async def routing_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """D-04/D-06: tier 403 and routing 503 are rendered by the protocol adapter."""
-    status, body = error_payload(exc, "gemini")
+    protocol = "openai" if _is_openai_path(request) else "gemini"
+    status, body = error_payload(exc, protocol)
     return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(AistudioError)
-async def aistudio_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-    status, body = error_payload(exc, "gemini")
+async def aistudio_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    protocol = "openai" if _is_openai_path(request) else "gemini"
+    status, body = error_payload(exc, protocol)
     return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    if _is_openai_path(request):
+        from aistudio_api.api.format_errors import format_error_response
+
+        return format_error_response(exc, "openai")
     detail = exc.detail
     if isinstance(detail, dict):
         msg = str(detail.get("message") or detail)
@@ -292,8 +308,12 @@ async def instance_exception_handler(
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
-    _request: Request, exc: RequestValidationError
+    request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    if _is_openai_path(request):
+        from aistudio_api.api.format_errors import format_error_response
+
+        return format_error_response(exc, "openai")
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
     return JSONResponse(
         status_code=code,

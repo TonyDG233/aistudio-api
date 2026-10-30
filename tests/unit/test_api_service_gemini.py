@@ -15,6 +15,7 @@ from aistudio_api.api.schemas import (
     GeminiGenerateContentRequest,
     GeminiPart,
 )
+from aistudio_api.application import generation_service
 from aistudio_api.application.api_service_gemini import (
     handle_gemini_generate_content,
 )
@@ -205,3 +206,78 @@ async def test_pg02_metadata_only_attempt_switches_before_first_sse_event() -> N
     assert isinstance(second.handle, FakeHandle)
     assert second.handle.released is True
     assert pipeline.attempts == []
+
+
+@pytest.mark.asyncio
+async def test_native_gemini_non_stream_calls_generation_service(monkeypatch) -> None:
+    client = MagicMock()
+    client.generate_content = AsyncMock(return_value=_output("spy ok"))
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    calls: list[dict[str, object]] = []
+    real_generate = generation_service.generate
+
+    async def spy_generate(**kwargs):
+        calls.append(kwargs)
+        return await real_generate(**kwargs)
+
+    monkeypatch.setattr(generation_service, "generate", spy_generate)
+
+    response = await handle_gemini_generate_content(
+        "gemini-3.7-flash", _request(), stream=False, pipeline=pipeline
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["model_path"] == "gemini-3.7-flash"
+    assert calls[0]["api_format"] == "gemini"
+    assert calls[0]["pipeline"] is pipeline
+    assert isinstance(response, GeminiGenerateContentResponse)
+    assert response.candidates[0].content.parts[0].text == "spy ok"
+    assert isinstance(attempt.handle, FakeHandle)
+    assert attempt.handle.released is True
+
+
+@pytest.mark.asyncio
+async def test_native_gemini_stream_calls_generation_service(
+    monkeypatch,
+) -> None:
+    async def fake_stream(**_kwargs):
+        yield ("body", "spy stream")
+        yield ("finish_reason", 1)
+        yield (
+            "usage",
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        )
+
+    client = MagicMock()
+    client.stream_generate_content = fake_stream
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    calls: list[dict[str, object]] = []
+    real_stream = generation_service.stream_generation
+
+    def spy_stream(**kwargs):
+        calls.append(kwargs)
+        return real_stream(**kwargs)
+
+    monkeypatch.setattr(generation_service, "stream_generation", spy_stream)
+
+    response = await handle_gemini_generate_content(
+        "gemini-3.7-flash", _request(), stream=True, pipeline=pipeline
+    )
+    assert isinstance(response, StreamingResponse)
+    chunks = [
+        chunk
+        async for chunk in cast(AsyncIterator[str], response.body_iterator)
+    ]
+
+    assert len(calls) == 1
+    assert calls[0]["model_path"] == "gemini-3.7-flash"
+    assert calls[0]["api_format"] == "gemini"
+    assert calls[0]["pipeline"] is pipeline
+    assert any("spy stream" in str(chunk) for chunk in chunks)
+    assert any('"finishReason": "STOP"' in str(chunk) for chunk in chunks)
+    assert isinstance(attempt.handle, FakeHandle)
+    assert attempt.handle.released is True
