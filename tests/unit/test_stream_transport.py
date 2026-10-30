@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import gzip
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,8 +13,6 @@ from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     STREAM_CLEANUP_JS,
     STREAMING_INIT_JS,
-    build_hooked_request_args,
-    build_streaming_init_args,
 )
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest
 from aistudio_api.infrastructure.gateway.session import BrowserSession
@@ -80,7 +76,6 @@ async def test_transport_native_cdp_binding_stream_push():
         url="http://test.com",
         headers={},
         body="{}",
-        timeout_ms=3000,
     ):
         collected.append((tag, payload))
 
@@ -92,10 +87,33 @@ async def test_transport_native_cdp_binding_stream_push():
 
 
 @pytest.mark.asyncio
-async def test_transport_streaming_timeout_raises():
-    """Verify stream timeout before completion explicitly raises TimeoutError."""
+async def test_transport_streaming_page_closed_raises():
+    """Verify stream immediately raises BrowserTransportError if browser page closes mid-stream."""
     transport = XHRStreamTransport()
     page = MagicMock(spec=CDPPage)
+    page.is_closed = MagicMock(side_effect=[False, True, True, True])
+    page.on_binding = MagicMock()
+    page.add_binding = AsyncMock()
+    page.evaluate = AsyncMock()
+
+    with pytest.raises(
+        BrowserTransportError, match="Browser page closed during streaming"
+    ):
+        async for _ in transport.send_streaming_request(
+            page,
+            url="http://test.com",
+            headers={},
+            body="{}",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_transport_stream_tolerates_idle_gap_without_deadline():
+    """Infinite streaming: idle gaps past one 1s poll slice never abort the stream."""
+    transport = XHRStreamTransport()
+    page = MagicMock(spec=CDPPage)
+    page.is_closed = MagicMock(return_value=False)
     binding_listener = None
 
     def mock_on_binding(name: str, callback):
@@ -116,26 +134,34 @@ async def test_transport_streaming_timeout_raises():
 
     page.evaluate = AsyncMock(side_effect=fake_evaluate)
 
-    async def push_status_only():
+    async def push_events():
         while captured_rid is None or binding_listener is None:
             await asyncio.sleep(0.01)
         binding_listener(
             json.dumps({"rid": captured_rid, "type": "status", "status": 200})
         )
+        # Longer than the 1s slice used only to detect page closure.
+        await asyncio.sleep(1.2)
+        binding_listener(
+            json.dumps({"rid": captured_rid, "type": "chunk", "text": "late chunk"})
+        )
+        binding_listener(json.dumps({"rid": captured_rid, "type": "done"}))
 
-    push_task = asyncio.create_task(push_status_only())
-    with pytest.raises(
-        TimeoutError, match="streaming response timed out before completion"
+    push_task = asyncio.create_task(push_events())
+
+    collected = []
+    async for tag, payload in transport.send_streaming_request(
+        page,
+        url="http://test.com",
+        headers={},
+        body="{}",
     ):
-        async for _ in transport.send_streaming_request(
-            page,
-            url="http://test.com",
-            headers={},
-            body="{}",
-            timeout_ms=100,
-        ):
-            pass
+        collected.append((tag, payload))
+
     await push_task
+
+    assert ("status", 200) in collected
+    assert ("chunk", b"late chunk") in collected
 
 
 @pytest.mark.asyncio
@@ -163,7 +189,6 @@ async def test_transport_abort_stream_by_rid():
             url="http://test.com",
             headers={},
             body="{}",
-            timeout_ms=5000,
         ):
             pass
 
@@ -196,35 +221,6 @@ async def test_transport_abort_stream_by_rid():
         await task2
 
     assert transport.in_flight_count == 0
-
-
-def test_build_request_args_gzip_above_threshold():
-    """Verify bodies >= 96KB are automatically gzipped and base64-encoded for fetch."""
-    small_body = '["models/gemini-3.7-flash","hello"]'
-    small_args = build_hooked_request_args(
-        url="https://example.com",
-        headers={"Content-Type": "application/json+protobuf"},
-        body=small_body,
-        timeout_s=60.0,
-    )
-    assert "gzip" not in small_args
-    assert small_args["body"] == small_body
-
-    large_body = '["models/gemini-3.7-flash","' + ("A" * (96 * 1024)) + '"]'
-    large_args = build_streaming_init_args(
-        url="https://example.com",
-        headers={"Content-Type": "application/json+protobuf"},
-        body=large_body,
-        timeout_s=60.0,
-        rid="r_gzip",
-    )
-    assert large_args.get("gzip") is True
-    assert large_args["rid"] == "r_gzip"
-    headers = large_args["headers"]
-    assert isinstance(headers, dict)
-    assert headers["Content-Encoding"] == "gzip"
-    compressed_bytes = base64.b64decode(str(large_args["body"]))
-    assert gzip.decompress(compressed_bytes).decode("utf-8") == large_body
 
 
 @pytest.mark.asyncio
@@ -281,7 +277,6 @@ async def test_replay_failure_logs_and_attaches_cdp_net_evidence():
             url="https://alkalimakersuite-pa.clients6.google.com/$rpc/MakerSuiteService/GenerateContent",
             headers={},
             body="[]",
-            timeout_ms=5000,
         )
     assert exc_info.value.net_evidence is not None
     assert len(exc_info.value.net_evidence) == 1

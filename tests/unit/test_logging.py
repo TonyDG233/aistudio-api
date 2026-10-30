@@ -575,3 +575,50 @@ def test_instance_client_raw_dump_sanitizes_malicious_model(monkeypatch, tmp_pat
     assert "\\" not in name
     assert ".." not in name
     assert "evil" in name
+
+
+def test_ai_studio_client_raw_dump_only_writes_safe_fields(monkeypatch, tmp_path):
+    """N-14: control-client raw dump 只写 safe_* 字段且模型文件名已净化。"""
+    import json
+
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+    raw_dir = tmp_path / "raw"
+    monkeypatch.delenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR", raising=False)
+    monkeypatch.setattr(settings, "dump_raw_response", True)
+    monkeypatch.setattr(settings, "dump_raw_response_dir", str(raw_dir))
+
+    client = AIStudioClient(port=9222)
+    client._dump_raw_exchange(
+        kind="generate_content",
+        model="..\\evil/../models/gemini-3.7-flash",
+        capture_prompt="Authorization: Bearer super-secret-token",
+        modified_body='{"key": "AIzaSyRawBodyLeak1234567890", "text": "hello"}',
+        raw_response="Cookie: SAPISID=raw-cookie-value",
+    )
+
+    files = list(raw_dir.glob("aistudio_*.json"))
+    assert len(files) == 1
+    dumped = files[0]
+    assert dumped.parent == raw_dir
+    assert "/" not in dumped.name
+    assert "\\" not in dumped.name
+    assert ".." not in dumped.name
+
+    raw_text = dumped.read_text(encoding="utf-8")
+    data = json.loads(raw_text)
+    assert data["kind"] == "generate_content"
+    assert data["safe_request_body"]["text"] == "hello"
+    assert set(data) == {
+        "kind",
+        "model",
+        "safe_prompt",
+        "safe_request_body",
+        "safe_response",
+    }
+    for key in ("capture_prompt", "modified_body", "raw_response", "headers", "body"):
+        assert key not in data
+    assert "super-secret-token" not in raw_text
+    assert "AIzaSyRawBodyLeak1234567890" not in raw_text
+    assert "raw-cookie-value" not in raw_text

@@ -80,6 +80,63 @@ async def test_browser_session_generate_snapshot(mock_cdp_page):
 
 
 @pytest.mark.asyncio
+async def test_browser_session_generate_snapshot_retries_five_times_with_250ms(
+    mock_cdp_page,
+):
+    """Snapshot failures retry 5 times with a 250ms pause between attempts."""
+    session = BrowserSession(port=9222)
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="test_snapshot_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+    mock_cdp_page.evaluate = AsyncMock(side_effect=RuntimeError("snapshot not ready"))
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="retry")])]
+
+    with pytest.raises(RuntimeError, match="Snapshot generation failed"):
+        await session.generate_snapshot(contents)
+
+    assert mock_cdp_page.evaluate.await_count == 5
+    assert mock_cdp_page.wait_for_timeout.await_count == 4
+    assert [call.args for call in mock_cdp_page.wait_for_timeout.await_args_list] == [
+        (250,)
+    ] * 4
+
+
+@pytest.mark.asyncio
+async def test_browser_session_generate_snapshot_empty_result_also_retries(
+    mock_cdp_page,
+):
+    """Empty snapshots follow the same 5x250ms retry schedule as exceptions."""
+    session = BrowserSession(port=9222)
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="test_snapshot_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+    mock_cdp_page.evaluate = AsyncMock(return_value="")
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="retry")])]
+
+    with pytest.raises(RuntimeError, match="Snapshot generation failed"):
+        await session.generate_snapshot(contents)
+
+    assert mock_cdp_page.evaluate.await_count == 5
+    assert [call.args for call in mock_cdp_page.wait_for_timeout.await_args_list] == [
+        (250,)
+    ] * 4
+
+
+@pytest.mark.asyncio
 async def test_browser_session_send_hooked_request(mock_cdp_page):
     session = BrowserSession(port=9222)
     session.set_ready_context(
@@ -107,7 +164,6 @@ async def test_browser_session_send_hooked_request(mock_cdp_page):
         url="https://alkalimakersuite-pa.clients6.google.com/test",
         headers={"content-type": "application/json"},
         body='["test"]',
-        timeout_ms=5000,
     )
     assert status == 200
     assert body == b'["response_data"]'
@@ -162,7 +218,6 @@ async def test_browser_session_send_streaming_request(mock_cdp_page):
         url="https://alkalimakersuite-pa.clients6.google.com/stream",
         headers={"content-type": "application/json"},
         body='["stream"]',
-        timeout_ms=5000,
     ):
         collected.append((tag, data))
 

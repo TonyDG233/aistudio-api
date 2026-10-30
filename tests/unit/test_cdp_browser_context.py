@@ -8,6 +8,8 @@ import pytest
 
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient
 from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
+from aistudio_api.infrastructure.gateway.session_state import SessionContext
+from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 
 
 class FakeConn:
@@ -199,3 +201,33 @@ async def test_pooled_session_bootstraps_inside_given_context(monkeypatch) -> No
 
     await session.close()
     page.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pooled_session_generate_snapshot_retries_five_times_with_250ms() -> None:
+    """Pooled snapshot failures retry 5 times with a 250ms pause between attempts."""
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.evaluate = AsyncMock(side_effect=RuntimeError("snapshot not ready"))
+    page.wait_for_timeout = AsyncMock()
+    context = SessionContext(
+        page=page,
+        snap_key="snap_key",
+        auth_user="0",
+        auth_file=None,
+        base_template={"url": "https://example.com"},
+    )
+    session = PooledSession(
+        context=context, transport=MagicMock(), realm_id="realm-acc"
+    )
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="retry")])]
+
+    with pytest.raises(RuntimeError, match="PooledSession snapshot generation failed"):
+        await session.generate_snapshot(contents)
+
+    assert page.evaluate.await_count == 5
+    assert page.wait_for_timeout.await_count == 4
+    assert [call.args for call in page.wait_for_timeout.await_args_list] == [
+        (250,)
+    ] * 4
