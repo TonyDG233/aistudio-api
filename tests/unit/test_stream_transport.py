@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ from aistudio_api.infrastructure.browser.scripts import (
     STREAM_CLEANUP_JS,
     STREAMING_INIT_JS,
 )
+from aistudio_api.infrastructure.gateway import streaming as streaming_module
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest
 from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
@@ -351,3 +353,110 @@ async def test_streaming_gateway_raises_on_empty_200_stream_and_retains_trailing
     assert isinstance(usage_events[0], dict)
     assert usage_events[0]["prompt_tokens"] == 15
     assert usage_events[0]["cached_tokens"] == 10
+
+
+@pytest.mark.asyncio
+async def test_pg03_tool_stream_without_finish_synthesizes_stop_and_keeps_usage():
+    mock_session = MagicMock(spec=BrowserSession)
+    captured = CapturedRequest(
+        url="https://alkalimakersuite-pa.clients6.google.com/$rpc/GenerateContent",
+        headers={},
+        body='["models/gemini-3.7-flash"]',
+        model="models/gemini-3.7-flash",
+    )
+    gateway = StreamingGateway(session=mock_session)
+
+    part = [None] * 10 + [
+        [
+            "emit_complete_response_x",
+            [[["content", [None, None, "hello"]]]],
+            "call_1",
+        ]
+    ]
+    candidate = [[[part], "model"], None]
+    chunk = [[candidate], None, [7, 4, 11]]
+    frame = ")]}'\n" + json.dumps([[chunk]])
+
+    async def tool_stream(**_kwargs):
+        yield ("status", 200)
+        yield ("chunk", frame.encode("utf-8"))
+
+    mock_session.send_streaming_request = MagicMock(side_effect=tool_stream)
+
+    events = [
+        event
+        async for event in gateway.stream_chat(
+            captured=captured, model="models/gemini-3.7-flash"
+        )
+    ]
+
+    assert any(kind == "tool_calls" for kind, _payload in events)
+    assert ("finish_reason", 1) in events
+    assert events[-1] == ("done", None)
+    usage_events = [payload for kind, payload in events if kind == "usage"]
+    assert len(usage_events) == 1
+    assert isinstance(usage_events[0], dict)
+    assert usage_events[0]["total_tokens"] == 11
+
+
+@pytest.mark.asyncio
+async def test_pg03_tool_stream_idle_after_open_connection_synthesizes_stop(
+    monkeypatch,
+):
+    """A tool stream left open after tool_calls finishes within the idle window."""
+    monkeypatch.setattr(streaming_module, "TOOL_STREAM_IDLE_FINISH_S", 0.05)
+
+    mock_session = MagicMock(spec=BrowserSession)
+    captured = CapturedRequest(
+        url="https://alkalimakersuite-pa.clients6.google.com/$rpc/GenerateContent",
+        headers={},
+        body='["models/gemini-3.7-flash"]',
+        model="models/gemini-3.7-flash",
+    )
+    gateway = StreamingGateway(session=mock_session)
+
+    part = [None] * 10 + [
+        [
+            "emit_complete_response_x",
+            [[["content", [None, None, "hello"]]]],
+            "call_1",
+        ]
+    ]
+    candidate = [[[part], "model"], None]
+    chunk = [[candidate], None, [7, 4, 11]]
+    frame = ")]}'\n" + json.dumps([[chunk]])
+    closed = False
+
+    async def stalled_tool_stream(**_kwargs):
+        nonlocal closed
+        try:
+            yield ("status", 200)
+            yield ("chunk", frame.encode("utf-8"))
+            # Upstream keeps the connection open without done/finish.
+            await asyncio.Event().wait()
+        finally:
+            closed = True
+
+    mock_session.send_streaming_request = MagicMock(
+        side_effect=stalled_tool_stream
+    )
+
+    started = time.monotonic()
+    events = [
+        event
+        async for event in gateway.stream_chat(
+            captured=captured, model="models/gemini-3.7-flash"
+        )
+    ]
+    elapsed = time.monotonic() - started
+
+    assert any(kind == "tool_calls" for kind, _payload in events)
+    finish_events = [payload for kind, payload in events if kind == "finish_reason"]
+    assert finish_events == [1]
+    usage_events = [payload for kind, payload in events if kind == "usage"]
+    assert len(usage_events) == 1
+    assert isinstance(usage_events[0], dict)
+    assert usage_events[0]["total_tokens"] == 11
+    assert events[-1] == ("done", None)
+    assert elapsed < 2.0
+    assert closed is True

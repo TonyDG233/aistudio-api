@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -10,7 +13,11 @@ import pytest
 from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_routing_pipeline
 from aistudio_api.config import settings
-from aistudio_api.domain.errors import SurfaceCapacityError, TierRequiredError
+from aistudio_api.domain.errors import (
+    RequestError,
+    SurfaceCapacityError,
+    TierRequiredError,
+)
 from aistudio_api.domain.models import Candidate, ModelOutput
 from tests.unit.routing_fakes import (
     FakeHandle,
@@ -23,6 +30,11 @@ _HEADERS = {"x-goog-api-key": "test-key"}
 _BODY = {
     "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
 }
+_PG_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "pg"
+
+
+def _pg_fixture(name: str) -> dict[str, Any]:
+    return json.loads((_PG_FIXTURES / name).read_text(encoding="utf-8"))
 
 
 class _RaisingPipeline:
@@ -139,3 +151,43 @@ async def test_streaming_success_uses_pipeline_instance() -> None:
     assert isinstance(attempt.handle, FakeHandle)
     assert attempt.handle.released is True
 
+
+
+@pytest.mark.asyncio
+async def test_pg02_prestream_failure_returns_real_http_status_not_sse() -> None:
+    fixture = _pg_fixture("f02_prestream_400.json")
+    upstream = fixture["upstream"]
+    expected = fixture["expected"]
+    assert isinstance(upstream, dict)
+    assert isinstance(expected, dict)
+    error_body = upstream["error"]
+    assert isinstance(error_body, dict)
+
+    async def failing_stream(*_args, **_kwargs):
+        raise RequestError(int(upstream["status"]), str(error_body["message"]))
+        yield ("body", "never")  # pragma: no cover
+
+    fake_client = MagicMock()
+    fake_client.stream_generate_content = failing_stream
+    attempt = make_attempt(fake_client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+    app.dependency_overrides[get_routing_pipeline] = lambda: pipeline
+
+    async with _client() as client:
+        response = await client.post(
+            "/v1beta/gemini-3.7-flash:streamGenerateContent",
+            headers=_HEADERS,
+            json=_BODY,
+        )
+
+    assert response.status_code == expected["http_status"]
+    content_type = response.headers["content-type"]
+    assert content_type.startswith(expected["content_type"])
+    assert "text/event-stream" not in content_type
+    assert expected["sse"] is False
+    error = response.json()["error"]
+    assert error["code"] == expected["error_code"]
+    assert error["status"] == expected["error_status"]
+    assert str(error_body["message"]) in error["message"]
+    assert isinstance(attempt.handle, FakeHandle)
+    assert attempt.handle.released is True
