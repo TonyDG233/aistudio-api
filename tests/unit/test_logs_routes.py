@@ -267,6 +267,63 @@ async def test_export_single_day_returns_log(monkeypatch, tmp_path):
     assert "single-day-line" in response.text
 
 
+async def test_export_sanitizes_historical_secrets_and_keeps_markers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AISTUDIO_LOG_DIR", str(tmp_path))
+    _write_archive(
+        tmp_path,
+        date.today(),
+        "Authorization: Bearer historical-secret\n"
+        "Cookie: SAPISID=historical-cookie; theme=dark\n"
+        "x-goog-api-key: AIzaSyHistoricalValue1234567890\n"
+        "已删除 API Key: sk-b6-deadbeefcafebabe\n"
+        "HTTP DELETE /api-keys/sk-b6-deadbeefcafebabe -> 200\n"
+        "[toolshape] preserved\n"
+        "pg08 preserved\n",
+    )
+
+    async with _client() as client:
+        response = await client.get("/logs/export", params={"days": 1})
+
+    assert response.status_code == 200
+    body = response.text
+    assert "historical-secret" not in body
+    assert "historical-cookie" not in body
+    assert "theme=dark" not in body
+    assert "AIzaSyHistoricalValue1234567890" not in body
+    assert "sk-b6-deadbeefcafebabe" not in body
+    assert "Authorization: Bearer ***" in body
+    assert "Cookie: ***" in body
+    assert "[toolshape] preserved" in body
+    assert "pg08 preserved" in body
+
+
+async def test_export_zip_sanitizes_historical_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("AISTUDIO_LOG_DIR", str(tmp_path))
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    first_name = _write_archive(
+        tmp_path, yesterday, "Cookie: SID=zip-cookie-value\n[toolshape] zip-keep\n"
+    )
+    second_name = _write_archive(
+        tmp_path, today, "Authorization: Bearer zip-secret\npg08 zip-keep\n"
+    )
+
+    async with _client() as client:
+        response = await client.get("/logs/export", params={"days": 2})
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        first = archive.read(first_name).decode("utf-8")
+        second = archive.read(second_name).decode("utf-8")
+
+    assert "zip-cookie-value" not in first
+    assert "[toolshape] zip-keep" in first
+    assert "zip-secret" not in second
+    assert "pg08 zip-keep" in second
+
+
 @pytest.mark.parametrize("path", ["/logs/export", "/api/logs/export"])
 async def test_export_api_alias_serves_same_archive(monkeypatch, tmp_path, path):
     monkeypatch.setenv("AISTUDIO_LOG_DIR", str(tmp_path))

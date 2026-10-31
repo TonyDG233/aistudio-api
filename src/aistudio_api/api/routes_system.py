@@ -485,7 +485,7 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("创建 API Key: 备注=%s, 前缀=%s", name, new_key[:8] + "...")
+    logger.info("创建 API Key: 备注=%s, 密钥=***", name)
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
 
 
@@ -533,7 +533,7 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("删除 API Key: 前缀=%s", key_value[:8] + "...")
+    logger.info("删除 API Key: 密钥=***")
     return {"ok": True}
 
 
@@ -586,6 +586,6 @@ async def update_api_key_name(
         raise HTTPException(400, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
-    logger.info("更新 API Key 备注: 前缀=%s, 备注=%s", key_value[:8] + "...", new_name)
+    logger.info("更新 API Key 备注: 密钥=***, 备注=%s", new_name)
 
     return updated_item

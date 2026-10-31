@@ -5,10 +5,12 @@ on:
     branches:
       - master
       - main
+      - rebuild-upstream
   pull_request:
     branches:
       - master
       - main
+      - rebuild-upstream
   workflow_dispatch:
 
 concurrency:

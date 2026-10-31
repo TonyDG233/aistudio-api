@@ -2,8 +2,9 @@
   "date": "2026-10-31",
   "server_starts": 1,
   "generation_budget": 5,
-  "generation_used": 3,
-  "generation_success": 2,
+  "generation_used": 5,
+  "generation_success": 5,
+  "count_tokens_used": 1,
   "model_discovery": {
     "source": "live_page",
     "count": 31,
@@ -15,28 +16,30 @@
     "paid_request_instance": "inst-2",
     "in_flight_after": [0, 0]
   },
-  "failures": [
-    {
-      "item": "native_gemini_stream",
-      "status": 200,
-      "symptom": "client received zero SSE events; server log lacks stream completion"
-    },
-    {
-      "item": "count_tokens_client_parse",
-      "status": 200,
-      "symptom": "client could not parse JSON; server log reports totalTokens=11"
-    },
-    {
-      "item": "openai_tier_403_shape",
-      "status": 403,
-      "symptom": "missing tier/model/required_tier/current_tier fields"
-    }
-  ],
-  "logs": {
-    "spa": 200,
-    "sse": 200,
-    "export": 200
+  "functional_checks": {
+    "tier_403_four_fields_openai": true,
+    "tier_403_four_fields_gemini": true,
+    "native_gemini_stream_events": 2,
+    "native_gemini_stream_finish": "STOP",
+    "native_tools_functionCall": "get_weather",
+    "signature_cache_before": 0,
+    "signature_cache_after": 1,
+    "pg08_atg_stream": 200,
+    "logs_spa": 200,
+    "logs_sse": 200,
+    "logs_export": 200
   },
-  "shutdown": "ports closed; Chrome 0",
-  "secrets_printed": false
+  "b4_log_export": {
+    "export_sanitizer": "PASS (offline)",
+    "historical_cleanup": "PASS (offline)",
+    "sk_b6_prefixes_after_cleanup": 0,
+    "cookie_secret_values_after_cleanup": 0,
+    "authorization_secret_values_after_cleanup": 0,
+    "toolshape_lines_preserved": 2160,
+    "pg08_lines_preserved": 474,
+    "note": "Functional live run from 2026-10-31 passed; sanitizer and archive cleanup verified offline, no new live run was performed."
+  },
+  "shutdown": "8080/9222 closed; Chrome 0",
+  "secrets_printed": false,
+  "verdict": "PASS"
 }

@@ -205,3 +205,44 @@ async def test_rotation_status_and_clear_cooldown():
         )
         assert resp_clear.status_code == 200
         mock_rotator.clear_cooldown.assert_called_once_with("acc_1", model=None)
+
+
+@pytest.mark.asyncio
+async def test_api_key_route_logs_never_render_key_or_prefix(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+    import shutil
+    from pathlib import Path
+
+    import aistudio_api.api.routes_system as routes_system
+    import aistudio_api.infrastructure.gateway.model_defaults as model_defaults
+
+    config_path = tmp_path / "config.yaml"
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "defaults" / "config.yaml",
+        config_path,
+    )
+    monkeypatch.setattr(routes_system, "_resolve_config_path", lambda _p: config_path)
+    monkeypatch.setattr(model_defaults, "_resolve_config_path", lambda _p: config_path)
+    model_defaults.invalidate_config_cache()
+    caplog.set_level(logging.INFO, logger="aistudio.routes.system")
+
+    secret = "sk-b6-SECRETKEY1234567890"
+    item = await routes_system.create_api_key(
+        routes_system.CreateApiKeyRequest(name="b6-probe", key=secret)
+    )
+    await routes_system.update_api_key_name(
+        item.key, routes_system.UpdateApiKeyRequest(name="b6-renamed")
+    )
+    await routes_system.delete_api_key(item.key)
+    model_defaults.invalidate_config_cache()
+
+    messages = [record.getMessage() for record in caplog.records]
+    joined = "\n".join(messages)
+    assert any("创建 API Key" in message for message in messages)
+    assert any("更新 API Key 备注" in message for message in messages)
+    assert any("删除 API Key" in message for message in messages)
+    assert secret not in joined
+    assert secret[:8] not in joined
+    assert "***" in joined

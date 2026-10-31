@@ -42,10 +42,6 @@ _AUTH_HEADER_RE = re.compile(
 )
 _SET_COOKIE_RE = re.compile(r"(?i)(\bset-cookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
 _COOKIE_HEADER_RE = re.compile(r"(?i)(\bcookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
-_COOKIE_PAIR_RE = re.compile(r"([^=;\s]+)\s*=\s*([^;]*)")
-_SENSITIVE_COOKIE_NAME_RE = re.compile(
-    r"(?i)^(?:sapisid(?:hash)?|sid|hsid|ssid|apisid|__secure-.*|.*(?:auth|session|token).*)$"
-)
 _COOKIE_TOKEN_RE = re.compile(
     r"(?i)\b(sapisidhash|sapisid|hsid|ssid|apisid|sid)\s*=\s*([^;\s\"',]+)"
 )
@@ -53,9 +49,11 @@ _API_KEY_RE = re.compile(
     r"(?i)(\b(?:x-goog-api-key|api[_-]?key|access[_-]?token)\b[\"']?\s*[:=]\s*[\"']?)"
     r"([^\s,;\"'}]+)"
 )
+_API_KEY_PATH_RE = re.compile(r"(?i)(/api-keys/)([^\s?#\"']+)")
 _QUERY_KEY_RE = re.compile(r"(?i)([?&]key=)([^&\s]+)")
 _BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)([a-z0-9\-._~+/=]{8,})")
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
+_SK_TOKEN_RE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9][A-Za-z0-9_-]{4,}")
 
 _ARCHIVE_NAME_RE = re.compile(r"^aistudio-(\d{8})\.log$")
 
@@ -68,24 +66,16 @@ def sanitize_log_message(message: str) -> str:
         lambda match: f"{match.group(1)}{match.group(2) or ''}{_MASK}", text
     )
     text = _SET_COOKIE_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
-    text = _COOKIE_HEADER_RE.sub(
-        lambda match: match.group(1) + _mask_cookie_header(match.group(2)), text
-    )
+    # Cookie headers are masked wholesale: even non-auth cookie names can carry
+    # session material, so no cookie value may reach the ring or archive sink.
+    text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _COOKIE_TOKEN_RE.sub(lambda match: f"{match.group(1)}={_MASK}", text)
     text = _API_KEY_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
+    text = _API_KEY_PATH_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _QUERY_KEY_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
+    text = _SK_TOKEN_RE.sub(_MASK, text)
     return _GOOGLE_API_KEY_RE.sub(_MASK, text)
-
-
-def _mask_cookie_header(value: str) -> str:
-    def _mask_pair(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if _SENSITIVE_COOKIE_NAME_RE.match(name):
-            return f"{name}={_MASK}"
-        return match.group(0)
-
-    return _COOKIE_PAIR_RE.sub(_mask_pair, value)
 
 
 def level_number(level: str) -> int:
