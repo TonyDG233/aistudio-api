@@ -82,6 +82,57 @@ async def test_paid_lane_plus_instance_fails_pro_admission() -> None:
         await pipeline.begin(model_path="gemini-4-argon")
 
 
+def test_rebind_selection_is_rank_based_and_prefers_minimal_paid_tier(
+    tmp_path,
+) -> None:
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("pro", "pro@example.com", "Pro"),
+        ("ultra", "ultra@example.com", "Ultra"),
+    )
+    rotator = AccountRotator(store)
+
+    picked = rotator.select_rebind_account(
+        lane="paid", required_tiers=("Pro",)
+    )
+    assert picked is not None
+    assert picked.id == accounts["pro"].id
+
+    # Rank-based requirement: Ultra still satisfies a Pro requirement.
+    only_ultra = rotator.select_rebind_account(
+        lane="paid",
+        required_tiers=("Pro",),
+        exclude_account_ids={accounts["pro"].id},
+    )
+    assert only_ultra is not None
+    assert only_ultra.id == accounts["ultra"].id
+
+
+def test_rebind_selection_obeys_only_tier_interval(tmp_path) -> None:
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("pro", "pro@example.com", "Pro"),
+        ("ultra", "ultra@example.com", "Ultra"),
+    )
+    rotator = AccountRotator(store)
+
+    picked = rotator.select_rebind_account(lane="paid", only_tier="Pro")
+    assert picked is not None
+    assert picked.id == accounts["pro"].id
+    assert (
+        rotator.select_rebind_account(
+            lane="paid",
+            only_tier="Pro",
+            exclude_account_ids={accounts["pro"].id},
+        )
+        is None
+    )
+
+
 def test_rotator_has_no_group_or_affinity_parameters() -> None:
     signature = inspect.signature(AccountRotator.get_next_account)
     assert "active_groups" not in signature.parameters

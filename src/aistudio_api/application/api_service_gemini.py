@@ -325,16 +325,10 @@ async def _build_gemini_streaming_response(
             first_chunk = _render_stream_event(event)
     except StopAsyncIteration:
         await events.aclose()
-
-        async def empty_stream() -> AsyncGenerator[str, None]:
-            if False:
-                yield ""
-
-        return StreamingResponse(
-            empty_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        # A streaming request must never answer HTTP 200 with an empty SSE
+        # body: clients that wait for the first ``data:`` frame observe "200 +
+        # 0 events".  Surface this as a real upstream/protocol error instead.
+        raise RequestError(502, "generation produced no stream events") from None
     except BrowserTransportError as exc:
         await events.aclose()
         raise RequestError(502, str(exc)) from exc

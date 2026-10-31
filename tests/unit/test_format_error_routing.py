@@ -68,3 +68,44 @@ def test_sse_tier_error_carries_fields() -> None:
     assert "required_tier" in chunk
     assert "current_tier" in chunk
     assert "PERMISSION_DENIED" in chunk
+
+
+class _TierRaisingPipeline:
+    async def begin(self, *, model_path: str, requested_surface: str | None = None):
+        del model_path, requested_surface
+        raise _tier_error()
+
+
+@pytest.mark.asyncio
+async def test_openai_route_tier_403_keeps_four_fields() -> None:
+    import httpx
+    from fastapi import FastAPI
+
+    from aistudio_api.api import routes_openai
+    from aistudio_api.api.dependencies import get_routing_pipeline
+
+    app = FastAPI()
+    app.include_router(routes_openai.router)
+    app.dependency_overrides[routes_openai.require_openai] = lambda: None
+    app.dependency_overrides[get_routing_pipeline] = lambda: _TierRaisingPipeline()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-4-argon",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 403
+    error = response.json()["error"]
+    assert error["type"] == "tier_required"
+    assert error["code"] == "tier_required"
+    assert error["tier"] == "Pro"
+    assert error["model"] == "gemini-4-argon"
+    assert error["required_tier"] == "Pro"
+    assert error["current_tier"] == "Free"
+    assert response.status_code not in (429, 503)

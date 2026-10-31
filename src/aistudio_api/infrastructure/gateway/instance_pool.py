@@ -20,6 +20,12 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from aistudio_api.application.model_access import (
+    TierSelector,
+    canonical_tier,
+    resolve_tier_selector,
+    tier_matches_selector,
+)
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -54,11 +60,13 @@ class InstanceBusyError(RuntimeError):
 
 @dataclass(frozen=True)
 class InstanceSpec:
-    """One normalized ``instances`` entry (count/surface/min_tier)."""
+    """One normalized ``instances`` entry (count/surface/tier selector)."""
 
     count: int
     surface: str
-    min_tier: str
+    min_tier: str = ""
+    only_tier: str = ""
+    max_tier: str = ""
 
     @classmethod
     def from_mapping(cls, item: dict[str, object]) -> InstanceSpec:
@@ -66,11 +74,43 @@ class InstanceSpec:
             count = int(str(item.get("count", 1)))
         except (TypeError, ValueError):
             count = 1
+        surface = str(item.get("surface") or "chat").lower()
+        raw_max = item.get("max_tier")
+        selector = resolve_tier_selector(
+            only_tier=item.get("only_tier"),
+            min_tier=item.get("min_tier"),
+            max_tier=raw_max,
+        )
+        if selector.only_tier is not None:
+            return cls(
+                count=count,
+                surface=surface,
+                only_tier=selector.only_tier,
+                min_tier=selector.min_tier,
+                max_tier=selector.max_tier,
+            )
         return cls(
             count=count,
-            surface=str(item.get("surface") or "chat").lower(),
-            min_tier=str(item.get("min_tier") or "Free"),
+            surface=surface,
+            min_tier=selector.min_tier,
+            max_tier=canonical_tier(raw_max) or "",
         )
+
+    @property
+    def selector(self) -> TierSelector:
+        if self.only_tier:
+            return resolve_tier_selector(only_tier=self.only_tier)
+        return resolve_tier_selector(
+            min_tier=self.min_tier or None,
+            max_tier=self.max_tier or None,
+        )
+
+    @property
+    def lane(self) -> str:
+        return self.selector.lane
+
+    def accepts_tier(self, tier: object) -> bool:
+        return tier_matches_selector(tier, self.selector)
 
 
 @dataclass
@@ -103,6 +143,8 @@ class InstanceSlot:
     surface: str
     min_tier: str
     lane: str
+    only_tier: str = ""
+    max_tier: str = ""
     context_id: str = ""
     account_id: str = ""
     auth_file: str | None = None
@@ -134,6 +176,18 @@ class InstanceSlot:
     @property
     def in_flight(self) -> int:
         return self.active_requests
+
+    @property
+    def selector(self) -> TierSelector:
+        if self.only_tier:
+            return resolve_tier_selector(only_tier=self.only_tier)
+        return resolve_tier_selector(
+            min_tier=self.min_tier or None,
+            max_tier=self.max_tier or None,
+        )
+
+    def accepts_tier(self, tier: object) -> bool:
+        return tier_matches_selector(tier, self.selector)
 
     @property
     def page(self) -> CDPPage | None:
@@ -283,6 +337,10 @@ class InstancePool:
             raise ValueError(f"unknown surface: {normalized.surface}")
         if lane not in ("free", "paid"):
             raise ValueError(f"unknown instance lane: {lane}")
+        if normalized.lane != lane:
+            raise ValueError(
+                f"instance tier selector lane {normalized.lane} cannot use {lane} slot"
+            )
         async with self._lock:
             if len(self._slots) >= self.max_contexts:
                 raise InstanceCapacityError(
@@ -297,6 +355,8 @@ class InstancePool:
                 surface=normalized.surface,
                 min_tier=normalized.min_tier,
                 lane=lane,
+                only_tier=normalized.only_tier,
+                max_tier=normalized.max_tier,
                 last_used=self._clock(),
                 created_at=self._clock(),
             )
@@ -330,6 +390,12 @@ class InstancePool:
         if account_lane is not None and account_lane != slot.lane:
             raise InstanceTierError(
                 f"account lane {account_lane} cannot use {slot.lane} instance"
+            )
+        if not slot.accepts_tier(tier):
+            raise InstanceTierError(
+                f"account tier {tier} outside instance tier spec "
+                f"only={slot.only_tier or '-'} min={slot.min_tier or '-'} "
+                f"max={slot.max_tier or '-'}"
             )
 
         async with slot.lifecycle_lock:

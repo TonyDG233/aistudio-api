@@ -21,7 +21,9 @@ EXPECTED_KEYS = {
     "account_id",
     "state",
     "surface",
+    "only_tier",
     "min_tier",
+    "max_tier",
     "in_flight",
     "latest",
 }
@@ -47,7 +49,9 @@ class FakeManager:
                     account_id="a",
                     state=InstanceState.ACTIVE,
                     surface="chat",
+                    only_tier="Free",
                     min_tier="Free",
+                    max_tier="Free",
                     in_flight=1,
                     latest=True,
                 ),
@@ -148,6 +152,9 @@ async def test_list_instances_exposes_single_surface_fields(manager) -> None:
     item = payload["instances"][0]
     assert set(item) == EXPECTED_KEYS
     assert item["surface"] == "chat"
+    assert item["only_tier"] == "Free"
+    assert item["min_tier"] == "Free"
+    assert item["max_tier"] == "Free"
     assert "channel" not in item
     assert "context" not in str(payload).lower()
     assert "pages" not in str(payload).lower()

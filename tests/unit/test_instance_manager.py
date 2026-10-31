@@ -134,6 +134,29 @@ def _paid_spec(count: int = 1, surface: str = "chat") -> InstanceSpec:
     return InstanceSpec(count=count, surface=surface, min_tier="Pro")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        InstanceSpec(count=1, surface="chat", only_tier="Pro"),
+        InstanceSpec(count=1, surface="chat", min_tier="Pro", max_tier="Pro"),
+    ],
+)
+async def test_paid_interval_excludes_ultra_at_startup(tmp_path, spec) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("ultra", "ultra@example.com", "Ultra")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[spec], max_contexts=1)
+
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+
+    assert record.state is InstanceState.UNSTARTED
+    assert record.account_id == ""
+    assert cdp.created == []
+
+
 def _by_account(items: tuple[Any, ...], account_id: str) -> Any:
     return next(item for item in items if item.account_id == account_id)
 

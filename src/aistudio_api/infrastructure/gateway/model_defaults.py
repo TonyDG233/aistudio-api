@@ -11,6 +11,11 @@ from pathlib import Path
 
 import yaml
 
+from aistudio_api.application.model_access import (
+    TierSelectorError,
+    canonical_tier,
+    resolve_tier_selector,
+)
 from aistudio_api.config import resolve_config_file
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -35,7 +40,6 @@ _SAFETY_CATEGORY_ORDER = (
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _VALID_SURFACES = ("chat", "build")
 _VALID_MIN_TIERS = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
-_INSTANCE_TIER_LOOKUP = {tier.lower(): tier for tier in _VALID_MIN_TIERS}
 
 _LEGACY_KEEPALIVE_KEYS = (
     "auto_switch",
@@ -255,15 +259,27 @@ def _require_mapping(config: dict[str, object], key: str) -> dict[str, object]:
 
 
 def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
-    """归一化 instances 配置：坏项丢弃、同 surface/min_tier 合并 count。"""
+    """Normalize ``instances`` tier selectors into closed interval specs.
+
+    ``only_tier`` / ``min_tier`` / ``max_tier`` must be strings naming a known
+    tier; at least one is required.  ``only_tier`` pins an exact tier,
+    ``min_tier`` alone opens ``min..Ultra_20X``, ``max_tier`` alone defaults its
+    lower bound to Pro (Free stays Free), and min+max form a closed interval.
+    Only a missing selector, a conflicting combination, an inverted interval or
+    a lane mix is rejected; non-string/unknown selectors are hard errors instead
+    of being silently dropped.  Free and paid lanes never mix.  Every Free
+    selector normalizes to the same ``only=Free,min=Free,max=Free`` merge key so
+    ``only_tier: Free`` and legacy ``min_tier: Free`` merge their counts.
+    """
     if not isinstance(raw_instances, list):
         raise ConfigValidationError(
             "配置校验失败：instances 必须为列表，"
             f"当前类型为 {_describe_type(raw_instances)}"
         )
 
-    merged_counts: dict[tuple[str, str], int] = {}
-    order: list[tuple[str, str]] = []
+    merged_counts: dict[tuple[str, str, str, str], int] = {}
+    order: list[tuple[str, str, str, str]] = []
+    normalized_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
     for index, item in enumerate(raw_instances):
         if not isinstance(item, dict):
             logger.warning("忽略非法实例配置 #%d：必须为字典", index)
@@ -271,7 +287,6 @@ def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
 
         count = item.get("count")
         raw_surface = item.get("surface")
-        raw_min_tier = item.get("min_tier")
 
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             logger.warning("忽略非法实例配置 #%d：count 必须为正整数", index)
@@ -282,33 +297,99 @@ def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
             logger.warning("忽略非法实例配置 #%d：surface 只允许 chat/build", index)
             continue
 
-        min_tier = (
-            _INSTANCE_TIER_LOOKUP.get(raw_min_tier.strip().lower())
-            if isinstance(raw_min_tier, str)
-            else None
-        )
-        if min_tier is None:
-            logger.warning(
-                "忽略非法实例配置 #%d：min_tier 只允许 %s",
-                index,
-                "/".join(_VALID_MIN_TIERS),
+        raw_only = item.get("only_tier")
+        raw_min = item.get("min_tier")
+        raw_max = item.get("max_tier")
+        for name, value in (
+            ("only_tier", raw_only),
+            ("min_tier", raw_min),
+            ("max_tier", raw_max),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个实例配置 {name} 必须为字符串，"
+                    f"当前类型为 {_describe_type(value)}"
+                )
+            if value.strip() and canonical_tier(value) is None:
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个实例配置 {name}={value!r} 不是已知 tier"
+                    f"（{'/'.join(_VALID_MIN_TIERS)}）"
+                )
+        provided = [
+            value
+            for value in (raw_only, raw_min, raw_max)
+            if isinstance(value, str) and value.strip()
+        ]
+        if not provided:
+            raise ConfigValidationError(
+                "配置校验失败：第 "
+                f"{index + 1} 个实例配置缺少 tier 选择器"
+                "（only_tier/min_tier/max_tier 至少一个）"
             )
-            continue
 
-        key = (surface, min_tier)
+        try:
+            selector = resolve_tier_selector(
+                only_tier=raw_only,
+                min_tier=raw_min,
+                max_tier=raw_max,
+            )
+        except TierSelectorError as exc:
+            raise ConfigValidationError(
+                f"配置校验失败：第 {index + 1} 个实例配置非法：{exc}"
+            ) from exc
+
+        if selector.lane == "free":
+            normalized: dict[str, object] = {
+                "count": count,
+                "surface": surface,
+                "only_tier": "Free",
+                "min_tier": "Free",
+                "max_tier": "Free",
+            }
+            key = (surface, "Free", "Free", "Free")
+        elif selector.only_tier is not None:
+            normalized = {
+                "count": count,
+                "surface": surface,
+                "only_tier": selector.only_tier,
+            }
+            key = (surface, selector.only_tier, "", "")
+        else:
+            upper_explicit = isinstance(raw_max, str) and bool(raw_max.strip())
+            normalized = {
+                "count": count,
+                "surface": surface,
+                "min_tier": selector.min_tier,
+            }
+            if upper_explicit:
+                normalized["max_tier"] = selector.max_tier
+            key = (
+                surface,
+                "",
+                selector.min_tier,
+                selector.max_tier if upper_explicit else "",
+            )
+
         if key in merged_counts:
             merged_counts[key] += count
         else:
             merged_counts[key] = count
             order.append(key)
+            normalized_by_key[key] = normalized
 
     if not merged_counts:
         raise ConfigValidationError("配置校验失败：instances 未包含任何有效实例配置")
 
-    return [
-        {"count": merged_counts[key], "surface": key[0], "min_tier": key[1]}
-        for key in order
-    ]
+    normalized_specs: list[dict[str, object]] = []
+    for key in order:
+        entry = dict(normalized_by_key[key])
+        entry["count"] = merged_counts[key]
+        normalized_specs.append(entry)
+    return normalized_specs
 
 
 _MAX_CONTEXTS_LIMIT = 16
@@ -879,7 +960,7 @@ def _default_config() -> dict[str, object]:
             "api_allow_anonymous": False,
         },
         "instances": [
-            {"count": 1, "surface": "chat", "min_tier": "Free"},
+            {"count": 1, "surface": "chat", "only_tier": "Free"},
             {"count": 1, "surface": "chat", "min_tier": "Pro"},
         ],
         "max_contexts": 2,
@@ -1427,7 +1508,14 @@ def get_configured_security_settings(
 def get_configured_instance_specs(
     config_path: str | os.PathLike[str] | None = None,
 ) -> list[dict[str, object]]:
-    """归一化 instances 配置：坏项丢弃、同 surface/min_tier 合并 count。"""
+    """Normalize ``instances`` into merged closed tier-interval specs.
+
+    ``only_tier`` pins one exact tier; ``min_tier`` alone opens a paid
+    ``min..Ultra_20X`` interval; ``max_tier`` alone defaults the paid lower
+    bound to Pro (Free max stays Free); min+max form a closed interval.  Free
+    selectors always normalize to ``only=Free,min=Free,max=Free`` so duplicate
+    specs merge counts, and unknown/non-string selectors fail loudly.
+    """
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
     return _normalize_instance_specs(config.get("instances"))

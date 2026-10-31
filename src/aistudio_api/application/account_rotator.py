@@ -10,6 +10,13 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from aistudio_api.application.model_access import (
+    instance_lane_for_tier,
+    resolve_tier_selector,
+    tier_matches_selector,
+    tier_rank,
+    tier_satisfies_required,
+)
 from aistudio_api.config import resolve_rotator_state_file, settings
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 
@@ -638,6 +645,70 @@ class AccountRotator:
         stats = self.get_account_stats(account_id)
         return bool(stats and stats.is_available(model, surface=surface))
 
+    def select_rebind_account(
+        self,
+        *,
+        lane: str,
+        model: str | None = None,
+        surface: str | None = None,
+        exclude_account_ids: set[str] | None = None,
+        only_tier: str = "",
+        min_tier: str = "",
+        max_tier: str = "",
+        required_tiers: tuple[str, ...] | list[str] | None = None,
+    ) -> AccountMeta | None:
+        """Pick a healthy same-lane account for a request-triggered slot rebind.
+
+        Excludes failed/cooldown accounts supplied by the caller plus accounts
+        that are disabled, expired or cannot satisfy the instance tier interval
+        and the route's rank-based tier requirement.  ``min_tier`` keeps the
+        legacy call shape (``min_tier: Free`` means exactly Free).
+        ``exclude_account_ids`` also carries accounts already attempted by the
+        request and accounts bound to other instances; no background rebind is
+        implied — this is only a read-only selection helper.
+        """
+        excluded = set(exclude_account_ids or ())
+        required = tuple(required_tiers or ())
+        selector = None
+        if only_tier:
+            selector = resolve_tier_selector(only_tier=only_tier)
+        elif min_tier or max_tier:
+            selector = resolve_tier_selector(
+                min_tier=min_tier or None,
+                max_tier=max_tier or None,
+            )
+        candidates: list[tuple[AccountMeta, AccountStats]] = []
+        for account in self._store.list_accounts():
+            if account.id in excluded:
+                continue
+            if not account.enabled or getattr(account, "expired", False):
+                continue
+            tier = getattr(account, "tier", "Free") or "Free"
+            if instance_lane_for_tier(tier) != lane:
+                continue
+            if selector is not None and not tier_matches_selector(tier, selector):
+                continue
+            if required and not tier_satisfies_required(tier, required):
+                continue
+            stats = self.get_account_stats(account.id)
+            if stats is None or not stats.is_available(model, surface=surface):
+                continue
+            resolver = getattr(self._store, "get_auth_path_optional", None)
+            if callable(resolver) and resolver(account.id, require_exists=True) is None:
+                continue
+            candidates.append((account, stats))
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda item: (
+                tier_rank(getattr(item[0], "tier", "Free")),
+                item[1].total_requests,
+                item[1].model_requests_total(model),
+                item[1].last_used,
+            ),
+        )[0]
+
     def get_all_stats(self) -> dict[str, dict[str, object]]:
         """获取所有账号的运行透视与配额状态。"""
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -756,7 +827,9 @@ class AccountRotator:
         for account in accounts:
             if not account.enabled or getattr(account, "expired", False):
                 continue
-            if required_tiers and account.tier not in required_tiers:
+            if required_tiers and not tier_satisfies_required(
+                account.tier, required_tiers
+            ):
                 continue
 
             stats = self._stats.setdefault(

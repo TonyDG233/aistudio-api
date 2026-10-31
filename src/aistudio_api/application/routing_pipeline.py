@@ -18,12 +18,13 @@ from __future__ import annotations
 import inspect
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from aistudio_api.application.account_orchestrator import record_rotator_event
 from aistudio_api.application.model_access import (
     best_tier,
+    tier_rank,
     tier_satisfies_required,
 )
 from aistudio_api.application.routing_eligibility import (
@@ -156,6 +157,14 @@ class RouteCandidate:
     in_flight: int
     last_used: float
     number: int
+    min_tier: str = "Free"
+    only_tier: str = ""
+    max_tier: str = ""
+
+    @property
+    def account_tier_rank(self) -> int:
+        """Rank of the account tier; lower is the smallest sufficient tier."""
+        return tier_rank(self.tier)
 
     @classmethod
     def from_instance(cls, instance: Instance) -> RouteCandidate:
@@ -168,6 +177,9 @@ class RouteCandidate:
             in_flight=instance.in_flight,
             last_used=instance.last_used,
             number=instance.number,
+            min_tier=instance.min_tier,
+            only_tier=instance.only_tier,
+            max_tier=instance.max_tier,
         )
 
 
@@ -178,6 +190,7 @@ class RouteContext:
     budget: RoutingBudget
     max_retries: int
     attempted_instances: set[str] = field(default_factory=set)
+    attempted_accounts: set[str] = field(default_factory=set)
     failed_accounts: set[str] = field(default_factory=set)
     total_attempts: int = 0
     retry_same: bool = False
@@ -202,6 +215,7 @@ class RouteContext:
             "lane": self.route.lane,
             "candidates": [candidate.instance_id for candidate in self.candidates],
             "attempted": sorted(self.attempted_instances),
+            "attempted_accounts": sorted(self.attempted_accounts),
             "failed_accounts": sorted(self.failed_accounts),
             "budget": self.budget.snapshot(),
             "retry_same": self.retry_same,
@@ -381,15 +395,26 @@ class RoutingPipeline:
     def _order(
         self, route: ModelRoute, instances: Iterable[Instance]
     ) -> list[Instance]:
+        """Sort same-lane candidates for balanced dispatch.
+
+        Ordering is load first (idle before busy), then the smallest sufficient
+        account tier (Pro before Ultra when Pro satisfies the route), then
+        least-used/model-used/LRU, and only then warm/sticky/number.  Sticky is
+        therefore a final tie-breaker: it keeps a healthy slot logged in, it
+        never gives one slot a monopoly on traffic.
+        """
         sticky_id = getattr(self._manager, "current_instance_id", None)
         rotator = self._rotator
         rows: list[tuple[tuple[object, ...], Instance]] = []
         for instance in instances:
+            candidate = RouteCandidate.from_instance(instance)
+            if not tier_allows(candidate.tier, route):
+                continue
             stats = None
             if rotator is not None:
                 getter = getattr(rotator, "get_account_stats", None)
                 if callable(getter):
-                    stats = getter(instance.account_id)
+                    stats = getter(candidate.account_id)
             total_requests = _as_int(getattr(stats, "total_requests", 0), 0)
             model_requests = 0
             if stats is not None:
@@ -397,14 +422,16 @@ class RoutingPipeline:
                 if callable(counter):
                     model_requests = _as_int(counter(route.model), 0)
             warm = 0 if instance.state is InstanceState.ACTIVE else 1
+            sticky = 0 if instance.id == sticky_id else 1
             key = (
-                0 if instance.id == sticky_id else 1,
+                candidate.in_flight,
+                candidate.account_tier_rank,
                 total_requests,
                 model_requests,
-                instance.in_flight,
-                instance.last_used,
+                candidate.last_used,
                 warm,
-                instance.number,
+                sticky,
+                candidate.number,
             )
             rows.append((key, instance))
         rows.sort(key=lambda item: item[0])
@@ -530,6 +557,7 @@ class RoutingPipeline:
                     surface=candidate.surface,
                 )
                 context.register_attempt()
+                context.attempted_accounts.add(candidate.account_id)
                 logger.info(
                     "[routing] acquire instance=%s account=%s attempt=%d",
                     candidate.instance_id,
@@ -706,6 +734,148 @@ class RoutingPipeline:
         self._record_error("error", context, attempt)
         raise exc
 
+    async def _try_rebind(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        reason: str,
+        *,
+        reuse: bool,
+    ) -> bool:
+        """Request-triggered single-slot rebind.
+
+        A lane may have only one configured slot while the account store holds
+        several healthy accounts in that lane (e.g. ``1 Free + 1 Pro`` slots and
+        Free accounts A/B).  A 429 on the sole Free slot marks A failed, but
+        ``next_candidate()`` then has no second instance to switch to.  This
+        path releases the active handle first, picks another eligible account in
+        the same lane, rebinds the *existing* slot in place (close Page/Context,
+        activate the new account), clears the old template cache and lets the
+        caller re-acquire the slot.  It is synchronous with the request and
+        never spawns a background rebind.
+
+        With multiple slots the same heal happens immediately after a dead slot
+        error, but the current request keeps moving to another ready candidate
+        (``reuse=False``) instead of re-taking the slot it just failed.
+
+        There is no per-slot one-rebind cap: one slot may rebind A -> B -> C
+        when each account 429s.  Loop and duplicate protection comes from
+        ``attempted_accounts``/``failed_accounts`` plus the per-request
+        ``max_switches`` budget.
+        """
+        manager = self._manager
+        reassign = getattr(manager, "reassign", None)
+        selector = getattr(self._rotator, "select_rebind_account", None)
+        if not callable(reassign) or not callable(selector):
+            return False
+
+        exclusions = (
+            set(context.failed_accounts)
+            | set(context.attempted_accounts)
+            | {attempt.account_id}
+        )
+        bound_fn = getattr(manager, "instance_account_ids", None)
+        if callable(bound_fn):
+            try:
+                raw_bound = bound_fn()
+            except Exception as exc:
+                logger.debug("[routing] 读取已绑定账号失败: %s", exc)
+                raw_bound = ()
+            bound = (
+                {str(item) for item in raw_bound}
+                if isinstance(raw_bound, (list, tuple, set, frozenset))
+                else set()
+            )
+            bound.discard(attempt.account_id)
+            exclusions |= bound
+
+        # The pool refuses to activate while the handle is held; release it
+        # before touching the slot, then let the caller re-acquire it.
+        await self.release(attempt)
+        attempt.client.clear_templates()
+        if self._instance_active_requests(attempt.instance_id) > 0:
+            logger.info(
+                "[routing] 跳过改绑：实例仍有在途请求 instance=%s",
+                attempt.instance_id,
+            )
+            return False
+
+        for _ in range(len(exclusions) + 1):
+            try:
+                account = selector(
+                    lane=context.route.lane,
+                    model=context.route.model,
+                    surface=context.route.surface,
+                    exclude_account_ids=exclusions,
+                    only_tier=attempt.candidate.only_tier,
+                    min_tier=attempt.candidate.min_tier,
+                    max_tier=attempt.candidate.max_tier,
+                    required_tiers=context.route.required_tiers,
+                )
+            except Exception as exc:
+                logger.warning("[routing] 选择改绑账号失败: %s", exc)
+                return False
+            if account is None:
+                return False
+            target_id = str(getattr(account, "id", "") or "")
+            if not target_id:
+                return False
+            try:
+                result = reassign(attempt.instance_id, target_id)
+                instance = await result if inspect.isawaitable(result) else result
+            except Exception as exc:
+                logger.warning(
+                    "[routing] 单槽请求期改绑失败 instance=%s target=%s: %s",
+                    attempt.instance_id,
+                    target_id,
+                    exc,
+                )
+                context.failed_accounts.add(target_id)
+                exclusions.add(target_id)
+                continue
+
+            if isinstance(instance, Instance):
+                updated = RouteCandidate.from_instance(instance)
+            else:
+                updated = replace(
+                    attempt.candidate,
+                    account_id=target_id,
+                    tier=str(getattr(account, "tier", "") or attempt.candidate.tier),
+                    state=InstanceState.ACTIVE,
+                    in_flight=0,
+                )
+            context.candidates = [
+                updated if candidate.instance_id == attempt.instance_id else candidate
+                for candidate in context.candidates
+            ]
+            if reuse:
+                context.attempted_instances.discard(attempt.instance_id)
+            context.budget.record_switch(reason)
+            context.retry_same = False
+            context.last_reason = f"rebind:{reason}"
+            attempt.client.clear_templates()
+            logger.warning(
+                "[routing] 请求期改绑 reason=%s instance=%s %s -> %s reuse=%s budget=%s",
+                reason,
+                attempt.instance_id,
+                attempt.account_id,
+                target_id,
+                reuse,
+                context.budget.snapshot(),
+            )
+            return True
+        return False
+
+    def _instance_active_requests(self, instance_id: str) -> int:
+        getter = getattr(self._manager, "instance_active_requests", None)
+        if not callable(getter):
+            return 0
+        try:
+            value = getter(instance_id)
+            return int(value) if isinstance(value, (int, float, str)) else 0
+        except Exception:
+            return 0
+
     async def _switch_or_raise(
         self,
         context: RouteContext,
@@ -718,12 +888,18 @@ class RoutingPipeline:
         if not attempt.account_id:
             raise exc
         context.failed_accounts.add(attempt.account_id)
-        exhausted = (
-            context.total_attempts >= context.max_retries
-            or not context.budget.can_switch()
-            or context.next_candidate() is None
+        can_continue = (
+            context.total_attempts < context.max_retries
+            and context.budget.can_switch()
         )
-        if exhausted:
+        if can_continue:
+            # Heal the failed slot immediately (429-dead slots must not stay in
+            # the pool).  When another candidate exists the request continues on
+            # it; the rebound slot is healthy for subsequent requests.
+            reuse = context.next_candidate() is None
+            if await self._try_rebind(context, attempt, reason, reuse=reuse):
+                return "switch"
+        if not can_continue or context.next_candidate() is None:
             if quota_exhausted:
                 raise SurfaceSwitchExhaustedError(
                     surface=context.route.surface

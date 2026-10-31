@@ -9,7 +9,7 @@ security:
 instances:
   - count: 1
     surface: chat
-    min_tier: Free
+    only_tier: Free
   - count: 1
     surface: chat
     min_tier: Pro
