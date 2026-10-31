@@ -28,6 +28,9 @@
   暂停与 1/3/7 天导出。
 - **配置与鉴权**：`AISTUDIO_CONFIG_PATH` 指定配置路径，文件缺失时从 `defaults/config.yaml` 播种；
   支持深合并、热重载与原子写回；对外 API 默认要求 API Key。
+- **旧版配置自愈**：启动校验时自动移除废弃的 `groups`、`channel_registry`、`channels` 键，
+  将 legacy `min_tier: Free` 归一为 `only_tier: Free`，并用默认模板深合并补齐新配置块；
+  仅在内容实际变化时原子写回，不覆盖当前干净配置，也不改写受版本控制的默认模板。
 - **Web 控制台**：账号、实例、设置、日志与仪表盘页面；静态前端产物随仓库发布。
 - **容器与 CI**：Dockerfile 内置默认配置与静态前端；GHCR 镜像自动构建，支持 `rebuild-upstream`、`main`、`master`
   分支与手动触发。
@@ -41,6 +44,8 @@
 - 请求按上游 BotGuard 快照就绪状态启动，并按请求固定 `SessionContext`，避免跨请求串扰。
 - 路由候选顺序直接使用账号 tier 秩，实例选择结果可重复、可解释。
 - 配置以 `defaults/config.yaml` 为唯一受版本控制的默认值；根 `config.yaml` 仅作本地运行态，不纳入版本控制。
+  运行时默认配置直接读取该模板（含诊断开关、路由退避、完整模型画像与冷却参数），模板缺失时启动明确报错，
+  不再维护可能与模板漂移的内嵌默认副本。
 - Claude 与 Responses 协议保留配置开关但默认关闭；Build surface 在对应阶段前显式拒绝，而非静默切换 surface。
 - 吸收上游对内存占用、readiness watchdog、`Ultra_20X` tier 归一与 Web 配置编辑器的修复。
 - 收紧分层边界：Application 不再导入 API/FastAPI 或读取全局 `runtime_state`，请求统计改为构造注入回调；

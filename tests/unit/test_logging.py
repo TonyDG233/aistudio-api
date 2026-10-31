@@ -382,22 +382,16 @@ async def test_middleware_request_dump_and_access_log():
 
 
 @pytest.mark.asyncio
-async def test_health_success_access_log_is_debug_only(caplog):
-    """Health probes succeed constantly; success must not reach the INFO stream."""
+async def test_health_success_emits_no_access_log_record(caplog):
+    """Health probes succeed constantly; success must not emit any access record."""
     set_dump_requests(False)
     with caplog.at_level(logging.DEBUG):
         async with _client() as client:
             resp = await client.get("/health")
 
     assert resp.status_code == 200
-    messages = [(record.levelno, record.getMessage()) for record in caplog.records]
     success = "HTTP GET /health -> 200"
-    assert not any(
-        level == logging.INFO and success in message for level, message in messages
-    )
-    assert any(
-        level == logging.DEBUG and success in message for level, message in messages
-    )
+    assert not any(success in record.getMessage() for record in caplog.records)
 
 
 def _http_request(path: str):

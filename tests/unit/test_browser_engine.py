@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from aistudio_api.infrastructure.browser.browser_engine import (
+    _OPT_CLOAKBROWSER_DIR,
     _assign_process_to_job,
     _create_windows_job_object,
     _derive_stable_fingerprint_seed,
@@ -105,29 +106,23 @@ def test_find_chromium_executable_strictly_requires_cloakbrowser(tmp_path):
         assert found == str(fake_chrome)
 
     # 4. When CloakBrowser is installed in /opt/cloakbrowser (e.g. Docker container)
-    fake_opt_chrome = tmp_path / "opt_cloak" / "chrome"
-    fake_opt_chrome.parent.mkdir(parents=True)
+    # The production constant pins the system-level location; point it at a real
+    # temp directory so the branch is exercised with native path semantics on
+    # every platform (no POSIX string comparison that breaks on Windows).
+    assert Path("/opt/cloakbrowser") == _OPT_CLOAKBROWSER_DIR
+    fake_opt_dir = tmp_path / "opt_cloakbrowser"
+    fake_opt_chrome = fake_opt_dir / "chrome"
+    fake_opt_dir.mkdir(parents=True)
     fake_opt_chrome.write_text("fake docker cloakbrowser")
     if platform.system() != "Windows":
         fake_opt_chrome.chmod(0o755)
 
-    orig_glob = Path.glob
-
-    def fake_opt_is_dir(self):
-        if self.name == ".cloakbrowser":
-            return False
-        if str(self) == "/opt/cloakbrowser":
-            return True
-        return orig_is_dir(self)
-
-    def fake_opt_glob(self, pat):
-        if str(self) == "/opt/cloakbrowser":
-            return [fake_opt_chrome]
-        return orig_glob(self, pat)
-
     with (
-        patch.object(Path, "is_dir", fake_opt_is_dir),
-        patch.object(Path, "glob", fake_opt_glob),
+        patch(
+            "aistudio_api.infrastructure.browser.browser_engine._OPT_CLOAKBROWSER_DIR",
+            fake_opt_dir,
+        ),
+        patch("pathlib.Path.home", return_value=tmp_path / "empty_home"),
         patch("aistudio_api.config.settings.browser_executable_path", None),
         patch(
             "aistudio_api.infrastructure.browser.browser_engine._is_termux",
@@ -174,9 +169,16 @@ def test_spawn_process_watchdog_windows_returns_none():
 
 
 def test_spawn_process_watchdog_reaps_live_target_on_pipe_eof():
-    """P-01/P-04: closing the pipe write-end must kill a live target process."""
+    """P-01/P-04: closing the pipe write-end must kill a live target process.
+
+    On Windows there are no pipes to close: the watchdog is intentionally
+    disabled in favour of the Job Object path and must report ``(None, None)``.
+    """
     if platform.system() == "Windows":
-        pytest.skip("watchdog POSIX only")
+        watcher, pipe_w = _spawn_process_watchdog(os.getpid(), target_pgid=None)
+        assert watcher is None
+        assert pipe_w is None
+        return
 
     import subprocess
     import sys

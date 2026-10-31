@@ -70,7 +70,7 @@ features:
   # falls back to plain text, required fails explicitly when the synthetic call
   # is absent. mode_by_format overrides one protocol face.
   atg:
-    mode: off
+    mode: "off"
     mode_by_format:
       gemini: inherit
       openai: inherit

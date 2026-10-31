@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,9 @@ def test_js_ast_syntax_with_external_runtime():
         else:
             cmd = [runtime, "-c", str(js_file)]
 
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
         assert res.returncode == 0, (
             f"{runtime} syntax check failed for {js_file.name}:\n{res.stderr}"
         )
@@ -190,14 +193,38 @@ def test_evaluate_wrapper_expressions_parse_cleanly():
         ("HOOKED_REQUEST_JS", HOOKED_REQUEST_JS, None),
     ]
 
-    for name, script_text, arg in scripts:
-        expr = script_text.strip()
-        wrapped = f"({expr})({json.dumps(arg)})" if arg is not None else f"({expr})()"
+    prelude = (
+        "globalThis.window = globalThis; "
+        "globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };"
+    )
 
-        prelude = "globalThis.window = globalThis; globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };"
-        code = f"{prelude} try {{ new Function({wrapped!r}); }} catch (e) {{ if (e instanceof SyntaxError) throw e; }}"
-        cmd = [runtime, "-e", code]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        assert res.returncode == 0, (
-            f"SyntaxError in evaluate() wrapper for {name}:\n{res.stderr}"
-        )
+    # Run each probe from a temp file instead of `runtime -e <multiline>` so the
+    # code survives bun.CMD / cmd.exe argument quoting. json.dumps produces a
+    # valid JS string literal, keeping the wrapped expression byte-exact.
+    with tempfile.TemporaryDirectory(prefix="aistudio-js-eval-") as tmp_dir:
+        for name, script_text, arg in scripts:
+            expr = script_text.strip()
+            wrapped = (
+                f"({expr})({json.dumps(arg)})"
+                if arg is not None
+                else f"({expr})()"
+            )
+
+            code = (
+                f"{prelude}\n"
+                f"try {{ new Function({json.dumps(wrapped)}); }}\n"
+                "catch (e) { if (e instanceof SyntaxError) throw e; }\n"
+            )
+            probe_path = Path(tmp_dir) / f"{name}.js"
+            probe_path.write_text(code, encoding="utf-8")
+
+            res = subprocess.run(
+                [runtime, str(probe_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert res.returncode == 0, (
+                f"SyntaxError in evaluate() wrapper for {name}:\n{res.stderr}"
+            )

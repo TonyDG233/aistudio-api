@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 import yaml
 
-from aistudio_api.config import resolve_config_file
+from aistudio_api.config import (
+    resolve_config_file,
+    resolve_default_config_template,
+)
 from aistudio_api.domain.model_access import (
     TierSelectorError,
     canonical_tier,
@@ -546,13 +551,138 @@ def validate_config_mapping(raw_dict: object) -> dict[str, object]:
     return config
 
 
+_OBSOLETE_CONFIG_KEYS = ("groups", "channel_registry", "channels")
+_OBSOLETE_KEY_PARENTS = ("routing", "features", "model_defaults")
+
+
+def _strip_obsolete_config_keys(config: dict[str, object]) -> bool:
+    """Remove legacy strategy-group/channel keys without touching user blocks.
+
+    Top-level keys are always removed; the same obsolete names nested inside the
+    known routing/features/model_defaults blocks are removed too. Arbitrary
+    custom blocks (for example ``proxy``) are left byte-for-byte intact, and
+    valid ``target_groups`` fields are never touched.
+    """
+    changed = False
+    for key in _OBSOLETE_CONFIG_KEYS:
+        if key in config:
+            del config[key]
+            changed = True
+    for parent_name in _OBSOLETE_KEY_PARENTS:
+        parent = config.get(parent_name)
+        if isinstance(parent, dict) and _strip_obsolete_config_keys(parent):
+            changed = True
+    return changed
+
+
+def _migrate_legacy_instance(item: dict[str, object]) -> bool:
+    """Normalize a legacy Free ``min_tier``/``max_tier`` selector in place.
+
+    Only Free-only selectors are converted. A ``min_tier: Free`` combined with a
+    paid ``max_tier`` is a Free/Paid lane mix that must fail validation instead
+    of being silently rewritten. Paid ``min_tier`` intervals are untouched.
+    """
+    raw_only = item.get("only_tier")
+    raw_min = item.get("min_tier")
+    raw_max = item.get("max_tier")
+    only = canonical_tier(raw_only) if isinstance(raw_only, str) else None
+    lower = canonical_tier(raw_min) if isinstance(raw_min, str) else None
+    upper = canonical_tier(raw_max) if isinstance(raw_max, str) else None
+
+    if only == "Free":
+        changed = False
+        for key in ("min_tier", "max_tier"):
+            value = item.get(key)
+            if isinstance(value, str) and canonical_tier(value) == "Free":
+                del item[key]
+                changed = True
+        return changed
+
+    if only is not None or upper not in (None, "Free"):
+        return False
+    if lower not in (None, "Free"):
+        return False
+    if lower == "Free" or upper == "Free":
+        item.pop("min_tier", None)
+        item.pop("max_tier", None)
+        item["only_tier"] = "Free"
+        return True
+    return False
+
+
+def _migrate_legacy_config_mapping(
+    config: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    """Return a migrated copy of ``config`` and whether anything changed."""
+    migrated = copy.deepcopy(config)
+    changed = _strip_obsolete_config_keys(migrated)
+
+    raw_instances = migrated.get("instances")
+    if isinstance(raw_instances, list):
+        for item in raw_instances:
+            if isinstance(item, dict) and _migrate_legacy_instance(item):
+                changed = True
+    return migrated, changed
+
+
+def _read_config_file(config_path: Path) -> dict[str, object]:
+    """Read a runtime config file, raising ConfigValidationError on bad input."""
+    try:
+        content = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：无法读取配置文件 {config_path}：{exc}"
+        ) from exc
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(f"配置校验失败：YAML 语法错误：{exc}") from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ConfigValidationError(
+            "配置校验失败：配置顶层必须为字典，"
+            f"当前类型为 {_describe_type(loaded)}"
+        )
+    return cast("dict[str, object]", loaded)
+
+
+def _is_default_template_path(config_path: Path) -> bool:
+    """True when ``config_path`` points at the tracked defaults template."""
+    try:
+        return config_path.resolve() == resolve_default_config_template().resolve()
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def validate_config(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """启动时校验合并后的配置；关键块非法会立即抛出 ConfigValidationError。"""
+    """启动时校验合并后的配置；关键块非法会立即抛出 ConfigValidationError。
+
+    校验通过后会迁移旧版运行配置（移除废弃策略组/渠道键、把 legacy
+    ``min_tier: Free`` 归一为 ``only_tier: Free``），并以默认模板深合并补齐所有
+    当前配置块。只有内容确实发生变化时才原子写回，且绝不改写受版本控制的
+    ``defaults/config.yaml`` 模板。
+    """
     resolved_path = _resolve_config_path(config_path)
-    merged = _load_yaml_config(resolved_path)
-    return validate_config_mapping(merged)
+    exists = resolved_path.is_file()
+    raw = _read_config_file(resolved_path) if exists else {}
+    migrated, migration_changed = _migrate_legacy_config_mapping(raw)
+    validated = validate_config_mapping(migrated)
+
+    merged = _deep_merge(_default_config(), migrated)
+    assert isinstance(merged, dict)
+    if (
+        exists
+        and not _is_default_template_path(resolved_path)
+        and (migration_changed or merged != raw)
+    ):
+        content = yaml.dump(merged, allow_unicode=True, sort_keys=False)
+        _atomic_write_text(resolved_path, content)
+        invalidate_config_cache()
+        logger.info("已迁移并写回旧版配置文件：%s", resolved_path)
+    return validated
 
 
 @dataclass(frozen=True)
@@ -851,221 +981,38 @@ def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
     return delay
 
 
+@lru_cache(maxsize=1)
+def _default_config_template() -> dict[str, object]:
+    """Load the tracked ``defaults/config.yaml`` template (single source of truth)."""
+    try:
+        template_path = resolve_default_config_template()
+    except FileNotFoundError as exc:
+        raise ConfigValidationError(f"配置校验失败：{exc}") from exc
+    try:
+        loaded = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：无法读取默认配置模板 {template_path}：{exc}"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：默认配置模板 {template_path} YAML 语法错误：{exc}"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise ConfigValidationError(
+            "配置校验失败：默认配置模板 "
+            f"{template_path} 顶层必须为字典，当前类型为 {_describe_type(loaded)}"
+        )
+    return cast("dict[str, object]", loaded)
+
+
 def _default_config() -> dict[str, object]:
-    return {
-        "api_keys": [],
-        "logging": {
-            "level": "INFO",
-            "dump_requests": False,
-        },
-        "model_defaults": {
-            "drop_unsupported_params": False,
-            "profiles": [
-                {
-                    "name": "image_models",
-                    "match": {"contains": ["image", "imagen"]},
-                    "is_image_model": True,
-                    "generation_config_defaults": {
-                        "response_mime_type": None,
-                        "image_output_mode": "image_only",
-                        "thinking_config": {"level": "MINIMAL", "mode": 1},
-                    },
-                    "clear_generation_config_indexes": [7, 13, 17],
-                    "disable_safety_settings": True,
-                },
-                {
-                    "name": "video_models",
-                    "match": {"prefixes": ["veo-"], "contains": ["veo"]},
-                    "disable_safety_settings": True,
-                },
-                {
-                    "name": "gemma_models",
-                    "match": {"prefixes": ["gemma-"]},
-                    "default_tools": ["google_search"],
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                },
-                {
-                    "name": "gemini_models",
-                    "match": {"prefixes": ["gemini-"]},
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                },
-            ],
-            "models": {},
-        },
-        "rotator": {
-            "max_retries": 5,
-            "quota_scope": "account",
-            "cooldowns": {
-                "rate_limited_short": 60,
-                "rate_limited_drip": 300,
-                "rate_limited_drip_extended": 600,
-                "auth_error": 0,
-            },
-        },
-        "features": {
-            "routing": {
-                "max_switches": 2,
-                "retry_same_delay_sec": 2.0,
-            },
-            "formats": {
-                "openai": True,
-                "claude": False,
-                "responses": False,
-                "media": {"allow_private_urls": False},
-            },
-            "atg": {
-                "mode": "off",
-                "mode_by_format": {
-                    "gemini": "inherit",
-                    "openai": "inherit",
-                    "claude": "inherit",
-                    "responses": "inherit",
-                },
-                "tool_prefix": "atg_emit_",
-                "control_position": "tail",
-                "strict": False,
-                "empty_retries": 2,
-                "recovery": "repair",
-                "side_buffer_bytes": 0,
-                "client_synthetic_guard": True,
-                "max_response_bytes": 16 * 1024 * 1024,
-                "text_model_pattern": "",
-                "non_text_model_pattern": "",
-            },
-            "keepalive": {
-                "auth_update": True,
-                "auth_update_hours": 24.0,
-                "metadata_refresh": True,
-                "metadata_refresh_hours": 24.0,
-                "metadata_refresh_on_startup": True,
-                "active_activity": False,
-                "active_activity_seconds": 60.0,
-            },
-        },
-        "paid_model_rules": {
-            "ultra_required": {
-                "contains": ["veo", "ultra"],
-                "required_tiers": ["Ultra", "Ultra_20X"],
-            },
-            "pro_required": {
-                "contains": ["argon", "gemini-4", "imagen"],
-                "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
-            },
-        },
-        "tier_quotas": {
-            "Free": {
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 100},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 10},
-                "default_limit": 20,
-            },
-            "Plus": {
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 300},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 30},
-                "default_limit": 50,
-            },
-            "Pro": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
-                    "daily_limit": 50,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 150},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 50},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 50,
-                },
-                "default_limit": 50,
-            },
-            "Ultra": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
-                    "daily_limit": 250,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 1500},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 250},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 250,
-                },
-                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
-                "default_limit": 250,
-            },
-            "Ultra_20X": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
-                    "daily_limit": 1000,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 5000},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 1000},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 1000,
-                },
-                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 200},
-                "default_limit": 1000,
-            },
-            "overrides": {},
-        },
-        "security": {
-            "api_allow_anonymous": False,
-        },
-        "instances": [
-            {"count": 1, "surface": "chat", "only_tier": "Free"},
-            {"count": 1, "surface": "chat", "min_tier": "Pro"},
-        ],
-        "max_contexts": 2,
-        "account_presets": [
-            {
-                "id": "preset_all",
-                "name": "全部启用 (最大并发)",
-                "description": "激活所有可用账号，提供最充沛的并发与负载池",
-                "action": "enable_all",
-                "is_system": True,
-            },
-            {
-                "id": "preset_paid_only",
-                "name": "纯高阶付费池 (Plus/Pro/Ultra)",
-                "description": "仅激活具有付费权益的账号，全力保障高阶模型调用",
-                "action": "filter_tier",
-                "target_tiers": ["Plus", "Pro", "Ultra", "Ultra_20X"],
-                "is_system": True,
-            },
-            {
-                "id": "preset_ultra_only",
-                "name": "旗舰专属池 (Ultra 独占)",
-                "description": "仅激活 Ultra 顶级算力账号，保障最顶尖模型调用",
-                "action": "filter_tier",
-                "target_tiers": ["Ultra", "Ultra_20X"],
-                "is_system": True,
-            },
-            {
-                "id": "preset_free_only",
-                "name": "纯免费节能池 (Free)",
-                "description": "仅激活 Free 等级账号，用于日常普通模型测试",
-                "action": "filter_tier",
-                "target_tiers": ["Free"],
-                "is_system": True,
-            },
-            {
-                "id": "preset_production",
-                "name": "生产专属集群 (Production)",
-                "description": "仅激活 group 标记为 production 的核心业务账号",
-                "action": "filter_group",
-                "target_groups": ["production"],
-                "is_system": True,
-            },
-        ],
-    }
+    """Return an independent deep copy of the tracked default configuration.
+
+    Every caller receives its own copy so mutation cannot leak into the cached
+    template or into another caller.
+    """
+    return copy.deepcopy(_default_config_template())
 
 
 _CONFIG_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
@@ -1073,9 +1020,10 @@ _API_KEYS_CACHE: dict[str, tuple[float, frozenset[str], list[dict[str, str]]]] =
 
 
 def invalidate_config_cache() -> None:
-    """Clear in-memory configuration and API keys cache."""
+    """Clear in-memory configuration, template and API keys cache."""
     _CONFIG_CACHE.clear()
     _API_KEYS_CACHE.clear()
+    _default_config_template.cache_clear()
     _compiled_profiles.cache_clear()
     _compiled_model_overrides.cache_clear()
 
@@ -1139,6 +1087,8 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(loaded, dict):
         loaded = {}
+    else:
+        loaded, _ = _migrate_legacy_config_mapping(loaded)
     merged = _deep_merge(_default_config(), loaded)
     assert isinstance(merged, dict)
     merged = _apply_noncritical_fallbacks(merged)

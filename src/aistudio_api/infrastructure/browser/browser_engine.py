@@ -22,6 +22,10 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("browser")
 
+# System-level CloakBrowser installation (e.g. Docker containers). Kept as a
+# module-level constant so tests can exercise this branch on any platform.
+_OPT_CLOAKBROWSER_DIR = Path("/opt/cloakbrowser")
+
 
 def _derive_stable_fingerprint_seed(key: str) -> int:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -98,7 +102,7 @@ def find_chromium_executable() -> str:
                 ):
                     return _resolve_local_chrome(str(match))
     # 4. System-level CloakBrowser (/opt/cloakbrowser/**/chrome)
-    opt_cloak_dir = Path("/opt/cloakbrowser")
+    opt_cloak_dir = _OPT_CLOAKBROWSER_DIR
     if opt_cloak_dir.is_dir():
         for pat in (
             "chrome",
