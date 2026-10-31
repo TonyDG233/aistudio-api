@@ -29,6 +29,8 @@ class Instance:
     latest: bool = False
     tier: str = ""
     last_used: float = 0.0
+    only_tier: str = ""
+    max_tier: str = ""
 
 
 @dataclass(frozen=True)

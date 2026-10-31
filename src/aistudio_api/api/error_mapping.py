@@ -85,6 +85,10 @@ def error_payload(
         message = str(exc)
         fields = dict(exc.as_fields())
         field_values: dict[str, object] = dict(fields)
+        # RoutingError.as_fields() carries its own ``type``/``reason``; OpenAI
+        # and Claude reserve ``error.type`` for the protocol-level error class.
+        if protocol != "gemini":
+            field_values.pop("type", None)
         if protocol == "gemini":
             status_text = "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
             return status, {

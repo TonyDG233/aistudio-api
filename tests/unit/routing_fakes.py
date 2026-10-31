@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -31,6 +32,32 @@ class FakeHandle:
 
     def release(self) -> None:
         self.released = True
+
+
+@dataclass
+class FakeSession:
+    """Session payload consumed by the scripted ``InstanceRequestClient``."""
+
+    account_id: str
+    generate: Callable[..., Awaitable[Any]] | None = None
+    stream: Callable[..., AsyncIterator[tuple[str, object | None]]] | None = None
+
+
+@dataclass
+class TrackingHandle(FakeHandle):
+    manager: RebindFakeManager | None = None
+    instance_id: str = ""
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        if self.manager is not None:
+            self.manager.active_requests = max(0, self.manager.active_requests - 1)
+            if self.instance_id:
+                self.manager.active_by_instance[self.instance_id] = max(
+                    0, self.manager.active_by_instance.get(self.instance_id, 0) - 1
+                )
 
 
 def make_instance(
@@ -185,6 +212,81 @@ class FakeManager:
         raise RuntimeError(f"unknown instance {instance_id}")
 
 
+class RebindFakeManager(FakeManager):
+    """Fake manager that supports request-triggered in-place account rebinds."""
+
+    def __init__(
+        self,
+        instances: list[Instance] | None = None,
+        *,
+        sessions: dict[str, Any] | None = None,
+        account_sessions: dict[str, Any] | None = None,
+        current_instance_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            instances, sessions=sessions, current_instance_id=current_instance_id
+        )
+        self.account_sessions = dict(account_sessions or {})
+        self.account_tiers = {item.account_id: item.tier for item in self.instances}
+        self.reassign_calls: list[tuple[str, str]] = []
+        self.active_requests = 0
+        self.active_by_instance: dict[str, int] = {}
+        self.last_handles: dict[str, TrackingHandle] = {}
+
+    async def begin_request(self, instance_id: str) -> TrackingHandle:
+        self.begin_calls.append(instance_id)
+        item = next(
+            (candidate for candidate in self.instances if candidate.id == instance_id),
+            None,
+        )
+        if item is None:
+            raise RuntimeError(f"unknown instance {instance_id}")
+        if item.state is not InstanceState.ACTIVE:
+            raise RuntimeError("not active")
+        session = self.sessions.get(instance_id)
+        if session is None:
+            session = self.account_sessions.get(item.account_id) or FakeSession(
+                account_id=item.account_id
+            )
+            self.sessions[instance_id] = session
+        self.active_requests += 1
+        self.active_by_instance[instance_id] = (
+            self.active_by_instance.get(instance_id, 0) + 1
+        )
+        handle = TrackingHandle(
+            slot=FakeSlot(session=session),
+            manager=self,
+            instance_id=instance_id,
+        )
+        self.last_handles[instance_id] = handle
+        return handle
+
+    async def reassign(self, instance_id: str, account_id: str) -> Instance:
+        if self.active_by_instance.get(instance_id, 0) > 0:
+            raise RuntimeError("instance busy: release active request first")
+        self.reassign_calls.append((instance_id, account_id))
+        for index, item in enumerate(self.instances):
+            if item.id != instance_id:
+                continue
+            updated = replace(
+                item,
+                account_id=account_id,
+                tier=self.account_tiers.get(account_id, item.tier),
+            )
+            self.instances[index] = updated
+            self.sessions[instance_id] = self.account_sessions.get(
+                account_id
+            ) or FakeSession(account_id=account_id)
+            return updated
+        raise RuntimeError(f"unknown instance {instance_id}")
+
+    def instance_account_ids(self) -> set[str]:
+        return {item.account_id for item in self.instances if item.account_id}
+
+    def instance_active_requests(self, instance_id: str) -> int:
+        return self.active_by_instance.get(instance_id, 0)
+
+
 def _with_state(instance: Instance, state: InstanceState) -> Instance:
     return Instance(
         id=instance.id,
@@ -193,6 +295,8 @@ def _with_state(instance: Instance, state: InstanceState) -> Instance:
         state=state,
         surface=instance.surface,
         min_tier=instance.min_tier,
+        only_tier=instance.only_tier,
+        max_tier=instance.max_tier,
         in_flight=instance.in_flight,
         latest=instance.latest,
         tier=instance.tier,
@@ -292,8 +396,11 @@ def make_attempt(
 __all__ = [
     "FakeHandle",
     "FakeManager",
+    "FakeSession",
     "FakeSlot",
+    "RebindFakeManager",
     "ScriptedPipeline",
+    "TrackingHandle",
     "make_attempt",
     "make_context",
     "make_instance",

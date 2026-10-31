@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -9,6 +11,12 @@ from fastapi import FastAPI
 from aistudio_api.api import routes_gemini
 from aistudio_api.api.dependencies import get_routing_pipeline
 from aistudio_api.application.token_counter import TokenCountOutcome
+from tests.unit.routing_fakes import (
+    FakeHandle,
+    ScriptedPipeline,
+    make_attempt,
+    make_context,
+)
 
 MODEL = "gemini-3.8-flash"
 
@@ -47,9 +55,33 @@ async def test_gemini_count_tokens_route_returns_total_tokens(monkeypatch):
     )
 
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
     assert response.json() == {"totalTokens": 17}
     assert captured["api_format"] == "gemini"
     assert captured["model_path"] == MODEL
+
+
+async def test_gemini_count_tokens_uses_pooled_client_and_returns_positive_json():
+    client = MagicMock()
+    client.count_tokens = AsyncMock(return_value=11)
+    attempt = make_attempt(client, account_id="free-a", tier="Free")
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+    app = _app()
+    app.dependency_overrides[get_routing_pipeline] = lambda: pipeline
+
+    response = await _post(
+        app,
+        f"/v1beta/models/{MODEL}:countTokens",
+        {"contents": [{"parts": [{"text": "B6 count tokens"}]}]},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    payload = response.json()
+    assert payload["totalTokens"] > 0
+    assert client.count_tokens.await_count == 1
+    assert isinstance(attempt.handle, FakeHandle)
+    assert attempt.handle.released is True
 
 
 async def test_gemini_count_tokens_route_is_post_only():

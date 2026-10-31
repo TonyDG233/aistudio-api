@@ -23,7 +23,9 @@ class InstanceResponse(BaseModel):
     account_id: str
     state: str
     surface: str
+    only_tier: str
     min_tier: str
+    max_tier: str
     in_flight: int
     latest: bool
 
@@ -55,7 +57,9 @@ def to_instance_response(instance: Instance) -> InstanceResponse:
         account_id=instance.account_id,
         state=instance.state.value,
         surface=instance.surface,
+        only_tier=instance.only_tier,
         min_tier=instance.min_tier,
+        max_tier=instance.max_tier,
         in_flight=instance.in_flight,
         latest=instance.latest,
     )

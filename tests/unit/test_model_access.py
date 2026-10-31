@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from aistudio_api.application.model_access import (
+    TierSelectorError,
     account_is_paid,
     clear_paid_models,
     instance_lane_for_tier,
@@ -15,8 +16,10 @@ from aistudio_api.application.model_access import (
     is_paid_model,
     model_account_requirement,
     model_requires_paid_account,
+    resolve_tier_selector,
     set_paid_models,
     surface_capability,
+    tier_matches_spec,
 )
 from aistudio_api.infrastructure.gateway.model_discovery import ModelDiscoveryService
 
@@ -58,6 +61,70 @@ def test_paid_models_are_chat_only_and_require_paid_account() -> None:
     assert model_requires_paid_account("gemini-3.1-pro-preview") is False
     assert model_account_requirement("gemini-3.1-pro-preview") == "any"
     assert surface_capability("gemini-3-flash-preview", ("chat", "build")) == ("chat",)
+
+
+def test_tier_selectors_enforce_exact_and_interval_semantics() -> None:
+    # only_tier Pro is exactly Pro; Ultra needs its own selector.
+    assert tier_matches_spec("Pro", only_tier="Pro") is True
+    assert tier_matches_spec("Ultra", only_tier="Pro") is False
+    assert tier_matches_spec("Ultra_20X", only_tier="Pro") is False
+    # only_tier Ultra matches the normalized Ultra family.
+    assert tier_matches_spec("Ultra", only_tier="Ultra") is True
+    assert tier_matches_spec("Ultra_20X", only_tier="Ultra") is True
+    assert tier_matches_spec("Pro", only_tier="Ultra") is False
+    # min=max=Pro is the same closed interval and excludes Ultra.
+    assert tier_matches_spec("Pro", min_tier="Pro", max_tier="Pro") is True
+    assert tier_matches_spec("Ultra", min_tier="Pro", max_tier="Pro") is False
+    # Legacy min_tier Free is exactly Free and never a paid tier.
+    assert tier_matches_spec("Free", min_tier="Free") is True
+    assert tier_matches_spec("Plus", min_tier="Free") is False
+    assert tier_matches_spec("Pro", min_tier="Free") is False
+    # A Free spec never binds Pro/Ultra even if max is left open.
+    assert tier_matches_spec("Ultra", only_tier="Free") is False
+    assert tier_matches_spec("Pro", min_tier="Free", max_tier="Free") is False
+
+
+def test_max_tier_only_defaults_paid_lower_bound_to_pro() -> None:
+    selector = resolve_tier_selector(max_tier="Ultra")
+    assert selector.min_tier == "Pro"
+    assert selector.max_tier == "Ultra"
+    assert selector.lane == "paid"
+
+    free_selector = resolve_tier_selector(max_tier="Free")
+    assert free_selector.lane == "free"
+    assert (free_selector.min_tier, free_selector.max_tier) == ("Free", "Free")
+
+    with pytest.raises(TierSelectorError, match="Pro"):
+        resolve_tier_selector(max_tier="Plus")
+    with pytest.raises(TierSelectorError, match="Pro"):
+        resolve_tier_selector(min_tier="Plus", max_tier="Plus")
+
+
+def test_normalized_free_spec_is_consistent_with_only_tier() -> None:
+    selector = resolve_tier_selector(
+        only_tier="Free", min_tier="Free", max_tier="Free"
+    )
+    assert selector.lane == "free"
+    assert selector.only_tier == "Free"
+    assert (selector.min_tier, selector.max_tier) == ("Free", "Free")
+
+    with pytest.raises(TierSelectorError, match="only_tier"):
+        resolve_tier_selector(only_tier="Pro", min_tier="Ultra")
+
+
+def test_invalid_tier_selector_values_are_hard_errors() -> None:
+    for kwargs in (
+        {"only_tier": 1},
+        {"min_tier": [1]},
+        {"max_tier": True},
+        {"only_tier": "Diamond"},
+    ):
+        with pytest.raises(TierSelectorError):
+            resolve_tier_selector(**kwargs)
+
+    # A valid sibling must not mask an invalid selector in the same item.
+    with pytest.raises(TierSelectorError, match="min_tier"):
+        resolve_tier_selector(only_tier="Pro", min_tier=1)
 
 
 def test_account_tier_paid_eligibility() -> None:

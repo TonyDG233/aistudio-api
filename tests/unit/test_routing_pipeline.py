@@ -73,9 +73,10 @@ async def test_begin_wakes_sleeping_and_unstarted_candidates() -> None:
     )
     context = await _pipeline(manager).begin(model_path="gemini-3.7-flash")
     assert manager.wake_calls == [(False, "chat")]
+    # Sticky is now only a final tie-breaker: balanced last_used/LRU wins first.
     assert [item.instance_id for item in context.candidates] == [
-        "inst-a",
         "inst-b",
+        "inst-a",
         "inst-c",
     ]
     assert all(item.state is InstanceState.ACTIVE for item in context.candidates)
@@ -162,6 +163,341 @@ async def test_pipeline_uses_real_instance_manager_active_requests(tmp_path) -> 
 
     paid_context = await pipeline.begin(model_path="gemini-4-argon")
     assert [item.tier for item in paid_context.candidates] == ["Pro"]
+
+
+@pytest.mark.asyncio
+async def test_two_idle_free_slots_distribute_sequential_requests(tmp_path) -> None:
+    from tests.unit.test_instance_manager import (
+        FakeCDP,
+        _free_spec,
+        _manager,
+        _store_with_accounts,
+    )
+
+    store, _accounts = _store_with_accounts(
+        tmp_path,
+        ("free1", "free1@example.com", "Free"),
+        ("free2", "free2@example.com", "Free"),
+    )
+    manager = _manager(
+        store,
+        FakeCDP(),
+        specs=[_free_spec(count=2)],
+        max_contexts=2,
+    )
+    await manager.startup()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    used: list[str] = []
+    for _ in range(4):
+        context = await pipeline.begin(model_path="gemini-3.7-flash")
+        attempt = await pipeline.acquire(context)
+        assert attempt is not None
+        used.append(attempt.instance_id)
+        await pipeline.release(attempt)
+
+    assert used[0] != used[1]
+    assert set(used) == {"inst-1", "inst-2"}
+    assert used.count("inst-1") == 2
+    assert used.count("inst-2") == 2
+
+
+@pytest.mark.asyncio
+async def test_paid_route_prefers_pro_slot_before_idle_ultra() -> None:
+    manager = FakeManager(
+        [
+            make_instance(
+                "inst-ultra", account_id="ultra", tier="Ultra",
+                number=1, last_used=1.0,
+            ),
+            make_instance(
+                "inst-pro", account_id="pro", tier="Pro",
+                number=2, last_used=2.0,
+            ),
+        ]
+    )
+    context = await _pipeline(manager).begin(model_path="gemini-4-argon")
+    assert [item.instance_id for item in context.candidates] == [
+        "inst-pro",
+        "inst-ultra",
+    ]
+
+
+def test_order_uses_candidate_account_tier_rank() -> None:
+    pipeline = _pipeline(FakeManager([]))
+    route = make_route(
+        "gemini-4-argon", paid=True, required_tiers=("Pro",)
+    )
+    ultra = make_instance(
+        "inst-ultra", account_id="ultra", tier="Ultra", number=1, last_used=0.0
+    )
+    pro = make_instance(
+        "inst-pro", account_id="pro", tier="Pro", number=2, last_used=9.0
+    )
+
+    ordered = pipeline._order(route, [ultra, pro])
+
+    assert [item.id for item in ordered] == ["inst-pro", "inst-ultra"]
+
+
+@pytest.mark.asyncio
+async def test_busy_pro_slot_falls_back_to_idle_ultra() -> None:
+    manager = FakeManager(
+        [
+            make_instance(
+                "inst-pro", account_id="pro", tier="Pro",
+                number=1, last_used=1.0, in_flight=1,
+            ),
+            make_instance(
+                "inst-ultra", account_id="ultra", tier="Ultra",
+                number=2, last_used=2.0,
+            ),
+        ]
+    )
+    context = await _pipeline(manager).begin(model_path="gemini-4-argon")
+    assert [item.instance_id for item in context.candidates] == [
+        "inst-ultra",
+        "inst-pro",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_429_dead_slot_is_rebound_while_request_continues_on_other_slot(
+    monkeypatch,
+) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    class _Rotator:
+        def get_account_stats(self, account_id: str):
+            del account_id
+            return SimpleNamespace(
+                total_requests=0,
+                model_requests_total=lambda _model: 0,
+            )
+
+        def is_account_available(
+            self, account_id: str, *, model=None, surface=None
+        ) -> bool:
+            del account_id, model, surface
+            return True
+
+        def select_rebind_account(self, **kwargs):
+            excluded = set(kwargs.get("exclude_account_ids") or ())
+            if "free-c" in excluded:
+                return None
+            return SimpleNamespace(id="free-c", tier="Free")
+
+        def record_rate_limited(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_auth_error(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_session_expired(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_success(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_error(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    class _Client:
+        def __init__(self, session, *, account_id, tier, surface) -> None:
+            del session
+            self.account_id = account_id
+            self.tier = tier
+            self.surface = surface
+            self.clear_calls = 0
+
+        def clear_templates(self) -> None:
+            self.clear_calls += 1
+
+    monkeypatch.setattr(routing_pipeline_module, "InstanceRequestClient", _Client)
+    manager = RebindFakeManager(
+        [
+            make_instance(
+                "inst-1", account_id="free-a", tier="Free", number=1, last_used=1.0
+            ),
+            make_instance(
+                "inst-2", account_id="free-b", tier="Free", number=2, last_used=2.0
+            ),
+        ],
+        current_instance_id="inst-1",
+    )
+    manager.account_tiers["free-c"] = "Free"
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", _Rotator()),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    first = await pipeline.acquire(context)
+    assert first is not None
+    assert first.instance_id == "inst-1"
+    error = UsageLimitExceeded("429")
+
+    assert (
+        await pipeline.handle_error(context, first, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert (
+        await pipeline.handle_error(context, first, error, has_yielded_data=False)
+        == "switch"
+    )
+    # The failed slot was healed immediately, but this request continues on
+    # inst-2 instead of re-taking the slot it just failed.
+    assert manager.reassign_calls == [("inst-1", "free-c")]
+    assert first.handle.released is True  # type: ignore[attr-defined]
+    assert first.client.clear_calls >= 1  # type: ignore[attr-defined]
+    await pipeline.release(first)
+
+    second = await pipeline.acquire(context)
+    assert second is not None
+    assert second.instance_id == "inst-2"
+    await pipeline.release(second)
+
+    by_id = {item.id: item for item in manager.instances}
+    assert by_id["inst-1"].account_id == "free-c"
+    assert by_id["inst-2"].account_id == "free-b"
+    assert {by_id["inst-1"].tier, by_id["inst-2"].tier} == {"Free"}
+    assert all(item.account_id != "free-a" for item in manager.instances)
+    assert manager.active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_single_slot_allows_successive_429_rebinds_within_budget(
+    monkeypatch,
+) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    class _Rotator:
+        def __init__(self) -> None:
+            self.exclusions: list[set[str]] = []
+
+        def get_account_stats(self, account_id: str):
+            del account_id
+            return SimpleNamespace(
+                total_requests=0,
+                model_requests_total=lambda _model: 0,
+            )
+
+        def is_account_available(
+            self, account_id: str, *, model=None, surface=None
+        ) -> bool:
+            del account_id, model, surface
+            return True
+
+        def select_rebind_account(self, **kwargs):
+            excluded: set[str] = set(kwargs.get("exclude_account_ids") or ())
+            self.exclusions.append(excluded)
+            for account_id in ("free-b", "free-c"):
+                if account_id not in excluded:
+                    return SimpleNamespace(id=account_id, tier="Free")
+            return None
+
+        def record_rate_limited(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_auth_error(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_session_expired(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_success(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_error(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    class _Client:
+        def __init__(self, session, *, account_id, tier, surface) -> None:
+            del session
+            self.account_id = account_id
+            self.tier = tier
+            self.surface = surface
+
+        def clear_templates(self) -> None:
+            return None
+
+    monkeypatch.setattr(routing_pipeline_module, "InstanceRequestClient", _Client)
+    manager = RebindFakeManager(
+        [
+            make_instance(
+                "inst-1", account_id="free-a", tier="Free", number=1, last_used=1.0
+            )
+        ],
+        current_instance_id="inst-1",
+    )
+    manager.account_tiers.update({"free-b": "Free", "free-c": "Free"})
+    rotator = _Rotator()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    error = UsageLimitExceeded("429")
+
+    first = await pipeline.acquire(context)
+    assert first is not None
+    assert first.account_id == "free-a"
+    assert (
+        await pipeline.handle_error(context, first, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert (
+        await pipeline.handle_error(context, first, error, has_yielded_data=False)
+        == "switch"
+    )
+    await pipeline.release(first)
+
+    second = await pipeline.acquire(context)
+    assert second is not None
+    assert second.account_id == "free-b"
+    assert (
+        await pipeline.handle_error(context, second, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert (
+        await pipeline.handle_error(context, second, error, has_yielded_data=False)
+        == "switch"
+    )
+    await pipeline.release(second)
+
+    third = await pipeline.acquire(context)
+    assert third is not None
+    assert third.account_id == "free-c"
+    pipeline.record_success(context, third)
+    await pipeline.release(third)
+
+    rebind_accounts = [account_id for _instance_id, account_id in manager.reassign_calls]
+    assert rebind_accounts == ["free-b", "free-c"]
+    assert len(rebind_accounts) == len(set(rebind_accounts))
+    assert context.budget.switches == 2
+    assert context.budget.max_switches == 2
+    assert context.attempted_accounts == {"free-a", "free-b", "free-c"}
+    assert {item.account_id for item in manager.instances} == {"free-c"}
+    assert rotator.exclusions[0] == {"free-a"}
+    assert rotator.exclusions[1] == {"free-a", "free-b"}
+
+    # The third 429 has no switch budget left and must not loop or re-bind.
+    assert (
+        await pipeline.handle_error(context, third, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    with pytest.raises(SurfaceSwitchExhaustedError):
+        await pipeline.handle_error(context, third, error, has_yielded_data=False)
+    assert manager.reassign_calls == [
+        ("inst-1", "free-b"),
+        ("inst-1", "free-c"),
+    ]
 
 
 @pytest.mark.asyncio

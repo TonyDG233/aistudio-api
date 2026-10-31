@@ -21,7 +21,6 @@ from typing import Any, Protocol
 
 from aistudio_api.application.model_access import (
     instance_lane_for_tier,
-    tier_satisfies_min,
 )
 from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.infrastructure.account.account_store import AccountMeta
@@ -112,9 +111,24 @@ class _Record:
     surface: str
     min_tier: str
     lane: str
+    only_tier: str = ""
+    max_tier: str = ""
     created_at: float = 0.0
     started_at: float = 0.0
     last_error: str | None = None
+
+    @property
+    def spec(self) -> InstanceSpec:
+        return InstanceSpec(
+            count=1,
+            surface=self.surface,
+            only_tier=self.only_tier,
+            min_tier=self.min_tier,
+            max_tier=self.max_tier,
+        )
+
+    def accepts_tier(self, tier: object) -> bool:
+        return self.spec.accepts_tier(tier)
 
 
 class InstanceManager:
@@ -156,14 +170,16 @@ class InstanceManager:
             accounts = self._ordered_accounts(active)
             used: set[str] = set()
             for spec in self._pool.specs:
-                lane = instance_lane_for_tier(spec.min_tier)
+                lane = spec.lane
                 for _ in range(max(0, int(spec.count))):
                     try:
                         slot = await self._pool.add_slot(
                             InstanceSpec(
                                 count=1,
                                 surface=spec.surface,
+                                only_tier=spec.only_tier,
                                 min_tier=spec.min_tier,
+                                max_tier=spec.max_tier,
                             ),
                             lane=lane,
                         )
@@ -176,11 +192,13 @@ class InstanceManager:
                     record = self._new_record(
                         slot_id=slot.slot_id,
                         surface=spec.surface,
+                        only_tier=spec.only_tier,
                         min_tier=spec.min_tier,
+                        max_tier=spec.max_tier,
                         lane=lane,
                     )
                     self._records[record.id] = record
-                    account = self._pick_account(lane, spec.min_tier, accounts, used)
+                    account = self._pick_account(spec, accounts, used)
                     if account is None:
                         record.state = InstanceState.UNSTARTED
                         continue
@@ -287,7 +305,9 @@ class InstanceManager:
             record = self._new_record(
                 slot_id=slot.slot_id,
                 surface=spec.surface,
+                only_tier=spec.only_tier,
                 min_tier=spec.min_tier,
+                max_tier=spec.max_tier,
                 lane=lane,
             )
             record.account_id = account.id
@@ -376,9 +396,11 @@ class InstanceManager:
                 raise InstanceInvalidAccountError(
                     "Free/paid 实例池互相隔离，不能跨池改绑账号"
                 )
-            if not tier_satisfies_min(account.tier, record.min_tier):
+            if not record.accepts_tier(account.tier):
                 raise InstanceInvalidAccountError(
-                    f"账号 tier={account.tier} 不满足实例 min_tier={record.min_tier}"
+                    f"账号 tier={account.tier} 不满足实例 tier 区间 "
+                    f"only={record.only_tier or '-'} min={record.min_tier or '-'} "
+                    f"max={record.max_tier or '-'}"
                 )
             if self._has_record_for_account(account.id, exclude_id=record.id):
                 raise InstanceAlreadyExistsError(f"账号 {account_id} 已有实例")
@@ -466,8 +488,7 @@ class InstanceManager:
                 )
                 if account is None:
                     account = self._pick_account(
-                        record.lane,
-                        record.min_tier,
+                        record.spec,
                         self._ordered_accounts(self._accounts.get_active_account()),
                         used,
                     )
@@ -674,18 +695,25 @@ class InstanceManager:
         }
 
     def instance_account_ids(self) -> set[str]:
+        """Every account currently bound to a slot, in any lifecycle state.
+
+        UNSTARTED/RECLAIMING slots can still hold a bound account id while a
+        rebind or startup is in flight; excluding them lets rebind selection
+        pick the same account twice.
+        """
         return {
             record.account_id
             for record in self._records.values()
             if record.account_id
-            and record.state
-            in (
-                InstanceState.STARTING,
-                InstanceState.ACTIVE,
-                InstanceState.INVALID,
-                InstanceState.SLEEPING,
-            )
         }
+
+    def instance_active_requests(self, instance_id: str) -> int:
+        """In-flight request count for one instance (0 when unknown)."""
+        record = self._records.get(instance_id)
+        if record is None:
+            return 0
+        slot = self._pool.get(record.slot_id)
+        return int(slot.active_requests) if slot is not None else 0
 
     async def close_all(self) -> None:
         async with self._lifecycle_lock:
@@ -744,8 +772,7 @@ class InstanceManager:
 
     def _pick_account(
         self,
-        lane: str,
-        min_tier: str,
+        spec: InstanceSpec,
         accounts: list[AccountMeta],
         used: set[str],
     ) -> AccountMeta | None:
@@ -754,9 +781,7 @@ class InstanceManager:
                 continue
             if not account.enabled or account.expired:
                 continue
-            if instance_lane_for_tier(account.tier) != lane:
-                continue
-            if not tier_satisfies_min(account.tier, min_tier):
+            if not spec.accepts_tier(account.tier):
                 continue
             if (
                 self._accounts.get_auth_path_optional(account.id, require_exists=True)
@@ -811,7 +836,7 @@ class InstanceManager:
         for spec in self._pool.specs:
             if spec.surface != surface:
                 continue
-            if tier_satisfies_min(account.tier, spec.min_tier):
+            if spec.accepts_tier(account.tier):
                 return spec
         return None
 
@@ -823,9 +848,11 @@ class InstanceManager:
         surface: str | None = None,
     ) -> _Record:
         target_surface = surface or record.surface
-        if not tier_satisfies_min(account.tier, record.min_tier):
+        if not record.accepts_tier(account.tier):
             raise InstanceInvalidAccountError(
-                f"账号 tier={account.tier} 不满足实例 min_tier={record.min_tier}"
+                f"账号 tier={account.tier} 不满足实例 tier 区间 "
+                f"only={record.only_tier or '-'} min={record.min_tier or '-'} "
+                f"max={record.max_tier or '-'}"
             )
         auth_file = self._accounts.get_auth_path_optional(
             account.id, require_exists=True
@@ -892,17 +919,20 @@ class InstanceManager:
         self, target: AccountMeta, target_lane: str
     ) -> _Record | None:
         for record in self._records.values():
-            if record.account_id == target.id:
+            if record.account_id == target.id and record.accepts_tier(target.tier):
                 return record
         for record in self._records.values():
             if (
                 record.lane == target_lane
                 and not record.account_id
+                and record.accepts_tier(target.tier)
                 and record.state in (InstanceState.UNSTARTED, InstanceState.SLEEPING)
             ):
                 return record
         for record in self._records.values():
             if record.lane != target_lane or not record.account_id:
+                continue
+            if not record.accepts_tier(target.tier):
                 continue
             account = self._accounts.get_account(record.account_id)
             if account is None or not account.enabled:
@@ -921,7 +951,9 @@ class InstanceManager:
         *,
         slot_id: str,
         surface: str,
+        only_tier: str,
         min_tier: str,
+        max_tier: str,
         lane: str,
     ) -> _Record:
         number = self._next_number
@@ -935,6 +967,8 @@ class InstanceManager:
             surface=surface,
             min_tier=min_tier,
             lane=lane,
+            only_tier=only_tier,
+            max_tier=max_tier,
             created_at=self._clock(),
         )
 
@@ -1003,7 +1037,9 @@ class InstanceManager:
             account_id=record.account_id,
             state=record.state,
             surface=record.surface,
-            min_tier=record.min_tier,
+            min_tier=record.spec.selector.min_tier,
+            only_tier=record.only_tier,
+            max_tier=record.max_tier,
             in_flight=in_flight,
             latest=record.id == self._latest_id,
             tier=slot.tier if slot is not None else "",

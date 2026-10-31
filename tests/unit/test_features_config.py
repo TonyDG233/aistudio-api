@@ -148,17 +148,298 @@ instances:
   - count: 1
     surface: video
     min_tier: Pro
-  - count: 1
-    surface: chat
-    min_tier: Diamond
   - just-a-string
 """,
     )
 
     assert get_configured_instance_specs(path) == [
-        {"count": 3, "surface": "chat", "min_tier": "Free"},
+        {
+            "count": 3,
+            "surface": "chat",
+            "only_tier": "Free",
+            "min_tier": "Free",
+            "max_tier": "Free",
+        },
         {"count": 1, "surface": "build", "min_tier": "Ultra_20X"},
     ]
+
+
+def test_instances_only_tier_is_valid_and_normalized(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Free
+  - count: 1
+    surface: chat
+    only_tier: Pro
+""",
+    )
+
+    assert get_configured_instance_specs(path) == [
+        {
+            "count": 1,
+            "surface": "chat",
+            "only_tier": "Free",
+            "min_tier": "Free",
+            "max_tier": "Free",
+        },
+        {"count": 1, "surface": "chat", "only_tier": "Pro"},
+    ]
+
+
+def test_instances_min_max_interval_is_valid(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Pro
+    max_tier: Ultra
+""",
+    )
+
+    assert get_configured_instance_specs(path) == [
+        {"count": 1, "surface": "chat", "min_tier": "Pro", "max_tier": "Ultra"},
+    ]
+
+
+def test_instances_max_tier_alone_is_valid(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    max_tier: Free
+""",
+    )
+
+    assert get_configured_instance_specs(path) == [
+        {
+            "count": 1,
+            "surface": "chat",
+            "only_tier": "Free",
+            "min_tier": "Free",
+            "max_tier": "Free",
+        },
+    ]
+
+
+def test_instances_max_tier_above_free_defaults_lower_bound_to_pro(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    max_tier: Ultra
+""",
+    )
+
+    assert get_configured_instance_specs(path) == [
+        {"count": 1, "surface": "chat", "min_tier": "Pro", "max_tier": "Ultra"},
+    ]
+
+
+def test_instances_max_tier_plus_alone_is_rejected(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    max_tier: Plus
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="Pro"):
+        validate_config(path)
+
+
+def test_instances_paid_interval_upper_below_pro_is_rejected(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Plus
+    max_tier: Plus
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="Pro"):
+        validate_config(path)
+
+
+@pytest.mark.parametrize(
+    ("selector_yaml", "field"),
+    [
+        ("only_tier: 1", "only_tier"),
+        ("only_tier: [Free]", "only_tier"),
+        ("only_tier: true", "only_tier"),
+        ("only_tier: Diamond", "only_tier"),
+        ("min_tier: 1", "min_tier"),
+        ("min_tier: [Free]", "min_tier"),
+        ("min_tier: false", "min_tier"),
+        ("min_tier: Diamond", "min_tier"),
+        ("max_tier: 1", "max_tier"),
+        ("max_tier: [Free]", "max_tier"),
+        ("max_tier: true", "max_tier"),
+        ("max_tier: Diamond", "max_tier"),
+    ],
+)
+def test_instances_invalid_tier_selectors_are_hard_errors(
+    tmp_path, selector_yaml, field
+):
+    path = _write_config(
+        tmp_path,
+        f"""
+instances:
+  - count: 1
+    surface: chat
+    {selector_yaml}
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match=field):
+        validate_config(path)
+
+
+def test_invalid_tier_selector_is_rejected_even_with_valid_sibling(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Pro
+    min_tier: 1
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="min_tier"):
+        validate_config(path)
+
+
+def test_only_free_and_legacy_min_free_share_one_merge_key(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Free
+  - count: 2
+    surface: chat
+    min_tier: Free
+  - count: 1
+    surface: chat
+    max_tier: Free
+""",
+    )
+
+    assert get_configured_instance_specs(path) == [
+        {
+            "count": 4,
+            "surface": "chat",
+            "only_tier": "Free",
+            "min_tier": "Free",
+            "max_tier": "Free",
+        },
+    ]
+
+
+def test_normalized_instance_specs_are_consumable_by_the_pool(tmp_path):
+    from aistudio_api.infrastructure.gateway.instance_pool import InstanceSpec
+
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Free
+  - count: 1
+    surface: chat
+    min_tier: Pro
+""",
+    )
+
+    specs = get_configured_instance_specs(path)
+    parsed = [InstanceSpec.from_mapping(spec) for spec in specs]
+
+    assert [item.lane for item in parsed] == ["free", "paid"]
+    assert parsed[0].accepts_tier("Free") is True
+    assert parsed[0].accepts_tier("Pro") is False
+    assert parsed[1].accepts_tier("Pro") is True
+    assert parsed[1].accepts_tier("Ultra") is True
+
+
+def test_instances_missing_all_tier_selectors_is_invalid(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="tier 选择器"):
+        validate_config(path)
+
+
+def test_instances_only_tier_conflict_is_invalid(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Pro
+    min_tier: Ultra
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="only_tier"):
+        validate_config(path)
+
+
+def test_instances_inverted_min_max_is_invalid(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Ultra
+    max_tier: Pro
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="min_tier"):
+        validate_config(path)
+
+
+def test_instances_free_and_paid_interval_cannot_mix(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+instances:
+  - count: 1
+    surface: chat
+    min_tier: Free
+    max_tier: Pro
+""",
+    )
+
+    with pytest.raises(ConfigValidationError, match="Free"):
+        validate_config(path)
 
 
 def test_instances_all_invalid_raises_config_validation_error(tmp_path):
