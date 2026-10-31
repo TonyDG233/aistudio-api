@@ -85,17 +85,19 @@ flowchart TD
 
 **依赖约束**：
 
-- API 层不直接访问浏览器、Cookie 或 Wire 数组；只通过依赖注入取得 `RoutingPipeline`、`AccountService`、`RuntimeState`（`api/dependencies.py:124-170`）。
-- Application 层通过 `RequestSession` / `GenerationClient` 等协议消费部分 Infrastructure 能力（`routing_pipeline.py:63-145`），生成核心不散落协议判断（`generation_service.py:1-11`）；但当前仍有 12 个文件直接依赖 Infrastructure 具体实现，属 P0/P1 技术债（B7-02/B7-03）。
-- Domain 不导入 FastAPI、CDP 或 JSPB；`Instance` 只暴露用户可见字段（`domain/instances.py:18-33`）。
-- Infrastructure 负责 CDP、Cookie、模板、Wire、流解析与日志；它依赖 Domain 的错误/模型，不反向依赖 API；但当前 3 个 gateway 文件反向依赖 application（P0，B7-03）。
-- **已知 P0 技术债（不是受控例外）**：`infrastructure/gateway/model_discovery.py:16-19`、`model_defaults.py:14-18` 与 `instance_pool.py:23-25` 直接复用 `application/model_access.py` 的 Paid/tier 判定，同时 `application -> infrastructure` 有 12 个文件的具体实现耦合，构成真实的 `infrastructure -> application` 循环；架构耦合审计将其判为 P0（`REV-B7-architecture-coupling-audit.md:67-75`，任务 B7-03）。`application -> api` 的 6 文件反向依赖同属 P0（任务 B7-02）。临时豁免不改变债务等级；修复方向是把 Tier/Paid 规则下沉到 `domain/model_access.py`，并让两层只依赖 domain。
+- API 层不直接访问浏览器、Cookie 或 Wire 数组；只通过依赖注入取得 `RoutingPipeline`、`AccountService`、`RuntimeState`（`api/dependencies.py:124-170`）。Gemini 协议渲染与错误映射留在 API 层（`api/gemini_service.py`、`api/error_mapping.py`）。
+- Application 层**不导入 `aistudio_api.api` 或 FastAPI**（`tests/unit/test_layer_boundaries.py` 静态校验）；HTTP 请求 DTO 由 `application/contracts/` 提供，finish reason 映射在无框架依赖的 `application/finish_reasons.py`，统计记录通过构造注入的 `stats_recorder` 回调完成，不反向读取 `api.state.runtime_state`。
+- Domain 不导入 FastAPI、CDP 或 JSPB；`Instance` 只暴露用户可见字段（`domain/instances.py:18-33`）；Tier/Paid 共享规则位于 `domain/model_access.py`。
+- Infrastructure 负责 CDP、Cookie、模板、Wire、流解析与日志；它依赖 Domain 的错误/模型，**不反向依赖 application**（`tests/unit/test_layer_boundaries.py` 静态校验）。
+- 历史 P0 债务（`application -> api` 的 6 文件反向依赖、`infrastructure -> application` 的 `model_access` 循环）已通过 B7-01/B7-02/B7-03 消除，并由 `tests/unit/test_layer_boundaries.py` 固化；不再保留临时豁免或 P0 断言。
 
 ### 1.1 关键模块职责
 
 | 层 | 文件 | 职责 |
 |---|---|---|
 | API | `routes_gemini.py` | `/v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens` |
+| API | `gemini_service.py` | Gemini 协议渲染、SSE 事件与协议错误载荷 |
+| API | `error_mapping.py` | 四协议错误映射；Gemini 403/502/429 状态字符串与 JSPB 清理 |
 | API | `routes_openai.py` | `/v1/chat/completions`、OpenAI 流式/非流式响应 |
 | API | `routes_models.py` | OpenAI `/v1/models` 与 Gemini 模型发现 |
 | API | `routes_instances.py` | 实例列表、创建、关闭、重启、surface 切换、改绑 |
@@ -103,6 +105,8 @@ flowchart TD
 | API | `routes_keepalive.py` | 手动触发/查询 `auth_update`、`metadata_refresh`、`active_activity` |
 | API | `routes_logs.py` | 日志 SSE、ring 查询、1/3/7 天导出 |
 | API | `dependencies.py` | Web 密码会话、API Key 鉴权、运行时单例注入 |
+| Application | `contracts/` | Gemini/OpenAI HTTP 请求 DTO（无 FastAPI 依赖） |
+| Application | `finish_reasons.py` | wire finish code → Gemini `finishReason` |
 | Application | `generation_service.py` | 路由获取、重试、ATG wrap/unwrap、usage/finish/response_id |
 | Application | `routing_pipeline.py` | 模型准入、唤醒、候选排序、`active_requests` 句柄、失败槽改绑 |
 | Application | `routing_eligibility.py` | surface/lane/required tier 解析与 Paid 准入 |
@@ -113,6 +117,7 @@ flowchart TD
 | Application | `signature_cache.py` | 按 `call_id` 持久化真实 `thoughtSignature`，TTL 30 天 |
 | Application | `format_converters/` | OpenAI 请求/响应/媒体转换 |
 | Application | `atg/` | 合成工具包装、提取、修复、流式解包 |
+| Domain | `model_access.py` | Tier 排序与 Paid/tier 共享判定 |
 | Infrastructure | `instance_pool.py` | 单页实例、`active_requests`、有界 retire、Page→Context 关闭顺序 |
 | Infrastructure | `pooled_session.py` | 池化会话的 Page/Cookie/模板/快照/传输 |
 | Infrastructure | `session.py` | 控制面单页会话与有界 rebind（D-05/D-10/D-11） |
@@ -140,14 +145,14 @@ flowchart TD
 
 ### 2.2 Free / Paid lane 隔离
 
-- lane 由**账号 tier** 决定，不由模型名决定：`account_is_paid(tier)` 为真进入 paid lane，否则 Free lane（`model_access.py:273-285`）。
+- lane 由**账号 tier** 决定，不由模型名决定：`account_is_paid(tier)` 为真进入 paid lane，否则 Free lane（`domain/model_access.py:273-285`）。
 - 同一账号的 chat/build 不并存；Free 实例与 paid 实例可同时在线，各自拥有独立 Context/Page/Cookie/模板/在途计数。
-- Free 模型只能命中 Free 实例；paid 模型必须命中 required tiers 允许的付费实例（最低 Pro；仅 `accessModes=4` 的模型要求 Ultra），且当前仅允许 `chat` surface（`model_access.py:255-261`、`routing_eligibility.py:195-200`、`221-233`）。
+- Free 模型只能命中 Free 实例；paid 模型必须命中 required tiers 允许的付费实例（最低 Pro；仅 `accessModes=4` 的模型要求 Ultra），且当前仅允许 `chat` surface（`domain/model_access.py:255-261`、`routing_eligibility.py:195-200`、`221-233`）。
 - `InstancePool.add_slot` 与 `InstanceManager._activate` 都校验 lane 一致；跨 lane 改绑直接拒绝（`instance_pool.py:327-363`、`instance_manager.py:389-425`）。
 
 ### 2.3 Tier 选择器：`only_tier` / `min_tier` / `max_tier`
 
-实例配置使用闭区间选择器，三者至少提供一个；旧 `min_tier` 仍兼容，但精确定位应使用 `only_tier`（`model_access.py:119-188`、`model_defaults.py:261-392`）。
+实例配置使用闭区间选择器，三者至少提供一个；旧 `min_tier` 仍兼容，但精确定位应使用 `only_tier`（`domain/model_access.py:119-188`、`model_defaults.py:261-392`）。
 
 | 输入 | 归一化结果 | 说明 |
 |---|---|---|
@@ -162,11 +167,11 @@ flowchart TD
 
 **校验与 lane 规则**：
 
-1. `None`/空字符串视为未提供；显式提供的非空选择器必须是字符串且为已知 tier（Free/Plus/Pro/Ultra/Ultra_20X）；三者都未提供、非字符串（如数字/列表）或未知名称立即抛 `TierSelectorError`/`ConfigValidationError`，不静默忽略（`model_access.py:96-116`、`model_defaults.py:300-332`）。
-2. `only_tier` 不能与不同的 `min_tier/max_tier` 同时配置；标准化形式允许 `only=Free,min=Free,max=Free` 这类同区间写法（`model_access.py:140-155`）。
-3. Free 与 paid 不能混在同一区间；Free 实例只能是 `Free..Free`（`model_access.py:172-188`）。
-4. Paid 实例的 `min_tier` 不能低于 Plus；`max_tier` 不能低于 Pro；确实需要 Plus 槽位时使用 `only_tier: Plus`（`model_access.py:157-188`）。
-5. 账号 tier 必须先匹配 lane，再满足 `min_tier..max_tier` 闭区间（`model_access.py:191-196`、`instance_pool.py:180-190`）。
+1. `None`/空字符串视为未提供；显式提供的非空选择器必须是字符串且为已知 tier（Free/Plus/Pro/Ultra/Ultra_20X）；三者都未提供、非字符串（如数字/列表）或未知名称立即抛 `TierSelectorError`/`ConfigValidationError`，不静默忽略（`domain/model_access.py:96-116`、`model_defaults.py:300-332`）。
+2. `only_tier` 不能与不同的 `min_tier/max_tier` 同时配置；标准化形式允许 `only=Free,min=Free,max=Free` 这类同区间写法（`domain/model_access.py:140-155`）。
+3. Free 与 paid 不能混在同一区间；Free 实例只能是 `Free..Free`（`domain/model_access.py:172-188`）。
+4. Paid 实例的 `min_tier` 不能低于 Plus；`max_tier` 不能低于 Pro；确实需要 Plus 槽位时使用 `only_tier: Plus`（`domain/model_access.py:157-188`）。
+5. 账号 tier 必须先匹配 lane，再满足 `min_tier..max_tier` 闭区间（`domain/model_access.py:191-196`、`instance_pool.py:180-190`）。
 6. 配置合并键：Free 统一按键 `(surface, Free, Free, Free)`；paid `only_tier` 按 `(surface, only, "", "")`；`min/max` 仅在上界显式配置时把上界纳入键，从而合并重复 spec 的 count（`model_defaults.py:345-391`）。
 
 实例视图同时返回三个字段，供后续 C2 UI 使用；当前 `.vue` 尚未改造（`instance_manager.py:1031-1047`）。
@@ -228,9 +233,9 @@ sequenceDiagram
 
 关键点：
 
-1. **协议入口只做渲染**：Gemini 与 OpenAI 路由都调用同一个 `generation_service.generate` / `stream_generation`（`api_service_gemini.py:147-151`、`315-319`、`routes_openai.py:103-116`）。
-2. **路由在生成前冻结**：`RoutingPipeline.begin` 解析 surface/lane/required tiers，唤醒合格休眠实例，过滤 tier 与 429/403 可用性，再排序候选（`routing_pipeline.py:313-393`）。
-3. **并发只靠 `active_requests`**：`begin_request` 返回幂等 `ActiveRequest`，`release()` 在 `finally` 调用（`instance_pool.py:116-135`、`routing_pipeline.py:586-587`）。
+1. **协议入口只做渲染**：Gemini 与 OpenAI 路由都调用同一个 `generation_service.generate` / `stream_generation`（`api/gemini_service.py::handle_gemini_generate_content`、`::_build_gemini_streaming_response`、`api/routes_openai.py::chat_completions`）。
+2. **路由在生成前冻结**：`RoutingPipeline.begin` 解析 surface/lane/required tiers，唤醒合格休眠实例，过滤 tier 与 429/403 可用性，再排序候选（`routing_pipeline.py::RoutingPipeline.begin`）。
+3. **并发只靠 `active_requests`**：`begin_request` 返回幂等 `ActiveRequest`，`release()` 在 `finally` 调用（`instance_pool.py:116-135`、`routing_pipeline.py::RoutingPipeline.acquire`、`::RoutingPipeline.release`）。
 4. **快照按请求生成**：`PooledSession.generate_snapshot` 用 `build_snapshot_hash_parts` 拼接内容并 SHA-256，再调用页面内签名函数；快照不跨请求复用（`pooled_session.py:163-188`、`session.py:60-86`）。
 5. **流式解析**：`IncrementalJSONStreamParser` 去 XSSI 前缀、按括号深度切块；上层 `streaming.py` 统一处理 finish/usage/response_id 与截断修复（`stream_parser.py:151-273`、`streaming.py:99-249`）。
 
@@ -245,13 +250,13 @@ sequenceDiagram
 - **surface**：只接受 `chat` / `build`；旧 `pg/playground/official` 前缀显式拒绝，不静默换面（`routing_eligibility.py:60-108`）。
 - **lane**：`paid` 或 `free`，由模型 Paid 真值与 required tiers 决定。
 - **required tiers**：优先级为 **live/snapshot 真值 → `paid_model_rules` → `accessModes` → Paid 标记**（`routing_eligibility.py:146-204`）。
-- **Paid 准入**：账号 tier 必须达到 required tiers 的最低档；不足时抛 `TierRequiredError`，不切号、不降级到 Free，也不用 503 表达 tier 不足（`routing_pipeline.py:440-447`、`api/error_mapping.py`）。
+- **Paid 准入**：账号 tier 必须达到 required tiers 的最低档；不足时抛 `TierRequiredError`，不切号、不降级到 Free，也不用 503 表达 tier 不足（`routing_pipeline.py::RoutingPipeline._tier_error`、`api/error_mapping.py`）。
 
 Live Free 真值优先：真实 `paid is False` 且无 Paid `accessModes` 的记录，静态子串规则（如 `image`）不得把它覆盖为 Paid（`model_discovery.py:300-320`、`601-660`、`routing_eligibility.py:134-164`）。
 
 ### 4.2 负载均衡顺序
 
-`RoutingPipeline._order` 的排序键（`routing_pipeline.py:395-438`）：
+`RoutingPipeline._order` 的排序键（`routing_pipeline.py::RoutingPipeline._order`）：
 
 ```text
 (
@@ -272,18 +277,18 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 
 | 错误 | 策略 | 实现 |
 |---|---|---|
-| `UsageLimitExceeded` (429) | 同账号重试一次 → 池内切号 → 预算耗尽返回 503 | `routing_pipeline.py:665-685`、`879-917` |
-| `AuthError` (403) | 首次同账号重新签名重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py:642-663` |
-| `SessionExpiredError` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:633-640` |
-| `session_hang` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:717-724` |
-| `RequestError` 204/404 | 同账号重试一次；204 仍空 → `BrowserTransportError` | `routing_pipeline.py:687-715` |
-| 已出正文 | 不切号，直接抛出 | `has_yielded_data` 分支（`routing_pipeline.py:636-640` 等） |
+| `UsageLimitExceeded` (429) | 同账号重试一次 → 池内切号 → 预算耗尽返回 503 | `routing_pipeline.py::RoutingPipeline.handle_error`、`::RoutingPipeline._switch_or_raise` |
+| `AuthError` (403) | 首次同账号重新签名重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py::RoutingPipeline.handle_error` |
+| `SessionExpiredError` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py::RoutingPipeline.handle_error` |
+| `session_hang` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py::RoutingPipeline.handle_error` |
+| `RequestError` 204/404 | 同账号重试一次；204 仍空 → `BrowserTransportError` | `routing_pipeline.py::RoutingPipeline.handle_error` |
+| 已出正文 | 不切号，直接抛出 | `has_yielded_data` 分支（`routing_pipeline.py::RoutingPipeline.handle_error`） |
 
-`RoutingBudget` 只记录连续切号次数，同账号重试不计入；默认 `max_switches=2`（`routing_safety.py:13-49`、`routing_pipeline.py:377-384`）。没有 lease、reservation、defer、pinned、circuit breaker 或后台 rebalance。
+`RoutingBudget` 只记录连续切号次数，同账号重试不计入；默认 `max_switches=2`（`routing_safety.py:13-49`、`routing_pipeline.py::RoutingPipeline.begin`）。没有 lease、reservation、defer、pinned、circuit breaker 或后台 rebalance。
 
 ### 4.4 失败槽立即改绑（immediate failed-slot rebind）
 
-当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/session_expired/session_hang 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py:737-867`）：
+当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/session_expired/session_hang 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py::RoutingPipeline._try_rebind`）：
 
 1. 释放当前 `ActiveRequest` 句柄（否则池拒绝激活）。
 2. 清空该实例的模板缓存。
@@ -370,7 +375,7 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 | `item[77]` | Field 78 | `access_tier`；`2` 表示 Paid（Pro-only） |
 | `item[82]` | Field 83 | `accessModes`；含 `3` 或 `4` 表示 Paid |
 
-`paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)`（`model_discovery.py:906`）。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新以真实记录覆盖，fallback 只在无快照冷启动时作为初始种子（`model_access.py:221-239`、`model_discovery.py:507-541`）。不在传入列表中的模型保留旧状态，避免已知 Paid 因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
+`paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)`（`model_discovery.py:906`）。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新以真实记录覆盖，fallback 只在无快照冷启动时作为初始种子（`domain/model_access.py:221-239`、`model_discovery.py:507-541`）。不在传入列表中的模型保留旧状态，避免已知 Paid 因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
 
 路由的 required tiers 解析（`routing_eligibility.py:146-204`、`model_discovery.py:601-660`）：
 
@@ -408,7 +413,7 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 - 通过 `RoutingPipeline` 获取/释放 `RouteAttempt`，遵守 `active_requests`。
 - 负责 ATG wrap/unwrap、同账号空响应重试、429/403/会话异常的 `handle_error` 分支。
 - 从 `ModelOutput` 或 `StreamEvent` 提取 `usage`、`finish_reason`、`response_id`、`thought_signature`。
-- 不渲染 Gemini/OpenAI/Claude 的具体 JSON/SSE；渲染在 API 层完成（`api_service_gemini.py:1-7`、`format_converters/`）。
+- 不渲染 Gemini/OpenAI/Claude 的具体 JSON/SSE；渲染在 API 层完成（`api/gemini_service.py:1-7`、`format_converters/`）。
 
 ### 8.2 PG-01..PG-04
 

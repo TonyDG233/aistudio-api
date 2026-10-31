@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import cast
 
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,

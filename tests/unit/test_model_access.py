@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from aistudio_api.application.model_access import (
+from aistudio_api.domain.model_access import (
     TierSelectorError,
     account_is_paid,
     clear_paid_models,
@@ -50,7 +50,8 @@ def test_paid_models_are_chat_only_and_require_paid_account() -> None:
     )
 
     assert is_paid_model("gemini-3-flash-preview") is True
-    assert is_paid_model("pg/gemini-3-flash-preview") is True
+    assert is_paid_model("chat/gemini-3-flash-preview") is True
+    assert is_paid_model("pg/gemini-3-flash-preview") is False
     assert is_paid_model("models/gemini-3.8-flash") is False
 
     assert is_chat_only_model("gemini-3-flash-preview") is True

@@ -13,17 +13,21 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 
-from aistudio_api.application.model_access import (
+from aistudio_api.domain.model_access import (
     is_paid_model as _is_paid_model,
     set_paid_models,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
-    DEFAULT_API_KEY,
-    DEFAULT_EXT_BIN,
-    DEFAULT_ORIGIN,
-    DEFAULT_USER_AGENT,
     calculate_sapisid_hash,
     get_tier_header_value,
+)
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    AI_STUDIO_ORIGIN,
+    EXT_BIN,
+    GRPC_WEB_USER_AGENT,
+    LIST_MODELS_URL,
+    WEB_API_KEY,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -580,7 +584,7 @@ class ModelDiscoveryService:
 
     def is_model_allowed_for_tier(self, model_id: str, tier: str | None) -> bool:
         """根据 paid_model_rules 与缓存 accessModes 判断指定订阅等级是否可访问该模型。"""
-        from aistudio_api.application.model_access import tier_satisfies_required
+        from aistudio_api.domain.model_access import tier_satisfies_required
 
         req_tiers = self.get_required_tiers(model_id)
         if req_tiers:
@@ -588,12 +592,12 @@ class ModelDiscoveryService:
         return True
 
     def is_paid_model(self, model_id: str) -> bool:
-        """判定目标模型是否为付费模型（唯一来源：application.model_access）。"""
+        """判定目标模型是否为付费模型（唯一来源：domain.model_access）。"""
         return _is_paid_model(model_id)
 
     def get_required_tier(self, model_id: str) -> str:
         """获取目标模型所需的最低账号层级（兼容现有单层级调用）。"""
-        from aistudio_api.application.model_access import minimum_required_tier
+        from aistudio_api.domain.model_access import minimum_required_tier
 
         tiers = self.get_required_tiers(model_id)
         return minimum_required_tier(tiers) or "Free"
@@ -672,11 +676,11 @@ class ModelDiscoveryService:
         (opts) => {
             return new Promise((resolve) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', 'https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels');
+                xhr.open('POST', opts.url);
                 xhr.setRequestHeader('Content-Type', 'application/json+protobuf');
-                xhr.setRequestHeader('X-User-Agent', 'grpc-web-javascript/0.1');
-                xhr.setRequestHeader('X-Goog-Api-Key', 'AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs');
-                xhr.setRequestHeader('X-Goog-Ext-519733851-bin', 'CAESAUwwATgEQABQBGICSlBwAHgBkAEAmAEB');
+                xhr.setRequestHeader('X-User-Agent', opts.userAgent);
+                xhr.setRequestHeader('X-Goog-Api-Key', opts.apiKey);
+                xhr.setRequestHeader('X-Goog-Ext-519733851-bin', opts.extBin);
                 if (opts && opts.authUser) {
                     xhr.setRequestHeader('X-Goog-AuthUser', String(opts.authUser));
                 }
@@ -711,6 +715,10 @@ class ModelDiscoveryService:
                 "authorization": authorization,
                 "authUser": auth_user or "0",
                 "tierHeader": get_tier_header_value(tier),
+                "url": LIST_MODELS_URL,
+                "apiKey": WEB_API_KEY,
+                "userAgent": GRPC_WEB_USER_AGENT,
+                "extBin": EXT_BIN,
             },
             timeout_s=12.0,
         )
@@ -742,13 +750,13 @@ class ModelDiscoveryService:
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
         headers = {
             "Content-Type": "application/json+protobuf",
-            "X-User-Agent": DEFAULT_USER_AGENT,
-            "X-Goog-Api-Key": DEFAULT_API_KEY,
+            "X-User-Agent": GRPC_WEB_USER_AGENT,
+            "X-Goog-Api-Key": WEB_API_KEY,
             "X-Goog-AuthUser": auth_user or "0",
-            "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+            "X-Goog-Ext-519733851-bin": EXT_BIN,
             "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-            "Origin": DEFAULT_ORIGIN,
-            "Referer": f"{DEFAULT_ORIGIN}/",
+            "Origin": AI_STUDIO_ORIGIN,
+            "Referer": AI_STUDIO_HOME_URL,
             "Cookie": cookie_header,
         }
         if auth_header:
@@ -759,7 +767,7 @@ class ModelDiscoveryService:
 
         from aistudio_api.config import settings
 
-        url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
+        url = LIST_MODELS_URL
         async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
             resp = await client.post(url, headers=headers, content="[]")
             if resp.status_code != 200:

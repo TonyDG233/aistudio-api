@@ -9,8 +9,8 @@ from typing import Any, cast
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application import token_counter
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.domain.errors import RequestError, UsageLimitExceeded
 from aistudio_api.infrastructure.gateway.instance_client import InstanceRequestClient
 from tests.unit.routing_fakes import ScriptedPipeline, make_attempt, make_context
@@ -68,7 +68,7 @@ async def test_count_tokens_maps_upstream_total_and_releases_attempt():
     client = FakeClient(42)
 
     outcome = await token_counter.count_tokens(
-        model_path=f"pg/{MODEL}",
+        model_path=f"chat/{MODEL}",
         req=_gemini_request(),
         pipeline=_pipeline(client),
         api_format="gemini",

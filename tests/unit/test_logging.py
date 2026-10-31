@@ -381,6 +381,67 @@ async def test_middleware_request_dump_and_access_log():
         set_dump_requests(False)
 
 
+@pytest.mark.asyncio
+async def test_health_success_access_log_is_debug_only(caplog):
+    """Health probes succeed constantly; success must not reach the INFO stream."""
+    set_dump_requests(False)
+    with caplog.at_level(logging.DEBUG):
+        async with _client() as client:
+            resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    messages = [(record.levelno, record.getMessage()) for record in caplog.records]
+    success = "HTTP GET /health -> 200"
+    assert not any(
+        level == logging.INFO and success in message for level, message in messages
+    )
+    assert any(
+        level == logging.DEBUG and success in message for level, message in messages
+    )
+
+
+def _http_request(path: str):
+    from starlette.requests import Request as StarletteRequest
+
+    return StarletteRequest(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_non_200_access_log_stays_info(caplog):
+    from starlette.responses import JSONResponse
+
+    from aistudio_api.api.app import logging_and_dump_middleware
+
+    async def _unhealthy(_request):
+        return JSONResponse({"status": "error"}, status_code=503)
+
+    set_dump_requests(False)
+    with caplog.at_level(logging.INFO):
+        response = await logging_and_dump_middleware(_http_request("/health"), _unhealthy)
+
+    assert response.status_code == 503
+    assert any(
+        record.levelno == logging.INFO
+        and "HTTP GET /health -> 503" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_dump_request_to_file_by_req_id_only_writes_safe_fields(tmp_path):
     """验证按请求 ID 落盘的 JSON 只含 safe_* 字段，绝无原始报文/凭据。"""
     import json

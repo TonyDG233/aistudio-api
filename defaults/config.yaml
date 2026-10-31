@@ -44,6 +44,9 @@ rotator:
 features:
   routing:
     max_switches: 2
+    # 429 同账号首次重试前的退避秒数（0..30，默认 2.0），可用
+    # AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
+    retry_same_delay_sec: 2.0
   # P6 保活：auth/metadata 默认 24h；active_activity 默认关闭（不启用 idle 回收）。
   keepalive:
     auth_update: true

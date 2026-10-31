@@ -15,7 +15,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from aistudio_api.application.model_access import (
+from aistudio_api.domain.errors import SurfaceCapacityError, SurfaceUnavailableError
+from aistudio_api.domain.model_access import (
     best_tier,
     is_paid_model,
     minimum_required_tier,
@@ -24,7 +25,6 @@ from aistudio_api.application.model_access import (
     tier_rank,
     tier_satisfies_required,
 )
-from aistudio_api.domain.errors import SurfaceCapacityError, SurfaceUnavailableError
 
 VALID_SURFACES: tuple[str, ...] = ("chat", "build")
 _DROPPED_SURFACE_PREFIXES = frozenset({"pg", "playground", "official"})

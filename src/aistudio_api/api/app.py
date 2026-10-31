@@ -374,6 +374,7 @@ async def lifespan(_app: FastAPI):
         instance_manager=instance_manager,
         account_store=account_store,
         rotator=rotator,
+        stats_recorder=runtime_state.record,
     )
 
     keepalive = AccountKeepaliveService(
@@ -464,8 +465,8 @@ app.include_router(
     keepalive_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
-app.include_router(models_router, dependencies=[Depends(require_api_key)])
-app.include_router(openai_router, dependencies=[Depends(require_api_key)])
+app.include_router(models_router)
+app.include_router(openai_router)
 app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
@@ -689,13 +690,24 @@ async def logging_and_dump_middleware(request, call_next):
             is_stream=is_event_stream,
         )
     elif not is_static:
-        logger.info(
-            "HTTP %s %s -> %d (%.1fms)",
-            request.method,
-            path,
-            response.status_code,
-            elapsed_ms,
-        )
+        if path == "/health" and response.status_code == 200:
+            # Health probes are polled continuously; keep success out of the
+            # INFO UI stream, but retain diagnostics.
+            logger.debug(
+                "HTTP %s %s -> %d (%.1fms)",
+                request.method,
+                path,
+                response.status_code,
+                elapsed_ms,
+            )
+        else:
+            logger.info(
+                "HTTP %s %s -> %d (%.1fms)",
+                request.method,
+                path,
+                response.status_code,
+                elapsed_ms,
+            )
 
     return response
 

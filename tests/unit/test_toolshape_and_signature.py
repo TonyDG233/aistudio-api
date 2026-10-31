@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application import generation_service
 from aistudio_api.application.chat_service import normalize_gemini_request
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput

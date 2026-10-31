@@ -119,6 +119,10 @@ async def test_update_config_yaml_applies_normalized_logging(monkeypatch):
     monkeypatch.setattr(
         routes_system, "set_log_level", lambda level: applied_levels.append(level)
     )
+    # Keep the runtime dump override untouched: only the level is under test.
+    monkeypatch.setattr(routes_system, "set_dump_requests", lambda _value: None)
+    monkeypatch.setattr(routes_system, "set_dump_to_file", lambda _value: None)
+    monkeypatch.setattr(routes_system, "set_dump_dir", lambda _value: None)
 
     try:
         async with _client() as client:

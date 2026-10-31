@@ -10,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from threading import RLock
 
-_CHANNEL_PREFIXES = {"pg", "chat", "playground", "build", "official"}
+_CHANNEL_PREFIXES = {"chat", "build"}
 
 # Known Paid models. Discovery/snapshots may override per model; these keep
 # routing safe before the first ListModels request completes.  Every live

@@ -5,14 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from aistudio_api.api.gemini_service import handle_gemini_generate_content
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.application.token_counter import count_tokens
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .dependencies import get_routing_pipeline
-from .schemas import GeminiGenerateContentRequest
 
 logger = get_logger("routes.gemini")
 router = APIRouter()

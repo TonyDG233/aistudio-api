@@ -20,7 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from aistudio_api.application.model_access import (
+from aistudio_api.domain.model_access import (
     TierSelector,
     canonical_tier,
     resolve_tier_selector,

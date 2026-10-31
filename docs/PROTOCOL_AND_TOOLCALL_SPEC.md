@@ -21,7 +21,7 @@ Claude/Responses（未启用）─┘        │
 证据：
 
 - `src/aistudio_api/application/generation_service.py:1-11`：模块职责与“无 lease/reservation”说明。
-- `src/aistudio_api/application/api_service_gemini.py:1-6`：Gemini 只做 wire 渲染与错误翻译。
+- `src/aistudio_api/api/gemini_service.py:1-7`：Gemini 只做 wire 渲染与错误翻译。
 - `src/aistudio_api/api/routes_gemini.py:21-61`：Gemini 入口。
 - `src/aistudio_api/api/routes_openai.py:79-158`：OpenAI 入口。
 - `defaults/config.yaml:57-64`：`formats.openai=true`，`claude/responses=false`。
@@ -342,15 +342,15 @@ wire 写入位置：
 
 ### 4.4 PG-02 首事件前真实 HTTP 状态
 
-`_build_gemini_streaming_response`（`api_service_gemini.py:309-360`）：
+`_build_gemini_streaming_response`（`api/gemini_service.py::_build_gemini_streaming_response`）：
 
-1. 创建 `stream_generation` 异步迭代器（`:315-320`）。
-2. 在构造 `StreamingResponse` 之前循环 `__anext__()`，直到渲染出非空首个 chunk（`:321-325`）。
-3. 若迭代器在首 chunk 前结束 -> `RequestError(502, "generation produced no stream events")`（`:326-331`）。
-4. `BrowserTransportError` -> `RequestError(502)`；`AtgError` -> `RequestError(502)`（`:332-337`）。
-5. 其他异常原样抛出（`:338-340`）。
-6. 首个 chunk 已确定后才返回 `StreamingResponse`（`:342-360`）。
-7. 首 chunk 之后的异常在 `body()` 中 yield `format_sse_error(exc)`（`:344-354`）。
+1. 创建 `stream_generation` 异步迭代器。
+2. 在构造 `StreamingResponse` 之前循环 `__anext__()`，直到渲染出非空首个 chunk。
+3. 若迭代器在首 chunk 前结束 -> `RequestError(502, "generation produced no stream events")`。
+4. `BrowserTransportError` -> `RequestError(502)`；`AtgError` -> `RequestError(502)`。
+5. 其他异常原样抛出。
+6. 首个 chunk 已确定后才返回 `StreamingResponse`。
+7. 首 chunk 之后的异常在 `body()` 中 yield `format_sse_error(exc)`。
 
 因此 PG-01/PG-04 等“首事件前失败”会走真实 HTTP 4xx/5xx，而不是 200 + SSE error。
 
@@ -379,19 +379,19 @@ OpenAI 路由采用同样的预读模式（`routes_openai.py:111-135`）。
 
 ### 4.6 Gemini 非流式渲染
 
-`handle_gemini_generate_content`（`api_service_gemini.py:134-176`）：
+`handle_gemini_generate_content`（`api/gemini_service.py::handle_gemini_generate_content`）：
 
-- `AtgError` -> `RequestError(502)`（`:153-154`）。
+- `AtgError` -> `RequestError(502)`。
 - 输出 parts 由 `to_gemini_parts(text, function_calls, function_responses, thinking, images, reasoning_images)` 生成。
 - `finishReason=outcome.finish_reason`。
 - `usageMetadata=to_gemini_usage_metadata(output.usage)`。
 - `modelVersion=outcome.model`，`responseId=outcome.response_id`。
 
-finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`:40-66`）。
+finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`application/finish_reasons.py::WIRE_TO_GEMINI_FINISH_REASON`）。
 
 ### 4.7 Gemini 流式渲染
 
-`format_sse_event`（`api_service_gemini.py:179-236`）：
+`format_sse_event`（`api/gemini_service.py::format_sse_event`）：
 
 | 事件 | parts |
 |---|---|
@@ -604,13 +604,13 @@ guard 命中（客户端已有合成通道）
 
 **保护**：Gemini 流式入口在返回 `StreamingResponse` 之前预读首个可渲染事件；首事件前失败 -> 真实 HTTP 状态；首事件后失败 -> SSE error。
 
-**代码**：`api_service_gemini.py:309-360`；OpenAI 对应 `routes_openai.py:111-158`。
+**代码**：`api/gemini_service.py::_build_gemini_streaming_response`；OpenAI 对应 `api/routes_openai.py::chat_completions`。
 
 **状态映射**：
 
-- `BrowserTransportError` -> 502（`api_service_gemini.py:332-334`）。
-- `AtgError` -> 502（`:335-337`）。
-- 空流 -> 502（`:326-331`）。
+- `BrowserTransportError` -> 502（`api/gemini_service.py::_build_gemini_streaming_response`）。
+- `AtgError` -> 502（同上）。
+- 空流 -> 502（同上）。
 - 其他异常由 FastAPI/`error_mapping` 映射（`api/error_mapping.py:56-136`）。
 
 **边界**：
@@ -856,7 +856,7 @@ upstream response [200, 1234] -> totalTokens=1234
 ## 10. 残余限制汇总
 
 1. **PG-05 分片工具调用未聚合**：`StreamingGateway` 逐 chunk yield `tool_calls`（`streaming.py:173-175`），没有按 call_id 合并；`generation_service` 也没有聚合器。分片工具流可能产生多个部分调用。
-2. **PG-13 非 STOP finish 原样透传**：`api_service_gemini` 有 10/12/13 的映射（`api_service_gemini.py:40-66`），但没有“有合法工具调用时把 MALFORMED/UNEXPECTED/TOO_MANY 视为可交付”的重写。ATG 的 `TOOL_CALLS -> STOP` 只比较字符串，真实 int finish 不触发（`extractor.py:131-132`, `:181-186`）。
+2. **PG-13 非 STOP finish 原样透传**：`application/finish_reasons.py` 有 10/12/13 的映射（`application/finish_reasons.py::WIRE_TO_GEMINI_FINISH_REASON`），但没有“有合法工具调用时把 MALFORMED/UNEXPECTED/TOO_MANY 视为可交付”的重写。ATG 的 `TOOL_CALLS -> STOP` 只比较字符串，真实 int finish 不触发（`extractor.py:131-132`, `:181-186`）。
 3. **PG-11 toolConfig 不写入上游**：`wire_codec.py:330-375` 只用 `tool_config` 做 NONE 清空和 allowedFunctionNames 声明过滤，没有写顶层 toolConfig；上游 ANY/required 可能被降级为 AUTO。这是上游 wire 限制。
 4. **PG-12 snapshot hash 对工具 part 视而不见**：`build_snapshot_hash_parts` 只收集 text/inline/file/code，functionCall/functionResponse 追加空串（`session.py:60-86`）。工具占比高的历史可能得到近似常量 hash，是否触发上游 403 未在本规格中验证。
 5. **ATG required 可能在已 yield 数据后失败**：流式 `finalize` 在部分内容已发送后才检查 required（`generation_service.py:459-475`, `stream_extractor.py:158-165`）。客户端可能看到半截内容 + 错误。
@@ -880,7 +880,7 @@ upstream response [200, 1234] -> totalTokens=1234
 | 原生归一化 | `src/aistudio_api/application/chat_service.py:37-43`, `:567-704`, `:720-809`, `:1033-1040` |
 | Struct 强制 | `src/aistudio_api/infrastructure/gateway/wire_types.py:325-372` |
 | wire 下标 | `src/aistudio_api/infrastructure/gateway/wire_spec.py:28-43` |
-| 首事件预读 | `src/aistudio_api/application/api_service_gemini.py:309-360`; `src/aistudio_api/api/routes_openai.py:111-158` |
+| 首事件预读 | `src/aistudio_api/api/gemini_service.py::_build_gemini_streaming_response`; `src/aistudio_api/api/routes_openai.py::chat_completions` |
 | 工具流终止 | `src/aistudio_api/infrastructure/gateway/streaming.py:34-37`, `:113-136`, `:239-249`; `wire_parser.py:437-541` |
 | ATG 配置/门面 | `src/aistudio_api/application/atg/__init__.py:38-90`; `atg/config.py:43-110` |
 | ATG 注入 | `src/aistudio_api/application/atg/injector.py:104-216` |

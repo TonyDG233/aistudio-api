@@ -21,6 +21,7 @@ from aistudio_api.domain.errors import (
 )
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.capture import RequestCaptureService
+from aistudio_api.infrastructure.gateway.public_web_constants import COUNT_TOKENS_URL
 from aistudio_api.infrastructure.gateway.replay import RequestReplayService
 from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
@@ -185,11 +186,7 @@ class InstanceRequestClient:
             if "/GenerateContent" in base_url:
                 url = base_url.replace("/GenerateContent", "/CountTokens")
             else:
-                url = (
-                    "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
-                    "google.internal.alkali.applications.makersuite.v1."
-                    "MakerSuiteService/CountTokens"
-                )
+                url = COUNT_TOKENS_URL
             raw_headers = ctx.base_template.get("headers")
             headers = (
                 {str(k): str(v) for k, v in raw_headers.items()}

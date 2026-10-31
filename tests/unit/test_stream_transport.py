@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from aistudio_api.domain.errors import BrowserTransportError
+from aistudio_api.infrastructure.account.cookie_parser import get_tier_header_value
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     STREAM_CLEANUP_JS,
@@ -28,6 +29,68 @@ def test_streaming_scripts_defined_and_non_empty():
     assert len(STREAM_CLEANUP_JS.strip()) > 0
     assert "__AISTUDIO__" in STREAMING_INIT_JS
     assert "__AISTUDIO__" in STREAM_CLEANUP_JS
+
+
+@pytest.mark.asyncio
+async def test_explicit_free_tier_header_is_not_replaced_by_active_pro(
+    monkeypatch,
+):
+    """A Free pooled session must never borrow another active account's Pro tier."""
+    from aistudio_api.infrastructure.gateway import transport as transport_module
+
+    page = MagicMock(spec=CDPPage)
+    page._cached_cookies = {"SAPISID": "test_sapisid"}
+    monkeypatch.setattr(
+        transport_module, "_get_active_account_tier", lambda: "Pro"
+    )
+
+    headers = await transport_module._ensure_authorization_header(
+        page,
+        {"x-aistudio-g1-tier": "stale", "X-Other": "keep"},
+        tier="Free",
+    )
+
+    assert headers.get("X-AIStudio-G1-Tier") == get_tier_header_value("Free")
+    assert headers.get("X-AIStudio-G1-Tier") != get_tier_header_value("Pro")
+    assert "X-AIStudio-G1-Tier" not in headers
+    assert headers["X-Other"] == "keep"
+    assert "Authorization" in headers
+
+
+@pytest.mark.asyncio
+async def test_supplied_paid_tier_wins_over_active_account_tier(monkeypatch):
+    """Any explicit non-empty tier is preserved verbatim instead of read from the store."""
+    from aistudio_api.infrastructure.gateway import transport as transport_module
+
+    page = MagicMock(spec=CDPPage)
+    page._cached_cookies = {"SAPISID": "test_sapisid"}
+    monkeypatch.setattr(
+        transport_module, "_get_active_account_tier", lambda: "Free"
+    )
+
+    headers = await transport_module._ensure_authorization_header(
+        page, {}, tier="Ultra"
+    )
+
+    assert headers["X-AIStudio-G1-Tier"] == get_tier_header_value("Ultra")
+
+
+@pytest.mark.asyncio
+async def test_blank_tier_falls_back_to_active_account_tier(monkeypatch):
+    """Only a blank/None supplied tier reads the active account tier."""
+    from aistudio_api.infrastructure.gateway import transport as transport_module
+
+    page = MagicMock(spec=CDPPage)
+    page._cached_cookies = {"SAPISID": "test_sapisid"}
+    monkeypatch.setattr(
+        transport_module, "_get_active_account_tier", lambda: "Pro"
+    )
+
+    headers = await transport_module._ensure_authorization_header(
+        page, {}, tier="  "
+    )
+
+    assert headers["X-AIStudio-G1-Tier"] == get_tier_header_value("Pro")
 
 
 @pytest.mark.asyncio

@@ -1,24 +1,20 @@
 """Minimal model-list projection for the new single-instance architecture.
 
 Bare model IDs stay the default API entry point. When the build surface is
-enabled, canonical ``pg/`` (chat) and ``build/`` aliases are projected for
-models that can run there. Paid/chat-only models are never projected into
-``build``. No channel registry, strategy groups, or leases are involved.
+enabled, canonical ``build/`` aliases are projected for models that can run
+there. Paid/chat-only models are never projected into ``build``. Legacy
+``pg``/``playground``/``chat`` catalog aliases are not emitted or parsed. No
+channel registry, strategy groups, or leases are involved.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from aistudio_api.application.model_access import is_chat_only_model
+from aistudio_api.domain.model_access import is_chat_only_model
 
-_PREFIX_TO_SURFACE = {
-    "pg": "chat",
-    "chat": "chat",
-    "playground": "chat",
-    "build": "build",
-}
-_SURFACE_TO_PREFIX = {"chat": "pg", "build": "build"}
+_PREFIX_TO_SURFACE = {"build": "build"}
+_SURFACE_TO_PREFIX = {"build": "build"}
 
 
 def clean_model_id(raw: object) -> str:
@@ -58,12 +54,11 @@ def project_model_ids(
 
     projected: list[str] = list(seen)
     for clean in seen:
-        for surface in surfaces:
-            if surface == "build" and is_chat_only_model(clean):
-                continue
-            candidate = f"{catalog_prefix(surface)}/{clean}"
-            if candidate not in projected:
-                projected.append(candidate)
+        if is_chat_only_model(clean):
+            continue
+        candidate = f"{catalog_prefix('build')}/{clean}"
+        if candidate not in projected:
+            projected.append(candidate)
     return projected
 
 

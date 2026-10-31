@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.media import MediaFetcher
 from aistudio_api.application.format_converters.openai_request import (
     convert_openai_request,

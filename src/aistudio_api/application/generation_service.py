@@ -132,7 +132,7 @@ def _wrap_atg_request(
 
 def _finish_reason(output: ModelOutput, normalized: NormalizedGeminiRequest) -> str:
     del normalized
-    from aistudio_api.application.api_service_gemini import to_gemini_finish_reason
+    from aistudio_api.application.finish_reasons import to_gemini_finish_reason
 
     return to_gemini_finish_reason(
         output.candidates[0].finish_reason if output.candidates else None
@@ -287,9 +287,7 @@ async def generate(
 
 def _stream_finish(value: object) -> str:
     if isinstance(value, int):
-        from aistudio_api.application.api_service_gemini import (
-            to_gemini_finish_reason,
-        )
+        from aistudio_api.application.finish_reasons import to_gemini_finish_reason
 
         return to_gemini_finish_reason(value)
     return str(value)

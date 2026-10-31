@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application import generation_service
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
 from tests.unit.routing_fakes import (

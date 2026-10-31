@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from aistudio_api.api.dependencies import get_runtime_state
+from aistudio_api.api.dependencies import (
+    get_runtime_state,
+    require_api_key_or_web_session,
+)
 from aistudio_api.api.response_models import (
     GeminiModelListResponse,
     GeminiModelResponse,
@@ -73,7 +76,11 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
     )
 
 
-@router.get("/v1beta/models", response_model=GeminiModelListResponse)
+@router.get(
+    "/v1beta/models",
+    response_model=GeminiModelListResponse,
+    dependencies=[Depends(require_api_key_or_web_session)],
+)
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelListResponse:
@@ -87,7 +94,11 @@ async def list_models(
     return GeminiModelListResponse(models=models)
 
 
-@router.get("/v1beta/models/{model_id:path}", response_model=GeminiModelResponse)
+@router.get(
+    "/v1beta/models/{model_id:path}",
+    response_model=GeminiModelResponse,
+    dependencies=[Depends(require_api_key_or_web_session)],
+)
 async def get_model(
     model_id: str,
     runtime_state: RuntimeState = Depends(get_runtime_state),

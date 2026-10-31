@@ -1,4 +1,4 @@
-"""OpenAI Chat Completions request schema.
+"""OpenAI Chat Completions HTTP request contract.
 
 Only the fields the converter consumes are constrained. Unknown fields are kept
 so OpenAI SDK extensions (``extra_body`` flattening, provider-specific options)

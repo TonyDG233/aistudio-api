@@ -8,19 +8,88 @@ Responses.  Tier insufficiency is always HTTP 403 with
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from aistudio_api.domain.errors import RoutingError, TierRequiredError
+from aistudio_api.application.atg.extractor import AtgError
+from aistudio_api.domain.errors import (
+    AistudioError,
+    AuthError,
+    BrowserTransportError,
+    RequestError,
+    RoutingError,
+    SessionExpiredError,
+    TierRequiredError,
+    UsageLimitExceeded,
+    parse_upstream_grpc_error,
+)
 
 ProtocolName = Literal["gemini", "openai", "claude", "responses"]
 
 
-def _generic_gemini(exc: Exception) -> tuple[int, str, str]:
-    from aistudio_api.application.api_service_gemini import (
-        classify_gemini_error_payload,
-    )
+def clean_upstream_error_message(raw_msg: str) -> str:
+    """Extract a clean, readable error message from Google/JSPB upstream error strings."""
+    if not raw_msg:
+        return ""
+    text = raw_msg.strip()
+    if "[,[" not in text and "[null,[" not in text and not text.startswith("[,"):
+        return text
+    inner = text
+    while True:
+        m = re.match(r"^HTTP\s+\d+:\s*(.*)$", inner)
+        if m:
+            inner = m.group(1).strip()
+        else:
+            break
+    _, msg = parse_upstream_grpc_error(inner)
+    return msg or inner
 
-    return classify_gemini_error_payload(exc)
+
+def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
+    """Extract standard Gemini HTTP status code, message, and status string."""
+    if isinstance(exc, TierRequiredError):
+        return 403, str(exc), "PERMISSION_DENIED"
+    if isinstance(exc, RoutingError):
+        status = int(getattr(exc, "status_code", 503))
+        status_text = "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
+        return status, str(exc), status_text
+    if isinstance(exc, SessionExpiredError):
+        return (
+            401,
+            "All accounts have expired sessions. Please import fresh cookies.",
+            "UNAUTHENTICATED",
+        )
+    if isinstance(exc, AuthError):
+        return 403, str(exc), "PERMISSION_DENIED"
+    if isinstance(exc, UsageLimitExceeded):
+        return 429, str(exc), "RESOURCE_EXHAUSTED"
+    if isinstance(exc, ValueError):
+        return 400, str(exc), "INVALID_ARGUMENT"
+    if isinstance(exc, RequestError):
+        status = exc.status if exc.status > 0 else 500
+        clean_msg = clean_upstream_error_message(str(exc))
+        status_map = {
+            400: "INVALID_ARGUMENT",
+            401: "UNAUTHENTICATED",
+            403: "PERMISSION_DENIED",
+            404: "NOT_FOUND",
+            429: "RESOURCE_EXHAUSTED",
+            500: "INTERNAL",
+            502: "UNAVAILABLE",
+            503: "UNAVAILABLE",
+        }
+        return (
+            status,
+            clean_msg,
+            status_map.get(status, "INTERNAL" if status >= 500 else "UNKNOWN"),
+        )
+    if isinstance(exc, BrowserTransportError):
+        return 502, str(exc), "UNAVAILABLE"
+    if isinstance(exc, AtgError):
+        return 502, str(exc), "UNAVAILABLE"
+    if isinstance(exc, AistudioError):
+        return 500, str(exc), "INTERNAL"
+    return 500, str(exc), "INTERNAL"
 
 
 def _openai_error(
@@ -112,7 +181,7 @@ def error_payload(
             extra=field_values,
         )
 
-    code, message, status_text = _generic_gemini(exc)
+    code, message, status_text = classify_gemini_error_payload(exc)
     if protocol == "gemini":
         return code, {
             "error": {"code": code, "message": message, "status": status_text}
@@ -136,4 +205,9 @@ def error_payload(
     return code, _openai_error(message=message, error_type=error_type, code=code)
 
 
-__all__ = ["ProtocolName", "error_payload"]
+__all__ = [
+    "ProtocolName",
+    "classify_gemini_error_payload",
+    "clean_upstream_error_message",
+    "error_payload",
+]

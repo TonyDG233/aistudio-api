@@ -1,13 +1,11 @@
 import pytest
 
+from aistudio_api.api.error_mapping import classify_gemini_error_payload
 from aistudio_api.api.responses import (
     to_gemini_parts,
     to_gemini_usage_metadata,
 )
-from aistudio_api.application.api_service_gemini import (
-    classify_gemini_error_payload,
-    to_gemini_finish_reason,
-)
+from aistudio_api.application.finish_reasons import to_gemini_finish_reason
 from aistudio_api.domain.errors import (
     AuthError,
     BrowserTransportError,
@@ -168,7 +166,7 @@ def test_to_gemini_finish_reason_mappings():
 
 
 def test_clean_upstream_error_message():
-    from aistudio_api.application.api_service_gemini import clean_upstream_error_message
+    from aistudio_api.api.error_mapping import clean_upstream_error_message
 
     assert clean_upstream_error_message("") == ""
     assert clean_upstream_error_message("Normal plain error") == "Normal plain error"
@@ -188,13 +186,13 @@ def test_clean_upstream_error_message():
 async def test_build_gemini_streaming_response_passes_requested_model():
     from unittest.mock import MagicMock
 
-    from aistudio_api.api.schemas import (
+    from aistudio_api.api.gemini_service import (
+        _build_gemini_streaming_response,
+    )
+    from aistudio_api.application.contracts.gemini import (
         GeminiContent,
         GeminiGenerateContentRequest,
         GeminiPart,
-    )
-    from aistudio_api.application.api_service_gemini import (
-        _build_gemini_streaming_response,
     )
 
     passed_model = None
@@ -241,13 +239,13 @@ async def test_streaming_metadata_event_does_not_block_same_account_retry():
     """Metadata-only attempts still retry on the same instance before any body."""
     from unittest.mock import MagicMock
 
-    from aistudio_api.api.schemas import (
+    from aistudio_api.api.gemini_service import (
+        _build_gemini_streaming_response,
+    )
+    from aistudio_api.application.contracts.gemini import (
         GeminiContent,
         GeminiGenerateContentRequest,
         GeminiPart,
-    )
-    from aistudio_api.application.api_service_gemini import (
-        _build_gemini_streaming_response,
     )
     from aistudio_api.domain.errors import RequestError
     from tests.unit.routing_fakes import (

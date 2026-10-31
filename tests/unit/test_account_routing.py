@@ -7,15 +7,15 @@ import inspect
 import pytest
 
 from aistudio_api.application.account_rotator import AccountRotator
-from aistudio_api.application.model_access import (
-    account_is_paid,
-    instance_lane_for_tier,
-    tier_satisfies_min,
-)
 from aistudio_api.application.routing_eligibility import resolve_model_route
 from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.domain.errors import TierRequiredError
 from aistudio_api.domain.instances import InstanceState
+from aistudio_api.domain.model_access import (
+    account_is_paid,
+    instance_lane_for_tier,
+    tier_satisfies_min,
+)
 from tests.unit.routing_fakes import FakeManager, make_instance
 
 
