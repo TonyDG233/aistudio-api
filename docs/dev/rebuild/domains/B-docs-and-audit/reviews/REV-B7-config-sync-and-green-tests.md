@@ -178,3 +178,72 @@
 - 未 stage、未 commit、未 amend、未 push。
 - **未提交 / 未 push。**
 - 本报告在目标树与主仓逐字节一致；两份文件的路径与 SHA256 由交付说明给出。
+
+---
+
+## 9. B7 闭环复核（2026-10-31）
+
+- 复核对象：目标树 `D:\LLM\self_programming\aistudio-api\.kilo\worktrees\rebuild-upstream`（HEAD `a089bdb`，6 个未提交修改）；主仓 `D:\LLM\self_programming\aistudio-api`（HEAD `084ad7c`）
+- 复核模式：严格离线、只读；未启动 `main.py server`、浏览器/Chromium、服务端、Docker 构建或任何网络请求；未修改 `src/`、`tests/`、`config.yaml`、`defaults/config.yaml` 或既有文档章节
+- 唯一写入：本节追加到本报告的目标树副本与主仓副本；未 stage、未 commit、未 push
+- 本轮范围：P2-1..P2-5 关闭复核 + `_normalize_retry_same_delay` 拆分 + 全量门禁复跑
+
+### 9.1 P2-1..P2-5 关闭结论
+
+| 项 | 结论 | 证据（`file:line`） |
+|---|---|---|
+| **P2-1** 写回 post-fallback `validated`，非关键非法值自愈落盘 | **RESOLVED** | `validate_config_mapping` 在深合并副本上执行 `_apply_noncritical_fallbacks(config)` 后返回该 `config`（`model_defaults.py:431-442`，`:442`）；非法 `logging.level` 在该函数内被改写为 `INFO`（`:124-132`）；`validate_config` 以 `validated != raw` 判定变化并写回 `yaml.dump(validated, ...)`（`:672-679`，`:677`、`:679`）。关键块非法由 `validate_config_mapping` 在写回块之前抛错（`:444-551`），不会进入写回。测试：`tests/unit/test_config_migration.py:275-283`（`validated` 与磁盘均为 `INFO`）、`:285-294`（关键非法抛错、原字节不变、无 `.tmp` 残留）。独立探针：`p1_validated_level='INFO'`、`p1_persisted_level='INFO'`；`p2_raised=True`、`p2_unchanged=True`、`p2_tmp_residue=[]` |
+| **P2-2** `auth_error` 默认值与契约注释对齐，根配置不跟踪不泄密 | **RESOLVED** | 模板 `defaults/config.yaml:41` 为 `auth_error: 0`；契约注释与兜底同值（`model_defaults.py:473-483`）；测试显式断言模板值为 0 且有效值为 0（`tests/unit/test_features_config.py:648-670`，`:668-669`）。根 `config.yaml` 已更新为 `auth_error: 0`（`:23`），但未跟踪：`git ls-files config.yaml` 空、`.gitignore:15` 为 `/config.yaml`、`git status --ignored` 显示 `!! config.yaml`，且不在 6 个已修改文件中；未把任何密钥写入跟踪文件 |
+| **P2-3** 原子写 `OSError` 被捕获、告警后继续、无临时残留 | **RESOLVED（写失败容错口径）** | `_atomic_write_text` 在 `os.replace` 失败时经 `except BaseException` 删除同目录隐藏临时文件并重抛（`model_defaults.py:1048-1063`，`:1060-1063`）；`validate_config` 捕获 `OSError` 记录 warning、跳过缓存失效并返回内存中 `validated`（`:680-691`，`:682-687`、`:691`）；`lifespan()` 首行调用后继续启动（`api/app.py:280`）。测试：`tests/unit/test_config_migration.py:297-320`（写函数抛 `PermissionError` → warning + 返回 `validated` + 原文件不变 + 无残留）、`:323-344`（`os.replace` 失败 → 隐藏临时文件清理 + 无残留）。独立探针：warning 命中、`p3_instances=[{'count': 2, 'surface': 'chat', 'only_tier': 'Free'}]`、`p3_file_unchanged=True`、`p3_tmp_residue=[]` |
+| **P2-4** 模板非法输入/缓存失效/隐藏残留断言补齐且非恒真 | **RESOLVED** | 模板 YAML 语法错误与顶层非字典分支分别由 `_default_config_template` 抛 `ConfigValidationError`（`model_defaults.py:1014-1022`）；对应参数化测试构造真实临时模板并断言错误消息（`tests/unit/test_config_migration.py:347-369`）。缓存失效测试先向 `_CONFIG_CACHE` 注入 `stale_marker`，调用 `validate_config` 后断言键被 `invalidate_config_cache()` 清除（`model_defaults.py:1039-1045`），再通过真实 `_load_yaml_config`（`:1090-1113`）验证后续读取无 `stale_marker`、已迁移且已重新缓存（`tests/unit/test_config_migration.py:372-400`）。残留断言改为 `iterdir()` + `name.endswith(".tmp")`，可发现隐藏 `.{name}.*.tmp`，替代原先可能漏检的 `glob("*.tmp")`（`tests/unit/test_config_migration.py:137,294,320,344`）。这些断言均为真实文件读写/缓存状态校验，非自证；原 `:70` 同源等值断言仍保留为解析冒烟，但 `:81-90` 深拷贝隔离是实际回归校验 |
+| **P2-5** entrypoint 精确优先级与 `config.py` 对齐 | **RESOLVED** | `docker-entrypoint.sh:6-14`：非空 `AISTUDIO_CONFIG_PATH` 无条件胜出，否则非空 `AISTUDIO_CONFIG_FILE`，否则默认；`:16` 导出最终路径；`:19-23` 仅目标缺失且模板存在时 `cp`，已有文件绝不覆盖；`:25` `exec "$@"`。`config.py:105-121` 使用 `os.getenv("AISTUDIO_CONFIG_PATH") or os.getenv("AISTUDIO_CONFIG_FILE")`，与 `-n` 语义一致（空串视为未设置）。测试断言 `if`/`elif` 顺序、两处赋值、默认分支且不再存在旧的 `AISTUDIO_CONFIG_FILE !=` 条件（`tests/unit/test_config_migration.py:403-415`）。`Dockerfile:10` 默认 `AISTUDIO_CONFIG_FILE=/app/data/config.yaml`，与容器默认路径一致 |
+
+### 9.2 `_normalize_retry_same_delay` 拆分复核
+
+- 启动迁移路径 `_apply_noncritical_fallbacks` 只调用 `_normalize_retry_same_delay`（`model_defaults.py:213-215`），该函数不读取任何环境变量（`:958-976`）。
+- 环境变量只在 `_resolve_retry_same_delay` 中叠加（`:986-997`），消费点为 `get_configured_routing_settings`（`:1480`）。
+- 结论：`AISTUDIO_RETRY_SAME_DELAY_SEC` 只影响运行时返回值，不会把 env 值写脏/持久化进 `config.yaml`。
+- 证据：测试全局设置 `AISTUDIO_RETRY_SAME_DELAY_SEC=0`（`tests/conftest.py:182`），而迁移测试仍断言落盘 `retry_same_delay_sec == 2.0`（`tests/unit/test_config_migration.py:166`）；独立探针在 env 覆盖下得到 `p4_persisted_delay=1.5`、`p4_runtime_delay=0.0`、`p4_persisted_is_float_1_5=True`。
+
+### 9.3 本轮门禁（目标工作树实跑）
+
+执行环境：`$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; $env:UV_OFFLINE='1'`；工作目录为目标工作树。
+
+| 门禁 | 精确结果 |
+|---|---|
+| `uv run pytest -q` | **889 passed in 12.19s**（0 failed / 0 skipped） |
+| `uv run ruff check .` | `All checks passed!`（exit 0，0 errors） |
+| `uv run pyright src tests` | `0 errors, 0 warnings, 0 informations`（exit 0） |
+| `git diff --check` | exit 0 |
+| `git diff --cached --check` | exit 0 |
+| `git diff --cached --name-only` | 空（无 staged 文件） |
+| `git ls-files config.yaml` | 空（根配置未跟踪） |
+| `git status --porcelain=v1` | 门禁时 6 个代码/配置/测试文件 ` M`，无新增未跟踪文件；追加本报告后为 7 个（含本报告） |
+| HEAD / 分支 | `a089bdb` / `rebuild-upstream` |
+| commit / push | 无 |
+
+### 9.4 未关闭项（逐项原文）
+
+- **P1 项**：无。
+- **P2 项**：P2-1、P2-2、P2-3（写失败容错口径）、P2-4、P2-5 均已关闭，无新增未关闭 P2。
+- **Q/N 项**：本报告自始不存在 Q/N 编号项。
+- **原 P2-3 内未随本轮关闭的子项（原文逐字引用）**：
+  > 写回使用 `yaml.dump`（`model_defaults.py:681`），旧运行配置中的注释/格式在发生迁移时全部丢失（模板本身受 `_is_default_template_path` 保护，不受影响）。
+  - 该子项在本轮 P2-3 的验收口径（只读/写失败容错）之外，当前实现仍为 `yaml.dump(validated, ...)`（当前行号 `model_defaults.py:679`），故转入残余风险 R-2，不虚报为已修复。
+
+### 9.5 残余风险（非阻断）
+
+1. **无实机/镜像验证**：本次未执行 `docker build`、未启动服务/浏览器；Dockerfile/entrypoint 结论基于静态审计、路径解析探针与单元测试。
+2. **迁移仍会改写旧运行配置并丢弃注释**：首次启动旧配置会补齐全部默认块；`yaml.dump` 不保留旧注释/格式（原 P2-3 子项）。属有意自愈，但建议发布说明提示备份。
+3. **`auth_error` 仍是 dead knob**：默认值已归 0，注释已对齐；当前无代码读取 `cooldowns["auth_error"]`，`record_auth_error` 固定 `auth_cooldown = 0.0`。若未来接入读取方，需重新确认“403 无硬锁”语义。
+4. **测试环境依赖外部 JS 运行时**：`bun`/`node` 均缺失时相关语法用例会通用 skip；本次 Windows 主机具备 `bun`，故达成 0 skipped。
+5. **未验证真实上游/真实账号**：严格离线要求下无 live 行为复核。
+
+### 9.6 最终结论
+
+**Verdict: PASS（B7 配置同步闭环轮）。**
+
+- P2-1..P2-5 按本轮定义全部关闭，均有源码行号与真实测试/独立探针双重证据。
+- 全量门禁：pytest 889 passed、0 failed、0 skipped；Ruff 0；Pyright 0；`git diff --check` / `--cached --check` 0；根 `config.yaml` 未跟踪；无 staged 文件。
+- 未发现新的 P0/P1 阻断项；保留的残余风险均为非阻断。
+- **未提交 / 未 push。**
