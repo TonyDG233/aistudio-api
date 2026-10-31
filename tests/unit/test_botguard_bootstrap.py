@@ -8,8 +8,10 @@ import pytest
 
 from aistudio_api.infrastructure.browser.scripts import INSTALL_HOOKS_JS
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
-    AISTUDIO_HOME_URL,
     bootstrap_botguard_and_template,
+)
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
 )
 
 
@@ -89,6 +91,6 @@ async def test_login_redirect_reloads_cookies_returns_to_aistudio_and_captures()
     )
 
     assert page.reload_calls == 1
-    assert page.goto_urls == [AISTUDIO_HOME_URL]
+    assert page.goto_urls == [AI_STUDIO_HOME_URL]
     assert snap_key == "snapKey"
     assert template["body"] == '["models/gemini-test"]'

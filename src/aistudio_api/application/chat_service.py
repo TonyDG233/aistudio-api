@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from aistudio_api.api.schemas import (
+    from aistudio_api.application.contracts.gemini import (
         GeminiGenerateContentRequest,
         GeminiPart,
         GeminiTool,

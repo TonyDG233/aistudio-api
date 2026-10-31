@@ -6,10 +6,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from aistudio_api.application.model_access import (
-    instance_lane_for_tier,
-    normalize_model_key,
-)
 from aistudio_api.application.routing_eligibility import ModelRoute
 from aistudio_api.application.routing_pipeline import (
     RouteAttempt,
@@ -18,6 +14,10 @@ from aistudio_api.application.routing_pipeline import (
 )
 from aistudio_api.application.routing_safety import RoutingBudget
 from aistudio_api.domain.instances import Instance, InstanceState
+from aistudio_api.domain.model_access import (
+    instance_lane_for_tier,
+    normalize_model_key,
+)
 
 
 @dataclass

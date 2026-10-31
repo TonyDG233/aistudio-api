@@ -1,7 +1,7 @@
 """Protobuf-over-JSON (JSPB) wire specification indexes and typed containers.
 
 Centralizes all raw wire array offsets defined in Google AI Studio
-gRPC-web/MakerSuiteService protocol specifications.
+gRPC-web/MakerSuite service protocol specifications.
 """
 
 from __future__ import annotations

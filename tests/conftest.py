@@ -163,8 +163,8 @@ def _shared_test_env(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def isolate_test_config(monkeypatch, _shared_test_env):
     """Isolate all test runs from repository-level config.yaml modifications and runtime state files."""
-    from aistudio_api.application.model_access import clear_paid_models
     from aistudio_api.config import settings
+    from aistudio_api.domain.model_access import clear_paid_models
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     config_file, data_dir = _shared_test_env
@@ -179,6 +179,7 @@ def isolate_test_config(monkeypatch, _shared_test_env):
     monkeypatch.setenv("AISTUDIO_STATS_FILE", str(stats_file))
     monkeypatch.setenv("AISTUDIO_MODEL_CACHE_FILE", str(model_cache_file))
     monkeypatch.setenv("AISTUDIO_ROTATOR_STATE_FILE", str(rotator_file))
+    monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "0")
     monkeypatch.setattr(settings, "model_cache_file", str(model_cache_file))
 
     saved_models = model_discovery._cached_models

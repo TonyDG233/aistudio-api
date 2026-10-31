@@ -30,6 +30,13 @@ from aistudio_api.infrastructure.browser.scripts import (
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
     bootstrap_botguard_and_template,
 )
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    DEFAULT_CHAT_MODEL,
+    GENERATE_CONTENT_URL,
+    GRPC_WEB_USER_AGENT,
+    WEB_API_KEY,
+)
 from aistudio_api.infrastructure.gateway.session_auth import (
     bootstrap_google_session,
     derive_profile_dir,
@@ -87,15 +94,15 @@ def build_snapshot_hash_parts(
 
 
 DEFAULT_BOOTSTRAP_TEMPLATE: dict[str, object] = {
-    "url": "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",
+    "url": GENERATE_CONTENT_URL,
     "headers": {
         "Content-Type": "application/json+protobuf",
-        "X-User-Agent": "grpc-web-javascript/0.1",
-        "X-Goog-Api-Key": "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs",
+        "X-User-Agent": GRPC_WEB_USER_AGENT,
+        "X-Goog-Api-Key": WEB_API_KEY,
         "X-Goog-AuthUser": "0",
-        "Referer": "https://aistudio.google.com/",
+        "Referer": AI_STUDIO_HOME_URL,
     },
-    "body": '["models/gemini-3.7-flash"]',
+    "body": f'["models/{DEFAULT_CHAT_MODEL}"]',
 }
 
 

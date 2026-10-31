@@ -31,6 +31,8 @@
 - **Web 控制台**：账号、实例、设置、日志与仪表盘页面；静态前端产物随仓库发布。
 - **容器与 CI**：Dockerfile 内置默认配置与静态前端；GHCR 镜像自动构建，支持 `rebuild-upstream`、`main`、`master`
   分支与手动触发。
+- **应用层请求契约**：新增 `application/contracts/`（Gemini/OpenAI HTTP 请求 DTO）与
+  `application/finish_reasons.py`，使应用层无需依赖 FastAPI 或 API 模块。
 
 ### Changed
 
@@ -41,6 +43,9 @@
 - 配置以 `defaults/config.yaml` 为唯一受版本控制的默认值；根 `config.yaml` 仅作本地运行态，不纳入版本控制。
 - Claude 与 Responses 协议保留配置开关但默认关闭；Build surface 在对应阶段前显式拒绝，而非静默切换 surface。
 - 吸收上游对内存占用、readiness watchdog、`Ultra_20X` tier 归一与 Web 配置编辑器的修复。
+- 收紧分层边界：Application 不再导入 API/FastAPI 或读取全局 `runtime_state`，请求统计改为构造注入回调；
+  Gemini 协议渲染与错误映射归位 API 层，Tier/Paid 共享规则归位 Domain，Infrastructure 不再反向依赖 Application。
+- 兼容性：旧 `pg/` 前缀已移除；生成接口接受显式 `chat/` 前缀，但模型元数据目录不输出也不接受该前缀。
 
 ### Fixed
 
@@ -58,6 +63,7 @@
 - 移除蓝绿发布与就绪探测的旧调度语义，以及 lease/reservation/pinned/defer 等预留机制。
 - 移除旧的全账号兜底切换路径，避免绕过实例池直接操作浏览器会话。
 - 移除仓库中的历史批次台账与失败草稿，仅保留归档记录。
+- 移除越层的 `application/api_service_gemini.py`、`api/schemas.py` 与 `api/schemas_openai.py`，由新契约与 API 模块取代。
 
 ### Security
 

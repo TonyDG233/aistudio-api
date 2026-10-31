@@ -13,17 +13,17 @@ import pytest
 from aistudio_api.api import routes_models, routes_openai
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.instance_manager import InstanceManager
-from aistudio_api.application.model_access import (
-    clear_paid_models,
-    is_paid_model,
-    set_paid_models,
-)
 from aistudio_api.application.routing_eligibility import (
     resolve_model_route,
     resolve_required_tiers,
     tier_allows,
 )
 from aistudio_api.config import settings
+from aistudio_api.domain.model_access import (
+    clear_paid_models,
+    is_paid_model,
+    set_paid_models,
+)
 from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
 from aistudio_api.infrastructure.gateway.instance_pool import InstanceSlot, SlotState
 from aistudio_api.infrastructure.gateway.model_discovery import (

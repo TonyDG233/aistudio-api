@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from aistudio_api.application.model_access import clear_paid_models
 from aistudio_api.application.routing_eligibility import (
     parse_model_surface,
     resolve_model_route,
@@ -12,6 +11,7 @@ from aistudio_api.application.routing_eligibility import (
     tier_allows,
 )
 from aistudio_api.domain.errors import SurfaceCapacityError, SurfaceUnavailableError
+from aistudio_api.domain.model_access import clear_paid_models
 from aistudio_api.infrastructure.gateway import model_defaults
 from aistudio_api.infrastructure.gateway.model_discovery import (
     ModelDiscoveryService,
@@ -35,20 +35,32 @@ def test_bare_model_defaults_to_chat() -> None:
     assert parse_model_surface("gemini-3.7-flash") == ("chat", "gemini-3.7-flash")
 
 
-def test_explicit_surface_prefix() -> None:
-    assert parse_model_surface("chat/gemini-3.7-flash") == (
-        "chat",
-        "gemini-3.7-flash",
-    )
-    assert parse_model_surface("build/gemini-3.7-flash") == (
-        "build",
-        "gemini-3.7-flash",
-    )
+@pytest.mark.parametrize(
+    ("model_path", "expected"),
+    [
+        ("gemini-3.7-flash", ("chat", "gemini-3.7-flash")),
+        ("models/gemini-3.7-flash", ("chat", "gemini-3.7-flash")),
+        ("chat/gemini-3.7-flash", ("chat", "gemini-3.7-flash")),
+        ("build/gemini-3.7-flash", ("build", "gemini-3.7-flash")),
+    ],
+)
+def test_surface_prefix_matrix(
+    model_path: str, expected: tuple[str, str]
+) -> None:
+    assert parse_model_surface(model_path) == expected
 
 
-def test_old_channel_alias_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "model_path",
+    [
+        "pg/gemini-3.7-flash",
+        "playground/gemini-3.7-flash",
+        "official/gemini-3.7-flash",
+    ],
+)
+def test_legacy_channel_alias_is_rejected(model_path: str) -> None:
     with pytest.raises(SurfaceUnavailableError):
-        parse_model_surface("pg/gemini-3.7-flash")
+        parse_model_surface(model_path)
 
 
 def test_unconfigured_surface_is_rejected_with_capacity_code() -> None:

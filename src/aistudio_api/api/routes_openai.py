@@ -9,16 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
-from aistudio_api.api.dependencies import get_routing_pipeline, get_runtime_state
+from aistudio_api.api.dependencies import (
+    get_routing_pipeline,
+    get_runtime_state,
+    require_api_key,
+    require_api_key_or_web_session,
+)
 from aistudio_api.api.format_errors import (
     format_error_response,
     format_media_allow_private,
     openai_sse_error,
     require_format_enabled,
 )
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
 from aistudio_api.api.state import discovery_sessions_for
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.common import (
     ConversionError,
     strip_models_prefix,
@@ -76,7 +81,10 @@ def _enabled_surfaces(state: RuntimeState) -> tuple[str, ...]:
     return ("chat",)
 
 
-@router.post("/v1/chat/completions", dependencies=[Depends(require_openai)])
+@router.post(
+    "/v1/chat/completions",
+    dependencies=[Depends(require_openai), Depends(require_api_key)],
+)
 async def chat_completions(
     request: Request,
     pipeline: RoutingPipeline = Depends(get_routing_pipeline),
@@ -158,7 +166,10 @@ async def chat_completions(
         return format_error_response(exc, "openai")
 
 
-@router.get("/v1/models", dependencies=[Depends(require_openai)])
+@router.get(
+    "/v1/models",
+    dependencies=[Depends(require_openai), Depends(require_api_key_or_web_session)],
+)
 async def list_models(
     state: RuntimeState = Depends(get_runtime_state),
 ) -> JSONResponse:
@@ -176,7 +187,10 @@ async def list_models(
     )
 
 
-@router.get("/v1/models/{model_id:path}", dependencies=[Depends(require_openai)])
+@router.get(
+    "/v1/models/{model_id:path}",
+    dependencies=[Depends(require_openai), Depends(require_api_key_or_web_session)],
+)
 async def get_model(
     model_id: str,
     state: RuntimeState = Depends(get_runtime_state),

@@ -10,14 +10,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from aistudio_api.application.model_access import (
+from aistudio_api.config import resolve_rotator_state_file, settings
+from aistudio_api.domain.model_access import (
     instance_lane_for_tier,
     resolve_tier_selector,
     tier_matches_selector,
     tier_rank,
     tier_satisfies_required,
 )
-from aistudio_api.config import resolve_rotator_state_file, settings
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 
 if TYPE_CHECKING:
@@ -923,13 +923,20 @@ class AccountRotator:
         model: str | None = None,
         *,
         surface: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(
                 account_id=account_id, quota_scope=self.quota_scope
             )
         self._stats[account_id].record_rate_limited(model, surface=surface)
-        logger.warning("账号 %s 在模型 %s 触发真实上游 429", account_id, model or "all")
+        logger.warning(
+            "账号 %s 在模型 %s (surface=%s) 触发真实上游 429: %s",
+            account_id,
+            model or "all",
+            surface or "-",
+            reason or "-",
+        )
         self.save_state()
 
     def record_error(
@@ -952,13 +959,20 @@ class AccountRotator:
         model: str | None = None,
         *,
         surface: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(
                 account_id=account_id, quota_scope=self.quota_scope
             )
         self._stats[account_id].record_auth_error(model, surface=surface)
-        logger.warning("账号 %s 权限被拒绝 (HTTP 403)", account_id)
+        logger.warning(
+            "账号 %s 权限被拒绝 (HTTP 403) model=%s surface=%s reason=%s",
+            account_id,
+            model or "all",
+            surface or "-",
+            reason or "-",
+        )
         self.save_state()
 
     def record_session_expired(

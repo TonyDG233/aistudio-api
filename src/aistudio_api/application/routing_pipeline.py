@@ -15,6 +15,7 @@ Error policy:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable
@@ -22,11 +23,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from aistudio_api.application.account_orchestrator import record_rotator_event
-from aistudio_api.application.model_access import (
-    best_tier,
-    tier_rank,
-    tier_satisfies_required,
-)
 from aistudio_api.application.routing_eligibility import (
     ModelRoute,
     resolve_model_route,
@@ -48,11 +44,19 @@ from aistudio_api.domain.errors import (
     is_transient_rpc_error,
 )
 from aistudio_api.domain.instances import Instance, InstanceState
+from aistudio_api.domain.model_access import (
+    best_tier,
+    tier_rank,
+    tier_satisfies_required,
+)
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.instance_client import InstanceRequestClient
 from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
+from aistudio_api.infrastructure.utils.log_broadcast import sanitize_log_message
 from aistudio_api.infrastructure.utils.logger import get_logger
+
+DEFAULT_RETRY_SAME_DELAY_SEC = 2.0
 
 logger = get_logger("routing")
 
@@ -194,6 +198,7 @@ class RouteContext:
     failed_accounts: set[str] = field(default_factory=set)
     total_attempts: int = 0
     retry_same: bool = False
+    retry_same_delay_sec: float = 0.0
     last_reason: str = "initial"
 
     def next_candidate(self) -> RouteCandidate | None:
@@ -287,6 +292,38 @@ def _as_int(value: object, default: int) -> int:
     return default
 
 
+def _as_float(value: object, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _summarize_error(exc: Exception | None, summary: str | None = None) -> str:
+    """Compact, sanitized upstream reason used in routing/rotator warnings.
+
+    Contains only the exception type, its ``status`` (when present) and the
+    first 160 characters of the collapsed message; cookie/Bearer/API-key
+    material is masked by :func:`sanitize_log_message` before truncation.
+    """
+    text = summary or ""
+    if not text and exc is not None:
+        header = type(exc).__name__
+        status = getattr(exc, "status", None)
+        if status is not None:
+            header = f"{header} status={status}"
+        message = " ".join(str(exc).split())
+        text = f"{header}: {message}" if message else header
+    collapsed = " ".join(str(text).split())
+    return sanitize_log_message(collapsed)[:160]
+
+
 class RoutingPipeline:
     """Plan and execute one request's route over existing instances."""
 
@@ -297,12 +334,14 @@ class RoutingPipeline:
         account_store: object | None = None,
         rotator: AccountRotator | None = None,
         routing_settings_provider: RoutingSettingsProvider | None = None,
+        stats_recorder: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._manager = instance_manager
         self._accounts = account_store
         self._rotator = rotator
         self._routing_settings_provider = routing_settings_provider
+        self._stats_recorder = stats_recorder
         self._clock = clock
 
     def _rotator_or_none(self) -> AccountRotator | None:
@@ -376,11 +415,16 @@ class RoutingPipeline:
         ordered = self._order(route, available)
         settings = self._routing_settings()
         max_switches = max(0, _as_int(settings.get("max_switches", 2), 2))
+        retry_same_delay_sec = min(
+            30.0,
+            max(0.0, _as_float(settings.get("retry_same_delay_sec", 0.0), 0.0)),
+        )
         context = RouteContext(
             route=route,
             candidates=[RouteCandidate.from_instance(item) for item in ordered],
             budget=RoutingBudget(max_switches=max_switches),
             max_retries=self._max_retries(),
+            retry_same_delay_sec=retry_same_delay_sec,
         )
         logger.info(
             "[routing] model=%s surface=%s lane=%s candidates=%s max_switches=%d",
@@ -485,8 +529,16 @@ class RoutingPipeline:
             try:
                 return dict(self._routing_settings_provider())
             except Exception as exc:
-                logger.warning("[routing] 路由配置读取失败，回退 max_switches=2: %s", exc)
-                return {"max_switches": 2}
+                logger.warning(
+                    "[routing] 路由配置读取失败，回退 max_switches=2、"
+                    "retry_same_delay_sec=%.1f: %s",
+                    DEFAULT_RETRY_SAME_DELAY_SEC,
+                    exc,
+                )
+                return {
+                    "max_switches": 2,
+                    "retry_same_delay_sec": DEFAULT_RETRY_SAME_DELAY_SEC,
+                }
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_routing_settings,
         )
@@ -604,17 +656,16 @@ class RoutingPipeline:
             usage=usage,
             rotator=self._rotator_or_none(),
         )
-        try:
-            from aistudio_api.api.state import runtime_state
-
-            runtime_state.record(
-                context.route.model,
-                "success",
-                usage=usage,
-                finish_reason=finish_reason,
-            )
-        except Exception as exc:
-            logger.debug("[routing] 统计记录失败: %s", exc)
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(
+                    context.route.model,
+                    "success",
+                    usage=usage,
+                    finish_reason=finish_reason,
+                )
+            except Exception as exc:
+                logger.debug("[routing] 统计记录失败: %s", exc)
 
     async def handle_error(
         self,
@@ -629,9 +680,10 @@ class RoutingPipeline:
             raise exc
         if isinstance(exc, ValueError):
             raise RequestError(400, str(exc)) from exc
+        reason_summary = _summarize_error(exc)
 
         if isinstance(exc, SessionExpiredError):
-            self._record_error("session_expired", context, attempt)
+            self._record_error("session_expired", context, attempt, exc=exc)
             attempt.client.clear_templates()
             if has_yielded_data:
                 raise exc
@@ -644,7 +696,7 @@ class RoutingPipeline:
                 raise self._tier_error(
                     context.route, attempt.candidate.tier
                 ) from exc
-            self._record_error("auth_error", context, attempt)
+            self._record_error("auth_error", context, attempt, exc=exc)
             attempt.client.clear_templates()
             if has_yielded_data:
                 raise exc
@@ -653,9 +705,13 @@ class RoutingPipeline:
                 context.retry_same = True
                 context.budget.record_retry("403")
                 logger.warning(
-                    "[routing] 403 同账号重新签名重试 instance=%s account=%s",
+                    "[routing] 403 同账号重新签名重试 model=%s surface=%s "
+                    "instance=%s account=%s reason=%s",
+                    context.route.model,
+                    context.route.surface,
                     attempt.instance_id,
                     attempt.account_id,
+                    reason_summary,
                 )
                 return "retry_same"
             return await self._switch_or_raise(
@@ -663,7 +719,7 @@ class RoutingPipeline:
             )
 
         if isinstance(exc, UsageLimitExceeded):
-            self._record_error("rate_limited", context, attempt)
+            self._record_error("rate_limited", context, attempt, exc=exc)
             if has_yielded_data:
                 raise exc
             if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
@@ -671,10 +727,21 @@ class RoutingPipeline:
                 context.retry_same = True
                 context.budget.record_retry("429")
                 logger.warning(
-                    "[routing] 429 同账号重试 instance=%s account=%s",
+                    "[routing] 429 同账号重试 model=%s surface=%s "
+                    "instance=%s account=%s reason=%s",
+                    context.route.model,
+                    context.route.surface,
                     attempt.instance_id,
                     attempt.account_id,
+                    reason_summary,
                 )
+                if context.retry_same_delay_sec > 0:
+                    logger.info(
+                        "[routing] 429 同账号退避 %.2fs 后重试 instance=%s",
+                        context.retry_same_delay_sec,
+                        attempt.instance_id,
+                    )
+                    await asyncio.sleep(context.retry_same_delay_sec)
                 return "retry_same"
             return await self._switch_or_raise(
                 context,
@@ -689,7 +756,7 @@ class RoutingPipeline:
                 exc.status == 404
                 and not is_transient_rpc_error(exc)
             ):
-                self._record_error("error", context, attempt)
+                self._record_error("error", context, attempt, exc=exc)
                 raise exc
             if (
                 not has_yielded_data
@@ -701,13 +768,16 @@ class RoutingPipeline:
                 context.budget.record_retry(f"retry_{exc.status}")
                 attempt.client.clear_templates()
                 logger.warning(
-                    "[routing] %s 同账号重试 instance=%s account=%s",
+                    "[routing] %s 同账号重试 model=%s instance=%s account=%s "
+                    "reason=%s",
                     exc.status,
+                    context.route.model,
                     attempt.instance_id,
                     attempt.account_id,
+                    reason_summary,
                 )
                 return "retry_same"
-            self._record_error("error", context, attempt)
+            self._record_error("error", context, attempt, exc=exc)
             if exc.status == 204:
                 raise BrowserTransportError(
                     "上游返回 204 空响应，同账号重试后仍为空"
@@ -715,7 +785,7 @@ class RoutingPipeline:
             raise exc
 
         if is_browser_session_hang_error(exc):
-            self._record_error("error", context, attempt)
+            self._record_error("error", context, attempt, exc=exc)
             attempt.client.clear_templates()
             if has_yielded_data:
                 raise exc
@@ -724,14 +794,14 @@ class RoutingPipeline:
             )
 
         if isinstance(exc, RequestError):
-            self._record_error("error", context, attempt)
+            self._record_error("error", context, attempt, exc=exc)
             raise exc
 
         if isinstance(exc, (AistudioError, BrowserTransportError)):
-            self._record_error("error", context, attempt)
+            self._record_error("error", context, attempt, exc=exc)
             raise exc
 
-        self._record_error("error", context, attempt)
+        self._record_error("error", context, attempt, exc=exc)
         raise exc
 
     async def _try_rebind(
@@ -741,6 +811,7 @@ class RoutingPipeline:
         reason: str,
         *,
         reuse: bool,
+        summary: str = "",
     ) -> bool:
         """Request-triggered single-slot rebind.
 
@@ -855,12 +926,16 @@ class RoutingPipeline:
             context.last_reason = f"rebind:{reason}"
             attempt.client.clear_templates()
             logger.warning(
-                "[routing] 请求期改绑 reason=%s instance=%s %s -> %s reuse=%s budget=%s",
+                "[routing] 请求期改绑 reason=%s model=%s surface=%s "
+                "instance=%s %s -> %s reuse=%s detail=%s budget=%s",
                 reason,
+                context.route.model,
+                context.route.surface,
                 attempt.instance_id,
                 attempt.account_id,
                 target_id,
                 reuse,
+                summary,
                 context.budget.snapshot(),
             )
             return True
@@ -897,7 +972,13 @@ class RoutingPipeline:
             # the pool).  When another candidate exists the request continues on
             # it; the rebound slot is healthy for subsequent requests.
             reuse = context.next_candidate() is None
-            if await self._try_rebind(context, attempt, reason, reuse=reuse):
+            if await self._try_rebind(
+                context,
+                attempt,
+                reason,
+                reuse=reuse,
+                summary=_summarize_error(exc),
+            ):
                 return "switch"
         if not can_continue or context.next_candidate() is None:
             if quota_exhausted:
@@ -909,32 +990,42 @@ class RoutingPipeline:
         context.retry_same = False
         await self._wake(context.route)
         logger.warning(
-            "[routing] 切换实例 reason=%s from=%s budget=%s",
+            "[routing] 切换实例 reason=%s model=%s surface=%s from=%s "
+            "detail=%s budget=%s",
             reason,
+            context.route.model,
+            context.route.surface,
             attempt.instance_id,
+            _summarize_error(exc),
             context.budget.snapshot(),
         )
         return "switch"
 
     def _record_error(
-        self, event: str, context: RouteContext, attempt: RouteAttempt
+        self,
+        event: str,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        *,
+        exc: Exception | None = None,
+        summary: str | None = None,
     ) -> None:
         record_rotator_event(
             event,
             account_id=attempt.account_id,
             model=context.route.model,
             surface=context.route.surface,
+            reason=_summarize_error(exc, summary) or None,
             rotator=self._rotator_or_none(),
         )
-        try:
-            from aistudio_api.api.state import runtime_state
-
-            runtime_state.record(
-                context.route.model,
-                "rate_limited" if event == "rate_limited" else "errors",
-            )
-        except Exception as exc:
-            logger.debug("[routing] 错误统计记录失败: %s", exc)
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(
+                    context.route.model,
+                    "rate_limited" if event == "rate_limited" else "errors",
+                )
+            except Exception as exc:
+                logger.debug("[routing] 错误统计记录失败: %s", exc)
 
 
 __all__ = [

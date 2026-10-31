@@ -11,12 +11,12 @@ from pathlib import Path
 
 import yaml
 
-from aistudio_api.application.model_access import (
+from aistudio_api.config import resolve_config_file
+from aistudio_api.domain.model_access import (
     TierSelectorError,
     canonical_tier,
     resolve_tier_selector,
 )
-from aistudio_api.config import resolve_config_file
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
@@ -40,6 +40,10 @@ _SAFETY_CATEGORY_ORDER = (
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _VALID_SURFACES = ("chat", "build")
 _VALID_MIN_TIERS = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
+
+_RETRY_SAME_DELAY_DEFAULT_SEC = 2.0
+_RETRY_SAME_DELAY_MAX_SEC = 30.0
+_RETRY_SAME_DELAY_ENV = "AISTUDIO_RETRY_SAME_DELAY_SEC"
 
 _LEGACY_KEEPALIVE_KEYS = (
     "auto_switch",
@@ -201,6 +205,9 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     max_switches,
                 )
                 raw_routing["max_switches"] = 2
+            raw_routing["retry_same_delay_sec"] = _resolve_retry_same_delay(
+                raw_routing
+            )
 
         default_features = defaults.get("features")
         default_keepalive = (
@@ -792,6 +799,58 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
     )
 
 
+def _coerce_retry_same_delay(value: object) -> float | None:
+    """Parse a 429 same-account retry delay and clamp it to 0..30 seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return min(_RETRY_SAME_DELAY_MAX_SEC, max(0.0, parsed))
+
+
+def _routing_defaults() -> dict[str, object]:
+    return {
+        "max_switches": 2,
+        "retry_same_delay_sec": _RETRY_SAME_DELAY_DEFAULT_SEC,
+    }
+
+
+def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
+    """Resolve ``features.routing.retry_same_delay_sec`` with env override.
+
+    Invalid YAML/env values never raise: they fall back to the production
+    default so a typo cannot crash startup or silently disable the delay.
+    """
+    raw_delay = raw_routing.get(
+        "retry_same_delay_sec", _RETRY_SAME_DELAY_DEFAULT_SEC
+    )
+    delay = _coerce_retry_same_delay(raw_delay)
+    if delay is None:
+        logger.warning(
+            "配置 features.routing.retry_same_delay_sec 非法（%r），回退默认 %s",
+            raw_delay,
+            _RETRY_SAME_DELAY_DEFAULT_SEC,
+        )
+        delay = _RETRY_SAME_DELAY_DEFAULT_SEC
+    env_value = os.getenv(_RETRY_SAME_DELAY_ENV)
+    if env_value:
+        env_delay = _coerce_retry_same_delay(env_value)
+        if env_delay is None:
+            logger.warning(
+                "环境变量 %s 非法（%r），忽略并使用配置值 %s",
+                _RETRY_SAME_DELAY_ENV,
+                env_value,
+                delay,
+            )
+        else:
+            delay = env_delay
+    return delay
+
+
 def _default_config() -> dict[str, object]:
     return {
         "api_keys": [],
@@ -856,6 +915,7 @@ def _default_config() -> dict[str, object]:
         "features": {
             "routing": {
                 "max_switches": 2,
+                "retry_same_delay_sec": 2.0,
             },
             "formats": {
                 "openai": True,
@@ -1420,7 +1480,11 @@ def get_configured_formats(
 def get_configured_routing_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """返回 features.routing 配置；缺失/非法时回退 max_switches=2。"""
+    """返回 features.routing 配置；缺失/非法时回退 max_switches=2。
+
+    ``retry_same_delay_sec`` 默认 2.0 秒，限制在 0..30；环境变量
+    ``AISTUDIO_RETRY_SAME_DELAY_SEC`` 可覆盖（非法值忽略，不抛异常）。
+    """
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
     raw_features = config.get("features")
@@ -1432,7 +1496,7 @@ def get_configured_routing_settings(
             "配置 features.routing 非法（%r），回退默认 max_switches=2",
             _describe_type(raw_routing),
         )
-        return {"max_switches": 2}
+        return _routing_defaults()
     raw_switches = raw_routing.get("max_switches", 2)
     if (
         isinstance(raw_switches, bool)
@@ -1443,8 +1507,11 @@ def get_configured_routing_settings(
             "配置 features.routing.max_switches 非法（%r），回退默认 2",
             raw_switches,
         )
-        return {"max_switches": 2}
-    return {"max_switches": raw_switches}
+        raw_switches = 2
+    return {
+        "max_switches": raw_switches,
+        "retry_same_delay_sec": _resolve_retry_same_delay(raw_routing),
+    }
 
 
 def get_configured_keepalive_settings(

@@ -13,15 +13,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import httpx
 
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    AI_STUDIO_ORIGIN,
+    BENEFIT_TIER_URL,
+    EXT_BIN,
+    GRPC_WEB_USER_AGENT,
+    LIST_MODELS_URL,
+    WEB_API_KEY,
+    aistudio_new_chat_url,
+)
 from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("cookie_parser")
-
-DEFAULT_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
-DEFAULT_EXT_BIN = "CAESAUwwATgEQABQBGICSlBwAHgBkAEAmAEB"
-DEFAULT_ORIGIN = "https://aistudio.google.com"
-DEFAULT_USER_AGENT = "grpc-web-javascript/0.1"
 
 
 BENEFIT_TIER_TO_NAME: dict[int, str] = {
@@ -277,7 +282,7 @@ def parse_raw_cookies(raw: object) -> dict[str, str]:
 
 
 def calculate_sapisid_hash(
-    cookies: dict[str, str], origin: str = DEFAULT_ORIGIN
+    cookies: dict[str, str], origin: str = AI_STUDIO_ORIGIN
 ) -> str:
     """计算 Google SAPISIDHASH 鉴权头部。"""
     sapisid = cookies.get("SAPISID") or cookies.get("__Secure-1PAPISID") or ""
@@ -526,7 +531,7 @@ async def probe_account_emails_map(
             if emails:
                 return emails
         resp_ai = await http_client.get(
-            f"https://aistudio.google.com/u/{u_index}/prompts/new_chat",
+            aistudio_new_chat_url(auth_user=u_index, temporary=False),
             headers=headers,
         )
         if resp_ai.status_code == 200:
@@ -584,19 +589,19 @@ async def probe_account_benefit_tier(
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     headers = {
         "Content-Type": "application/json+protobuf",
-        "X-User-Agent": DEFAULT_USER_AGENT,
-        "X-Goog-Api-Key": DEFAULT_API_KEY,
+        "X-User-Agent": GRPC_WEB_USER_AGENT,
+        "X-Goog-Api-Key": WEB_API_KEY,
         "X-Goog-AuthUser": u_index,
-        "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+        "X-Goog-Ext-519733851-bin": EXT_BIN,
         "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-        "Origin": DEFAULT_ORIGIN,
-        "Referer": f"{DEFAULT_ORIGIN}/",
+        "Origin": AI_STUDIO_ORIGIN,
+        "Referer": AI_STUDIO_HOME_URL,
         "Cookie": cookie_header,
     }
     if auth_header:
         headers["Authorization"] = auth_header
 
-    tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
+    tier_url = BENEFIT_TIER_URL
     try:
         async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as client:
             resp = await client.post(tier_url, headers=headers, content="[]")
@@ -639,19 +644,19 @@ async def probe_google_accounts_infinite(
             auth_header = calculate_sapisid_hash(cookie_dict)
             headers = {
                 "Content-Type": "application/json+protobuf",
-                "X-User-Agent": DEFAULT_USER_AGENT,
-                "X-Goog-Api-Key": DEFAULT_API_KEY,
+                "X-User-Agent": GRPC_WEB_USER_AGENT,
+                "X-Goog-Api-Key": WEB_API_KEY,
                 "X-Goog-AuthUser": u_index,
-                "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+                "X-Goog-Ext-519733851-bin": EXT_BIN,
                 "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-                "Origin": DEFAULT_ORIGIN,
-                "Referer": f"{DEFAULT_ORIGIN}/",
+                "Origin": AI_STUDIO_ORIGIN,
+                "Referer": AI_STUDIO_HOME_URL,
                 "Cookie": cookie_header,
             }
             if auth_header:
                 headers["Authorization"] = auth_header
 
-            url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
+            url = LIST_MODELS_URL
             try:
                 resp = await client.post(url, headers=headers, content="[]")
                 # 200 (OK), 400 (Bad Request on param but authed), 403 (Forbidden/Permission/Quota) 均表示此账号 Session 存在
@@ -659,7 +664,7 @@ async def probe_google_accounts_infinite(
                 if resp.status_code in (200, 400, 403):
                     consecutive_failures = 0
                     detected_tier = "Free"
-                    tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
+                    tier_url = BENEFIT_TIER_URL
                     try:
                         tier_resp = await client.post(
                             tier_url, headers=headers, content="[]"

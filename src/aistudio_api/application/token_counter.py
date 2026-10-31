@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass
 from typing import cast
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.application.routing_pipeline import (
     RouteAttempt,
     RoutingPipelineProtocol,

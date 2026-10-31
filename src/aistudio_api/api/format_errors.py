@@ -9,9 +9,9 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from aistudio_api.api.error_mapping import error_payload
-from aistudio_api.application.api_service_gemini import (
+from aistudio_api.api.error_mapping import (
     classify_gemini_error_payload,
+    error_payload,
 )
 from aistudio_api.application.format_converters import ConversionError
 from aistudio_api.domain.errors import RoutingError, TierRequiredError

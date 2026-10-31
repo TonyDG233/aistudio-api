@@ -180,7 +180,8 @@ async def _ensure_authorization_header(
         )
     }
     clean_headers["X-Goog-AuthUser"] = str(auth_user or "0")
-    effective_tier = tier if tier and tier != "Free" else _get_active_account_tier()
+    supplied_tier = (tier or "").strip()
+    effective_tier = supplied_tier or _get_active_account_tier()
     tier_header = get_tier_header_value(effective_tier)
     if tier_header:
         clean_headers["X-AIStudio-G1-Tier"] = tier_header

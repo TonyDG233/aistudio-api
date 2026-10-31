@@ -13,12 +13,14 @@ from aistudio_api.infrastructure.browser.cdp_client import (
     CDPConnection,
     CDPPage,
 )
+from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
 from aistudio_api.infrastructure.gateway.session import (
     DEFAULT_BOOTSTRAP_TEMPLATE,
     BrowserSession,
 )
 from aistudio_api.infrastructure.gateway.session_auth import verify_account_identity
 from aistudio_api.infrastructure.gateway.session_state import SessionContext
+from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
 
 
 @pytest.mark.asyncio
@@ -128,6 +130,34 @@ async def test_session_template_capture_universal_bootstrap():
     # Other models ALSO use bootstrap now, saving 30 seconds
     tpl2 = await session.capture_template("gemini-3.1-pro-preview")
     assert tpl2["url"] == "http://bootstrap.com"
+
+
+@pytest.mark.asyncio
+async def test_pooled_session_capture_template_does_not_mutate_base_template():
+    """Model adaptation returns a copy: the cached realm template stays intact."""
+    base_template: dict[str, object] = {
+        "url": "http://bootstrap.com",
+        "headers": {},
+        "body": '["models/gemini-3.7-flash",null,null]',
+    }
+    context = SessionContext(
+        page=MagicMock(spec=CDPPage),
+        snap_key="snap_key",
+        auth_user="0",
+        auth_file=None,
+        base_template=base_template,
+    )
+    session = PooledSession(
+        context=context,
+        transport=XHRStreamTransport(),
+        realm_id="realm",
+    )
+
+    adapted = await session.capture_template("gemini-3.1-pro-preview")
+
+    assert adapted["body"] == '["models/gemini-3.1-pro-preview",null,null]'
+    assert context.base_template["body"] == '["models/gemini-3.7-flash",null,null]'
+    assert base_template["body"] == '["models/gemini-3.7-flash",null,null]'
 
 
 def test_session_has_no_idle_recovery_or_activity_timestamp():

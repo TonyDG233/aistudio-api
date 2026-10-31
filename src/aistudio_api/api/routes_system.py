@@ -47,7 +47,7 @@ def health_response() -> HealthResponse:
 def stats_response() -> StatsResponse:
     from aistudio_api.api.response_models import AccountBreakdownItem
     from aistudio_api.api.state import runtime_state
-    from aistudio_api.application.model_access import is_paid_model
+    from aistudio_api.domain.model_access import is_paid_model
     from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
 
     stats = dict(runtime_state.model_stats)

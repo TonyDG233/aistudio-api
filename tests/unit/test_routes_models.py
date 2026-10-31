@@ -5,12 +5,83 @@ from aistudio_api.api.app import app
 from aistudio_api.config import settings
 
 _AUTH_HEADERS = {"x-goog-api-key": "test-key"}
+_WEB_SESSION_HEADERS = {"authorization": "Bearer admin-pass"}
 
 
 def _build_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     )
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_accept_web_session_without_api_key(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    async with _build_client() as client:
+        for path in (
+            "/v1beta/models",
+            "/v1beta/models/gemini-3.7-flash",
+            "/v1/models",
+            "/v1/models/gemini-3.7-flash",
+        ):
+            response = await client.get(path, headers=_WEB_SESSION_HEADERS)
+            assert response.status_code == 200, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_accept_api_key_with_web_password_set(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(path, headers=_AUTH_HEADERS)
+            assert response.status_code == 200, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_reject_missing_credentials(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", None)
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(path)
+            assert response.status_code == 401, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_reject_invalid_web_session(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(
+                path, headers={"authorization": "Bearer wrong-password"}
+            )
+            assert response.status_code == 401, path
+
+
+@pytest.mark.asyncio
+async def test_web_password_alone_does_not_authorize_chat_completions(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    monkeypatch.setattr(
+        "aistudio_api.api.format_errors.format_enabled", lambda *_args: True
+    )
+    async with _build_client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers=_WEB_SESSION_HEADERS,
+            json={
+                "model": "gemini-3.7-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert response.status_code == 401
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -498,6 +500,214 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
         ("inst-1", "free-b"),
         ("inst-1", "free-c"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_429_same_retry_sleeps_configured_delay(monkeypatch) -> None:
+    """VPS #1: a 429 same-account retry backs off before hitting upstream again."""
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "retry_same_delay_sec": 2.0,
+        },
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    assert context.retry_same_delay_sec == 2.0
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    outcome = await pipeline.handle_error(
+        context,
+        attempt,
+        UsageLimitExceeded("HTTP 429: RPM burst"),
+        has_yielded_data=False,
+    )
+
+    assert outcome == "retry_same"
+    sleep_mock.assert_awaited_once_with(2.0)
+
+
+@pytest.mark.asyncio
+async def test_routing_settings_failure_uses_default_retry_delay() -> None:
+    """A broken settings provider must not silently disable the 429 backoff."""
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+
+    def broken_provider() -> dict[str, object]:
+        raise RuntimeError("config store unavailable")
+
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=broken_provider,
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+
+    assert context.retry_same_delay_sec == 2.0
+
+
+@pytest.mark.asyncio
+async def test_429_same_retry_skips_delay_when_zero(monkeypatch) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "retry_same_delay_sec": 0.0,
+        },
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    outcome = await pipeline.handle_error(
+        context, attempt, UsageLimitExceeded("429"), has_yielded_data=False
+    )
+
+    assert outcome == "retry_same"
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_429_same_retries_never_sleep(monkeypatch) -> None:
+    """403 and 204 retry_same paths must not apply the 429 backoff."""
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "retry_same_delay_sec": 2.0,
+        },
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    assert (
+        await pipeline.handle_error(
+            context, attempt, AuthError("HTTP 403: WAA denied"),
+            has_yielded_data=False,
+        )
+        == "retry_same"
+    )
+    sleep_mock.assert_not_awaited()
+
+    context2 = await pipeline.begin(model_path="gemini-4-argon")
+    attempt2 = await pipeline.acquire(context2)
+    assert attempt2 is not None
+    assert (
+        await pipeline.handle_error(
+            context2,
+            attempt2,
+            RequestError(204, "no content"),
+            has_yielded_data=False,
+        )
+        == "retry_same"
+    )
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_429_warning_includes_model_and_upstream_reason(caplog) -> None:
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded("HTTP 429: RPM burst"),
+            has_yielded_data=False,
+        )
+
+    assert outcome == "retry_same"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "gemini-4-argon" in message and "HTTP 429: RPM burst" in message
+        for message in messages
+    )
+    assert all("SAPISID" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_429_warning_redacts_cookie_and_bearer(caplog) -> None:
+    """Reason summaries must not leak cookie or Bearer secrets to warnings."""
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    secret = "SENTINELSECRETCOOKIE123"
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded(
+                f"HTTP 429: Cookie: SAPISID={secret}; "
+                f"Authorization: Bearer {secret}"
+            ),
+            has_yielded_data=False,
+        )
+
+    assert outcome == "retry_same"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("gemini-4-argon" in message for message in messages)
+    assert all(secret not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_403_warning_includes_model_and_upstream_reason(caplog) -> None:
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError("HTTP 403: WAA denied"),
+            has_yielded_data=False,
+        )
+
+    assert outcome == "retry_same"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "gemini-4-argon" in message and "HTTP 403: WAA denied" in message
+        for message in messages
+    )
+    assert all("SAPISID" not in message for message in messages)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_instance_specs,
     get_configured_logging_settings,
     get_configured_rotator_settings,
+    get_configured_routing_settings,
     get_configured_security_settings,
     invalidate_config_cache,
     validate_config,
@@ -65,6 +66,41 @@ def test_hash_include_code_defaults_true_and_env_overrides_yaml(tmp_path, monkey
 
     monkeypatch.setenv("AISTUDIO_HASH_INCLUDE_CODE", "1")
     assert resolve_hash_include_code() is True
+
+
+def test_routing_retry_same_delay_default_env_clamp_and_invalid(
+    tmp_path, monkeypatch
+):
+    """VPS #1: 429 same-account delay defaults to 2.0s and is env-overridable."""
+    path = _write_config(
+        tmp_path,
+        "features:\n  routing:\n    max_switches: 1\n    retry_same_delay_sec: 1.5\n",
+    )
+    monkeypatch.delenv("AISTUDIO_RETRY_SAME_DELAY_SEC", raising=False)
+    settings = get_configured_routing_settings(path)
+    assert settings["max_switches"] == 1
+    assert settings["retry_same_delay_sec"] == 1.5
+
+    monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "0")
+    assert get_configured_routing_settings(path)["retry_same_delay_sec"] == 0.0
+
+    monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "99")
+    assert get_configured_routing_settings(path)["retry_same_delay_sec"] == 30.0
+
+    monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "-3")
+    assert get_configured_routing_settings(path)["retry_same_delay_sec"] == 0.0
+
+    monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "not-a-number")
+    assert get_configured_routing_settings(path)["retry_same_delay_sec"] == 1.5
+
+
+def test_routing_retry_same_delay_defaults_to_two_seconds(tmp_path, monkeypatch):
+    path = _write_config(tmp_path, "features:\n  routing:\n    max_switches: 2\n")
+    monkeypatch.delenv("AISTUDIO_RETRY_SAME_DELAY_SEC", raising=False)
+
+    settings = get_configured_routing_settings(path)
+
+    assert settings["retry_same_delay_sec"] == 2.0
 
 
 def test_invalid_rotator_type_fails_startup_validation(tmp_path):

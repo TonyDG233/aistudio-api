@@ -14,10 +14,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application import generation_service
 from aistudio_api.application.atg import create_atg_processor
 from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.gateway.wire_codec import AistudioWireCodec
 from tests.unit.routing_fakes import ScriptedPipeline, make_attempt, make_context

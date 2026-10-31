@@ -1,4 +1,4 @@
-"""HTTP request schemas."""
+"""Gemini generateContent HTTP request contracts."""
 
 from __future__ import annotations
 

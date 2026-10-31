@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from aistudio_api.application.model_access import clear_paid_models, set_paid_models
 from aistudio_api.application.routing_eligibility import (
     resolve_model_route,
     resolve_required_tiers,
     tier_allows,
 )
+from aistudio_api.domain.model_access import clear_paid_models, set_paid_models
 from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
 

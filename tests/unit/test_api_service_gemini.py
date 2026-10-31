@@ -9,15 +9,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.responses import StreamingResponse
 
+from aistudio_api.api.gemini_service import (
+    handle_gemini_generate_content,
+)
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.api.schemas import (
+from aistudio_api.application import generation_service
+from aistudio_api.application.contracts.gemini import (
     GeminiContent,
     GeminiGenerateContentRequest,
     GeminiPart,
-)
-from aistudio_api.application import generation_service
-from aistudio_api.application.api_service_gemini import (
-    handle_gemini_generate_content,
 )
 from aistudio_api.domain.errors import RequestError, UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput

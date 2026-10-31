@@ -96,6 +96,7 @@ def _app(pipeline: ScriptedPipeline) -> FastAPI:
     app = FastAPI()
     app.include_router(routes_openai.router)
     app.dependency_overrides[routes_openai.require_openai] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key] = lambda: None
     app.dependency_overrides[get_routing_pipeline] = lambda: pipeline
     return app
 

@@ -16,13 +16,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.application.api_service_gemini import (
+from aistudio_api.api.gemini_service import (
     format_sse_event,
     format_sse_usage,
-    to_gemini_finish_reason,
 )
 from aistudio_api.application.chat_service import normalize_gemini_request
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
+from aistudio_api.application.finish_reasons import to_gemini_finish_reason
 from aistudio_api.application.signature_cache import DUMMY_THOUGHT_SIGNATURE
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest
 from aistudio_api.infrastructure.gateway.session import BrowserSession

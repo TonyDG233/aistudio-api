@@ -14,16 +14,16 @@
 | Instance | 用户可见实例：一个账号 + 一个 BrowserContext + 一个 Page + 一个 surface | `src/aistudio_api/domain/instances.py:18-33` |
 | InstanceSlot | 池内运行槽位，持有账号、context、page、session、`active_requests` | `src/aistudio_api/infrastructure/gateway/instance_pool.py:138-214` |
 | PooledSession | 单个 BrowserContext 的会话外壳，持有 page、cookie jar、transport | `src/aistudio_api/infrastructure/gateway/pooled_session.py:42-58` |
-| Lane | `free` / `paid` 两条物理隔离的实例池 | `src/aistudio_api/application/model_access.py:40-61` |
+| Lane | `free` / `paid` 两条物理隔离的实例池 | `src/aistudio_api/domain/model_access.py::account_is_paid`, `::instance_lane_for_tier` |
 | `active_requests` | 唯一并发原语；一个实例同一时刻只允许一个请求句柄 | `instance_pool.py:1-11`, `:205-214` |
 | RouteCandidate | 路由阶段冻结的候选快照 | `src/aistudio_api/application/routing_pipeline.py:150-183` |
-| 最小满足 tier | 满足模型 `required_tiers` 的最低账号 tier | `model_access.py:295-317` |
+| 最小满足 tier | 满足模型 `required_tiers` 的最低账号 tier | `domain/model_access.py:295-317` |
 | 改绑（rebind） | 不新建实例，原地关闭旧 Page/Context 后激活同槽位的新账号 | `instance_pool.py:527-561`, `instance_manager.py:389-425` |
 
 核心不变量：
 
 1. 一个实例只对应一个账号、一个 Context、一个 Page、一个 surface（`instance_pool.py:1-11`, `:138-166`）。
-2. Free 与 Paid 是物理隔离的两条 lane，lane 由账号 tier 推导，不由模型名推导（`model_access.py:273-285`）。
+2. Free 与 Paid 是物理隔离的两条 lane，lane 由账号 tier 推导，不由模型名推导（`domain/model_access.py::account_is_paid`, `::instance_lane_for_tier`）。
 3. 实例创建时必须满足 lane 与 tier 区间；跨 lane 改绑在管理器层直接拒绝（`instance_pool.py:336-343`, `instance_manager.py:395-404`）。
 4. 同一账号不能同时占用两个实例；`create` / `reassign` 均检查（`instance_manager.py:291-294`, `:405-406`）。
 5. 没有 lease / reservation / pinned / defer / 后台 rebalance；只有 `active_requests`（`instance_pool.py:7-10`, `routing_pipeline.py:5-6`）。
@@ -365,7 +365,7 @@ if active_requests == 0: active_zero.set()
 
 ### 6.1 请求入口
 
-- Gemini：`api/routes_gemini.py:21-45` -> `api_service_gemini.py:134-176` / `:309-360` -> `generation_service.generate` / `stream_generation`。
+- Gemini：`api/routes_gemini.py:21-45` -> `api/gemini_service.py::handle_gemini_generate_content` / `::_build_gemini_streaming_response` -> `generation_service.generate` / `stream_generation`。
 - OpenAI：`api/routes_openai.py:79-158` -> `convert_openai_request` -> `GeminiGenerateContentRequest` -> `generation_service`。
 - `countTokens`：`routes_gemini.py:48-61` -> `token_counter.count_tokens`。
 
@@ -685,9 +685,9 @@ TierRequiredError(
 - Claude：`403`，`type=error`，`error.type=permission_error`，合并四个字段。
 - OpenAI / Responses：`403`，`error.type=tier_required`，`error.code=tier_required`，合并四个字段。
 
-Gemini 流式错误也保留字段：`format_sse_error` 在 `TierRequiredError`/`RoutingError` 时 `error.update(exc.as_fields())`（`api_service_gemini.py:272-286`）。
+Gemini 流式错误也保留字段：`format_sse_error` 在 `TierRequiredError`/`RoutingError` 时 `error.update(exc.as_fields())`（`api/gemini_service.py::format_sse_error`）。
 
-`classify_gemini_error_payload` 对 `TierRequiredError` 返回 `(403, str(exc), "PERMISSION_DENIED")`（`api_service_gemini.py:87-94`）。
+`classify_gemini_error_payload` 对 `TierRequiredError` 返回 `(403, str(exc), "PERMISSION_DENIED")`（`api/error_mapping.py::classify_gemini_error_payload`）。
 
 ### 9.5 与其他错误的边界
 
@@ -861,8 +861,8 @@ begin(paid_model)
 | Pool 生命周期 | `instance_pool.py:327-364`, `:366-460`, `:498-575`, `:592-627` |
 | Manager 生命周期 | `src/aistudio_api/application/instance_manager.py:164-232`, `:287-505`, `:507-608` |
 | 状态映射 | `instance_manager.py:999-1047` |
-| lane 推导 | `src/aistudio_api/application/model_access.py:40-61`, `:273-285` |
-| tier 归一化 | `model_access.py:71-188`, `:191-196` |
+| lane 推导 | `src/aistudio_api/domain/model_access.py::account_is_paid`, `::tier_rank`, `::instance_lane_for_tier` |
+| tier 归一化 | `domain/model_access.py:71-188`, `:191-196` |
 | 配置归一化/合并 | `src/aistudio_api/infrastructure/gateway/model_defaults.py:261-416` |
 | 路由准入 | `src/aistudio_api/application/routing_pipeline.py:313-393` |
 | 候选排序 | `routing_pipeline.py:395-438` |
@@ -870,5 +870,5 @@ begin(paid_model)
 | 改绑 | `routing_pipeline.py:737-917`, `instance_manager.py:389-425` |
 | 预算 | `src/aistudio_api/application/routing_safety.py:13-49` |
 | quota_scope | `src/aistudio_api/application/account_rotator.py:70-101`, `:215-282`, `:544-552`; `model_defaults.py:1472-1483` |
-| 403 契约 | `src/aistudio_api/domain/errors.py:24-62`; `src/aistudio_api/api/error_mapping.py:56-81`; `api_service_gemini.py:87-94`, `:272-286` |
+| 403 契约 | `src/aistudio_api/domain/errors.py:24-62`; `src/aistudio_api/api/error_mapping.py::classify_gemini_error_payload`; `src/aistudio_api/api/gemini_service.py::format_sse_error` |
 | 默认配置 | `defaults/config.yaml:8-18`, `:33-46` |

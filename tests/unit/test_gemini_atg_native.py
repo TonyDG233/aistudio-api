@@ -19,14 +19,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.responses import StreamingResponse
 
-from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.application import generation_service
-from aistudio_api.application.api_service_gemini import (
+from aistudio_api.api.gemini_service import (
     handle_gemini_generate_content,
 )
+from aistudio_api.api.response_models import GeminiGenerateContentResponse
+from aistudio_api.application import generation_service
 from aistudio_api.application.atg import create_atg_processor
 from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.domain.errors import RequestError
 from aistudio_api.domain.models import Candidate, ModelOutput
 from tests.unit.routing_fakes import (

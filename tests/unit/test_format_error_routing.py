@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aistudio_api.api.error_mapping import error_payload
-from aistudio_api.application.api_service_gemini import format_sse_error
+from aistudio_api.api.gemini_service import format_sse_error
 from aistudio_api.domain.errors import (
     SurfaceCapacityError,
     SurfaceSwitchExhaustedError,
@@ -87,6 +87,7 @@ async def test_openai_route_tier_403_keeps_four_fields() -> None:
     app = FastAPI()
     app.include_router(routes_openai.router)
     app.dependency_overrides[routes_openai.require_openai] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key] = lambda: None
     app.dependency_overrides[get_routing_pipeline] = lambda: _TierRaisingPipeline()
 
     async with httpx.AsyncClient(

@@ -21,16 +21,16 @@ def record_rotator_event(
     model: str | None = None,
     surface: str | None = None,
     usage: dict[str, object] | None = None,
+    reason: str | None = None,
     rotator: AccountRotator | None = None,
 ) -> None:
-    """Record one attempt outcome without mutating the active account."""
-    if not account_id:
-        return
-    if rotator is None:
-        from aistudio_api.api.state import runtime_state
+    """Record one attempt outcome without mutating the active account.
 
-        rotator = runtime_state.rotator
-    if rotator is None:
+    ``reason`` is an optional sanitized upstream summary; it is only forwarded
+    to the rotator events that log it (``rate_limited`` / ``auth_error``) and
+    never contains cookies or API keys.
+    """
+    if not account_id or rotator is None:
         return
 
     if event == "success":
@@ -38,9 +38,19 @@ def record_rotator_event(
             account_id, model=model, usage=usage, surface=surface
         )
     elif event == "rate_limited":
-        rotator.record_rate_limited(account_id, model=model, surface=surface)
+        if reason:
+            rotator.record_rate_limited(
+                account_id, model=model, surface=surface, reason=reason
+            )
+        else:
+            rotator.record_rate_limited(account_id, model=model, surface=surface)
     elif event == "auth_error":
-        rotator.record_auth_error(account_id, model=model, surface=surface)
+        if reason:
+            rotator.record_auth_error(
+                account_id, model=model, surface=surface, reason=reason
+            )
+        else:
+            rotator.record_auth_error(account_id, model=model, surface=surface)
     elif event == "session_expired":
         rotator.record_session_expired(account_id, model=model, surface=surface)
     elif event == "error":

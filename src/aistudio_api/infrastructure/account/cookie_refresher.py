@@ -9,6 +9,9 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     parse_raw_cookies,
     parse_storage_state,
 )
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    GOOGLE_LOGIN_BOOTSTRAP_URL,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("cookie_refresher")
@@ -57,7 +60,7 @@ def _refresh_session_cookies(cookies: dict[str, str]) -> dict[str, str]:
 
     try:
         resp = session.get(
-            "https://accounts.google.com/ServiceLogin?continue=https://aistudio.google.com",
+            GOOGLE_LOGIN_BOOTSTRAP_URL,
             impersonate="chrome",
             timeout=15,
             allow_redirects=True,

@@ -17,13 +17,15 @@ from aistudio_api.infrastructure.browser.scripts import (
     INSTALL_HOOKS_JS,
     STOP_GENERATION_JS,
 )
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+)
 from aistudio_api.infrastructure.gateway.session_auth import is_login_page_url
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("session.botguard")
 
 BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
-AISTUDIO_HOME_URL = "https://aistudio.google.com/"
 
 OPEN_PLAYGROUND_JS = """(() => {
     const clickable = Array.from(document.querySelectorAll('button, mat-card, a, [role="button"], [role="tab"], .nav-item'));
@@ -280,7 +282,7 @@ async def bootstrap_botguard_and_template(
                     # P-03: reload 后重新导航回 AI Studio，并继续轮询捕获；
                     # 只在有界等待窗口内重试，避免无限循环。
                     with suppress(Exception):
-                        await page.goto(AISTUDIO_HOME_URL)
+                        await page.goto(AI_STUDIO_HOME_URL)
                     for _ in range(10):
                         await page.wait_for_timeout(500)
                         recovered_url = getattr(page, "url", "") or ""

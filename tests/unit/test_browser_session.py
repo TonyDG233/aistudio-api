@@ -510,11 +510,11 @@ async def test_browser_session_generate_snapshot_concurrency(mock_cdp_page):
 
 def test_browser_session_temporary_chat_urls():
     """Verify AI Studio navigation URLs always enforce temporary=true to prevent history pollution."""
-    from aistudio_api.infrastructure.gateway.session_auth import (
+    from aistudio_api.infrastructure.gateway.public_web_constants import (
         AI_STUDIO_URL,
         AI_STUDIO_URL_FALLBACK,
-        get_aistudio_urls,
     )
+    from aistudio_api.infrastructure.gateway.session_auth import get_aistudio_urls
 
     assert "temporary=true" in AI_STUDIO_URL
     assert "temporary=true" in AI_STUDIO_URL_FALLBACK

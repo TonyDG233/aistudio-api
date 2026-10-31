@@ -8,7 +8,11 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, Request
 
-from aistudio_api.api.dependencies import require_api_key, require_web_auth
+from aistudio_api.api.dependencies import (
+    require_api_key,
+    require_api_key_or_web_session,
+    require_web_auth,
+)
 from aistudio_api.config import settings
 
 
@@ -17,6 +21,10 @@ def _build_api_client() -> httpx.AsyncClient:
 
     @app.get("/protected", dependencies=[Depends(require_api_key)])
     async def protected():
+        return {"ok": True}
+
+    @app.get("/read", dependencies=[Depends(require_api_key_or_web_session)])
+    async def read():
         return {"ok": True}
 
     return httpx.AsyncClient(
@@ -43,6 +51,60 @@ async def test_empty_api_keys_and_anonymous_disabled_returns_401(monkeypatch):
     assert response.status_code == 401
     assert "未配置 API Key" in response.json()["detail"]["message"]
     assert response.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.asyncio
+async def test_read_only_dependency_empty_api_keys_and_no_web_session_returns_401(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "web_password", None)
+
+    async with _build_api_client() as client:
+        response = await client.get("/read")
+
+    assert response.status_code == 401
+    assert "未配置 API Key" in response.json()["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_read_only_dependency_accepts_web_session(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+
+    async with _build_api_client() as client:
+        response = await client.get(
+            "/read", headers={"Authorization": "Bearer admin-pass"}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_read_only_dependency_rejects_invalid_web_session(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+
+    async with _build_api_client() as client:
+        response = await client.get(
+            "/read", headers={"Authorization": "Bearer not-the-password"}
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_read_only_dependency_still_accepts_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"secret-token"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+
+    async with _build_api_client() as client:
+        response = await client.get(
+            "/read", headers={"Authorization": "Bearer secret-token"}
+        )
+
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio

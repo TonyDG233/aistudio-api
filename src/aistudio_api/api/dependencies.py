@@ -15,6 +15,19 @@ from .state import runtime_state
 logger = get_logger("auth")
 
 
+def _extract_bearer_token(request: Request) -> str | None:
+    authorization = (request.headers.get("authorization") or "").strip()
+    if not authorization:
+        return None
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+
+    token = token.strip()
+    return token or None
+
+
 def _extract_request_token(request: Request) -> str | None:
     # 1. Google Gemini standard query param: ?key=...
     query_key = request.query_params.get("key")
@@ -32,16 +45,27 @@ def _extract_request_token(request: Request) -> str | None:
         return api_key
 
     # 4. Bearer token in Authorization header
-    authorization = (request.headers.get("authorization") or "").strip()
-    if not authorization:
-        return None
+    return _extract_bearer_token(request)
 
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer":
-        return None
 
-    token = token.strip()
-    return token or None
+def _web_session_password() -> str | None:
+    """Return the configured admin password, or None when the console is open."""
+    if not settings.auth_enabled:
+        return None
+    password = settings.web_password
+    if not password:
+        return None
+    return password.strip() or None
+
+
+def _web_session_matches(token: str | None) -> bool:
+    password = _web_session_password()
+    return bool(token and password and secrets.compare_digest(token, password))
+
+
+def _is_valid_web_session(request: Request) -> bool:
+    """Accept only the explicit Bearer admin credential as a web session."""
+    return _web_session_matches(_extract_bearer_token(request))
 
 
 def require_web_auth(request: Request) -> None:
@@ -49,13 +73,7 @@ def require_web_auth(request: Request) -> None:
     if not settings.auth_enabled:
         return
 
-    token = _extract_request_token(request)
-    if (
-        token
-        and settings.web_password
-        and settings.web_password.strip()
-        and secrets.compare_digest(token, settings.web_password)
-    ):
+    if _web_session_matches(_extract_request_token(request)):
         return
     client_ip = request.client.host if request.client else "unknown"
     logger.warning("管理控制台鉴权失败: 客户端=%s", client_ip)
@@ -66,8 +84,8 @@ def require_web_auth(request: Request) -> None:
     )
 
 
-def require_api_key(request: Request) -> None:
-    """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
+def _validate_api_key(request: Request) -> None:
+    """Shared API key validation: 401 on missing keys, missing token, or bad token."""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_api_keys,
         get_configured_security_settings,
@@ -119,6 +137,23 @@ def require_api_key(request: Request) -> None:
         },
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def require_api_key(request: Request) -> None:
+    """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
+    _validate_api_key(request)
+
+
+def require_api_key_or_web_session(request: Request) -> None:
+    """Read-only auth for model endpoints: valid API key or Web admin session.
+
+    Generation endpoints must keep using :func:`require_api_key`: the web
+    password is deliberately not accepted as an API key outside read-only
+    model metadata routes.
+    """
+    if _is_valid_web_session(request):
+        return
+    _validate_api_key(request)
 
 
 def get_client() -> AIStudioClient:

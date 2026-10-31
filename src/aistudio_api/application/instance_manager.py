@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from aistudio_api.application.model_access import (
+from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
+from aistudio_api.domain.model_access import (
     instance_lane_for_tier,
 )
-from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.gateway.instance_pool import (
     ActiveRequest,

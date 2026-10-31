@@ -19,8 +19,8 @@ from fastapi import FastAPI, HTTPException, Request
 from aistudio_api.api import routes_openai
 from aistudio_api.api.dependencies import get_routing_pipeline, get_runtime_state
 from aistudio_api.api.format_errors import format_enabled
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
 from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,
@@ -670,6 +670,10 @@ def _app(*, with_pipeline: bool = True) -> FastAPI:
     app = FastAPI()
     app.include_router(routes_openai.router)
     app.dependency_overrides[routes_openai.require_openai] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key_or_web_session] = (
+        lambda: None
+    )
     app.dependency_overrides[get_runtime_state] = lambda: SimpleNamespace(client=None)
     if with_pipeline:
         app.dependency_overrides[get_routing_pipeline] = lambda: object()
@@ -902,6 +906,9 @@ async def test_route_models_list_bare_by_default_and_prefixed_when_both_enabled(
     both = FastAPI()
     both.include_router(routes_openai.router)
     both.dependency_overrides[routes_openai.require_openai] = lambda: None
+    both.dependency_overrides[routes_openai.require_api_key_or_web_session] = (
+        lambda: None
+    )
     both.dependency_overrides[get_runtime_state] = lambda: SimpleNamespace(
         client=None,
         instance_manager=SimpleNamespace(
@@ -911,14 +918,17 @@ async def test_route_models_list_bare_by_default_and_prefixed_when_both_enabled(
     prefixed = await _get(both, "/v1/models")
     assert {item["id"] for item in _as_dict(prefixed.json())["data"]} == {
         "gemini-x",
-        "pg/gemini-x",
         "build/gemini-x",
     }
 
-    single = await _get(both, "/v1/models/pg/gemini-x")
+    single = await _get(both, "/v1/models/build/gemini-x")
     assert single.status_code == 200
-    assert single.json()["id"] == "pg/gemini-x"
+    assert single.json()["id"] == "build/gemini-x"
     assert calls == ["gemini-x"]
+
+    legacy = await _get(both, "/v1/models/pg/gemini-x")
+    assert legacy.status_code == 404
+    assert calls == ["gemini-x", "pg/gemini-x"]
 
 
 def test_require_openai_raises_http_exception_when_disabled(monkeypatch):

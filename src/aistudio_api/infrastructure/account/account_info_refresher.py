@@ -1,7 +1,7 @@
 """账号信息刷新：无浏览器直连探测 AI Studio 档位（tier）与登录态，并回填邮箱。
 
 传输与判定对齐上游：
-- 探测 RPC：``POST .../MakerSuiteService/GetAiStudioBenefitTier``，body ``"[]"``，
+- 探测 RPC：``POST .../MakerSuite service/GetAiStudioBenefitTier``，body ``"[]"``，
   ``content-type: application/json+protobuf``，携带账号 Cookie、SAPISIDHASH
   Authorization 与 AI Studio web API key。
 - 档位映射：``[]``/``0`` -> Free；``1`` -> Pro；``2`` -> Ultra；``3`` -> Plus；
@@ -27,8 +27,19 @@ import httpx
 
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.account.cookie_parser import (
-    DEFAULT_EXT_BIN,
     calculate_sapisid_hash,
+)
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    AI_STUDIO_ORIGIN,
+    BENEFIT_TIER_URL,
+    DEFAULT_APP_ID,
+    EXT_BIN,
+    GRPC_WEB_USER_AGENT,
+    WEB_API_KEY,
+    WEB_API_KEY_PREFIX,
+    WEB_API_KEY_RE,
+    aistudio_app_url,
 )
 from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -41,17 +52,10 @@ if TYPE_CHECKING:
 
 logger = get_logger("account_refresher")
 
-RPC_HOST = "alkalimakersuite-pa.clients6.google.com"
-RPC_BASE = "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
-RPC_URL = f"https://{RPC_HOST}{RPC_BASE}GetAiStudioBenefitTier"
-PAGE_HOST = "aistudio.google.com"
-ORIGIN = "https://aistudio.google.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
 TIER_BY_CODE: dict[int, str] = {1: "Pro", 2: "Ultra", 3: "Plus"}
-DEFAULT_WEB_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
-DEFAULT_APP_ID = "3b85b4ed-f945-422c-ba25-395d1feef528"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -64,7 +68,6 @@ _NOISE_EMAIL_DOMAIN_RE = re.compile(
     r"|googleusercontent\.com)$",
     re.IGNORECASE,
 )
-_WEB_API_KEY_RE = re.compile(r"AIzaSy[A-Za-z0-9_-]{25,45}")
 
 
 class RefreshInProgressError(RuntimeError):
@@ -206,7 +209,7 @@ class AccountInfoRefresher:
         self._web_api_key = (
             override
             or (os.getenv("MAKERSUITE_WEB_API_KEY") or "").strip()
-            or DEFAULT_WEB_API_KEY
+            or WEB_API_KEY
         )
         if concurrency is None:
             concurrency = int(
@@ -494,7 +497,7 @@ class AccountInfoRefresher:
         return _CookieJar(header="; ".join(header_parts), jar=jar)
 
     def _build_authorization(self, jar: dict[str, str]) -> str:
-        return calculate_sapisid_hash(jar, origin=ORIGIN)
+        return calculate_sapisid_hash(jar, origin=AI_STUDIO_ORIGIN)
 
     def _rpc_headers(
         self, cookies: _CookieJar, *, auth_user: str = "0"
@@ -502,14 +505,14 @@ class AccountInfoRefresher:
         headers: dict[str, str] = {
             "accept": "*/*",
             "content-type": "application/json+protobuf",
-            "origin": ORIGIN,
-            "referer": f"{ORIGIN}/",
+            "origin": AI_STUDIO_ORIGIN,
+            "referer": AI_STUDIO_HOME_URL,
             "user-agent": USER_AGENT,
             "x-goog-api-key": self._web_api_key,
             "x-goog-authuser": str(auth_user or "0"),
-            "x-goog-ext-519733851-bin": DEFAULT_EXT_BIN,
+            "x-goog-ext-519733851-bin": EXT_BIN,
             "x-ai-studio-visit-id": f"v1_{uuid.uuid4()}",
-            "x-user-agent": "grpc-web-javascript/0.1",
+            "x-user-agent": GRPC_WEB_USER_AGENT,
         }
         if cookies.header:
             headers["cookie"] = cookies.header
@@ -523,7 +526,7 @@ class AccountInfoRefresher:
     ) -> TransportResponse:
         headers = self._rpc_headers(cookies, auth_user=auth_user)
         response = await self._transport.request(
-            "POST", RPC_URL, headers=headers, content="[]"
+            "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
         )
         if response.status == 403 and self._is_key_problem(response.body):
             rotated = await self._recover_web_api_key(cookies, auth_user=auth_user)
@@ -535,7 +538,7 @@ class AccountInfoRefresher:
                     "re-extracted key."
                 )
                 response = await self._transport.request(
-                    "POST", RPC_URL, headers=headers, content="[]"
+                    "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
                 )
         return response
 
@@ -553,11 +556,11 @@ class AccountInfoRefresher:
         except Exception as e:
             logger.warning("[Refresh] Unable to re-extract the web API key: %s", e)
             return None
-        keys = list(dict.fromkeys(_WEB_API_KEY_RE.findall(html)))
+        keys = list(dict.fromkeys(WEB_API_KEY_RE.findall(html)))
         if not keys:
             return None
         return next(
-            (candidate for candidate in keys if candidate.startswith("AIzaSyDdP8")),
+            (candidate for candidate in keys if candidate.startswith(WEB_API_KEY_PREFIX)),
             keys[0],
         )
 
@@ -573,7 +576,7 @@ class AccountInfoRefresher:
         }
         if cookies.header:
             headers["cookie"] = cookies.header
-        url = f"https://{PAGE_HOST}/apps/{self._app_id}?authuser={auth_user or '0'}"
+        url = aistudio_app_url(self._app_id, auth_user=auth_user)
         response = await self._transport.request("GET", url, headers=headers)
         if response.status != 200:
             raise RuntimeError(f"page fetch HTTP {response.status}")
