@@ -1,42 +1,95 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aistudio-api.local/config.schema.json",
-  "title": "aistudio-api runtime config (Gate 0.5 baseline)",
-  "description": "Gate 0.5 冻结的最小配置契约；与 12-gate0-inputs.md §3 对应。",
+  "title": "aistudio-api runtime config (current contract)",
+  "description": "当前运行配置的结构契约。同时覆盖 defaults/config.yaml（当前分发默认）与 config/config.example.yaml（Gate 0.5 示例）；跨字段语义（tier 选择器合法性、Free/paid lane 不混合、rotator 冷却范围、配额桶等）由运行时 model_defaults / application.model_access 校验，本 schema 只保证结构与基本类型。",
+  "$comment": "覆盖当前 defaults/config.yaml 顶层键：api_keys、security.api_allow_anonymous、instances、max_contexts、diagnostics.hash_include_code、logging、rotator、features.{routing,keepalive,formats,atg}、paid_model_rules、model_defaults、tier_quotas、account_presets；同时保留 Gate 0.5 示例的 limits.max_instances 与顶层 keepalive.enabled/interval_hours。",
+  "$defs": {
+    "tierName": {
+      "type": "string",
+      "pattern": "^([Ff][Rr][Ee][Ee]|[Pp][Ll][Uu][Ss]|[Pp][Rr][Oo]|[Uu][Ll][Tt][Rr][Aa]|[Uu][Ll][Tt][Rr][Aa][ _-]?[2][0][Xx])$",
+      "description": "Tier 名称：Free/Plus/Pro/Ultra/Ultra_20X；运行期 canonical_tier 接受大小写、空格与连字符变体。"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "modelMatch": {
+      "type": "object",
+      "description": "模型匹配规则；contains/prefixes 由运行期 model_defaults 解释。",
+      "properties": {
+        "contains": { "$ref": "#/$defs/stringArray" },
+        "prefixes": { "$ref": "#/$defs/stringArray" }
+      },
+      "additionalProperties": true
+    }
+  },
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "instances": {
       "type": "array",
-      "description": "实例级配置：1 账号 + 1 Context + 1 Page + 1 surface；同账号 chat/build 不得并存。",
+      "description": "实例级配置：1 账号 + 1 Context + 1 Page + 1 surface；同账号 chat/build 不得并存。tier 选择器至少一个：only_tier 精确钉住（Ultra 展开 Ultra..Ultra_20X），min_tier 单独开 min..Ultra_20X，max_tier 单独默认下界 Pro，min+max 为闭区间；Free 只能是 Free..Free，Free 与付费 lane 不得混合。",
       "default": [],
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["account_id", "count", "surface"],
+        "required": ["count", "surface"],
+        "anyOf": [
+          { "required": ["only_tier"] },
+          { "required": ["min_tier"] },
+          { "required": ["max_tier"] }
+        ],
+        "$comment": "跨字段规则由 application/model_access.resolve_tier_selector 在启动时校验：only_tier 不得与不同的 min_tier/max_tier 组合；min_tier<=max_tier；Free/paid lane 不混合；付费 min_tier 不得低于 Plus、max_tier 不得低于 Pro。非字符串或未知 tier 直接 ConfigValidationError，不静默忽略。",
         "properties": {
           "account_id": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "Gate 0.5 示例字段；运行期 _normalize_instance_specs 不使用该字段，槽位按 tier 选择器在账号库中选择账号。"
           },
           "count": {
             "type": "integer",
             "minimum": 1,
-            "default": 1
+            "default": 1,
+            "description": "该 spec 的实例数量；重复 spec 按归一化 tier 区间合并 count。"
           },
           "surface": {
-            "enum": ["chat", "build"]
+            "enum": ["chat", "build"],
+            "default": "chat"
+          },
+          "only_tier": {
+            "$ref": "#/$defs/tierName",
+            "description": "精确 tier。Free -> Free..Free；Ultra -> Ultra..Ultra_20X；Plus/Pro 保持精确。不得与不同的 min_tier/max_tier 同时配置。"
           },
           "min_tier": {
-            "enum": ["free", "pro"],
-            "default": "free"
+            "$ref": "#/$defs/tierName",
+            "description": "闭区间下界。单独配置时：Free -> Free..Free；付费 -> min..Ultra_20X。"
+          },
+          "max_tier": {
+            "$ref": "#/$defs/tierName",
+            "description": "闭区间上界。单独配置时：Free -> Free..Free；付费下界默认 Pro，且上界不得低于 Pro；Plus 槽位请用 only_tier: Plus。"
           }
         }
       }
     },
+    "max_contexts": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16,
+      "description": "全局实例/Context 上限（1-16）；缺省等于 instances count 之和。"
+    },
+    "security": {
+      "type": "object",
+      "description": "API 鉴权口径（D-14）：默认关闭免密；空 api_keys 绝不开放。",
+      "properties": {
+        "api_allow_anonymous": { "type": "boolean", "default": false },
+        "web_password": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
     "limits": {
       "type": "object",
-      "description": "全局只做总上限；容量按实例数计算，不引入 lease/reservation。",
+      "description": "Gate 0.5 示例的全局只做总上限；容量按实例数计算，不引入 lease/reservation。",
       "additionalProperties": false,
       "default": {},
       "properties": {
@@ -55,27 +108,121 @@
         "type": "string"
       }
     },
+    "diagnostics": {
+      "type": "object",
+      "description": "诊断开关（D-09）；不进入普通用户 UI。",
+      "properties": {
+        "hash_include_code": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": true
+    },
+    "rotator": {
+      "type": "object",
+      "description": "账号轮换与冷却（D-07）；缺失键由运行期深合并默认值。",
+      "properties": {
+        "max_retries": { "type": "integer", "minimum": 0 },
+        "quota_scope": { "enum": ["account", "account_surface"] },
+        "cooldowns": {
+          "type": "object",
+          "properties": {
+            "rate_limited_short": { "type": "integer", "minimum": 0 },
+            "rate_limited_drip": { "type": "integer", "minimum": 0 },
+            "rate_limited_drip_extended": { "type": "integer", "minimum": 0 },
+            "auth_error": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
     "features": {
       "type": "object",
       "additionalProperties": false,
       "default": {},
       "properties": {
         "formats": {
-          "type": "array",
-          "uniqueItems": true,
-          "default": ["openai", "gemini"],
-          "items": {
-            "enum": ["openai", "gemini", "claude", "responses"]
-          }
+          "description": "Gate 0.5 示例使用数组；当前 defaults 使用对象（openai/claude/responses/media）。",
+          "anyOf": [
+            {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["openai", "gemini", "claude", "responses"] }
+            },
+            {
+              "type": "object",
+              "properties": {
+                "openai": { "type": "boolean" },
+                "gemini": { "type": "boolean" },
+                "claude": { "type": "boolean" },
+                "responses": { "type": "boolean" },
+                "media": {
+                  "type": "object",
+                  "properties": {
+                    "allow_private_urls": { "type": "boolean" }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          ]
         },
         "build_surface": {
           "type": "boolean",
           "default": false
+        },
+        "routing": {
+          "type": "object",
+          "properties": {
+            "max_switches": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "keepalive": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval_hours": { "type": "integer", "minimum": 1, "maximum": 168 },
+            "auth_update": { "type": "boolean" },
+            "auth_update_hours": { "type": "integer", "minimum": 1 },
+            "metadata_refresh": { "type": "boolean" },
+            "metadata_refresh_hours": { "type": "integer", "minimum": 1 },
+            "metadata_refresh_on_startup": { "type": "boolean" },
+            "active_activity": { "type": "boolean" },
+            "active_activity_seconds": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": true
+        },
+        "atg": {
+          "type": "object",
+          "description": "Anti-Truncation Gateway；默认 off，按协议/模型开启。",
+          "properties": {
+            "mode": {
+              "description": "off/prefer/required；YAML 1.1 会把未加引号的 off 解析为布尔 false，运行期等价于 off。",
+              "enum": ["off", "prefer", "required", false]
+            },
+            "mode_by_format": {
+              "type": "object",
+              "additionalProperties": { "enum": ["inherit", "off", "prefer", "required"] }
+            },
+            "tool_prefix": { "type": "string" },
+            "control_position": { "enum": ["head", "tail"] },
+            "strict": { "type": "boolean" },
+            "empty_retries": { "type": "integer", "minimum": 0 },
+            "recovery": { "type": "string" },
+            "side_buffer_bytes": { "type": "integer", "minimum": 0 },
+            "client_synthetic_guard": { "type": "boolean" },
+            "max_response_bytes": { "type": "integer", "minimum": 0 },
+            "text_model_pattern": { "type": "string" },
+            "non_text_model_pattern": { "type": "string" }
+          },
+          "additionalProperties": true
         }
       }
     },
     "keepalive": {
       "type": "object",
+      "description": "Gate 0.5 示例的顶层保活配置；当前运行态默认位于 features.keepalive。",
       "additionalProperties": false,
       "default": {},
       "properties": {
@@ -125,9 +272,55 @@
         }
       }
     },
+    "paid_model_rules": {
+      "type": "object",
+      "description": "Paid 模型规则覆盖；每个条目含模型匹配与 required_tiers。",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "contains": { "$ref": "#/$defs/stringArray" },
+          "prefixes": { "$ref": "#/$defs/stringArray" },
+          "required_tiers": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/tierName" }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
     "model_defaults": {
       "type": "object",
-      "description": "upstream 原生模型默认规则；新分支保留，不在此 schema 内重复定义。"
+      "description": "upstream 原生模型默认规则（profiles/models/drop_unsupported_params）；结构由运行期深合并解释。",
+      "additionalProperties": true
+    },
+    "tier_quotas": {
+      "type": "object",
+      "description": "按 tier 的软额度桶与 daily_limit；只用于仪表盘百分比展示，不硬禁用账号。",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "account_presets": {
+      "type": "array",
+      "description": "系统/用户账号预设；结构与运行期 account_store 解释。",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "action": { "type": "string" },
+          "target_tiers": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/tierName" }
+          },
+          "target_groups": { "$ref": "#/$defs/stringArray" },
+          "is_system": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
     }
   }
 }

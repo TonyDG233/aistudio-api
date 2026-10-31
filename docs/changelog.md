@@ -1,40 +1,73 @@
 # Changelog
 
-可审计的文档/架构/行为变更记录；git log 之外的补充。
+本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
-格式：
+## [2.0-rebuild] - 2026-10-31
 
-```text
-## YYYY-MM-DD
-- 范围：文件/domain
-- 变更：一句话
-- 原因：决策 ID / 审计项
-- 验证：命令或工件路径
-```
+重建版本：在保留上游协议能力与前端界面的前提下，将运行时重构为“多实例池 + 请求期路由”架构，
+并补齐账号、保活、日志、模型发现与安全链路。
 
-## 2026-10-27
+### Added
 
-- 范围：`docs/dev/rebuild/05`、`06*`、`10`、`12`
-- 变更：按第二轮复审修复 Gate 0/0.5 阻塞；明确 429/rebind/sleep-wake/idle 口径；新增测试处置表与 P9-pre 输入。
-- 原因：`08-02-execution-readiness-reaudit.md` B1-B6、G0.1-G0.8。
-- 验证：`06-index-validation.md` 脚本输出 `errors=0`。
+- **多实例池**：`instance_pool.py` 以“1 实例 = 1 账号 + 1 浏览器上下文 + 1 页面 + 1 surface”为单位管理并发，
+  `active_requests` 是唯一并发原语；Free 与付费账号分 lane 隔离，容量按配置计算，不自动扩容。
+- **请求期路由**：`routing_pipeline.py` 解析 `chat/`、`build/` 模型前缀，按 tier 准入与负载均衡选择实例；
+  排序依据为在途请求数、账号最低满足 tier、总/模型请求数、最近使用与实例编号。
+- **统一生成主链**：`generation_service.py` 统一负责路由获取、同账号空响应重试、账号/实例切换与 usage/finish 提取；
+  OpenAI Chat Completions、`/v1/models` 与 Gemini 原生 `generateContent`、`streamGenerateContent`、`countTokens` 共用该链路。
+- **工具调用与 ATG**：签名缓存、流式截断 JSON 修复与 Struct 形状归一；ATG（Anti-Truncation Gateway）支持
+  `off/prefer/required`，默认关闭。
+- **账号体系**：Cookie 导入与跨域刷新、多子账号递归探测、账号预设与分组、上游原生 tier 与 Paid 识别；
+  账号文件使用临时文件加原子替换写入。
+- **模型发现**：通过池化会话直接调用上游 ListModels，运行时解析 `access_tier` 与 `accessModes`，
+  以 live 结果覆盖静态规则中的 Free/Paid 判定。
+- **保活调度**：`account_keepalive` 提供元数据刷新、Cookie 回写与可选的活跃活动任务，默认 24 小时周期，
+  单全局锁串行执行，忙碌时跳过且不推进下次执行时间。
+- **日志子系统**：stderr、内存环形缓冲（SSE 实时推送）与按日归档三路 sink；日志页支持级别过滤、搜索、
+  暂停与 1/3/7 天导出。
+- **配置与鉴权**：`AISTUDIO_CONFIG_PATH` 指定配置路径，文件缺失时从 `defaults/config.yaml` 播种；
+  支持深合并、热重载与原子写回；对外 API 默认要求 API Key。
+- **Web 控制台**：账号、实例、设置、日志与仪表盘页面；静态前端产物随仓库发布。
+- **容器与 CI**：Dockerfile 内置默认配置与静态前端；GHCR 镜像自动构建，支持 `rebuild-upstream`、`main`、`master`
+  分支与手动触发。
 
-- 范围：`docs/dev/rebuild/08-01/08-02/08-03/08-04/08-05/08-06`
-- 变更：审查文档统一为 `08-0x` 命名；闭合 D12 租约测试、状态机、证据 allowlist、handoff 验收门。
-- 原因：`08-04-final-readiness-audit.md` R1/R3/R4、`08-05-final-readiness-audit.md` 剩余项。
-- 验证：`08-06-final-readiness-audit.md` 复核通过（有条件）；基线 `0f9357b`，交接 HEAD 现查。`06-index-validation.md` 输出 `errors=0`。
+### Changed
 
-- 范围：`docs/dev/rebuild/05`、`06-feature-index.csv`、`08-05`、`08-06`、`10`；`docs/changelog.md`
-- 变更：修正 05 的文档编号引用、10 的 G1-G11 固定出处、D12-006/008 的 decision note；08-05 顶部加“已被 08-06 取代”历史横幅；记录 handoff 基线 SHA。
-- 原因：`08-06-final-readiness-audit.md` §3.2 非阻断残留；G0.1 交接基线。
-- 验证：`06-index-validation.md` 脚本输出 `OK ... errors=0`；交接基线 `7cd92f7dcb2b8675050aa342a38b9853a27e33c4`。
+- 运行时从“控制面单页会话 + 后台自动切换”改为“请求实例池 + 请求期换绑”；控制面只承担管理操作，不占用请求实例容量。
+- 流式输出不再受请求级总超时限制，支持无限时长输出；仅保留工具调用的短空闲终止窗口。
+- 请求按上游 BotGuard 快照就绪状态启动，并按请求固定 `SessionContext`，避免跨请求串扰。
+- 路由候选顺序直接使用账号 tier 秩，实例选择结果可重复、可解释。
+- 配置以 `defaults/config.yaml` 为唯一受版本控制的默认值；根 `config.yaml` 仅作本地运行态，不纳入版本控制。
+- Claude 与 Responses 协议保留配置开关但默认关闭；Build surface 在对应阶段前显式拒绝，而非静默切换 surface。
+- 吸收上游对内存占用、readiness watchdog、`Ultra_20X` tier 归一与 Web 配置编辑器的修复。
 
-- 范围：`docs/dev/rebuild`、`docs/dev/evidence`、`docs/changelog.md`
-- 变更：从 `rebuild @ 8e0ab11` 迁移文档与 evidence allowlist 到 `upstream/master @ 4623109` 之上的 `rebuild-upstream` worktree；`ledger-batches` 仅留 README。
-- 原因：Gate 0 / D6 迁移边界。
-- 验证：迁移提交 `cf6e681`（236 files）；11 个 `.log` force-add；`spikeQ4*` 未迁移；`mustExist` 全过；索引 `errors=0`。
+### Fixed
 
-- 范围：`docs/dev/rebuild/13-gate0-execution-record.md`、`12-gate0-inputs.md`、`acceptance/`、`config/`、`tests/fixtures/{events,pg}`
-- 变更：记录 Gate 0 执行与分支名偏差；冻结 Gate 0.5 五层接口/状态表/config+event schema/PG F-01..F-04 fixture/acceptance 模板，并勾满 12 §6。
-- 原因：`10-handoff-prompt.md` Gate 0/0.5；`08-06-final-readiness-audit.md` §6。
-- 验证：索引脚本 `errors=0`；`config.example.yaml` 通过 `config.schema.json`（jsonschema 0 错误）；disposition 26/26（worktree）/80/80（rebuild）；详见 `13-gate0-execution-record.md` §3。
+- 修复 403 级联切号：首次同账号重新签名重试，第二次才切号；付费 tier 不足的 403 不触发切号。
+- 修复 429 处理：同账号重试一次后池内切号，预算耗尽返回 503。
+- 修复流式截断与意外终止：补齐不完整 JSON 分块，finish-only 与工具流可正确收尾，`CONTINUING` 不再被当作终止码。
+- 修复工具调用参数与响应的 Struct 形状；缺少签名时从缓存取回或使用上游可接受的占位签名。
+- 修复实例池重复预热与双 BotGuard 探针；池化启用时跳过控制面预热。
+- 修复故障槽请求期换绑、路由均衡与实例 tier 选择器（`only_tier`/`min_tier`/`max_tier`）。
+- 修复日志导出与归档写入的脱敏缺口，历史日志不再原样泄漏密钥或 Cookie。
+
+### Removed
+
+- 移除请求级全局超时 watchdog 与后台自动切换/再平衡，相关行为改由路由层显式重试与换绑承担。
+- 移除蓝绿发布与就绪探测的旧调度语义，以及 lease/reservation/pinned/defer 等预留机制。
+- 移除旧的全账号兜底切换路径，避免绕过实例池直接操作浏览器会话。
+- 移除仓库中的历史批次台账与失败草稿，仅保留归档记录。
+
+### Security
+
+- 对外接口默认拒绝匿名访问；仅显式设置 `security.api_allow_anonymous: true` 时放开。
+- 日志在写入环形缓冲与归档文件前统一遮蔽 Authorization、Cookie、Set-Cookie、Google API Key、Bearer 与 `sk-*` 令牌；
+  导出时对历史行再次脱敏，形成纵深防御。
+- 请求与响应 dump 只保留白名单字段，禁止明文记录请求头、Cookie、令牌与完整响应体。
+- API Key 的创建、删除与更新日志固定输出 `***`，不记录 Key 或前缀。
+- Cookie 仅保留核心认证项并剔除易失效项；账号与配置写回使用原子替换，避免半写状态。
+
+## [0.1.0] - 2026-05-16
+
+- 初始开源版本：提供 Google AI Studio 的 OpenAI 兼容接口、账号 Cookie 管理与基础请求转发能力。
