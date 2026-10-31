@@ -622,3 +622,65 @@ def test_ai_studio_client_raw_dump_only_writes_safe_fields(monkeypatch, tmp_path
     assert "super-secret-token" not in raw_text
     assert "AIzaSyRawBodyLeak1234567890" not in raw_text
     assert "raw-cookie-value" not in raw_text
+
+
+def test_set_dump_to_file_runtime_override_does_not_mutate_unrelated_settings(
+    monkeypatch,
+):
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.utils.logger import is_dump_to_file_enabled
+
+    original_dump_to_file = settings.dump_to_file
+    original_dump_requests = settings.dump_requests
+    monkeypatch.delenv("AISTUDIO_DUMP_FILE", raising=False)
+    monkeypatch.delenv("AISTUDIO_DUMP_TO_FILE", raising=False)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults."
+        "get_configured_logging_settings",
+        dict,
+    )
+    try:
+        set_dump_to_file(True)
+        # Simulate settings drift: the runtime override must still win.
+        monkeypatch.setattr(settings, "dump_to_file", False)
+        assert is_dump_to_file_enabled() is True
+        assert settings.dump_requests == original_dump_requests
+    finally:
+        set_dump_to_file(None)
+        settings.dump_to_file = original_dump_to_file
+
+
+@pytest.mark.asyncio
+async def test_request_validation_log_omits_user_input(caplog):
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from fastapi.exceptions import RequestValidationError
+
+    from aistudio_api.api.app import validation_exception_handler
+
+    secret = "SECRET_INPUT_FRAGMENT_9f3a"
+    exc = RequestValidationError(
+        [
+            {
+                "loc": ("body", "prompt"),
+                "type": "string_type",
+                "msg": "Input should be a valid string",
+                "input": {"text": secret},
+            }
+        ]
+    )
+    request = cast(
+        Any,
+        SimpleNamespace(
+            url=SimpleNamespace(path="/v1beta/models/gemini:generateContent")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        response = await validation_exception_handler(request, exc)
+
+    assert response.status_code == 400
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in logged
+    assert "string_type" in logged

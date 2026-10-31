@@ -620,6 +620,16 @@ class RoutingPipeline:
             attempt.client.clear_templates()
             if has_yielded_data:
                 raise exc
+            if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
+                attempt.same_retries += 1
+                context.retry_same = True
+                context.budget.record_retry("403")
+                logger.warning(
+                    "[routing] 403 同账号重新签名重试 instance=%s account=%s",
+                    attempt.instance_id,
+                    attempt.account_id,
+                )
+                return "retry_same"
             return await self._switch_or_raise(
                 context, attempt, exc, reason="auth_error"
             )

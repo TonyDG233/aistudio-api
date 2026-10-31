@@ -364,7 +364,6 @@ class AccountStats:
     def record_auth_error(
         self,
         model: str | None = None,
-        cooldown_seconds: float | None = None,
         *,
         surface: str | None = None,
     ) -> None:
@@ -374,17 +373,9 @@ class AccountStats:
         self.auth_errors += 1
         self.last_auth_error = now
         self.last_used = now
-        if cooldown_seconds is None:
-            from aistudio_api.infrastructure.gateway.model_defaults import (
-                get_configured_rotator_settings,
-            )
-
-            rot_cfg = get_configured_rotator_settings()
-            cooldowns = rot_cfg["cooldowns"]
-            if not isinstance(cooldowns, dict):
-                raise RuntimeError("rotator 配置缺少 cooldowns 配置块")
-            cooldown_seconds = float(str(cooldowns["auth_error"]))
-        self.auth_cooldown = now + cooldown_seconds
+        # 403 是浏览器/WAA 会话故障，绝不给账号加冷却锁；仅靠 auth_errors
+        # 惩罚分做动态避让（首次 403 原位重签，二次 403 才切号）。
+        self.auth_cooldown = 0.0
         m_stats = self.get_model_daily(model, surface=surface)
         m_stats.requests += 1
         m_stats.errors += 1
@@ -886,7 +877,6 @@ class AccountRotator:
         self,
         account_id: str,
         model: str | None = None,
-        cooldown_seconds: float | None = None,
         *,
         surface: str | None = None,
     ) -> None:
@@ -894,13 +884,8 @@ class AccountRotator:
             self._stats[account_id] = AccountStats(
                 account_id=account_id, quota_scope=self.quota_scope
             )
-        self._stats[account_id].record_auth_error(
-            model, cooldown_seconds=cooldown_seconds, surface=surface
-        )
-        logger.warning(
-            "账号 %s 遇到 403 权限拒绝，暂停使用并切换备用账号",
-            account_id,
-        )
+        self._stats[account_id].record_auth_error(model, surface=surface)
+        logger.warning("账号 %s 权限被拒绝 (HTTP 403)", account_id)
         self.save_state()
 
     def record_session_expired(

@@ -16,6 +16,7 @@ from aistudio_api.domain.errors import (
     SessionExpiredError,
     SurfaceCapacityError,
     SurfaceSwitchExhaustedError,
+    TierRequiredError,
     UsageLimitExceeded,
 )
 from aistudio_api.domain.instances import InstanceState
@@ -413,6 +414,14 @@ async def test_auth_error_switch_then_success() -> None:
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     first = await pipeline.acquire(context)
     assert first is not None
+    # 首次 403：同账号重新签名原位重试，不立即切号。
+    assert (
+        await pipeline.handle_error(
+            context, first, AuthError("auth failed"), has_yielded_data=False
+        )
+        == "retry_same"
+    )
+    # 二次 403：才切换到健康账号。
     assert (
         await pipeline.handle_error(
             context, first, AuthError("auth failed"), has_yielded_data=False
@@ -434,10 +443,94 @@ async def test_auth_error_exhausted_raises_original() -> None:
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
+    # 首次 403 允许同账号重新签名重试一次。
+    assert (
+        await pipeline.handle_error(
+            context, attempt, AuthError("auth failed"), has_yielded_data=False
+        )
+        == "retry_same"
+    )
+    # 二次 403 且无备用账号：抛出原始 AuthError。
     with pytest.raises(AuthError):
         await pipeline.handle_error(
             context, attempt, AuthError("auth failed"), has_yielded_data=False
         )
+
+
+@pytest.mark.asyncio
+async def test_paid_tier_required_error_raises_without_switch() -> None:
+    manager = FakeManager(
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    wake_calls_before = list(manager.wake_calls)
+    error = TierRequiredError(
+        model="gemini-4-argon",
+        tier="Pro",
+        required_tier="Ultra",
+        current_tier="Pro",
+    )
+
+    with pytest.raises(TierRequiredError):
+        await pipeline.handle_error(
+            context, attempt, error, has_yielded_data=False
+        )
+
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+    assert manager.wake_calls == wake_calls_before
+
+
+@pytest.mark.asyncio
+async def test_auth_error_then_429_follows_same_instance_policy() -> None:
+    manager = FakeManager(
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    first = await pipeline.acquire(context)
+    assert first is not None
+
+    # 首次 403：同账号重新签名原位重试，不切号。
+    assert (
+        await pipeline.handle_error(
+            context, first, AuthError("auth failed"), has_yielded_data=False
+        )
+        == "retry_same"
+    )
+    assert first.same_retries == 1
+    assert context.budget.switches == 0
+
+    # 随后 429 复用同一重试预算：立即切号，而不是再次原位重试。
+    assert (
+        await pipeline.handle_error(
+            context, first, UsageLimitExceeded("429"), has_yielded_data=False
+        )
+        == "switch"
+    )
+    assert context.budget.switches == 1
+    await pipeline.release(first)
+
+    second = await pipeline.acquire(context)
+    assert second is not None
+    assert second.instance_id == "inst-2"
+    # 新实例上的 429 重新获得一次同账号重试机会。
+    assert (
+        await pipeline.handle_error(
+            context, second, UsageLimitExceeded("429"), has_yielded_data=False
+        )
+        == "retry_same"
+    )
+    await pipeline.release(second)
 
 
 @pytest.mark.asyncio

@@ -82,9 +82,11 @@ class AccountService:
         """更新账号的登录邮箱。"""
         return self._store.update_account_email(account_id, email)
 
-    def update_account_tier(self, account_id: str, tier: str) -> bool:
+    def update_account_tier(
+        self, account_id: str, tier: str, checked_at: str | None = None
+    ) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
-        return self._store.update_account_tier(account_id, tier)
+        return self._store.update_account_tier(account_id, tier, checked_at=checked_at)
 
     def save_account_from_cookies(
         self,

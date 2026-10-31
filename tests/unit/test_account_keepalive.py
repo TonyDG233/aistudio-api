@@ -155,12 +155,18 @@ class FakeManager:
 class FakeRefresher:
     def __init__(self, *, ok: bool = True) -> None:
         self.calls: list[list[str]] = []
+        self.skip_flags: list[bool] = []
         self._ok = ok
 
     async def refresh_accounts(
-        self, accounts: list[AccountMeta], *, refresh_email: bool = True
+        self,
+        accounts: list[AccountMeta],
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[SimpleNamespace]:
         self.calls.append([account.id for account in accounts])
+        self.skip_flags.append(skip_fresh_free_tier)
         return [
             SimpleNamespace(
                 account_id=account.id,
@@ -178,7 +184,11 @@ class GateRefresher:
         self.release = asyncio.Event()
 
     async def refresh_accounts(
-        self, accounts: list[AccountMeta], *, refresh_email: bool = True
+        self,
+        accounts: list[AccountMeta],
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[SimpleNamespace]:
         self.started.set()
         await self.release.wait()
@@ -195,7 +205,11 @@ class GateRefresher:
 
 class BusyRefresher:
     async def refresh_accounts(
-        self, accounts: list[AccountMeta], *, refresh_email: bool = True
+        self,
+        accounts: list[AccountMeta],
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[SimpleNamespace]:
         raise RefreshInProgressError("already running")
 
@@ -213,6 +227,26 @@ class StaticTransport:
         content: str = "",
     ) -> TransportResponse:
         return TransportResponse(status=self.status, body="[]")
+
+
+class CountingTransport:
+    def __init__(self) -> None:
+        self.posts = 0
+        self.gets = 0
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: str = "",
+    ) -> TransportResponse:
+        if method == "POST":
+            self.posts += 1
+        else:
+            self.gets += 1
+        return TransportResponse(status=200, body="[]")
 
 
 def _account(store: AccountStore, account_id: str, email: str) -> AccountMeta:
@@ -525,6 +559,7 @@ async def test_metadata_refresh_only_targets_due_healthy_accounts(tmp_path):
 
     assert result["ok"] is True
     assert refresher.calls == [["acc_stale"]]
+    assert refresher.skip_flags == [True]
     stale_after = store.get_account("acc_stale")
     expired_after = store.get_account("acc_expired")
     assert stale_after is not None
@@ -593,3 +628,48 @@ def test_auto_switch_and_rebalance_are_not_part_of_keepalive():
     import aistudio_api.application.account_keepalive as module
 
     assert "InstanceSwitcher" not in vars(module)
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_skips_benefit_tier_for_fresh_free(tmp_path):
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    account = _account(store, "acc_free", "free@example.com")
+    checked = (now - timedelta(days=2)).isoformat()
+    store.update_account_refresh(account.id, tier="Free", tier_checked_at=checked)
+    transport = CountingTransport()
+    refresher = AccountInfoRefresher(store, transport=transport)
+    service = _service(
+        store, refresher=refresher, clock=FakeClock(now.timestamp())
+    )
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["ok"] is True
+    assert transport.posts == 0
+    after = store.get_account(account.id)
+    assert after is not None
+    assert after.tier == "Free"
+    assert after.tier_checked_at == checked
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_probes_free_tier_older_than_three_days(tmp_path):
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    account = _account(store, "acc_free", "free@example.com")
+    checked = (now - timedelta(days=4)).isoformat()
+    store.update_account_refresh(account.id, tier="Free", tier_checked_at=checked)
+    transport = CountingTransport()
+    refresher = AccountInfoRefresher(store, transport=transport)
+    service = _service(
+        store, refresher=refresher, clock=FakeClock(now.timestamp())
+    )
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["ok"] is True
+    assert transport.posts == 1
+    after = store.get_account(account.id)
+    assert after is not None
+    assert after.tier_checked_at != checked

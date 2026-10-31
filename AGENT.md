@@ -257,6 +257,7 @@ uv run python3 main.py server --port 8080
 - **Free/Pro 分流**：Free 模型走 Free 池；paid 模型必须 Pro 及以上，且先 chat。
 - **Paid 模型 tier 不足**：领域错误 → API 层按 OpenAI/Gemini/Claude/Responses 映射 403；错误体含 `tier/model/required_tier/current_tier`；不切号、不自动降级到 free、不得用 503 表达 tier 不足。
 - **429**：先同账号重试 → 唤醒/切现有池内实例 → 保存消息后切换再重试 → 耗尽 503 + 等待/管理页提示；已出正文不切号。
+- **鉴权 403**：不加硬冷却锁；首次 403 重新签名并原位重试，第二次 403 才切换到健康账号（累加 `auth_errors` 供调度避让）；Paid 模型 `TierRequiredError` 403 不切号。
 - 连续切号上限保留；丢弃全局回退与死熔断器；不请求期切号处理 403。
 - **`quota_scope`（D-01）**：默认 `account`（chat/build 共用额度），可选 `account_surface`（分开）；只影响 `AccountStats` 记账键与 `/stats`/配额展示/429 冷却口径；不新增实例/Context/Page；不请求期自动改口径。
 - 上游瞬态错误：先重试，再路由，再重试；现有实例都试过或触发连续切号上限后报错。

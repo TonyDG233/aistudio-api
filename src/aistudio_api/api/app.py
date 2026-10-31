@@ -8,7 +8,9 @@ import inspect
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -47,6 +49,9 @@ from .routes_system import (
 )
 from .state import RuntimeState, runtime_state
 
+if TYPE_CHECKING:
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
 _log_cfg = get_configured_logging_settings()
 setup_logging(str(_log_cfg.get("level", "INFO")))
 logger = get_logger("server")
@@ -77,7 +82,9 @@ async def _warmup_control_session(client: AIStudioClient) -> None:
     """
     for attempt in range(3):
         try:
+            logger.debug("开始预热浏览器后端: attempt=%d", attempt + 1)
             await client.warmup()
+            logger.debug("浏览器预热就绪: attempt=%d", attempt + 1)
             return
         except Exception as exc:
             if attempt < 2:
@@ -128,6 +135,120 @@ async def _refresh_model_catalog_once(state: RuntimeState) -> int:
     return len(models)
 
 
+TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
+
+
+def _checked_at_ts(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+async def _refresh_startup_account_metadata(
+    account_store: AccountStore,
+    *,
+    covered_ids: set[str] | None = None,
+) -> None:
+    """Probe startup tier/email, skipping keepalive-covered and fresh Free accounts.
+
+    ``covered_ids`` are accounts already handled by the keepalive startup
+    metadata refresh. A verified Free tier whose ``tier_checked_at`` is within
+    three days skips the benefit-tier HTTP probe; a missing email is still
+    refreshed.
+    """
+    import json
+
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        is_verified_free_tier_fresh,
+    )
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        probe_account_benefit_tier,
+        probe_account_email,
+    )
+
+    covered = covered_ids or set()
+    now_ts = time.time()
+    accounts_to_check = [
+        account
+        for account in account_store.list_accounts()
+        if account.id not in covered
+        and (
+            not account.email
+            or (checked := _checked_at_ts(account.tier_checked_at)) is None
+            or (now_ts - checked > TIER_PROBE_FRESHNESS_SECONDS)
+        )
+    ]
+    if not accounts_to_check:
+        logger.debug("启动探测：账号已被 keepalive 覆盖或最近已校验，跳过")
+        return
+
+    logger.info(
+        "开始自动校验账号订阅等级与邮箱 (共 %d 个账号待检测)...",
+        len(accounts_to_check),
+    )
+    upgraded_count = 0
+    checked_count = 0
+    skipped_tier_count = 0
+
+    for account in accounts_to_check:
+        auth_path = account_store.get_auth_path(account.id)
+        if auth_path is None or not auth_path.is_file():
+            continue
+        try:
+            auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
+            raw_cookies = auth_data.get("cookies") or []
+            cookie_dict = {
+                str(cookie.get("name") or ""): str(cookie.get("value") or "")
+                for cookie in raw_cookies
+                if isinstance(cookie, dict) and cookie.get("name")
+            }
+            if not cookie_dict:
+                continue
+            checked_count += 1
+            if not account.email:
+                email = await probe_account_email(
+                    cookie_dict, auth_user=account.auth_user or "0"
+                )
+                if email:
+                    account_store.update_account_email(account.id, email)
+            if is_verified_free_tier_fresh(account, now=now_ts):
+                skipped_tier_count += 1
+                logger.debug(
+                    "订阅等级 3 天内已校验且为 Free，跳过启动 tier 探测: id=%s",
+                    account.id,
+                )
+                continue
+            probed_tier = await probe_account_benefit_tier(
+                cookie_dict, auth_user=account.auth_user or "0"
+            )
+            resolved_tier = probed_tier or "Free"
+            account_store.update_account_tier(
+                account.id,
+                resolved_tier,
+                checked_at=datetime.now(UTC).isoformat(),
+            )
+            if resolved_tier != "Free" and account.tier == "Free":
+                upgraded_count += 1
+                logger.info(
+                    "账号订阅等级自动升级: id=%s (u/%s) -> %s",
+                    account.id,
+                    account.auth_user,
+                    resolved_tier,
+                )
+        except Exception as exc:
+            logger.debug("账号 %s 订阅检测异常: %s", account.id, exc)
+
+    logger.info(
+        "账号订阅校验完成: 检测=%d 个, 跳过 tier=%d 个, 发现付费订阅=%d 个",
+        checked_count,
+        skipped_tier_count,
+        upgraded_count,
+    )
+
+
 async def _shutdown_runtime(
     state: RuntimeState,
     tasks: tuple[asyncio.Task[object] | None, ...] = (),
@@ -159,7 +280,10 @@ async def lifespan(_app: FastAPI):
     validate_config()
     signature_cache.configure_path(resolve_data_dir() / "signature_cache.json")
 
-    from aistudio_api.application.account_keepalive import AccountKeepaliveService
+    from aistudio_api.application.account_keepalive import (
+        AccountKeepaliveService,
+        KeepaliveSettings,
+    )
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_info_refresher import (
@@ -197,9 +321,16 @@ async def lifespan(_app: FastAPI):
     if active_auth_path is not None and client.session is not None:
         client.session._auth_file = str(active_auth_path)
     logger.info(
-        "Client initialized (port=%s, accounts=%d)",
+        "服务初始化完成: 监听浏览器调试端口=%d, 已加载账号数=%d",
         runtime_state.browser_port,
         len(account_store.list_accounts()),
+    )
+    logger.debug(
+        "账号初始状态: %s",
+        [
+            f"{a.id}(u/{a.auth_user},tier={a.tier},enabled={a.enabled})"
+            for a in account_store.list_accounts()
+        ],
     )
 
     # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
@@ -252,10 +383,36 @@ async def lifespan(_app: FastAPI):
         instance_manager=instance_manager,
     )
     runtime_state.keepalive = keepalive
-    await keepalive.start()
+    # App owns the first metadata refresh below so the two startup probes can
+    # coordinate: keepalive reports covered accounts and app-side skips them.
+    await keepalive.start(startup_metadata_done=True)
 
     startup_task: asyncio.Task[object] | None = None
     startup_task = asyncio.create_task(_startup_instances(runtime_state, warmup_task))
+
+    # 启动订阅/邮箱自检：先跑 keepalive metadata refresh，再对未被覆盖的账号
+    # 做应用侧探测；3 天内已验证 Free 的账号跳过 benefit-tier 探测。
+    tier_task: asyncio.Task[object] | None = None
+
+    async def _startup_metadata_and_tiers() -> None:
+        covered_ids: set[str] = set()
+        settings = KeepaliveSettings.from_config()
+        if settings.metadata_refresh and settings.metadata_refresh_on_startup:
+            result = await keepalive.run_startup_metadata_refresh()
+            raw_accounts = result.get("accounts")
+            if result.get("reason") in ("checked", "no_due_accounts"):
+                if isinstance(raw_accounts, (list, tuple)):
+                    covered_ids = {str(account_id) for account_id in raw_accounts}
+            else:
+                logger.debug(
+                    "keepalive 启动 metadata 刷新未覆盖批次: reason=%s",
+                    result.get("reason"),
+                )
+        await _refresh_startup_account_metadata(
+            account_store, covered_ids=covered_ids
+        )
+
+    tier_task = asyncio.create_task(_startup_metadata_and_tiers())
 
     # Model discovery warmup: wait until the instance pool has a READY session
     # (preferring the Pro/paid lane), then refresh the live ListModels catalog
@@ -289,7 +446,7 @@ async def lifespan(_app: FastAPI):
     finally:
         logger.info("服务正在关闭")
         await _shutdown_runtime(
-            runtime_state, (warmup_task, startup_task, model_warmup_task)
+            runtime_state, (warmup_task, startup_task, tier_task, model_warmup_task)
         )
 
 
@@ -337,15 +494,37 @@ async def aistudio_error_handler(request: Request, exc: Exception) -> JSONRespon
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    if _is_openai_path(request):
-        from aistudio_api.api.format_errors import format_error_response
-
-        return format_error_response(exc, "openai")
     detail = exc.detail
     if isinstance(detail, dict):
         msg = str(detail.get("message") or detail)
     else:
         msg = str(detail)
+    code = exc.status_code
+    if code >= 500:
+        logger.error(
+            "HTTP 异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    elif code in (401, 403, 429):
+        logger.warning(
+            "HTTP 权限/限额异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    else:
+        logger.info(
+            "HTTP 业务异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    if _is_openai_path(request):
+        from aistudio_api.api.format_errors import format_error_response
+
+        return format_error_response(exc, "openai")
     status_map = {
         400: "INVALID_ARGUMENT",
         401: "UNAUTHENTICATED",
@@ -355,10 +534,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
         429: "RESOURCE_EXHAUSTED",
         503: "UNAVAILABLE",
     }
-    code = exc.status_code
-    status_str = status_map.get(
-        code, "INTERNAL" if code >= 500 else "UNKNOWN"
-    )
+    status_str = status_map.get(code, "INTERNAL" if code >= 500 else "UNKNOWN")
     return JSONResponse(
         status_code=code,
         content={
@@ -391,6 +567,20 @@ async def validation_exception_handler(
 
         return format_error_response(exc, "openai")
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
+    # RequestValidationError.errors() does not support include_input here, so
+    # project only non-input fields to keep prompts/body fragments out of logs.
+    safe_errors = [
+        {
+            "loc": error.get("loc"),
+            "type": error.get("type"),
+            "msg": error.get("msg"),
+        }
+        for error in exc.errors()
+        if isinstance(error, dict)
+    ]
+    logger.warning(
+        "请求参数校验失败: path=%s, errors=%s", request.url.path, safe_errors
+    )
     return JSONResponse(
         status_code=code,
         content={
@@ -608,5 +798,5 @@ def main():
 
     import uvicorn
 
-    logger.info("正在启动服务，监听端口 %s", args.port)
+    logger.info("启动服务: 监听端口=%d, 浏览器调试端口=%d", args.port, runtime_state.browser_port)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")

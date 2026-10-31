@@ -123,8 +123,33 @@ class _CookieJar:
     jar: dict[str, str]
 
 
+TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _parse_checked_at(value: object) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def is_verified_free_tier_fresh(account: object, *, now: float | None = None) -> bool:
+    """True when a verified Free tier was checked within the last three days."""
+    if str(getattr(account, "tier", "") or "") != "Free":
+        return False
+    checked = _parse_checked_at(getattr(account, "tier_checked_at", None))
+    if checked is None:
+        return False
+    current = time.time() if now is None else now
+    return current - checked < TIER_PROBE_FRESHNESS_SECONDS
 
 
 def resolve_app_id() -> str:
@@ -200,7 +225,11 @@ class AccountInfoRefresher:
         return self._concurrency
 
     async def refresh_account(
-        self, account: AccountMeta, *, refresh_email: bool = True
+        self,
+        account: AccountMeta,
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> RefreshResult:
         """刷新单账号：凭据有效性 + 档位（可选邮箱回填）。"""
         cookies = self._load_cookies(account)
@@ -215,6 +244,32 @@ class AccountInfoRefresher:
             )
 
         checked_at = _now_iso()
+        if skip_fresh_free_tier and is_verified_free_tier_fresh(account):
+            email: str | None = None
+            email_error: str | None = None
+            if refresh_email or not account.email:
+                try:
+                    email = await self._fetch_account_email(
+                        cookies, account.email, auth_user=account.auth_user
+                    )
+                except Exception as e:
+                    email_error = str(e)
+            if email:
+                self._store.update_account_refresh(account.id, email=email)
+            logger.info(
+                "[Refresh] %s verified Free within 3 days; tier probe skipped",
+                account.id,
+            )
+            return RefreshResult(
+                account_id=account.id,
+                ok=True,
+                tier=str(account.tier or "Free"),
+                expired=False,
+                email=email or account.email,
+                error=email_error,
+                checked_at=checked_at,
+            )
+
         response = await self._post_tier_request(cookies, auth_user=account.auth_user)
         envelope = self._parse_envelope(response.body)
         message = self._envelope_message(envelope)
@@ -305,6 +360,7 @@ class AccountInfoRefresher:
         accounts: list[AccountMeta],
         *,
         refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[RefreshResult]:
         """并发刷新一批账号（``Semaphore`` 限流，结果顺序与输入一致）。
 
@@ -323,7 +379,11 @@ class AccountInfoRefresher:
 
         async def _run(account: AccountMeta) -> RefreshResult:
             async with semaphore:
-                return await self.refresh_account(account, refresh_email=refresh_email)
+                return await self.refresh_account(
+                    account,
+                    refresh_email=refresh_email,
+                    skip_fresh_free_tier=skip_fresh_free_tier,
+                )
 
         try:
             results = await asyncio.gather(*(_run(account) for account in accounts))
@@ -569,6 +629,7 @@ class AccountInfoRefresher:
 
 
 __all__ = [
+    "TIER_PROBE_FRESHNESS_SECONDS",
     "AccountInfoRefresher",
     "HttpTransport",
     "HttpxTransport",

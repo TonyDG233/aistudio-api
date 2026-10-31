@@ -17,6 +17,7 @@ from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     DOM_GC_CLEANUP_JS,
     SNAPSHOT_GENERATE_JS,
+    build_snapshot_args,
 )
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
     bootstrap_botguard_and_template,
@@ -88,6 +89,7 @@ class PooledSession:
                     page,
                     reload_cookies_cb=reload_cb,
                     is_proc_alive_cb=lambda: not page.is_closed(),
+                    auth_user=target_auth_user,
                 ),
                 timeout=timeout_s,
             )
@@ -159,18 +161,23 @@ class PooledSession:
         return base
 
     async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
-        content_hash = sha256(
-            " ".join(build_snapshot_hash_parts(contents)).encode("utf-8")
-        ).hexdigest()
+        prompt = " ".join(build_snapshot_hash_parts(contents))
+        content_hash = sha256(prompt.encode("utf-8")).hexdigest()
+        args = build_snapshot_args(prompt=prompt, content_hash=content_hash)
         async with self._snapshot_lock:
             for attempt in range(5):
                 try:
-                    snapshot = await self._context.page.evaluate(
+                    raw_res = await self._context.page.evaluate(
                         SNAPSHOT_GENERATE_JS,
-                        args=content_hash,
+                        args=args,
                         timeout_s=25.0,
                     )
-                    if isinstance(snapshot, str) and snapshot:
+                    snapshot = ""
+                    if isinstance(raw_res, dict):
+                        snapshot = str(raw_res.get("snapshot") or "")
+                    elif isinstance(raw_res, str):
+                        snapshot = raw_res
+                    if snapshot:
                         return snapshot
                 except Exception as exc:
                     log.debug("PooledSession 快照第 %d 次失败: %s", attempt + 1, exc)

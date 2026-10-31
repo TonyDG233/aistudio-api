@@ -153,3 +153,92 @@ async def test_shutdown_cancels_and_gathers_unfinished_background_tasks():
     assert pending.done()
     assert pending_other.done()
     assert not already_done.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_startup_metadata_and_app_probe_do_not_double_probe(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from aistudio_api.application.account_keepalive import (
+        AccountKeepaliveService,
+        KeepaliveSettings,
+    )
+    from aistudio_api.infrastructure.account import cookie_parser
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        AccountInfoRefresher,
+        TransportResponse,
+    )
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    class _CountingTransport:
+        def __init__(self) -> None:
+            self.posts = 0
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            content: str = "",
+        ) -> TransportResponse:
+            if method == "POST":
+                self.posts += 1
+            return TransportResponse(status=200, body="[]")
+
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    account = store.save_account(
+        "acc-1",
+        "",
+        {"cookies": [{"name": "SID", "value": "sid", "domain": ".google.com"}]},
+        account_id="acc-1",
+        tier="Pro",
+    )
+    store.update_account_refresh(
+        account.id,
+        tier="Pro",
+        tier_checked_at=(now - timedelta(days=2)).isoformat(),
+    )
+    transport = _CountingTransport()
+    service = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        AccountInfoRefresher(store, transport=transport),
+        clock=lambda: now.timestamp(),
+        tick_seconds=3600.0,
+    )
+    settings = KeepaliveSettings.from_mapping(
+        {"metadata_refresh": True, "metadata_refresh_on_startup": True}
+    )
+
+    result = await service.run_now("metadata_refresh", settings=settings)
+    raw_accounts = result.get("accounts")
+    assert isinstance(raw_accounts, (list, tuple))
+    covered = {str(item) for item in raw_accounts}
+    assert covered == {account.id}
+    assert transport.posts == 1
+
+    calls: list[str] = []
+
+    async def _fake_tier(raw_or_dict: object, auth_user: str = "0") -> str:
+        calls.append("tier")
+        return "Pro"
+
+    async def _fake_email(raw_or_dict: object, auth_user: str = "0") -> str:
+        calls.append("email")
+        return "acc-1@example.com"
+
+    monkeypatch.setattr(
+        cookie_parser, "probe_account_benefit_tier", _fake_tier
+    )
+    monkeypatch.setattr(cookie_parser, "probe_account_email", _fake_email)
+
+    await app_module._refresh_startup_account_metadata(
+        store, covered_ids=covered
+    )
+    assert calls == []
+
+    await app_module._refresh_startup_account_metadata(store)
+    assert calls == ["email"]
+    assert transport.posts == 1

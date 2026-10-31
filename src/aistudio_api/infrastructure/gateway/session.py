@@ -9,6 +9,7 @@ task exists here.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -24,9 +25,9 @@ from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     DOM_GC_CLEANUP_JS,
     SNAPSHOT_GENERATE_JS,
+    build_snapshot_args,
 )
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
-    BOTGUARD_BOOTSTRAP_PROMPT,
     bootstrap_botguard_and_template,
 )
 from aistudio_api.infrastructure.gateway.session_auth import (
@@ -293,6 +294,7 @@ class BrowserSession:
                     is_proc_alive_cb=lambda: (
                         self._proc is None or self._proc.is_alive()
                     ),
+                    auth_user=target_auth_user,
                 )
 
                 target_tier = get_tier_from_meta(auth_file)
@@ -309,7 +311,7 @@ class BrowserSession:
                 self._preparing = False
                 self._ready_event.set()
                 log.info(
-                    "会话切换完成: auth_file=%s, u/%s (活跃在途=%d)",
+                    "会话切换成功: 文件=%s, auth_user=%s, 在途请求数=%d",
                     auth_file,
                     target_auth_user,
                     self._in_flight,
@@ -328,7 +330,7 @@ class BrowserSession:
                 self._preparing = False
                 self._last_error = exc
                 self._ready_event.set()
-                log.error("会话切换失败: %s", exc)
+                log.error("会话切换失败: 目标文件=%s, 错误=%s", auth_file, exc)
                 raise
 
     async def _drain_and_close_context(self, context: SessionContext) -> None:
@@ -402,22 +404,27 @@ class BrowserSession:
                     body_list[0] = normalized_model
                     base["body"] = json.dumps(body_list, separators=(",", ":"))
         except Exception as e:
-            log.debug("Failed to adapt model into base template body: %s", e)
+            log.debug("适配模型名称至模板失败: %s", e)
         return base
 
     async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
         ctx = await self.ensure_ready()
-        content_hash = sha256(
-            " ".join(build_snapshot_hash_parts(contents)).encode("utf-8")
-        ).hexdigest()
+        prompt = " ".join(build_snapshot_hash_parts(contents))
+        content_hash = sha256(prompt.encode("utf-8")).hexdigest()
+        args = build_snapshot_args(prompt=prompt, content_hash=content_hash)
 
         async with self._snapshot_lock:
             for attempt in range(5):
                 try:
-                    snapshot = await ctx.page.evaluate(
-                        SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
+                    raw_res = await ctx.page.evaluate(
+                        SNAPSHOT_GENERATE_JS, args=args, timeout_s=25.0
                     )
-                    if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
+                    snapshot = ""
+                    if isinstance(raw_res, dict):
+                        snapshot = str(raw_res.get("snapshot") or "")
+                    elif isinstance(raw_res, str):
+                        snapshot = raw_res
+                    if snapshot:
                         return snapshot
                 except Exception as e:
                     log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
@@ -490,15 +497,13 @@ class BrowserSession:
         if (
             target_page is not None
             and not target_page.is_closed()
-            and (self._in_flight <= 0 or (self._stream_cleanup_count % 5 == 0))
+            and self._in_flight <= 0
         ):
             with suppress(Exception):
                 await target_page.evaluate(DOM_GC_CLEANUP_JS)
-            if self._in_flight <= 0 and (self._stream_cleanup_count % 10 == 0):
+            if self._stream_cleanup_count % 10 == 0:
                 with suppress(Exception):
                     await target_page.collect_garbage()
-                import gc
-
                 gc.collect()
 
     async def import_cookies(
@@ -627,7 +632,6 @@ class BrowserSession:
 
 
 __all__ = [
-    "BOTGUARD_BOOTSTRAP_PROMPT",
     "DEFAULT_BOOTSTRAP_TEMPLATE",
     "DRAIN_TIMEOUT_S",
     "BrowserSession",

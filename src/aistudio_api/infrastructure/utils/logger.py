@@ -155,7 +155,7 @@ def is_dump_to_file_enabled() -> bool:
 
 
 def set_dump_to_file(enabled: bool | None) -> None:
-    """动态设置是否落盘转储文件。"""
+    """动态设置是否将转储数据持久化为文件。"""
     global _dump_to_file_override
     _dump_to_file_override = enabled
     if enabled is not None:
@@ -303,6 +303,9 @@ def set_log_level(level: str | int) -> None:
     for logger_name in _NOISY_LOGGER_PREFIXES:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
+    # 静默外部 HTTP 客户端的冗余网络日志（即使 DEBUG 也不放大 httpx/httpcore 噪音）
+    for logger_name in ("httpx", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 def setup_logging(level: str | int = "INFO") -> None:
     """初始化全局日志系统：stderr + broadcast + daily file 三 sink。"""
@@ -335,8 +338,8 @@ def setup_logging(level: str | int = "INFO") -> None:
     with contextlib.suppress(OSError):
         cleanup_old_logs()
 
-    # 将 uvicorn 的日志器也接入统一格式
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    # 将 uvicorn 与 httpx 的日志器也接入统一格式
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore"):
         lgr = logging.getLogger(logger_name)
         lgr.handlers.clear()
         if _root_handler not in lgr.handlers:
@@ -344,7 +347,6 @@ def setup_logging(level: str | int = "INFO") -> None:
         lgr.propagate = False
 
     set_log_level(level)
-
 
 def get_logger(name: str = "aistudio") -> logging.Logger:
     """获取遵循统一命名空间的日志器实例。"""
@@ -454,6 +456,12 @@ def dump_request_exchange(
     response_headers: dict[str, str] | None = None,
     response_text: str | None = None,
     is_stream: bool = False,
+    model: str | None = None,
+    account_id: str | None = None,
+    auth_user: str | None = None,
+    token_usage: dict[str, object] | None = None,
+    finish_reason: str | None = None,
+    error_detail: str | None = None,
 ) -> None:
     """转储单次完整请求与响应详细信息。"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -504,6 +512,9 @@ def dump_request_exchange(
                 "method": method,
                 "url": safe_url,
                 "client": client,
+                "model": model,
+                "account_id": account_id,
+                "auth_user": auth_user,
                 "safe_headers": safe_headers,
                 "safe_query_params": safe_query_params,
                 "safe_body": safe_body,
@@ -512,8 +523,9 @@ def dump_request_exchange(
                 "is_stream": is_stream,
                 "safe_response_headers": safe_resp_headers if response_headers else {},
                 "safe_response_body": safe_response_body,
+                "token_usage": token_usage,
+                "finish_reason": finish_reason,
             }
-
             serialized = json.dumps(record_data, ensure_ascii=False, indent=2)
             dump_file_path.write_text(serialized, encoding="utf-8")
 
@@ -523,11 +535,18 @@ def dump_request_exchange(
             dump_logger.warning("请求文件转储失败: %s", e)
 
     file_line = f"转储文件:     {dump_file_path}\n" if dump_file_path else ""
+    model_line = f"目标模型:     {model}\n" if model else ""
+    acc_line = f"调度账号:     {account_id} (u/{auth_user or '0'})\n" if account_id else ""
+    usage_line = f"Token统计:    {json.dumps(token_usage, ensure_ascii=False)}\n" if token_usage else ""
+    finish_line = f"结束原因:     {finish_reason}\n" if finish_reason else ""
+    error_line = f"错误详情:     {error_detail}\n" if error_detail else ""
     dump_msg = (
         f"\n==================== [请求报文转储: {req_id}] ====================\n"
         f"记录时间:     {timestamp}\n"
         f"客户端:       {client}\n"
         f"请求接口:     {method} {safe_url}\n"
+        f"{model_line}"
+        f"{acc_line}"
         f"{file_line}"
         f"查询参数:     {safe_query_params if safe_query_params else '(无)'}\n"
         f"请求头:\n{header_lines}\n"
@@ -535,6 +554,9 @@ def dump_request_exchange(
         f"-------------------- [响应报文转储: {req_id}] --------------------\n"
         f"响应状态:     HTTP {status_code}\n"
         f"处理耗时:     {elapsed_ms:.2f} ms\n"
+        f"{usage_line}"
+        f"{finish_line}"
+        f"{error_line}"
         f"{resp_header_lines}"
         f"响应内容:\n{pretty_resp}\n"
         f"==================== [转储结束: {req_id}] ===================="

@@ -370,13 +370,24 @@ def validate_config_mapping(raw_dict: object) -> dict[str, object]:
         "rate_limited_short",
         "rate_limited_drip",
         "rate_limited_drip_extended",
-        "auth_error",
     ):
         value = cooldowns.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigValidationError(
                 f"配置校验失败：rotator.cooldowns.{key} 必须为数值，当前值为 {value!r}"
             )
+
+    # ``auth_error`` is a legacy/dead knob. Upstream configs omit it; keep it
+    # optional for compatibility while defaulting to 0 (403 has no hard lock).
+    if "auth_error" in cooldowns:
+        auth_error = cooldowns["auth_error"]
+        if isinstance(auth_error, bool) or not isinstance(auth_error, (int, float)):
+            raise ConfigValidationError(
+                "配置校验失败：rotator.cooldowns.auth_error 必须为数值，"
+                f"当前值为 {auth_error!r}"
+            )
+    else:
+        cooldowns["auth_error"] = 0
 
     paid_rules = _require_mapping(config, "paid_model_rules")
     for name, rule in paid_rules.items():
@@ -554,8 +565,12 @@ class ModelProfile:
         )
 
 
-def _normalize_model_name(model: str) -> str:
-    return model.removeprefix("models/").lower()
+def normalize_model_name(model: str) -> str:
+    """Normalize model string (strip, lowercase, remove 'models/' prefix)."""
+    return model.strip().removeprefix("models/").lower()
+
+
+_normalize_model_name = normalize_model_name
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -754,7 +769,7 @@ def _default_config() -> dict[str, object]:
                 "rate_limited_short": 60,
                 "rate_limited_drip": 300,
                 "rate_limited_drip_extended": 600,
-                "auth_error": 300,
+                "auth_error": 0,
             },
         },
         "features": {
