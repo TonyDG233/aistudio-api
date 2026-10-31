@@ -199,8 +199,21 @@ uv run python3 main.py server --port 8080
 - **1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（chat 或 build）**。
 - 同一账号的 chat/build 不并存；需要切换就关闭当前实例再重建，或换账号。
 - 实例是调度与用量单位；Context/Page 是实现细节，不作为用户可配置项。
-- 实例配置使用 `count/surface/min_tier`；全局只做总上限。
+- 实例配置使用 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器；全局只做总上限。
 - 容量按实例数计算，不再有 reservation 计数。
+
+#### 4.1.1 实例 Tier 选择器（only_tier / min_tier / max_tier）
+
+实例 tier 选择器定义账号可落入的闭区间；实现事实在 `application/model_access.py` 与 `infrastructure/gateway/model_defaults.py`。
+
+- **至少一个选择器**：`only_tier`/`min_tier`/`max_tier` 至少一个非空；`None`/空字符串视为未提供；显式提供的非空值必须是字符串，非字符串（如数字/列表）或未知 tier 名称一律 fail-fast（`model_access.py:96-116`、`model_defaults.py:300-332`）。未知/非字符串不得静默忽略，否则槽位会漂移到非预期 lane。
+- **`only_tier` 精确钉住**：`Free` 归一 `Free..Free`；`Ultra` 展开 `Ultra..Ultra_20X`；`Plus`/`Pro` 保持精确。`only_tier` 不得与不同的 `min_tier/max_tier` 同时配置；允许标准化后的同区间写法（如 `only=Free,min=Free,max=Free`）（`model_access.py:140-155`）。
+- **`min_tier` 单独**：`Free` → `Free..Free`；付费 tier → `min..Ultra_20X`（`model_access.py:167-170`）。
+- **`max_tier` 单独**：`Free` → `Free..Free`；付费上限下界默认 `Pro`，不能低于 Pro；确需 Plus 槽位时显式 `only_tier: Plus`（`model_access.py:157-165`）。
+- **`min_tier` + `max_tier`**：形成闭区间；要求 `rank(min) <= rank(max)`；Free 只能 `Free..Free`，不得与付费混合；付费区间 `min` 不能低于 Plus、`max` 不能低于 Pro（`model_access.py:172-188`）。
+- **Lane 规则**：Free 选择器只落 Free lane；任何付费选择器落 paid lane；账号 tier 必须先匹配 lane，再满足 `min..max`（`model_access.py:191-196`、`instance_pool.py:180-190`）。`InstancePool.add_slot` 与 `InstanceManager.reassign` 都拒绝跨 lane（`instance_pool.py:327-343`、`instance_manager.py:389-404`）。
+- **归一化与合并**：所有 Free 选择器归一为 `only=Free,min=Free,max=Free`，使 `only_tier: Free` 与旧 `min_tier: Free` 合并 count；paid `only_tier` 单独成键；`min/max` 仅在上界显式配置时把上界纳入合并键（`model_defaults.py:345-391`）。
+- **运行时契约**：`InstanceSpec.from_mapping` 归一 spec，`spec.selector` 生成闭区间，`accepts_tier` 校验账号（`instance_pool.py:71-114`）；实例 API 返回 `only_tier/min_tier/max_tier`，前端 `.vue` 暂不改，留待 C2（`domain/instances.py:18-33`、`instance_manager.py:1031-1047`）。
 
 ### 4.2 Free/Pro 多实例池（核心灵魂）
 
@@ -208,7 +221,7 @@ uv run python3 main.py server --port 8080
 - Free 账号实例与 Pro 账号实例可以同时在线，各自独立 BrowserContext/Page/Cookie/模板/在途计数；**严禁 Free 模型占用或消耗 Pro 账号配额**。
 - 候选包含 SLEEPING/UNSTARTED 实例；消息到达时唤醒所有合格休眠/未启动实例，不局限于存活实例。
 - 容量按实例数计算；不自动新开实例；容量满按路由/切号/503 处理。
-- 实例数量、surface、最低 tier 只在实例配置设置；不恢复策略组、tag、quota group、affinity 打分。
+- 实例数量、surface、tier 区间（`only_tier`/`min_tier`/`max_tier`）只在实例配置设置；不恢复策略组、tag、quota group、affinity 打分。
 
 ### 4.3 唯一并发原语：`active_requests`
 
@@ -254,10 +267,10 @@ uv run python3 main.py server --port 8080
 
 ## 5. 路由、错误与重试
 
-- **Free/Pro 分流**：Free 模型走 Free 池；paid 模型必须 Pro 及以上，且先 chat。
+- **Free/Pro 分流**：Free 模型走 Free 池；paid 模型必须 Pro 及以上，且先 chat；实例 tier 区间只决定账号能否落槽，不改变模型准入。
 - **Paid 模型 tier 不足**：领域错误 → API 层按 OpenAI/Gemini/Claude/Responses 映射 403；错误体含 `tier/model/required_tier/current_tier`；不切号、不自动降级到 free、不得用 503 表达 tier 不足。
 - **429**：先同账号重试 → 唤醒/切现有池内实例 → 保存消息后切换再重试 → 耗尽 503 + 等待/管理页提示；已出正文不切号。
-- **鉴权 403**：不加硬冷却锁；首次 403 重新签名并原位重试，第二次 403 才切换到健康账号（累加 `auth_errors` 供调度避让）；Paid 模型 `TierRequiredError` 403 不切号。
+- **鉴权 403**：不加硬冷却锁（`auth_cooldown=0.0`）；首次 403 重新签名并原位重试，第二次 403 才切换到健康账号；`auth_errors` 只累加计数，调度准入不读取，不存在动态避让；Paid 模型 `TierRequiredError` 403 不切号。
 - 连续切号上限保留；丢弃全局回退与死熔断器；不请求期切号处理 403。
 - **`quota_scope`（D-01）**：默认 `account`（chat/build 共用额度），可选 `account_surface`（分开）；只影响 `AccountStats` 记账键与 `/stats`/配额展示/429 冷却口径；不新增实例/Context/Page；不请求期自动改口径。
 - 上游瞬态错误：先重试，再路由，再重试；现有实例都试过或触发连续切号上限后报错。
@@ -320,13 +333,13 @@ uv run python3 main.py server --port 8080
 
 ## 8. 配置口径
 
-- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/min_tier`；全局只做总上限。
+- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`config/config.schema.json` 覆盖 `defaults/config.yaml` 与 Gate 0.5 示例的顶层键；跨字段语义仍由 `application/model_access` 与 `model_defaults` 在运行期校验。
 - **D-07**：`_load_yaml_config` 不得浅替换 `rotator` 块；缺失键用默认值深合并；启动时校验类型/必填；请求路径不得抛 `KeyError`；非关键配置回退默认必须显式记录。
 - 删除 `channel_registry`，只保留 `surface=chat/build`；删除旧 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
 - 保留热更新与原子写回；legacy 配置键一次性迁移后删除；关键配置 fail-fast，非关键配置回退默认。
 - **D-12**：新设置按现有 UI（`SettingsView`/`ApiKeyManagerCard` 等）增量承载，不重构 Web 布局/导航；`hash_include_code` 是诊断开关，不进普通用户 UI。
-- **配置双写（待修改）**：目标树当前 `config.yaml` 与 `defaults/config.yaml` 均为 tracked，这是上游骨架状态，不是目标口径。主仓已实装 `defaults/config.yaml` 单一分发默认；根 `config.yaml` 只作本地运行时配置，必须 git-ignored/不入库，避免把个人信息带进仓库。
-- **B1（P9-pre）迁移**：默认配置以 `defaults/config.yaml` 为 tracked 基准，根 `config.yaml` 从版本控制移除并加入 ignore；迁移完成前不得提交任何根配置运行态内容；features 变更本地同步两处，但只提交 `defaults/config.yaml`。
+- **配置跟踪（已迁移）**：根 `config.yaml` 是本地运行时配置，untracked + gitignored（`.gitignore:15:/config.yaml`），不得入库；`defaults/config.yaml` 是唯一 tracked 的分发默认。`git ls-files config.yaml` 为空，与 Q-04/changelog 一致。
+- **B1（P9-pre）迁移**：默认配置以 `defaults/config.yaml` 为 tracked 基准；根 `config.yaml` 已从版本控制移除并加入 ignore；features 变更只提交 `defaults/config.yaml`，根运行态内容不提交。
 
 ---
 
@@ -371,7 +384,7 @@ aistudio-api/
 │   │   ├── browser/               # CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine, scripts)
 │   │   ├── gateway/               # 会话/鉴权/捕获/重放/传输/Wire (session, session_auth, capture, replay, transport, client, wire_*, streaming, model_*)
 │   │   └── utils/                 # 统一日志与通用工具 (logger, common)
-├── config.yaml                    # 本地运行时配置 (待修改：应 git-ignored；当前骨架仍 tracked)
+├── config.yaml                    # 本地运行时配置 (untracked + gitignored；不入库)
 ├── defaults/config.yaml           # 单一分发默认配置 (tracked)
 ├── main.py                        # 本地统一启动入口
 └── tests/                         # 单元测试套件

@@ -99,6 +99,10 @@
     "root_config_tracked": false,
     "secrets_printed": false
   },
-  "verdict": "PASS",
-  "reason": "Functional live run passed all checks (one server start, 5/5 generations, both streams, native tools + signature_cache, PG-08/ATG prefer stream, four-field 403 on both surfaces, countTokens JSON). B4 export sanitizer and historical log cleanup PASS, verified offline; no new live run was performed."
+  "verdict": {
+    "functional_live": "PASS",
+    "b4_export_redaction": "PASS (offline-verified)",
+    "overall": "PASS"
+  },
+  "reason": "Functional live run passed all checks (one server start, 5/5 generations, both streams, native tools + signature_cache, PG-08/ATG prefer stream, four-field 403 on both surfaces, countTokens JSON). B4 export sanitizer and historical log cleanup PASS, verified offline; no new live export and no new live run was performed."
 }

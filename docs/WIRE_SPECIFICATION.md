@@ -123,6 +123,9 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`18`** | `seed` | `int \| null` | 随机种子（Field 19） |
 | **`26`** | `output_resolution` | `list[str] \| null` | 生图分辨率配置，如 `["1:1", "1K"]` |
 
+> [!NOTE]
+> **Seed 常量与写入路径**：代码以 `GenerationConfigIndex.SEED = 18` 作为唯一索引定义（`src/aistudio_api/infrastructure/gateway/wire_spec.py:63`）。请求侧 `generation_config.seed` 若存在，会写入 `generation_config_overrides["seed"]`（`src/aistudio_api/application/chat_service.py:1009-1010`），再由 `WireCodec.rewrite` 通过 `AistudioGenerationConfig.seed` setter 写入 generation config 数组下标 18（`src/aistudio_api/infrastructure/gateway/wire_types.py:223-232`、`wire_codec.py:305-310`）。缺失时不写该下标，不生成随机默认值。
+
 ---
 
 ## 5. 安全策略 (SafetySettings)
@@ -325,6 +328,47 @@ AI Studio Web 核心过滤数组：
 `hCb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17]`
 前端逻辑中 `1` (`STOP`) 与 `2` (`MAX_TOKENS`) 视为常规完成，其余在 `hCb` 中的代码均触发错误或警告弹窗处理。
 
+> [!IMPORTANT]
+> **`CONTINUING=22` 的网关实现**：`WIRE_FINISH_REASON_CONTINUING = 22` 与 `WIRE_FINISH_REASON_STOP = 1` 统一定义在 `src/aistudio_api/infrastructure/gateway/wire_spec.py:127-128`。流式解析只把 `finish_reason not in (0, 22)` 视为终止码；`0` 与 `22` 都继续接收后续分块（`streaming.py:163-168`、`197-202`）。如果工具流已经产出 `tool_calls` 但上游没有给出终止码，网关在流结束时合成 `STOP`，避免客户端无限等待（`streaming.py:239-247`）。文本流不设全局 wall-clock deadline。
+
+### 7.5 PG-04：functionCall / functionResponse 的 Struct 强制
+
+Gemini 上游要求 `functionCall.args` 与 `functionResponse.response` 是合法的 `google.protobuf.Struct`。网关在进入 Wire 编码前统一收口（`src/aistudio_api/infrastructure/gateway/wire_types.py:336-372`）：
+
+| 输入形状 | `functionCall.args` | `functionResponse.response` |
+|---|---|---|
+| `dict` | 原样透传 | 原样透传 |
+| 可解析为 JSON object 的字符串 | 使用解析后的 object | 使用解析后的 object |
+| 普通字符串 / 数组 / 标量 | 包成 `{"content": value}` | 包成 `{"result": value}` |
+| `None` | `{}` | `{}` |
+
+编码侧 `_encode_wire_args` 把 dict 转成 Struct 字段列表 `[[key, value_wire], ...]`，并在外层再包一层容器；`_encode_wire_value` 按类型生成 Value 数组：null `[0]`、number `[null, num]`、string `[null, null, str]`、bool `[null, null, null, bool]`、object `[null,null,null,null,[fields]]`、array `[null,null,null,null,null,[[items]]]`（`wire_types.py:375-405`）。
+
+响应侧 `_decode_wire_struct` / `_decode_wire_list` / `_decode_wire_value` 负责反向解码，且对 Repeated 容器只剥离一层外层包装，避免把单元素列表错误展开（`wire_parser.py:292-362`）。OpenAI 适配层对非法 JSON arguments 不做硬拒绝，而是保留原文到 `content`，让 PG-04 仍能生成合法 Struct（`application/format_converters/openai_request.py:64-93`）。
+
+`[toolshape]` 日志只输出工具名、参数键集合/类型等形状摘要，不输出参数值或工具内容；`emit_toolshape` 每次请求只发一次（`application/chat_service.py:619-715`、`1033-1035`）。
+
+### 7.6 PG-01：thoughtSignature 缓存与 DUMMY 兜底
+
+Gemini 要求历史模型 `functionCall` Part 携带 `thoughtSignature`。客户端（OpenAI/Claude 适配器、会重建 tool channel 的预设）可能丢失该字段，网关按 `call_id` 从持久缓存恢复（`src/aistudio_api/application/signature_cache.py:1-11`）：
+
+- 写入：响应中的 `function_calls[*].thought_signature` / `thoughtSignature` 由 `record_function_call_signatures` 按 `call_id` 写入；空 id/空签名忽略（`signature_cache.py:161-180`）。
+- 读取：`_historical_function_call_signature` 先看 Part 自带签名，再看缓存；缓存未命中才回退占位符 `DUMMY_THOUGHT_SIGNATURE = "context_engineering_is_the_way_to_go"`（`chat_service.py:730-734`、`signature_cache.py:25-27`）。
+- 缓存特性：读取不消费，可被后续轮次重复使用；TTL 默认 30 天，最多 4096 条；原子写入 `data/signature_cache.json`，代理重启后仍可用（`signature_cache.py:29-146`、`api/app.py:281`）。
+- 真实缓存签名优先于 DUMMY；DUMMY 只是上游可接受的占位符，不替代真实签名缓存。
+
+B6 实机验收记录：原生工具调用后 `signature_cache_entries_before=0`、`after=1`（`docs/dev/evidence/B6/results.json`）。
+
+### 7.7 流式截断修复与终态兜底
+
+AI Studio 流式响应以 `)]}'` XSSI 前缀开头，随后是嵌套数组。`IncrementalJSONStreamParser` 用字符串/转义状态机按括号深度切出 chunk（`src/aistudio_api/infrastructure/gateway/stream_parser.py:151-230`）。上游连接被截断时，最后一个 chunk 可能是不完整 JSON：
+
+1. `_close_json_fragment` 补全未闭合字符串/数组/对象，转义裸控制符，裁掉被切断的 `\uXXXX`（`stream_parser.py:29-100`）。
+2. `_cut_at_last_top_level_comma` 丢弃最深未闭合容器里的半个元素，保留已收到的兄弟元素（`stream_parser.py:103-129`）。
+3. `_repair_truncated_json` 最多尝试 8 轮“补全 → 解析 → 回退到上一个顶层逗号”，救不回来返回 `None`（`stream_parser.py:132-148`）。
+4. `finish()` 在流结束时修复并交付最后一个分块；只有包含 usage、response_id 或有效 candidate 内容时才交付，避免空片段污染终态（`stream_parser.py:232-273`）。
+5. `streaming.py` 在流结束后调用 `parser.finish()`，再合成缺失的 finish/usage/done；若一个 chunk 都没收到，抛 `BrowserTransportError("stream ended before any data arrived (connection truncated)")`（`streaming.py:190-249`）。
+
 ---
 
 ## 8. 前端逆向未公开特性参考
@@ -355,3 +399,55 @@ AI Studio Web 核心过滤数组：
    下发给 MakerSuite 的 `tools` 需保留字段的 `description` (下标 2) 与 `enum` (下标 4)，以保障模型获取参数语义与合法枚举选项。同时参数 Schema 数组下标上限为 `22` (`propertyOrdering`)，不包含 `title` 与 `default` 字段。
 4. **客户端 Schema 字段多态解包 (`parametersJsonSchema`)**：
    官方 SDK（如 `@google/genai`）在生成 Gemini 工具规范时，默认将参数挂载在 `parametersJsonSchema` 字段下。网关层兼容该多态字段提取，保障参数结构完整转换。
+
+### 8.2 ListModels 模型发现字段与动态 Paid
+
+`ModelDiscoveryService._parse_raw_models` 解析 MakerSuite `ListModels` 响应 `raw_data[0]` 的每条模型数组（`src/aistudio_api/infrastructure/gateway/model_discovery.py:772-915`）。代码使用 **0-based 数组下标**：`access_tier` 读取 `item[77]`（protobuf Field 78），`accessModes` 读取 `item[82]`（protobuf Field 83）。历史任务口径中的“77/83”实际指这两个 0-based 数组下标，不是 1-based protobuf 字段号；本文统一写作 `item[77] (Field 78)` / `item[82] (Field 83)`，避免混淆：
+
+| 数组下标 | protobuf 字段（1-based） | 字段 | 用途 |
+|---|---|---|---|
+| `0` | Field 1 | `id` | 模型 ID，如 `models/gemini-3.8-flash` |
+| `2` | Field 3 | `version` | 版本，缺省 `"001"` |
+| `3` | Field 4 | `displayName` | 展示名 |
+| `4` | Field 5 | `description` | 描述 |
+| `5`/`6` | Field 6/7 | `inputTokenLimit`/`outputTokenLimit` | Token 上限 |
+| `7` | Field 8 | `supportedGenerationMethods` | 必须含 `generateContent`，否则仅图片/视频/音频模型保留 |
+| `8`/`9`/`10` | Field 9/10/11 | `temperature`/`topP`/`topK` | 默认采样参数 |
+| `56` | Field 57 | `aliases` | 模型别名 |
+| `64` | Field 65 | `capabilityCodes` | 能力码（chat/code/function/google_search/thinking/image/video/audio 等） |
+| `71` | Field 72 | `thinking` 配置 | 默认 thinking level 与可选 levels |
+| **`item[77]`** | **Field 78** | **`access_tier`** | **`2` 表示 Paid（Pro-only）** |
+| **`item[82]`** | **Field 83** | **`accessModes`** | **含 `3` 或 `4` 表示 Paid** |
+
+Paid 判定（`model_discovery.py:906`）：
+
+```text
+paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)
+```
+
+`accessModes` 的 tier 语义在路由侧进一步区分（`routing_eligibility.py:195-200`、`model_discovery.py:648-656`）：
+
+- 仅含 `4` 且不含 `3` → `Ultra/Ultra_20X`；
+- 含 `3` → `Pro/Ultra/Ultra_20X`；
+- 仅显式 `paid=True` 或内置 Paid 集合命中 → `Pro/Ultra/Ultra_20X`。
+
+### 8.3 Live Free 真值优先与 fallback 边界
+
+模型记录带 `_discovery_source` 标记（`model_discovery.py:270-320`）：
+
+| source | 是否 truth | 说明 |
+|---|---|---|
+| `live_page` | 是 | READY 池会话页面内 ListModels XHR |
+| `live_http` | 是 | 账号 Cookie + SAPISIDHASH 直接 HTTP |
+| `snapshot` | 是 | `data/models_cache.json` 持久化快照 |
+| `fallback` | **否** | 仅冷启动兜底，绝不冒充 live |
+
+真值优先级：
+
+1. **真实记录显式 Free**（`paid is False` 且 `accessModes` 不含 3/4）→ authoritative Free；`paid_model_rules` 的静态子串规则（如 `image`）不得覆盖（`routing_eligibility.py:134-164`、`model_discovery.py:601-614`）。
+2. **真实记录显式 Paid**（`paid is True` 或含 3/4）→ Paid lane；required tiers 由规则/`accessModes` 给出，最低 Pro（仅 `4` 时为 Ultra）（`routing_eligibility.py:241-250`）。
+3. **fallback / unknown** → 保持历史顺序：`paid_model_rules` → `accessModes` → 内置 Paid 集合（`routing_eligibility.py:166-204`）。
+
+快照写入 `data/models_cache.json` 时保留 `_discovery_source=snapshot`。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新时以真实记录覆盖，fallback 仅在无快照冷启动时作为初始种子（`model_access.py:221-239`、`model_discovery.py:507-541`）。不在传入列表中的模型保留旧状态，避免已知 Paid 模型因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
+
+B6 实机证据：`model_source=live_page`、31 个模型；`gemini-3.8-flash` 为 live Free（`access_tier=null`、`accessModes=[]`、`required_tiers=[]`），`antigravity-preview-09-2026` 等为 live Paid（`access_tier=2`）（`docs/dev/evidence/B6/model_discovery_fix.json`）。

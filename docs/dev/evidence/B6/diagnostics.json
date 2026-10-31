@@ -41,5 +41,10 @@
   },
   "shutdown": "8080/9222 closed; Chrome 0",
   "secrets_printed": false,
-  "verdict": "PASS"
+  "verdict": {
+    "functional_live": "PASS",
+    "b4_export_redaction": "PASS (offline-verified)",
+    "overall": "PASS",
+    "note": "No new live export was performed; B4 redaction and archive cleanup were verified offline."
+  }
 }

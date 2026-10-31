@@ -45,7 +45,7 @@ end = gidx + 1
 if lines[gidx].rstrip("\r\n") == "  groups:":
     while end < len(lines):
         s = lines[end].rstrip("\r\n")
-        if s.startswith("  - ") or s.startswith("    "):
+        if s.startswith(("  - ", "    ")):
             end += 1
             continue
         break
@@ -60,6 +60,6 @@ if groups:
 else:
     render = "  groups: []\n"
 
-lines = lines[:gidx] + [render] + lines[end:]
+lines = [*lines[:gidx], render, *lines[end:]]
 CFG.write_text("".join(lines), encoding="utf-8")
 print(f"config.yaml updated: route_by_tier={route_val} build_surface={build_surface} groups={len(groups)} items")
