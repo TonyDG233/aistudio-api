@@ -645,7 +645,7 @@ def test_shutdown_runtime_cancels_background_tasks_first():
     assert events == ["keepalive.stop"]
 
 
-def test_auth_error_cooldown_is_optional_and_defaults_to_zero():
+def test_auth_error_cooldown_inherits_tracked_template_default():
     normalized = validate_config_mapping(
         {
             "rotator": {
@@ -661,7 +661,11 @@ def test_auth_error_cooldown_is_optional_and_defaults_to_zero():
     assert isinstance(rotator, dict)
     cooldowns = rotator["cooldowns"]
     assert isinstance(cooldowns, dict)
-    assert cooldowns["auth_error"] == 0
+    template_rotator = model_defaults._default_config()["rotator"]
+    assert isinstance(template_rotator, dict)
+    template_cooldowns = template_rotator["cooldowns"]
+    assert isinstance(template_cooldowns, dict)
+    assert cooldowns["auth_error"] == template_cooldowns["auth_error"]
     assert cooldowns["rate_limited_short"] == 60
 
 

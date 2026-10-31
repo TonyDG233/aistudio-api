@@ -74,6 +74,32 @@ _TEMPLATE_CONFIG_PATHS = (
     _PROJECT_ROOT / "defaults" / "config.yaml",
     _DEFAULT_CONFIG_PATH,
 )
+_DOCKER_TEMPLATE_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+
+def resolve_default_config_template() -> Path:
+    """解析受版本控制的默认配置模板路径（配置默认值的唯一来源）。
+
+    优先级：仓库 ``<root>/defaults/config.yaml`` > 容器内
+    ``/app/defaults/config.yaml``。模板缺失时抛出 :class:`FileNotFoundError`，
+    由调用方转换为配置校验错误，绝不回退到内嵌默认字典。
+    """
+    for candidate in (
+        _PROJECT_ROOT / "defaults" / "config.yaml",
+        _DOCKER_TEMPLATE_CONFIG_PATH,
+    ):
+        if candidate.is_file():
+            return candidate
+    checked = " / ".join(
+        str(path)
+        for path in (
+            _PROJECT_ROOT / "defaults" / "config.yaml",
+            _DOCKER_TEMPLATE_CONFIG_PATH,
+        )
+    )
+    raise FileNotFoundError(
+        f"找不到默认配置模板 defaults/config.yaml（已查找：{checked}）"
+    )
 
 
 def resolve_config_file(config_path: str | os.PathLike[str] | None = None) -> Path:
