@@ -65,7 +65,7 @@ paid_model_rules:
     contains: ["veo", "ultra"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "gemini-4", "image", "imagen"]
+    contains: ["argon", "gemini-4", "imagen"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 rotator:
   max_retries: 5
@@ -163,18 +163,42 @@ def _shared_test_env(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def isolate_test_config(monkeypatch, _shared_test_env):
     """Isolate all test runs from repository-level config.yaml modifications and runtime state files."""
+    from aistudio_api.application.model_access import clear_paid_models
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
     config_file, data_dir = _shared_test_env
     stats_file = data_dir / "stats.json"
     rotator_file = data_dir / "rotator_state.json"
+    model_cache_file = data_dir / "models_cache.json"
     accounts_dir = data_dir / "accounts"
 
     monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_file))
     monkeypatch.setenv("AISTUDIO_DATA_DIR", str(data_dir))
     monkeypatch.setenv("AISTUDIO_ACCOUNTS_DIR", str(accounts_dir))
     monkeypatch.setenv("AISTUDIO_STATS_FILE", str(stats_file))
+    monkeypatch.setenv("AISTUDIO_MODEL_CACHE_FILE", str(model_cache_file))
     monkeypatch.setenv("AISTUDIO_ROTATOR_STATE_FILE", str(rotator_file))
+    monkeypatch.setattr(settings, "model_cache_file", str(model_cache_file))
+
+    saved_models = model_discovery._cached_models
+    saved_fetched_at = model_discovery._last_fetched_at
+    saved_source = model_discovery.last_source
+    saved_error = model_discovery.last_error
+    model_discovery._cached_models = []
+    model_discovery._last_fetched_at = 0.0
+    model_discovery.last_source = "fallback"
+    model_discovery.last_error = None
+    clear_paid_models()
     yield
+    model_discovery._cached_models = saved_models
+    model_discovery._last_fetched_at = saved_fetched_at
+    model_discovery.last_source = saved_source
+    model_discovery.last_error = saved_error
+    clear_paid_models()
     if stats_file.exists():
         stats_file.unlink()
     if rotator_file.exists():
         rotator_file.unlink()
+    if model_cache_file.exists():
+        model_cache_file.unlink()

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -27,6 +29,8 @@ def setup_mock_account_service():
     )
     mock_svc.list_accounts.return_value = [sample_acc]
     mock_svc.get_active_account.return_value = sample_acc
+    mock_svc.get_account.return_value = sample_acc
+    mock_svc.activate_account = AsyncMock(return_value=sample_acc)
 
     orig = runtime_state.account_service
     runtime_state.account_service = mock_svc
@@ -141,3 +145,68 @@ async def test_api_accounts_active_endpoint():
         assert "no-store" in resp.headers.get("Cache-Control", "")
         data = resp.json()
         assert data["id"] == "acc_1"
+
+
+@pytest.mark.asyncio
+async def test_activate_reuses_ready_pool_slot_without_control_switch(
+    setup_mock_account_service,
+):
+    """Q5/N12: same-account activation must not open a second control Page."""
+    control_session = SimpleNamespace(
+        switch_auth=AsyncMock(), ensure_botguard_service=AsyncMock()
+    )
+    saved_manager = runtime_state.instance_manager
+    saved_client = runtime_state.client
+    saved_rotator = runtime_state.rotator
+    runtime_state.instance_manager = cast(
+        Any,
+        SimpleNamespace(
+            ready_slot_for_account=MagicMock(return_value=object())
+        ),
+    )
+    runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
+    runtime_state.rotator = None
+    try:
+        async with _client() as client:
+            resp = await client.post("/accounts/acc_1/activate")
+    finally:
+        runtime_state.instance_manager = saved_manager
+        runtime_state.client = saved_client
+        runtime_state.rotator = saved_rotator
+
+    assert resp.status_code == 200
+    setup_mock_account_service.set_active_account.assert_called_once_with("acc_1")
+    control_session.switch_auth.assert_not_awaited()
+    control_session.ensure_botguard_service.assert_not_awaited()
+    setup_mock_account_service.activate_account.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_activate_without_ready_pool_keeps_control_switch_fallback(
+    setup_mock_account_service,
+):
+    """The no-pool / no-ready-slot path keeps the existing control switch."""
+    control_session = SimpleNamespace(
+        switch_auth=AsyncMock(), ensure_botguard_service=AsyncMock()
+    )
+    saved_manager = runtime_state.instance_manager
+    saved_client = runtime_state.client
+    saved_rotator = runtime_state.rotator
+    runtime_state.instance_manager = cast(
+        Any,
+        SimpleNamespace(ready_slot_for_account=MagicMock(return_value=None)),
+    )
+    runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
+    runtime_state.rotator = None
+    try:
+        async with _client() as client:
+            resp = await client.post("/accounts/acc_1/activate")
+    finally:
+        runtime_state.instance_manager = saved_manager
+        runtime_state.client = saved_client
+        runtime_state.rotator = saved_rotator
+
+    assert resp.status_code == 200
+    setup_mock_account_service.activate_account.assert_awaited_once_with(
+        "acc_1", control_session
+    )

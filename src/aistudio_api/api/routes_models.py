@@ -12,6 +12,7 @@ from aistudio_api.api.response_models import (
     GeminiModelListResponse,
     GeminiModelResponse,
 )
+from aistudio_api.api.state import discovery_sessions_for
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("routes.models")
@@ -77,10 +78,10 @@ async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelListResponse:
     """Return bare model IDs; discovery owns model/paid metadata."""
-    session = runtime_state.client._session if runtime_state.client else None
+    sessions = discovery_sessions_for(runtime_state)
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    discovered = await model_discovery.get_models(session=session)
+    discovered = await model_discovery.get_models(sessions=sessions)
     models = [_to_gemini_model(item) for item in discovered]
     logger.info("获取模型列表完成 (共发现 %d 个)", len(models))
     return GeminiModelListResponse(models=models)
@@ -91,10 +92,12 @@ async def get_model(
     model_id: str,
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelResponse:
-    session = runtime_state.client._session if runtime_state.client else None
+    sessions = discovery_sessions_for(runtime_state)
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    model_info = await model_discovery.get_model_by_id(model_id, session=session)
+    model_info = await model_discovery.get_model_by_id(
+        model_id, sessions=sessions
+    )
     if model_info is not None:
         logger.info("成功获取模型元数据: %s", model_id)
         return _to_gemini_model(model_info)

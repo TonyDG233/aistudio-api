@@ -6,7 +6,7 @@ import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aistudio_api.config import resolve_stats_file, settings
 from aistudio_api.infrastructure.utils.common import atomic_write_json
@@ -22,6 +22,45 @@ if TYPE_CHECKING:
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("state")
+
+
+def discovery_sessions_for(state: object) -> tuple[Any, ...]:
+    """Resolve ordered discovery sessions (ready pool lane first)."""
+    manager = getattr(state, "instance_manager", None)
+    getter = getattr(manager, "discovery_sessions", None)
+    if callable(getter):
+        try:
+            sessions: Any = getter()
+        except Exception as exc:
+            logger.debug("discovery sessions resolution failed: %s", exc)
+            sessions = ()
+        if sessions:
+            return tuple(session for session in sessions if session is not None)
+    single = discovery_session_for(state)
+    return (single,) if single is not None else ()
+
+
+def discovery_session_for(state: object) -> Any | None:
+    """Resolve the session used by read-only model discovery.
+
+    A ready pool session always wins over the control session; the control
+    session is only a cold-start fallback before any instance is READY.
+    Duck-typed so route tests can pass a lightweight state object.
+    """
+    manager = getattr(state, "instance_manager", None)
+    getter = getattr(manager, "discovery_session", None)
+    if callable(getter):
+        try:
+            session = getter()
+        except Exception as exc:
+            logger.debug("discovery session resolution failed: %s", exc)
+            session = None
+        if session is not None:
+            return session
+    client = getattr(state, "client", None)
+    if client is None:
+        return None
+    return getattr(client, "_session", None)
 
 
 @dataclass
@@ -57,6 +96,23 @@ class RuntimeState:
 
     def __post_init__(self) -> None:
         self.load_stats()
+
+    def discovery_session(self) -> Any | None:
+        """Resolve the session used by read-only model discovery."""
+        return discovery_session_for(self)
+
+    def discovery_sessions(self) -> tuple[Any, ...]:
+        """READY pool sessions for startup discovery; never the control session."""
+        manager = getattr(self, "instance_manager", None)
+        getter = getattr(manager, "discovery_sessions", None)
+        if not callable(getter):
+            return ()
+        try:
+            sessions: Any = getter()
+        except Exception as exc:
+            logger.debug("discovery sessions resolution failed: %s", exc)
+            return ()
+        return tuple(session for session in sessions if session is not None)
 
     def load_stats(self) -> None:
         """从持久化文件加载历史调用统计。"""

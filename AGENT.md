@@ -231,7 +231,13 @@ uv run python3 main.py server --port 8080
 - 只允许一个明确处于 drain 的旧页，且有界等待超时后强制关闭；drain 只发生在旧 Page/Context 上，期间不新建新页；不得把“1 active + 1 drain”当页预算例外。
 - 关闭即释放实例；失败/stale 才手动重启，禁止自动 stale 复活；idle browser 自动回收默认关闭。
 
-### 4.6 浏览器进程与 CDP（D-02/D-03）
+### 4.6 实机防风控铁律
+
+- **严禁任何 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程！** 每次冷启动均会触发 BotGuard 探针，短时间重复启停会导致账号被 Google 风控封禁。即使获批执行实机测试，全流程也只允许由主控或用户在单次常驻进程中完成，严禁反复重启服务。
+- 多实例池启用时，启动预热只允许由 `InstanceManager.startup()` 在池会话（`PooledSession`）上完成；控制面 `client.session` 不得在启动时自动开页/跑 BotGuard。控制面仅在按需场景（无活跃实例、手动导入 Cookie、保活）打开，且保持单页。
+- 离线开发/回归默认 mock/fixture，不得以“验证启动”为名启动真实服务、真实浏览器或发起网络请求。
+
+### 4.7 浏览器进程与 CDP（D-02/D-03）
 
 - 保留 pipe watchdog，只负责父进程死亡后的孤儿 Chromium 清理；不得据此做账号 stale 复活、自动 rebind 或自动重启浏览器会话。
 - 只保留 WebSocket ping；不恢复 `set_liveness_checker` 与 `Runtime.evaluate` 轮询；半开连接由命令超时与断线失败兜底；页面崩溃/断线立即失败 pending futures。
@@ -239,7 +245,7 @@ uv run python3 main.py server --port 8080
 - 保留 CloakBrowser 低内存/伪装参数：`--renderer-process-limit=1`、`--in-process-gpu`、128MB V8 限制、`--use-gl=angle --use-angle=swiftshader`、`--mute-audio`、`--fingerprint-platform=windows`、`--fingerprint-timezone`；移除 `--disable-audio` 与 `--disable-software-rasterizer`。
 - 不访问真实 Google/真实账号/真实 IP，除非用户单独授权；默认 mock/fake CDP/fixture。
 
-### 4.7 禁止恢复清单
+### 4.8 禁止恢复清单
 
 - 旧 lease/租约、reservation、pinned、defer、同账号双页、后台自动 rebind、自动 rebalance、策略组 `groups`、`channel_registry`、账号 tag 路由、quota group、`ensure_active_account`/`try_switch_account` 全局回退、死熔断器。
 - 发现旧 fork 代码含上述机制时，只能按 `06`/`08-09` 改写，不得原样搬运。
@@ -414,6 +420,7 @@ B0（目标树 `AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-
 - 不因单步失败推翻 `05/06/08-09` 或重写整体方案。
 - 不 merge/checkout 旧 `rebuild`，不 push，不 rewrite history。
 - 不访问真实 Google/真实账号/真实 IP，除非用户单独授权；默认离线 fixture/mock。
+- **实机防风控**：严禁 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程；获批实机测试也只允许主控/用户在单次常驻进程中完成，严禁反复重启（见 4.6）。
 - 不为过测试修改测试/配置/契约；不伪造审计、不预填证据、不用文档进度冒充迁移进度。
 - 不新增 D-xx/Gate/顺序/范围；需要时停下问用户。
 - 不把函数签名/底层实现甩给用户裁决；向用户汇报用大白话，说明功能保留、执行顺序、可运行结果。

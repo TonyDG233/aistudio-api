@@ -535,3 +535,24 @@ async def test_close_without_instance_id_closes_pool(tmp_path) -> None:
     assert result is None
     assert manager._pool.slots() == ()
     assert (await manager.list_instances()).instances == ()
+
+
+@pytest.mark.asyncio
+async def test_ready_slot_for_account_reuses_existing_page(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    created_before = len(cdp.created)
+
+    slot = manager.ready_slot_for_account(accounts["free"].id)
+
+    assert slot is not None
+    assert slot.account_id == accounts["free"].id
+    assert slot.session is not None
+    # Lookup must not create another Context/Page or retire the slot.
+    assert len(cdp.created) == created_before
+    assert manager.ready_slot_for_account("missing-account") is None
+    assert len(cdp.created) == created_before

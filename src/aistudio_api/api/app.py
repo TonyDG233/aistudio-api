@@ -69,14 +69,77 @@ async def _call_lifecycle_method(target: object | None, method_name: str) -> Non
         )
 
 
+async def _warmup_control_session(client: AIStudioClient) -> None:
+    """Legacy pool-disabled warmup: opens the control Page and BotGuard once.
+
+    Pool-enabled startup must never call this: pooled sessions are the only
+    request instances, and a control Page would double the BotGuard probes.
+    """
+    for attempt in range(3):
+        try:
+            await client.warmup()
+            return
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+                continue
+            logger.warning("浏览器预热失败: %s", exc)
+
+
+def _start_control_warmup(
+    client: AIStudioClient, *, pool_enabled: bool
+) -> asyncio.Task[object] | None:
+    """Return the legacy control warmup task, or None when the pool is enabled."""
+    if pool_enabled:
+        return None
+    return asyncio.create_task(_warmup_control_session(client))
+
+
+async def _startup_instances(
+    state: RuntimeState,
+    warmup_task: asyncio.Task[object] | None,
+) -> None:
+    """Start pooled request instances; legacy control warmup only when present."""
+    if warmup_task is not None:
+        try:
+            await warmup_task
+        except Exception as exc:
+            logger.debug("实例预启动前预热失败: %s", exc)
+    manager = state.instance_manager
+    if manager is None:
+        return
+    try:
+        await manager.startup()  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.warning("实例预启动失败: %s", exc)
+
+
+async def _refresh_model_catalog_once(state: RuntimeState) -> int:
+    """Refresh ListModels from READY pool sessions only (never the control Page)."""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    sessions = state.discovery_sessions()
+    models = await model_discovery.get_models(sessions=sessions, force_refresh=True)
+    logger.info(
+        "模型发现预热完成: source=%s count=%d",
+        model_discovery.last_source,
+        len(models),
+    )
+    return len(models)
+
+
 async def _shutdown_runtime(
     state: RuntimeState,
     tasks: tuple[asyncio.Task[object] | None, ...] = (),
 ) -> None:
     """固定关闭顺序：取消后台任务 → keepalive → instance_manager → client。"""
+    cancelled: list[asyncio.Task[object]] = []
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
+            cancelled.append(task)
+    if cancelled:
+        await asyncio.gather(*cancelled, return_exceptions=True)
 
     await _call_lifecycle_method(state.keepalive, "stop")
     await _call_lifecycle_method(state.instance_manager, "close")
@@ -139,22 +202,6 @@ async def lifespan(_app: FastAPI):
         len(account_store.list_accounts()),
     )
 
-    # 后台预热浏览器，避免首次请求延迟
-    warmup_task = None
-
-    async def _warmup():
-        for attempt in range(3):
-            try:
-                await client.warmup()
-                return
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                logger.warning("浏览器预热失败: %s", e)
-
-    warmup_task = asyncio.create_task(_warmup())
-
     # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
     from aistudio_api.application.instance_manager import InstanceManager
     from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
@@ -162,6 +209,21 @@ async def lifespan(_app: FastAPI):
         get_configured_instance_specs,
         get_configured_max_contexts,
     )
+
+    # 显式分流：多实例池启用时只允许 InstanceManager.startup() 预热池会话；
+    # 控制面 client.session 不得在启动时自动开页/跑 BotGuard。只有配置中
+    # 完全没有任何实例（真正的 pool-disabled legacy 模式）才允许控制面预热。
+    pool_specs = get_configured_instance_specs()
+    pool_enabled = bool(pool_specs)
+    if pool_enabled:
+        logger.info(
+            "实例池已启用 (%d 组配置)：跳过控制面预热，启动仅由 "
+            "InstanceManager.startup() 激活池会话",
+            len(pool_specs),
+        )
+    else:
+        logger.info("实例池未配置：使用 legacy 控制面预热（不创建池会话）")
+    warmup_task = _start_control_warmup(client, pool_enabled=pool_enabled)
 
     instance_pool = InstancePool(
         client.session.ensure_cdp_client,
@@ -193,28 +255,42 @@ async def lifespan(_app: FastAPI):
     await keepalive.start()
 
     startup_task: asyncio.Task[object] | None = None
+    startup_task = asyncio.create_task(_startup_instances(runtime_state, warmup_task))
 
-    async def _startup_instances():
-        if warmup_task is not None:
+    # Model discovery warmup: wait until the instance pool has a READY session
+    # (preferring the Pro/paid lane), then refresh the live ListModels catalog
+    # and repeat on the cache TTL. Pool sessions only: never the control session
+    # and never a new Page/BotGuard path.
+    model_warmup_task: asyncio.Task[object] | None = None
+
+    async def _model_warmup():
+        from aistudio_api.infrastructure.gateway.model_discovery import (
+            model_discovery,
+        )
+
+        if startup_task is not None:
             try:
-                await warmup_task
+                await startup_task
             except Exception as exc:
-                logger.debug("实例预启动前预热失败: %s", exc)
-        manager = runtime_state.instance_manager
-        if manager is None:
-            return
-        try:
-            await manager.startup()  # type: ignore[attr-defined]
-        except Exception as exc:
-            logger.warning("实例预启动失败: %s", exc)
+                logger.debug("模型发现预热前实例启动失败: %s", exc)
+        while True:
+            try:
+                await _refresh_model_catalog_once(runtime_state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("模型发现预热失败: %s", exc)
+            await asyncio.sleep(model_discovery.cache_ttl)
 
-    startup_task = asyncio.create_task(_startup_instances())
+    model_warmup_task = asyncio.create_task(_model_warmup())
 
     try:
         yield
     finally:
         logger.info("服务正在关闭")
-        await _shutdown_runtime(runtime_state, (warmup_task, startup_task))
+        await _shutdown_runtime(
+            runtime_state, (warmup_task, startup_task, model_warmup_task)
+        )
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)

@@ -12,16 +12,26 @@ from threading import RLock
 _CHANNEL_PREFIXES = {"pg", "chat", "playground", "build", "official"}
 
 # Known Paid models. Discovery/snapshots may override per model; these keep
-# routing safe before the first ListModels request completes.
+# routing safe before the first ListModels request completes.  Every live
+# Paid model from docs/dev/evidence/B6/model_discovery_fix.json is seeded here.
 _DEFAULT_PAID_MODELS = {
-    "argon",
-    "argon-2-preview",
+    "antigravity-preview-09-2026",
+    "deep-research-preview-04-2026",
+    "deep-research-max-preview-04-2026",
     "gemini-4-argon",
     "gemini-3-flash-preview",
     "gemini-3.6-flash",
+    "gemini-nano-banana-2.1",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-image-preview",
     "gemini-3-pro-image",
+    "gemini-2.5-flash-image",
+    "lyria-3.5",
+    "lyria-3-pro-preview",
+    "lyria-3-clip-preview",
+    "gemini-omni-1.1-flash",
+    "argon",
+    "argon-2-preview",
     "veo-2.0-generate-001",
     "veo-3.1-generate-preview",
 }
