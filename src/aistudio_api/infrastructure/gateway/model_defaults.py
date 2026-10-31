@@ -210,7 +210,7 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     max_switches,
                 )
                 raw_routing["max_switches"] = 2
-            raw_routing["retry_same_delay_sec"] = _resolve_retry_same_delay(
+            raw_routing["retry_same_delay_sec"] = _normalize_retry_same_delay(
                 raw_routing
             )
 
@@ -671,17 +671,23 @@ def validate_config(
     migrated, migration_changed = _migrate_legacy_config_mapping(raw)
     validated = validate_config_mapping(migrated)
 
-    merged = _deep_merge(_default_config(), migrated)
-    assert isinstance(merged, dict)
     if (
         exists
         and not _is_default_template_path(resolved_path)
-        and (migration_changed or merged != raw)
+        and (migration_changed or validated != raw)
     ):
-        content = yaml.dump(merged, allow_unicode=True, sort_keys=False)
-        _atomic_write_text(resolved_path, content)
-        invalidate_config_cache()
-        logger.info("已迁移并写回旧版配置文件：%s", resolved_path)
+        content = yaml.dump(validated, allow_unicode=True, sort_keys=False)
+        try:
+            _atomic_write_text(resolved_path, content)
+        except OSError as exc:
+            logger.warning(
+                "无法写回已迁移的配置文件 %s（%s）；继续使用内存中已校验的配置",
+                resolved_path,
+                exc,
+            )
+        else:
+            invalidate_config_cache()
+            logger.info("已迁移并写回旧版配置文件：%s", resolved_path)
     return validated
 
 
@@ -949,11 +955,12 @@ def _routing_defaults() -> dict[str, object]:
     }
 
 
-def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
-    """Resolve ``features.routing.retry_same_delay_sec`` with env override.
+def _normalize_retry_same_delay(raw_routing: dict[str, object]) -> float:
+    """Normalize the persisted config value without applying env overrides.
 
-    Invalid YAML/env values never raise: they fall back to the production
-    default so a typo cannot crash startup or silently disable the delay.
+    Runtime-only overrides must never dirty the config file during startup
+    migration; :func:`_resolve_retry_same_delay` layers the env value on top
+    when the routing settings are actually consumed.
     """
     raw_delay = raw_routing.get(
         "retry_same_delay_sec", _RETRY_SAME_DELAY_DEFAULT_SEC
@@ -966,6 +973,16 @@ def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
             _RETRY_SAME_DELAY_DEFAULT_SEC,
         )
         delay = _RETRY_SAME_DELAY_DEFAULT_SEC
+    return delay
+
+
+def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
+    """Resolve ``features.routing.retry_same_delay_sec`` with env override.
+
+    Invalid YAML/env values never raise: they fall back to the production
+    default so a typo cannot crash startup or silently disable the delay.
+    """
+    delay = _normalize_retry_same_delay(raw_routing)
     env_value = os.getenv(_RETRY_SAME_DELAY_ENV)
     if env_value:
         env_delay = _coerce_retry_same_delay(env_value)

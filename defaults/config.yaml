@@ -38,7 +38,7 @@ rotator:
     rate_limited_short: 60
     rate_limited_drip: 300
     rate_limited_drip_extended: 600
-    auth_error: 300
+    auth_error: 0
 
 # P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）
 features:

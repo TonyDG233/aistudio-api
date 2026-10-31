@@ -51,6 +51,8 @@
 - 收紧分层边界：Application 不再导入 API/FastAPI 或读取全局 `runtime_state`，请求统计改为构造注入回调；
   Gemini 协议渲染与错误映射归位 API 层，Tier/Paid 共享规则归位 Domain，Infrastructure 不再反向依赖 Application。
 - 兼容性：旧 `pg/` 前缀已移除；生成接口接受显式 `chat/` 前缀，但模型元数据目录不输出也不接受该前缀。
+- 配置启动迁移写回的是已应用非关键回退的有效配置（例如非法 `logging.level` 会持久化为 `INFO`），
+  `rotator.cooldowns.auth_error` 默认值调整为 `0`，403 认证失败不再产生固定冷却锁。
 
 ### Fixed
 
@@ -61,6 +63,8 @@
 - 修复实例池重复预热与双 BotGuard 探针；池化启用时跳过控制面预热。
 - 修复故障槽请求期换绑、路由均衡与实例 tier 选择器（`only_tier`/`min_tier`/`max_tier`）。
 - 修复日志导出与归档写入的脱敏缺口，历史日志不再原样泄漏密钥或 Cookie。
+- 修复只读配置目录下的启动失败：迁移写回失败时记录警告并继续以内存中已校验的配置启动，
+  同时清理可能残留的临时文件。
 
 ### Removed
 
