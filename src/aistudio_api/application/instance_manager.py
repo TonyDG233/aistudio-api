@@ -604,6 +604,68 @@ class InstanceManager:
         self._sync_records()
         return tuple(self._pool.slots())
 
+    def discovery_sessions(self) -> tuple[Any, ...]:
+        """Return READY pool sessions ordered for read-only model discovery.
+
+        Paid lane first, then Free; within each lane idle slots
+        (``active_requests == 0``) come before busy ones.  Discovery only
+        performs a standalone ListModels XHR on an existing page: it never
+        acquires ``active_requests`` and never closes, retires, or re-lanes a
+        slot.
+        """
+        self._sync_records()
+        ready = [
+            slot
+            for slot in self._pool.slots()
+            if slot.state is SlotState.READY
+            and slot.session is not None
+            and not slot.page_closed()
+        ]
+        ready.sort(
+            key=lambda slot: (
+                0 if slot.lane == "paid" else 1,
+                0 if int(getattr(slot, "active_requests", 0) or 0) == 0 else 1,
+            )
+        )
+        return tuple(slot.session for slot in ready)
+
+    def ready_slot_for_account(self, account_id: str) -> Any | None:
+        """Return the READY pool slot already bound to ``account_id``, if any.
+
+        Used by manual account activation to reuse the existing single page
+        instead of switching/opening the control-plane page for the same
+        account (same-account double-page guard).  It only syncs the current
+        instance pointer; it never acquires, closes, or retires a slot.
+        """
+        if not account_id:
+            return None
+        self._sync_records()
+        found: Any | None = None
+        for slot in self._pool.slots():
+            if (
+                slot.state is SlotState.READY
+                and getattr(slot, "account_id", "") == account_id
+                and slot.session is not None
+                and not slot.page_closed()
+            ):
+                found = slot
+                break
+        if found is None:
+            return None
+        for record in self._records.values():
+            if (
+                record.account_id == account_id
+                and record.state is InstanceState.ACTIVE
+            ):
+                self._current_id = record.id
+                break
+        return found
+
+    def discovery_session(self) -> Any | None:
+        """Return the preferred READY pool session for discovery."""
+        sessions = self.discovery_sessions()
+        return sessions[0] if sessions else None
+
     def active_account_ids(self) -> set[str]:
         return {
             record.account_id

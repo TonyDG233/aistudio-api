@@ -1,0 +1,109 @@
+{
+  "generated_at": "2026-10-31T04:44:09+0800",
+  "base": "http://127.0.0.1:8080",
+  "proxy": "127.0.0.1:10809",
+  "evidence_scope": "original B6 run only; the 14-model result below is fallback, not live",
+  "later_live_fix": {
+    "evidence": "docs/dev/evidence/B6/model_discovery_fix.json",
+    "generated_at": "2026-10-30T21:08:44.567122+00:00",
+    "summary": "Separate later run after the discovery wiring fix (pool-session discovery + _model_warmup). It does not retroactively make this original B6 run live and it is not an acceptance PASS."
+  },
+  "generation_requests": 3,
+  "results": {
+    "empty_key_401": true,
+    "empty_key_status": 401,
+    "models_status": 200,
+    "models_count": 14,
+    "models_source": "fallback / discovery not wired",
+    "models_are_live": false,
+    "models_source_root_cause": "No _model_warmup startup task; models routes used the control session (client._session) instead of a READY pool session; page XHR failures were debug-only and get_models silently returned the 14-entry static fallback list.",
+    "models": [
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-pro-preview",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash",
+      "gemini-3.1-flash-image",
+      "gemini-3-pro-image",
+      "gemma-4-31b-it",
+      "gemma-4-26b-a4b-it",
+      "veo-3.1-generate-preview",
+      "gemini-pro-latest",
+      "gemini-flash-latest",
+      "gemini-flash-lite-latest"
+    ],
+    "instances_before": {
+      "status": 200,
+      "count": 2,
+      "states": [
+        "active",
+        "active"
+      ],
+      "in_flight": [
+        0,
+        0
+      ],
+      "tiers": [
+        "Free",
+        "Pro"
+      ]
+    },
+    "free_openai_nonstream": {
+      "status": 404,
+      "content_length": 0,
+      "marker": false,
+      "response_id_present": false
+    },
+    "count_tokens": {
+      "status": 404,
+      "total_tokens_present": false
+    },
+    "logs_spa": {
+      "status": 404,
+      "html": false
+    },
+    "logs_sse": {
+      "status": 200,
+      "content_type": "text/event-stream; charset=utf-8",
+      "first_event": false
+    },
+    "logs_export": {
+      "status": 200,
+      "content_disposition": false,
+      "body_length": 2468110
+    },
+    "keepalive_get": {
+      "status": 200,
+      "available": true,
+      "running": false,
+      "slots": null
+    },
+    "keepalive_auth_update": {
+      "status": 200
+    },
+    "keepalive_metadata_refresh": {
+      "status": 200
+    },
+    "instances_after": {
+      "status": 200,
+      "count": 2,
+      "states": [
+        "active",
+        "active"
+      ],
+      "in_flight": [
+        0,
+        0
+      ]
+    },
+    "toolshape_log_present": true,
+    "toolshape_redacted_marker": true
+  },
+  "failure": {
+    "step": "free_openai_nonstream",
+    "status": 404,
+    "body_type": "json"
+  },
+  "sensitive_values_logged": false
+}

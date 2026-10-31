@@ -131,14 +131,36 @@ def _rule_matches(rule: Mapping[str, object], clean_model: str) -> bool:
     )
 
 
+def _live_paid_truth(clean_model: str) -> bool | None:
+    """Live/snapshot Paid truth for a model, or ``None`` for fallback/unknown."""
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        discovery_entry_paid_truth,
+        model_discovery,
+    )
+
+    return discovery_entry_paid_truth(
+        model_discovery.get_cached_model_info(clean_model)
+    )
+
+
 def resolve_required_tiers(
     model_path: str,
     *,
     rules: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
-    """Resolve allowed tiers in the frozen order: rules -> accessModes -> paid."""
+    """Resolve allowed tiers with live discovery truth ahead of static rules.
+
+    A real (live/snapshot) record with explicit ``paid is False`` and no Paid
+    ``accessModes`` is authoritative Free: static substring rules such as
+    ``image`` must not override it.  Live Paid, fallback, and unknown models
+    keep the historical order: rules -> accessModes -> paid/capability.
+    """
     clean = normalize_model_key(model_path)
     if not clean:
+        return ()
+
+    live_truth = _live_paid_truth(clean)
+    if live_truth is False:
         return ()
 
     if rules is None:
@@ -210,9 +232,22 @@ def resolve_model_route(
             ),
         )
     required = resolve_required_tiers(clean, rules=rules)
-    paid = is_paid_model(clean) or any(tier_rank(tier) > 0 for tier in required)
-    if paid and not required:
-        required = _PAID_MIN_TIERS
+    live_truth = _live_paid_truth(clean)
+    if live_truth is False:
+        # Live discovery is authoritative: never route a real Free model into
+        # the paid lane because of a stale seed/static rule.
+        paid = False
+        required = ()
+    elif live_truth is True:
+        paid = True
+        if not required:
+            required = _PAID_MIN_TIERS
+    else:
+        paid = is_paid_model(clean) or any(
+            tier_rank(tier) > 0 for tier in required
+        )
+        if paid and not required:
+            required = _PAID_MIN_TIERS
     minimum = minimum_required_tier(required)
     return ModelRoute(
         raw_model=str(model_path),

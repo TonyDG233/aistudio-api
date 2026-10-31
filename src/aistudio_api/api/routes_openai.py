@@ -18,6 +18,7 @@ from aistudio_api.api.format_errors import (
 )
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.api.schemas_openai import OpenAIChatRequest
+from aistudio_api.api.state import discovery_sessions_for
 from aistudio_api.application.format_converters.common import (
     ConversionError,
     strip_models_prefix,
@@ -161,11 +162,11 @@ async def chat_completions(
 async def list_models(
     state: RuntimeState = Depends(get_runtime_state),
 ) -> JSONResponse:
-    session = state.client._session if state.client is not None else None
+    sessions = discovery_sessions_for(state)
     from aistudio_api.application.model_catalog import project_model_ids
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    discovered = await model_discovery.get_models(session=session)
+    discovered = await model_discovery.get_models(sessions=sessions)
     projected = project_model_ids(discovered, enabled_surfaces=_enabled_surfaces(state))
     return JSONResponse(
         {
@@ -180,12 +181,12 @@ async def get_model(
     model_id: str,
     state: RuntimeState = Depends(get_runtime_state),
 ) -> JSONResponse:
-    session = state.client._session if state.client is not None else None
+    sessions = discovery_sessions_for(state)
     from aistudio_api.application.model_catalog import resolve_model_request
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     clean_id, _surface = resolve_model_request(model_id)
-    model = await model_discovery.get_model_by_id(clean_id, session=session)
+    model = await model_discovery.get_model_by_id(clean_id, sessions=sessions)
     if model is None:
         return format_error_response(HTTPException(404, "Model not found"), "openai")
     raw_id = model_id.removeprefix("models/") or str(

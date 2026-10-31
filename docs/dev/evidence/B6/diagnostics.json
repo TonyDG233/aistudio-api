@@ -1,0 +1,91 @@
+{
+  "generated_at": "2026-10-31",
+  "proxy": "127.0.0.1:10809",
+  "evidence_scope": "original B6 run only; model discovery result is fallback, not live",
+  "later_live_fix": {
+    "evidence": "docs/dev/evidence/B6/model_discovery_fix.json",
+    "generated_at": "2026-10-30T21:08:44.567122+00:00",
+    "summary": "Separate later run after the discovery wiring fix (pool-session discovery + _model_warmup). It does not retroactively make the original B6 run live and it is not an acceptance PASS."
+  },
+  "model_discovery": {
+    "status": 200,
+    "count": 14,
+    "source": "fallback / discovery not wired",
+    "models_are_live": false,
+    "root_cause": "app.py had no _model_warmup task; routes_models.py and OpenAI /v1/models passed runtime_state.client._session (control session) instead of a READY InstancePool/PooledSession; _fetch_via_page failures were swallowed at logger.debug and get_models silently returned the 14-entry static _FALLBACK_MODELS. The observed 14 IDs were never live Page XHR data."
+  },
+  "pool": {
+    "instances": 2,
+    "states": ["active", "active"],
+    "tiers": ["Free", "Pro"],
+    "in_flight_before": [0, 0],
+    "in_flight_after": [0, 0]
+  },
+  "generation_attempts": [
+    {
+      "model": "gemini-3.7-flash",
+      "endpoint": "/v1/chat/completions",
+      "status": 404,
+      "error_type": "not_found_error",
+      "note": "ATG was prefer during the first scripted attempt; a later ATG-off diagnostic produced the same 404"
+    },
+    {
+      "model": "gemini-3.7-flash",
+      "endpoint": "/v1/chat/completions",
+      "status": 404,
+      "error_type": "not_found_error",
+      "note": "ATG off"
+    },
+    {
+      "model": "gemini-3.5-flash",
+      "endpoint": "/v1/chat/completions",
+      "status": 403,
+      "error_type": "permission_error",
+      "note": "ATG off"
+    }
+  ],
+  "count_tokens": [
+    {
+      "model": "gemini-3.7-flash",
+      "status": 404,
+      "error_type": "not_found_error"
+    },
+    {
+      "model": "gemini-3.5-flash",
+      "status": 503,
+      "error_type": "surface_quota_exceeded"
+    }
+  ],
+  "logs": {
+    "spa_with_html_accept": 200,
+    "spa_without_html_accept": 404,
+    "sse_status": 200,
+    "sse_content_type": "text/event-stream; charset=utf-8",
+    "export_status": 200,
+    "export_media_type": "text/plain; charset=utf-8",
+    "export_bytes": 2468110,
+    "toolshape_log_present": true,
+    "toolshape_redacted_marker": true
+  },
+  "keepalive": {
+    "get": 200,
+    "auth_update": 200,
+    "metadata_refresh": 200
+  },
+  "security_checks": {
+    "empty_api_key": 401,
+    "temporary_keys_cleaned": true,
+    "api_key_count_after_cleanup": 0,
+    "atg_mode_after_cleanup": "off",
+    "root_config_tracked": false,
+    "secrets_printed": false
+  },
+  "shutdown": {
+    "port_8080": "closed",
+    "port_9222": "closed",
+    "chrome_processes": 0
+  },
+  "generation_budget_used": 3,
+  "generation_successes": 0,
+  "stopped_reason": "upstream 404/403 then countTokens 503; failure-stop rule invoked"
+}

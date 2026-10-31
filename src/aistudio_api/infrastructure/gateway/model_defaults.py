@@ -802,7 +802,7 @@ def _default_config() -> dict[str, object]:
                 "required_tiers": ["Ultra", "Ultra_20X"],
             },
             "pro_required": {
-                "contains": ["argon", "gemini-4", "image", "imagen"],
+                "contains": ["argon", "gemini-4", "imagen"],
                 "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
             },
         },

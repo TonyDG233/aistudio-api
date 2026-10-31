@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from aistudio_api.application.model_access import (
@@ -16,6 +19,15 @@ from aistudio_api.application.model_access import (
     surface_capability,
 )
 from aistudio_api.infrastructure.gateway.model_discovery import ModelDiscoveryService
+
+EVIDENCE = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "dev"
+    / "evidence"
+    / "B6"
+    / "model_discovery_fix.json"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -100,3 +112,25 @@ def test_fallback_paid_models_allow_catalog_projection_without_discovery() -> No
     assert is_chat_only_model("gemini-3-flash-preview") is True
     assert is_chat_only_model("gemini-3.1-pro-preview") is False
     assert is_chat_only_model("gemini-3.8-flash") is False
+
+
+def test_default_paid_seeds_cover_every_live_paid_model() -> None:
+    payload = json.loads(EVIDENCE.read_text(encoding="utf-8"))
+    live_paid = {
+        str(item["id"]) for item in payload["models"] if item.get("paid") is True
+    }
+    assert live_paid
+
+    clear_paid_models()
+    for model_id in sorted(live_paid):
+        assert is_paid_model(model_id) is True, model_id
+    # Q2: "pro" in the name is not a Paid signal.
+    assert is_paid_model("gemini-3.1-pro-preview") is False
+
+
+def test_live_evidence_entries_all_have_explicit_paid_flags() -> None:
+    payload = json.loads(EVIDENCE.read_text(encoding="utf-8"))
+    models = payload["models"]
+    assert len(models) == 31
+    for item in models:
+        assert isinstance(item.get("paid"), bool), item.get("id")

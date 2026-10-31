@@ -367,6 +367,27 @@ async def activate_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
     """切换到指定账号。"""
+    manager = runtime_state.instance_manager
+    ready_slot = None
+    ready_lookup = getattr(manager, "ready_slot_for_account", None)
+    if callable(ready_lookup):
+        with contextlib.suppress(Exception):
+            ready_slot = ready_lookup(account_id)
+
+    if ready_slot is not None:
+        # Same-account guard: a READY pool slot already owns this account's
+        # single page.  Only sync registry/rotator/pool-current state; never
+        # switch or open the control-plane page (no BotGuard re-probe).
+        account = account_service.get_account(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在或切换失败")
+        account_service.set_active_account(account_id)
+        if runtime_state.rotator:
+            runtime_state.rotator.add_account(account.id)
+            runtime_state.rotator.clear_cooldown(account.id)
+        log.info("手动激活账号（复用已就绪实例页，未切控制面）: %s (%s)", account.id, account.name)
+        return to_account_response(account)
+
     browser_session = runtime_state.client._session if runtime_state.client else None
 
     if browser_session is None:
