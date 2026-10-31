@@ -304,7 +304,7 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
 
     snapshot = await session.generate_snapshot(contents)
     assert snapshot == "!snapshot_token_ok"
-    assert passed_args == [expected_hash]
+    assert passed_args[0]["hash"] == expected_hash
 
 
 @pytest.mark.asyncio
@@ -351,7 +351,10 @@ async def test_generate_snapshot_hash_include_code_false_matches_upstream(
     ]
 
     assert await session.generate_snapshot(contents) == "!snapshot_token_ok"
-    assert passed_args == [sha256(b" ").hexdigest()]
+    # D-09 hash 口径不变：code 部分仍折叠为 ""；新 JS 契约以 {prompt, hash} 传入。
+    assert passed_args == [
+        {"prompt": " ", "hash": sha256(b" ").hexdigest()}
+    ]
 
 
 def test_browser_session_single_page_surface_contract():

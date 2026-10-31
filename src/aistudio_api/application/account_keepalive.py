@@ -131,6 +131,8 @@ class AccountKeepaliveService:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._job_lock = asyncio.Lock()
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
         self._running: str | None = None
         self._last_results: dict[str, dict[str, object]] = {}
         self._last_error: str | None = None
@@ -157,7 +159,7 @@ class AccountKeepaliveService:
             log.warning("[Keepalive] pool slot inspection failed: %s", exc)
             return ()
 
-    async def start(self) -> None:
+    async def start(self, *, startup_metadata_done: bool = False) -> None:
         if self._task is not None and not self._task.done():
             return
         now = self._clock()
@@ -166,6 +168,7 @@ class AccountKeepaliveService:
             "metadata_refresh": (
                 now
                 if settings.metadata_refresh_on_startup
+                and not startup_metadata_done
                 else now + settings.metadata_refresh_seconds
             ),
             "auth_update": now,
@@ -260,6 +263,7 @@ class AccountKeepaliveService:
             return {"ok": False, "task": task, "reason": "busy"}
 
         async with self._job_lock:
+            self._idle_event.clear()
             self._running = task
             current = settings or self._settings()
             try:
@@ -280,7 +284,16 @@ class AccountKeepaliveService:
                 "at": _iso(self._clock()),
                 "trigger": trigger,
             }
+            self._idle_event.set()
             return self._last_results[task]
+
+    async def run_startup_metadata_refresh(self) -> dict[str, object]:
+        """Run the startup metadata refresh, waiting out an in-flight job."""
+        while True:
+            result = await self.run_now("metadata_refresh", trigger="startup")
+            if result.get("reason") != "busy":
+                return result
+            await self._idle_event.wait()
 
     async def _execute(
         self, task: str, settings: KeepaliveSettings, trigger: str
@@ -310,7 +323,11 @@ class AccountKeepaliveService:
             return {"ok": True, "reason": "no_due_accounts", "count": 0}
 
         try:
-            results = await self._refresher.refresh_accounts(due, refresh_email=True)
+            results = await self._refresher.refresh_accounts(
+                due,
+                refresh_email=True,
+                skip_fresh_free_tier=True,
+            )
         except RefreshInProgressError:
             log.info("[Keepalive] metadata refresh skipped: already running")
             return {"ok": False, "reason": "refresh_in_progress", "count": 0}

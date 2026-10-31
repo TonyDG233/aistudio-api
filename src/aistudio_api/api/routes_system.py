@@ -199,7 +199,7 @@ async def clear_cooldown(
         rotator.clear_cooldown(req.account_id, model=req.model)
     else:
         rotator.clear_all_cooldowns()
-    logger.info("已清除冷却锁定: 账号=%s, 模型=%s", req.account_id, req.model)
+    logger.info("已清除冷却状态: 账号=%s, 模型=%s", req.account_id or "全部", req.model or "全部")
 
     return {"ok": True, "accounts": rotator.get_all_stats()}
 
@@ -261,7 +261,7 @@ async def force_next_account(
     if result is None:
         raise HTTPException(500, detail="切换失败")
 
-    logger.info("已强制切换至下一可用账号: %s (%s)", result.id, result.name)
+    logger.info("强制切换到下一个账号: id=%s, name=%s", result.id, result.name)
     return {
         "ok": True,
         "account": {
@@ -485,7 +485,7 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("已创建新 API Key: 备注=%s, 密钥=%s", name, new_key[:8] + "...")
+    logger.info("创建 API Key: 备注=%s, 前缀=%s", name, new_key[:8] + "...")
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
 
 
@@ -533,7 +533,7 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("已删除 API Key: %s", key_value[:8] + "...")
+    logger.info("删除 API Key: 前缀=%s", key_value[:8] + "...")
     return {"ok": True}
 
 
@@ -586,6 +586,6 @@ async def update_api_key_name(
         raise HTTPException(400, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
-    logger.info("API Key 备注名已更新: %s -> %s", key_value[:8] + "...", new_name)
+    logger.info("更新 API Key 备注: 前缀=%s, 备注=%s", key_value[:8] + "...", new_name)
 
     return updated_item

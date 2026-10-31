@@ -22,7 +22,7 @@ _UNSET: object = object()
 
 
 def _atomic_write_json(path: Path, data: object) -> None:
-    """原子写入 JSON 文件（写唯一临时文件后原子替换，防止写穿或损坏）。"""
+    """写入 JSON 文件，通过临时文件加原子替换防止文件损坏。"""
     target_path = path.resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
@@ -242,7 +242,7 @@ class PresetApplyResult:
 
 
 def _load_system_presets_from_config() -> list[AccountPreset]:
-    """从 config.yaml 动态加载系统预设方案，绝不在代码中硬编码。"""
+    """从 config.yaml 读取系统预设方案。"""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_presets,
     )
@@ -457,10 +457,7 @@ class AccountStore:
     def _find_registered_account(
         self, registry: Registry, account_id: str
     ) -> AccountMeta | None:
-        for stored_id, meta in registry.accounts.items():
-            if stored_id == account_id:
-                return meta
-        return None
+        return registry.accounts.get(account_id)
 
     def get_account(self, account_id: str) -> AccountMeta | None:
         """获取单个账号。"""
@@ -647,7 +644,9 @@ class AccountStore:
         self._save_registry(registry)
         return True
 
-    def update_account_tier(self, account_id: str, tier: str) -> bool:
+    def update_account_tier(
+        self, account_id: str, tier: str, checked_at: str | None = None
+    ) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Ultra_20X / Plus)，并持久化 meta.json 与 registry.json。"""
         from aistudio_api.infrastructure.account.cookie_parser import (
             normalize_benefit_tier,
@@ -658,15 +657,16 @@ class AccountStore:
         if acc is None:
             return False
         clean_tier = normalize_benefit_tier(tier)
-        if acc.tier == clean_tier:
-            return False
+        changed = acc.tier != clean_tier
         acc.tier = clean_tier
+        if checked_at is not None:
+            acc.tier_checked_at = checked_at
         account_dir = _safe_account_dir(self._accounts_dir, acc.id)
         meta_path = account_dir / "meta.json"
         if meta_path.exists():
             _atomic_write_json(meta_path, acc.to_dict())
         self._save_registry(registry)
-        return True
+        return changed
 
     def update_account_refresh(
         self,
@@ -916,7 +916,7 @@ class AccountStore:
         return True
 
     def create_snapshot_preset(self, name: str, description: str = "") -> AccountPreset:
-        """一键快照：捕获当前所有 enabled=True 的账号 ID 列表保存为自定义预设。"""
+        """保存当前所有已启用账号的 ID 列表为预设方案。"""
         import secrets
 
         registry = self._load_registry()

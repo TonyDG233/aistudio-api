@@ -326,3 +326,32 @@ def test_shutdown_runtime_cancels_background_tasks_first():
 
     asyncio.run(scenario())
     assert events == ["keepalive.stop"]
+
+
+def test_auth_error_cooldown_is_optional_and_defaults_to_zero():
+    normalized = validate_config_mapping(
+        {
+            "rotator": {
+                "cooldowns": {
+                    "rate_limited_short": 60,
+                    "rate_limited_drip": 300,
+                    "rate_limited_drip_extended": 600,
+                }
+            }
+        }
+    )
+    rotator = normalized["rotator"]
+    assert isinstance(rotator, dict)
+    cooldowns = rotator["cooldowns"]
+    assert isinstance(cooldowns, dict)
+    assert cooldowns["auth_error"] == 0
+    assert cooldowns["rate_limited_short"] == 60
+
+
+def test_auth_error_cooldown_still_rejects_non_numeric_when_present():
+    with pytest.raises(
+        ConfigValidationError, match=r"rotator\.cooldowns\.auth_error"
+    ):
+        validate_config_mapping(
+            {"rotator": {"cooldowns": {"auth_error": "not-a-number"}}}
+        )
