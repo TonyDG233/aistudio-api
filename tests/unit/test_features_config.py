@@ -665,7 +665,8 @@ def test_auth_error_cooldown_inherits_tracked_template_default():
     assert isinstance(template_rotator, dict)
     template_cooldowns = template_rotator["cooldowns"]
     assert isinstance(template_cooldowns, dict)
-    assert cooldowns["auth_error"] == template_cooldowns["auth_error"]
+    assert template_cooldowns["auth_error"] == 0
+    assert cooldowns["auth_error"] == 0
     assert cooldowns["rate_limited_short"] == 60
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import cast
@@ -133,7 +134,7 @@ def test_legacy_config_is_migrated_and_atomically_written(tmp_path, monkeypatch)
     assert len(replace_calls) == 1
     assert Path(replace_calls[0][0]).parent == tmp_path
     assert replace_calls[0][1] == str(path)
-    assert not list(tmp_path.glob("*.tmp"))
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
     migrated = _read_yaml(path)
     assert "groups" not in migrated
@@ -269,3 +270,146 @@ def test_validate_config_never_rewrites_tracked_template(monkeypatch):
     validate_config(_DEFAULTS_PATH)
 
     assert _DEFAULTS_PATH.read_text(encoding="utf-8") == template
+
+
+def test_invalid_noncritical_logging_level_is_persisted_as_fallback(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("logging:\n  level: BOGUS\n", encoding="utf-8")
+
+    validated = validate_config(path)
+
+    assert _as_dict(validated["logging"])["level"] == "INFO"
+    assert _as_dict(_read_yaml(path)["logging"])["level"] == "INFO"
+
+
+def test_invalid_critical_config_still_raises_without_fallback_write(tmp_path):
+    content = "logging:\n  level: BOGUS\nrotator:\n  max_retries: -1\n"
+    path = tmp_path / "config.yaml"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError, match=r"rotator\.max_retries"):
+        validate_config(path)
+
+    assert path.read_text(encoding="utf-8") == content
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_migration_write_oserror_is_logged_and_keeps_validated_config(
+    tmp_path, monkeypatch, caplog
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(_LEGACY_CONFIG, encoding="utf-8")
+
+    def _read_only_write(target: Path, content: str) -> None:
+        raise PermissionError(13, "read-only file system", str(target))
+
+    monkeypatch.setattr(model_defaults, "_atomic_write_text", _read_only_write)
+
+    with caplog.at_level(logging.WARNING, logger="aistudio.config"):
+        validated = validate_config(path)
+
+    assert validated["instances"] == [
+        {"count": 3, "surface": "chat", "only_tier": "Free"}
+    ]
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any(
+        "无法写回已迁移的配置文件" in message and str(path) in message
+        for message in warnings
+    )
+    assert path.read_text(encoding="utf-8") == _LEGACY_CONFIG
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_atomic_write_failure_removes_hidden_temp_file(
+    tmp_path, monkeypatch, caplog
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(_LEGACY_CONFIG, encoding="utf-8")
+
+    def _failing_replace(src, dst):
+        raise PermissionError(13, "denied", str(dst))
+
+    monkeypatch.setattr(model_defaults.os, "replace", _failing_replace)
+
+    with caplog.at_level(logging.WARNING, logger="aistudio.config"):
+        validated = validate_config(path)
+
+    assert validated["instances"] == [
+        {"count": 3, "surface": "chat", "only_tier": "Free"}
+    ]
+    assert any(
+        "无法写回已迁移的配置文件" in record.getMessage() for record in caplog.records
+    )
+    assert path.read_text(encoding="utf-8") == _LEGACY_CONFIG
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+@pytest.mark.parametrize(
+    ("template_content", "message"),
+    [
+        ("rotator: [\n", "YAML"),
+        ("- not\n- a\n- mapping\n", "顶层必须为字典"),
+    ],
+)
+def test_invalid_default_template_raises(
+    tmp_path, monkeypatch, template_content, message
+):
+    template_path = tmp_path / "defaults" / "config.yaml"
+    template_path.parent.mkdir(parents=True)
+    template_path.write_text(template_content, encoding="utf-8")
+
+    model_defaults.invalidate_config_cache()
+    monkeypatch.setattr(
+        model_defaults, "resolve_default_config_template", lambda: template_path
+    )
+
+    with pytest.raises(ConfigValidationError, match=message):
+        model_defaults._default_config()
+
+    model_defaults.invalidate_config_cache()
+
+
+def test_migration_write_invalidates_stale_config_cache(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(_LEGACY_CONFIG, encoding="utf-8")
+    path_key = str(path.resolve())
+    model_defaults._CONFIG_CACHE[path_key] = (
+        path.stat().st_mtime,
+        {"stale_marker": True},
+    )
+
+    try:
+        validate_config(path)
+
+        assert path_key not in model_defaults._CONFIG_CACHE
+
+        reloaded = model_defaults._load_yaml_config(path)
+        assert "stale_marker" not in reloaded
+        assert "groups" not in reloaded
+        assert "channels" not in reloaded
+        assert reloaded["instances"] == [
+            {"count": 3, "surface": "chat", "only_tier": "Free"}
+        ]
+        assert (
+            _as_dict(_as_dict(reloaded["rotator"])["cooldowns"])["rate_limited_short"]
+            == 60
+        )
+        cached = model_defaults._CONFIG_CACHE[path_key][1]
+        assert cached["instances"] == reloaded["instances"]
+    finally:
+        model_defaults.invalidate_config_cache()
+
+
+def test_docker_entrypoint_config_precedence_matches_config_module():
+    script = (_REPO_ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    block = script.split('export AISTUDIO_CONFIG_PATH="$CONFIG_FILE"', 1)[0]
+
+    assert 'if [ -n "${AISTUDIO_CONFIG_PATH:-}" ]; then' in block
+    assert 'elif [ -n "${AISTUDIO_CONFIG_FILE:-}" ]; then' in block
+    assert block.index("AISTUDIO_CONFIG_PATH") < block.index(
+        "AISTUDIO_CONFIG_FILE"
+    ) < block.index('CONFIG_FILE="$DEFAULT_CONFIG_FILE"')
+    assert 'CONFIG_FILE="$AISTUDIO_CONFIG_PATH"' in block
+    assert 'CONFIG_FILE="$AISTUDIO_CONFIG_FILE"' in block
+    assert "AISTUDIO_CONFIG_FILE !=" not in block
+    assert 'export AISTUDIO_CONFIG_PATH="$CONFIG_FILE"' in script
