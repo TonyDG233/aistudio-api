@@ -6,7 +6,7 @@ import asyncio
 import json
 import tempfile
 import zipfile
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from aistudio_api.infrastructure.utils.log_broadcast import (
     get_broadcaster,
     level_number,
     resolve_log_dir,
+    sanitize_log_message,
 )
 
 protected_router = APIRouter()
@@ -220,12 +221,18 @@ def resolve_export_range(
     return [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
 
 
+def _iter_sanitized_lines(path: Path) -> Iterator[str]:
+    """Yield archive lines with credentials masked before they leave the server."""
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for line in handle:
+            yield sanitize_log_message(line)
+
+
 async def _iter_file(path: Path) -> AsyncGenerator[bytes, None]:
     if not path.is_file():
         return
-    with path.open("rb") as handle:
-        while chunk := handle.read(64 * 1024):
-            yield chunk
+    for line in _iter_sanitized_lines(path):
+        yield line.encode("utf-8")
 
 
 async def _iter_zip(paths: list[Path]) -> AsyncGenerator[bytes, None]:
@@ -234,12 +241,9 @@ async def _iter_zip(paths: list[Path]) -> AsyncGenerator[bytes, None]:
             for path in paths:
                 if not path.is_file():
                     continue
-                with (
-                    archive.open(path.name, "w") as destination,
-                    path.open("rb") as source,
-                ):
-                    while chunk := source.read(64 * 1024):
-                        destination.write(chunk)
+                with archive.open(path.name, "w") as destination:
+                    for line in _iter_sanitized_lines(path):
+                        destination.write(line.encode("utf-8"))
         buffer.seek(0)
         while chunk := buffer.read(64 * 1024):
             yield chunk

@@ -86,11 +86,11 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and default configuration template
+# Copy application code (src includes the static frontend under
+# src/aistudio_api/static) and the tracked default configuration template.
 COPY src/ src/
 COPY main.py .
-COPY config.yaml /app/defaults/config.yaml
-COPY config.yaml /app/config.yaml
+COPY defaults/config.yaml /app/defaults/config.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 # Create necessary directories

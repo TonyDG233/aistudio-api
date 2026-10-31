@@ -51,6 +51,9 @@ def test_daily_handler_writes_sanitized_line(tmp_path):
     )
     try:
         _emit(handler, "Authorization: Bearer secret-token")
+        _emit(handler, "Cookie: SAPISID=abc123; theme=dark")
+        _emit(handler, "x-goog-api-key: AIzaSySecretValue1234567890")
+        _emit(handler, "[toolshape] pg08 keep-me")
     finally:
         handler.close()
 
@@ -59,6 +62,10 @@ def test_daily_handler_writes_sanitized_line(tmp_path):
     assert "2026-10-20 12:34:56 INFO aistudio.test.archive" in text
     assert "secret-token" not in text
     assert "Bearer ***" in text
+    assert "abc123" not in text
+    assert "theme=dark" not in text
+    assert "AIzaSySecretValue1234567890" not in text
+    assert "[toolshape] pg08 keep-me" in text
 
 
 def test_daily_handler_switches_file_on_day_change(tmp_path):

@@ -77,14 +77,21 @@ _TEMPLATE_CONFIG_PATHS = (
 
 
 def resolve_config_file(config_path: str | os.PathLike[str] | None = None) -> Path:
-    """解析配置文件路径（优先使用 AISTUDIO_CONFIG_FILE 环境变量）。
+    """解析运行时配置文件路径。
 
-    若目标路径配置文件不存在，则自动从内置配置模板初始化复制，绝不覆盖已有配置文件。
+    优先级：显式 ``config_path`` > ``AISTUDIO_CONFIG_PATH`` >
+    ``AISTUDIO_CONFIG_FILE``（向后兼容）> 项目根 ``config.yaml``。
+    ``AISTUDIO_CONFIG_PATH`` 与 ``AISTUDIO_CONFIG_FILE`` 同时存在时前者优先。
+
+    若目标路径配置文件不存在，则自动从内置配置模板（``defaults/config.yaml``）
+    初始化复制并创建父目录，绝不覆盖已有配置文件。
     """
     if config_path is not None:
         target = Path(config_path)
     else:
-        override = os.getenv("AISTUDIO_CONFIG_FILE")
+        override = os.getenv("AISTUDIO_CONFIG_PATH") or os.getenv(
+            "AISTUDIO_CONFIG_FILE"
+        )
         target = Path(override) if override else _DEFAULT_CONFIG_PATH
 
     if not target.exists():
