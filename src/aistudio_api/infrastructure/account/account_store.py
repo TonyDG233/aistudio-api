@@ -648,15 +648,13 @@ class AccountStore:
         self, account_id: str, tier: str, checked_at: str | None = None
     ) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Ultra_20X / Plus)，并持久化 meta.json 与 registry.json。"""
-        from aistudio_api.infrastructure.account.cookie_parser import (
-            normalize_benefit_tier,
-        )
+        from aistudio_api.domain.model_access import normalize_tier
 
         registry = self._load_registry()
         acc = self._find_registered_account(registry, account_id)
         if acc is None:
             return False
-        clean_tier = normalize_benefit_tier(tier)
+        clean_tier = normalize_tier(tier)
         changed = acc.tier != clean_tier
         acc.tier = clean_tier
         if checked_at is not None:

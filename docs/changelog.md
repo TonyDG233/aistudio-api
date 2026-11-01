@@ -53,6 +53,8 @@
 - 兼容性：旧 `pg/` 前缀已移除；生成接口接受显式 `chat/` 前缀，但模型元数据目录不输出也不接受该前缀。
 - 配置启动迁移写回的是已应用非关键回退的有效配置（例如非法 `logging.level` 会持久化为 `INFO`），
   `rotator.cooldowns.auth_error` 默认值调整为 `0`，403 认证失败不再产生固定冷却锁。
+- `X-AIStudio-G1-Tier` 映射与 tier 归一集中到 `domain/model_access.py`（`tier_header_value`/`normalize_tier`），
+  Cookie 解析、transport、模型发现与账号刷新共用单一来源；Free 账号仍不发送该请求头。
 
 ### Fixed
 
@@ -65,6 +67,9 @@
 - 修复日志导出与归档写入的脱敏缺口，历史日志不再原样泄漏密钥或 Cookie。
 - 修复只读配置目录下的启动失败：迁移写回失败时记录警告并继续以内存中已校验的配置启动，
   同时清理可能残留的临时文件。
+- 容器 HEALTHCHECK 改为认证豁免的 `/health`，不再每 30 秒用未带 Key 的 `/v1beta/models` 探测。
+- 只读模型列表的缺 Key 401 按客户端 IP/path 在 5 分钟窗口内去重；WARN 附带截断到 80 字符的
+  `User-Agent` 与去除查询串/片段的 `Referer`，重复项降为 DEBUG，避免日志洪水与密钥泄漏。
 
 ### Removed
 

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from aistudio_api.domain.errors import BrowserTransportError
-from aistudio_api.infrastructure.account.cookie_parser import get_tier_header_value
+from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     STREAM_CLEANUP_JS,
@@ -50,8 +50,8 @@ async def test_explicit_free_tier_header_is_not_replaced_by_active_pro(
         tier="Free",
     )
 
-    assert headers.get("X-AIStudio-G1-Tier") == get_tier_header_value("Free")
-    assert headers.get("X-AIStudio-G1-Tier") != get_tier_header_value("Pro")
+    assert headers.get("X-AIStudio-G1-Tier") == tier_header_value("Free")
+    assert headers.get("X-AIStudio-G1-Tier") != tier_header_value("Pro")
     assert "X-AIStudio-G1-Tier" not in headers
     assert headers["X-Other"] == "keep"
     assert "Authorization" in headers
@@ -72,7 +72,7 @@ async def test_supplied_paid_tier_wins_over_active_account_tier(monkeypatch):
         page, {}, tier="Ultra"
     )
 
-    assert headers["X-AIStudio-G1-Tier"] == get_tier_header_value("Ultra")
+    assert headers["X-AIStudio-G1-Tier"] == tier_header_value("Ultra")
 
 
 @pytest.mark.asyncio
@@ -90,7 +90,7 @@ async def test_blank_tier_falls_back_to_active_account_tier(monkeypatch):
         page, {}, tier="  "
     )
 
-    assert headers["X-AIStudio-G1-Tier"] == get_tier_header_value("Pro")
+    assert headers["X-AIStudio-G1-Tier"] == tier_header_value("Pro")
 
 
 @pytest.mark.asyncio

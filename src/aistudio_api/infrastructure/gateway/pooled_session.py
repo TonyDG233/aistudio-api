@@ -13,7 +13,12 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
 
+from aistudio_api.config import resolve_fingerprint_spoof_enabled
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
+from aistudio_api.infrastructure.browser.fingerprint import (
+    apply_fingerprint,
+    build_fingerprint_profile,
+)
 from aistudio_api.infrastructure.browser.scripts import (
     DOM_GC_CLEANUP_JS,
     SNAPSHOT_GENERATE_JS,
@@ -70,12 +75,21 @@ class PooledSession:
         auth_file: str | None,
         auth_user: str | None,
         realm_id: str,
+        account_id: str | None = None,
         timeout_s: float = 90.0,
     ) -> PooledSession:
         page = await cdp.create_page_in_context(context_id, block_assets=True)
         target_auth_user = auth_user or get_auth_user_from_meta(auth_file)
         page.account_auth_file = auth_file
         try:
+            # P3-F: register the account fingerprint before navigation/cookies so
+            # the very first document already sees the spoofed navigator/WebGL.
+            if resolve_fingerprint_spoof_enabled():
+                profile = build_fingerprint_profile(
+                    account_id=account_id, auth_file=auth_file
+                )
+                await apply_fingerprint(page, profile, enabled=True)
+
             await load_cookies_to_page(page, auth_file)
             await navigate_to_aistudio(
                 page, auth_user=target_auth_user, auth_file=auth_file

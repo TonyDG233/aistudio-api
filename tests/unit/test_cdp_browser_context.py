@@ -168,6 +168,8 @@ async def test_pooled_session_bootstraps_inside_given_context(monkeypatch) -> No
     page = MagicMock()
     page.is_closed.return_value = False
     page.close = AsyncMock()
+    page.cdp = MagicMock()
+    page.cdp.send = AsyncMock()
     cdp = MagicMock(spec=CDPClient)
     cdp.create_page_in_context = AsyncMock(return_value=page)
 

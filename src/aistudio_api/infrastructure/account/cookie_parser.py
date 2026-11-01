@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import httpx
 
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
+)
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
     AI_STUDIO_ORIGIN,
@@ -29,62 +32,13 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("cookie_parser")
 
 
-BENEFIT_TIER_TO_NAME: dict[int, str] = {
-    0: "Free",
-    1: "Pro",
-    2: "Ultra",
-    3: "Plus",
-}
-
-BENEFIT_TIER_TO_HEADER: dict[str, str] = {
-    "Pro": "TIER1",
-    "Ultra": "TIER2",
-    "Ultra_20X": "TIER2",
-    "Plus": "TIER0",
-}
-
-_CANONICAL_TIERS: dict[str, str] = {
-    "free": "Free",
-    "plus": "Plus",
-    "pro": "Pro",
-    "ultra": "Ultra",
-    "ultra_20x": "Ultra_20X",
-}
-
-
-def normalize_benefit_tier(tier: str | None) -> str:
-    """Normalize benefit tier string into canonical name (Free / Plus / Pro / Ultra / Ultra_20X)."""
-    if not tier:
-        return "Free"
-    return _CANONICAL_TIERS.get(tier.strip().lower(), "Free")
-
-
 def parse_benefit_tier_response(raw_data: object) -> str:
-    """解析 GetAiStudioBenefitTier 响应数组为标准权益名称 (Free / Pro / Ultra / Plus)。"""
-    if isinstance(raw_data, str):
-        text = raw_data.strip().removeprefix(")]}'").strip()
-        if text.startswith("[,"):
-            text = "[null," + text[2:]
-        try:
-            raw_data = json.loads(text)
-        except Exception:
-            return "Free"
-    if not isinstance(raw_data, list) or not raw_data or raw_data[0] is None:
-        return "Free"
-    val = raw_data[0]
-    if isinstance(val, bool):
-        return "Free"
-    if isinstance(val, (int, float)):
-        return BENEFIT_TIER_TO_NAME.get(int(val), "Free")
-    return "Free"
+    """解析 GetAiStudioBenefitTier 响应数组为标准权益名称 (Free / Pro / Ultra / Plus)。
 
-
-def get_tier_header_value(tier: str | None) -> str | None:
-    """根据账号权益等级返回对应的 X-AIStudio-G1-Tier 请求头取值。"""
-    if not tier:
-        return None
-    clean = normalize_benefit_tier(tier)
-    return BENEFIT_TIER_TO_HEADER.get(clean)
+    解码与归一化统一委托给 :func:`parse_benefit_tier_envelope`；未知 code 在本
+    调用面按 Free 处理（与历史行为一致）。
+    """
+    return parse_benefit_tier_envelope(raw_data).display_tier()
 
 
 # Cookies that need httpOnly=False so JS can read them for SAPISIDHASH.

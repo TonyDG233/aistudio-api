@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from aistudio_api.domain.errors import BrowserTransportError
+from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
-    get_tier_header_value,
 )
 from aistudio_api.infrastructure.browser.scripts import (
     HOOKED_REQUEST_JS,
@@ -182,7 +182,7 @@ async def _ensure_authorization_header(
     clean_headers["X-Goog-AuthUser"] = str(auth_user or "0")
     supplied_tier = (tier or "").strip()
     effective_tier = supplied_tier or _get_active_account_tier()
-    tier_header = get_tier_header_value(effective_tier)
+    tier_header = tier_header_value(effective_tier)
     if tier_header:
         clean_headers["X-AIStudio-G1-Tier"] = tier_header
     cookie_dict = getattr(page, "_cached_cookies", None)

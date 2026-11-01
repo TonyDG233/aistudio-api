@@ -3,7 +3,7 @@
   "$id": "https://aistudio-api.local/config.schema.json",
   "title": "aistudio-api runtime config (current contract)",
   "description": "当前运行配置的结构契约。同时覆盖 defaults/config.yaml（当前分发默认）与 config/config.example.yaml（Gate 0.5 示例）；跨字段语义（tier 选择器合法性、Free/paid lane 不混合、rotator 冷却范围、配额桶等）由运行时 model_defaults / application.model_access 校验，本 schema 只保证结构与基本类型。",
-  "$comment": "覆盖当前 defaults/config.yaml 顶层键：api_keys、security.api_allow_anonymous、instances、max_contexts、diagnostics.hash_include_code、logging、rotator、features.{routing,keepalive,formats,atg}、paid_model_rules、model_defaults、tier_quotas、account_presets；同时保留 Gate 0.5 示例的 limits.max_instances 与顶层 keepalive.enabled/interval_hours。",
+  "$comment": "覆盖当前 defaults/config.yaml 顶层键：api_keys、security.api_allow_anonymous、instances、max_contexts、diagnostics.hash_include_code、browser.fingerprint_spoof_enabled、logging、rotator、features.{routing,keepalive,formats,atg}、paid_model_rules、model_defaults、tier_quotas、account_presets；同时保留 Gate 0.5 示例的 limits.max_instances 与顶层 keepalive.enabled/interval_hours。",
   "$defs": {
     "tierName": {
       "type": "string",
@@ -113,6 +113,18 @@
       "description": "诊断开关（D-09）；不进入普通用户 UI。",
       "properties": {
         "hash_include_code": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": true
+    },
+    "browser": {
+      "type": "object",
+      "description": "浏览器运行时配置（P3-F 指纹伪装）。指纹按账号确定性生成并在页面导航前通过 CDP 注入。",
+      "properties": {
+        "fingerprint_spoof_enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否注入按账号生成的 Windows 桌面浏览器指纹。默认 true；显式 false 时完全跳过脚本与屏幕指标注入。"
+        }
       },
       "additionalProperties": true
     },

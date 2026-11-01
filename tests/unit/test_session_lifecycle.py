@@ -33,6 +33,8 @@ async def test_session_hot_cookie_switching(tmp_path):
 
     page = MagicMock(spec=CDPPage)
     page.is_closed = MagicMock(return_value=False)
+    page.cdp = MagicMock()
+    page.cdp.send = AsyncMock()
     mock_cdp = MagicMock(spec=CDPClient)
     mock_cdp.connect_page = AsyncMock(return_value=page)
     session._cdp_client = mock_cdp
@@ -198,6 +200,8 @@ async def test_switch_auth_rebinds_single_page_in_order():
     new_page.is_closed = MagicMock(return_value=False)
     new_page.close = AsyncMock()
     new_page.target_id = "new-tab"
+    new_page.cdp = MagicMock()
+    new_page.cdp.send = AsyncMock()
 
     order: list[str] = []
     old_page.close.side_effect = lambda: order.append("close_old")

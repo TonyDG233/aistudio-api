@@ -19,6 +19,8 @@ def _page(target_id: str, url: str) -> MagicMock:
     page.close = AsyncMock()
     page.url = url
     page.target_id = target_id
+    page.cdp = MagicMock()
+    page.cdp.send = AsyncMock()
     return page
 
 

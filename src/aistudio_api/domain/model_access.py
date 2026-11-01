@@ -60,6 +60,25 @@ _TIER_CANONICAL = {
     "ultra20x": "Ultra_20X",
 }
 
+# Authoritative observed ``GetAiStudioBenefitTier`` integer code -> canonical
+# tier label map.  Both the cookie parser and the account refresher consume
+# this single table; do not re-declare local copies.
+BENEFIT_TIER_BY_CODE: dict[int, str] = {
+    0: "Free",
+    1: "Pro",
+    2: "Ultra",
+    3: "Plus",
+}
+
+# Canonical tier -> ``X-AIStudio-G1-Tier`` request header value. Free has no
+# entry on purpose: upstream expects the header to be absent for Free accounts.
+BENEFIT_TIER_TO_HEADER: dict[str, str] = {
+    "Pro": "TIER1",
+    "Ultra": "TIER2",
+    "Ultra_20X": "TIER2",
+    "Plus": "TIER0",
+}
+
 _PAID_MODELS: set[str] = set(_DEFAULT_PAID_MODELS)
 _LOCK = RLock()
 
@@ -91,6 +110,31 @@ def canonical_tier(value: object) -> str | None:
         return None
     text = str(value).strip().lower().replace(" ", "_").replace("-", "_")
     return _TIER_CANONICAL.get(text)
+
+
+def normalize_tier(value: object) -> str:
+    """Return the canonical tier label, treating unknown/empty values as Free."""
+    return canonical_tier(value) or "Free"
+
+
+def benefit_tier_from_code(code: int, *, unknown: str = "Free") -> str:
+    """Map an observed benefit-tier integer code to a canonical tier label.
+
+    ``unknown`` keeps the two call-site policies intact: the RPC parser treats
+    unrecognised codes as Free, while the refresher surfaces ``unknown-<code>``
+    for non-zero codes it has never seen.
+    """
+    return BENEFIT_TIER_BY_CODE.get(code, unknown)
+
+
+def tier_header_value(value: object) -> str | None:
+    """Return the ``X-AIStudio-G1-Tier`` value for a tier; Free/unknown -> None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return BENEFIT_TIER_TO_HEADER.get(normalize_tier(text))
 
 
 def _selector_label(name: str, value: object) -> str | None:
@@ -339,10 +383,13 @@ def surface_capability(
 
 
 __all__ = [
+    "BENEFIT_TIER_BY_CODE",
+    "BENEFIT_TIER_TO_HEADER",
     "PAID_TIERS",
     "TierSelector",
     "TierSelectorError",
     "account_is_paid",
+    "benefit_tier_from_code",
     "best_tier",
     "canonical_tier",
     "clear_paid_models",
@@ -353,9 +400,11 @@ __all__ = [
     "model_account_requirement",
     "model_requires_paid_account",
     "normalize_model_key",
+    "normalize_tier",
     "resolve_tier_selector",
     "set_paid_models",
     "surface_capability",
+    "tier_header_value",
     "tier_matches_selector",
     "tier_matches_spec",
     "tier_rank",

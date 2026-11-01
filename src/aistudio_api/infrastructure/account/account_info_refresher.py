@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 
 from aistudio_api.config import settings
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
 )
@@ -55,7 +58,6 @@ logger = get_logger("account_refresher")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
-TIER_BY_CODE: dict[int, str] = {1: "Pro", 2: "Ultra", 3: "Plus"}
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -274,11 +276,11 @@ class AccountInfoRefresher:
             )
 
         response = await self._post_tier_request(cookies, auth_user=account.auth_user)
-        envelope = self._parse_envelope(response.body)
-        message = self._envelope_message(envelope)
+        envelope = parse_benefit_tier_envelope(response.body)
+        message = envelope.message
 
         if response.status == 200:
-            tier = self._tier_name(self._tier_code_from_envelope(envelope))
+            tier = envelope.display_tier(include_unknown_code=True)
             email: str | None = None
             email_error: str | None = None
             wants_email = refresh_email or not account.email
@@ -413,11 +415,11 @@ class AccountInfoRefresher:
 
         checked_at = _now_iso()
         response = await self._post_tier_request(cookies, auth_user=account.auth_user)
-        envelope = self._parse_envelope(response.body)
-        message = self._envelope_message(envelope)
+        envelope = parse_benefit_tier_envelope(response.body)
+        message = envelope.message
 
         if response.status == 200:
-            tier = self._tier_name(self._tier_code_from_envelope(envelope))
+            tier = envelope.display_tier(include_unknown_code=True)
             self._store.update_account_refresh(
                 account.id, tier=tier, tier_checked_at=checked_at, expired=False
             )
@@ -604,31 +606,6 @@ class AccountInfoRefresher:
             if exact:
                 return exact
         return found[0]
-
-    @staticmethod
-    def _parse_envelope(body: str) -> list[object] | None:
-        try:
-            parsed = json.loads(str(body or "").strip())
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, list) else None
-
-    @staticmethod
-    def _tier_code_from_envelope(envelope: list[object] | None) -> int:
-        if not envelope:
-            return 0
-        first = envelope[0]
-        return first if isinstance(first, int) else 0
-
-    @staticmethod
-    def _tier_name(code: int) -> str:
-        return TIER_BY_CODE.get(code) or ("Free" if code == 0 else f"unknown-{code}")
-
-    @staticmethod
-    def _envelope_message(envelope: list[object] | None) -> str:
-        if envelope and len(envelope) >= 2 and isinstance(envelope[1], str):
-            return envelope[1][:300]
-        return ""
 
 
 __all__ = [
