@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -75,6 +76,10 @@ _TEMPLATE_CONFIG_PATHS = (
     _DEFAULT_CONFIG_PATH,
 )
 _DOCKER_TEMPLATE_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+# path -> ((mtime_ns, size), enabled).  Kept tiny: one entry per configured path.
+_FINGERPRINT_SPOOF_CACHE: dict[str, tuple[tuple[int, int], bool]] = {}
+_FINGERPRINT_SPOOF_CACHE_LOCK = Lock()
 
 
 def resolve_default_config_template() -> Path:
@@ -303,6 +308,60 @@ def resolve_hash_include_code() -> bool:
     return True
 
 
+def resolve_fingerprint_spoof_enabled() -> bool:
+    """P3-F 浏览器指纹伪装开关（默认开启）。
+
+    优先级：``AISTUDIO_FINGERPRINT_SPOOF`` 环境变量 >
+    ``browser.fingerprint_spoof_enabled`` 配置 > 默认 True。配置读取失败、键缺失
+    或值类型不合法时保守回退为开启，避免无意间把 SwiftShader 软渲染指纹暴露给
+    上游页面。
+
+    配置解析结果按 ``(path, mtime_ns, size)`` 缓存：``PooledSession.bootstrap``
+    会在事件循环里高频调用本函数，重复 YAML 解析会形成可见的小文件阻塞读。
+    环境变量覆盖每次动态求值，不进入缓存；配置文件的 mtime/size 一旦变化即
+    自动失效并重新解析，文件不可读时仍安全回退为 True。
+    """
+    env_value = _load_env(
+        "AISTUDIO_FINGERPRINT_SPOOF", "AISTUDIO_FINGERPRINT_SPOOF_ENABLED"
+    )
+    if env_value is not None:
+        return env_value.strip().lower() not in ("0", "false", "no", "off")
+
+    path = resolve_config_file()
+    cache_key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        with _FINGERPRINT_SPOOF_CACHE_LOCK:
+            _FINGERPRINT_SPOOF_CACHE.pop(cache_key, None)
+        return True
+
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+    with _FINGERPRINT_SPOOF_CACHE_LOCK:
+        cached = _FINGERPRINT_SPOOF_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
+    enabled = True
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        browser = raw.get("browser")
+        if isinstance(browser, dict):
+            value = browser.get("fingerprint_spoof_enabled")
+            if isinstance(value, bool):
+                enabled = value
+            elif isinstance(value, str):
+                enabled = value.strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        enabled = True
+
+    with _FINGERPRINT_SPOOF_CACHE_LOCK:
+        _FINGERPRINT_SPOOF_CACHE[cache_key] = (fingerprint, enabled)
+    return enabled
+
+
 @dataclass(slots=True)
 class Settings:
     port: int = int(os.getenv("AISTUDIO_PORT", "8080"))
@@ -311,6 +370,7 @@ class Settings:
     )
     browser_headless: bool = _load_bool_env("AISTUDIO_BROWSER_HEADLESS", default=True)
     hash_include_code: bool = resolve_hash_include_code()
+    fingerprint_spoof_enabled: bool = resolve_fingerprint_spoof_enabled()
     browser_executable_path: str | None = os.getenv("AISTUDIO_BROWSER_EXECUTABLE")
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())

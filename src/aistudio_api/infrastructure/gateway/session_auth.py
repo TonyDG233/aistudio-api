@@ -10,10 +10,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aistudio_api.domain.errors import SessionExpiredError
+from aistudio_api.domain.model_access import normalize_tier
 from aistudio_api.infrastructure.account.account_store import write_storage_state
-from aistudio_api.infrastructure.account.cookie_parser import (
-    normalize_benefit_tier,
-    parse_benefit_tier_response,
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
 )
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
@@ -96,7 +96,7 @@ def get_tier_from_meta(auth_file: str | None) -> str:
             meta_path = Path(auth_file).parent / "meta.json"
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                return normalize_benefit_tier(str(meta.get("tier") or "Free"))
+                return normalize_tier(str(meta.get("tier") or "Free"))
         except Exception:
             pass
     return "Free"
@@ -223,7 +223,7 @@ async def extract_account_tier(
             timeout_s=10.0,
         )
         if isinstance(res, dict) and res.get("ok"):
-            return parse_benefit_tier_response(res.get("text"))
+            return parse_benefit_tier_envelope(res.get("text")).display_tier()
     except Exception as e:
         log.debug("从页面提取账号订阅等级失败: %s", e)
     return None

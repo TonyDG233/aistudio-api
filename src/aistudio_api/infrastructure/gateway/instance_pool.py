@@ -475,6 +475,7 @@ class InstancePool:
                     auth_file=slot.auth_file,
                     auth_user=slot.auth_user,
                     realm_id=realm_id,
+                    account_id=slot.account_id,
                 )
             except asyncio.CancelledError:
                 with suppress(Exception):

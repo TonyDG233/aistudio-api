@@ -368,10 +368,9 @@ def test_update_account_email(tmp_path):
 
 def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     """测试 GetAiStudioBenefitTier 响应解析、请求头映射及账号等级持久化。"""
+    from aistudio_api.domain.model_access import normalize_tier, tier_header_value
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.account.cookie_parser import (
-        get_tier_header_value,
-        normalize_benefit_tier,
         parse_benefit_tier_response,
     )
 
@@ -379,18 +378,42 @@ def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     assert parse_benefit_tier_response("[null]") == "Free"
     assert parse_benefit_tier_response("[0]") == "Free"
     assert parse_benefit_tier_response(")]}'\n[1]") == "Pro"
+    assert parse_benefit_tier_response("[,1]") == "Free"
     assert parse_benefit_tier_response([2]) == "Ultra"
     assert parse_benefit_tier_response([3]) == "Plus"
+    # Malformed / empty / non-list / unsupported element shapes all degrade to Free.
+    assert parse_benefit_tier_response("") == "Free"
+    assert parse_benefit_tier_response("not-json") == "Free"
+    assert parse_benefit_tier_response("null") == "Free"
+    assert parse_benefit_tier_response(True) == "Free"
+    assert parse_benefit_tier_response([True]) == "Free"
+    assert parse_benefit_tier_response(["1"]) == "Free"
+    assert parse_benefit_tier_response([9]) == "Free"
 
-    assert get_tier_header_value("Free") is None
-    assert get_tier_header_value("Pro") == "TIER1"
-    assert get_tier_header_value("Ultra") == "TIER2"
-    assert get_tier_header_value("Ultra_20X") == "TIER2"
-    assert get_tier_header_value("ultra_20x") == "TIER2"
-    assert normalize_benefit_tier("ultra_20x") == "Ultra_20X"
-    assert get_tier_header_value("Plus") == "TIER0"
-    assert get_tier_header_value("Ultra_20X") == "TIER2"
-    assert get_tier_header_value("ultra_20x") == "TIER2"
+    from aistudio_api.infrastructure.account.benefit_tier import (
+        parse_benefit_tier_envelope,
+    )
+
+    envelope = parse_benefit_tier_envelope(')]}\'\n[9,"unexpected tier"]')
+    assert envelope.code == 9
+    assert envelope.tier is None
+    assert envelope.message == "unexpected tier"
+    assert envelope.display_tier() == "Free"
+    assert envelope.display_tier(include_unknown_code=True) == "unknown-9"
+    known = parse_benefit_tier_envelope("[2]")
+    assert known.code == 2
+    assert known.tier == "Ultra"
+    assert known.display_tier(include_unknown_code=True) == "Ultra"
+
+    assert tier_header_value("Free") is None
+    assert tier_header_value("Pro") == "TIER1"
+    assert tier_header_value("Ultra") == "TIER2"
+    assert tier_header_value("Ultra_20X") == "TIER2"
+    assert tier_header_value("ultra_20x") == "TIER2"
+    assert normalize_tier("ultra_20x") == "Ultra_20X"
+    assert tier_header_value("Plus") == "TIER0"
+    assert tier_header_value("Ultra_20X") == "TIER2"
+    assert tier_header_value("ultra_20x") == "TIER2"
 
     store = AccountStore(accounts_dir=tmp_path / "accounts_tier_test")
     acc = store.save_account(

@@ -23,6 +23,7 @@ SNAPSHOT_PROBE_JS = _load_js("snapshot_probe.js")
 CHECK_IDENTITY_JS = _load_js("check_identity.js")
 DOM_GC_CLEANUP_JS = _load_js("dom_gc_cleanup.js")
 EXTRACT_EMAIL_JS = _load_js("extract_email.js")
+FINGERPRINT_SPOOF_JS = _load_js("fingerprint_spoof.js")
 
 
 def build_snapshot_args(*, prompt: str, content_hash: str) -> dict[str, str]:

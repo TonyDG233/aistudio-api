@@ -16,12 +16,16 @@ from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
 from pathlib import Path
 
-from aistudio_api.config import settings
+from aistudio_api.config import resolve_fingerprint_spoof_enabled, settings
 from aistudio_api.infrastructure.browser.browser_engine import (
     ChromiumProcess,
     launch_chromium_process,
 )
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
+from aistudio_api.infrastructure.browser.fingerprint import (
+    apply_fingerprint,
+    build_fingerprint_profile,
+)
 from aistudio_api.infrastructure.browser.scripts import (
     DOM_GC_CLEANUP_JS,
     SNAPSHOT_GENERATE_JS,
@@ -285,6 +289,14 @@ class BrowserSession:
                     new_page = await self._cdp_client.connect_page(block_assets=True)
                 new_page.account_auth_file = auth_file
 
+                # P3-F: the control session uses the auth file identity (parent
+                # directory + file name) as the fingerprint identity because no
+                # account_id is available here, so a hot account switch also
+                # swaps the injected profile.
+                if resolve_fingerprint_spoof_enabled():
+                    profile = build_fingerprint_profile(auth_file=auth_file)
+                    await apply_fingerprint(new_page, profile, enabled=True)
+
                 await load_cookies_to_page(new_page, auth_file)
                 await navigate_to_aistudio(
                     new_page,
@@ -530,6 +542,13 @@ class BrowserSession:
         # D03-025: 控制面 cookie 导入使用临时页，完成后立即关闭。
         page = await self._cdp_client.create_new_page(block_assets=False)
         try:
+            # P3-F: the temp import page navigates to Google/AI Studio, so it
+            # needs the imported account's fingerprint before that navigation
+            # (same switch and auth-file identity as transition_to_account).
+            if resolve_fingerprint_spoof_enabled():
+                profile = build_fingerprint_profile(auth_file=target_auth)
+                await apply_fingerprint(page, profile, enabled=True)
+
             await page.set_cookies(pw_cookies)
             with suppress(Exception):
                 await bootstrap_google_session(page)

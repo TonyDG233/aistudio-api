@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 from aistudio_api.domain.model_access import (
     is_paid_model as _is_paid_model,
     set_paid_models,
+    tier_header_value,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
-    get_tier_header_value,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
@@ -714,7 +714,7 @@ class ModelDiscoveryService:
             args={
                 "authorization": authorization,
                 "authUser": auth_user or "0",
-                "tierHeader": get_tier_header_value(tier),
+                "tierHeader": tier_header_value(tier),
                 "url": LIST_MODELS_URL,
                 "apiKey": WEB_API_KEY,
                 "userAgent": GRPC_WEB_USER_AGENT,
@@ -761,7 +761,7 @@ class ModelDiscoveryService:
         }
         if auth_header:
             headers["Authorization"] = auth_header
-        tier_header = get_tier_header_value(tier)
+        tier_header = tier_header_value(tier)
         if tier_header:
             headers["X-AIStudio-G1-Tier"] = tier_header
 

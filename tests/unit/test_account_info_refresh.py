@@ -201,6 +201,7 @@ def test_401_marks_expired(tmp_path: Path) -> None:
     assert result.expired is True
     assert result.tier is None
     assert "401" in (result.error or "")
+    assert "Login required" in (result.error or "")
     stored = store.get_account(account.id)
     assert stored is not None
     assert stored.expired is True
