@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -20,6 +21,12 @@ from aistudio_api.api.format_errors import (
     format_media_allow_private,
     openai_sse_error,
     require_format_enabled,
+)
+from aistudio_api.api.sse_keepalive import (
+    KEEPALIVE_FRAME,
+    KeepaliveIterator,
+    KeepaliveTimeout,
+    keepalive_interval_sec,
 )
 from aistudio_api.api.state import discovery_sessions_for
 from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
@@ -42,6 +49,7 @@ from aistudio_api.application.generation_service import (
     stream_generation,
 )
 from aistudio_api.application.routing_pipeline import RoutingPipeline
+from aistudio_api.domain.errors import RequestError
 
 if TYPE_CHECKING:
     from aistudio_api.api.state import RuntimeState
@@ -116,17 +124,36 @@ async def chat_completions(
             )
             return JSONResponse(openai_response(model=model_path, outcome=outcome))
 
-        iterator: AsyncIterator[StreamEvent] = stream_generation(
-            model_path=model_path,
-            req=gemini_request,
-            pipeline=pipeline,
-            api_format="openai",
+        events: KeepaliveIterator[StreamEvent] = KeepaliveIterator(
+            stream_generation(
+                model_path=model_path,
+                req=gemini_request,
+                pipeline=pipeline,
+                api_format="openai",
+            ),
+            interval=keepalive_interval_sec(),
         )
+
+        # Phase A: bounded wait for the first renderable event.  Errors and an
+        # exhausted stream before the deadline keep the existing PG-02
+        # non-200 JSON mapping; a slow upstream switches to 200 + keepalives.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + events.interval
+        first_event: StreamEvent | None = None
         try:
-            first_event = await iterator.__anext__()
-            while first_event.kind == "routing_wait":
-                first_event = await iterator.__anext__()
+            while first_event is None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                event = await events.next_event(remaining)
+                if isinstance(event, KeepaliveTimeout):
+                    break
+                candidate = cast("StreamEvent", event)
+                if candidate.kind == "routing_wait":
+                    continue
+                first_event = candidate
         except StopAsyncIteration:
+            await events.aclose()
             return format_error_response(
                 HTTPException(
                     500,
@@ -138,24 +165,41 @@ async def chat_completions(
                 "openai",
             )
         except Exception as exc:
+            await events.aclose()
             return format_error_response(exc, "openai")
 
         renderer = OpenAIStreamRenderer(model_path)
 
         async def event_stream() -> AsyncIterator[str]:
+            rendered_any = False
             try:
-                chunk = renderer.render(first_event)
-                if chunk:
-                    yield chunk
-                async for event in iterator:
-                    rendered = renderer.render(event)
+                if first_event is not None:
+                    chunk = renderer.render(first_event)
+                    rendered_any = rendered_any or bool(chunk)
+                    if chunk:
+                        yield chunk
+                else:
+                    yield KEEPALIVE_FRAME
+                async for item in events:
+                    if isinstance(item, str):
+                        yield item
+                        continue
+                    rendered = renderer.render(item)
+                    rendered_any = rendered_any or bool(rendered)
                     if rendered:
                         yield rendered
-                tail = renderer.close()
-                if tail:
-                    yield tail
+                if rendered_any:
+                    tail = renderer.close()
+                    if tail:
+                        yield tail
+                else:
+                    yield openai_sse_error(
+                        RequestError(502, "generation produced no stream events")
+                    )
             except Exception as exc:
                 yield openai_sse_error(exc)
+            finally:
+                await events.aclose()
 
         return StreamingResponse(
             event_stream(),

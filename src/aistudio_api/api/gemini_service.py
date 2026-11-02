@@ -8,8 +8,10 @@ Gemini wire shapes and translates domain errors into Gemini payloads.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
+from typing import cast
 
 from fastapi.responses import StreamingResponse
 
@@ -20,6 +22,12 @@ from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
+from aistudio_api.api.sse_keepalive import (
+    KEEPALIVE_FRAME,
+    KeepaliveIterator,
+    KeepaliveTimeout,
+    keepalive_interval_sec,
+)
 from aistudio_api.application import generation_service
 from aistudio_api.application.atg.extractor import AtgError
 from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
@@ -214,17 +222,32 @@ async def _build_gemini_streaming_response(
     req: GeminiGenerateContentRequest,
     model_path: str,
 ) -> StreamingResponse:
-    events = generation_service.stream_generation(
-        model_path=model_path,
-        req=req,
-        pipeline=pipeline,
-        api_format="gemini",
+    events = KeepaliveIterator(
+        generation_service.stream_generation(
+            model_path=model_path,
+            req=req,
+            pipeline=pipeline,
+            api_format="gemini",
+        ),
+        interval=keepalive_interval_sec(),
     )
+
+    # Phase A: wait for a renderable chunk only until the first keepalive
+    # deadline.  Errors and an exhausted stream in that window keep the PG-02
+    # contract (a real non-200 JSON error, never "200 with an empty body"),
+    # while a slow-but-alive upstream flips the response to 200 + keepalives.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + events.interval
     first_chunk: str | None = None
     try:
         while first_chunk is None:
-            event = await events.__anext__()
-            first_chunk = _render_stream_event(event)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            event = await events.next_event(remaining)
+            if isinstance(event, KeepaliveTimeout):
+                break
+            first_chunk = _render_stream_event(cast("StreamEvent", event))
     except StopAsyncIteration:
         await events.aclose()
         # A streaming request must never answer HTTP 200 with an empty SSE
@@ -241,15 +264,27 @@ async def _build_gemini_streaming_response(
         await events.aclose()
         raise
 
-    assert first_chunk is not None
-
     async def body() -> AsyncGenerator[str, None]:
+        rendered_any = first_chunk is not None
         try:
-            yield first_chunk
-            async for event in events:
-                chunk = _render_stream_event(event)
+            if first_chunk is not None:
+                yield first_chunk
+            else:
+                # Headers are already 200; keep the connection warm while the
+                # preserved ``__anext__`` task keeps waiting for the upstream.
+                yield KEEPALIVE_FRAME
+            async for item in events:
+                if isinstance(item, str):
+                    yield item
+                    continue
+                chunk = _render_stream_event(item)
                 if chunk:
+                    rendered_any = True
                     yield chunk
+            if not rendered_any:
+                yield format_sse_error(
+                    RequestError(502, "generation produced no stream events")
+                )
         except Exception as exc:
             yield format_sse_error(exc)
         finally:
