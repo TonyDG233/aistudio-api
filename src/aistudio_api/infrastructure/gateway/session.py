@@ -55,7 +55,10 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     save_browser_cookies,
 )
 from aistudio_api.infrastructure.gateway.session_state import SessionContext
-from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
+from aistudio_api.infrastructure.gateway.transport import (
+    XHRStreamTransport,
+    refresh_page_auth_state,
+)
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -453,6 +456,14 @@ class BrowserSession:
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
         )
+
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate and refetch this page's cached cookie/signature state."""
+        page = self.page
+        if page is None or page.is_closed():
+            log.warning("刷新鉴权态失败: 当前没有可用页面")
+            return False
+        return await refresh_page_auth_state(page)
 
     async def send_hooked_request(
         self,

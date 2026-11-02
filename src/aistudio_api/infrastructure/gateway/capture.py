@@ -32,10 +32,26 @@ class RequestCaptureService:
         self._active_ctx_id: int | None = None
         self._lock = asyncio.Lock()
 
-    def clear_templates(self) -> None:
-        """清空捕获的请求模板（账号切换或强制刷新时调用）。"""
+    def clear_templates(self) -> bool:
+        """清空捕获的请求模板（账号切换或强制刷新时调用）。
+
+        Returns True only when there was something to clear; repeated calls on
+        an already-empty cache stay silent so one 403/switch path cannot emit
+        duplicate INFO lines.
+        """
+        if not self._templates:
+            return False
         self._templates.clear()
         logger.info("已清空请求模板缓存")
+        return True
+
+    async def refresh_auth_state(self) -> bool:
+        """Drop the session's cached cookie/signature state and refetch it."""
+        try:
+            return bool(await self._session.refresh_auth_state())
+        except Exception as exc:
+            logger.warning("刷新鉴权态失败: %s", exc)
+            return False
 
     async def capture(
         self,

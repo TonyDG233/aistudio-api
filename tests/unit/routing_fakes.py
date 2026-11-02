@@ -41,6 +41,12 @@ class FakeSession:
     account_id: str
     generate: Callable[..., Awaitable[Any]] | None = None
     stream: Callable[..., AsyncIterator[tuple[str, object | None]]] | None = None
+    refresh_ok: bool = True
+    refresh_calls: int = 0
+
+    async def refresh_auth_state(self) -> bool:
+        self.refresh_calls += 1
+        return self.refresh_ok
 
 
 @dataclass
@@ -206,9 +212,11 @@ class FakeManager:
             if item.id == instance_id:
                 if item.state is not InstanceState.ACTIVE:
                     raise RuntimeError("not active")
-                return FakeHandle(
-                    slot=FakeSlot(session=self.sessions.get(instance_id, object()))
-                )
+                session = self.sessions.get(instance_id)
+                if session is None:
+                    session = FakeSession(account_id=item.account_id)
+                    self.sessions[instance_id] = session
+                return FakeHandle(slot=FakeSlot(session=session))
         raise RuntimeError(f"unknown instance {instance_id}")
 
 

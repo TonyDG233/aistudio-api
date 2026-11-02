@@ -62,6 +62,12 @@ features:
     active_activity: false
     active_activity_seconds: 60
 
+  # 模型发现刷新节奏：live_page 成功后默认 24h 刷新一次；其他来源
+  # （fallback/snapshot/live_http）按较短间隔重试，默认 600s。
+  model_discovery:
+    live_refresh_interval_sec: 86400
+    fallback_refresh_interval_sec: 600
+
   # Protocol faces. OpenAI Chat Completions is part of P5; Claude/Responses
   # stay disabled until C3.
   formats:

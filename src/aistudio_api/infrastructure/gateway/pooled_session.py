@@ -37,7 +37,10 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     save_browser_cookies,
 )
 from aistudio_api.infrastructure.gateway.session_state import SessionContext
-from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
+from aistudio_api.infrastructure.gateway.transport import (
+    XHRStreamTransport,
+    refresh_page_auth_state,
+)
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -200,6 +203,14 @@ class PooledSession:
         raise RuntimeError(
             f"PooledSession snapshot generation failed for {content_hash[:8]}"
         )
+
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate and refetch this realm's cached cookie/signature state."""
+        page = self._context.page
+        if page.is_closed():
+            log.warning("刷新鉴权态失败: realm=%s 页面已关闭", self._realm_id)
+            return False
+        return await refresh_page_auth_state(page)
 
     async def send_hooked_request(
         self,

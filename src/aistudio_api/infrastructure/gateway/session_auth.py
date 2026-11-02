@@ -223,7 +223,7 @@ async def extract_account_tier(
             timeout_s=10.0,
         )
         if isinstance(res, dict) and res.get("ok"):
-            return parse_benefit_tier_envelope(res.get("text")).display_tier()
+            return parse_benefit_tier_envelope(res.get("text")).strict_tier()
     except Exception as e:
         log.debug("从页面提取账号订阅等级失败: %s", e)
     return None

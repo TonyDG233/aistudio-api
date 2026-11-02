@@ -57,11 +57,21 @@ class MediaFetcher:
         current = url
         headers = {"User-Agent": "aistudio-api/1.0", "Accept": "image/*"}
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=False,
-                transport=self._transport,
-            ) as client:
+            if self._transport is not None:
+                client = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    follow_redirects=False,
+                    transport=self._transport,
+                )
+            else:
+                from aistudio_api.config import settings
+
+                client = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    follow_redirects=False,
+                    proxy=settings.proxy_url,
+                )
+            async with client:
                 for redirect_index in range(self.max_redirects + 1):
                     await self._validate_url(current, field=field)
                     async with client.stream(

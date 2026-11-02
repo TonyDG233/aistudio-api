@@ -113,12 +113,10 @@ def _make_store(tmp_path: Path) -> tuple[AccountStore, AccountMeta]:
     [
         ("[]", "Free"),
         ("[0]", "Free"),
+        ("[null]", "Free"),
         ("[1]", "Pro"),
         ("[2]", "Ultra"),
         ("[3]", "Plus"),
-        ("[9]", "unknown-9"),
-        ("null", "Free"),
-        ("not-json", "Free"),
     ],
 )
 def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
@@ -135,6 +133,81 @@ def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
     assert stored is not None
     assert stored.tier == expected
     assert stored.expired is False
+
+
+@pytest.mark.parametrize("existing_tier", ["Pro", "Ultra"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[9]",
+        "not-json",
+        "null",
+        '[null, "error message"]',
+    ],
+)
+def test_malformed_200_preserves_existing_tier_and_skips_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    existing_tier: str,
+) -> None:
+    store, account = _make_store(tmp_path)
+    store.update_account_refresh(
+        account.id,
+        tier=existing_tier,
+        tier_checked_at="2026-01-01T00:00:00Z",
+        expired=False,
+    )
+    current = store.get_account(account.id)
+    assert current is not None
+    update_mock = MagicMock(wraps=store.update_account_refresh)
+    monkeypatch.setattr(store, "update_account_refresh", update_mock)
+    transport = FakeTransport([TransportResponse(status=200, body=body)])
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    result = asyncio.run(refresher.refresh_account(current, refresh_email=False))
+
+    assert result.ok is False
+    assert result.tier is None
+    assert result.expired is None
+    update_mock.assert_not_called()
+    stored = store.get_account(account.id)
+    assert stored is not None
+    assert stored.tier == existing_tier
+    assert stored.tier_checked_at == "2026-01-01T00:00:00Z"
+    assert stored.expired is False
+
+
+def test_batch_continues_after_malformed_200(tmp_path: Path) -> None:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    pro = store.save_account(
+        name="Pro", email="pro@example.com", storage_state=_storage_state(), tier="Pro"
+    )
+    ultra = store.save_account(
+        name="Ultra",
+        email="ultra@example.com",
+        storage_state=_storage_state(),
+        tier="Ultra",
+    )
+    accounts = [pro, ultra]
+    transport = FakeTransport(
+        [
+            TransportResponse(status=200, body="not-json"),
+            TransportResponse(status=200, body="[9]"),
+        ]
+    )
+    refresher = AccountInfoRefresher(store, transport=transport, concurrency=2)
+
+    async def _run() -> list[RefreshResult]:
+        return await refresher.refresh_accounts(accounts, refresh_email=False)
+
+    results = asyncio.run(_run())
+
+    assert len(results) == 2
+    assert all(result.ok is False for result in results)
+    assert all(result.tier is None for result in results)
+    assert store.get_account(pro.id).tier == "Pro"  # type: ignore[union-attr]
+    assert store.get_account(ultra.id).tier == "Ultra"  # type: ignore[union-attr]
 
 
 # --------------------------------------------------------------------------- #

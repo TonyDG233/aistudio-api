@@ -169,6 +169,16 @@ def _cookies_from_auth_file(auth_file: str | None) -> dict[str, str]:
     }
 
 
+def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
+    """Stable, log-safe identity used to decide whether a refresh changed."""
+    return [
+        (
+            str(item.get("id") or item.get("name") or ""),
+            str(item.get("displayName") or ""),
+        )
+        for item in models
+    ]
+
 
 # 本地保底默认模型列表（仅冷启动/网络未就绪时使用；live 数据永远优先）。
 # 与主分支 16 条保底条目及 paid 标记保持一致，禁止把 fallback 冒充 live。
@@ -336,6 +346,7 @@ class ModelDiscoveryService:
         # It is never set to a live value unless a live fetch actually parsed.
         self.last_source: str = "fallback"
         self.last_error: str | None = None
+        self._last_refresh_info: str | None = None
         self._load_snapshot()
 
     @property
@@ -416,6 +427,7 @@ class ModelDiscoveryService:
 
             # The attempt error is kept for honest logging when we fall back.
             self.last_error = None
+            cached_before = list(self._cached_models)
 
             # 1. 优先通过 READY 池会话（paid 先、Free 后）发 XHR 拉 ListModels
             candidates: list[Any] = []
@@ -527,13 +539,39 @@ class ModelDiscoveryService:
                     self.last_source,
                     self.last_error or "unknown",
                 )
+            self._log_refresh_summary(
+                source=self.last_source,
+                models=self._cached_models,
+                changed=(
+                    _model_identity(cached_before)
+                    != _model_identity(self._cached_models)
+                ),
+            )
 
             return self._cached_models
+
+    def _log_refresh_summary(
+        self,
+        *,
+        source: str,
+        models: list[dict[str, object]],
+        changed: bool,
+    ) -> None:
+        """Emit one INFO summary per refresh, suppressing identical repeats."""
+        summary = (
+            f"模型发现更新: source={source} count={len(models)} "
+            f"changed={'true' if changed else 'false'}"
+        )
+        if summary == self._last_refresh_info:
+            return
+        self._last_refresh_info = summary
+        logger.info(summary)
 
     def _accept_live(self, models: list[dict[str, object]], *, source: str) -> None:
         """Commit a live parse result and persist it with paid metadata."""
         if not models:
             raise RuntimeError("live discovery returned no models")
+        changed = _model_identity(self._cached_models) != _model_identity(models)
         self._cached_models = mark_discovery_source(
             [dict(item) for item in models], source
         )
@@ -542,7 +580,9 @@ class ModelDiscoveryService:
         self._last_fetched_at = time.time()
         self.last_source = source
         self.last_error = None
-        logger.info("模型发现更新: source=%s count=%d", source, len(models))
+        self._log_refresh_summary(
+            source=source, models=self._cached_models, changed=changed
+        )
 
     async def get_model_by_id(
         self,

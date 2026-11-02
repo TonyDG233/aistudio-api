@@ -148,7 +148,9 @@ class GenerationClient(Protocol):
 
     async def count_tokens(self, *, packed_body: list[object]) -> int: ...
 
-    def clear_templates(self) -> None: ...
+    def clear_templates(self) -> bool: ...
+
+    async def refresh_auth_state(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -697,23 +699,36 @@ class RoutingPipeline:
                     context.route, attempt.candidate.tier
                 ) from exc
             self._record_error("auth_error", context, attempt, exc=exc)
-            attempt.client.clear_templates()
             if has_yielded_data:
+                attempt.client.clear_templates()
                 raise exc
             if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
-                attempt.same_retries += 1
-                context.retry_same = True
-                context.budget.record_retry("403")
+                # 403 常见根因是页面缓存的 SAPISID/__Secure-1PSIDTS 已过期；
+                # 先用仍然有效的浏览器会话重新取 cookie，再重新签名重试。
+                if await self._refresh_auth_state(context, attempt, reason_summary):
+                    attempt.same_retries += 1
+                    context.retry_same = True
+                    context.budget.record_retry("403")
+                    attempt.client.clear_templates()
+                    logger.warning(
+                        "[routing] 403 同账号重新签名重试 model=%s surface=%s "
+                        "instance=%s account=%s reason=%s",
+                        context.route.model,
+                        context.route.surface,
+                        attempt.instance_id,
+                        attempt.account_id,
+                        reason_summary,
+                    )
+                    return "retry_same"
                 logger.warning(
-                    "[routing] 403 同账号重新签名重试 model=%s surface=%s "
-                    "instance=%s account=%s reason=%s",
+                    "[routing] 403 鉴权刷新失败，拒绝重发过期凭据改走切换/报错 "
+                    "model=%s surface=%s instance=%s account=%s reason=%s",
                     context.route.model,
                     context.route.surface,
                     attempt.instance_id,
                     attempt.account_id,
                     reason_summary,
                 )
-                return "retry_same"
             return await self._switch_or_raise(
                 context, attempt, exc, reason="auth_error"
             )
@@ -804,6 +819,50 @@ class RoutingPipeline:
         self._record_error("error", context, attempt, exc=exc)
         raise exc
 
+    async def _refresh_auth_state(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        reason_summary: str,
+    ) -> bool:
+        """Refresh the same instance's cookie/signature state before a 403 retry.
+
+        Returns False when the client cannot refresh or the live cookie jar no
+        longer carries SAPISID material; callers must then fall back to
+        switching accounts/instances instead of resending stale credentials.
+        """
+        refresher = getattr(attempt.client, "refresh_auth_state", None)
+        if not callable(refresher):
+            logger.warning(
+                "[routing] 客户端不支持 403 鉴权刷新 instance=%s account=%s "
+                "reason=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                reason_summary,
+            )
+            return False
+        try:
+            result = refresher()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.warning(
+                "[routing] 403 鉴权刷新异常 instance=%s account=%s error=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                _summarize_error(exc),
+            )
+            return False
+        refreshed = bool(result)
+        if refreshed:
+            logger.info(
+                "[routing] 403 鉴权态已刷新 instance=%s account=%s model=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                context.route.model,
+            )
+        return refreshed
+
     async def _try_rebind(
         self,
         context: RouteContext,
@@ -863,7 +922,6 @@ class RoutingPipeline:
         # The pool refuses to activate while the handle is held; release it
         # before touching the slot, then let the caller re-acquire it.
         await self.release(attempt)
-        attempt.client.clear_templates()
         if self._instance_active_requests(attempt.instance_id) > 0:
             logger.info(
                 "[routing] 跳过改绑：实例仍有在途请求 instance=%s",

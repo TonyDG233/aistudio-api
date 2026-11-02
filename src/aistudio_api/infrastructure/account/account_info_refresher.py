@@ -5,9 +5,9 @@
   ``content-type: application/json+protobuf``，携带账号 Cookie、SAPISIDHASH
   Authorization 与 AI Studio web API key。
 - 档位映射：``[]``/``0`` -> Free；``1`` -> Pro；``2`` -> Ultra；``3`` -> Plus；
-  其他 -> ``unknown-N``。
-- ``200`` -> 凭据有效；``401`` -> 标记过期；``403`` 且疑为 key 被拒 -> 回收 key
-  重试一次；``5xx``/网络故障 -> 非权威失败，不改状态。
+  未知 code 或不可解析的 ``200`` 响应不产生权威档位，``tier`` 保持原值。
+- ``200`` -> 凭据有效且档位权威才写入；``401`` -> 标记过期；``403`` 且疑为 key
+  被拒 -> 回收 key 重试一次；``5xx``/网络故障 -> 非权威失败，不改状态。
 - 邮箱回填：apps 页 HTML 的 ``WIZ_global_data`` ``"oPEP7c"`` 正则 + 噪音域排除回退。
 """
 
@@ -280,7 +280,26 @@ class AccountInfoRefresher:
         message = envelope.message
 
         if response.status == 200:
-            tier = envelope.display_tier(include_unknown_code=True)
+            tier = envelope.strict_tier()
+            if tier is None:
+                logger.warning(
+                    "[Refresh] %s returned HTTP 200 without an authoritative "
+                    "tier (account tier unchanged): code=%r message=%r",
+                    account.id,
+                    envelope.code,
+                    message,
+                )
+                return RefreshResult(
+                    account_id=account.id,
+                    ok=False,
+                    tier=None,
+                    expired=None,
+                    error=(
+                        "probe returned HTTP 200 but no parseable canonical "
+                        "tier; account tier unchanged"
+                    ),
+                    checked_at=checked_at,
+                )
             email: str | None = None
             email_error: str | None = None
             wants_email = refresh_email or not account.email
@@ -419,7 +438,25 @@ class AccountInfoRefresher:
         message = envelope.message
 
         if response.status == 200:
-            tier = envelope.display_tier(include_unknown_code=True)
+            tier = envelope.strict_tier()
+            if tier is None:
+                logger.warning(
+                    "[Refresh] %s probe returned HTTP 200 without an "
+                    "authoritative tier (account tier unchanged): "
+                    "code=%r message=%r",
+                    account.id,
+                    envelope.code,
+                    message,
+                )
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": (
+                        "probe returned HTTP 200 but no parseable canonical "
+                        "tier; account tier unchanged"
+                    ),
+                    "checked_at": checked_at,
+                }
             self._store.update_account_refresh(
                 account.id, tier=tier, tier_checked_at=checked_at, expired=False
             )

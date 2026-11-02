@@ -41,6 +41,16 @@ def parse_benefit_tier_response(raw_data: object) -> str:
     return parse_benefit_tier_envelope(raw_data).display_tier()
 
 
+def parse_benefit_tier_strict(raw_data: object) -> str | None:
+    """解析 RPC 响应；只有上游明确给出的等级才返回字符串，否则 ``None``。
+
+    ``None`` covers malformed/unparseable bodies, non-list values, unknown
+    numeric codes and network-level failures. It must never be turned into
+    ``"Free"`` by callers, because that would overwrite a real Pro/Ultra tier.
+    """
+    return parse_benefit_tier_envelope(raw_data).strict_tier()
+
+
 # Cookies that need httpOnly=False so JS can read them for SAPISIDHASH.
 _AUTH_COOKIE_NAMES = {
     "SID",
@@ -523,8 +533,12 @@ async def probe_account_email(
 async def probe_account_benefit_tier(
     raw_or_dict: object,
     auth_user: str = "0",
-) -> str:
-    """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。"""
+) -> str | None:
+    """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。
+
+    只有上游明确返回可解析的等级时才返回字符串；无 Cookie、网络/代理异常、
+    非 200 或响应体不可解析时返回 ``None``，调用方不得将其降级为 Free。
+    """
     cookie_dict = (
         raw_or_dict
         if isinstance(raw_or_dict, dict)
@@ -532,7 +546,7 @@ async def probe_account_benefit_tier(
         else cookies_for_google_rpc(raw_or_dict)
     )
     if not cookie_dict:
-        return "Free"
+        return None
 
     import httpx
 
@@ -559,11 +573,15 @@ async def probe_account_benefit_tier(
     try:
         async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as client:
             resp = await client.post(tier_url, headers=headers, content="[]")
-            if resp.status_code == 200:
-                return parse_benefit_tier_response(resp.text)
+            if resp.status_code != 200:
+                logger.debug(
+                    "探测子账号 u/%s 权益等级返回 HTTP %d", u_index, resp.status_code
+                )
+                return None
+            return parse_benefit_tier_strict(resp.text)
     except Exception as e:
         logger.debug("探测子账号 u/%s 权益等级失败: %s", u_index, e)
-    return "Free"
+        return None
 
 
 async def probe_google_accounts_infinite(
@@ -617,14 +635,14 @@ async def probe_google_accounts_infinite(
                 # 401 表示该 auth_user 未登录或 Session 无效
                 if resp.status_code in (200, 400, 403):
                     consecutive_failures = 0
-                    detected_tier = "Free"
+                    detected_tier: str | None = None
                     tier_url = BENEFIT_TIER_URL
                     try:
                         tier_resp = await client.post(
                             tier_url, headers=headers, content="[]"
                         )
                         if tier_resp.status_code == 200:
-                            detected_tier = parse_benefit_tier_response(tier_resp.text)
+                            detected_tier = parse_benefit_tier_strict(tier_resp.text)
                     except Exception:
                         pass
                     detected_email = emails_map.get(u_index)

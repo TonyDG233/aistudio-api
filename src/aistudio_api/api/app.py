@@ -50,6 +50,8 @@ from .routes_system import (
 from .state import RuntimeState, runtime_state
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from aistudio_api.infrastructure.account.account_store import AccountStore
 
 _log_cfg = get_configured_logging_settings()
@@ -127,12 +129,49 @@ async def _refresh_model_catalog_once(state: RuntimeState) -> int:
 
     sessions = state.discovery_sessions()
     models = await model_discovery.get_models(sessions=sessions, force_refresh=True)
-    logger.info(
-        "模型发现预热完成: source=%s count=%d",
-        model_discovery.last_source,
-        len(models),
-    )
     return len(models)
+
+
+def _model_warmup_interval_seconds(
+    source: str,
+    settings: dict[str, int] | None = None,
+) -> int:
+    """Live page success refreshes daily; every other source retries sooner."""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_model_discovery_settings,
+    )
+
+    resolved = (
+        settings if settings is not None else get_configured_model_discovery_settings()
+    )
+    if source == "live_page":
+        return int(resolved.get("live_refresh_interval_sec", 86400))
+    return int(resolved.get("fallback_refresh_interval_sec", 600))
+
+
+async def _model_warmup_cycle(
+    state: RuntimeState,
+    *,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    settings: dict[str, int] | None = None,
+) -> int:
+    """Run one refresh and sleep for the interval matching its source."""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    failed = False
+    try:
+        await _refresh_model_catalog_once(state)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        failed = True
+        logger.warning("模型发现预热失败: %s", exc)
+    source = model_discovery.last_source
+    if failed or model_discovery.last_error is not None:
+        source = "fallback"
+    interval = _model_warmup_interval_seconds(source, settings)
+    await sleep(interval)
+    return interval
 
 
 TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
@@ -224,19 +263,26 @@ async def _refresh_startup_account_metadata(
             probed_tier = await probe_account_benefit_tier(
                 cookie_dict, auth_user=account.auth_user or "0"
             )
-            resolved_tier = probed_tier or "Free"
+            if probed_tier is None:
+                logger.debug(
+                    "启动 tier 探测失败/不可解析，保留原等级: id=%s (u/%s, tier=%s)",
+                    account.id,
+                    account.auth_user,
+                    account.tier,
+                )
+                continue
             account_store.update_account_tier(
                 account.id,
-                resolved_tier,
+                probed_tier,
                 checked_at=datetime.now(UTC).isoformat(),
             )
-            if resolved_tier != "Free" and account.tier == "Free":
+            if probed_tier != "Free" and account.tier == "Free":
                 upgraded_count += 1
                 logger.info(
                     "账号订阅等级自动升级: id=%s (u/%s) -> %s",
                     account.id,
                     account.auth_user,
-                    resolved_tier,
+                    probed_tier,
                 )
         except Exception as exc:
             logger.debug("账号 %s 订阅检测异常: %s", account.id, exc)
@@ -356,11 +402,14 @@ async def lifespan(_app: FastAPI):
         logger.info("实例池未配置：使用 legacy 控制面预热（不创建池会话）")
     warmup_task = _start_control_warmup(client, pool_enabled=pool_enabled)
 
+    def _on_slot_retired(_realm_id: str) -> None:
+        client.clear_templates()
+
     instance_pool = InstancePool(
         client.session.ensure_cdp_client,
         specs_provider=get_configured_instance_specs,
         max_contexts_provider=get_configured_max_contexts,
-        on_slot_retired=lambda _realm_id: client.clear_templates(),
+        on_slot_retired=_on_slot_retired,
     )
     instance_manager = InstanceManager(
         instance_pool,
@@ -422,23 +471,13 @@ async def lifespan(_app: FastAPI):
     model_warmup_task: asyncio.Task[object] | None = None
 
     async def _model_warmup():
-        from aistudio_api.infrastructure.gateway.model_discovery import (
-            model_discovery,
-        )
-
         if startup_task is not None:
             try:
                 await startup_task
             except Exception as exc:
                 logger.debug("模型发现预热前实例启动失败: %s", exc)
         while True:
-            try:
-                await _refresh_model_catalog_once(runtime_state)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("模型发现预热失败: %s", exc)
-            await asyncio.sleep(model_discovery.cache_ttl)
+            await _model_warmup_cycle(runtime_state)
 
     model_warmup_task = asyncio.create_task(_model_warmup())
 
@@ -533,7 +572,10 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
         404: "NOT_FOUND",
         409: "ABORTED",
         429: "RESOURCE_EXHAUSTED",
+        500: "INTERNAL",
+        502: "UNAVAILABLE",
         503: "UNAVAILABLE",
+        504: "DEADLINE_EXCEEDED",
     }
     status_str = status_map.get(code, "INTERNAL" if code >= 500 else "UNKNOWN")
     return JSONResponse(

@@ -205,6 +205,23 @@
           },
           "additionalProperties": true
         },
+        "model_discovery": {
+          "type": "object",
+          "description": "模型发现刷新节奏：live_page 成功用长间隔，其他来源用短重试间隔。",
+          "properties": {
+            "live_refresh_interval_sec": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 86400
+            },
+            "fallback_refresh_interval_sec": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 600
+            }
+          },
+          "additionalProperties": true
+        },
         "atg": {
           "type": "object",
           "description": "Anti-Truncation Gateway；默认 off，按协议/模型开启。",

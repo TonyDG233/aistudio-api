@@ -75,8 +75,12 @@ class InstanceRequestClient:
         self._replay = RequestReplayService(session)
         self._streaming = StreamingGateway(session)
 
-    def clear_templates(self) -> None:
-        self._capture.clear_templates()
+    def clear_templates(self) -> bool:
+        return self._capture.clear_templates()
+
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate the instance page's cached cookies and refetch them."""
+        return await self._capture.refresh_auth_state()
 
     def _dump_raw_exchange(
         self,

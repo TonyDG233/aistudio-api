@@ -20,6 +20,7 @@ from aistudio_api.infrastructure.gateway.instance_pool import (
     InstancePool,
     InstanceSpec,
     SessionFactory,
+    SlotState,
 )
 
 
@@ -558,6 +559,171 @@ async def test_close_without_instance_id_closes_pool(tmp_path) -> None:
     assert result is None
     assert manager._pool.slots() == ()
     assert (await manager.list_instances()).instances == ()
+
+
+@pytest.mark.asyncio
+async def test_sync_account_tier_moves_promoted_account_to_paid_and_refills_free(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("promoted", "promoted@example.com", "Free"),
+        ("spare", "spare@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+    await manager.startup()
+
+    before = (await manager.list_instances()).instances
+    free_before = next(item for item in before if item.min_tier == "Free")
+    assert free_before.account_id == accounts["promoted"].id
+    assert next(item for item in before if item.min_tier == "Pro").account_id == ""
+
+    store.update_account_tier(accounts["promoted"].id, "Pro")
+    updated = await manager.sync_account_tier(accounts["promoted"].id, "Pro")
+
+    assert updated >= 1
+    after = (await manager.list_instances()).instances
+    promoted = next(
+        item for item in after if item.account_id == accounts["promoted"].id
+    )
+    spare = next(item for item in after if item.account_id == accounts["spare"].id)
+    assert promoted.min_tier == "Pro"
+    assert promoted.state is InstanceState.ACTIVE
+    assert promoted.tier == "Pro"
+    assert spare.min_tier == "Free"
+    assert spare.state is InstanceState.ACTIVE
+    assert spare.tier == "Free"
+    assert sum(
+        1 for item in after if item.account_id == accounts["promoted"].id
+    ) == 1
+
+    slots = manager._pool.slots()
+    promoted_slot = next(
+        slot for slot in slots if slot.account_id == accounts["promoted"].id
+    )
+    spare_slot = next(
+        slot for slot in slots if slot.account_id == accounts["spare"].id
+    )
+    assert promoted_slot.lane == "paid"
+    assert promoted_slot.session is not None
+    assert promoted_slot.session.active_context.tier == "Pro"
+    assert spare_slot.lane == "free"
+    assert spare_slot.session is not None
+    assert spare_slot.session.active_context.tier == "Free"
+
+    await manager.sync_account_tier(accounts["promoted"].id, "Pro")
+    account_ids = [slot.account_id for slot in manager._pool.slots() if slot.account_id]
+    assert len(account_ids) == len(set(account_ids))
+    assert next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["promoted"].id
+    ).min_tier == "Pro"
+
+
+@pytest.mark.asyncio
+async def test_sync_account_tier_without_free_replacement_unbinds_free_slot(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("promoted", "promoted@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+    await manager.startup()
+
+    store.update_account_tier(accounts["promoted"].id, "Pro")
+    await manager.sync_account_tier(accounts["promoted"].id, "Pro")
+
+    after = (await manager.list_instances()).instances
+    promoted = next(
+        item for item in after if item.account_id == accounts["promoted"].id
+    )
+    free_item = next(item for item in after if item.min_tier == "Free")
+    assert promoted.min_tier == "Pro"
+    assert promoted.state is InstanceState.ACTIVE
+    assert free_item.account_id == ""
+    assert free_item.state is InstanceState.UNSTARTED
+
+    free_slot = next(slot for slot in manager._pool.slots() if slot.lane == "free")
+    assert free_slot.account_id == ""
+    assert free_slot.state is SlotState.UNSTARTED
+    assert free_slot.session is None
+
+    spare = store.save_account(
+        name="spare",
+        email="spare@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+    awoken = await manager.wake_eligible(paid=False)
+
+    assert len(awoken) == 1
+    assert awoken[0].account_id == spare.id
+    assert awoken[0].state is InstanceState.ACTIVE
+    assert free_slot.account_id == spare.id
+
+
+@pytest.mark.asyncio
+async def test_sync_account_tier_binds_restored_pro_to_unstarted_paid_slot(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free", "free@example.com", "Free"),
+        ("dormant", "dormant@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+    await manager.startup()
+
+    before = (await manager.list_instances()).instances
+    assert next(item for item in before if item.min_tier == "Pro").state is InstanceState.UNSTARTED
+
+    store.update_account_tier(accounts["dormant"].id, "Pro")
+    await manager.sync_account_tier(accounts["dormant"].id, "Pro")
+
+    after = (await manager.list_instances()).instances
+    dormant = next(item for item in after if item.account_id == accounts["dormant"].id)
+    assert dormant.min_tier == "Pro"
+    assert dormant.state is InstanceState.ACTIVE
+    assert dormant.tier == "Pro"
+    paid_slot = next(slot for slot in manager._pool.slots() if slot.lane == "paid")
+    assert paid_slot.account_id == accounts["dormant"].id
+    assert paid_slot.state is SlotState.READY
+    assert paid_slot.session is not None
+    assert paid_slot.session.active_context.tier == "Pro"
+
+
+@pytest.mark.asyncio
+async def test_sync_account_tier_same_lane_updates_without_restart(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("pro", "pro@example.com", "Pro")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_paid_spec()], max_contexts=1)
+    await manager.startup()
+
+    slot = manager._pool.slots()[0]
+    context_id = slot.context_id
+    assert slot.account_id == accounts["pro"].id
+    assert slot.tier == "Pro"
+
+    store.update_account_tier(accounts["pro"].id, "Ultra")
+    updated = await manager.sync_account_tier(accounts["pro"].id, "Ultra")
+
+    assert updated == 1
+    assert slot.account_id == accounts["pro"].id
+    assert slot.context_id == context_id
+    assert slot.tier == "Ultra"
+    assert slot.session is not None
+    assert slot.session.active_context.tier == "Ultra"
+    assert len(cdp.created) == 1
+    listed = (await manager.list_instances()).instances
+    assert len(listed) == 1
+    assert listed[0].account_id == accounts["pro"].id
+    assert listed[0].tier == "Ultra"
 
 
 @pytest.mark.asyncio
