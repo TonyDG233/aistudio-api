@@ -316,8 +316,9 @@ async def test_429_dead_slot_is_rebound_while_request_continues_on_other_slot(
             self.surface = surface
             self.clear_calls = 0
 
-        def clear_templates(self) -> None:
+        def clear_templates(self) -> bool:
             self.clear_calls += 1
+            return True
 
     monkeypatch.setattr(routing_pipeline_module, "InstanceRequestClient", _Client)
     manager = RebindFakeManager(
@@ -425,8 +426,8 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
             self.tier = tier
             self.surface = surface
 
-        def clear_templates(self) -> None:
-            return None
+        def clear_templates(self) -> bool:
+            return False
 
     monkeypatch.setattr(routing_pipeline_module, "InstanceRequestClient", _Client)
     manager = RebindFakeManager(

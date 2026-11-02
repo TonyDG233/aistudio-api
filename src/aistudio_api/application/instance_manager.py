@@ -14,6 +14,7 @@ the old Page/Context when the timeout expires, and only then switches account.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Any, Protocol
 
 from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.domain.model_access import (
+    canonical_tier,
     instance_lane_for_tier,
 )
 from aistudio_api.infrastructure.account.account_store import AccountMeta
@@ -682,6 +684,132 @@ class InstanceManager:
                 break
         return found
 
+    async def sync_account_tier(self, account_id: str, tier: str) -> int:
+        """Synchronize a manually detected tier into pool and instance records.
+
+        Same-lane tier changes are mirrored in place (slot + session context)
+        without restarting a page. A cross-lane change (free slot now holding a
+        paid account, or the reverse) retires and unbinds the old slot so it can
+        never serve an ineligible account, refills that slot with another
+        account from its configured lane when one is available, and binds the
+        restored account to an idle slot in its new lane. Returns the number of
+        slots the pool touched.
+        """
+        if not account_id:
+            return 0
+        canonical = canonical_tier(tier) or str(tier or "")
+        target_lane = instance_lane_for_tier(canonical)
+        async with self._lifecycle_lock:
+            self._sync_records()
+            affected = [
+                record
+                for record in self._records.values()
+                if record.account_id == account_id
+            ]
+            sync = getattr(self._pool, "sync_account_tier", None)
+            if not callable(sync):
+                return 0
+            result = sync(
+                account_id,
+                canonical,
+                drain_timeout_s=self._drain_timeout_s,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            updated = result if isinstance(result, int) else 0
+
+            evicted: list[_Record] = []
+            for record in affected:
+                slot = self._pool.get(record.slot_id)
+                if slot is None:
+                    record.account_id = ""
+                    record.state = InstanceState.INVALID
+                    record.last_error = "runtime missing"
+                    continue
+                if getattr(slot, "account_id", "") == account_id:
+                    record.account_id = account_id
+                    record.state = self._state_from_slot(slot)
+                else:
+                    record.account_id = ""
+                    record.state = self._state_from_slot(slot)
+                    record.last_error = None
+                    evicted.append(record)
+
+            account = self._accounts.get_account(account_id)
+            already_bound = any(
+                record.account_id == account_id
+                for record in self._records.values()
+            )
+            if (
+                not already_bound
+                and account is not None
+                and account.enabled
+                and not account.expired
+            ):
+                target = self._find_bindable_record(target_lane, canonical)
+                if target is not None:
+                    try:
+                        await self._activate(target, account)
+                    except InstanceError as exc:
+                        target.state = InstanceState.INVALID
+                        target.last_error = str(exc)
+                        log.warning(
+                            "[instances] tier sync could not bind account=%s "
+                            "slot=%s tier=%s: %s",
+                            account_id,
+                            target.slot_id,
+                            canonical,
+                            exc,
+                        )
+
+            for record in evicted:
+                if record.account_id:
+                    continue
+                used = {
+                    item.account_id
+                    for item in self._records.values()
+                    if item.account_id
+                }
+                used.add(account_id)
+                replacement = self._pick_account(
+                    record.spec,
+                    self._ordered_accounts(self._accounts.get_active_account()),
+                    used,
+                )
+                if replacement is None:
+                    log.info(
+                        "[instances] tier sync left slot=%s unstarted: no "
+                        "eligible replacement in lane=%s",
+                        record.slot_id,
+                        record.lane,
+                    )
+                    continue
+                try:
+                    await self._activate(record, replacement)
+                except InstanceError as exc:
+                    record.state = InstanceState.INVALID
+                    record.last_error = str(exc)
+                    log.warning(
+                        "[instances] tier sync replacement failed slot=%s "
+                        "account=%s: %s",
+                        record.slot_id,
+                        replacement.id,
+                        exc,
+                    )
+
+            self._repair_latest()
+            self._repair_current()
+            log.info(
+                "[instances] tier sync account=%s tier=%s lane=%s slots=%d "
+                "evicted=%d",
+                account_id,
+                canonical,
+                target_lane,
+                updated,
+                len(evicted),
+            )
+            return updated
+
     def discovery_session(self) -> Any | None:
         """Return the preferred READY pool session for discovery."""
         sessions = self.discovery_sessions()
@@ -914,6 +1042,23 @@ class InstanceManager:
         record.account_id = ""
         record.last_error = None
         return timed_out
+
+    def _find_bindable_record(
+        self, lane: str, tier: object
+    ) -> _Record | None:
+        """Return an unbound idle record in ``lane`` that accepts ``tier``."""
+        for record in sorted(self._records.values(), key=lambda item: item.number):
+            if record.lane != lane or record.account_id:
+                continue
+            if record.state not in (
+                InstanceState.UNSTARTED,
+                InstanceState.SLEEPING,
+            ):
+                continue
+            if not record.accepts_tier(tier):
+                continue
+            return record
+        return None
 
     def _find_target_record(
         self, target: AccountMeta, target_lane: str

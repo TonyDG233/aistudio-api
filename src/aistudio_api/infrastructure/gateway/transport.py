@@ -154,6 +154,35 @@ def _get_active_account_tier() -> str:
     return "Free"
 
 
+async def refresh_page_auth_state(page: CDPPage) -> bool:
+    """Drop the page's cached cookies and refetch them from CDP.
+
+    ``_ensure_authorization_header`` signs ``SAPISIDHASH`` with
+    ``page._cached_cookies``; a stale cache keeps re-signing with an old
+    ``SAPISID`` (and old ``__Secure-1PSIDTS`` is never re-read), so a 403
+    retry on the same account would resend the same expired credentials.
+    This forces one fresh ``Network.getCookies`` and reports whether the new
+    jar still contains SAPISID material.
+
+    Never raises: a failed refresh must be distinguishable from a successful
+    re-sign so callers can fall back to switching accounts/instances.
+    """
+    try:
+        page._cached_cookies = None
+        await page.get_cookies()
+        cookie_dict = getattr(page, "_cached_cookies", None)
+    except Exception as exc:
+        logger.warning("刷新页面鉴权 cookies 失败: %s", exc)
+        return False
+    if not isinstance(cookie_dict, dict) or not any(
+        "SAPISID" in str(name) for name in cookie_dict
+    ):
+        logger.warning("刷新页面鉴权 cookies 后仍未取得 SAPISID，放弃同账号重签")
+        return False
+    logger.debug("已刷新页面鉴权 cookies: 数量=%d", len(cookie_dict))
+    return True
+
+
 async def _ensure_authorization_header(
     page: CDPPage,
     headers: dict[str, str],

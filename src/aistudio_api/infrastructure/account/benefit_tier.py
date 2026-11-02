@@ -22,11 +22,29 @@ class BenefitTierEnvelope:
     canonical label from the domain table, or ``None`` for an unknown code.
     ``message`` mirrors the optional second envelope element used in error
     bodies (truncated to 300 characters).
+
+    ``valid`` is true only for an unambiguous upstream tier answer: an empty
+    body/bare ``null`` hole (explicit Free) or a known numeric code. Unknown
+    codes, malformed JSON, non-list bodies, invalid element shapes and a
+    ``null`` hole paired with a non-empty message leave it false so probes can
+    return ``None`` instead of fabricating Free.
     """
 
     code: int | None
     tier: str | None
     message: str = ""
+    valid: bool = False
+
+    def strict_tier(self) -> str | None:
+        """Return the explicit tier, or ``None`` when no valid answer exists.
+
+        Unlike :meth:`display_tier`, this never maps an unknown code or an
+        unparseable body to Free. Only an explicit upstream answer (including
+        the documented empty/null Free encoding) produces a tier.
+        """
+        if not self.valid:
+            return None
+        return self.tier or "Free"
 
     def display_tier(self, *, include_unknown_code: bool = False) -> str:
         """Return the label policy for one call site.
@@ -61,14 +79,25 @@ def parse_benefit_tier_envelope(raw_data: object) -> BenefitTierEnvelope:
         except Exception:
             return BenefitTierEnvelope(None, None)
 
-    if not isinstance(payload, list) or not payload:
+    if not isinstance(payload, list):
         return BenefitTierEnvelope(None, None)
 
     message = ""
     if len(payload) >= 2 and isinstance(payload[1], str):
         message = payload[1][:300]
 
+    if not payload:
+        # Documented upstream shape for a Free account (no tier code carried).
+        return BenefitTierEnvelope(None, None, message, valid=True)
+
     first = payload[0]
+    if first is None:
+        # A bare jspb null-hole/omitted first element encodes Free explicitly.
+        # ``[null, "error message"]`` carries an error alongside the hole, so it
+        # is not an authoritative Free answer.
+        if message:
+            return BenefitTierEnvelope(None, None, message)
+        return BenefitTierEnvelope(None, None, message, valid=True)
     if isinstance(first, bool):
         return BenefitTierEnvelope(None, None, message)
     if isinstance(first, (int, float)):
@@ -77,7 +106,7 @@ def parse_benefit_tier_envelope(raw_data: object) -> BenefitTierEnvelope:
         except (OverflowError, ValueError):
             return BenefitTierEnvelope(None, None, message)
         tier = benefit_tier_from_code(code, unknown="") or None
-        return BenefitTierEnvelope(code, tier, message)
+        return BenefitTierEnvelope(code, tier, message, valid=tier is not None)
     return BenefitTierEnvelope(None, None, message)
 
 

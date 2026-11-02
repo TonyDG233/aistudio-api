@@ -388,8 +388,9 @@ class _RebindClient:
         self.surface = surface
         self.clear_calls = 0
 
-    def clear_templates(self) -> None:
+    def clear_templates(self) -> bool:
         self.clear_calls += 1
+        return True
 
     async def generate_content(self, **kwargs):
         assert self._session.generate is not None

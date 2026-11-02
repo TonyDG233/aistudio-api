@@ -84,6 +84,13 @@ _KEEPALIVE_DEFAULT_FLOATS = {
     "active_activity_seconds": 60.0,
 }
 
+_MODEL_DISCOVERY_LIVE_REFRESH_DEFAULT_SEC = 86400
+_MODEL_DISCOVERY_FALLBACK_REFRESH_DEFAULT_SEC = 600
+_MODEL_DISCOVERY_DEFAULTS = {
+    "live_refresh_interval_sec": _MODEL_DISCOVERY_LIVE_REFRESH_DEFAULT_SEC,
+    "fallback_refresh_interval_sec": _MODEL_DISCOVERY_FALLBACK_REFRESH_DEFAULT_SEC,
+}
+
 
 class ConfigValidationError(ValueError):
     """配置文件关键块类型或必填项非法。"""
@@ -257,6 +264,38 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     )
                     value = _KEEPALIVE_DEFAULT_FLOATS[key]
                 raw_keepalive[key] = float(value)
+
+        default_model_discovery = (
+            default_features.get("model_discovery")
+            if isinstance(default_features, dict)
+            else None
+        )
+        fallback_model_discovery = (
+            dict(default_model_discovery)
+            if isinstance(default_model_discovery, dict)
+            else dict(_MODEL_DISCOVERY_DEFAULTS)
+        )
+        raw_model_discovery = raw_features.get("model_discovery")
+        if not isinstance(raw_model_discovery, dict):
+            logger.warning(
+                "配置 features.model_discovery 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_model_discovery),
+            )
+            raw_features["model_discovery"] = fallback_model_discovery
+        else:
+            for key, default_value in _MODEL_DISCOVERY_DEFAULTS.items():
+                value = raw_model_discovery.get(
+                    key, fallback_model_discovery.get(key, default_value)
+                )
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    logger.warning(
+                        "配置 features.model_discovery.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        default_value,
+                    )
+                    value = default_value
+                raw_model_discovery[key] = value
 
     return config
 
@@ -1501,6 +1540,42 @@ def get_configured_keepalive_settings(
             **_KEEPALIVE_DEFAULT_FLOATS,
         }
     return dict(raw_keepalive)
+
+
+def get_configured_model_discovery_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, int]:
+    """返回 features.model_discovery 刷新节奏；非法值回退 24h/10min 默认。
+
+    ``live_refresh_interval_sec`` 只用于 ``last_source == "live_page"`` 的成功
+    刷新；其他来源（fallback/snapshot/live_http）走较短的
+    ``fallback_refresh_interval_sec`` 重试。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    raw_discovery = (
+        raw_features.get("model_discovery") if isinstance(raw_features, dict) else None
+    )
+    settings: dict[str, int] = {}
+    if not isinstance(raw_discovery, dict):
+        logger.warning(
+            "配置 features.model_discovery 非法（%r），回退默认刷新节奏",
+            _describe_type(raw_discovery),
+        )
+        raw_discovery = {}
+    for key, default_value in _MODEL_DISCOVERY_DEFAULTS.items():
+        value = raw_discovery.get(key, default_value)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            logger.warning(
+                "配置 features.model_discovery.%s 非法（%r），回退默认值 %r",
+                key,
+                value,
+                default_value,
+            )
+            value = default_value
+        settings[key] = value
+    return settings
 
 
 def resolve_quota_scope(

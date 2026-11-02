@@ -108,10 +108,18 @@ class AIStudioClient:
         if self._session is not None:
             await self._session.switch_auth(auth_file)
 
-    def clear_templates(self) -> None:
-        """清除捕获的请求模板。"""
-        if getattr(self, "_capture_service", None) is not None:
-            self._capture_service.clear_templates()
+    def clear_templates(self) -> bool:
+        """清除捕获的请求模板，返回是否真的清空了缓存。"""
+        service = getattr(self, "_capture_service", None)
+        if service is None:
+            return False
+        return bool(service.clear_templates())
+
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate the browser page's cached cookies and refetch them."""
+        if self._session is None:
+            return False
+        return await self._session.refresh_auth_state()
 
     async def close(self) -> None:
         """关闭浏览器后端。"""

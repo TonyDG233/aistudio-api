@@ -23,6 +23,7 @@ from enum import StrEnum
 from aistudio_api.domain.model_access import (
     TierSelector,
     canonical_tier,
+    instance_lane_for_tier,
     resolve_tier_selector,
     tier_matches_selector,
 )
@@ -283,6 +284,87 @@ class InstancePool:
 
     def slots(self) -> tuple[InstanceSlot, ...]:
         return tuple(self._slots.values())
+
+    async def sync_account_tier(
+        self,
+        account_id: str,
+        tier: str,
+        *,
+        drain_timeout_s: float = 12.0,
+    ) -> int:
+        """Synchronize a manually detected tier into every bound slot.
+
+        Same-lane changes update ``slot.tier`` and ``session.active_context.tier``
+        in place. A cross-lane change (e.g. Free -> Pro) must never leave the old
+        account serving from a slot whose configured lane no longer accepts it:
+        the slot is retired, unbound and left UNSTARTED so the manager can refill
+        it with an account that still belongs to that lane.
+
+        Slot state/binding mutations happen under the pool lock; runtime close
+        happens under the slot lifecycle lock with the caller's bounded drain
+        timeout. Returns the number of affected slots.
+        """
+        if not account_id:
+            return 0
+        canonical = canonical_tier(tier) or str(tier or "")
+        target_lane = instance_lane_for_tier(canonical)
+        evict: list[InstanceSlot] = []
+        affected = 0
+        async with self._lock:
+            for slot in self._slots.values():
+                if slot.account_id != account_id:
+                    continue
+                affected += 1
+                if slot.lane == target_lane:
+                    slot.tier = canonical
+                    session = slot.session
+                    context = (
+                        getattr(session, "active_context", None)
+                        if session is not None
+                        else None
+                    )
+                    if context is not None:
+                        context.tier = canonical
+                    continue
+                slot.state = SlotState.RETIRING
+                evict.append(slot)
+
+        for slot in evict:
+            try:
+                await self.retire_runtime(
+                    slot.slot_id, timeout_s=max(0.0, float(drain_timeout_s))
+                )
+            except Exception as exc:
+                log.warning(
+                    "[pool] cross-lane retire failed slot=%s account=%s: %s",
+                    slot.slot_id,
+                    account_id,
+                    exc,
+                )
+            finally:
+                async with self._lock:
+                    if slot.account_id == account_id:
+                        slot.account_id = ""
+                        slot.auth_file = None
+                        slot.auth_user = "0"
+                        slot.tier = "Free"
+                        slot.last_error = None
+                        if slot.context_id or slot.session is not None:
+                            slot.state = SlotState.INVALID
+                        else:
+                            slot.state = SlotState.UNSTARTED
+            slot.last_used = self._clock()
+            log.info(
+                "[pool] cross-lane tier change unbound slot=%s account=%s "
+                "from_lane=%s to_lane=%s tier=%s state=%s",
+                slot.slot_id,
+                account_id,
+                "paid" if slot.lane == "paid" else "free",
+                target_lane,
+                canonical,
+                slot.state.value,
+            )
+        return affected
 
     def eligible_slots(
         self, *, paid: bool, surface: str | None = None

@@ -21,6 +21,10 @@ class RequestSession(Protocol):
 
     async def generate_snapshot(self, contents: list[AistudioContent]) -> str: ...
 
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate cached cookies and refetch the live auth material."""
+        ...
+
     async def send_hooked_request(
         self,
         *,

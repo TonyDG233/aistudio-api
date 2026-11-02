@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastApiPath
 from pydantic import BaseModel, Field
@@ -502,27 +503,75 @@ async def detect_account_tier(
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
-    """探测并更新指定账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
+    """强制探测并更新指定账号的订阅权益等级 (Free / Pro / Ultra / Plus)。
+
+    这是人工/支持侧动作，必须绕过启动期“3 天内已验证 Free 则跳过”的缓存策略。
+    只有上游明确给出可解析等级时才写库；探测失败返回 400（缺少 Cookie）或
+    502（网络/代理/上游异常、响应不可解析），绝不把已有 Pro/Ultra 降级为 Free。
+    """
+    import inspect
     import json
 
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    detected_tier: str | None = None
+    auth_user = str(acc.auth_user or "0")
     target_auth = account_service.get_account_auth_path(account_id)
+    detected_tier: str | None = None
+    cookie_dict: dict[str, str] = {}
+
+    # 1. 优先使用该账号已 READY 的池化页面（最新 Cookie + 页面内 XHR 探测）。
+    instance_manager = getattr(runtime_state, "instance_manager", None)
+    slot: object | None = None
+    ready_getter = getattr(instance_manager, "ready_slot_for_account", None)
+    if callable(ready_getter):
+        with contextlib.suppress(Exception):
+            slot = ready_getter(account_id)
+    session = getattr(slot, "session", None) if slot is not None else None
+    page = getattr(session, "page", None) if session is not None else None
+    session_extractor = getattr(session, "extract_account_tier", None)
+    if callable(session_extractor):
+        extractor = cast(Callable[..., Awaitable[object]], session_extractor)
+        with contextlib.suppress(Exception):
+            extracted = await extractor()
+            if isinstance(extracted, str):
+                detected_tier = extracted
+        if detected_tier is None:
+            with contextlib.suppress(Exception):
+                extracted = await extractor(auth_user=auth_user)
+                if isinstance(extracted, str):
+                    detected_tier = extracted
+
     browser_session = runtime_state.client._session if runtime_state.client else None
     if (
-        browser_session is not None
+        page is None
+        and browser_session is not None
         and browser_session.page is not None
-        and target_auth
-        and str(target_auth) == browser_session._auth_file
-        and hasattr(browser_session, "extract_account_tier")
     ):
-        detected_tier = await browser_session.extract_account_tier()
+        current_auth = getattr(browser_session, "_auth_file", None)
+        if not target_auth or not current_auth or str(target_auth) == str(current_auth):
+            page = browser_session.page
 
-    if not detected_tier and target_auth and target_auth.is_file():
-        try:
+    if page is not None:
+        from aistudio_api.infrastructure.gateway.session_auth import (
+            extract_account_tier,
+        )
+
+        if detected_tier is None:
+            with contextlib.suppress(Exception):
+                detected_tier = await extract_account_tier(page, auth_user=auth_user)
+        with contextlib.suppress(Exception):
+            raw_page_cookies = await page.get_cookies()
+            cookie_dict = {
+                str(c.get("name") or ""): str(c.get("value") or "")
+                for c in raw_page_cookies
+                if isinstance(c, dict) and c.get("name")
+            }
+
+    # 2. 页面不可用或页面探测失败时，用 auth.json 的凭据走直连 HTTP 探测。
+    if not cookie_dict and target_auth and target_auth.is_file():
+        with contextlib.suppress(Exception):
             auth_data = json.loads(target_auth.read_text(encoding="utf-8"))
             raw_cookies = auth_data.get("cookies") or []
             cookie_dict = {
@@ -530,20 +579,47 @@ async def detect_account_tier(
                 for c in raw_cookies
                 if isinstance(c, dict) and c.get("name")
             }
-            if cookie_dict:
-                detected_tier = await probe_account_benefit_tier(
-                    cookie_dict, auth_user=acc.auth_user or "0"
-                )
-        except Exception as e:
-            log.debug("通过 HTTP 探测账号 %s 订阅等级失败: %s", account_id, e)
 
-    if detected_tier:
-        account_service.update_account_tier(
-            account_id,
-            detected_tier,
-            checked_at=datetime.now(UTC).isoformat(),
+    if detected_tier is None and cookie_dict:
+        detected_tier = await probe_account_benefit_tier(
+            cookie_dict, auth_user=auth_user
         )
-        log.info("已更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
+
+    if detected_tier is None:
+        if not cookie_dict:
+            raise HTTPException(
+                status_code=400,
+                detail="缺少可探测该账号的 Cookie，请先导入或刷新 cookies",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "订阅等级探测失败：网络/代理异常、上游非 200 或响应不可解析；"
+                "账号原等级保持不变"
+            ),
+        )
+
+    account_service.update_account_tier(
+        account_id,
+        detected_tier,
+        checked_at=datetime.now(UTC).isoformat(),
+    )
+    log.info("已更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
+
+    # 3. 同步已存在实例/池记录中的 tier，避免视图继续展示旧等级。
+    sync_tier = getattr(instance_manager, "sync_account_tier", None)
+    if callable(sync_tier):
+        try:
+            result = sync_tier(account_id, detected_tier)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            log.warning(
+                "账号 %s tier 已更新为 %s，但实例池同步失败: %s",
+                account_id,
+                detected_tier,
+                exc,
+            )
 
     acc = account_service.get_account(account_id)
     if not acc:

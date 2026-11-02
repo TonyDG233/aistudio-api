@@ -308,6 +308,40 @@ def test_legacy_lease_and_pinned_surface_is_gone() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_account_tier_cross_lane_unbinds_free_slot_and_keeps_same_lane() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append)
+    free = await pool.add_slot(pool.specs[0], lane="free")
+    paid = await pool.add_slot(pool.specs[1], lane="paid")
+    await _activate(pool, free.slot_id, account_id="restored", tier="Free")
+    await _activate(pool, paid.slot_id, account_id="paid-acc", tier="Pro", lane="paid")
+    free_context = free.context_id
+    paid_context = paid.context_id
+
+    updated = await pool.sync_account_tier("restored", "Pro", drain_timeout_s=0.1)
+
+    assert updated == 1
+    assert free.state is SlotState.UNSTARTED
+    assert free.account_id == ""
+    assert free.session is None
+    assert free.context_id == ""
+    assert free_context in cdp.disposed
+    assert retired == [f"{free.slot_id}-g1"]
+    assert paid.state is SlotState.READY
+    assert paid.account_id == "paid-acc"
+    assert paid.context_id == paid_context
+
+    updated = await pool.sync_account_tier("paid-acc", "Ultra")
+    assert updated == 1
+    assert paid.tier == "Ultra"
+    assert paid.session is not None
+    assert paid.session.active_context.tier == "Ultra"
+    assert paid.context_id == paid_context
+    assert paid.account_id == "paid-acc"
+
+
+@pytest.mark.asyncio
 async def test_snapshot_has_no_lease_or_page_budget_fields() -> None:
     cdp = FakeCDP()
     pool = _pool(cdp, max_contexts=1)
