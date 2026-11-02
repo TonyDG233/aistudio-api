@@ -273,3 +273,63 @@ $ git diff --cached --stat
 ## 11. Blockers
 
 **None.** 未发现 P0/P1。按指令未修复任何源码。
+
+## 12. C1c-2 复核闭环（2026-11-02 追加，只读离线）
+
+- 复核对象：目标树 HEAD `3b7a8b8`（`3b7a8b881e5fccf15d0d80326550868fae6c913e`），工作区 6 个已跟踪修改；主仓 HEAD `86bee18`（`86bee1809f9511d9c8e2593c640fc79ea1b68ce4`）。
+- 只读边界：本节追加前目标树 `git status --porcelain=v1` 恰为 6 个 `M`；追加后仅多出本报告 1 个 `M`，主仓也仅本报告 1 个 `M`。未修改任何源码/测试/配置，未启动服务/浏览器，未联网，未 stage、未 commit、未 push。
+- 门禁（目标树 `.venv`，全程离线，逐字结果）：
+  - `pytest -q` → **1012 passed in 12.75s**（期望 1012/0/0）
+  - `pytest -q tests/unit/test_sse_keepalive.py` → **47 passed in 1.98s**
+  - `ruff check .` → exit 0（All checks passed，0 error）
+  - `pyright` → **0 errors, 0 warnings, 0 informations**
+  - `pyright src tests` → **0 errors, 0 warnings, 0 informations**
+  - `git diff --check` → exit 0（仅 LF→CRLF advisory warnings）
+  - `git diff --cached --check` → exit 0；`git diff --cached --stat` 为空（0 staged）
+- 分支状态：目标树 `rebuild-upstream...origin/rebuild-upstream [ahead 1]`；主仓 `rebuild...origin/rebuild [ahead 42]`。均为本地提交，**未 push**。
+
+### 12.1 原问题逐项闭环
+
+| 原项 | 闭环结论 | 证据（file:line） |
+|---|---|---|
+| P2-1 | **已闭环** | `next_with_timeout` 已整体删除（全仓 0 命中）；唯一创建 task 的 `_ensure_pending` 在 await 前同步写入单槽 `self._pending`（`sse_keepalive.py:133-139,154`），超时保留同一 task（`:160-163`），关闭时 `_cancel_pending` 取消并回收（`:194-211`）；`__all__` 不再导出该函数（`:214-226`）。测试 `test_next_event_preserves_pending_task`（`test_sse_keepalive.py:251-265`）断言超时后 task 仍存活、再次调用取回结果且槽位清空。 |
+| N6 | **已闭环** | 哨兵改为唯一 `object()` 单例（`sse_keepalive.py:38-39`），`__anext__` 返回该单例（`:171-175`）；Gemini/OpenAI 均以 `item is KEEPALIVE_SENTINEL` 判定（`gemini_service.py:288-291`、`routes_openai.py:184-187`）。测试以 `is KEEPALIVE_SENTINEL` 断言（`test_sse_keepalive.py:275,300,318,352`）。 |
+| N7 | **已闭环** | 两个流式面的 pre-header 清理全部改为 `with contextlib.suppress(Exception): await events.aclose()`：Gemini 4 条路径（`gemini_service.py:259-277`），OpenAI 2 条路径（`routes_openai.py:160-170`）；原始异常仍原样抛出/映射，`CancelledError`（BaseException）不被吞掉。 |
+| Q1 / N9 | **已闭环** | OpenAI 窗内空流由 500 改为 `RequestError(502, "generation produced no stream events")`（`routes_openai.py:160-166`），502 映射为 `api_error`（`format_errors.py:30,221,247`）。`routing_wait` 在 Phase A 被显式跳过、不占首窗（`routes_openai.py:155-158`、`gemini_service.py:253-257`）；post-header 的 `routing_wait` 不计入 `rendered_any`，只有 routing_wait 的 200 流最终发 SSE error 且无 `[DONE]`（`routes_openai.py:190-203`）。测试：窗内空流 502（`test_sse_keepalive.py:611-626`）；routing_wait→pre-header 400/502（`:761-807`）；routing_wait-only 预算内 502（`:810-823`）；预算后 200 + keepalive + 末尾 api_error（`:826-841`）。 |
+| P2-2 / Q2 / Q3 | **已闭环** | 新增独立 `AISTUDIO_SSE_PREREAD_WINDOW_SEC`（`sse_keepalive.py:31,79-90`），未设置/非法时跟随 keepalive（`:87-90`，keepalive 默认 15s：`:29,68-76`）；两端改用 `preread_window_sec()`（`gemini_service.py:243`、`routes_openai.py:144`）。8 组环境值解析 + 跟随/独立测试（`test_sse_keepalive.py:213-247`）。文档：`.env.example:50-55`、`docs/PROTOCOL_AND_TOOLCALL_SPEC.md:423-425`，其中 `:425` 明确“没有整体生成/空闲总超时”。 |
+| N1 | **已闭环** | post-header 已产出数据后上游抛错 → SSE error 且释放：Gemini `gemini_service.py:300-303` + 测试 `test_sse_keepalive.py:665-680`；OpenAI `routes_openai.py:204-207` + 测试 `:683-696`；两者均断言 `active_requests == 0`。 |
+| N2 | **已闭环** | 连续 routing_wait 不重置绝对 deadline：Gemini `gemini_service.py:242-249`、OpenAI `routes_openai.py:143-150`；测试构造 20×10ms routing_wait + 0.05s 预读窗，断言 200、首帧 keepalive 且晚到内容仍渲染（`test_sse_keepalive.py:844-880`）。 |
+| N3 | **已闭环（补强）** | 新增 ASGI `http.disconnect` 集成测试（`test_sse_keepalive.py:699-758`），断言底层 generator `finally` 触发且 `pipeline.active_requests == 0`。Gemini 侧复用同一 `KeepaliveIterator` 清理契约，未单独加断连用例（残留观察，非阻塞）。 |
+| N4 | **已闭环** | routing_wait 后紧接 pre-header 错误：Gemini/OpenAI 各 2 例（400/502），断言真实非 200、非 event-stream、含 error body（`test_sse_keepalive.py:761-807`）；实现先跳 routing_wait 再映射错误（`gemini_service.py:253-277`、`routes_openai.py:154-170`）。 |
+| N8 | **已闭环** | `aclose()` 对 pending 的 post-cancel await 增加 `CLOSE_AWAIT_TIMEOUT_SEC = 1.0` 上限（`sse_keepalive.py:33,194-211`），超时注册 `_consume_task_outcome` 后返回，避免关闭挂死；测试把上限降到 0.05s，断言 `aclose()` <0.5s 且释放后底层 `finally` 执行（`test_sse_keepalive.py:329-361`）。 |
+| N10 | **已闭环** | `aclose()` 幂等 + 关闭后 `next_event`/`__anext__` 安全抛 `StopAsyncIteration`（`sse_keepalive.py:151-152,177-192`）；测试 `test_aclose_is_idempotent_and_next_event_after_close_is_safe`（`test_sse_keepalive.py:306-326`）。 |
+
+### 12.2 仍未闭环但非阻塞的 N（原文保留）
+
+- **N-5**（原文）：`ruff format --check` 全仓不 clean。92 个文件（含 `gemini_service.py:192` 的既有格式偏差，HEAD 版本同样存在）；C1c 新增/改动的 4 个文件中仅该既有行不满足 format。`ruff check` 为 0。
+  - 复核：现该行因新增 import 位移到 `gemini_service.py:195`；`git show HEAD:src/aistudio_api/api/gemini_service.py | ruff format --check -` 仍 exit 1，确认非本次改动引入。**非阻塞。**
+- **N-11**（更新）：C1b 基线 965 + `test_sse_keepalive.py` 47 = 1012，与全量 1012 精确吻合。**非阻塞。**
+- **N-12**（原文）：tracked diff 哈希对换行敏感。本报告记录的 8,993 bytes / SHA256 为本次 Windows 工作区 `git diff` 原样字节；若 `core.autocrlf` 不同，哈希会变化。
+  - 复核：本次 6 文件 diff 为 36,684 bytes（见 §13）；仍对换行敏感。**非阻塞。**
+
+### 12.3 复核结论
+
+**PASS — 0 个未闭环 P0/P1/P2/Q。** N-1/N-2/N-3/N-4/N-6/N-7/N-8/N-9/N-10 已闭环或补强；N-5/N-11/N-12 为非阻塞观察。按指令未修复任何源码。
+
+## 13. 复核产物 SHA256
+
+- 6 文件 tracked diff（`.env.example`、`docs/PROTOCOL_AND_TOOLCALL_SPEC.md`、`gemini_service.py`、`routes_openai.py`、`sse_keepalive.py`、`test_sse_keepalive.py`）：`36,684` bytes；SHA256 `27A3FEF193F0443FC5752732FAECCDB56B18CAE21D24FA7126D4CCE752ED8852`。
+- `src/aistudio_api/api/sse_keepalive.py`：`7,949` bytes；`A5B39BF1F7D25B03CEE3812B9E693DDE941F4A2CB0C2DE67BFC827AB317AEFFB`。
+- `src/aistudio_api/api/gemini_service.py`：`11,194` bytes；`F9F6D229E7407B8CEF87A1A2B3F8246CB316995BEE46345AEDC936A548DEE23D`。
+- `src/aistudio_api/api/routes_openai.py`：`9,266` bytes；`4059E98F3C14B8EA39A577BDEFCA0F2F999A82590857DD1164C12BAEDFC6F26F`。
+- `tests/unit/test_sse_keepalive.py`：`27,779` bytes；`00D60C3E7448D50C9135AEC7AFAE69CDDA39508C92D6069F171141D53E0982FB`。
+- `.env.example`：`2,765` bytes；`D9B15AD873215A7BE048B450B39B3B410DEC18C2A3E736FE5035644C9DE46788`。
+- `docs/PROTOCOL_AND_TOOLCALL_SPEC.md`：`49,049` bytes；`E4C129219A585541FFCD625B3C71E137B706C896751C24CEBDC5C90DD3A4D18D`。
+- 两份报告副本追加后应字节一致；其 SHA256 在最终复核回复中给出（不嵌入文内，避免自指）。
+
+## 14. 复核后状态
+
+- **未提交**：目标树仍为 6 个已跟踪修改 + 本报告 1 个修改；主仓仅本报告 1 个修改。
+- **未 push**：目标树 `rebuild-upstream` ahead 1、主仓 `rebuild` ahead 42，均为本地既有提交。
+- **未 stage**：`git diff --cached --stat` 为空，退出码 0。
+- 本节仅追加审计结论，未修复源码，未改变任何门禁口径。

@@ -416,7 +416,13 @@ wire 写入位置：
 
 因此 PG-01/PG-04 等“首事件前失败”会走真实 HTTP 4xx/5xx，而不是 200 + SSE error。
 
-OpenAI 路由采用同样的预读模式（`routes_openai.py:111-135`）。
+OpenAI 路由采用同样的预读模式（`routes_openai.py:111-135`），窗内空流同样返回 502 `generation produced no stream events`；`routing_wait` 只渲染为进度注释，不计入首个模型内容帧。
+
+**首窗与保活环境变量**（`api/sse_keepalive.py`）：
+
+- `AISTUDIO_SSE_KEEPALIVE_SEC`：正文等待上游事件时发送 `: keepalive\n\n` 注释帧的间隔，默认 15 秒；非数字、`NaN`/`inf`、0 或负值回退 15 秒。它与“是否返回响应头”无关，只控制 200 之后的保活节奏。
+- `AISTUDIO_SSE_PREREAD_WINDOW_SEC`：返回 `StreamingResponse` 前的首事件预读窗口。未设置或非法时跟随 `AISTUDIO_SSE_KEEPALIVE_SEC`（默认 15 秒）；独立设置时以自身为准，且必须为有限正数。
+- 本实现**没有整体生成/空闲总超时**：上游若永久挂起，200 后的 body 会持续发送 keepalive 而不是主动终止。连接释放依赖客户端断开/CDP WebSocket 断开，浏览器命令超时由命令层控制。不要把首窗或 keepalive 间隔理解成服务端总超时。
 
 ### 4.5 PG-03 finish-only 与工具流终止
 

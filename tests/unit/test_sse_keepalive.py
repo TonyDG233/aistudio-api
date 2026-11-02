@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import Message, Scope
 
 from aistudio_api.api import routes_gemini, routes_openai
 from aistudio_api.api.dependencies import get_routing_pipeline, get_runtime_state
@@ -21,10 +23,12 @@ from aistudio_api.api.sse_keepalive import (
     DEFAULT_KEEPALIVE_INTERVAL_SEC,
     KEEPALIVE_ENV,
     KEEPALIVE_FRAME,
+    KEEPALIVE_SENTINEL,
     KEEPALIVE_TIMEOUT,
+    PREREAD_WINDOW_ENV,
     KeepaliveIterator,
     keepalive_interval_sec,
-    next_with_timeout,
+    preread_window_sec,
 )
 from aistudio_api.application.contracts.gemini import (
     GeminiContent,
@@ -45,6 +49,7 @@ FAST_INTERVAL = "0.02"
 @pytest.fixture(autouse=True)
 def _fast_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(KEEPALIVE_ENV, FAST_INTERVAL)
+    monkeypatch.delenv(PREREAD_WINDOW_ENV, raising=False)
 
 
 def _gemini_request() -> GeminiGenerateContentRequest:
@@ -129,6 +134,56 @@ def _slow_empty_stream(**kwargs: Any) -> AsyncIterator[StreamEvent]:
     return generator()
 
 
+def _stream_then_raise(events: list[tuple[str, object | None]], exc: Exception):
+    async def stream(**_kwargs: Any) -> AsyncIterator[tuple[str, object | None]]:
+        for event in events:
+            yield event
+        raise exc
+
+    return stream
+
+
+def _routing_wait_then_raise(exc: Exception):
+    async def stream(**_kwargs: Any) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(kind="routing_wait", payload="resolving-instance")
+        raise exc
+
+    return stream
+
+
+def _routing_wait_sequence(
+    count: int, delay: float, events: list[tuple[str, object | None]]
+):
+    async def stream(**_kwargs: Any) -> AsyncIterator[StreamEvent]:
+        for _ in range(count):
+            yield StreamEvent(kind="routing_wait", payload="resolving-instance")
+            await asyncio.sleep(delay)
+        for kind, payload in events:
+            yield StreamEvent(kind=kind, payload=payload)
+
+    return stream
+
+
+def _routing_wait_only(**kwargs: Any) -> AsyncIterator[StreamEvent]:
+    del kwargs
+
+    async def generator() -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(kind="routing_wait", payload="resolving-instance")
+
+    return generator()
+
+
+def _slow_routing_wait_only(**kwargs: Any) -> AsyncIterator[StreamEvent]:
+    del kwargs
+
+    async def generator() -> AsyncIterator[StreamEvent]:
+        for _ in range(20):
+            yield StreamEvent(kind="routing_wait", payload="resolving-instance")
+            await asyncio.sleep(0.01)
+
+    return generator()
+
+
 # ========== helpers ==========
 
 
@@ -155,21 +210,59 @@ def test_keepalive_interval_env_parsing(
     assert keepalive_interval_sec() == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, float(FAST_INTERVAL)),
+        ("", float(FAST_INTERVAL)),
+        ("0", float(FAST_INTERVAL)),
+        ("-1", float(FAST_INTERVAL)),
+        ("nan", float(FAST_INTERVAL)),
+        ("inf", float(FAST_INTERVAL)),
+        ("not-a-number", float(FAST_INTERVAL)),
+        ("2.5", 2.5),
+    ],
+)
+def test_preread_window_env_parsing(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    monkeypatch.setenv(KEEPALIVE_ENV, FAST_INTERVAL)
+    if raw is None:
+        monkeypatch.delenv(PREREAD_WINDOW_ENV, raising=False)
+    else:
+        monkeypatch.setenv(PREREAD_WINDOW_ENV, raw)
+    assert preread_window_sec() == expected
+
+
+def test_preread_window_follows_keepalive_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEEPALIVE_ENV, "3.5")
+    monkeypatch.delenv(PREREAD_WINDOW_ENV, raising=False)
+    assert preread_window_sec() == 3.5
+
+    monkeypatch.setenv(KEEPALIVE_ENV, "0.02")
+    monkeypatch.setenv(PREREAD_WINDOW_ENV, "9")
+    assert keepalive_interval_sec() == 0.02
+    assert preread_window_sec() == 9.0
+
+
 @pytest.mark.asyncio
-async def test_next_with_timeout_preserves_pending_task() -> None:
+async def test_next_event_preserves_pending_task() -> None:
     async def source() -> AsyncIterator[str]:
         await asyncio.sleep(0.06)
         yield "value"
 
-    iterator = source()
-    pending: list[asyncio.Task[str]] = []
-    first = await next_with_timeout(iterator, 0.01, pending=pending)
+    iterator = KeepaliveIterator(source(), interval=0.01)
+    first = await iterator.next_event(0.01)
     assert first is KEEPALIVE_TIMEOUT
-    assert pending and not pending[0].done()
+    pending = iterator._pending
+    assert pending is not None and not pending.done()
 
-    second = await next_with_timeout(iterator, 0.5, pending=pending)
+    second = await iterator.next_event(0.5)
     assert second == "value"
-    assert pending == []
+    assert iterator._pending is None
+    await iterator.aclose()
 
 
 @pytest.mark.asyncio
@@ -179,11 +272,11 @@ async def test_keepalive_iterator_emits_comment_then_preserves_event() -> None:
         yield "data"
 
     iterator = KeepaliveIterator(source(), interval=0.02)
-    assert await iterator.__anext__() == KEEPALIVE_FRAME
-    seen: list[str] = []
+    assert await iterator.__anext__() is KEEPALIVE_SENTINEL
+    seen: list[object] = []
     for _ in range(50):
         item = await iterator.__anext__()
-        seen.append(cast("str", item))
+        seen.append(item)
         if item == "data":
             break
     assert "data" in seen
@@ -204,10 +297,68 @@ async def test_keepalive_iterator_close_cancels_pending_and_closes_source() -> N
             closed.set()
 
     iterator = KeepaliveIterator(source(), interval=0.02)
-    assert await iterator.__anext__() == KEEPALIVE_FRAME
+    assert await iterator.__anext__() is KEEPALIVE_SENTINEL
     await iterator.aclose()
     await asyncio.sleep(0)
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_idempotent_and_next_event_after_close_is_safe() -> None:
+    closed = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        try:
+            await asyncio.sleep(10)
+            yield "never"
+        finally:
+            closed.set()
+
+    iterator = KeepaliveIterator(source(), interval=0.02)
+    assert await iterator.__anext__() is KEEPALIVE_SENTINEL
+    await iterator.aclose()
+    await iterator.aclose()
+    await asyncio.sleep(0)
+    assert closed.is_set()
+    with pytest.raises(StopAsyncIteration):
+        await iterator.next_event()
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_aclose_bounds_wait_for_uncooperative_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aistudio_api.api import sse_keepalive
+
+    monkeypatch.setattr(sse_keepalive, "CLOSE_AWAIT_TIMEOUT_SEC", 0.05)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        try:
+            started.set()
+            await asyncio.sleep(10)
+            yield "never"
+        except asyncio.CancelledError:
+            await release.wait()
+            raise
+        finally:
+            finished.set()
+
+    iterator = KeepaliveIterator(source(), interval=0.02)
+    assert await iterator.__anext__() is KEEPALIVE_SENTINEL
+    assert started.is_set()
+    loop = asyncio.get_running_loop()
+    before = loop.time()
+    await iterator.aclose()
+    elapsed = loop.time() - before
+    assert elapsed < 0.5
+    release.set()
+    await asyncio.wait_for(finished.wait(), 1.0)
+    await asyncio.sleep(0)
 
 
 # ========== Gemini ASGI/httpx ==========
@@ -466,8 +617,12 @@ async def test_openai_empty_stream_within_window_is_non_200(
         _openai_app(object()), "/v1/chat/completions", _openai_body()
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 502
     assert "text/event-stream" not in response.headers["content-type"]
+    assert response.json()["error"]["message"].endswith(
+        "generation produced no stream events"
+    )
+    assert response.json()["error"]["type"] == "api_error"
 
 
 @pytest.mark.asyncio
@@ -502,3 +657,224 @@ async def test_openai_empty_stream_after_deadline_is_keepalive_plus_error(
     assert ": keepalive" in response.text
     payloads = _sse_payloads(response.text)
     assert payloads[-1]["error"]["type"] == "api_error"
+
+
+# ========== post-header errors / routing_wait semantics ==========
+
+
+@pytest.mark.asyncio
+async def test_gemini_post_header_exception_emits_sse_error_and_releases() -> None:
+    pipeline = _tracking_pipeline(
+        _stream_then_raise([("body", "hello")], RequestError(502, "boom"))
+    )
+    response = await _post(
+        _gemini_app(pipeline),
+        "/v1beta/gemini-3.7-flash:streamGenerateContent?alt=sse",
+        _gemini_request().model_dump(mode="json", exclude_none=True),
+    )
+
+    assert response.status_code == 200
+    payloads = _sse_payloads(response.text)
+    assert payloads[0]["candidates"][0]["content"]["parts"][0]["text"] == "hello"
+    assert payloads[-1]["error"]["code"] == 502
+    assert pipeline.active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_post_header_exception_emits_sse_error_and_releases() -> None:
+    pipeline = _tracking_pipeline(
+        _stream_then_raise([("body", "hello")], RequestError(502, "boom"))
+    )
+    response = await _post(
+        _openai_app(pipeline), "/v1/chat/completions", _openai_body()
+    )
+
+    assert response.status_code == 200
+    assert "hello" in response.text
+    payloads = _sse_payloads(response.text)
+    assert payloads[-1]["error"]["type"] == "api_error"
+    assert pipeline.active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_asgi_disconnect_releases_active_request() -> None:
+    closed = asyncio.Event()
+
+    async def slow_stream(
+        **_kwargs: Any,
+    ) -> AsyncIterator[tuple[str, object | None]]:
+        try:
+            await asyncio.sleep(10)
+            yield ("body", "never")
+        finally:
+            closed.set()
+
+    pipeline = _tracking_pipeline(slow_stream)
+    app = _openai_app(pipeline)
+    messages: asyncio.Queue[Message] = asyncio.Queue()
+    await messages.put(
+        {
+            "type": "http.request",
+            "body": json.dumps(_openai_body()).encode(),
+            "more_body": False,
+        }
+    )
+    first_body = asyncio.Event()
+
+    async def receive() -> Message:
+        return await messages.get()
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_body.set()
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"test"), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+
+    task = asyncio.create_task(app(scope, receive, send))
+    try:
+        await asyncio.wait_for(first_body.wait(), 2.0)
+        await messages.put({"type": "http.disconnect"})
+        await asyncio.wait_for(task, 2.0)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+    assert closed.is_set()
+    assert pipeline.active_requests == 0
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (RequestError(400, "bad request"), 400),
+        (RequestError(502, "upstream exploded"), 502),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gemini_routing_wait_then_pre_header_error_is_real_non_200(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception, expected: int
+) -> None:
+    monkeypatch.setattr(
+        "aistudio_api.api.gemini_service.generation_service.stream_generation",
+        _routing_wait_then_raise(exc),
+    )
+    response = await _post(
+        _gemini_app(object()),
+        "/v1beta/gemini-3.7-flash:streamGenerateContent?alt=sse",
+        _gemini_request().model_dump(mode="json", exclude_none=True),
+    )
+
+    assert response.status_code == expected
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert "error" in response.json()
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (RequestError(400, "bad request"), 400),
+        (RequestError(502, "upstream exploded"), 502),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_routing_wait_then_pre_header_error_is_real_non_200(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception, expected: int
+) -> None:
+    monkeypatch.setattr(
+        routes_openai, "stream_generation", _routing_wait_then_raise(exc)
+    )
+    response = await _post(
+        _openai_app(object()), "/v1/chat/completions", _openai_body()
+    )
+
+    assert response.status_code == expected
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert "error" in response.json()
+
+
+@pytest.mark.asyncio
+async def test_openai_routing_wait_only_then_empty_before_headers_is_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(routes_openai, "stream_generation", _routing_wait_only)
+    response = await _post(
+        _openai_app(object()), "/v1/chat/completions", _openai_body()
+    )
+
+    assert response.status_code == 502
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert response.json()["error"]["message"].endswith(
+        "generation produced no stream events"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_routing_wait_only_then_empty_after_deadline_is_sse_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PREREAD_WINDOW_ENV, "0.03")
+    monkeypatch.setattr(routes_openai, "stream_generation", _slow_routing_wait_only)
+    response = await _post(
+        _openai_app(object()), "/v1/chat/completions", _openai_body()
+    )
+
+    assert response.status_code == 200
+    assert ": keepalive" in response.text
+    assert ": resolving-instance" in response.text
+    assert "[DONE]" not in response.text
+    payloads = _sse_payloads(response.text)
+    assert payloads[-1]["error"]["type"] == "api_error"
+
+
+@pytest.mark.asyncio
+async def test_gemini_consecutive_routing_wait_does_not_reset_preread_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PREREAD_WINDOW_ENV, "0.05")
+    monkeypatch.setattr(
+        "aistudio_api.api.gemini_service.generation_service.stream_generation",
+        _routing_wait_sequence(20, 0.01, [("body", "late")]),
+    )
+    response = await _post(
+        _gemini_app(object()),
+        "/v1beta/gemini-3.7-flash:streamGenerateContent?alt=sse",
+        _gemini_request().model_dump(mode="json", exclude_none=True),
+    )
+
+    assert response.status_code == 200
+    assert response.text.startswith(KEEPALIVE_FRAME)
+    assert "late" in response.text
+
+
+@pytest.mark.asyncio
+async def test_openai_consecutive_routing_wait_does_not_reset_preread_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PREREAD_WINDOW_ENV, "0.05")
+    monkeypatch.setattr(
+        routes_openai,
+        "stream_generation",
+        _routing_wait_sequence(20, 0.01, [("body", "late")]),
+    )
+    response = await _post(
+        _openai_app(object()), "/v1/chat/completions", _openai_body()
+    )
+
+    assert response.status_code == 200
+    assert response.text.startswith(KEEPALIVE_FRAME)
+    assert "late" in response.text
