@@ -9,6 +9,7 @@ Gemini wire shapes and translates domain errors into Gemini payloads.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator
 from typing import cast
@@ -24,9 +25,11 @@ from aistudio_api.api.response_models import (
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
+    KEEPALIVE_SENTINEL,
     KeepaliveIterator,
     KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_window_sec,
 )
 from aistudio_api.application import generation_service
 from aistudio_api.application.atg.extractor import AtgError
@@ -237,7 +240,7 @@ async def _build_gemini_streaming_response(
     # contract (a real non-200 JSON error, never "200 with an empty body"),
     # while a slow-but-alive upstream flips the response to 200 + keepalives.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + events.interval
+    deadline = loop.time() + preread_window_sec()
     first_chunk: str | None = None
     try:
         while first_chunk is None:
@@ -247,21 +250,30 @@ async def _build_gemini_streaming_response(
             event = await events.next_event(remaining)
             if isinstance(event, KeepaliveTimeout):
                 break
-            first_chunk = _render_stream_event(cast("StreamEvent", event))
+            stream_event = cast("StreamEvent", event)
+            if stream_event.kind == "routing_wait":
+                # ``routing_wait`` is a resolving progress comment, never a
+                # model content frame; it must not consume the first window.
+                continue
+            first_chunk = _render_stream_event(stream_event)
     except StopAsyncIteration:
-        await events.aclose()
+        with contextlib.suppress(Exception):
+            await events.aclose()
         # A streaming request must never answer HTTP 200 with an empty SSE
         # body: clients that wait for the first ``data:`` frame observe "200 +
         # 0 events".  Surface this as a real upstream/protocol error instead.
         raise RequestError(502, "generation produced no stream events") from None
     except BrowserTransportError as exc:
-        await events.aclose()
+        with contextlib.suppress(Exception):
+            await events.aclose()
         raise RequestError(502, str(exc)) from exc
     except AtgError as exc:
-        await events.aclose()
+        with contextlib.suppress(Exception):
+            await events.aclose()
         raise RequestError(502, str(exc)) from exc
     except Exception:
-        await events.aclose()
+        with contextlib.suppress(Exception):
+            await events.aclose()
         raise
 
     async def body() -> AsyncGenerator[str, None]:
@@ -274,10 +286,10 @@ async def _build_gemini_streaming_response(
                 # preserved ``__anext__`` task keeps waiting for the upstream.
                 yield KEEPALIVE_FRAME
             async for item in events:
-                if isinstance(item, str):
-                    yield item
+                if item is KEEPALIVE_SENTINEL:
+                    yield KEEPALIVE_FRAME
                     continue
-                chunk = _render_stream_event(item)
+                chunk = _render_stream_event(cast("StreamEvent", item))
                 if chunk:
                     rendered_any = True
                     yield chunk

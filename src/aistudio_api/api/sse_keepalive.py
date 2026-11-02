@@ -8,10 +8,11 @@ next upstream event.
 The tricky part is that the first event may only appear after a long
 ``:generateContent`` upload/function-call round trip.  Waiting for it before
 returning ``StreamingResponse`` means the headers are not flushed in time, so
-the gateway never sees a 200.  The helpers here allow a *bounded* first wait:
-when the deadline elapses the pending ``__anext__`` task is kept alive and the
-caller returns the response, then the body continues awaiting the same task
-while periodically yielding keepalive comments.
+the gateway never sees a 200.  :class:`KeepaliveIterator` therefore owns a
+single bounded first wait: when the deadline elapses the pending ``__anext__``
+task is kept alive and reused, so callers can return the response and then
+continue awaiting the same task from the body while periodically yielding
+keepalive comments.
 """
 
 from __future__ import annotations
@@ -27,11 +28,19 @@ T = TypeVar("T")
 
 DEFAULT_KEEPALIVE_INTERVAL_SEC = 15.0
 KEEPALIVE_ENV = "AISTUDIO_SSE_KEEPALIVE_SEC"
+PREREAD_WINDOW_ENV = "AISTUDIO_SSE_PREREAD_WINDOW_SEC"
 KEEPALIVE_FRAME = ": keepalive\n\n"
+CLOSE_AWAIT_TIMEOUT_SEC = 1.0
+
+# Timeout marker yielded by ``KeepaliveIterator.__anext__``.  It is a unique
+# object rather than a string so a generic ``T = str`` stream can never collide
+# with a real payload.
+_KEEPALIVE_SENTINEL = object()
+KEEPALIVE_SENTINEL: object = _KEEPALIVE_SENTINEL
 
 
 class KeepaliveTimeout:
-    """Sentinel returned by :func:`next_with_timeout` when the wait elapsed."""
+    """Sentinel returned by :meth:`KeepaliveIterator.next_event` on timeout."""
 
     __slots__ = ()
 
@@ -42,6 +51,20 @@ class KeepaliveTimeout:
 KEEPALIVE_TIMEOUT = KeepaliveTimeout()
 
 
+def _positive_env_float(name: str) -> float | None:
+    """Read a strictly positive finite float from ``name``, else ``None``."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
 def keepalive_interval_sec() -> float:
     """Return the configured keepalive interval, defaulting to 15 seconds.
 
@@ -49,57 +72,43 @@ def keepalive_interval_sec() -> float:
     to :data:`DEFAULT_KEEPALIVE_INTERVAL_SEC` so a bad environment override can
     never make the stream spin or hang.
     """
-    raw = os.environ.get(KEEPALIVE_ENV)
-    if raw is None or not raw.strip():
-        return DEFAULT_KEEPALIVE_INTERVAL_SEC
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_KEEPALIVE_INTERVAL_SEC
-    if not math.isfinite(value) or value <= 0:
-        return DEFAULT_KEEPALIVE_INTERVAL_SEC
-    return value
+    value = _positive_env_float(KEEPALIVE_ENV)
+    return DEFAULT_KEEPALIVE_INTERVAL_SEC if value is None else value
 
 
-async def next_with_timeout(
-    iterator: AsyncIterator[T],
-    timeout: float,
-    *,
-    pending: list[asyncio.Task[T]] | None = None,
-) -> T | KeepaliveTimeout:
-    """Await the next item for at most ``timeout`` seconds.
+def preread_window_sec() -> float:
+    """Return the first-event pre-read window in seconds.
 
-    A task is created for ``iterator.__anext__()`` and awaited with
-    :func:`asyncio.wait`.  When the timeout elapses the task is **not**
-    cancelled: the sentinel :data:`KEEPALIVE_TIMEOUT` is returned and, when a
-    ``pending`` slot is supplied, the task stays in it so the next call can
-    continue awaiting the same ``__anext__`` instead of losing work.
-
-    On completion the task result is returned (or its exception raised,
-    including ``StopAsyncIteration``).
+    ``AISTUDIO_SSE_PREREAD_WINDOW_SEC`` overrides it independently.  When it is
+    unset or invalid the value follows the keepalive interval, which itself
+    defaults to 15 seconds.  A non-finite, zero or negative override falls back
+    to the keepalive interval rather than risking an unbounded header wait.
     """
-    if pending:
-        task = pending[0]
-    else:
-        coroutine = cast("Coroutine[Any, Any, T]", iterator.__anext__())
-        task = asyncio.create_task(coroutine)
-        if pending is not None:
-            pending.append(task)
-    done, _still_pending = await asyncio.wait({task}, timeout=timeout)
-    if not done:
-        return KEEPALIVE_TIMEOUT
-    if pending is not None:
-        pending.clear()
-    return task.result()
+    value = _positive_env_float(PREREAD_WINDOW_ENV)
+    if value is not None:
+        return value
+    return keepalive_interval_sec()
+
+
+def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
+    """Retrieve a finished task's result/exception so asyncio never warns."""
+    try:
+        task.result()
+    except (asyncio.CancelledError, StopAsyncIteration):
+        pass
+    except Exception:
+        pass
 
 
 class KeepaliveIterator(Generic[T]):
-    """Wrap an async iterator, yielding SSE keepalive comments while waiting.
+    """Wrap an async iterator, yielding keepalive markers while waiting.
 
-    Only one ``__anext__`` task is ever in flight.  When it exceeds the
-    keepalive interval a ``": keepalive\\n\\n"`` string is yielded and the task
-    is preserved for the next call, so slow upstream events are never lost.
-    ``aclose()`` cancels the pending task and closes the underlying iterator.
+    Only one ``__anext__`` task is ever in flight, and it is always owned by
+    ``self._pending``: there is no code path that creates an untracked task.
+    When it exceeds the keepalive interval :data:`KEEPALIVE_SENTINEL` is
+    yielded and the task is preserved for the next call, so slow upstream
+    events are never lost.  ``aclose()`` is idempotent, cancels the pending
+    task with a bounded await, and then closes the underlying iterator.
     """
 
     def __init__(
@@ -110,7 +119,7 @@ class KeepaliveIterator(Generic[T]):
     ) -> None:
         self._iterator = iterator
         self._interval = keepalive_interval_sec() if interval is None else interval
-        self._pending: list[asyncio.Task[T]] = []
+        self._pending: asyncio.Task[T] | None = None
         self._closed = False
         self._done = False
 
@@ -120,6 +129,14 @@ class KeepaliveIterator(Generic[T]):
 
     def __aiter__(self) -> KeepaliveIterator[T]:
         return self
+
+    def _ensure_pending(self) -> asyncio.Task[T]:
+        task = self._pending
+        if task is None:
+            coroutine = cast("Coroutine[Any, Any, T]", self._iterator.__anext__())
+            task = asyncio.create_task(coroutine)
+            self._pending = task
+        return task
 
     async def next_event(
         self,
@@ -134,22 +151,27 @@ class KeepaliveIterator(Generic[T]):
         if self._closed or self._done:
             raise StopAsyncIteration
         effective = self._interval if timeout is None else timeout
+        task = self._ensure_pending()
         try:
-            result = await next_with_timeout(
-                self._iterator, effective, pending=self._pending
-            )
-        except StopAsyncIteration:
-            self._done = True
-            raise
+            done, _still_pending = await asyncio.wait({task}, timeout=effective)
         except asyncio.CancelledError:
             await self.aclose()
             raise
-        return result
+        if not done:
+            # ``asyncio.wait`` does not cancel on timeout; keep the same task
+            # in ``_pending`` so no upstream work is lost or leaked.
+            return KEEPALIVE_TIMEOUT
+        self._pending = None
+        try:
+            return task.result()
+        except StopAsyncIteration:
+            self._done = True
+            raise
 
-    async def __anext__(self) -> T | str:
+    async def __anext__(self) -> T | object:
         result = await self.next_event()
         if isinstance(result, KeepaliveTimeout):
-            return KEEPALIVE_FRAME
+            return _KEEPALIVE_SENTINEL
         return result
 
     async def aclose(self) -> None:
@@ -157,38 +179,48 @@ class KeepaliveIterator(Generic[T]):
         if self._closed:
             return
         self._closed = True
-        await self._cancel_pending()
+        settled = await self._cancel_pending()
+        if not settled:
+            # The cancelled ``__anext__`` is still unwinding.  Calling
+            # ``aclose()`` now would raise "asynchronous generator is already
+            # running"; the cancellation path closes it once it yields control.
+            return
         aclose = getattr(self._iterator, "aclose", None)
         if callable(aclose):
             result = aclose()
             if isawaitable(result):
                 await cast("Awaitable[None]", result)
 
-    async def _cancel_pending(self) -> None:
-        if not self._pending:
-            return
-        task = self._pending.pop()
+    async def _cancel_pending(self) -> bool:
+        """Cancel the in-flight task; return False if it outlived the bound."""
+        task = self._pending
+        self._pending = None
+        if task is None:
+            return True
         if not task.done():
             task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except StopAsyncIteration:
-            pass
-        except Exception:
-            # A pending anext may have failed just after the timeout; close()
-            # must stay quiet and let the exception be observed elsewhere.
-            pass
+        # Bound the post-cancel await so an uncooperative iterator cannot hang
+        # shutdown forever.  This never cancels a normal pending ``__anext__``.
+        done, _still_pending = await asyncio.wait(
+            {task}, timeout=CLOSE_AWAIT_TIMEOUT_SEC
+        )
+        if not done:
+            task.add_done_callback(_consume_task_outcome)
+            return False
+        _consume_task_outcome(task)
+        return True
 
 
 __all__ = [
+    "CLOSE_AWAIT_TIMEOUT_SEC",
     "DEFAULT_KEEPALIVE_INTERVAL_SEC",
     "KEEPALIVE_ENV",
     "KEEPALIVE_FRAME",
+    "KEEPALIVE_SENTINEL",
     "KEEPALIVE_TIMEOUT",
+    "PREREAD_WINDOW_ENV",
     "KeepaliveIterator",
     "KeepaliveTimeout",
     "keepalive_interval_sec",
-    "next_with_timeout",
+    "preread_window_sec",
 ]

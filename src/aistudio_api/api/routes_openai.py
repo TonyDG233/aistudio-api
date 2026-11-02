@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,9 +25,11 @@ from aistudio_api.api.format_errors import (
 )
 from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
+    KEEPALIVE_SENTINEL,
     KeepaliveIterator,
     KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_window_sec,
 )
 from aistudio_api.api.state import discovery_sessions_for
 from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
@@ -138,7 +141,7 @@ async def chat_completions(
         # exhausted stream before the deadline keep the existing PG-02
         # non-200 JSON mapping; a slow upstream switches to 200 + keepalives.
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + events.interval
+        deadline = loop.time() + preread_window_sec()
         first_event: StreamEvent | None = None
         try:
             while first_event is None:
@@ -150,22 +153,20 @@ async def chat_completions(
                     break
                 candidate = cast("StreamEvent", event)
                 if candidate.kind == "routing_wait":
+                    # ``routing_wait`` is only a resolving progress comment,
+                    # never a model content frame for the first window.
                     continue
                 first_event = candidate
         except StopAsyncIteration:
-            await events.aclose()
+            with contextlib.suppress(Exception):
+                await events.aclose()
             return format_error_response(
-                HTTPException(
-                    500,
-                    detail={
-                        "message": "generation produced no stream events",
-                        "type": "server_error",
-                    },
-                ),
+                RequestError(502, "generation produced no stream events"),
                 "openai",
             )
         except Exception as exc:
-            await events.aclose()
+            with contextlib.suppress(Exception):
+                await events.aclose()
             return format_error_response(exc, "openai")
 
         renderer = OpenAIStreamRenderer(model_path)
@@ -181,11 +182,15 @@ async def chat_completions(
                 else:
                     yield KEEPALIVE_FRAME
                 async for item in events:
-                    if isinstance(item, str):
-                        yield item
+                    if item is KEEPALIVE_SENTINEL:
+                        yield KEEPALIVE_FRAME
                         continue
-                    rendered = renderer.render(item)
-                    rendered_any = rendered_any or bool(rendered)
+                    event = cast("StreamEvent", item)
+                    rendered = renderer.render(event)
+                    # A resolving comment is progress, not a model frame: a
+                    # routing-wait-only stream must still end in an SSE error.
+                    if event.kind != "routing_wait":
+                        rendered_any = rendered_any or bool(rendered)
                     if rendered:
                         yield rendered
                 if rendered_any:
