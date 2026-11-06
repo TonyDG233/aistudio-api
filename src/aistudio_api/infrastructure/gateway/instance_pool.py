@@ -456,12 +456,16 @@ class InstancePool:
         account_lane: str | None = None,
         surface: str | None = None,
         timeout_s: float = 90.0,
+        force: bool = False,
     ) -> InstanceSlot:
         """Start (or restart) exactly one Context and one Page for a slot.
 
-        Any previous runtime is closed first: Page close happens before
-        ``dispose_browser_context``. A new generation/realm_id is assigned and
-        the retire callback is fired for the old realm.
+        A READY slot already bound to the same account/surface/auth file is
+        normally reused without touching its runtime. ``force=True`` bypasses
+        that no-op so a manual restart always closes the old Page/Context and
+        bootstraps a new generation/realm. Any previous runtime is closed first:
+        Page close happens before ``dispose_browser_context``. The retire
+        callback is fired for the old realm.
         """
         slot = self._slots.get(slot_id)
         if slot is None:
@@ -484,7 +488,8 @@ class InstancePool:
             if slot.state is SlotState.RETIRING:
                 raise InstanceCapacityError(f"instance retiring: {slot_id}")
             if (
-                slot.state is SlotState.READY
+                not force
+                and slot.state is SlotState.READY
                 and slot.account_id == account_id
                 and slot.surface == target_surface
                 and slot.auth_file == auth_file

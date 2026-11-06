@@ -87,6 +87,7 @@ class AIStudioClient:
         self.port = port
         self._session = BrowserSession(port=port)
         self._capture_service = RequestCaptureService(self._session)
+        self._session.attach_capture_service(self._capture_service)
         self._replay_service = RequestReplayService(session=self._session)
 
         self._streaming_gateway = StreamingGateway(session=self._session)

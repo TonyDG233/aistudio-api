@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aistudio_api.config import resolve_fingerprint_spoof_enabled, settings
 from aistudio_api.infrastructure.browser.browser_engine import (
@@ -54,13 +56,21 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     navigate_to_aistudio,
     save_browser_cookies,
 )
-from aistudio_api.infrastructure.gateway.session_state import SessionContext
+from aistudio_api.infrastructure.gateway.session_state import (
+    SNAPSHOT_WARMUP_IDLE_S,
+    SNAPSHOT_WARMUP_PROMPT_BYTES,
+    SessionContext,
+    should_warm_snapshot,
+)
 from aistudio_api.infrastructure.gateway.transport import (
     XHRStreamTransport,
     refresh_page_auth_state,
 )
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from aistudio_api.infrastructure.gateway.capture import RequestCaptureService
 
 log = get_logger("session")
 
@@ -132,6 +142,10 @@ class BrowserSession:
         self._drain_timeout_s = DRAIN_TIMEOUT_S
         self._transition_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
+        self._capture_service: RequestCaptureService | None = None
+        self._last_snapshot_at: float | None = None
+        self._force_snapshot_warmup = False
+        self.last_snapshot_warmup = False
         self._transport = XHRStreamTransport()
         self._in_flight: int = 0
         self._stream_cleanup_count: int = 0
@@ -156,11 +170,21 @@ class BrowserSession:
     def base_template(self) -> dict[str, object] | None:
         return self._active_context.base_template if self._active_context else None
 
+    def attach_capture_service(self, service: RequestCaptureService) -> None:
+        """Bind the request capture service so teardown can invalidate templates."""
+        self._capture_service = service
+
+    def _invalidate_capture_templates(self) -> None:
+        service = self._capture_service
+        if service is not None:
+            service.clear_templates(invalidate_base=True)
+
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
         self._active_context = context
         self._preparing = False
         self._last_error = None
+        self._last_snapshot_at = None
         self._ready_event.set()
 
     def get_current_auth_user(self) -> str:
@@ -265,6 +289,10 @@ class BrowserSession:
             self._preparing = True
             self._ready_event.clear()
             self._last_error = None
+            # The page/context is about to be rebuilt: cached templates and the
+            # warmup timestamp both belong to the old page identity.
+            self._invalidate_capture_templates()
+            self._last_snapshot_at = None
             target_auth_user = get_auth_user_from_meta(auth_file)
             target_tier = get_tier_from_meta(auth_file)
             self._auth_file = auth_file
@@ -429,26 +457,53 @@ class BrowserSession:
             log.debug("适配模型名称至模板失败: %s", e)
         return base
 
-    async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
+    async def generate_snapshot(
+        self, contents: list[AistudioContent], *, payload_size: int | None = None
+    ) -> str:
         ctx = await self.ensure_ready()
         prompt = " ".join(build_snapshot_hash_parts(contents))
         content_hash = sha256(prompt.encode("utf-8")).hexdigest()
-        args = build_snapshot_args(prompt=prompt, content_hash=content_hash)
 
         async with self._snapshot_lock:
+            now = time.monotonic()
+            prompt_bytes = len(prompt.encode("utf-8"))
+            warmup = should_warm_snapshot(
+                last_snapshot_at=self._last_snapshot_at,
+                now=now,
+                prompt_bytes=prompt_bytes,
+                payload_bytes=payload_size or 0,
+                force=self._force_snapshot_warmup,
+            )
+            args = build_snapshot_args(
+                prompt=prompt, content_hash=content_hash, warmup=warmup
+            )
+
             for attempt in range(5):
                 try:
                     raw_res = await ctx.page.evaluate(
                         SNAPSHOT_GENERATE_JS, args=args, timeout_s=25.0
                     )
                     snapshot = ""
+                    warmup_used = warmup
                     if isinstance(raw_res, dict):
                         snapshot = str(raw_res.get("snapshot") or "")
+                        warmup_used = bool(raw_res.get("warmup_used", warmup))
                     elif isinstance(raw_res, str):
                         snapshot = raw_res
                     if snapshot:
+                        self._last_snapshot_at = time.monotonic()
+                        self._force_snapshot_warmup = False
+                        self.last_snapshot_warmup = warmup_used
                         return snapshot
                 except Exception as e:
+                    if "low_quality_snapshot" in str(e):
+                        # JS already warmed and retried once; more outer retries
+                        # only multiply dms calls and blur the failure cause.
+                        raise RuntimeError(
+                            "Snapshot generation failed "
+                            f"(low_quality_snapshot) for content hash "
+                            f"{content_hash[:8]}"
+                        ) from e
                     log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
                 if attempt < 4:
                     await ctx.page.wait_for_timeout(250)
@@ -458,7 +513,12 @@ class BrowserSession:
         )
 
     async def refresh_auth_state(self) -> bool:
-        """Invalidate and refetch this page's cached cookie/signature state."""
+        """Invalidate and refetch this page's cached cookie/signature state.
+
+        Any 403-driven refresh also forces the next snapshot through a local
+        warmup so the WAA challenge sees fresh cookie state.
+        """
+        self._force_snapshot_warmup = True
         page = self.page
         if page is None or page.is_closed():
             log.warning("刷新鉴权态失败: 当前没有可用页面")
@@ -640,6 +700,7 @@ class BrowserSession:
 
     async def close(self) -> None:
         async with self._transition_lock:
+            self._invalidate_capture_templates()
             with suppress(Exception):
                 await self.save_current_cookies()
             await self._close_internal()
@@ -671,8 +732,11 @@ class BrowserSession:
 __all__ = [
     "DEFAULT_BOOTSTRAP_TEMPLATE",
     "DRAIN_TIMEOUT_S",
+    "SNAPSHOT_WARMUP_IDLE_S",
+    "SNAPSHOT_WARMUP_PROMPT_BYTES",
     "BrowserSession",
     "_is_aistudio_page_url",
     "_is_login_page_url",
     "build_snapshot_hash_parts",
+    "should_warm_snapshot",
 ]

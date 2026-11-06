@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
@@ -36,7 +37,10 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     navigate_to_aistudio,
     save_browser_cookies,
 )
-from aistudio_api.infrastructure.gateway.session_state import SessionContext
+from aistudio_api.infrastructure.gateway.session_state import (
+    SessionContext,
+    should_warm_snapshot,
+)
 from aistudio_api.infrastructure.gateway.transport import (
     XHRStreamTransport,
     refresh_page_auth_state,
@@ -61,6 +65,9 @@ class PooledSession:
         self._transport = transport
         self._realm_id = realm_id
         self._snapshot_lock = asyncio.Lock()
+        self._last_snapshot_at: float | None = None
+        self._force_snapshot_warmup = False
+        self.last_snapshot_warmup = False
         self._in_flight = 0
         self._stream_cleanup_count = 0
         self._capture_service = RequestCaptureService(self)
@@ -177,11 +184,24 @@ class PooledSession:
             log.debug("PooledSession 模板模型改写失败: %s", exc)
         return base
 
-    async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
+    async def generate_snapshot(
+        self, contents: list[AistudioContent], *, payload_size: int | None = None
+    ) -> str:
         prompt = " ".join(build_snapshot_hash_parts(contents))
         content_hash = sha256(prompt.encode("utf-8")).hexdigest()
-        args = build_snapshot_args(prompt=prompt, content_hash=content_hash)
         async with self._snapshot_lock:
+            now = time.monotonic()
+            prompt_bytes = len(prompt.encode("utf-8"))
+            warmup = should_warm_snapshot(
+                last_snapshot_at=self._last_snapshot_at,
+                now=now,
+                prompt_bytes=prompt_bytes,
+                payload_bytes=payload_size or 0,
+                force=self._force_snapshot_warmup,
+            )
+            args = build_snapshot_args(
+                prompt=prompt, content_hash=content_hash, warmup=warmup
+            )
             for attempt in range(5):
                 try:
                     raw_res = await self._context.page.evaluate(
@@ -190,13 +210,23 @@ class PooledSession:
                         timeout_s=25.0,
                     )
                     snapshot = ""
+                    warmup_used = warmup
                     if isinstance(raw_res, dict):
                         snapshot = str(raw_res.get("snapshot") or "")
+                        warmup_used = bool(raw_res.get("warmup_used", warmup))
                     elif isinstance(raw_res, str):
                         snapshot = raw_res
                     if snapshot:
+                        self._last_snapshot_at = time.monotonic()
+                        self._force_snapshot_warmup = False
+                        self.last_snapshot_warmup = warmup_used
                         return snapshot
                 except Exception as exc:
+                    if "low_quality_snapshot" in str(exc):
+                        raise RuntimeError(
+                            "PooledSession snapshot generation failed "
+                            f"(low_quality_snapshot) for {content_hash[:8]}"
+                        ) from exc
                     log.debug("PooledSession 快照第 %d 次失败: %s", attempt + 1, exc)
                 if attempt < 4:
                     await self._context.page.wait_for_timeout(250)
@@ -205,7 +235,12 @@ class PooledSession:
         )
 
     async def refresh_auth_state(self) -> bool:
-        """Invalidate and refetch this realm's cached cookie/signature state."""
+        """Invalidate and refetch this realm's cached cookie/signature state.
+
+        Any 403-driven refresh also forces the next snapshot through a local
+        warmup so the WAA challenge sees fresh cookie state.
+        """
+        self._force_snapshot_warmup = True
         page = self._context.page
         if page.is_closed():
             log.warning("刷新鉴权态失败: realm=%s 页面已关闭", self._realm_id)
@@ -287,6 +322,6 @@ class PooledSession:
         return await save_browser_cookies(self._context.page, self._context.auth_file)
 
     async def close(self) -> None:
-        self._capture_service.clear_templates()
+        self._capture_service.clear_templates(invalidate_base=True)
         with suppress(Exception):
             await self._context.page.close()

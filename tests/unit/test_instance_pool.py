@@ -112,6 +112,7 @@ async def _activate(
     tier: str = "Free",
     lane: str = "free",
     surface: str = "chat",
+    force: bool = False,
 ) -> None:
     await pool.activate(
         slot_id,
@@ -121,6 +122,7 @@ async def _activate(
         tier=tier,
         account_lane=lane,
         surface=surface,
+        force=force,
     )
 
 
@@ -263,6 +265,58 @@ async def test_sleep_releases_context_and_wake_creates_new_generation() -> None:
     assert slot.state is SlotState.READY
     assert slot.generation == 2
     assert slot.realm_id != first_realm
+    assert pool.live_contexts == 1
+
+
+@pytest.mark.asyncio
+async def test_activate_same_account_ready_without_force_reuses_runtime() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+
+    await _activate(pool, slot.slot_id)
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 1
+    assert slot.context_id == first_context
+    assert slot.realm_id == first_realm
+    assert slot.session is first_session
+    assert cdp.created == ["ctx-1"]
+    assert cdp.disposed == []
+    assert retired == []
+
+
+@pytest.mark.asyncio
+async def test_activate_same_account_ready_with_force_rebuilds_runtime() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+    assert first_session is not None
+
+    await _activate(pool, slot.slot_id, force=True)
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 2
+    assert slot.realm_id == f"{slot.slot_id}-g2"
+    assert slot.realm_id != first_realm
+    assert slot.context_id == "ctx-2"
+    assert slot.context_id != first_context
+    assert slot.session is not first_session
+    assert "page.close" in cdp.events
+    assert cdp.created == ["ctx-1", "ctx-2"]
+    assert cdp.disposed == ["ctx-1"]
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert retired == [first_realm]
     assert pool.live_contexts == 1
 
 

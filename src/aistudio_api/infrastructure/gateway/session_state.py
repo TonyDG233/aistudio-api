@@ -12,6 +12,35 @@ if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 
 
+# WAA 快照预热：首次、长时间闲置或超大请求后，先跑一次本地暖机再取签名。
+SNAPSHOT_WARMUP_IDLE_S = 600.0
+SNAPSHOT_WARMUP_PROMPT_BYTES = 32 * 1024
+
+
+def should_warm_snapshot(
+    *,
+    last_snapshot_at: float | None,
+    now: float,
+    prompt_bytes: int,
+    payload_bytes: int = 0,
+    force: bool = False,
+) -> bool:
+    """Shared warmup policy for control and pooled sessions.
+
+    The byte threshold uses the larger of the hash-prompt payload and the full
+    serialized request payload (contents + tools + system instruction +
+    generation config), so large tool histories trigger warmup even when their
+    hash text is small.
+    """
+    if force:
+        return True
+    if last_snapshot_at is None:
+        return True
+    if (now - last_snapshot_at) > SNAPSHOT_WARMUP_IDLE_S:
+        return True
+    return max(prompt_bytes, payload_bytes) >= SNAPSHOT_WARMUP_PROMPT_BYTES
+
+
 @dataclass
 class SessionContext:
     """Encapsulates a fully-bootstrapped, verified AI Studio page context."""

@@ -26,10 +26,23 @@ EXTRACT_EMAIL_JS = _load_js("extract_email.js")
 FINGERPRINT_SPOOF_JS = _load_js("fingerprint_spoof.js")
 
 
-def build_snapshot_args(*, prompt: str, content_hash: str) -> dict[str, str]:
+SNAPSHOT_PROMPT_TAIL_CHARS = 256
+
+
+def build_snapshot_args(
+    *, prompt: str, content_hash: str, warmup: bool = False
+) -> dict[str, object]:
+    """Prepare SNAPSHOT_GENERATE_JS arguments.
+
+    Only the tail of the prompt is forwarded to the page; the full payload is
+    never materialized in the composer textarea. The hash still covers the full
+    prompt because it is computed before this function is called.
+    """
+    tail = prompt[-SNAPSHOT_PROMPT_TAIL_CHARS:] if prompt else ""
     return {
-        "prompt": prompt,
+        "prompt": tail,
         "hash": content_hash,
+        "warmup": bool(warmup),
     }
 
 

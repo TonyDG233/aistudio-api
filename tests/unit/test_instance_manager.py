@@ -528,6 +528,78 @@ async def test_stale_instance_waits_for_manual_restart(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_restart_ready_same_account_forces_close_and_rebuild(
+    tmp_path, monkeypatch
+) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    slot = manager._pool.slots()[0]
+    assert slot.state is SlotState.READY
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+    assert first_session is not None
+
+    calls: list[dict[str, Any]] = []
+    original = manager._pool.activate
+
+    async def spy(slot_id: str, **kwargs: Any) -> Any:
+        calls.append({"slot_id": slot_id, **kwargs})
+        return await original(slot_id, **kwargs)
+
+    monkeypatch.setattr(manager._pool, "activate", spy)
+
+    restarted = await manager.restart(record.id)
+
+    assert calls
+    assert calls[-1]["slot_id"] == slot.slot_id
+    assert calls[-1]["force"] is True
+    assert restarted.state is InstanceState.ACTIVE
+    assert slot.state is SlotState.READY
+    assert slot.generation == 2
+    assert slot.realm_id != first_realm
+    assert slot.context_id != first_context
+    assert slot.session is not first_session
+    assert cdp.created == ["ctx-1", "ctx-2"]
+    assert cdp.disposed == [first_context]
+    assert "page.close" in cdp.events
+    assert cdp.events.index("page.close") < cdp.events.index(
+        f"context.dispose:{first_context}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_ready_same_account_with_inflight_request_stays_busy(
+    tmp_path,
+) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    slot = manager._pool.slots()[0]
+    handle = await manager._pool.begin_request(slot.slot_id)
+
+    try:
+        with pytest.raises(InstanceBusyError):
+            await manager.restart(record.id)
+    finally:
+        handle.release()
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 1
+    assert cdp.created == ["ctx-1"]
+    assert cdp.disposed == []
+
+
+@pytest.mark.asyncio
 async def test_create_is_async_starting_then_active(tmp_path) -> None:
     store, accounts = _store_with_accounts(
         tmp_path, ("free", "free@example.com", "Free")
