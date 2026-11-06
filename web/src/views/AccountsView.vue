@@ -2,16 +2,26 @@
 import { ref, computed, onMounted } from 'vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
+import { useInstancesStore } from '@/stores/instances.ts'
+import { useKeepaliveStore } from '@/stores/keepalive.ts'
+import { useDebugStore } from '@/stores/debug.ts'
 import { usePolling } from '@/composables/usePolling.ts'
 import type { AccountWithStats } from '@/types/accounts.ts'
+import type { Instance } from '@/types/instances.ts'
 import Button from '@/components/ui/Button.vue'
 import AccountTable from '@/components/accounts/AccountTable.vue'
+import StatsStrip from '@/components/accounts/StatsStrip.vue'
+import KeepaliveBar from '@/components/accounts/KeepaliveBar.vue'
+import InstancePoolCard from '@/components/accounts/InstancePoolCard.vue'
+import UiDebugMenu from '@/components/debug/UiDebugMenu.vue'
+import CreateInstanceModal from '@/components/instances/CreateInstanceModal.vue'
+import ReassignAccountModal from '@/components/instances/ReassignAccountModal.vue'
+import BindSlotModal from '@/components/instances/BindSlotModal.vue'
 import CookieImportModal from '@/components/modals/CookieImportModal.vue'
 import EditAccountModal from '@/components/modals/EditAccountModal.vue'
 import {
   Plus,
   RotateCcw,
-  ArrowRightLeft,
   BookmarkPlus,
   SlidersHorizontal,
   Trash2,
@@ -21,6 +31,9 @@ import {
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
+const instancesStore = useInstancesStore()
+const keepaliveStore = useKeepaliveStore()
+const debugStore = useDebugStore()
 
 const importModalOpen = ref(false)
 const editModalOpen = ref(false)
@@ -30,11 +43,22 @@ const snapshotName = ref('')
 const snapshotDesc = ref('')
 const selectedGroup = ref<string>('ALL')
 
+const createModalOpen = ref(false)
+const createPresetAccountId = ref<string | null>(null)
+const reassignModalOpen = ref(false)
+const reassignInstance = ref<Instance | null>(null)
+const bindModalOpen = ref(false)
+const bindAccount = ref<AccountWithStats | null>(null)
+const bindMode = ref<'activate' | 'change'>('activate')
+
 async function loadData() {
   await Promise.all([
     accountsStore.fetchAll(),
     accountsStore.fetchPresets(),
     accountsStore.fetchGroups(),
+    instancesStore.fetchAll(),
+    keepaliveStore.fetchStatus(),
+    debugStore.fetchState(),
   ])
 }
 
@@ -64,16 +88,31 @@ function handleEditName(acc: AccountWithStats) {
   editModalOpen.value = true
 }
 
+function openCreateModal(accountId: string | null = null) {
+  createPresetAccountId.value = accountId
+  createModalOpen.value = true
+}
+
+function openReassignModal(instance: Instance) {
+  reassignInstance.value = instance
+  reassignModalOpen.value = true
+}
+
+function openBindModal(acc: AccountWithStats, mode: 'activate' | 'change' = 'activate') {
+  bindAccount.value = acc
+  bindMode.value = mode
+  bindModalOpen.value = true
+}
+
+function handleCreateFromBind(acc: AccountWithStats) {
+  openCreateModal(acc.id)
+}
+
 async function handleClearAllCooldowns() {
   if (confirm('确定要清除全部账号的所有模型 429 锁定吗？')) {
     await systemStore.clearCooldown()
     await accountsStore.fetchAll()
   }
-}
-
-async function handleForceNext() {
-  await systemStore.forceNextAccount()
-  await accountsStore.fetchAll()
 }
 
 async function handleApplyPreset(presetId: string) {
@@ -97,6 +136,9 @@ async function handleDeletePreset(presetId: string, name: string) {
 
 <template>
   <div class="space-y-5">
+    <!-- UI Debug (visible only when backend ui_debug=true) -->
+    <UiDebugMenu />
+
     <!-- Top Action Bar -->
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
       <div class="flex items-center gap-3">
@@ -118,17 +160,6 @@ async function handleDeletePreset(presetId: string, name: string) {
         </Button>
 
         <Button
-          variant="outline"
-          size="md"
-          :loading="systemStore.switchingNext"
-          title="手动顺延切换至下一个可用账号"
-          @click="handleForceNext"
-        >
-          <ArrowRightLeft class="w-4 h-4" />
-          <span>切换下一账号</span>
-        </Button>
-
-        <Button
           variant="primary"
           size="md"
           @click="importModalOpen = true"
@@ -138,6 +169,12 @@ async function handleDeletePreset(presetId: string, name: string) {
         </Button>
       </div>
     </div>
+
+    <!-- Stats Strip -->
+    <StatsStrip />
+
+    <!-- Keepalive Bar -->
+    <KeepaliveBar />
 
     <!-- Presets & Custom Schemes Ribbon -->
     <div class="bg-white border border-gray-200/80 rounded-xl p-3 shadow-2xs space-y-2.5">
@@ -189,6 +226,12 @@ async function handleDeletePreset(presetId: string, name: string) {
       </div>
     </div>
 
+    <!-- Instance Pool -->
+    <InstancePoolCard
+      @reassign="openReassignModal"
+      @create="openCreateModal(null)"
+    />
+
     <!-- Group Tabs Filter Bar -->
     <div class="flex items-center justify-between border-b border-gray-200 pb-2 gap-2 flex-wrap">
       <div class="flex items-center gap-1.5 flex-wrap">
@@ -228,6 +271,8 @@ async function handleDeletePreset(presetId: string, name: string) {
       :accounts="filteredAccounts"
       :active-id="accountsStore.activeId"
       @edit-name="handleEditName"
+      @activate-account="openBindModal($event, 'activate')"
+      @change-slot="openBindModal($event, 'change')"
     />
 
     <!-- Snapshot Save Modal -->
@@ -282,6 +327,22 @@ async function handleDeletePreset(presetId: string, name: string) {
         </div>
       </div>
     </div>
+
+    <!-- Instance Modals -->
+    <CreateInstanceModal
+      v-model="createModalOpen"
+      :preset-account-id="createPresetAccountId"
+    />
+    <ReassignAccountModal
+      v-model="reassignModalOpen"
+      :instance="reassignInstance"
+    />
+    <BindSlotModal
+      v-model="bindModalOpen"
+      :account="bindAccount"
+      :mode="bindMode"
+      @create="handleCreateFromBind"
+    />
 
     <!-- Cookie Import Modal -->
     <CookieImportModal v-model="importModalOpen" />

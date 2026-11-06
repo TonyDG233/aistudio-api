@@ -11,6 +11,10 @@ import type {
   CreatePresetRequest,
   SnapshotPresetRequest,
   ApplyPresetResponse,
+  RefreshAccountsRequest,
+  RefreshAccountsResponse,
+  BatchDeleteResponse,
+  BatchToggleResponse,
 } from '@/types'
 
 export const accountsApi = {
@@ -121,6 +125,27 @@ export const accountsApi = {
   applyPreset(id: string): Promise<ApplyPresetResponse> {
     return request<ApplyPresetResponse>(`/api/accounts/presets/${encodeURIComponent(id)}/apply`, {
       method: 'POST',
+    })
+  },
+
+  refresh(req: RefreshAccountsRequest): Promise<RefreshAccountsResponse> {
+    return request<RefreshAccountsResponse>('/api/accounts/refresh', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
+
+  batchDelete(ids: string[]): Promise<BatchDeleteResponse> {
+    return request<BatchDeleteResponse>('/api/accounts/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    })
+  },
+
+  batchToggle(ids: string[], enabled: boolean): Promise<BatchToggleResponse> {
+    return request<BatchToggleResponse>('/api/accounts/batch-toggle', {
+      method: 'POST',
+      body: JSON.stringify({ ids, enabled }),
     })
   },
 }

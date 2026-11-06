@@ -480,6 +480,13 @@ def validate_config_mapping(raw_dict: object) -> dict[str, object]:
     assert isinstance(config, dict)
     _apply_noncritical_fallbacks(config)
 
+    diagnostics = _require_mapping(config, "diagnostics")
+    ui_debug = diagnostics.get("ui_debug")
+    if not isinstance(ui_debug, bool):
+        raise ConfigValidationError(
+            f"配置校验失败：diagnostics.ui_debug 必须为布尔值，当前值为 {ui_debug!r}"
+        )
+
     rotator = _require_mapping(config, "rotator")
     max_retries = rotator.get("max_retries")
     if (

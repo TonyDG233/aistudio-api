@@ -22,6 +22,9 @@ max_contexts: 2
 # 仅诊断用，不进入普通用户 UI；也可用 AISTUDIO_HASH_INCLUDE_CODE 环境变量覆盖。
 diagnostics:
   hash_include_code: true
+  # C2a 纯离线 UI 调试沙箱：true 时不启动真实浏览器/账号/网络，使用内存沙箱。
+  # 也可用 AISTUDIO_UI_DEBUG=1/true 环境变量临时覆盖。
+  ui_debug: false
 
 # 浏览器指纹伪装（P3-F）：按账号确定性生成 Windows 桌面指纹，并在页面导航前
 # 通过 CDP 注入。默认开启；显式置 false 时不注入任何脚本/屏幕指标。

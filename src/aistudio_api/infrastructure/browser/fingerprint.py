@@ -417,6 +417,22 @@ def build_device_metrics(
     }
 
 
+def get_account_fingerprint(account_id: str | None = None) -> str:
+    """Return a deterministic, browser-free fingerprint summary for an account.
+
+    The summary is stable for the same account id and never probes CDP or a
+    real page, so it is safe for read-only instance/UI routes.
+    """
+    if not account_id:
+        return ""
+    profile = build_fingerprint_profile(account_id=account_id)
+    return (
+        f"{profile.fingerprint_id} · {profile.gpu_family} · "
+        f"{profile.screen_width}x{profile.screen_height}@{profile.device_pixel_ratio:g} · "
+        f"{profile.hardware_concurrency}c/{profile.device_memory}GB"
+    )
+
+
 def build_fingerprint_script(profile: BrowserFingerprintProfile) -> str:
     """Return the self-contained JS source registered for every new document."""
     payload = build_fingerprint_payload(profile)
@@ -491,5 +507,6 @@ __all__ = [
     "build_fingerprint_profile",
     "build_fingerprint_script",
     "build_fingerprint_seed",
+    "get_account_fingerprint",
     "normalize_account_key",
 ]

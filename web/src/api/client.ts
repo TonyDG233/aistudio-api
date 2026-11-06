@@ -70,10 +70,15 @@ export async function request<T>(url: string, options: RequestInit = {}): Promis
     let errorDetail = `请求失败 (${response.status})`
     try {
       const errJson = await response.json()
-      if (errJson && typeof errJson.detail === 'string') {
-        errorDetail = errJson.detail
-      } else if (errJson && typeof errJson.error?.message === 'string') {
+      const detail = errJson?.detail
+      if (typeof detail === 'string') {
+        errorDetail = detail
+      } else if (detail && typeof detail === 'object' && typeof detail.message === 'string') {
+        errorDetail = detail.message
+      } else if (typeof errJson?.error?.message === 'string') {
         errorDetail = errJson.error.message
+      } else if (typeof errJson?.message === 'string') {
+        errorDetail = errJson.message
       }
     } catch {
       // ignore json parse error

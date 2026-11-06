@@ -12,6 +12,8 @@ class InstanceState(StrEnum):
     SLEEPING = "sleeping"
     UNSTARTED = "unstarted"
     RECLAIMING = "reclaiming"
+    RETIRING = "retiring"
+    COOLDOWN = "cooldown"
     INVALID = "invalid"
 
 

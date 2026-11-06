@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,8 +40,22 @@ public_router = APIRouter()
 protected_router = APIRouter()
 
 
+def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
+    sandbox = runtime_state.ui_sandbox
+    if runtime_state.ui_debug and sandbox is not None:
+        return str(getattr(sandbox, "scenario", "") or "") or None
+    return None
+
+
 def health_response() -> HealthResponse:
-    return HealthResponse(status="ok", busy=False)
+    from aistudio_api.api.state import runtime_state
+
+    return HealthResponse(
+        status="ok",
+        busy=False,
+        ui_debug=bool(runtime_state.ui_debug),
+        ui_debug_scenario=_ui_debug_scenario(runtime_state),
+    )
 
 
 def stats_response() -> StatsResponse:
@@ -155,6 +169,35 @@ async def stats():
     return stats_response()
 
 
+@protected_router.get("/api/system/status")
+async def system_status(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """Read-only runtime status used by the web console/debug menu."""
+    account_service = runtime_state.account_service
+    manager = runtime_state.instance_manager
+    accounts = 0
+    if account_service is not None:
+        try:
+            accounts = len(account_service.list_accounts())
+        except Exception:
+            accounts = 0
+    instances = 0
+    if manager is not None:
+        try:
+            instances = len(getattr(manager, "records", lambda: ())())
+        except Exception:
+            instances = 0
+    return {
+        "status": "ok",
+        "busy": bool(getattr(runtime_state, "ui_sandbox", None) is not None),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
+        "accounts": accounts,
+        "instances": instances,
+    }
+
+
 # ========== 调度与配额管理 API ==========
 
 
@@ -175,6 +218,8 @@ async def get_rotation_status(
             "mode": "sticky",
             "message": "调度器未初始化",
             "accounts": {},
+            "ui_debug": bool(runtime_state.ui_debug),
+            "ui_debug_scenario": _ui_debug_scenario(runtime_state),
         }
 
     return {
@@ -182,6 +227,8 @@ async def get_rotation_status(
         "mode": "sticky",
         "quota_scope": rotator.quota_scope,
         "accounts": rotator.get_all_stats(),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
     }
 
 
@@ -197,6 +244,14 @@ async def clear_cooldown(
 
     if req.account_id:
         rotator.clear_cooldown(req.account_id, model=req.model)
+        service = runtime_state.account_service
+        store = getattr(service, "store", None)
+        if (
+            store is not None
+            and service is not None
+            and service.get_account(req.account_id) is not None
+        ):
+            store.update_account_refresh(req.account_id, expired=False)
     else:
         rotator.clear_all_cooldowns()
     logger.info("已清除冷却状态: 账号=%s, 模型=%s", req.account_id or "全部", req.model or "全部")
@@ -239,6 +294,25 @@ async def force_next_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> dict[str, object]:
     """强制切换到下一个可用账号。"""
+    sandbox = runtime_state.ui_sandbox
+    if runtime_state.ui_debug and sandbox is not None:
+        next_account = getattr(sandbox, "next_account", None)
+        if not callable(next_account):
+            raise HTTPException(404, detail="没有可用的账号")
+        account = cast(Any, next_account)()
+        if account is None:
+            raise HTTPException(404, detail="没有可用的账号")
+        logger.info("UI 调试沙箱强制切换账号: id=%s", account.id)
+        return {
+            "ok": True,
+            "account": {
+                "id": account.id,
+                "name": account.name,
+                "email": account.email,
+            },
+            "ui_debug": True,
+        }
+
     rotator = runtime_state.rotator
     if rotator is None:
         raise HTTPException(503, detail="调度器未初始化")
@@ -280,7 +354,9 @@ class ConfigYamlUpdateRequest(BaseModel):
 
 
 @protected_router.get("/config")
-async def get_system_config() -> dict[str, object]:
+async def get_system_config(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
     """获取系统运行配置与 config.yaml 内容。"""
     from aistudio_api.config import settings
     from aistudio_api.infrastructure.utils.logger import (
@@ -308,6 +384,8 @@ async def get_system_config() -> dict[str, object]:
         "debug_env_active": is_debug_env_active(),
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
     }
 
 

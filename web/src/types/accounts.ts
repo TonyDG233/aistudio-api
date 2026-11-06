@@ -14,6 +14,9 @@ export interface Account {
   duplicate_of?: string | null
   enabled: boolean
   group: string
+  session_expired?: boolean
+  auth_cooldown?: number
+  is_available?: boolean
   rebind_required?: boolean
   previous_active_account_id?: string | null
   active_account_id?: string | null
@@ -66,6 +69,49 @@ export interface ApplyPresetResponse {
   previous_active_account_id?: string | null
   active_account_id?: string | null
   target_account?: Account | null
+}
+
+export interface RefreshAccountsRequest {
+  account_ids?: string[]
+  all?: boolean
+  refresh_email?: boolean
+}
+
+export interface RefreshAccountResult {
+  id: string
+  ok: boolean
+  tier?: string | null
+  expired?: boolean | null
+  email?: string | null
+  error?: string | null
+  checked_at?: string | null
+}
+
+export interface RefreshAccountsResponse {
+  results: RefreshAccountResult[]
+  refreshed_count: number
+  expired_count: number
+}
+
+export interface BatchDeleteResponse {
+  deleted: number
+}
+
+export interface BatchToggleRequest {
+  ids: string[]
+  enabled: boolean
+}
+
+export interface BatchToggleResult {
+  id: string
+  ok: boolean
+  error?: string | null
+}
+
+export interface BatchToggleResponse {
+  results: BatchToggleResult[]
+  toggled_count: number
+  error_count: number
 }
 
 export interface ImportCookiesRequest {

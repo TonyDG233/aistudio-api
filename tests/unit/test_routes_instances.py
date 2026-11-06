@@ -26,6 +26,14 @@ EXPECTED_KEYS = {
     "max_tier",
     "in_flight",
     "latest",
+    "account_email",
+    "account_name",
+    "account_tier",
+    "tier",
+    "fingerprint",
+    "fingerprint_summary",
+    "last_used",
+    "tier_selector",
 }
 
 

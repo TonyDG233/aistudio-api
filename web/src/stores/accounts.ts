@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { accountsApi } from '@/api/accounts.ts'
+import { systemApi } from '@/api/system.ts'
 import { useSystemStore } from './system.ts'
 import type {
   Account,
@@ -26,6 +27,9 @@ export const useAccountsStore = defineStore('accounts', () => {
   const presets = ref<AccountPreset[]>([])
   const groups = ref<string[]>([])
   const applyingPresetId = ref<string | null>(null)
+  const refreshingAll = ref(false)
+  const refreshingIds = ref<Record<string, boolean>>({})
+  const batchBusy = ref(false)
   const activeId = computed(() => activeAccount.value?.id || '')
 
   const accountRows = computed<AccountWithStats[]>(() => {
@@ -294,6 +298,155 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  async function refreshAll() {
+    const toast = useToastStore()
+    if (refreshingAll.value) return null
+    refreshingAll.value = true
+    try {
+      const res = await accountsApi.refresh({ all: true })
+      toast.success(
+        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
+      )
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '刷新全部账号失败'
+      toast.error(msg)
+      return null
+    } finally {
+      refreshingAll.value = false
+    }
+  }
+
+  async function refreshAccounts(ids: string[]) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return null
+    if (targets.some((id) => refreshingIds.value[id] === true)) return null
+    const next: Record<string, boolean> = { ...refreshingIds.value }
+    targets.forEach((id) => {
+      next[id] = true
+    })
+    refreshingIds.value = next
+    try {
+      const res = await accountsApi.refresh({ account_ids: targets })
+      toast.success(
+        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
+      )
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '刷新账号失败'
+      toast.error(msg)
+      return null
+    } finally {
+      const cleared: Record<string, boolean> = { ...refreshingIds.value }
+      targets.forEach((id) => {
+        delete cleared[id]
+      })
+      refreshingIds.value = cleared
+    }
+  }
+
+  async function refreshAccount(id: string) {
+    return refreshAccounts([id])
+  }
+
+  async function batchDelete(ids: string[]) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return false
+    const requested = targets.length
+    batchBusy.value = true
+    try {
+      const res = await accountsApi.batchDelete(targets)
+      const deleted = Math.max(0, Number(res.deleted) || 0)
+      const failed = requested - deleted
+      await fetchAll()
+      if (deleted === 0) {
+        toast.error(`批量删除失败: 0/${requested} 个账号被删除`)
+        return false
+      }
+      if (failed > 0) {
+        toast.warning(`已删除 ${deleted}/${requested} 个账号，${failed} 个删除失败`)
+        return false
+      }
+      toast.success(`已删除 ${deleted} 个账号`)
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '批量删除失败'
+      toast.error(msg)
+      return false
+    } finally {
+      batchBusy.value = false
+    }
+  }
+
+  async function batchToggle(ids: string[], enabled: boolean) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return false
+    const requested = targets.length
+    const action = enabled ? '启用' : '停用'
+    batchBusy.value = true
+    try {
+      const res = await accountsApi.batchToggle(targets, enabled)
+      const toggled = Math.max(0, Number(res.toggled_count) || 0)
+      const failed = Math.max(Number(res.error_count) || 0, requested - toggled)
+      await fetchAll()
+      if (toggled === 0) {
+        toast.error(`批量${action}失败: 0/${requested} 个账号成功`)
+        return false
+      }
+      if (failed > 0 || toggled < requested) {
+        toast.warning(`已${action} ${toggled}/${requested} 个账号，${failed} 个失败`)
+        return false
+      }
+      toast.success(`已${action} ${toggled} 个账号`)
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : `批量${action}失败`
+      toast.error(msg)
+      return false
+    } finally {
+      batchBusy.value = false
+    }
+  }
+
+  async function recoverAccount(id: string) {
+    const toast = useToastStore()
+    if (refreshingIds.value[id] === true) return false
+    refreshingIds.value = { ...refreshingIds.value, [id]: true }
+    try {
+      const res = await accountsApi.refresh({ account_ids: [id], refresh_email: true })
+      const result = res.results.find((item) => item.id === id)
+      if (result?.expired === true) {
+        toast.warning('登录态仍然失效，请重新导入 Cookies 后再恢复')
+        await fetchAll()
+        return false
+      }
+      if (!result || !result.ok) {
+        toast.error(result?.error || '刷新登录态失败，请重新导入 Cookies')
+        await fetchAll()
+        return false
+      }
+      // refresh 已清除持久化 expired；clearCooldown 清除 session_expired 与鉴权冷却。
+      await systemApi.clearCooldown({ account_id: id })
+      toast.success('账号登录态已恢复')
+      await fetchAll()
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '恢复账号失败'
+      toast.error(msg)
+      await fetchAll()
+      return false
+    } finally {
+      const cleared: Record<string, boolean> = { ...refreshingIds.value }
+      delete cleared[id]
+      refreshingIds.value = cleared
+    }
+  }
+
   return {
     accounts,
     activeAccount,
@@ -323,5 +476,14 @@ export const useAccountsStore = defineStore('accounts', () => {
     applyPreset,
     createSnapshotPreset,
     deletePreset,
+    refreshingAll,
+    refreshingIds,
+    batchBusy,
+    refreshAll,
+    refreshAccounts,
+    refreshAccount,
+    recoverAccount,
+    batchDelete,
+    batchToggle,
   }
 })

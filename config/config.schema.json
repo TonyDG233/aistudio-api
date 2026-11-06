@@ -112,7 +112,12 @@
       "type": "object",
       "description": "诊断开关（D-09）；不进入普通用户 UI。",
       "properties": {
-        "hash_include_code": { "type": "boolean", "default": true }
+        "hash_include_code": { "type": "boolean", "default": true },
+        "ui_debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "C2a 纯离线 UI 调试沙箱；true 时使用临时 AccountStore 与内存 sandbox，不启动真实浏览器/账号/网络。"
+        }
       },
       "additionalProperties": true
     },

@@ -62,6 +62,8 @@ class GeminiGenerateContentResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     busy: bool
+    ui_debug: bool = False
+    ui_debug_scenario: str | None = None
 
 
 class AccountBreakdownItem(BaseModel):

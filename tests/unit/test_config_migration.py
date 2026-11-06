@@ -161,7 +161,10 @@ def test_legacy_config_is_migrated_and_atomically_written(tmp_path, monkeypatch)
             "generation_config_defaults": {"response_mime_type": "application/json"}
         }
     }
-    assert migrated["diagnostics"] == {"hash_include_code": True}
+    assert migrated["diagnostics"] == {
+        "hash_include_code": True,
+        "ui_debug": False,
+    }
     features = _as_dict(migrated["features"])
     assert _as_dict(features["routing"])["retry_same_delay_sec"] == 2.0
     assert _as_dict(features["atg"])["mode"] == "off"

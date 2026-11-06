@@ -10,7 +10,9 @@ from typing import Any, cast
 import pytest
 
 from aistudio_api.application.instance_manager import (
+    InstanceAlreadyExistsError,
     InstanceBusyError,
+    InstanceInvalidAccountError,
     InstanceManager,
     InstanceRebindError,
 )
@@ -600,6 +602,154 @@ async def test_restart_ready_same_account_with_inflight_request_stays_busy(
 
 
 @pytest.mark.asyncio
+async def test_reassign_drains_inflight_then_switches_same_slot(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec()], max_contexts=1, drain_timeout_s=1.0
+    )
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(record.id)
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.02)
+        handle.release()
+
+    task = asyncio.create_task(_release_soon())
+    updated = await manager.reassign(record.id, free2.id)
+    await task
+
+    assert updated.account_id == free2.id
+    assert updated.state is InstanceState.ACTIVE
+    assert updated.in_flight == 0
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert cdp.events.index("context.dispose:ctx-1") < cdp.events.index(
+        "context.create:ctx-2"
+    )
+    assert accounts["free1"].id != updated.account_id
+
+
+@pytest.mark.asyncio
+async def test_reassign_timeout_force_closes_and_switches_same_slot(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec()], max_contexts=1, drain_timeout_s=0.02
+    )
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(record.id)
+    started = time.monotonic()
+    updated = await manager.reassign(record.id, free2.id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert updated.account_id == free2.id
+    assert updated.state is InstanceState.ACTIVE
+    assert updated.in_flight == 0
+    assert "context.dispose:ctx-1" in cdp.events
+    assert cdp.events.index("context.dispose:ctx-1") < cdp.events.index(
+        "context.create:ctx-2"
+    )
+    handle.release()
+
+
+@pytest.mark.asyncio
+async def test_reassign_unbound_slot_binds_account(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    unbound = next(
+        item for item in (await manager.list_instances()).instances if not item.account_id
+    )
+    assert unbound.state is InstanceState.UNSTARTED
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    bound = await manager.reassign(unbound.id, free2.id)
+
+    assert bound.account_id == free2.id
+    assert bound.state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_reassign_rejects_account_bound_to_other_instance(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free1", "free1@example.com", "Free"),
+        ("free2", "free2@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    first = next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["free1"].id
+    )
+
+    with pytest.raises(InstanceAlreadyExistsError, match="已绑定实例 #2"):
+        await manager.reassign(first.id, accounts["free2"].id)
+
+
+@pytest.mark.asyncio
+async def test_reassign_recovers_account_from_invalid_stale_slot(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    records = (await manager.list_instances()).instances
+    bound = next(item for item in records if item.account_id)
+    unbound = next(item for item in records if not item.account_id)
+    bound_slot = next(
+        slot
+        for slot in manager._pool.slots()
+        if slot.account_id == accounts["free1"].id
+    )
+    assert bound_slot.page is not None
+    bound_slot.page.closed = True
+
+    stale = (await manager.list_instances()).instances
+    stale_bound = next(item for item in stale if item.id == bound.id)
+    assert stale_bound.state is InstanceState.INVALID
+    assert stale_bound.account_id == accounts["free1"].id
+
+    rebound = await manager.reassign(unbound.id, accounts["free1"].id)
+
+    assert rebound.account_id == accounts["free1"].id
+    assert rebound.state is InstanceState.ACTIVE
+
+
+@pytest.mark.asyncio
 async def test_create_is_async_starting_then_active(tmp_path) -> None:
     store, accounts = _store_with_accounts(
         tmp_path, ("free", "free@example.com", "Free")
@@ -615,6 +765,59 @@ async def test_create_is_async_starting_then_active(tmp_path) -> None:
     assert len(listed) == 1
     assert listed[0].state is InstanceState.ACTIVE
     assert listed[0].account_id == accounts["free"].id
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_explicit_tier_selector_without_configured_spec(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[], max_contexts=2)
+
+    created = await manager.create(accounts["free"].id, only_tier="Free")
+
+    assert created.state is InstanceState.STARTING
+    assert created.only_tier == "Free"
+    assert created.min_tier == "Free"
+    assert created.max_tier == "Free"
+    await manager.wait_idle()
+    listed = (await manager.list_instances()).instances
+    assert listed[0].state is InstanceState.ACTIVE
+    assert listed[0].account_id == accounts["free"].id
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_account_already_bound_to_instance(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=2)
+    await manager.startup()
+
+    with pytest.raises(InstanceAlreadyExistsError):
+        await manager.create(accounts["free"].id)
+
+
+@pytest.mark.asyncio
+async def test_unbound_restart_and_wake_raise_clear_account_error(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _free_spec()], max_contexts=2)
+    await manager.startup()
+
+    unbound = next(
+        item for item in (await manager.list_instances()).instances if not item.account_id
+    )
+    with pytest.raises(InstanceInvalidAccountError, match="账号"):
+        await manager.restart(unbound.id)
+    with pytest.raises(InstanceInvalidAccountError, match="账号"):
+        await manager.wake(unbound.id)
 
 
 @pytest.mark.asyncio

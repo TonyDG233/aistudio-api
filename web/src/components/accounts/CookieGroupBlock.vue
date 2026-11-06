@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { CookieGroup } from './useCookieGroups.ts'
 import { formatDate } from '@/utils/format.ts'
 import {
@@ -8,15 +9,43 @@ import {
   FolderMinus,
 } from 'lucide-vue-next'
 
-defineProps<{
-  group: CookieGroup
-  collapsed: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    group: CookieGroup
+    collapsed: boolean
+    batchMode?: boolean
+    selectedCount?: number
+    totalCount?: number
+  }>(),
+  {
+    batchMode: false,
+    selectedCount: 0,
+    totalCount: 0,
+  },
+)
 
 const emit = defineEmits<{
   toggle: []
   deleteGroup: []
+  toggleSelectGroup: []
 }>()
+
+const expiredCount = computed(
+  () =>
+    props.group.accounts.filter(
+      (account) =>
+        account.enabled !== false &&
+        (account.expired === true || account.session_expired === true),
+    ).length,
+)
+
+const allSelected = computed(
+  () => props.totalCount > 0 && props.selectedCount >= props.totalCount,
+)
+
+const someSelected = computed(
+  () => props.selectedCount > 0 && props.selectedCount < props.totalCount,
+)
 </script>
 
 <template>
@@ -30,6 +59,17 @@ const emit = defineEmits<{
       @click="emit('toggle')"
     >
       <div class="flex items-center gap-3 min-w-0">
+        <input
+          v-if="batchMode"
+          type="checkbox"
+          class="w-3.5 h-3.5 shrink-0 accent-brand-600 cursor-pointer"
+          :checked="allSelected"
+          :indeterminate="someSelected"
+          title="选择该组全部账号"
+          @click.stop
+          @change="emit('toggleSelectGroup')"
+        >
+
         <!-- Expand Chevron -->
         <button
           type="button"
@@ -55,12 +95,18 @@ const emit = defineEmits<{
 
         <!-- Group Info -->
         <div class="truncate">
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2 flex-wrap">
             <span class="font-bold text-gray-900 text-xs tracking-tight">
               {{ group.name }}
             </span>
             <span class="text-[11px] font-mono text-gray-400">
               ({{ group.accounts.length }} 个子账号)
+            </span>
+            <span
+              v-if="expiredCount > 0"
+              class="px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-rose-100 text-rose-700 border border-rose-200"
+            >
+              ⚠ {{ expiredCount }} 个失效
             </span>
             <span
               v-if="group.hasActive"
