@@ -32,13 +32,19 @@ class RequestCaptureService:
         self._active_ctx_id: int | None = None
         self._lock = asyncio.Lock()
 
-    def clear_templates(self) -> bool:
+    def clear_templates(self, invalidate_base: bool = False) -> bool:
         """清空捕获的请求模板（账号切换或强制刷新时调用）。
+
+        ``invalidate_base`` also drops the cached context marker so the next
+        capture re-reads the session base template instead of reusing the old
+        context identity.
 
         Returns True only when there was something to clear; repeated calls on
         an already-empty cache stay silent so one 403/switch path cannot emit
         duplicate INFO lines.
         """
+        if invalidate_base:
+            self._active_ctx_id = None
         if not self._templates:
             return False
         self._templates.clear()
@@ -80,28 +86,46 @@ class RequestCaptureService:
             AistudioContent.from_user_prompt(prompt=prompt, images=images)
         ]
 
-        # 签名是一次性的票据（根据请求内容穿进 snapshot 计算），每次请求实时生成，不可复用缓存
-        snapshot = await self._session.generate_snapshot(snapshot_contents)
+        def build_body(snapshot_value: str) -> str:
+            return modify_body(
+                template.body,
+                model=model,
+                prompt=prompt,
+                contents=rewritten_contents,
+                system_instruction=system_instruction,
+                system_instruction_content=system_instruction_content,
+                tools=tools,
+                tool_config=tool_config,
+                safety_settings=safety_settings,
+                images=images,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                generation_config_overrides=generation_config_overrides,
+                sanitize_plain_text=sanitize_plain_text,
+                snapshot=snapshot_value,
+            )
 
-        body = modify_body(
-            template.body,
-            model=model,
-            prompt=prompt,
-            contents=rewritten_contents,
-            system_instruction=system_instruction,
-            system_instruction_content=system_instruction_content,
-            tools=tools,
-            tool_config=tool_config,
-            safety_settings=safety_settings,
-            images=images,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
-            generation_config_overrides=generation_config_overrides,
-            sanitize_plain_text=sanitize_plain_text,
-            snapshot=snapshot,
+        # Measure the complete request body (contents + tools + system
+        # instruction + generationConfig) before the real snapshot exists so
+        # large tool histories still trigger warmup.
+        payload_size = len(build_body("").encode("utf-8"))
+
+        # 签名是一次性的票据（根据请求内容穿进 snapshot 计算），每次请求实时生成，不可复用缓存
+        previous_snapshot_at = getattr(self._session, "_last_snapshot_at", None)
+        snapshot = await self._session.generate_snapshot(
+            snapshot_contents, payload_size=payload_size
         )
+        warmup_used = bool(getattr(self._session, "last_snapshot_warmup", False))
+        current_snapshot_at = getattr(self._session, "_last_snapshot_at", None)
+        if previous_snapshot_at is not None and current_snapshot_at is not None:
+            snapshot_interval = max(0.0, current_snapshot_at - previous_snapshot_at)
+            interval_text = f"{snapshot_interval:.2f}s"
+        else:
+            interval_text = "首次"
+
+        body = build_body(snapshot)
         captured = CapturedRequest(
             url=template.url,
             headers=dict(template.headers),
@@ -110,10 +134,14 @@ class RequestCaptureService:
             snapshot=snapshot,
         )
         logger.info(
-            "捕获请求模板成功: model=%s, 快照长度=%d, 请求体长度=%d",
+            "捕获请求模板成功: model=%s, 快照长度=%d, 请求体长度=%d, "
+            "叹号前缀=%s, 预热=%s, 距上次快照=%s",
             captured.model,
             len(captured.snapshot),
             len(captured.body),
+            captured.snapshot.startswith("!"),
+            warmup_used,
+            interval_text,
         )
         return captured
 

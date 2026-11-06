@@ -19,7 +19,9 @@ class RequestSession(Protocol):
 
     async def capture_template(self, model: str) -> dict[str, object]: ...
 
-    async def generate_snapshot(self, contents: list[AistudioContent]) -> str: ...
+    async def generate_snapshot(
+        self, contents: list[AistudioContent], *, payload_size: int | None = None
+    ) -> str: ...
 
     async def refresh_auth_state(self) -> bool:
         """Invalidate cached cookies and refetch the live auth material."""

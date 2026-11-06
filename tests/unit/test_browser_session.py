@@ -351,9 +351,9 @@ async def test_generate_snapshot_hash_include_code_false_matches_upstream(
     ]
 
     assert await session.generate_snapshot(contents) == "!snapshot_token_ok"
-    # D-09 hash 口径不变：code 部分仍折叠为 ""；新 JS 契约以 {prompt, hash} 传入。
+    # D-09 hash 口径不变：code 部分仍折叠为 ""；首次快照带 warmup 标记。
     assert passed_args == [
-        {"prompt": " ", "hash": sha256(b" ").hexdigest()}
+        {"prompt": " ", "hash": sha256(b" ").hexdigest(), "warmup": True}
     ]
 
 

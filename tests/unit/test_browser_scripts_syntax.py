@@ -181,7 +181,11 @@ def test_evaluate_wrapper_expressions_parse_cleanly():
 
     scripts = [
         ("INSTALL_HOOKS_JS", INSTALL_HOOKS_JS, None),
-        ("SNAPSHOT_GENERATE_JS", SNAPSHOT_GENERATE_JS, {"prompt": "test", "hash": "sample_hash"}),
+        (
+            "SNAPSHOT_GENERATE_JS",
+            SNAPSHOT_GENERATE_JS,
+            {"prompt": "test", "hash": "sample_hash", "warmup": False},
+        ),
         ("STREAMING_INIT_JS", STREAMING_INIT_JS, {"rid": "r1", "url": "http://x"}),
         ("STREAM_CLEANUP_JS", STREAM_CLEANUP_JS, "r1"),
         ("DIALOG_CLEANUP_JS", DIALOG_CLEANUP_JS, None),

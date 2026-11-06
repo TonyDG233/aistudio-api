@@ -434,7 +434,7 @@ class InstanceManager:
             slot = self._pool.get(record.slot_id)
             if slot is not None and int(slot.active_requests) > 0:
                 raise InstanceBusyError("该实例仍有在途请求")
-            await self._activate(record, account)
+            await self._activate(record, account, force=True)
             if self._current_id is None:
                 self._current_id = record.id
             return self._view(record)
@@ -974,6 +974,7 @@ class InstanceManager:
         account: AccountMeta,
         *,
         surface: str | None = None,
+        force: bool = False,
     ) -> _Record:
         target_surface = surface or record.surface
         if not record.accepts_tier(account.tier):
@@ -999,6 +1000,7 @@ class InstanceManager:
                 tier=account.tier,
                 account_lane=instance_lane_for_tier(account.tier),
                 surface=target_surface,
+                force=force,
             )
         except InstanceTierError as exc:
             record.state = InstanceState.INVALID
