@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,7 +21,7 @@ from aistudio_api.api.error_mapping import error_payload
 from aistudio_api.api.format_errors import format_for_path
 from aistudio_api.application.instance_manager import InstanceError
 from aistudio_api.application.signature_cache import signature_cache
-from aistudio_api.config import resolve_data_dir
+from aistudio_api.config import resolve_data_dir, resolve_ui_debug
 from aistudio_api.domain.errors import AistudioError, RoutingError, TierRequiredError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -37,6 +37,7 @@ from aistudio_api.infrastructure.utils.logger import (
 
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
+from .routes_debug import router as debug_router
 from .routes_gemini import router as gemini_router
 from .routes_instances import router as instances_router
 from .routes_keepalive import router as keepalive_router
@@ -323,7 +324,66 @@ async def _shutdown_runtime(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    validate_config()
+    ui_debug = resolve_ui_debug()
+    runtime_state.ui_debug = ui_debug
+    isolation = None
+    if ui_debug:
+        # Q1/Q2：在任何 config/log/API-key 路由或 validate_config 迁移写盘之前，
+        # 先把配置、数据、账号、统计、模型缓存、日志与 dump 路径全部重定向到临时
+        # 目录；关闭时恢复原始环境与 settings 并删除临时目录。
+        from .ui_sandbox import UiDebugIsolation
+
+        isolation = UiDebugIsolation().enter()
+    try:
+        validate_config()
+    except BaseException:
+        if isolation is not None:
+            isolation.close()
+        raise
+    if ui_debug:
+        # C2a：纯离线 UI 调试。绝不构造真实 client/browser、实例池、keepalive、
+        # 模型发现或账号元数据网络刷新；所有读写只落在临时 AccountStore 与内存沙箱。
+        from .ui_sandbox import create_ui_sandbox
+
+        try:
+            sandbox = create_ui_sandbox()
+        except BaseException:
+            if isolation is not None:
+                isolation.close()
+            raise
+        runtime_state.ui_sandbox = sandbox
+        runtime_state.client = None
+        runtime_state.account_service = sandbox.account_service
+        runtime_state.account_refresher = cast(Any, sandbox.refresher)
+        runtime_state.rotator = cast(Any, sandbox.rotator)
+        runtime_state.instance_manager = sandbox.manager
+        runtime_state.keepalive = sandbox.keepalive
+        runtime_state.routing_pipeline = None
+        signature_cache.configure_path(sandbox.root / "signature_cache.json")
+        logger.info(
+            "UI 调试沙箱已启用: scenario=%s, data_dir=%s（无浏览器/网络/真实磁盘）",
+            sandbox.scenario,
+            sandbox.root,
+        )
+        try:
+            yield
+        finally:
+            logger.info("UI 调试沙箱正在关闭")
+            sandbox.close()
+            runtime_state.keepalive = None
+            runtime_state.instance_manager = None
+            runtime_state.routing_pipeline = None
+            runtime_state.client = None
+            runtime_state.account_service = None
+            runtime_state.account_refresher = None
+            runtime_state.rotator = None
+            runtime_state.ui_sandbox = None
+            runtime_state.ui_debug = False
+            if isolation is not None:
+                isolation.close()
+        return
+
+    runtime_state.ui_sandbox = None
     signature_cache.configure_path(resolve_data_dir() / "signature_cache.json")
 
     from aistudio_api.application.account_keepalive import (
@@ -493,6 +553,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(debug_router, prefix="/api")
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )

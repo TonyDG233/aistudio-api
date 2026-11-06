@@ -24,6 +24,8 @@ from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.domain.model_access import (
     canonical_tier,
     instance_lane_for_tier,
+    resolve_tier_selector,
+    tier_matches_selector,
 )
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.gateway.instance_pool import (
@@ -286,20 +288,51 @@ class InstanceManager:
     def current_instance_id(self) -> str | None:
         return self._current_id
 
-    async def create(self, account_id: str, surface: str | None = None) -> Instance:
+    async def create(
+        self,
+        account_id: str,
+        surface: str | None = None,
+        *,
+        only_tier: str | None = None,
+        min_tier: str | None = None,
+        max_tier: str | None = None,
+    ) -> Instance:
         account = self._validate_account(account_id)
         normalized = self._normalize_surface(surface)
+        custom_selector = any(value for value in (only_tier, min_tier, max_tier))
         async with self._lifecycle_lock:
             if self._has_record_for_account(account.id):
                 raise InstanceAlreadyExistsError(
                     f"账号 {account_id} 已存在实例（同账号 chat/build 不并存）"
                 )
-            spec = self._matching_spec(account, normalized)
-            if spec is None:
-                raise InstanceNotReadyError(
-                    f"没有匹配账号 tier={account.tier} surface={normalized} 的实例配置"
+            if custom_selector:
+                selector = resolve_tier_selector(
+                    only_tier=only_tier or None,
+                    min_tier=min_tier or None,
+                    max_tier=max_tier or None,
                 )
-            lane = instance_lane_for_tier(account.tier)
+                if not tier_matches_selector(account.tier, selector):
+                    raise InstanceInvalidAccountError(
+                        f"账号 tier={account.tier} 不满足实例 tier 区间 "
+                        f"only={selector.only_tier or '-'} "
+                        f"min={selector.min_tier or '-'} "
+                        f"max={selector.max_tier or '-'}"
+                    )
+                spec = InstanceSpec(
+                    count=1,
+                    surface=normalized,
+                    only_tier=selector.only_tier or "",
+                    min_tier=selector.min_tier,
+                    max_tier=selector.max_tier,
+                )
+                lane = selector.lane
+            else:
+                spec = self._matching_spec(account, normalized)
+                if spec is None:
+                    raise InstanceNotReadyError(
+                        f"没有匹配账号 tier={account.tier} surface={normalized} 的实例配置"
+                    )
+                lane = instance_lane_for_tier(account.tier)
             try:
                 slot = await self._pool.add_slot(spec, lane=lane)
             except InstanceCapacityError as exc:
@@ -404,16 +437,34 @@ class InstanceManager:
                     f"only={record.only_tier or '-'} min={record.min_tier or '-'} "
                     f"max={record.max_tier or '-'}"
                 )
-            if self._has_record_for_account(account.id, exclude_id=record.id):
-                raise InstanceAlreadyExistsError(f"账号 {account_id} 已有实例")
+            other = self._record_for_account(account.id, exclude_id=record.id)
+            if other is not None:
+                raise InstanceAlreadyExistsError(
+                    f"账号 {account_id} 已绑定实例 #{other.number}，"
+                    f"请先在实例 #{other.number} 换绑其他账号或关闭该实例后"
+                    "再绑定此槽位"
+                )
+            previous = (
+                self._accounts.get_account(record.account_id)
+                if record.account_id
+                else None
+            )
+            was_current = self._current_id == record.id
             slot = self._pool.get(record.slot_id)
             if slot is not None and int(slot.active_requests) > 0:
-                raise InstanceBusyError("该实例仍有在途请求")
-            previous = self._require_account_for_record(record)
-            was_current = self._current_id == record.id
+                # Bounded safe drain/retire: stop new work, drain once, then
+                # force-close the old Page/Context before the new account starts.
+                await self._retire_record(record)
             try:
                 await self._activate(record, account)
             except InstanceError as exc:
+                if previous is None:
+                    record.account_id = ""
+                    record.state = InstanceState.UNSTARTED
+                    record.last_error = str(exc)
+                    self._repair_latest()
+                    self._repair_current()
+                    raise InstanceNotReadyError(f"绑定失败: {exc}") from exc
                 try:
                     await self._activate(record, previous)
                 except InstanceError as rollback_exc:
@@ -1125,15 +1176,27 @@ class InstanceManager:
             raise InstanceNotFoundError("实例不存在")
         return record
 
+    def _record_for_account(
+        self, account_id: str, *, exclude_id: str | None = None
+    ) -> _Record | None:
+        for record in self._records.values():
+            if (
+                record.account_id == account_id
+                and record.id != exclude_id
+                and record.state
+                not in (
+                    InstanceState.RECLAIMING,
+                    InstanceState.RETIRING,
+                    InstanceState.INVALID,
+                )
+            ):
+                return record
+        return None
+
     def _has_record_for_account(
         self, account_id: str, *, exclude_id: str | None = None
     ) -> bool:
-        return any(
-            record.account_id == account_id
-            and record.id != exclude_id
-            and record.state is not InstanceState.RECLAIMING
-            for record in self._records.values()
-        )
+        return self._record_for_account(account_id, exclude_id=exclude_id) is not None
 
     @staticmethod
     def _normalize_surface(surface: str | None) -> str:

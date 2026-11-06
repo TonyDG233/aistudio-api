@@ -88,6 +88,8 @@ class RuntimeState:
     instance_manager: object | None = None
     routing_pipeline: object | None = None
     keepalive: object | None = None
+    ui_debug: bool = False
+    ui_sandbox: object | None = None
     model_stats: dict[str, ModelStatsItem] = field(
         default_factory=lambda: defaultdict(ModelStatsItem)
     )

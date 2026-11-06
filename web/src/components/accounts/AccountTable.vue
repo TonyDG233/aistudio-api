@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { ref, computed, toRef, onMounted } from 'vue'
+import { ref, computed, toRef, onMounted, watch } from 'vue'
 import type { AccountWithStats } from '@/types/accounts.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
+import { useInstancesStore } from '@/stores/instances.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import { systemApi } from '@/api/system.ts'
 import { useCookieGroups, type CookieGroup } from './useCookieGroups.ts'
 import CookieGroupBlock from './CookieGroupBlock.vue'
 import AccountRow from './AccountRow.vue'
+import { accountStatus } from '@/utils/accountStatus.ts'
+import { boundInstanceFor } from '@/utils/instances.ts'
 import {
   Cookie,
   Users,
@@ -15,6 +18,10 @@ import {
   Layers,
   Clock,
   Trash2,
+  RefreshCw,
+  Power,
+  PowerOff,
+  X,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -24,27 +31,36 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   editName: [account: AccountWithStats]
+  activateAccount: [account: AccountWithStats]
+  changeSlot: [account: AccountWithStats]
 }>()
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
+const instancesStore = useInstancesStore()
 const toast = useToastStore()
 
 // 搜索与状态过滤
 const searchKeyword = ref('')
-const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired'>('all')
+const statusFilter = ref<'all' | 'ready' | 'limited' | 'cooldown' | 'expired'>('all')
+
+function matchesStatusFilter(acc: AccountWithStats): boolean {
+  if (statusFilter.value === 'all') return true
+  const status = accountStatus(
+    acc,
+    instancesStore.instances,
+    accountsStore.activeId,
+  )
+  if (statusFilter.value === 'expired') return status.key === 'expired'
+  if (statusFilter.value === 'limited') return status.key === 'quota'
+  if (statusFilter.value === 'cooldown') return status.key === 'cooldown'
+  return status.key === 'ready'
+}
 
 const filteredAccounts = computed<AccountWithStats[]>(() => {
   const kw = searchKeyword.value.trim().toLowerCase()
   return props.accounts.filter((acc) => {
-    // 状态过滤
-    if (statusFilter.value === 'expired') {
-      if (!acc.session_expired) return false
-    } else if (statusFilter.value === 'limited') {
-      if (acc.session_expired || acc.is_available !== false) return false
-    } else if (statusFilter.value === 'ready') {
-      if (acc.session_expired || acc.is_available === false) return false
-    }
+    if (!matchesStatusFilter(acc)) return false
 
     // 关键词过滤
     if (!kw) return true
@@ -137,6 +153,115 @@ const hoursUntilPacificMidnight = computed(() => {
   }
 })
 
+// 批量管理模式
+const batchMode = ref(false)
+const selectedIds = ref<Set<string>>(new Set())
+
+const selectedCount = computed(() => selectedIds.value.size)
+
+const batchRefreshing = computed(() =>
+  Array.from(selectedIds.value).some((id) => accountsStore.refreshingIds[id] === true),
+)
+
+const batchWorking = computed(() => accountsStore.batchBusy || batchRefreshing.value)
+
+const allFilteredSelected = computed(
+  () =>
+    filteredAccounts.value.length > 0 &&
+    filteredAccounts.value.every((acc) => selectedIds.value.has(acc.id)),
+)
+
+const someFilteredSelected = computed(
+  () => selectedCount.value > 0 && !allFilteredSelected.value,
+)
+
+watch(
+  () => props.accounts,
+  (accounts) => {
+    const live = new Set(accounts.map((acc) => acc.id))
+    let changed = false
+    const next = new Set<string>()
+    selectedIds.value.forEach((id) => {
+      if (live.has(id)) {
+        next.add(id)
+      } else {
+        changed = true
+      }
+    })
+    if (changed) {
+      selectedIds.value = next
+    }
+  },
+)
+
+function isSelected(id: string): boolean {
+  return selectedIds.value.has(id)
+}
+
+function toggleRow(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) {
+    next.delete(id)
+  } else {
+    next.add(id)
+  }
+  selectedIds.value = next
+}
+
+function toggleAllFiltered() {
+  const next = new Set(selectedIds.value)
+  if (allFilteredSelected.value) {
+    filteredAccounts.value.forEach((acc) => next.delete(acc.id))
+  } else {
+    filteredAccounts.value.forEach((acc) => next.add(acc.id))
+  }
+  selectedIds.value = next
+}
+
+function groupSelectedCount(group: CookieGroup): number {
+  return group.accounts.filter((acc) => selectedIds.value.has(acc.id)).length
+}
+
+function toggleSelectGroup(group: CookieGroup) {
+  const ids = group.accounts.map((acc) => acc.id)
+  const allSelected = ids.length > 0 && ids.every((id) => selectedIds.value.has(id))
+  const next = new Set(selectedIds.value)
+  if (allSelected) {
+    ids.forEach((id) => next.delete(id))
+  } else {
+    ids.forEach((id) => next.add(id))
+  }
+  selectedIds.value = next
+}
+
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value
+  if (!batchMode.value) {
+    selectedIds.value = new Set()
+  }
+}
+
+async function handleBatchRefresh() {
+  if (selectedCount.value === 0 || batchRefreshing.value) return
+  await accountsStore.refreshAccounts(Array.from(selectedIds.value))
+}
+
+async function handleBatchToggle(enabled: boolean) {
+  if (selectedCount.value === 0) return
+  await accountsStore.batchToggle(Array.from(selectedIds.value), enabled)
+}
+
+async function handleBatchDelete() {
+  if (selectedCount.value === 0) return
+  if (confirm(`确定要删除选中的 ${selectedCount.value} 个账号吗？此操作不可逆。`)) {
+    const ok = await accountsStore.batchDelete(Array.from(selectedIds.value))
+    if (ok) {
+      selectedIds.value = new Set()
+      batchMode.value = false
+    }
+  }
+}
+
 // 清理幽灵残留状态
 const cleaningGhosts = ref(false)
 
@@ -171,10 +296,9 @@ async function handleDeleteCookieGroup(group: CookieGroup) {
   }
 }
 
-// 针对登录态失效或受阻账号执行重新验证（解除禁用并在浏览器中重放连接）
+// 针对登录态失效或受阻账号执行重新验证（刷新清除 expired 后清除 session_expired/冷却）
 async function handleReverifyAccount(acc: AccountWithStats) {
-  await systemStore.clearCooldown({ account_id: acc.id })
-  await accountsStore.activateAccount(acc.id)
+  await accountsStore.recoverAccount(acc.id)
 }
 
 async function handleClearAccountCooldown(accountId: string) {
@@ -227,6 +351,29 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             @click="collapseAll"
           >
             收起全部
+          </button>
+
+          <button
+            type="button"
+            class="px-2.5 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            title="刷新所有账号的 Tier、登录态与邮箱"
+            :disabled="accountsStore.refreshingAll"
+            @click="accountsStore.refreshAll()"
+          >
+            <RefreshCw
+              class="w-3.5 h-3.5"
+              :class="{ 'animate-spin': accountsStore.refreshingAll }"
+            />
+            <span>{{ accountsStore.refreshingAll ? '刷新中...' : '刷新全部' }}</span>
+          </button>
+
+          <button
+            type="button"
+            class="px-2.5 py-1 text-xs font-medium rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            :class="batchMode ? 'text-brand-700 bg-brand-50 hover:bg-brand-100' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'"
+            @click="toggleBatchMode"
+          >
+            <span>{{ batchMode ? '退出批量' : '批量管理' }}</span>
           </button>
 
           <button
@@ -285,6 +432,14 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             <button
               type="button"
               class="px-2.5 py-1 rounded-lg transition-all cursor-pointer"
+              :class="statusFilter === 'cooldown' ? 'bg-white text-orange-700 font-semibold shadow-2xs' : 'text-gray-500 hover:text-gray-900'"
+              @click="statusFilter = 'cooldown'"
+            >
+              鉴权冷却
+            </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded-lg transition-all cursor-pointer"
               :class="statusFilter === 'expired' ? 'bg-white text-rose-700 font-semibold shadow-2xs' : 'text-gray-500 hover:text-gray-900'"
               @click="statusFilter = 'expired'"
             >
@@ -299,6 +454,78 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <span>每日配额刷新 (00:00 PST): 还剩 {{ hoursUntilPacificMidnight }}</span>
         </div>
       </div>
+
+      <!-- Batch Action Bar -->
+      <div
+        v-if="batchMode"
+        class="flex flex-col md:flex-row md:items-center justify-between gap-2 pt-2 border-t border-gray-200/60"
+      >
+        <div class="flex items-center gap-2 flex-wrap">
+          <label class="inline-flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input
+              type="checkbox"
+              class="w-3.5 h-3.5 accent-brand-600"
+              :checked="allFilteredSelected"
+              :indeterminate="someFilteredSelected"
+              @change="toggleAllFiltered"
+            >
+            <span>全选当前筛选</span>
+          </label>
+          <span class="text-xs font-mono text-gray-500">
+            已选 {{ selectedCount }} / {{ filteredAccounts.length }}
+          </span>
+        </div>
+
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchRefresh"
+          >
+            <RefreshCw
+              class="w-3 h-3"
+              :class="{ 'animate-spin': batchRefreshing }"
+            />
+            <span>{{ batchRefreshing ? '刷新中...' : '批量刷新' }}</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchToggle(true)"
+          >
+            <Power class="w-3 h-3" />
+            <span>批量启用</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchToggle(false)"
+          >
+            <PowerOff class="w-3 h-3" />
+            <span>批量停用</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchDelete"
+          >
+            <Trash2 class="w-3 h-3" />
+            <span>批量删除</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
+            @click="toggleBatchMode"
+          >
+            <X class="w-3 h-3" />
+            <span>退出</span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Tree Body -->
@@ -308,20 +535,28 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         :key="group.id"
         :group="group"
         :collapsed="isGroupCollapsed(group.id)"
+        :batch-mode="batchMode"
+        :selected-count="groupSelectedCount(group)"
+        :total-count="group.accounts.length"
         @toggle="toggleCookieGroup(group.id)"
         @delete-group="handleDeleteCookieGroup(group)"
+        @toggle-select-group="toggleSelectGroup(group)"
       >
         <AccountRow
           v-for="acc in group.accounts"
           :key="acc.id"
           :account="acc"
           :active="acc.id === activeId"
-          :activating="accountsStore.activatingId === acc.id"
           :force-expanded="forceExpandAllModels"
-          @activate="accountsStore.activateAccount(acc.id)"
+          :bound-instance="boundInstanceFor(acc.id, instancesStore.instances)"
+          :batch-mode="batchMode"
+          :selected="isSelected(acc.id)"
+          @activate="emit('activateAccount', acc)"
+          @change-slot="emit('changeSlot', acc)"
           @delete="handleDeleteAccount(acc)"
           @edit-name="emit('editName', acc)"
-          @clear-cooldown="acc.session_expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
+          @toggle-select="toggleRow(acc.id)"
+          @clear-cooldown="acc.session_expired || acc.expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
           @clear-model="handleClearModelCooldown(acc.id, $event)"
         />
       </CookieGroupBlock>

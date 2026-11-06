@@ -29,6 +29,17 @@ export interface UpdateLoggingConfigResponse {
 export interface HealthCheckResponse {
   status: string
   busy: boolean
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+}
+
+export interface SystemStatusResponse {
+  status: string
+  busy: boolean
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+  accounts?: number
+  instances?: number
 }
 export interface ApiKeyItem {
   name: string

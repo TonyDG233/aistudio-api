@@ -14,6 +14,7 @@ from aistudio_api.api.dependencies import (
     get_account_service,
     get_runtime_state,
 )
+from aistudio_api.api.ui_sandbox import UISandbox
 from aistudio_api.application.instance_manager import (
     InstanceError,
     InstanceRebindError,
@@ -50,11 +51,57 @@ def get_account_info_refresher(
 ) -> AccountInfoRefresher:
     """优先复用 lifespan 创建的共享刷新器，测试可依赖覆盖。"""
     global _refresher_singleton
-    if isinstance(runtime_state.account_refresher, AccountInfoRefresher):
-        return runtime_state.account_refresher
+    shared = runtime_state.account_refresher
+    if shared is not None and callable(getattr(shared, "refresh_accounts", None)):
+        return cast(AccountInfoRefresher, shared)
     if _refresher_singleton is None:
         _refresher_singleton = AccountInfoRefresher(account_service.store)
     return _refresher_singleton
+
+
+def get_ui_sandbox(runtime_state: RuntimeState) -> UISandbox | None:
+    """Return the active offline sandbox, or None outside ui_debug mode."""
+    sandbox = getattr(runtime_state, "ui_sandbox", None)
+    if getattr(runtime_state, "ui_debug", False) and isinstance(sandbox, UISandbox):
+        return sandbox
+    return None
+
+
+def _account_status(
+    runtime_state: RuntimeState, account_id: str
+) -> dict[str, object] | None:
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        flags = sandbox.flags(account_id)
+        return {
+            "session_expired": bool(flags["session_expired"]),
+            "auth_cooldown": int(flags["auth_cooldown"]),
+            "is_available": sandbox.is_available(account_id),
+            "quota_exhausted": sandbox.quota_exhausted(account_id),
+        }
+    rotator = getattr(runtime_state, "rotator", None)
+    service = getattr(runtime_state, "account_service", None)
+    if rotator is None or service is None:
+        return None
+    account = service.get_account(account_id)
+    stats = rotator.get_account_stats(account_id)
+    if account is None or stats is None:
+        return None
+    now = datetime.now(UTC).timestamp()
+    cooldown = (
+        max(0, int(stats.auth_cooldown - now)) if stats.auth_cooldown > now else 0
+    )
+    session_expired = bool(stats.session_expired)
+    is_available = bool(
+        account.enabled and not account.expired and not session_expired and cooldown == 0
+    )
+    return {
+        "session_expired": session_expired,
+        "auth_cooldown": cooldown,
+        "is_available": is_available,
+        # Real quota is a soft limit; only sandbox models an exhausted quota state.
+        "quota_exhausted": False,
+    }
 
 
 class AccountResponse(BaseModel):
@@ -76,6 +123,10 @@ class AccountResponse(BaseModel):
     previous_active_account_id: str | None = None
     active_account_id: str | None = None
     target_account: AccountResponse | None = None
+    session_expired: bool = False
+    auth_cooldown: int = 0
+    is_available: bool = True
+    quota_exhausted: bool = False
 
 
 async def _run_control_rebind(
@@ -120,12 +171,42 @@ async def _run_control_rebind(
     return False, "applied"
 
 
-def to_account_response(account: AccountMeta) -> AccountResponse:
+def _clear_account_failure_state(
+    runtime_state: RuntimeState, account_id: str
+) -> None:
+    """Clear persisted expiry and rotator session/cooldown locks after success."""
+    service = runtime_state.account_service
+    store = getattr(service, "store", None)
+    if store is not None:
+        store.update_account_refresh(account_id, expired=False)
+    rotator = runtime_state.rotator
+    clear = getattr(rotator, "clear_cooldown", None)
+    if callable(clear):
+        clear(account_id)
+
+
+def to_account_response(
+    account: AccountMeta,
+    *,
+    status: dict[str, object] | None = None,
+) -> AccountResponse:
     cid = getattr(account, "cookie_id", None) or (
         f"cookie_{account.created_at[:16]}"
         if getattr(account, "created_at", None)
         else f"cookie_{account.id}"
     )
+    expired = bool(getattr(account, "expired", False))
+    enabled = getattr(account, "enabled", True)
+    if status is None:
+        is_available = bool(enabled and not expired)
+        session_expired = False
+        auth_cooldown = 0
+        quota_exhausted = False
+    else:
+        is_available = bool(status.get("is_available", True))
+        session_expired = bool(status.get("session_expired", False))
+        auth_cooldown = int(str(status.get("auth_cooldown") or 0))
+        quota_exhausted = bool(status.get("quota_exhausted", False))
     return AccountResponse(
         id=account.id,
         name=account.name,
@@ -136,10 +217,14 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         cookie_id=cid,
         tier=getattr(account, "tier", "Free") or "Free",
         tier_checked_at=getattr(account, "tier_checked_at", None),
-        expired=bool(getattr(account, "expired", False)),
+        expired=expired,
         duplicate_of=getattr(account, "duplicate_of", None),
-        enabled=getattr(account, "enabled", True),
+        enabled=enabled,
         group=getattr(account, "group", "default") or "default",
+        session_expired=session_expired,
+        auth_cooldown=auth_cooldown,
+        is_available=is_available,
+        quota_exhausted=quota_exhausted,
     )
 
 
@@ -161,6 +246,23 @@ class BatchDeleteRequest(BaseModel):
 
 class BatchDeleteResponse(BaseModel):
     deleted: int
+
+
+class BatchToggleRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    enabled: bool
+
+
+class BatchToggleResult(BaseModel):
+    id: str
+    ok: bool
+    error: str | None = None
+
+
+class BatchToggleResponse(BaseModel):
+    results: list[BatchToggleResult]
+    toggled_count: int
+    error_count: int
 
 
 class RefreshAccountsRequest(BaseModel):
@@ -227,7 +329,6 @@ class ApplyPresetResponse(BaseModel):
     target_account: AccountResponse | None = None
 
 
-
 class ImportCookiesRequest(BaseModel):
     cookies: str
     name: str | None = None
@@ -280,21 +381,28 @@ class ImportBundleResponse(BaseModel):
 @router.get("/", response_model=list[AccountResponse])
 async def list_accounts(
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> list[AccountResponse]:
     """列出所有账号。"""
     accounts = account_service.list_accounts()
-    return [to_account_response(a) for a in accounts]
+    return [
+        to_account_response(a, status=_account_status(runtime_state, a.id))
+        for a in accounts
+    ]
 
 
 @router.get("/active", response_model=AccountResponse)
 async def get_active_account(
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
     """获取当前活跃账号。"""
     account = account_service.get_active_account()
     if account is None:
         raise HTTPException(status_code=404, detail="没有活跃账号")
-    return to_account_response(account)
+    return to_account_response(
+        account, status=_account_status(runtime_state, account.id)
+    )
 
 
 @router.post("/refresh", response_model=RefreshAccountsResponse)
@@ -369,6 +477,16 @@ async def activate_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> AccountResponse:
     """切换到指定账号。"""
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        account = sandbox.activate_account(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在或切换失败")
+        log.info("UI 调试沙箱激活账号: id=%s, name=%s", account.id, account.name)
+        return to_account_response(
+            account, status=_account_status(runtime_state, account.id)
+        )
+
     manager = runtime_state.instance_manager
     ready_slot = None
     ready_lookup = getattr(manager, "ready_slot_for_account", None)
@@ -413,6 +531,15 @@ async def detect_account_email(
 ) -> AccountResponse:
     """自动获取并更新指定账号的真实邮箱与订阅等级。"""
     import json
+
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        account = sandbox.detect_email(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        return to_account_response(
+            account, status=_account_status(runtime_state, account.id)
+        )
 
     acc = account_service.get_account(account_id)
     if not acc:
@@ -491,6 +618,9 @@ async def detect_account_email(
         )
         log.info("已更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
 
+    if email or detected_tier:
+        _clear_account_failure_state(runtime_state, account_id)
+
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -511,6 +641,15 @@ async def detect_account_tier(
     """
     import inspect
     import json
+
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        account = sandbox.detect_tier(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        return to_account_response(
+            account, status=_account_status(runtime_state, account.id)
+        )
 
     acc = account_service.get_account(account_id)
     if not acc:
@@ -605,6 +744,7 @@ async def detect_account_tier(
         checked_at=datetime.now(UTC).isoformat(),
     )
     log.info("已更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
+    _clear_account_failure_state(runtime_state, account_id)
 
     # 3. 同步已存在实例/池记录中的 tier，避免视图继续展示旧等级。
     sync_tier = getattr(instance_manager, "sync_account_tier", None)
@@ -643,6 +783,9 @@ async def delete_account(
 
     if runtime_state.rotator:
         runtime_state.rotator.remove_account(account_id)
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        sandbox.on_account_deleted(account_id)
     if is_active:
         new_active = account_service.select_active_candidate()
         browser_session = (
@@ -678,6 +821,9 @@ async def batch_delete_accounts(
             deleted_ids.append(account_id)
             if runtime_state.rotator:
                 runtime_state.rotator.remove_account(account_id)
+            sandbox = get_ui_sandbox(runtime_state)
+            if sandbox is not None:
+                sandbox.on_account_deleted(account_id)
     if active_id in deleted_ids:
         new_active = account_service.select_active_candidate()
         browser_session = (
@@ -719,6 +865,9 @@ async def delete_cookie_group(
                 deleted_count += 1
                 if rotator:
                     rotator.remove_account(a.id)
+                sandbox = get_ui_sandbox(runtime_state)
+                if sandbox is not None:
+                    sandbox.on_account_deleted(a.id)
                 log.info("已删除子账号: cookie_id=%s, id=%s", cookie_id, a.id)
 
     if active_deleted:
@@ -773,7 +922,9 @@ async def toggle_account(
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    response = to_account_response(account)
+    response = to_account_response(
+        account, status=_account_status(runtime_state, account.id)
+    )
     if (
         previous_active is not None
         and previous_active.id == account.id
@@ -807,6 +958,69 @@ async def toggle_account(
 
     log.info("账号状态已切换: id=%s, enabled=%s", account.id, account.enabled)
     return response
+
+
+@router.post("/batch-toggle", response_model=BatchToggleResponse)
+async def batch_toggle_accounts(
+    req: BatchToggleRequest,
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> BatchToggleResponse:
+    """批量切换账号使能状态；禁用 active/running 实例时走 D-05 有界 rebind。"""
+    manager = runtime_state.instance_manager
+    running_ids: set[str] = set()
+    account_ids_getter = getattr(manager, "instance_account_ids", None)
+    if callable(account_ids_getter):
+        with contextlib.suppress(Exception):
+            raw_ids = account_ids_getter()
+            if isinstance(raw_ids, (set, frozenset, list, tuple)):
+                running_ids = {str(item) for item in raw_ids}
+
+    results: list[BatchToggleResult] = []
+    for account_id in dict.fromkeys(str(i) for i in req.ids if str(i).strip()):
+        account = account_service.get_account(account_id)
+        if account is None:
+            results.append(
+                BatchToggleResult(id=account_id, ok=False, error="账号不存在")
+            )
+            continue
+        previous_enabled = bool(account.enabled)
+        previous_active = account_service.get_active_account()
+        toggled = account_service.toggle_account_enabled(account_id, req.enabled)
+        if toggled is None:
+            results.append(
+                BatchToggleResult(id=account_id, ok=False, error="账号不存在")
+            )
+            continue
+        needs_rebind = (not req.enabled) and (
+            (previous_active is not None and previous_active.id == account_id)
+            or account_id in running_ids
+        )
+        if not needs_rebind:
+            results.append(BatchToggleResult(id=account_id, ok=True))
+            continue
+        target = account_service.select_active_candidate(exclude={account_id})
+        try:
+            await _run_control_rebind(
+                runtime_state,
+                previous_account_id=account_id,
+                target_account_id=target.id if target is not None else None,
+                reason="batch_toggle",
+            )
+        except InstanceError as exc:
+            account_service.toggle_account_enabled(account_id, previous_enabled)
+            results.append(BatchToggleResult(id=account_id, ok=False, error=str(exc)))
+        else:
+            results.append(BatchToggleResult(id=account_id, ok=True))
+
+    toggled_count = sum(1 for result in results if result.ok)
+    error_count = len(results) - toggled_count
+    log.info("批量账号状态切换完成: toggled=%d, errors=%d", toggled_count, error_count)
+    return BatchToggleResponse(
+        results=results,
+        toggled_count=toggled_count,
+        error_count=error_count,
+    )
 
 
 @router.put("/{account_id}/group", response_model=AccountResponse)
@@ -981,7 +1195,8 @@ async def import_cookies(
     cid = f"cookie_{secrets.token_hex(4)}"
     detected_email = req.email
     detected_tier = req.tier
-    if not detected_email or not detected_tier:
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is None and (not detected_email or not detected_tier):
         raw_cookies_list = storage_state.get("cookies")
         if isinstance(raw_cookies_list, list):
             cookie_dict = {
@@ -1049,6 +1264,32 @@ async def probe_and_import(
         parse_cookie_string,
         probe_google_accounts_infinite,
     )
+
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        storage_state = parse_cookie_string(req.cookies)
+        raw_cookies = storage_state.get("cookies")
+        if not isinstance(raw_cookies, list) or not raw_cookies:
+            raise HTTPException(status_code=400, detail="未解析到有效 cookie")
+        prefix = req.name_prefix.strip() if req.name_prefix else "Google Account"
+        account = account_service.save_account_from_cookies(
+            name=prefix,
+            email=None,
+            storage_state=storage_state,
+            auth_user="0",
+            cookie_id="cookie_ui_debug",
+            tier="Free",
+        )
+        if account_service.get_active_account() is None:
+            account_service.set_active_account(account.id)
+        return ProbeAndImportResponse(
+            imported_count=1,
+            accounts=[
+                to_account_response(
+                    account, status=_account_status(runtime_state, account.id)
+                )
+            ],
+        )
 
     had_active_account = account_service.get_active_account() is not None
     probed = await probe_google_accounts_infinite(req.cookies)
@@ -1160,6 +1401,7 @@ async def import_bundle(
         )
 
     imported_accounts: list[AccountResponse] = []
+    sandbox = get_ui_sandbox(runtime_state)
     for idx, item in enumerate(items_to_import):
         raw_cookie_str = str(item.get("cookies") or "")
         if not raw_cookie_str:
@@ -1172,7 +1414,7 @@ async def import_bundle(
         acc_email = str(item["email"]) if item.get("email") else None
         acc_auth_user = str(item.get("auth_user") or "0")
         acc_tier = str(item.get("tier") or "")
-        if not acc_email or not acc_tier:
+        if sandbox is None and (not acc_email or not acc_tier):
             raw_cookies_list = storage_state.get("cookies")
             if isinstance(raw_cookies_list, list):
                 cookie_dict = {
@@ -1208,7 +1450,11 @@ async def import_bundle(
         if rotator:
             rotator.add_account(account.id)
             rotator.clear_cooldown(account.id)
-        imported_accounts.append(to_account_response(account))
+        imported_accounts.append(
+            to_account_response(
+                account, status=_account_status(runtime_state, account.id)
+            )
+        )
     if not account_service.get_active_account() and imported_accounts:
         account_service.set_active_account(imported_accounts[0].id)
     log.info("批量导入完成: 导入账号数=%d", len(imported_accounts))

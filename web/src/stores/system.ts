@@ -9,7 +9,6 @@ export const useSystemStore = defineStore('system', () => {
   const rotation = ref<RotationStatusResponse | null>(null)
   const loading = ref(false)
   const resettingCooldown = ref(false)
-  const switchingNext = ref(false)
   const health = ref<'checking' | 'online' | 'offline'>('checking')
 
   const totalRequests = computed(() => stats.value?.totals?.requests ?? 0)
@@ -62,29 +61,11 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
-  async function forceNextAccount() {
-    const toast = useToastStore()
-    switchingNext.value = true
-    try {
-      const res = await systemApi.forceNextAccount()
-      toast.success(`已切换至账号: ${res.account.name || res.account.email || res.account.id}`)
-      await fetchRotation()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '切换失败'
-      toast.error(msg)
-      return false
-    } finally {
-      switchingNext.value = false
-    }
-  }
-
   return {
     stats,
     rotation,
     loading,
     resettingCooldown,
-    switchingNext,
     totalRequests,
     totalRateLimited,
     totalSuccess,
@@ -96,7 +77,6 @@ export const useSystemStore = defineStore('system', () => {
     fetchStats,
     fetchRotation,
     clearCooldown,
-    forceNextAccount,
     checkHealth,
   }
 })

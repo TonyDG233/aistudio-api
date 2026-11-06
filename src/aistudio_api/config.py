@@ -308,6 +308,32 @@ def resolve_hash_include_code() -> bool:
     return True
 
 
+def resolve_ui_debug() -> bool:
+    """C2a 纯离线 UI 调试沙箱开关（默认关闭）。
+
+    优先级：``AISTUDIO_UI_DEBUG`` 环境变量（1/true/yes/on）>
+    ``diagnostics.ui_debug`` 配置 > 默认 False。开启后服务端不得构造真实
+    AIStudioClient/BrowserEngine、组件启动预热或访问真实账号/网络。
+    """
+    env_value = _load_env("AISTUDIO_UI_DEBUG")
+    if env_value is not None:
+        return env_value.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8")) or {}
+        diagnostics = raw.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            value = diagnostics.get("ui_debug")
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return False
+
+
 def resolve_fingerprint_spoof_enabled() -> bool:
     """P3-F 浏览器指纹伪装开关（默认开启）。
 

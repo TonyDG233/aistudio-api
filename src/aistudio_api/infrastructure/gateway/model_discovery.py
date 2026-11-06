@@ -34,6 +34,16 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("model_discovery")
 
 
+def _ui_debug_active() -> bool:
+    """Defensive guard: never read accounts or hit the network in ui_debug."""
+    try:
+        from aistudio_api.api.state import runtime_state
+
+        return bool(getattr(runtime_state, "ui_debug", False))
+    except Exception:
+        return False
+
+
 # ListModels field 65 (index 64) 主能力码语义映射
 MODEL_CAPABILITY_NAMES: dict[int, str] = {
     1: "chat_model",
@@ -408,6 +418,10 @@ class ModelDiscoveryService:
         sessions: Any | None = None,
     ) -> list[dict[str, object]]:
         """获取可用模型列表。"""
+        if _ui_debug_active():
+            from aistudio_api.api.ui_sandbox import sandbox_model_catalog
+
+            return sandbox_model_catalog()
         now = time.time()
         if (
             not force_refresh
@@ -591,6 +605,10 @@ class ModelDiscoveryService:
         sessions: Any | None = None,
     ) -> Mapping[str, object] | None:
         """根据 model_id 或模型别名获取单个模型元数据（含保底匹配）。"""
+        if _ui_debug_active():
+            from aistudio_api.api.ui_sandbox import sandbox_model_by_id
+
+            return sandbox_model_by_id(model_id)
         discovered = await self.get_models(session=session, sessions=sessions)
         clean_target = model_id.removeprefix("models/")
         for model_info in discovered:

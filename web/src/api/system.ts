@@ -10,12 +10,17 @@ import type {
   UpdateLoggingConfigRequest,
   UpdateLoggingConfigResponse,
   HealthCheckResponse,
+  SystemStatusResponse,
 } from '@/types'
 
 
 export const systemApi = {
   health(): Promise<HealthCheckResponse> {
     return request<HealthCheckResponse>('/health')
+  },
+
+  getStatus(): Promise<SystemStatusResponse> {
+    return request<SystemStatusResponse>('/api/system/status')
   },
 
   getStats(): Promise<StatsResponse> {
@@ -38,12 +43,6 @@ export const systemApi = {
     })
   },
 
-
-  forceNextAccount(): Promise<{ ok: boolean; account: { id: string; name: string; email: string | null } }> {
-    return request('/rotation/next', {
-      method: 'POST',
-    })
-  },
 
   getConfig(): Promise<SystemConfig> {
     return request<SystemConfig>('/config')

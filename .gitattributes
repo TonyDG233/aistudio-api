@@ -1,2 +1,5 @@
 # 二进制 fixture 禁止行尾转换，保证字节级可复现。
+# 文本文件统一 LF，保证 Vite 构建产物字节可复现（bun run build 后 git diff --check 为 0）
+* text=auto eol=lf
+
 *.bin -text

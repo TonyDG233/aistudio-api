@@ -626,6 +626,9 @@ class InstancePool:
         timed_out = False
         async with slot.lifecycle_lock:
             if slot.context_id == "" and slot.session is None:
+                if slot.active_requests > 0:
+                    slot.active_requests = 0
+                    slot.active_zero.set()
                 slot.state = SlotState.UNSTARTED
                 return False
             slot.state = SlotState.RETIRING
@@ -644,6 +647,11 @@ class InstancePool:
                         slot.active_requests,
                     )
             await self._close_runtime(slot)
+            if timed_out:
+                # The old Page/Context is gone and the remaining handles are
+                # aborted; the slot must be reusable for the new binding.
+                slot.active_requests = 0
+                slot.active_zero.set()
             slot.state = SlotState.UNSTARTED
             slot.last_error = None
             return timed_out
