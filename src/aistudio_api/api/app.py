@@ -731,17 +731,18 @@ async def logging_and_dump_middleware(request, call_next):
             response_text=resp_text,
             is_stream=is_event_stream,
         )
-    elif not is_static:
+    elif not is_static and not (
+        path == "/health" and response.status_code == 200
+    ):
         # Health probes are polled continuously; successful probes emit no
         # access log record at all (no INFO, no DEBUG, no broadcast ring entry).
-        if not (path == "/health" and response.status_code == 200):
-            logger.info(
-                "HTTP %s %s -> %d (%.1fms)",
-                request.method,
-                path,
-                response.status_code,
-                elapsed_ms,
-            )
+        logger.info(
+            "HTTP %s %s -> %d (%.1fms)",
+            request.method,
+            path,
+            response.status_code,
+            elapsed_ms,
+        )
 
     return response
 
