@@ -1113,12 +1113,27 @@ class UISandbox:
         shutil.rmtree(self.root, ignore_errors=True)
 
     # -------------------------------------------------------------- scenario
-    def formats_payload(self) -> dict[str, bool]:
-        """Live format switches for the dashboard quick examples."""
+    def _configured_formats_payload(self) -> dict[str, bool]:
+        """Effective config switches (Gemini is always on)."""
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_formats,
         )
 
+        raw = get_configured_formats()
+        return {
+            "gemini": True,
+            "openai": _format_flag(raw.get("openai", True)),
+            "claude": _format_flag(raw.get("claude", True)),
+            "responses": _format_flag(raw.get("responses", True)),
+        }
+
+    def formats_payload(self) -> dict[str, bool]:
+        """Live format switches for the dashboard quick examples.
+
+        ``None`` means "follow config" (all four enabled by default), ``True``
+        forces every face on, and ``False`` is an explicit closed state so the
+        dashboard toggle never lands back on a fake default.
+        """
         if self._formats_all_on is True:
             return {
                 "gemini": True,
@@ -1126,13 +1141,14 @@ class UISandbox:
                 "claude": True,
                 "responses": True,
             }
-        raw = get_configured_formats()
-        return {
-            "gemini": True,
-            "openai": _format_flag(raw.get("openai", False)),
-            "claude": _format_flag(raw.get("claude", False)),
-            "responses": _format_flag(raw.get("responses", False)),
-        }
+        if self._formats_all_on is False:
+            return {
+                "gemini": True,
+                "openai": False,
+                "claude": False,
+                "responses": False,
+            }
+        return self._configured_formats_payload()
 
     def default_text_model(self) -> str:
         from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -1323,7 +1339,13 @@ class UISandbox:
                     record.state = InstanceState.COOLDOWN
 
     def _action_toggle_formats(self) -> None:
-        self._formats_all_on = not bool(self._formats_all_on)
+        if self._formats_all_on is None:
+            # Default is all-on; the first toggle must expose a real closed
+            # state instead of silently returning the same all-on payload.
+            current = self._configured_formats_payload()
+            self._formats_all_on = not all(current.values())
+            return
+        self._formats_all_on = not self._formats_all_on
 
     def apply(
         self,

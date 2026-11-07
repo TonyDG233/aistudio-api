@@ -162,12 +162,12 @@
       "properties": {
         "formats": {
           "type": "object",
-          "description": "协议开关。Gemini 核心协议面常驻开启，不提供开关；其余协议按需开启。",
+          "description": "协议开关。Gemini 核心协议面常驻开启，不提供开关；OpenAI/Claude/Responses 默认全部开启，显式设为 false 可关闭对应协议面。",
           "properties": {
             "openai": { "type": "boolean", "default": true },
             "gemini": { "type": "boolean", "default": true },
-            "claude": { "type": "boolean", "default": false },
-            "responses": { "type": "boolean", "default": false },
+            "claude": { "type": "boolean", "default": true },
+            "responses": { "type": "boolean", "default": true },
             "media": {
               "type": "object",
               "properties": {

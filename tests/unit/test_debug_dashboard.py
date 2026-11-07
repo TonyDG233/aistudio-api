@@ -126,7 +126,23 @@ async def test_dashboard_toggle_formats_and_status(ui_debug):
         assert status["formats"]["gemini"] is True
         assert status["default_text_model"]
         assert status["formats"]["openai"] is True
-        assert status["formats"]["claude"] is False
+        assert status["formats"]["claude"] is True
+        assert status["formats"]["responses"] is True
+
+        closed = (
+            await client.post(
+                "/api/debug/dashboard/apply", json={"action": "toggle_formats"}
+            )
+        ).json()
+        assert closed["formats"] == {
+            "gemini": True,
+            "openai": False,
+            "claude": False,
+            "responses": False,
+        }
+        live_status = (await client.get("/api/system/status")).json()
+        assert live_status["formats"]["claude"] is False
+        assert live_status["formats"]["responses"] is False
 
         all_on = (
             await client.post(
@@ -139,16 +155,3 @@ async def test_dashboard_toggle_formats_and_status(ui_debug):
             "claude": True,
             "responses": True,
         }
-        live_status = (await client.get("/api/system/status")).json()
-        assert live_status["formats"]["claude"] is True
-        assert live_status["formats"]["responses"] is True
-
-        defaults = (
-            await client.post(
-                "/api/debug/dashboard/apply", json={"action": "toggle_formats"}
-            )
-        ).json()
-        assert defaults["formats"]["gemini"] is True
-        assert defaults["formats"]["openai"] is True
-        assert defaults["formats"]["claude"] is False
-        assert defaults["formats"]["responses"] is False

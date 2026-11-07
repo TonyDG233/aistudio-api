@@ -106,14 +106,13 @@ features:
     fallback_refresh_interval_sec: 600
 
   # 协议开关（协议面）。Gemini 核心协议面常驻开启，无独立开关。
-  # openai：/v1/chat/completions 与 /v1/models，P5 起默认开启。
-  # claude / responses：分别在 C3 适配后开启，默认关闭。
+  # openai / claude / responses：默认启用，可显式设为 false 关闭对应协议面。
   # media.allow_private_urls：是否允许抓取私网/回环 URL 作为多模态输入；
   #   默认 false（防 SSRF），确需内网资源时才可开启。
   formats:
     openai: true
-    claude: false
-    responses: false
+    claude: true
+    responses: true
     media:
       allow_private_urls: false
 

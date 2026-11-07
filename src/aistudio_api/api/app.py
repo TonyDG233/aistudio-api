@@ -16,9 +16,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from aistudio_api.api.error_mapping import error_payload
-from aistudio_api.api.format_errors import format_for_path
+from aistudio_api.api.format_errors import ApiFormat, format_for_path
 from aistudio_api.application.instance_manager import InstanceError
 from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.config import resolve_data_dir, resolve_ui_debug
@@ -37,6 +38,7 @@ from aistudio_api.infrastructure.utils.logger import (
 
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
+from .routes_claude import router as claude_router
 from .routes_debug import router as debug_router
 from .routes_debug_dashboard import router as debug_dashboard_router
 from .routes_gemini import router as gemini_router
@@ -45,6 +47,7 @@ from .routes_keepalive import router as keepalive_router
 from .routes_logs import protected_router as logs_protected_router
 from .routes_models import router as models_router
 from .routes_openai import router as openai_router
+from .routes_responses import router as responses_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -569,6 +572,8 @@ app.include_router(
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router)
 app.include_router(openai_router)
+app.include_router(claude_router)
+app.include_router(responses_router)
 app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
@@ -579,20 +584,58 @@ def _is_openai_path(request: Request) -> bool:
     return format_for_path(request.url.path) == "openai"
 
 
+def _protocol_for_request(request: Request) -> ApiFormat:
+    """Resolve the wire protocol face for one request path."""
+    return format_for_path(request.url.path)
+
+
 @app.exception_handler(TierRequiredError)
 @app.exception_handler(RoutingError)
 async def routing_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """D-04/D-06: tier 403 and routing 503 are rendered by the protocol adapter."""
-    protocol = "openai" if _is_openai_path(request) else "gemini"
-    status, body = error_payload(exc, protocol)
+    status, body = error_payload(exc, _protocol_for_request(request))
     return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(AistudioError)
 async def aistudio_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    protocol = "openai" if _is_openai_path(request) else "gemini"
-    status, body = error_payload(exc, protocol)
+    status, body = error_payload(exc, _protocol_for_request(request))
     return JSONResponse(status_code=status, content=body)
+
+
+def _attach_exception_headers(
+    response: JSONResponse, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Carry official HTTP headers (405 ``Allow``, 401 ``WWW-Authenticate``)."""
+    headers = getattr(exc, "headers", None)
+    if headers:
+        for key, value in headers.items():
+            response.headers[key] = value
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Render router-level 404/405 for Claude/Responses; keep FastAPI defaults."""
+    protocol = _protocol_for_request(request)
+    if protocol in ("claude", "responses"):
+        from aistudio_api.api.format_errors import format_error_response
+
+        wrapped = HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=getattr(exc, "headers", None),
+        )
+        return _attach_exception_headers(
+            format_error_response(wrapped, protocol), exc
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -624,10 +667,11 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
             msg,
             request.url.path,
         )
-    if _is_openai_path(request):
+    protocol = _protocol_for_request(request)
+    if protocol != "gemini":
         from aistudio_api.api.format_errors import format_error_response
 
-        return format_error_response(exc, "openai")
+        return _attach_exception_headers(format_error_response(exc, protocol), exc)
     status_map = {
         400: "INVALID_ARGUMENT",
         401: "UNAUTHENTICATED",
@@ -668,10 +712,11 @@ async def instance_exception_handler(
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    if _is_openai_path(request):
+    protocol = _protocol_for_request(request)
+    if protocol != "gemini":
         from aistudio_api.api.format_errors import format_error_response
 
-        return format_error_response(exc, "openai")
+        return format_error_response(exc, protocol)
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
     # RequestValidationError.errors() does not support include_input here, so
     # project only non-input fields to keep prompts/body fragments out of logs.

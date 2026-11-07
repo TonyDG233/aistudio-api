@@ -81,9 +81,9 @@ def formats_status(runtime_state: RuntimeState) -> dict[str, bool]:
     raw = get_configured_formats()
     return {
         "gemini": True,
-        "openai": _format_flag(raw.get("openai", False)),
-        "claude": _format_flag(raw.get("claude", False)),
-        "responses": _format_flag(raw.get("responses", False)),
+        "openai": _format_flag(raw.get("openai", True)),
+        "claude": _format_flag(raw.get("claude", True)),
+        "responses": _format_flag(raw.get("responses", True)),
     }
 
 
