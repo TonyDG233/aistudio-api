@@ -17,6 +17,10 @@ const selectedCategory = ref<string>('all')
 
 const allFields = computed<FieldDefinition[]>(() => Object.values(CONFIG_SCHEMA))
 
+function categoryLabel(key: string): string {
+  return SCHEMA_CATEGORIES.find((category) => category.key === key)?.label || '其他'
+}
+
 const filteredFields = computed(() => {
   const query = searchQuery.value.trim().toLowerCase()
   return allFields.value.filter((f) => {
@@ -85,15 +89,18 @@ const filteredFields = computed(() => {
           class="p-4 bg-white border border-gray-200/90 rounded-2xl shadow-2xs space-y-2 hover:border-gray-300 transition-colors"
         >
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 border-b border-gray-100 pb-2">
-            <div class="flex items-center gap-2">
-              <BookOpen class="w-4 h-4 text-brand-600" />
+            <div class="flex flex-wrap items-center gap-2 min-w-0">
+              <BookOpen class="w-4 h-4 text-brand-600 shrink-0" />
               <span class="font-bold text-gray-900 text-xs">{{ field.title }}</span>
-              <span class="font-mono text-[10px] text-gray-400 bg-gray-50 px-2 py-0.5 rounded border border-gray-200/60">
+              <span class="font-mono text-[10px] text-gray-400 bg-gray-50 px-2 py-0.5 rounded border border-gray-200/60 break-all">
                 {{ field.key }}
               </span>
             </div>
 
-            <div class="flex items-center gap-1.5">
+            <div class="flex items-center gap-1.5 flex-wrap">
+              <span class="inline-flex items-center text-[10px] px-2 py-0.5 rounded-full bg-brand-50 text-brand-700 border border-brand-200 font-semibold">
+                {{ categoryLabel(field.category) }}
+              </span>
               <span
                 v-for="t in field.tags || []"
                 :key="t"
@@ -109,8 +116,29 @@ const filteredFields = computed(() => {
             {{ field.description }}
           </div>
 
+          <div
+            v-if="field.options?.length"
+            class="p-2.5 bg-brand-50/50 border border-brand-100 rounded-xl space-y-1.5"
+          >
+            <div class="text-[11px] font-semibold text-brand-800">
+              可选值
+            </div>
+            <div
+              v-for="option in field.options"
+              :key="String(option.value)"
+              class="flex flex-col sm:flex-row sm:items-baseline gap-1 sm:gap-2 text-[11px] text-gray-600"
+            >
+              <span class="font-semibold text-gray-800">{{ option.label }}</span>
+              <span class="font-mono text-[10px] text-gray-400 break-all">{{ option.value }}</span>
+              <span
+                v-if="option.description"
+                class="text-gray-500"
+              >— {{ option.description }}</span>
+            </div>
+          </div>
+
           <div class="p-2.5 bg-gray-50 rounded-xl text-[11px] text-gray-500 leading-relaxed">
-            <strong class="text-gray-700">设计背景与原理:</strong> {{ field.explanation }}
+            <strong class="text-gray-700">设计背景与原理：</strong> {{ field.explanation }}
           </div>
 
           <div
@@ -118,7 +146,7 @@ const filteredFields = computed(() => {
             class="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200/60"
           >
             <CheckCircle2 class="w-3.5 h-3.5 text-emerald-600" />
-            <span>推荐值: {{ JSON.stringify(field.recommendedValue) }}</span>
+            <span>推荐值：{{ JSON.stringify(field.recommendedValue) }}</span>
           </div>
         </div>
 

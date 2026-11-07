@@ -55,6 +55,19 @@ export const systemApi = {
     })
   },
 
+  patchConfig(updates: Record<string, unknown>): Promise<SystemConfig> {
+    return request<SystemConfig>('/config', {
+      method: 'PATCH',
+      body: JSON.stringify({ updates }),
+    })
+  },
+
+  resetConfig(): Promise<SystemConfig> {
+    return request<SystemConfig>('/config/reset', {
+      method: 'POST',
+    })
+  },
+
   updateLoggingConfig(req: UpdateLoggingConfigRequest): Promise<UpdateLoggingConfigResponse> {
     return request<UpdateLoggingConfigResponse>('/config/logging', {
       method: 'PUT',

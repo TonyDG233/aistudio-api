@@ -1,11 +1,30 @@
-# API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 接口鉴权)
+# ============================================================================
+# aistudio-api 分发默认配置（唯一 tracked 基准）
+# 运行时通过 AISTUDIO_CONFIG_PATH 指向本地 config.yaml；缺失时从本模板复制。
+# 本文件同时是配置默认值的唯一来源，修改后会被启动校验按默认模板深合并。
+# ============================================================================
+
+# API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 与 /v1/... 接口鉴权)。
+# 元素可为字符串，或 {name, key, created_at} 结构；[] 或缺失表示请求必须携带 Key。
 api_keys: []
 
-# 对外 API 鉴权：默认关闭免密；空 api_keys 绝不开放
+# 对外 API 鉴权（D-14）：默认关闭免密。
+# false：必须携带有效 API Key；true：允许无 Key 匿名请求（高风险，需显式确认）。
+# 管理页密码只由环境变量 AISTUDIO_WEB_PASSWORD 控制，与本开关和 API Key 完全独立。
 security:
   api_allow_anonymous: false
 
-# 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface
+# 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface。
+# - count：该槽位的实例数量（正整数）；相同 tier 区间会合并计数。
+# - surface：chat 或 build；同一账号的 chat/build 不会同时存活。
+# tier 选择器（only_tier / min_tier / max_tier 至少一个非空，闭区间语义）：
+# - only_tier：精确钉住。Free 归一 Free..Free；Ultra 展开 Ultra..Ultra_20X；
+#   Plus/Pro 保持精确；不得与不同的 min_tier/max_tier 同时配置。
+# - min_tier 单独：Free -> Free..Free；付费 -> min..Ultra_20X。
+# - max_tier 单独：Free -> Free..Free；付费下界默认 Pro，且上界不得低于 Pro；
+#   确需 Plus 槽位请显式 only_tier: Plus。
+# - min_tier + max_tier：形成闭区间，要求 min <= max。
+# - Free 与付费 lane 不得混合；未知/非字符串 tier 会 fail-fast。
 instances:
   - count: 1
     surface: chat
@@ -14,7 +33,7 @@ instances:
     surface: chat
     min_tier: Pro
 
-# 全局实例/Context 上限（1-16）；缺省等于 instances count 之和。
+# 全局实例/Context 上限（1-16）；缺省等于 instances count 之和，超出按 16 截断。
 max_contexts: 2
 
 # 诊断开关（D-09）：snapshot hash 是否包含 executable_code / code_execution_result。
@@ -22,8 +41,9 @@ max_contexts: 2
 # 仅诊断用，不进入普通用户 UI；也可用 AISTUDIO_HASH_INCLUDE_CODE 环境变量覆盖。
 diagnostics:
   hash_include_code: true
-  # C2a 纯离线 UI 调试沙箱：true 时不启动真实浏览器/账号/网络，使用内存沙箱。
-  # 也可用 AISTUDIO_UI_DEBUG=1/true 环境变量临时覆盖。
+  # C2a 纯离线 UI 调试沙箱：true 时不启动真实浏览器/账号/网络，使用内存沙箱与
+  # 临时目录配置，保存操作不会触碰真实 config.yaml。
+  # 也可用 AISTUDIO_UI_DEBUG=1/true 环境变量临时覆盖；交互式改动下次启动生效。
   ui_debug: false
 
 # 浏览器指纹伪装（P3-F）：按账号确定性生成 Windows 桌面指纹，并在页面导航前
@@ -31,16 +51,27 @@ diagnostics:
 browser:
   fingerprint_spoof_enabled: true
 
-# 服务端日志与请求转储调试配置
+# 服务端日志与请求转储调试配置。
+# level：DEBUG（详细底层跟踪）/ INFO（标准运行信息）/ WARNING（仅警告与错误）/
+#        ERROR（仅严重错误）；非法值启动时回退 INFO 并记录 warning。
+# dump_requests：在标准输出打印请求/响应详情（仅 safe_*，禁止明文敏感字段）。
+# dump_to_file：把报文写入 dump_dir 下的独立文件；默认关闭。
+# dump_dir：转储目录；相对路径按进程工作目录解析。
 logging:
   level: INFO
   dump_requests: false
   dump_to_file: false
   dump_dir: dumps
 
+# 账号调度、重试与 429 冷却。
+# max_retries：单次请求的调度重试上限（非负整数）。
+# quota_scope（D-01）：account（默认，chat/build 共用额度）或 account_surface（分开）。
+#   只影响 AccountStats 记账键与 /stats、配额展示、429 冷却口径；不新增实例。
+# cooldowns（单位：秒）：rate_limited_short 短时限流冷却；
+#   rate_limited_drip 持续滴流冷却；rate_limited_drip_extended 延长冷却；
+#   auth_error 为历史死开关，403 不做硬冷却，保持 0。
 rotator:
   max_retries: 5
-  # D-01 配额记账口径：account（默认，chat/build 共用额度）或 account_surface（分开）
   quota_scope: account
   cooldowns:
     rate_limited_short: 60
@@ -48,14 +79,17 @@ rotator:
     rate_limited_drip_extended: 600
     auth_error: 0
 
-# P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）
 features:
+  # P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）。
+  # max_switches：连续切号上限（0 表示不切号）。
+  # retry_same_delay_sec：429 同账号首次重试前的退避秒数，范围 0..30，默认 2.0；
+  #   可用 AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
   routing:
     max_switches: 2
-    # 429 同账号首次重试前的退避秒数（0..30，默认 2.0），可用
-    # AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
     retry_same_delay_sec: 2.0
-  # P6 保活：auth/metadata 默认 24h；active_activity 默认关闭（不启用 idle 回收）。
+
+  # P6 保活节奏：auth/metadata 默认 24h 刷新一次。
+  # active_activity 默认关闭（不启用 idle 回收）；active_activity_seconds 为判定窗口。
   keepalive:
     auth_update: true
     auth_update_hours: 24
@@ -71,8 +105,11 @@ features:
     live_refresh_interval_sec: 86400
     fallback_refresh_interval_sec: 600
 
-  # Protocol faces. OpenAI Chat Completions is part of P5; Claude/Responses
-  # stay disabled until C3.
+  # 协议开关（协议面）。Gemini 核心协议面常驻开启，无独立开关。
+  # openai：/v1/chat/completions 与 /v1/models，P5 起默认开启。
+  # claude / responses：分别在 C3 适配后开启，默认关闭。
+  # media.allow_private_urls：是否允许抓取私网/回环 URL 作为多模态输入；
+  #   默认 false（防 SSRF），确需内网资源时才可开启。
   formats:
     openai: true
     claude: false
@@ -80,9 +117,21 @@ features:
     media:
       allow_private_urls: false
 
-  # Anti-Truncation Gateway (synthetic tool transport). Default off; prefer
-  # falls back to plain text, required fails explicitly when the synthetic call
-  # is absent. mode_by_format overrides one protocol face.
+  # Anti-Truncation Gateway（防截断合成工具网关）。默认关闭。
+  # mode：off（关闭）/ prefer（合成调用缺失时回退纯文本）/ required（缺失则明确失败）。
+  #   YAML 1.1 会把未加引号的 off 解析为布尔 false，运行期等价于 off，建议加引号。
+  # mode_by_format：按协议面覆盖 mode；inherit 表示沿用全局 mode；
+  #   四个键 gemini/openai/claude/responses 固定存在，取值 inherit/off/prefer/required。
+  # tool_prefix：合成工具名前缀，默认 atg_emit_。
+  # control_position：合成控制块插入位置，head（首部）或 tail（尾部，默认）。
+  # strict：严格模式；为 true 时对不完整的合成协议更早报错。
+  # empty_retries：空响应重试次数，范围 0..5，默认 2。
+  # recovery：恢复策略，repair（尝试修复，默认）或 fail（直接失败）。
+  # side_buffer_bytes：侧缓冲字节数，范围 >=0，默认 0（不额外缓存）。
+  # client_synthetic_guard：客户端合成工具调用保护，默认开启。
+  # max_response_bytes：响应体上限，范围 1024..104857600，默认 16777216（16 MiB）。
+  # text_model_pattern：文本模型匹配正则；空串表示不额外限制。
+  # non_text_model_pattern：非文本模型匹配正则；空串表示不额外限制。
   atg:
     mode: "off"
     mode_by_format:
@@ -101,6 +150,9 @@ features:
     text_model_pattern: ""
     non_text_model_pattern: ""
 
+# 付费模型准入规则（Paid 模型 tier 不足时返回 403，不切号、不降级）。
+# 每个条目：contains/prefixes/exact 匹配模型名，required_tiers 列出允许的 tier。
+# 未命中任何条目的模型按 Free 模型处理。
 paid_model_rules:
   ultra_required:
     contains: ["veo", "ultra"]
@@ -109,6 +161,11 @@ paid_model_rules:
     contains: ["argon", "gemini-4", "imagen"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
+# 模型原生默认规则：
+# - drop_unsupported_params：全局过滤下游传来的未知/不兼容参数（默认 false）。
+# - profiles：按 model 名称匹配（contains/prefixes/exact）套用生成默认值、工具与安全策略；
+#   is_image_model 启用生图管线；disable_safety_settings 完全不下发安全配置。
+# - models：按具体模型名精确覆盖 profiles 的默认值。
 model_defaults:
   drop_unsupported_params: false
   profiles:
@@ -163,6 +220,14 @@ model_defaults:
       drop_unsupported_params: true
   models: {}
 
+# 按 tier 的每日软额度（只用于仪表盘百分比与调度权重，超额绝不禁用账号）。
+# 每个 tier 下可配置任意规则桶：
+#   <bucket>:
+#     match: {contains/prefixes/exact: [...]}
+#     daily_limit: <int>
+#   default_limit: <int>   # 未命中任何桶时的回退额度
+# overrides：按精确模型名覆盖任意 tier 的额度（优先级最高）。
+# Free/Plus/Pro/Ultra/Ultra_20X 为系统识别的 canonical tier 名称。
 tier_quotas:
   Free:
     flash_models:
@@ -248,6 +313,10 @@ tier_quotas:
     default_limit: 1000
   overrides: {}
 
+# 账号预设方案：
+# - action：enable_all / filter_tier / filter_group。
+# - filter_tier 使用 target_tiers；filter_group 使用 target_groups。
+# - is_system: true 为内置方案，UI 不提供删除。
 account_presets:
   - id: preset_all
     name: 全部启用 (最大并发)

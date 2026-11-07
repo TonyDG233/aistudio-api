@@ -333,7 +333,7 @@ uv run python3 main.py server --port 8080
 
 ## 8. 配置口径
 
-- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`config/config.schema.json` 覆盖 `defaults/config.yaml` 与 Gate 0.5 示例的顶层键；跨字段语义仍由 `application/model_access` 与 `model_defaults` 在运行期校验。
+- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`defaults/config.schema.json` 覆盖 `defaults/config.yaml` 的顶层键；跨字段语义仍由 `application/model_access` 与 `model_defaults` 在运行期校验。
 - **D-07**：`_load_yaml_config` 不得浅替换 `rotator` 块；缺失键用默认值深合并；启动时校验类型/必填；请求路径不得抛 `KeyError`；非关键配置回退默认必须显式记录。
 - 删除 `channel_registry`，只保留 `surface=chat/build`；删除旧 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
 - 保留热更新与原子写回；legacy 配置键一次性迁移后删除；关键配置 fail-fast，非关键配置回退默认。

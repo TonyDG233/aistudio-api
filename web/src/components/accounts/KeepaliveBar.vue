@@ -179,7 +179,7 @@ async function refresh() {
           <span class="text-gray-700">{{ keepaliveStore.status.pool_slots ?? '-' }}</span>
         </div>
         <div class="flex items-center justify-between font-mono">
-          <span class="text-gray-500">in_flight</span>
+          <span class="text-gray-500">进行中请求</span>
           <span class="text-gray-700">{{ keepaliveStore.status.in_flight ?? '-' }}</span>
         </div>
       </div>

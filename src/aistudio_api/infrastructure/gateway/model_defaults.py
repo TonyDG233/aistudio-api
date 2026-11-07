@@ -109,6 +109,11 @@ def _deep_merge(base: object, override: object) -> object:
     return override
 
 
+def merge_config_documents(base: object, override: object) -> object:
+    """Public wrapper for partial config writes: dicts merge deeply, lists replace."""
+    return _deep_merge(base, override)
+
+
 def _describe_type(value: object) -> str:
     return type(value).__name__
 

@@ -36,6 +36,15 @@ const quickActionLabels: Record<string, string> = {
   keepalive_partial: '保活部分失败',
 }
 
+function scenarioLabel(value: string | null | undefined): string {
+  if (!value) return '实时'
+  return scenarioLabels[value] || '自定义场景'
+}
+
+function quickActionLabel(value: string): string {
+  return quickActionLabels[value] || '自定义操作'
+}
+
 async function refreshStores() {
   await Promise.all([
     accountsStore.fetchAll(),
@@ -72,9 +81,9 @@ async function applyAction(action: string) {
     >
       <span class="flex items-center gap-1.5">
         <Bug class="w-3.5 h-3.5 text-amber-600" />
-        <span>UI Debug</span>
+        <span>界面调试</span>
         <span class="text-[10px] font-mono font-normal px-1.5 py-0.5 rounded bg-amber-100 border border-amber-200 text-amber-800">
-          当前场景: {{ debugStore.activeScenario || 'live' }}
+          当前场景：{{ scenarioLabel(debugStore.activeScenario) }}
         </span>
       </span>
       <ChevronDown
@@ -101,8 +110,7 @@ async function applyAction(action: string) {
           :disabled="debugStore.running"
           @click="applyScenario(item)"
         >
-          <span>{{ scenarioLabels[item] || item }}</span>
-          <span class="ml-1 font-mono text-[10px] text-amber-500">{{ item }}</span>
+          <span>{{ scenarioLabel(item) }}</span>
         </button>
 
         <button
@@ -130,7 +138,7 @@ async function applyAction(action: string) {
           @click="applyAction(item)"
         >
           <Play class="w-3 h-3 text-gray-400" />
-          <span>{{ quickActionLabels[item] || item }}</span>
+          <span>{{ quickActionLabel(item) }}</span>
         </button>
       </div>
 
@@ -138,7 +146,7 @@ async function applyAction(action: string) {
         v-if="debugStore.running"
         class="text-[11px] font-mono text-amber-700"
       >
-        正在应用: {{ debugStore.runningScenario }}
+        正在应用：{{ scenarioLabel(debugStore.runningScenario) }}
       </div>
     </div>
   </div>
