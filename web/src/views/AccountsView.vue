@@ -41,6 +41,10 @@ const editingAccount = ref<AccountWithStats | null>(null)
 const snapshotModalOpen = ref(false)
 const snapshotName = ref('')
 const snapshotDesc = ref('')
+function groupLabel(group: string): string {
+  return group === 'default' ? '默认分组' : group
+}
+
 const selectedGroup = ref<string>('ALL')
 
 const createModalOpen = ref(false)
@@ -261,7 +265,7 @@ async function handleDeletePreset(presetId: string, name: string) {
           @click="selectedGroup = grp"
         >
           <Folder class="w-3 h-3 opacity-70" />
-          <span>{{ grp }}</span>
+          <span>{{ groupLabel(grp) }}</span>
         </button>
       </div>
     </div>

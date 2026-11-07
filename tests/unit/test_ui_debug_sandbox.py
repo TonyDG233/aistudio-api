@@ -69,7 +69,7 @@ def test_ui_debug_default_env_override_and_schema(monkeypatch, tmp_path):
     )
     assert defaults["diagnostics"]["ui_debug"] is False
     schema = json.loads(
-        (_REPO_ROOT / "config" / "config.schema.json").read_text(encoding="utf-8")
+        (_REPO_ROOT / "defaults" / "config.schema.json").read_text(encoding="utf-8")
     )
     assert schema["properties"]["diagnostics"]["properties"]["ui_debug"] == {
         "type": "boolean",

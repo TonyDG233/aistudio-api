@@ -5,7 +5,7 @@ import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
-import { SURFACE_OPTIONS, TIER_OPTIONS, isAccountEligible, isSlotOccupied } from '@/utils/instances.ts'
+import { SURFACE_OPTIONS, TIER_OPTIONS, isAccountEligible, isSlotOccupied, surfaceLabel, tierLabel } from '@/utils/instances.ts'
 
 const props = withDefaults(
   defineProps<{
@@ -113,7 +113,7 @@ function close() {
             :key="account.id"
             :value="account.id"
           >
-            {{ account.email || account.name || `ID: ${account.id}` }} · {{ account.tier || 'Free' }}
+            {{ account.email || account.name || `编号：${account.id}` }} · {{ tierLabel(account.tier) }}
           </option>
         </select>
         <p
@@ -126,7 +126,7 @@ function close() {
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <label class="block text-xs font-medium text-gray-700 mb-1">Surface</label>
+          <label class="block text-xs font-medium text-gray-700 mb-1">服务渠道</label>
           <select
             v-model="surface"
             class="w-full px-3 py-2 text-xs border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/20"
@@ -136,13 +136,13 @@ function close() {
               :key="item"
               :value="item"
             >
-              {{ item }}
+              {{ surfaceLabel(item) }}
             </option>
           </select>
         </div>
 
         <div>
-          <label class="block text-xs font-medium text-gray-700 mb-1">Tier 选择</label>
+          <label class="block text-xs font-medium text-gray-700 mb-1">账号等级</label>
           <select
             v-model="tier"
             class="w-full px-3 py-2 text-xs border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/20"
@@ -152,7 +152,7 @@ function close() {
               :key="item"
               :value="item"
             >
-              {{ item }}
+              {{ tierLabel(item) }}
             </option>
           </select>
         </div>

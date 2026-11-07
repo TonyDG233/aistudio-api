@@ -10,6 +10,10 @@ export interface SystemConfig {
   debug_env_active?: boolean
   dump_to_file?: boolean
   dump_dir?: string
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+  ok?: boolean
+  message?: string
 }
 export interface UpdateLoggingConfigRequest {
   level?: string

@@ -13,6 +13,8 @@ import {
   isSlotOccupied,
   isTierCompatible,
   slotSummary,
+  surfaceLabel,
+  tierLabel,
 } from '@/utils/instances.ts'
 
 interface SlotOption {
@@ -134,10 +136,10 @@ function close() {
     <div class="space-y-3 text-sm">
       <div class="p-2.5 rounded-xl bg-gray-50 border border-gray-200 text-[11px] flex items-center gap-2 flex-wrap">
         <span class="font-medium text-gray-800">
-          {{ account?.email || account?.name || account?.id }}
+          {{ account?.email || account?.name || (account ? `编号：${account.id}` : '') }}
         </span>
         <span class="px-1.5 py-0.5 rounded bg-white border border-gray-200 font-mono">
-          {{ account?.tier || 'Free' }}
+          {{ tierLabel(account?.tier) }}
         </span>
         <span class="text-gray-400">
           选择兼容槽位绑定/激活
@@ -185,7 +187,7 @@ function close() {
                 {{ instanceStateLabel(slot.instance.state) }}
               </span>
               <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-white text-gray-500 border border-gray-200">
-                {{ slot.instance.surface }}
+                {{ surfaceLabel(slot.instance.surface) }}
               </span>
               <span
                 v-if="slot.recommended"
@@ -203,14 +205,14 @@ function close() {
                 v-if="!slot.compatible"
                 class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-50 text-rose-700 border border-rose-200"
               >
-                Tier 不兼容
+                账号等级不兼容
               </span>
             </div>
             <div class="text-[11px] text-gray-500 font-mono truncate">
               槽位 {{ slotSummary(slot.instance) }} · 账号 {{ slot.instance.account_id || '未绑定' }}
             </div>
             <div class="text-[10px] text-gray-400 font-mono truncate">
-              指纹 {{ fingerprintSummary(slot.instance) }} · in_flight {{ slot.instance.in_flight }}
+              指纹 {{ fingerprintSummary(slot.instance) }} · 进行中 {{ slot.instance.in_flight }}
             </div>
           </div>
           <div class="shrink-0 text-[10px] text-gray-400">
@@ -223,7 +225,7 @@ function close() {
         v-if="!accountBoundInstance && !compatibleSlots.length && slots.length"
         class="text-[11px] text-amber-600"
       >
-        没有与该账号 Tier 兼容的空闲槽位，可新建实例。
+        没有与该账号等级兼容的空闲槽位，可新建实例。
       </div>
 
       <div

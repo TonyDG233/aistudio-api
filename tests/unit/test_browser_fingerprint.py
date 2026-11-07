@@ -272,7 +272,7 @@ def test_defaults_and_schema_declare_fingerprint_switch() -> None:
     assert defaults["browser"]["fingerprint_spoof_enabled"] is True
 
     schema = json.loads(
-        (PROJECT_ROOT / "config" / "config.schema.json").read_text(encoding="utf-8")
+        (PROJECT_ROOT / "defaults" / "config.schema.json").read_text(encoding="utf-8")
     )
     switch = schema["properties"]["browser"]["properties"][
         "fingerprint_spoof_enabled"

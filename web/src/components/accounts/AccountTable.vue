@@ -356,7 +356,7 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <button
             type="button"
             class="px-2.5 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
-            title="刷新所有账号的 Tier、登录态与邮箱"
+            title="刷新所有账号的等级、登录态与邮箱"
             :disabled="accountsStore.refreshingAll"
             @click="accountsStore.refreshAll()"
           >

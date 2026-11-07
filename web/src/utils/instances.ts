@@ -12,6 +12,32 @@ export const TIER_OPTIONS = ['Free', 'Plus', 'Pro', 'Ultra', 'Ultra_20X']
 
 export const SURFACE_OPTIONS = ['chat', 'build']
 
+export const TIER_LABELS: Record<string, string> = {
+  Free: '免费账号 (Free)',
+  Plus: 'Plus 会员',
+  Pro: 'Pro 会员',
+  Ultra: 'Ultra 会员',
+  Ultra_20X: 'Ultra 20X 会员',
+}
+
+export const SURFACE_LABELS: Record<string, string> = {
+  chat: '对话与工具 (Chat)',
+  build: '应用构建 (Build)',
+}
+
+export function surfaceLabel(value: string | null | undefined): string {
+  const key = String(value || 'chat')
+  return SURFACE_LABELS[key] || '未知渠道'
+}
+
+export function tierLabel(value: string | null | undefined): string {
+  const key = String(value || 'Free')
+  const canonical =
+    TIER_OPTIONS.find((item) => item.toLowerCase() === key.toLowerCase().replace(/[\s-]+/g, '_')) ||
+    key
+  return TIER_LABELS[canonical] || '其他等级'
+}
+
 export function tierRank(tier: string | null | undefined): number {
   const key = (tier || 'Free').toLowerCase().replace(/[\s-]+/g, '_')
   return TIER_RANK[key] ?? 0
@@ -40,11 +66,14 @@ export function isTierCompatible(
 
 export function slotSummary(instance: Instance): string {
   if (instance.only_tier) {
-    return `only ${instance.only_tier}`
+    return `仅限 ${tierLabel(instance.only_tier)}`
   }
   const min = instance.min_tier || 'Free'
   const max = instance.max_tier || min
-  return min === max ? `only ${min}` : `${min} ~ ${max}`
+  if (tierRank(min) === tierRank(max)) {
+    return `仅限 ${tierLabel(min)}`
+  }
+  return `${tierLabel(min)} 至 ${tierLabel(max)}`
 }
 
 export function fingerprintSummary(instance: Instance): string {

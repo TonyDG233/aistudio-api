@@ -21,7 +21,7 @@ import {
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
 import { accountStatus } from '@/utils/accountStatus.ts'
-import { instanceStateLabel, instanceStateTone } from '@/utils/instances.ts'
+import { instanceStateLabel, instanceStateTone, tierLabel } from '@/utils/instances.ts'
 
 const props = defineProps<{
   account: AccountWithStats
@@ -93,7 +93,7 @@ const isExpired = computed(() => {
 
 const primaryLabel = computed(() => {
   if (props.account.email) return props.account.email
-  return `ID: ${props.account.id}`
+  return `编号：${props.account.id}`
 })
 
 const secondaryLabel = computed(() => {
@@ -102,7 +102,7 @@ const secondaryLabel = computed(() => {
   if (props.account.name && props.account.name !== props.account.email) {
     parts.push(props.account.name)
   }
-  parts.push(`ID: ${props.account.id}`)
+  parts.push(`编号：${props.account.id}`)
   return parts.join(' · ')
 })
 
@@ -118,7 +118,7 @@ async function handleToggleEnabled() {
 }
 
 function startEditGroup() {
-  groupInput.value = props.account.group || 'default'
+  groupInput.value = props.account.group || ''
   editingGroup.value = true
 }
 
@@ -222,10 +222,10 @@ async function handleRefresh() {
             { 'opacity-50 cursor-wait': detectingTier },
           ]"
           :disabled="detectingTier"
-          title="点击重新探测此子账号的订阅类型 (Free / Plus / Pro / Ultra)"
+          title="点击重新探测此子账号的会员等级"
           @click="handleDetectTier"
         >
-          {{ detectingTier ? '...' : accountTier }}
+          {{ detectingTier ? '...' : tierLabel(accountTier) }}
         </button>
 
         <!-- Group Tag / Inline Editor -->
@@ -238,7 +238,7 @@ async function handleRefresh() {
               v-model="groupInput"
               type="text"
               class="px-1.5 py-0.5 text-[11px] font-mono border rounded focus:outline-none focus:ring-1 focus:ring-brand-500 w-20"
-              placeholder="group"
+              placeholder="默认分组"
               @keydown.enter="saveGroup"
               @blur="saveGroup"
             >
@@ -258,7 +258,7 @@ async function handleRefresh() {
             @click="startEditGroup"
           >
             <Tag class="w-2.5 h-2.5 text-gray-400 shrink-0" />
-            <span class="truncate">{{ account.group || 'default' }}</span>
+            <span class="truncate">{{ account.group && account.group !== 'default' ? account.group : '默认分组' }}</span>
           </button>
         </div>
 
@@ -400,7 +400,7 @@ async function handleRefresh() {
             type="button"
             class="p-1 text-gray-400 hover:text-brand-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
             :class="{ 'opacity-50 cursor-wait': refreshing }"
-            title="刷新此账号信息 (Tier/登录态/邮箱)"
+            title="刷新此账号信息（等级、登录态、邮箱）"
             :disabled="refreshing"
             @click="handleRefresh"
           >

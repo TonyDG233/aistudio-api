@@ -21,6 +21,10 @@ import {
 
 const toast = useToastStore()
 
+const emit = defineEmits<{
+  changed: []
+}>()
+
 const apiKeys = ref<ApiKeyItem[]>([])
 const loading = ref(false)
 const visibleKeys = ref<Set<string>>(new Set())
@@ -42,7 +46,7 @@ async function loadApiKeys() {
   try {
     apiKeys.value = await systemApi.listApiKeys()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '获取 API Key 列表失败'
+    const msg = err instanceof Error ? err.message : '获取 API 密钥列表失败'
     toast.error(msg)
   } finally {
     loading.value = false
@@ -67,7 +71,7 @@ function maskKey(key: string): string {
 }
 
 function handleCopy(key: string) {
-  void copy(key, key, '已复制 API Key 到剪贴板')
+  void copy(key, key, '已复制 API 密钥到剪贴板')
 }
 
 function openCreateModal() {
@@ -80,14 +84,15 @@ async function handleCreateKey() {
   creating.value = true
   try {
     const created = await systemApi.createApiKey({
-      name: newKeyName.value.trim() || 'API Key',
+      name: newKeyName.value.trim() || 'API 密钥',
       key: customKeyValue.value.trim() || undefined,
     })
-    toast.success(`成功创建 API Key: ${created.name}`)
+    toast.success(`成功创建 API 密钥：${created.name}`)
     createModalOpen.value = false
     await loadApiKeys()
+    emit('changed')
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '创建 API Key 失败'
+    const msg = err instanceof Error ? err.message : '创建 API 密钥失败'
     toast.error(msg)
   } finally {
     creating.value = false
@@ -107,9 +112,10 @@ async function handleSaveEditName() {
 
   try {
     await systemApi.updateApiKeyName(editingKey.value.key, { name })
-    toast.success('API Key 备注名已更新')
+    toast.success('API 密钥备注名已更新')
     editModalOpen.value = false
     await loadApiKeys()
+    emit('changed')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '更新备注失败'
     toast.error(msg)
@@ -117,11 +123,12 @@ async function handleSaveEditName() {
 }
 
 async function handleDeleteKey(item: ApiKeyItem) {
-  if (confirm(`确定要删除 API Key "${item.name}" 吗？删除后使用该 Key 的客户端将无法访问。`)) {
+  if (confirm(`确定要删除 API 密钥 "${item.name}" 吗？删除后使用该 Key 的客户端将无法访问。`)) {
     try {
       await systemApi.deleteApiKey(item.key)
-      toast.success('API Key 已删除')
+      toast.success('API 密钥已删除')
       await loadApiKeys()
+      emit('changed')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '删除失败'
       toast.error(msg)
@@ -138,7 +145,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
         <Key class="w-4 h-4 text-brand-600" />
         <div>
           <h3 class="font-semibold text-gray-900 text-sm">
-            客户端 API 密钥 (API Keys)
+            客户端 API 密钥
           </h3>
         </div>
       </div>
@@ -150,7 +157,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
           @click="openCreateModal"
         >
           <Plus class="w-3.5 h-3.5" />
-          <span>创建 API Key</span>
+          <span>创建 API 密钥</span>
         </Button>
       </div>
     </div>
@@ -162,7 +169,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
     >
       <AlertTriangle class="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
       <div>
-        未配置 API Key 时接口开放访问。添加密钥后将对入站请求进行校验。
+        当前未配置 API Key；是否允许无 Key 匿名请求由下方「安全与浏览器配置」控制
       </div>
     </div>
     <!-- Key List Table -->
@@ -177,7 +184,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
               备注名称
             </th>
             <th class="py-3 px-4">
-              API 密钥 (Token)
+              API 密钥
             </th>
             <th class="py-3 px-4">
               创建时间
@@ -259,7 +266,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
               <button
                 type="button"
                 class="text-gray-400 hover:text-rose-600 p-1.5 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer"
-                title="删除 API Key"
+                title="删除 API 密钥"
                 @click="handleDeleteKey(item)"
               >
                 <Trash2 class="w-4 h-4" />
@@ -273,24 +280,24 @@ async function handleDeleteKey(item: ApiKeyItem) {
     <!-- Create Modal -->
     <Modal
       v-model="createModalOpen"
-      title="创建新 API Key"
+      title="创建新 API 密钥"
     >
       <div class="space-y-4">
         <div class="space-y-1.5">
           <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider">
-            备注名称 / 标识
+            备注名称
           </label>
           <input
             v-model="newKeyName"
             type="text"
-            placeholder="例如: dev-client、prod-backend"
+            placeholder="例如：开发调试、生产后端"
             class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
           >
         </div>
 
         <div class="space-y-1.5">
           <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider">
-            自定义密钥 <span class="text-gray-400 font-normal">(留空将自动生成)</span>
+            自定义密钥 <span class="text-gray-400 font-normal">（留空将自动生成）</span>
           </label>
           <input
             v-model="customKeyValue"
@@ -325,7 +332,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
     <!-- Edit Name Modal -->
     <Modal
       v-model="editModalOpen"
-      title="修改 API Key 备注名"
+      title="修改 API 密钥备注名"
     >
       <div class="space-y-4">
         <div class="space-y-1.5">

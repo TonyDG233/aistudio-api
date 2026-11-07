@@ -18,6 +18,7 @@ import {
   instanceStateLabel,
   instanceStateTone,
   slotSummary,
+  surfaceLabel,
 } from '@/utils/instances.ts'
 
 const emit = defineEmits<{
@@ -31,7 +32,7 @@ const instancesStore = useInstancesStore()
 const accountLabels = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {}
   accountsStore.accounts.forEach((account) => {
-    map[account.id] = account.email || account.name || `ID: ${account.id}`
+    map[account.id] = account.email || account.name || `编号：${account.id}`
   })
   return map
 })
@@ -90,7 +91,7 @@ async function handleClose(instance: Instance) {
           v-if="instancesStore.latestInstanceId"
           class="text-[10px] font-mono text-gray-400 truncate"
         >
-          latest: {{ instancesStore.latestInstanceId }}
+          最新：{{ instancesStore.latestInstanceId }}
         </span>
       </div>
 
@@ -152,25 +153,25 @@ async function handleClose(instance: Instance) {
                 {{ instanceStateLabel(instance.state) }}
               </span>
               <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-gray-100 text-gray-600 border border-gray-200">
-                {{ instance.surface || 'chat' }}
+                {{ surfaceLabel(instance.surface) }}
               </span>
               <span
                 v-if="instance.in_flight > 0"
                 class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-50 text-amber-700 border border-amber-200"
               >
-                in_flight {{ instance.in_flight }}
+                进行中 {{ instance.in_flight }}
               </span>
               <span
                 v-if="instance.latest"
                 class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-brand-50 text-brand-700 border border-brand-200"
               >
-                latest
+                最新
               </span>
               <span
                 v-if="instance.id === instancesStore.currentInstanceId"
                 class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
               >
-                current
+                当前
               </span>
             </div>
 

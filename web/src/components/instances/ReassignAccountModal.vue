@@ -10,6 +10,8 @@ import {
   isSlotOccupied,
   isTierCompatible,
   slotSummary,
+  surfaceLabel,
+  tierLabel,
   tierRank,
 } from '@/utils/instances.ts'
 
@@ -81,9 +83,9 @@ function close() {
         v-if="instance"
         class="p-2.5 rounded-xl bg-gray-50 border border-gray-200 text-[11px] font-mono text-gray-600 flex items-center gap-2 flex-wrap"
       >
-        <span class="px-1.5 py-0.5 rounded bg-white border border-gray-200">{{ instance.surface }}</span>
-        <span>槽位: {{ slotSummary(instance) }}</span>
-        <span>当前: {{ instance.account_id || '未绑定' }}</span>
+        <span class="px-1.5 py-0.5 rounded bg-white border border-gray-200">{{ surfaceLabel(instance.surface) }}</span>
+        <span>槽位：{{ slotSummary(instance) }}</span>
+        <span>当前：{{ instance.account_id || '未绑定' }}</span>
       </div>
 
       <div
@@ -107,14 +109,14 @@ function close() {
             :key="account.id"
             :value="account.id"
           >
-            {{ account.email || account.name || `ID: ${account.id}` }} · {{ account.tier || 'Free' }}
+            {{ account.email || account.name || `编号：${account.id}` }} · {{ tierLabel(account.tier) }}
           </option>
         </select>
         <p
           v-if="!candidates.length"
           class="text-[11px] text-amber-600 mt-1"
         >
-          没有可用账号：需启用、未失效、Tier 兼容且未绑定其他实例。
+          没有可用账号：需启用、未失效、等级兼容且未绑定其他实例。
         </p>
         <p
           v-else

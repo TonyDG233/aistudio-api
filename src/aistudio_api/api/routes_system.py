@@ -17,10 +17,12 @@ from aistudio_api.api.response_models import (
     StatsResponse,
     StatsTotalsResponse,
 )
+from aistudio_api.config import resolve_default_config_template
 from aistudio_api.infrastructure.gateway.model_defaults import (
     ConfigValidationError,
     _resolve_config_path,
     get_configured_logging_settings,
+    merge_config_documents,
     write_config_text,
 )
 from aistudio_api.infrastructure.utils.logger import (
@@ -353,6 +355,17 @@ class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
 
 
+def _apply_logging_runtime(parsed: object) -> None:
+    """Apply the persisted logging block to the live logger runtime."""
+    if not isinstance(parsed, dict) or "logging" not in parsed:
+        return
+    normalized_logging = get_configured_logging_settings()
+    set_log_level(str(normalized_logging.get("level", "INFO")))
+    set_dump_requests(bool(normalized_logging.get("dump_requests", False)))
+    set_dump_to_file(bool(normalized_logging.get("dump_to_file", False)))
+    set_dump_dir(str(normalized_logging.get("dump_dir", "dumps")))
+
+
 @protected_router.get("/config")
 async def get_system_config(
     runtime_state: RuntimeState = Depends(get_runtime_state),
@@ -407,16 +420,132 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     try:
-        if isinstance(parsed, dict) and "logging" in parsed:
-            normalized_logging = get_configured_logging_settings()
-            set_log_level(str(normalized_logging.get("level", "INFO")))
-            set_dump_requests(bool(normalized_logging.get("dump_requests", False)))
-            set_dump_to_file(bool(normalized_logging.get("dump_to_file", False)))
-            set_dump_dir(str(normalized_logging.get("dump_dir", "dumps")))
+        _apply_logging_runtime(parsed)
     except Exception as e:
         raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
     logger.info("配置文件 config.yaml 已更新并重新加载")
     return {"ok": True, "message": "配置已保存并重载"}
+
+
+class ConfigPatchRequest(BaseModel):
+    updates: dict[str, object]
+
+
+@protected_router.patch("/config")
+async def patch_config(
+    req: ConfigPatchRequest,
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """按 section 局部更新 config.yaml，保留未提交键（含 D-09 诊断开关）。
+
+    前端按卡片提交局部对象，例如 ``{"updates": {"logging": {...}}}``；服务端读取
+    当前最新磁盘 YAML（ui_debug 下为沙盒临时路径）后递归合并，列表整体替换，
+    再走 ``validate_config_mapping`` 校验与原子写回。未提交的顶层/嵌套键原样保留。
+    """
+    config_path = _resolve_config_path(None)
+    try:
+        content = (
+            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        )
+    except OSError as e:
+        raise HTTPException(500, detail=f"读取配置文件失败: {e}") from e
+
+    try:
+        parsed = yaml.safe_load(content) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    if not isinstance(parsed, dict):
+        raise HTTPException(400, detail="YAML 顶层必须为字典结构")
+
+    merged = merge_config_documents(parsed, req.updates)
+    if not isinstance(merged, dict):
+        raise HTTPException(400, detail="配置合并结果必须为字典结构")
+
+    try:
+        write_config_text(
+            yaml.dump(merged, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        _apply_logging_runtime(merged)
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+
+    logger.info("配置已局部更新: %s", ", ".join(sorted(req.updates)))
+    payload = await get_system_config(runtime_state)
+    payload["ok"] = True
+    payload["message"] = "配置已保存并热重载"
+    return payload
+
+
+@protected_router.post("/config/reset")
+async def reset_config(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """用官方 defaults/config.yaml 覆盖当前配置，保留已创建的 API Key。
+
+    - 读取 ``defaults/config.yaml`` 模板（值语义，不继承用户改动）
+    - 保留当前磁盘配置中的 ``api_keys``（已创建的客户端密钥不丢）
+    - ui_debug 沙盒下强制 ``diagnostics.ui_debug: true``，且只写临时配置
+    - 校验 + 原子写回 + 刷新配置缓存，返回最新完整 SystemConfig
+    """
+    config_path = _resolve_config_path(None)
+    try:
+        template_path = resolve_default_config_template()
+        template_text = template_path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise HTTPException(500, detail=f"默认配置模板不存在: {e}") from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"读取默认配置模板失败: {e}") from e
+
+    try:
+        template = yaml.safe_load(template_text) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(500, detail=f"默认配置模板 YAML 解析失败: {e}") from e
+    if not isinstance(template, dict):
+        raise HTTPException(500, detail="默认配置模板顶层必须为字典结构")
+
+    preserved_keys: object = []
+    if config_path.exists():
+        try:
+            current = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            current = {}
+        if isinstance(current, dict) and isinstance(current.get("api_keys"), list):
+            preserved_keys = current["api_keys"]
+    template["api_keys"] = preserved_keys
+
+    if runtime_state.ui_debug:
+        diagnostics = template.get("diagnostics")
+        diagnostics_map = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+        diagnostics_map["ui_debug"] = True
+        template["diagnostics"] = diagnostics_map
+
+    try:
+        write_config_text(
+            yaml.dump(template, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        _apply_logging_runtime(template)
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+
+    logger.info("配置已重置为 defaults/config.yaml 默认值")
+    payload = await get_system_config(runtime_state)
+    payload["ok"] = True
+    payload["message"] = "已重置为官方默认配置并热重载"
+    return payload
 
 
 class LoggingConfigRequest(BaseModel):
