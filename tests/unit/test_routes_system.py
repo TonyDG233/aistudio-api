@@ -187,7 +187,7 @@ def test_stats_response_exposes_paid_marker_from_model_access():
 
 
 @pytest.mark.asyncio
-async def test_rotation_status_and_clear_cooldown():
+async def test_rotation_status_and_clear_cooldown(monkeypatch):
     from unittest.mock import MagicMock
 
     from aistudio_api.api.state import runtime_state
@@ -196,7 +196,7 @@ async def test_rotation_status_and_clear_cooldown():
     mock_rotator = MagicMock(spec=AccountRotator)
     mock_rotator.get_all_stats.return_value = {"acc_1": {"requests": 1}}
 
-    runtime_state.rotator = mock_rotator
+    monkeypatch.setattr(runtime_state, "rotator", mock_rotator)
     async with _client() as client:
         resp = await client.get("/rotation")
         assert resp.status_code == 200

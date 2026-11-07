@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aistudio_api.config import resolve_stats_file, settings
@@ -22,6 +24,28 @@ if TYPE_CHECKING:
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("state")
+
+STATS_SCHEMA_VERSION = 2
+# Top-level v2 envelope keys and legacy ghost counters that must never be
+# rendered as model rows.
+STATS_RESERVED_KEYS = frozenset(
+    {"models", "daily", "schema_version", "totals", "version"}
+)
+_CHANNEL_PREFIXES = {"pg", "chat", "playground", "build", "official"}
+
+
+def is_reserved_stats_key(value: object) -> bool:
+    """True for v2 envelope / legacy aggregate keys masquerading as models."""
+    return str(value or "").strip().lower() in STATS_RESERVED_KEYS
+
+
+def normalize_model_name(value: object) -> str:
+    """Normalize persisted model names (``models/`` and channel prefixes)."""
+    text = str(value or "").strip().removeprefix("models/")
+    head, separator, tail = text.partition("/")
+    if separator and tail and head.lower() in _CHANNEL_PREFIXES:
+        return tail
+    return text
 
 
 def discovery_sessions_for(state: object) -> tuple[Any, ...]:
@@ -78,6 +102,77 @@ class ModelStatsItem:
     last_used: str | None = None
 
 
+def _int_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(str(value)) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _load_item(raw: object) -> ModelStatsItem | None:
+    if not isinstance(raw, dict):
+        return None
+    raw_finish = raw.get("finish_reasons")
+    finish_reasons = (
+        {str(k): _int_value(v) for k, v in raw_finish.items()}
+        if isinstance(raw_finish, dict)
+        else {}
+    )
+    last_used = raw.get("last_used")
+    return ModelStatsItem(
+        requests=_int_value(raw.get("requests")),
+        success=_int_value(raw.get("success")),
+        rate_limited=_int_value(raw.get("rate_limited")),
+        errors=_int_value(raw.get("errors")),
+        prompt_tokens=_int_value(raw.get("prompt_tokens")),
+        completion_tokens=_int_value(raw.get("completion_tokens")),
+        reasoning_tokens=_int_value(raw.get("reasoning_tokens")),
+        cached_tokens=_int_value(raw.get("cached_tokens")),
+        total_tokens=_int_value(raw.get("total_tokens")),
+        finish_reasons=finish_reasons,
+        last_used=str(last_used) if last_used else None,
+    )
+
+
+def _add_item(target: ModelStatsItem, item: ModelStatsItem) -> None:
+    target.requests += item.requests
+    target.success += item.success
+    target.rate_limited += item.rate_limited
+    target.errors += item.errors
+    target.prompt_tokens += item.prompt_tokens
+    target.completion_tokens += item.completion_tokens
+    target.reasoning_tokens += item.reasoning_tokens
+    target.cached_tokens += item.cached_tokens
+    target.total_tokens += item.total_tokens
+    for reason, count in item.finish_reasons.items():
+        target.finish_reasons[reason] = target.finish_reasons.get(reason, 0) + count
+    if item.last_used and (
+        target.last_used is None or item.last_used > target.last_used
+    ):
+        target.last_used = item.last_used
+
+
+def _merge_item(
+    target: dict[str, ModelStatsItem], name: object, item: ModelStatsItem
+) -> None:
+    normalized = normalize_model_name(name)
+    if not normalized or is_reserved_stats_key(normalized):
+        return
+    existing = target.get(normalized)
+    if existing is None:
+        target[normalized] = item
+    else:
+        _add_item(existing, item)
+
+
+def _reserved_daily_ghosts(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(is_reserved_stats_key(day) for day in value)
+
+
 @dataclass
 class RuntimeState:
     client: AIStudioClient | None = None
@@ -93,6 +188,7 @@ class RuntimeState:
     model_stats: dict[str, ModelStatsItem] = field(
         default_factory=lambda: defaultdict(ModelStatsItem)
     )
+    daily_stats: dict[str, dict[str, ModelStatsItem]] = field(default_factory=dict)
     _last_saved_time: float = field(default=0.0, repr=False)
     _save_task: object | None = field(default=None, repr=False)
 
@@ -117,49 +213,118 @@ class RuntimeState:
         return tuple(session for session in sessions if session is not None)
 
     def load_stats(self) -> None:
-        """从持久化文件加载历史调用统计。"""
+        """Load persisted statistics from schema v2 or the legacy flat file.
+
+        The historical bug treated every top-level key (``models``/``daily``)
+        as a model, producing ghost rows with zero requests.  v2 envelopes are
+        now unwrapped and any old/ghost structure is backed up and rewritten as
+        a clean v2 document without dropping successfully parsed history.
+        """
         if not settings.persist_stats:
             return
         stats_path = resolve_stats_file()
         if not stats_path.is_file():
             return
         try:
-            raw = stats_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                for model, item in data.items():
-                    if isinstance(item, dict):
-                        raw_finish = item.get("finish_reasons")
-                        finish_reasons = (
-                            {str(k): int(str(v)) for k, v in raw_finish.items()}
-                            if isinstance(raw_finish, dict)
-                            else {}
-                        )
-                        self.model_stats[model] = ModelStatsItem(
-                            requests=int(item.get("requests", 0)),
-                            success=int(item.get("success", 0)),
-                            rate_limited=int(item.get("rate_limited", 0)),
-                            errors=int(item.get("errors", 0)),
-                            prompt_tokens=int(item.get("prompt_tokens", 0)),
-                            completion_tokens=int(item.get("completion_tokens", 0)),
-                            reasoning_tokens=int(item.get("reasoning_tokens", 0)),
-                            cached_tokens=int(item.get("cached_tokens", 0)),
-                            total_tokens=int(item.get("total_tokens", 0)),
-                            finish_reasons=finish_reasons,
-                            last_used=str(item["last_used"])
-                            if item.get("last_used")
-                            else None,
-                        )
+            data = json.loads(stats_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            needs_migration = False
+            raw_models = data.get("models")
+            raw_daily = data.get("daily")
+            is_v2 = isinstance(raw_models, dict) and (
+                data.get("schema_version") == STATS_SCHEMA_VERSION
+                or "daily" in data
+            )
+            if is_v2:
+                models_map = raw_models if isinstance(raw_models, dict) else {}
+                models_ghosts = any(
+                    is_reserved_stats_key(name) for name in models_map
+                )
+                for name, raw in models_map.items():
+                    if is_reserved_stats_key(name):
+                        continue
+                    item = _load_item(raw)
+                    if item is not None:
+                        _merge_item(self.model_stats, name, item)
+                if isinstance(raw_daily, dict):
+                    for day, day_models in raw_daily.items():
+                        if is_reserved_stats_key(day) or not isinstance(
+                            day_models, dict
+                        ):
+                            needs_migration = True
+                            continue
+                        bucket: dict[str, ModelStatsItem] = {}
+                        for name, raw in day_models.items():
+                            if is_reserved_stats_key(name):
+                                continue
+                            item = _load_item(raw)
+                            if item is not None:
+                                _merge_item(bucket, name, item)
+                        if bucket:
+                            self.daily_stats[str(day)] = bucket
+                extras = set(data) - {"schema_version", "models", "daily"}
+                needs_migration = bool(
+                    needs_migration
+                    or extras
+                    or models_ghosts
+                    or _reserved_daily_ghosts(raw_daily)
+                    or data.get("schema_version") != STATS_SCHEMA_VERSION
+                )
+            else:
+                # Legacy v1: top-level model -> counters.  Reserved aggregate
+                # keys are skipped strictly, then the file is migrated to v2.
+                for name, raw in data.items():
+                    if is_reserved_stats_key(name):
+                        continue
+                    item = _load_item(raw)
+                    if item is not None:
+                        _merge_item(self.model_stats, name, item)
+                needs_migration = True
+
+            if needs_migration:
+                self._migrate_stats_file(stats_path)
         except Exception as e:
             logger.warning("从 %s 读取模型统计失败: %s", stats_path, e)
 
+    def _migrate_stats_file(self, stats_path: Path) -> None:
+        """Back up the old file, then atomically rewrite a clean v2 envelope."""
+        try:
+            if stats_path.is_file():
+                shutil.copy2(
+                    stats_path,
+                    stats_path.with_name(f"{stats_path.name}.bak"),
+                )
+            self.save_stats()
+            logger.info("模型统计文件已迁移为 v2 干净结构: %s", stats_path)
+        except Exception as e:
+            # Never clear history: in-memory stats are already loaded; the
+            # original file (and backup when written) remains untouched.
+            logger.warning("模型统计文件迁移失败，保留原文件与内存数据: %s", e)
+
     def save_stats(self) -> None:
-        """将模型调用与 Token 统计持久化到文件。"""
+        """Persist statistics as a clean schema v2 envelope (no ghost keys)."""
         if not settings.persist_stats:
             return
         stats_path = resolve_stats_file()
         try:
-            payload = {model: asdict(item) for model, item in self.model_stats.items()}
+            payload = {
+                "schema_version": STATS_SCHEMA_VERSION,
+                "models": {
+                    name: asdict(item)
+                    for name, item in self.model_stats.items()
+                    if name and not is_reserved_stats_key(name)
+                },
+                "daily": {
+                    day: {
+                        name: asdict(item)
+                        for name, item in models.items()
+                        if name and not is_reserved_stats_key(name)
+                    }
+                    for day, models in self.daily_stats.items()
+                    if day and not is_reserved_stats_key(day)
+                },
+            }
             atomic_write_json(stats_path, payload)
             import time
 
@@ -201,37 +366,46 @@ class RuntimeState:
         usage: dict[str, object] | None = None,
         finish_reason: str | None = None,
     ) -> None:
-        stats = self.model_stats[model]
-        stats.requests += 1
+        name = normalize_model_name(model) or model
         tz = timezone(timedelta(hours=8))
-        stats.last_used = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(tz)
+        last_used = now.strftime("%Y-%m-%d %H:%M:%S")
+        daily = self.daily_stats.setdefault(now.strftime("%Y-%m-%d"), {})
+        targets = (self.model_stats[name], daily.setdefault(name, ModelStatsItem()))
+        clean_fr = str(finish_reason).strip().upper() if finish_reason else ""
+        for stats in targets:
+            stats.requests += 1
+            stats.last_used = last_used
 
-        if result == "success":
-            stats.success += 1
-        elif result == "rate_limited":
-            stats.rate_limited += 1
-        elif result == "errors":
-            stats.errors += 1
+            if result == "success":
+                stats.success += 1
+            elif result == "rate_limited":
+                stats.rate_limited += 1
+            elif result == "errors":
+                stats.errors += 1
 
-        if finish_reason:
-            clean_fr = str(finish_reason).strip().upper()
-            stats.finish_reasons[clean_fr] = stats.finish_reasons.get(clean_fr, 0) + 1
+            if clean_fr:
+                stats.finish_reasons[clean_fr] = (
+                    stats.finish_reasons.get(clean_fr, 0) + 1
+                )
 
-        if usage:
-            pt = int(str(usage.get("prompt_tokens") or 0))
-            ct = int(str(usage.get("completion_tokens") or 0))
-            tt = int(str(usage.get("total_tokens") or 0))
-            details = usage.get("completion_tokens_details")
-            rt = 0
-            if isinstance(details, dict):
-                rt = int(str(details.get("reasoning_tokens") or 0))
-            cached = int(str(usage.get("cached_tokens") or 0))
+            if usage:
+                pt = _int_value(usage.get("prompt_tokens"))
+                ct = _int_value(usage.get("completion_tokens"))
+                tt = _int_value(usage.get("total_tokens"))
+                details = usage.get("completion_tokens_details")
+                rt = (
+                    _int_value(details.get("reasoning_tokens"))
+                    if isinstance(details, dict)
+                    else 0
+                )
+                cached = _int_value(usage.get("cached_tokens"))
 
-            stats.prompt_tokens += pt
-            stats.completion_tokens += ct
-            stats.reasoning_tokens += rt
-            stats.cached_tokens += cached
-            stats.total_tokens += tt if tt else (pt + ct)
+                stats.prompt_tokens += pt
+                stats.completion_tokens += ct
+                stats.reasoning_tokens += rt
+                stats.cached_tokens += cached
+                stats.total_tokens += tt if tt else (pt + ct)
 
         if result in ("rate_limited", "errors"):
             self.save_stats()

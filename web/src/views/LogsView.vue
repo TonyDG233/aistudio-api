@@ -17,6 +17,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
+import LogsDebugMenu from '@/components/debug/LogsDebugMenu.vue'
 import { useToastStore } from '@/stores/toast.ts'
 import { clearToken } from '@/api/client.ts'
 import {
@@ -538,6 +539,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-5">
+    <LogsDebugMenu />
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
         <p class="flex items-center gap-2 text-[11px] text-gray-400">

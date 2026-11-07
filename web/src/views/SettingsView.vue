@@ -318,10 +318,10 @@ onBeforeRouteLeave((_to, _from, next) => {
       class="p-4 bg-amber-50/80 border border-amber-200 rounded-2xl text-xs text-amber-900 space-y-1.5"
     >
       <div class="font-bold flex items-center gap-1.5">
-        <span>🛠️ 界面调试沙盒模式已启动</span>
+        <span>🛠️ UI Debug 沙盒模式已启动</span>
       </div>
       <p class="leading-relaxed">
-        真实浏览器与真实磁盘写入已阻断，本页修改仅写入内存沙盒的临时配置。前往「账号管理 / 控制面板 / 日志」可通过顶部界面调试菜单切换模拟场景检查样式。
+        真实浏览器与真实磁盘写入已阻断，本页修改仅写入内存沙盒的临时配置。前往「账号管理 / 控制面板 / 日志」可通过顶部 UI Debug 菜单切换模拟场景检查样式。
       </p>
     </div>
 

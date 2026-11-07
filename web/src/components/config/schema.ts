@@ -362,10 +362,10 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
   },
   'diagnostics.ui_debug': {
     key: 'diagnostics.ui_debug',
-    title: '界面调试离线沙盒',
+    title: 'UI Debug 离线沙盒',
     category: 'logging',
     type: 'boolean',
-    description: '启用纯离线 UI 调试沙盒，不启动真实浏览器/账号/网络。',
+    description: '启用纯离线 UI Debug 沙盒，不启动真实浏览器/账号/网络。',
     explanation: 'C2a：开启后服务使用临时目录中的 config.yaml 与内存 AccountStore/InstanceManager，所有页面写入只落在临时沙盒，绝不触碰真实配置。交互式改动需重启服务生效。',
     defaultValue: false,
     recommendedValue: false,

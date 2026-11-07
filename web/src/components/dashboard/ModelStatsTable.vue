@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import type { ModelStatItem } from '@/types/stats.ts'
 import Badge from '@/components/ui/Badge.vue'
 import { formatDate } from '@/utils/format.ts'
+import { normalizeModelStats } from './modelStats.ts'
 import {
   Layers,
   ChevronDown,
@@ -22,13 +23,7 @@ function toggleExpand(key: string) {
   expandedModels.value[key] = !expandedModels.value[key]
 }
 
-const statList = computed(() => {
-  return Object.entries(props.stats || {}).map(([rawName, item]) => ({
-    name: rawName.replace(/^models\//, ''),
-    rawName,
-    ...item,
-  }))
-})
+const statList = computed(() => normalizeModelStats(props.stats))
 </script>
 
 <template>
@@ -46,29 +41,29 @@ const statList = computed(() => {
     </div>
 
     <div class="overflow-x-auto">
-      <table class="w-full text-left border-collapse text-sm">
+      <table class="w-full min-w-[760px] text-left border-collapse text-sm">
         <thead>
           <tr class="bg-gray-50/70 border-b border-gray-100 text-xs font-semibold text-gray-500 uppercase tracking-wider">
-            <th class="py-3 px-4 w-8" />
-            <th class="py-3 px-4">
+            <th class="py-3 px-3 w-8 sticky left-0 z-20 bg-gray-50" />
+            <th class="py-3 px-4 sticky left-8 z-20 bg-gray-50 min-w-[180px]">
               模型标识
             </th>
             <th class="py-3 px-3 text-center">
               请求数
             </th>
-            <th class="py-3 px-3 text-center">
+            <th class="py-3 px-3 text-center hidden lg:table-cell">
               成功
             </th>
-            <th class="py-3 px-3 text-center">
+            <th class="py-3 px-3 text-center hidden lg:table-cell">
               429
             </th>
-            <th class="py-3 px-3 text-center">
+            <th class="py-3 px-3 text-center hidden lg:table-cell">
               错误
             </th>
             <th class="py-3 px-4 text-center">
               Tokens
             </th>
-            <th class="py-3 px-6 text-right">
+            <th class="py-3 px-6 text-right hidden xl:table-cell">
               最后调用
             </th>
           </tr>
@@ -76,16 +71,19 @@ const statList = computed(() => {
         <tbody class="divide-y divide-gray-100 font-mono text-xs">
           <template
             v-for="item in statList"
-            :key="item.rawName"
+            :key="item.key"
           >
             <tr
-              class="hover:bg-gray-50/80 transition-colors cursor-pointer"
-              :class="{ 'bg-gray-50/40': expandedModels[item.rawName] }"
-              @click="toggleExpand(item.rawName)"
+              class="group hover:bg-gray-50/80 transition-colors cursor-pointer"
+              :class="{ 'bg-gray-50/40': expandedModels[item.key] }"
+              @click="toggleExpand(item.key)"
             >
-              <td class="py-3 px-3 text-center text-gray-400">
+              <td
+                class="py-3 px-3 text-center text-gray-400 sticky left-0 z-10"
+                :class="expandedModels[item.key] ? 'bg-gray-50' : 'bg-white group-hover:bg-gray-50'"
+              >
                 <ChevronDown
-                  v-if="expandedModels[item.rawName]"
+                  v-if="expandedModels[item.key]"
                   class="w-4 h-4 inline"
                 />
                 <ChevronRight
@@ -93,7 +91,10 @@ const statList = computed(() => {
                   class="w-4 h-4 inline"
                 />
               </td>
-              <td class="py-3.5 px-4 font-semibold text-gray-900">
+              <td
+                class="py-3.5 px-4 font-semibold text-gray-900 sticky left-8 z-10"
+                :class="expandedModels[item.key] ? 'bg-gray-50' : 'bg-white group-hover:bg-gray-50'"
+              >
                 <div class="flex items-center gap-1.5">
                   <span>{{ item.name }}</span>
                   <span
@@ -127,7 +128,7 @@ const statList = computed(() => {
               <td class="py-3.5 px-3 text-center font-medium text-gray-700">
                 {{ (item.requests || 0).toLocaleString() }}
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3.5 px-3 text-center hidden lg:table-cell">
                 <Badge
                   variant="green"
                   size="sm"
@@ -135,7 +136,7 @@ const statList = computed(() => {
                   {{ (item.success || 0).toLocaleString() }}
                 </Badge>
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3.5 px-3 text-center hidden lg:table-cell">
                 <Badge
                   :variant="(item.rate_limited || 0) > 0 ? 'red' : 'gray'"
                   size="sm"
@@ -143,7 +144,7 @@ const statList = computed(() => {
                   {{ (item.rate_limited || 0).toLocaleString() }}
                 </Badge>
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3.5 px-3 text-center hidden lg:table-cell">
                 <span
                   class="font-medium"
                   :class="(item.errors || 0) > 0 ? 'text-rose-600 font-bold' : 'text-gray-400'"
@@ -152,18 +153,18 @@ const statList = computed(() => {
                 </span>
               </td>
               <td class="py-3.5 px-4 text-center text-gray-600">
-                <span :title="`Prompt: ${(item.prompt_tokens || 0).toLocaleString()} / Completion: ${(item.completion_tokens || 0).toLocaleString()}`">
+                <span :title="`输入 Tokens: ${(item.prompt_tokens || 0).toLocaleString()} / 输出 Tokens: ${(item.completion_tokens || 0).toLocaleString()}`">
                   {{ (item.total_tokens || 0).toLocaleString() }}
                 </span>
               </td>
-              <td class="py-3.5 px-6 text-right text-gray-500">
+              <td class="py-3.5 px-6 text-right text-gray-500 hidden xl:table-cell">
                 {{ formatDate(item.last_used, { withSeconds: true }) }}
               </td>
             </tr>
 
             <!-- Accordion Sub-Drawer: Account Breakdown for this Model -->
             <tr
-              v-if="expandedModels[item.rawName]"
+              v-if="expandedModels[item.key]"
               class="bg-gray-50/70 border-b border-gray-100"
             >
               <td

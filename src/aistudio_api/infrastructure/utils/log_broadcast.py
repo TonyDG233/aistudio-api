@@ -153,6 +153,12 @@ class LogBroadcaster:
             return self._entries[0].id if self._entries else None
 
     @property
+    def latest_id(self) -> int:
+        """Return the last allocated sequence number (0 when nothing is left)."""
+        with self._lock:
+            return self._next_id
+
+    @property
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subscribers)
@@ -225,6 +231,18 @@ class LogBroadcaster:
         with self._lock:
             subscription.active = False
             self._subscribers.pop(subscription.id, None)
+
+    def clear(self) -> int:
+        """Drop retained entries without resetting the sequence or subscribers.
+
+        The monotonic ``_next_id`` deliberately survives so replayed clients
+        never observe duplicate ids after a sandbox clear; live subscriber
+        queues and their connections are left untouched.
+        """
+        with self._lock:
+            cleared = len(self._entries)
+            self._entries.clear()
+            return cleared
 
     def replay(
         self,
@@ -385,6 +403,19 @@ class DailyLogFileHandler(logging.Handler):
     def close(self) -> None:
         self._close_stream()
         super().close()
+
+    def reopen(self) -> None:
+        """Close the active stream so the next record re-resolves the log dir.
+
+        ``ui_debug`` redirects ``AISTUDIO_LOG_DIR`` after this handler was
+        constructed; reopening guarantees injected records land in the sandbox
+        archive instead of a stream opened before the redirect.
+        """
+        self.acquire()
+        try:
+            self._close_stream()
+        finally:
+            self.release()
 
     def _open_for_day(self, day: date) -> None:
         self._close_stream()

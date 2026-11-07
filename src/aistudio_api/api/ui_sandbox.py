@@ -16,12 +16,17 @@ import os
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aistudio_api.application.account_rotator import AccountStats
+from aistudio_api.api.state import ModelStatsItem, is_reserved_stats_key
+from aistudio_api.application.account_rotator import (
+    AccountModelDailyStats,
+    AccountStats,
+    get_pacific_date_key,
+)
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.config import resolve_default_config_template
 from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
@@ -41,7 +46,9 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("ui-debug")
 
-SCENARIOS = ("all_states", "mass_accounts", "narrow_edge", "empty")
+SCENARIOS = ("all_states", "mass_accounts", "narrow_edge", "empty", "all_429")
+DASHBOARD_SCENARIOS = ("all_states", "mass_accounts", "all_429", "empty")
+DASHBOARD_ACTIONS = ("simulate_requests", "simulate_429", "toggle_formats")
 _SANDBOX_DRAIN_TIMEOUT_S = 0.05
 ACTIONS = (
     "reset",
@@ -49,6 +56,7 @@ ACTIONS = (
     "account_expired",
     "instance_cooldown",
     "keepalive_partial",
+    *DASHBOARD_ACTIONS,
 )
 _SANDBOX_MAX_CONTEXTS = 10
 
@@ -1087,6 +1095,8 @@ class UISandbox:
             self.keepalive = SandboxKeepalive(self)
             self.scenario = "all_states"
             self.keepalive_partial = False
+            self.model_stats: dict[str, ModelStatsItem] = {}
+            self._formats_all_on: bool | None = None
             self._flags: dict[str, dict[str, Any]] = {}
             self._closed = False
             self.reset("all_states")
@@ -1103,6 +1113,55 @@ class UISandbox:
         shutil.rmtree(self.root, ignore_errors=True)
 
     # -------------------------------------------------------------- scenario
+    def formats_payload(self) -> dict[str, bool]:
+        """Live format switches for the dashboard quick examples."""
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_formats,
+        )
+
+        if self._formats_all_on is True:
+            return {
+                "gemini": True,
+                "openai": True,
+                "claude": True,
+                "responses": True,
+            }
+        raw = get_configured_formats()
+        return {
+            "gemini": True,
+            "openai": _format_flag(raw.get("openai", False)),
+            "claude": _format_flag(raw.get("claude", False)),
+            "responses": _format_flag(raw.get("responses", False)),
+        }
+
+    def default_text_model(self) -> str:
+        from aistudio_api.config import DEFAULT_TEXT_MODEL
+
+        return DEFAULT_TEXT_MODEL
+
+    def stats_payload(self) -> dict[str, object]:
+        """All-time model stats used by /stats while the sandbox is active."""
+        models = {
+            name: asdict(item)
+            for name, item in self.model_stats.items()
+            if name and not is_reserved_stats_key(name)
+        }
+        totals = {
+            key: sum(int(getattr(item, key, 0)) for item in self.model_stats.values())
+            for key in (
+                "requests",
+                "success",
+                "rate_limited",
+                "errors",
+                "prompt_tokens",
+                "completion_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "total_tokens",
+            )
+        }
+        return {"models": models, "totals": totals}
+
     def reset(self, scenario: str) -> None:
         if scenario not in SCENARIOS:
             raise ValueError(f"unknown scenario: {scenario}")
@@ -1111,9 +1170,11 @@ class UISandbox:
         self._flags.clear()
         self.scenario = scenario
         self.keepalive_partial = False
+        self._formats_all_on = None
         self.manager.reset()
         self.rotator.reset()
         self.keepalive.reset()
+        self.model_stats = {}
         if scenario == "empty":
             return
         if scenario == "mass_accounts":
@@ -1123,6 +1184,146 @@ class UISandbox:
         else:
             accounts, instances, active_id = _all_states_scenario()
         self._seed(accounts, instances, active_id)
+        if scenario == "all_429":
+            self._apply_all_429()
+        self._seed_dashboard_stats(scenario)
+
+    def _apply_all_429(self) -> None:
+        until = time.time() + 600
+        for account in self.account_service.list_accounts():
+            flags = self.flags(account.id)
+            flags["_cooldown_until"] = until
+            flags["auth_cooldown"] = 600
+        for record in self.manager.records():
+            if record.account_id:
+                record.state = InstanceState.COOLDOWN
+
+    def _seed_dashboard_stats(self, scenario: str) -> None:
+        if scenario == "empty":
+            return
+        if scenario == "all_429":
+            stats = _all_429_model_stats()
+        elif scenario == "mass_accounts":
+            stats = _mass_model_stats()
+        elif scenario == "narrow_edge":
+            stats = _narrow_model_stats()
+        else:
+            stats = _all_states_model_stats()
+        self.model_stats = stats
+        self._seed_account_daily(stats)
+
+    def _seed_account_daily(
+        self, stats: dict[str, ModelStatsItem]
+    ) -> None:
+        accounts = [
+            account
+            for account in self.account_service.list_accounts()
+            if account.enabled and not account.expired
+        ]
+        if not accounts:
+            return
+        for model_index, (model, item) in enumerate(stats.items()):
+            buckets = (
+                (0.62, 0),
+                (0.23, 1),
+                (0.15, 2),
+            )
+            for share, offset in buckets:
+                account = accounts[(model_index + offset) % len(accounts)]
+                daily = self._account_daily(account.id, model)
+                daily.requests += int(item.requests * share)
+                daily.success += int(item.success * share)
+                daily.rate_limited += int(item.rate_limited * share)
+                daily.errors += int(item.errors * share)
+                daily.prompt_tokens += int(item.prompt_tokens * share)
+                daily.completion_tokens += int(item.completion_tokens * share)
+                daily.reasoning_tokens += int(item.reasoning_tokens * share)
+                daily.cached_tokens += int(item.cached_tokens * share)
+                daily.total_tokens += int(item.total_tokens * share)
+                daily.last_used = time.time()
+                stats_for_account = self.rotator.get_account_stats(account.id)
+                if stats_for_account is not None:
+                    stats_for_account.total_requests += int(item.requests * share)
+                    stats_for_account.total_success += int(item.success * share)
+                    stats_for_account.total_rate_limited += int(
+                        item.rate_limited * share
+                    )
+                    stats_for_account.total_errors += int(item.errors * share)
+
+    def _account_daily(
+        self, account_id: str, model: str
+    ) -> AccountModelDailyStats:
+        stats = self.rotator.get_account_stats(account_id)
+        if stats is None:
+            return AccountModelDailyStats()
+        current_la = get_pacific_date_key()
+        stats._check_date_reset(current_la)
+        return stats.daily_models.setdefault(model, AccountModelDailyStats())
+
+    def _action_simulate_requests(self) -> None:
+        model = next(
+            (name for name in self.model_stats if "flash" in name),
+            next(iter(self.model_stats), "gemini-3.8-flash"),
+        )
+        item = self.model_stats.setdefault(model, ModelStatsItem())
+        item.requests += 10
+        item.success += 10
+        item.prompt_tokens += 32_000
+        item.completion_tokens += 12_000
+        item.reasoning_tokens += 4_000
+        item.cached_tokens += 2_000
+        item.total_tokens += 50_000
+        item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        account = next(
+            (
+                account
+                for account in self.account_service.list_accounts()
+                if account.enabled and not account.expired
+            ),
+            None,
+        )
+        if account is not None:
+            daily = self._account_daily(account.id, model)
+            daily.requests += 10
+            daily.success += 10
+            daily.prompt_tokens += 32_000
+            daily.completion_tokens += 12_000
+            daily.reasoning_tokens += 4_000
+            daily.cached_tokens += 2_000
+            daily.total_tokens += 50_000
+            daily.last_used = time.time()
+
+    def _action_simulate_429(self) -> None:
+        model = next(
+            (name for name in self.model_stats if "argon" in name),
+            next(iter(self.model_stats), "gemini-4-argon"),
+        )
+        item = self.model_stats.setdefault(model, ModelStatsItem())
+        item.requests += 1
+        item.rate_limited += 1
+        item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        account = next(
+            (
+                account
+                for account in self.account_service.list_accounts()
+                if self.is_available(account.id)
+            ),
+            None,
+        )
+        if account is not None:
+            flags = self.flags(account.id)
+            flags["_cooldown_until"] = time.time() + 300
+            flags["auth_cooldown"] = 300
+            daily = self._account_daily(account.id, model)
+            daily.requests += 1
+            daily.rate_limited += 1
+            daily.last_used = time.time()
+            for record in self.manager.records():
+                if record.account_id == account.id:
+                    record.state = InstanceState.COOLDOWN
+
+    def _action_toggle_formats(self) -> None:
+        self._formats_all_on = not bool(self._formats_all_on)
 
     def apply(
         self,
@@ -1148,6 +1349,12 @@ class UISandbox:
         elif action == "keepalive_partial":
             self.keepalive_partial = True
             self.keepalive._last_error = "sandbox scenario: partial keepalive"
+        elif action == "simulate_requests":
+            self._action_simulate_requests()
+        elif action == "simulate_429":
+            self._action_simulate_429()
+        elif action == "toggle_formats":
+            self._action_toggle_formats()
         return self.snapshot()
 
     def snapshot(self) -> dict[str, object]:
@@ -1157,7 +1364,12 @@ class UISandbox:
             "enabled": True,
             "scenario": self.scenario,
             "scenarios": list(SCENARIOS),
+            "dashboard_scenarios": list(DASHBOARD_SCENARIOS),
             "quick_actions": [action for action in ACTIONS if action != "reset"],
+            "dashboard_actions": list(DASHBOARD_ACTIONS),
+            "formats": self.formats_payload(),
+            "default_text_model": self.default_text_model(),
+            "stats": self.stats_payload(),
             "accounts": [
                 self.account_payload(account)
                 for account in self.account_service.list_accounts()
@@ -1647,12 +1859,179 @@ def _mass_scenario() -> tuple[
     return tuple(accounts), instances, active_seed.id
 
 
+def _format_flag(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "off", "no"}
+    return bool(value)
+
+
+def _last_used_label(minutes_ago: int = 0) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _all_states_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=128,
+            success=121,
+            rate_limited=5,
+            errors=2,
+            prompt_tokens=1_845_000,
+            completion_tokens=926_000,
+            reasoning_tokens=412_000,
+            cached_tokens=328_000,
+            total_tokens=3_183_000,
+            finish_reasons={"STOP": 118, "MAX_TOKENS": 3},
+            last_used=_last_used_label(2),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=862,
+            success=854,
+            rate_limited=6,
+            errors=2,
+            prompt_tokens=4_120_000,
+            completion_tokens=1_980_000,
+            reasoning_tokens=610_000,
+            cached_tokens=1_240_000,
+            total_tokens=7_950_000,
+            finish_reasons={"STOP": 840, "MAX_TOKENS": 14},
+            last_used=_last_used_label(1),
+        ),
+        "gemini-3.7-flash": ModelStatsItem(
+            requests=1_240,
+            success=1_232,
+            rate_limited=7,
+            errors=1,
+            prompt_tokens=6_840_000,
+            completion_tokens=2_460_000,
+            reasoning_tokens=820_000,
+            cached_tokens=2_180_000,
+            total_tokens=12_300_000,
+            finish_reasons={"STOP": 1215, "MAX_TOKENS": 17},
+            last_used=_last_used_label(0),
+        ),
+        "gemma-4-31b-it": ModelStatsItem(
+            requests=96,
+            success=94,
+            rate_limited=2,
+            errors=0,
+            prompt_tokens=620_000,
+            completion_tokens=310_000,
+            reasoning_tokens=180_000,
+            cached_tokens=120_000,
+            total_tokens=1_230_000,
+            finish_reasons={"STOP": 94},
+            last_used=_last_used_label(8),
+        ),
+    }
+
+
+def _mass_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=3_420,
+            success=3_268,
+            rate_limited=112,
+            errors=40,
+            prompt_tokens=48_500_000,
+            completion_tokens=22_400_000,
+            reasoning_tokens=9_800_000,
+            cached_tokens=7_600_000,
+            total_tokens=88_300_000,
+            finish_reasons={"STOP": 3190, "MAX_TOKENS": 78},
+            last_used=_last_used_label(1),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=11_860,
+            success=11_720,
+            rate_limited=98,
+            errors=42,
+            prompt_tokens=72_300_000,
+            completion_tokens=31_900_000,
+            reasoning_tokens=11_200_000,
+            cached_tokens=18_400_000,
+            total_tokens=133_800_000,
+            finish_reasons={"STOP": 11640, "MAX_TOKENS": 80},
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.6-flash": ModelStatsItem(
+            requests=5_130,
+            success=5_076,
+            rate_limited=38,
+            errors=16,
+            prompt_tokens=31_700_000,
+            completion_tokens=12_800_000,
+            reasoning_tokens=4_900_000,
+            cached_tokens=6_200_000,
+            total_tokens=55_600_000,
+            finish_reasons={"STOP": 5060, "MAX_TOKENS": 16},
+            last_used=_last_used_label(3),
+        ),
+    }
+
+
+def _all_429_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=186,
+            success=0,
+            rate_limited=186,
+            errors=0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            reasoning_tokens=0,
+            cached_tokens=0,
+            total_tokens=0,
+            finish_reasons={},
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=542,
+            success=0,
+            rate_limited=542,
+            errors=0,
+            total_tokens=0,
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.7-flash": ModelStatsItem(
+            requests=318,
+            success=0,
+            rate_limited=318,
+            errors=0,
+            total_tokens=0,
+            last_used=_last_used_label(1),
+        ),
+    }
+
+
+def _narrow_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=24,
+            success=24,
+            prompt_tokens=8_400,
+            completion_tokens=3_900,
+            reasoning_tokens=1_200,
+            cached_tokens=2_100,
+            total_tokens=15_600,
+            finish_reasons={"STOP": 24},
+            last_used=_last_used_label(0),
+        )
+    }
+
+
 def create_ui_sandbox() -> UISandbox:
     return UISandbox()
 
 
 __all__ = [
     "ACTIONS",
+    "DASHBOARD_ACTIONS",
+    "DASHBOARD_SCENARIOS",
     "SCENARIOS",
     "SandboxAccountRefresher",
     "SandboxInstanceManager",
