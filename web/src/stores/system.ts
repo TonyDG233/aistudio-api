@@ -1,12 +1,18 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { systemApi } from '@/api/system.ts'
-import type { StatsResponse, RotationStatusResponse, ClearCooldownRequest } from '@/types'
+import type {
+  StatsResponse,
+  RotationStatusResponse,
+  ClearCooldownRequest,
+  SystemStatusResponse,
+} from '@/types'
 import { useToastStore } from './toast.ts'
 
 export const useSystemStore = defineStore('system', () => {
   const stats = ref<StatsResponse | null>(null)
   const rotation = ref<RotationStatusResponse | null>(null)
+  const status = ref<SystemStatusResponse | null>(null)
   const loading = ref(false)
   const resettingCooldown = ref(false)
   const health = ref<'checking' | 'online' | 'offline'>('checking')
@@ -18,6 +24,10 @@ export const useSystemStore = defineStore('system', () => {
   const totalTokens = computed(() => stats.value?.totals?.total_tokens ?? 0)
   const promptTokens = computed(() => stats.value?.totals?.prompt_tokens ?? 0)
   const completionTokens = computed(() => stats.value?.totals?.completion_tokens ?? 0)
+  const formats = computed(() => status.value?.formats ?? null)
+  const defaultTextModel = computed(
+    () => status.value?.default_text_model || 'gemini-3.7-flash',
+  )
   async function fetchStats() {
     loading.value = true
     try {
@@ -26,6 +36,14 @@ export const useSystemStore = defineStore('system', () => {
       // ignore
     } finally {
       loading.value = false
+    }
+  }
+
+  async function fetchStatus() {
+    try {
+      status.value = await systemApi.getStatus()
+    } catch {
+      // ignore
     }
   }
 
@@ -64,6 +82,9 @@ export const useSystemStore = defineStore('system', () => {
   return {
     stats,
     rotation,
+    status,
+    formats,
+    defaultTextModel,
     loading,
     resettingCooldown,
     totalRequests,
@@ -75,6 +96,7 @@ export const useSystemStore = defineStore('system', () => {
     completionTokens,
     health,
     fetchStats,
+    fetchStatus,
     fetchRotation,
     clearCooldown,
     checkHealth,

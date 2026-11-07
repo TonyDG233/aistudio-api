@@ -60,13 +60,58 @@ def health_response() -> HealthResponse:
     )
 
 
+def _format_flag(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "off", "no"}
+    return bool(value)
+
+
+def formats_status(runtime_state: RuntimeState) -> dict[str, bool]:
+    """Return the four format switches; Gemini is always enabled."""
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    getter = getattr(sandbox, "formats_payload", None)
+    if callable(getter):
+        payload = getter()
+        if isinstance(payload, dict):
+            return {str(key): bool(value) for key, value in payload.items()}
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_formats,
+    )
+
+    raw = get_configured_formats()
+    return {
+        "gemini": True,
+        "openai": _format_flag(raw.get("openai", False)),
+        "claude": _format_flag(raw.get("claude", False)),
+        "responses": _format_flag(raw.get("responses", False)),
+    }
+
+
+def default_text_model(runtime_state: RuntimeState) -> str:
+    getter = getattr(runtime_state.ui_sandbox, "default_text_model", None)
+    if runtime_state.ui_debug and callable(getter):
+        value = getter()
+        if value:
+            return str(value)
+    from aistudio_api.config import DEFAULT_TEXT_MODEL
+
+    return DEFAULT_TEXT_MODEL
+
+
 def stats_response() -> StatsResponse:
     from aistudio_api.api.response_models import AccountBreakdownItem
-    from aistudio_api.api.state import runtime_state
+    from aistudio_api.api.state import is_reserved_stats_key, runtime_state
     from aistudio_api.domain.model_access import is_paid_model
     from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
 
-    stats = dict(runtime_state.model_stats)
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    source = getattr(sandbox, "model_stats", None)
+    raw_stats = source if isinstance(source, dict) else runtime_state.model_stats
+    stats = {
+        name: item
+        for name, item in raw_stats.items()
+        if name and not is_reserved_stats_key(name)
+    }
     rotator = runtime_state.rotator
     account_svc = runtime_state.account_service
     accounts_list = account_svc.list_accounts() if account_svc else []
@@ -197,6 +242,8 @@ async def system_status(
         "ui_debug_scenario": _ui_debug_scenario(runtime_state),
         "accounts": accounts,
         "instances": instances,
+        "formats": formats_status(runtime_state),
+        "default_text_model": default_text_model(runtime_state),
     }
 
 

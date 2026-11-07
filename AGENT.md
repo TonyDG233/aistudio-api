@@ -249,6 +249,7 @@ uv run python3 main.py server --port 8080
 - **严禁任何 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程！** 每次冷启动均会触发 BotGuard 探针，短时间重复启停会导致账号被 Google 风控封禁。即使获批执行实机测试，全流程也只允许由主控或用户在单次常驻进程中完成，严禁反复重启服务。
 - 多实例池启用时，启动预热只允许由 `InstanceManager.startup()` 在池会话（`PooledSession`）上完成；控制面 `client.session` 不得在启动时自动开页/跑 BotGuard。控制面仅在按需场景（无活跃实例、手动导入 Cookie、保活）打开，且保持单页。
 - 离线开发/回归默认 mock/fixture，不得以“验证启动”为名启动真实服务、真实浏览器或发起网络请求。
+- **前端 UI Debug 沙盒例外（强制规范）**：严禁在默认生产模式（`ui_debug=false`）下启动服务或拉起真实浏览器；凡涉及前端 UI 变更，Worker 与 Reviewer 必须在强制注入环境变量 `AISTUDIO_UI_DEBUG=1`（开启 `diagnostics.ui_debug=true` 的纯内存/临时目录隔离沙盒，100% 阻断真实浏览器与外网请求）的前提下，在 `127.0.0.1:<随机空闲端口>` 启动临时沙盒服务，使用 Playwright 等浏览器工具在多分辨率（`1440x900` / `1024x900` / `768x900`）下实测页面交互与检查样式；测试结束后必须在 `finally` 中立即关闭临时服务进程，并确认端口关闭、无进程残留、临时目录已清理。
 
 ### 4.7 浏览器进程与 CDP（D-02/D-03）
 
@@ -412,6 +413,8 @@ B 阶段新增/改造落点（未落地前不得声称存在）：
 - **主 agent = integrator**：唯一提交权；负责顺序、分派、回收报告、验收；不得把多个 domain 打包给少量 agent。
 - **worker**：每次只接一个 `Dxx-NNN` 或一个明确文件域；在 `.kilo/worktrees/rebuild-upstream` 修改并跑通 `uv run pytest`；不得改 `05/06/08-09`/架构文档；报告必须含改动文件、测试项、预期、实际、命令与结果。
 - **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `domains/Px/reviews/REV-<Step>.md`，同步主仓同路径；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
+- **前端 Review 截图归档（强制）**：凡涉及前端 UI 的审查步骤，Reviewer 必须在 `docs/dev/rebuild/domains/<Domain>/reviews/assets/` 保留 1~2 张最具代表性的完整页面实测截图（目标施工区与主工作区双仓同步留档、SHA256 一致），并在对应 `REV-*.md` 中引用，便于后续直观追溯 UI 样貌。
+- **复杂任务并行拆分（强制）**：当单步任务涉及多个独立页面或跨模块改动时，主控 Integrator 必须按文件域拆分为多个独立的并行子 Agent（`task`）执行；每个子 Agent 只读取/修改自己职责范围内的少量文件，严禁单 Agent 同时加载全站导致上下文膨胀、质量下降。
 - worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改代码/文档，不自行派下一步。
 
 ### 10.2 每步闭环
@@ -421,6 +424,7 @@ B 阶段新增/改造落点（未落地前不得声称存在）：
 - 跑 `uv run pytest`；必要时跑 ruff/pyright；全量审查 `git diff`。
 - reviewer 独立审；报告落盘；用户审计确认后才 commit；单步问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。
 - **UI 前置设计确认（强制）**：凡涉及前端 UI 界面、设置卡片、按钮或交互变更的步骤，主 Agent 严禁仅给简短摘要就直接派 Worker 改代码。开工前必须先只读盘点并提交《UI 页面与交互设计清单》，至少包含：①所在页面与卡片位置；②控件类型、中文文案、选项与默认值；③点击后的 API 调用、loading/成功/错误反馈与确认弹窗逻辑；④拟清理的废弃组件/按钮。必须等用户审阅并明确确认后，才准派 Worker 修改 .vue 代码；每次 UI 修改完工必须执行 bun run build 更新 src/aistudio_api/static 产物。
+- **UI 验收闭环（强制）**：UI 步骤必须包含 `AISTUDIO_UI_DEBUG=1` 沙盒 + Playwright `1440x900`/`1024x900`/`768x900` 实测；Reviewer 必须双写 1~2 张完整页面截图并在 `REV-*.md` 引用；多页面或跨模块步骤按文件域并行拆分 Worker/Reviewer，禁止单 Agent 一锅炖。
 
 ### 10.3 B 阶段固定顺序（不得改）
 
@@ -432,7 +436,7 @@ B0（目标树 `AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-
 
 - 不预写纸面 PKG；不把台账当施工清单；不把 534 当 MVP。
 - 不因单步失败推翻 `05/06/08-09` 或重写整体方案。
-- 不 merge/checkout 旧 `rebuild`，不 push，不 rewrite history。
+- 不 merge/checkout 旧 `rebuild`；不 push，除非用户明确授权本次推送并指定分支/范围；不 rewrite history。
 - 不访问真实 Google/真实账号/真实 IP，除非用户单独授权；默认离线 fixture/mock。
 - **实机防风控**：严禁 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程；获批实机测试也只允许主控/用户在单次常驻进程中完成，严禁反复重启（见 4.6）。
 - 不为过测试修改测试/配置/契约；不伪造审计、不预填证据、不用文档进度冒充迁移进度。

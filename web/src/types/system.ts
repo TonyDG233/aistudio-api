@@ -37,6 +37,9 @@ export interface HealthCheckResponse {
   ui_debug_scenario?: string | null
 }
 
+export type SystemFormatKey = 'gemini' | 'openai' | 'claude' | 'responses'
+export type SystemFormats = Record<SystemFormatKey, boolean>
+
 export interface SystemStatusResponse {
   status: string
   busy: boolean
@@ -44,6 +47,8 @@ export interface SystemStatusResponse {
   ui_debug_scenario?: string | null
   accounts?: number
   instances?: number
+  formats?: SystemFormats
+  default_text_model?: string
 }
 export interface ApiKeyItem {
   name: string

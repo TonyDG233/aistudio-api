@@ -134,7 +134,7 @@ function patchUiDebug(value: boolean) {
       <div class="flex-1 min-w-0">
         <ConfigSwitch
           :model-value="uiDebug"
-          label="启用界面调试沙盒"
+          label="启用 UI Debug 沙盒"
           description="开启后下次启动使用内存沙盒与临时配置，不启动真实浏览器、账号或网络"
           @update:model-value="patchUiDebug"
         />
@@ -147,7 +147,7 @@ function patchUiDebug(value: boolean) {
 
     <div class="flex items-start gap-2 p-3 bg-gray-50/80 border border-gray-200/70 rounded-xl text-[11px] text-gray-500 leading-relaxed">
       <Info class="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5" />
-      <span>界面调试开关只持久化到配置文件，下一次服务启动生效；当前运行状态不会热切换沙盒。</span>
+      <span>UI Debug 开关只持久化到配置文件，下一次服务启动生效；当前运行状态不会热切换沙盒。</span>
     </div>
   </div>
 </template>

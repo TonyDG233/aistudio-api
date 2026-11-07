@@ -12,4 +12,15 @@ export const debugApi = {
       body: JSON.stringify(req),
     })
   },
+
+  getDashboardState(): Promise<DebugUiState> {
+    return request<DebugUiState>('/api/debug/dashboard/state')
+  },
+
+  applyDashboard(req: DebugScenarioRequest): Promise<DebugScenarioResponse> {
+    return request<DebugScenarioResponse>('/api/debug/dashboard/apply', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
 }

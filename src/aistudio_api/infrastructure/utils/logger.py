@@ -348,6 +348,21 @@ def setup_logging(level: str | int = "INFO") -> None:
 
     set_log_level(level)
 
+
+def refresh_log_sinks() -> None:
+    """Re-resolve the daily archive path used by the shared file handler.
+
+    ``ui_debug`` swaps ``AISTUDIO_LOG_DIR`` to a temp directory at lifespan
+    startup.  The broadcast/file handlers are constructed at import time, so a
+    stream opened against an earlier directory must be closed before sandbox
+    debug records are emitted.
+    """
+    if _broadcast_handler is None or _file_handler is None:
+        setup_logging(_current_level)
+    if _file_handler is not None:
+        _file_handler.reopen()
+
+
 def get_logger(name: str = "aistudio") -> logging.Logger:
     """获取遵循统一命名空间的日志器实例。"""
     if not name.startswith("aistudio.") and name != "aistudio":

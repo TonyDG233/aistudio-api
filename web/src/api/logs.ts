@@ -1,4 +1,4 @@
-import { getToken } from './client.ts'
+import { getToken, request } from './client.ts'
 
 export class LogStreamError extends Error {
   status: number
@@ -91,4 +91,32 @@ export async function downloadLogArchive(options: LogExportOptions): Promise<voi
   anchor.click()
   anchor.remove()
   URL.revokeObjectURL(url)
+}
+
+export type DebugLogKind = 'all_levels' | 'sanitize_test' | 'long_payload'
+
+export interface DebugLogInjectResponse {
+  ok: boolean
+  kind: DebugLogKind
+  injected: number
+}
+
+export interface DebugLogClearResponse {
+  ok: boolean
+  cleared: number
+}
+
+export function injectDebugLogs(
+  kind: DebugLogKind,
+): Promise<DebugLogInjectResponse> {
+  return request<DebugLogInjectResponse>('/api/debug/logs/inject', {
+    method: 'POST',
+    body: JSON.stringify({ kind }),
+  })
+}
+
+export function clearDebugLogs(): Promise<DebugLogClearResponse> {
+  return request<DebugLogClearResponse>('/api/debug/logs/clear', {
+    method: 'POST',
+  })
 }

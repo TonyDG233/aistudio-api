@@ -71,7 +71,7 @@ export const useDebugStore = defineStore('debug', () => {
     runningScenario.value = label
     try {
       const res = await debugApi.applyScenario(req)
-      toast.success(`UI 调试已应用: ${label}`)
+      toast.success(`UI Debug 已应用: ${label}`)
       state.value = { ...(state.value || {}), ...res }
       await fetchState()
       return true
@@ -93,6 +93,37 @@ export const useDebugStore = defineStore('debug', () => {
     return apply({ action })
   }
 
+  async function applyDashboard(req: DebugScenarioRequest) {
+    const toast = useToastStore()
+    const label = req.scenario || req.action || 'dashboard'
+    running.value = true
+    runningScenario.value = label
+    try {
+      const res = await debugApi.applyDashboard(req)
+      toast.success(`UI Debug 已应用: ${label}`)
+      state.value = { ...(state.value || {}), ...res }
+      return true
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 404) {
+        debugUnavailable.value = true
+      }
+      const msg = err instanceof Error ? err.message : `应用调试场景失败: ${label}`
+      toast.error(msg)
+      return false
+    } finally {
+      running.value = false
+      runningScenario.value = null
+    }
+  }
+
+  function applyDashboardScenario(scenario: string) {
+    return applyDashboard({ scenario })
+  }
+
+  function applyDashboardAction(action: string) {
+    return applyDashboard({ action })
+  }
+
   return {
     state,
     loading,
@@ -105,5 +136,7 @@ export const useDebugStore = defineStore('debug', () => {
     fetchState,
     applyScenario,
     applyAction,
+    applyDashboardScenario,
+    applyDashboardAction,
   }
 })
