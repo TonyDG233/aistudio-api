@@ -1,6 +1,6 @@
 # 实例池与路由技术规格
 
-- 状态：依据当前 `rebuild-upstream` 工作树源码整理，只读核对，不涉及运行态验收。
+- 状态：依据当前主仓源码整理，只读核对，不涉及运行态验收。
 - 范围：实例池（`InstancePool` / `InstanceSlot` / `PooledSession`）、实例管理器（`InstanceManager`）、Free/Paid 物理隔离、tier 选择器归一化、`active_requests` 并发原语、`RoutingPipeline` 候选排序与错误/改绑路径、`quota_scope` 记账口径、付费模型本地 403 契约。
 - 非范围：浏览器启动细节、wire 编解码、日志/保活、ATG 协议细节。这些分别在其它文档中描述。
 - 文中 `file:line` 均指本仓库路径；代码行为以当前文件为准，项目决策文档仅用于解释意图。
@@ -69,6 +69,7 @@
   - [10.5 Paid tier 不足](#105-paid-tier-不足)
 - [11. 残余限制](#11-残余限制)
 - [12. 证据索引](#12-证据索引)
+- [13. C1b：Tier 单源、tier 同步与 403/429 加固](#13-c1btier-单源tier-同步与-403429-加固)
 
 ---
 
@@ -77,24 +78,24 @@
 | 术语 | 含义 | 证据 |
 |---|---|---|
 | Instance | 用户可见实例：一个账号 + 一个 BrowserContext + 一个 Page + 一个 surface | `src/aistudio_api/domain/instances.py:18-33` |
-| InstanceSlot | 池内运行槽位，持有账号、context、page、session、`active_requests` | `src/aistudio_api/infrastructure/gateway/instance_pool.py:138-214` |
-| PooledSession | 单个 BrowserContext 的会话外壳，持有 page、cookie jar、transport | `src/aistudio_api/infrastructure/gateway/pooled_session.py:42-58` |
-| Lane | `free` / `paid` 两条物理隔离的实例池 | `src/aistudio_api/domain/model_access.py::account_is_paid`, `::instance_lane_for_tier` |
-| `active_requests` | 唯一并发原语；一个实例同一时刻只允许一个请求句柄 | `instance_pool.py:1-11`, `:205-214` |
-| RouteCandidate | 路由阶段冻结的候选快照 | `src/aistudio_api/application/routing_pipeline.py:150-183` |
-| 最小满足 tier | 满足模型 `required_tiers` 的最低账号 tier | `domain/model_access.py:295-317` |
-| 改绑（rebind） | 不新建实例，原地关闭旧 Page/Context 后激活同槽位的新账号 | `instance_pool.py:527-561`, `instance_manager.py:389-425` |
+| InstanceSlot | 池内运行槽位，持有账号、context、page、session、`active_requests` | `src/aistudio_api/infrastructure/gateway/instance_pool.py:140-218` |
+| PooledSession | 单个 BrowserContext 的会话外壳，持有 page、cookie jar、transport | `src/aistudio_api/infrastructure/gateway/pooled_session.py:54-74` |
+| Lane | `free` / `paid` 两条物理隔离的实例池 | `src/aistudio_api/domain/model_access.py:317-330` |
+| `active_requests` | 唯一并发原语；一个实例同一时刻只允许一个请求句柄 | `instance_pool.py:1-11`, `:206-218` |
+| RouteCandidate | 路由阶段冻结的候选快照 | `src/aistudio_api/application/routing_pipeline.py:176-237` |
+| 最小满足 tier | 满足模型 `required_tiers` 的最低账号 tier | `domain/model_access.py:339-362` |
+| 改绑（rebind） | 不新建实例，原地关闭旧 Page/Context 后激活同槽位的新账号 | `instance_pool.py:615-658`, `instance_manager.py:424-478` |
 
 核心不变量：
 
-1. 一个实例只对应一个账号、一个 Context、一个 Page、一个 surface（`instance_pool.py:1-11`, `:138-166`）。
-2. Free 与 Paid 是物理隔离的两条 lane，lane 由账号 tier 推导，不由模型名推导（`domain/model_access.py::account_is_paid`, `::instance_lane_for_tier`）。
-3. 实例创建时必须满足 lane 与 tier 区间；跨 lane 改绑在管理器层直接拒绝（`instance_pool.py:336-343`, `instance_manager.py:395-404`）。
-4. 同一账号不能同时占用两个实例；`create` / `reassign` 均检查（`instance_manager.py:291-294`, `:405-406`）。
+1. 一个实例只对应一个账号、一个 Context、一个 Page、一个 surface（`instance_pool.py:1-11`, `:140-168`）。
+2. Free 与 Paid 是物理隔离的两条 lane，lane 由账号 tier 推导，不由模型名推导（`domain/model_access.py:317-330`）。
+3. 实例创建时必须满足 lane 与 tier 区间；跨 lane 改绑在管理器层直接拒绝（`instance_pool.py:409-446`, `instance_manager.py:424-478`）。
+4. 同一账号不能同时占用两个实例；`create` / `reassign` 均检查（`instance_manager.py:291-352`, `:424-478`）。
 5. 没有 lease / reservation / pinned / defer / 后台 rebalance；只有 `active_requests`（`instance_pool.py:7-10`, `routing_pipeline.py:5-6`）。
-6. 关闭/退役实例必须先关闭 Page，再销毁 BrowserContext，最后触发 realm 级缓存清理（`instance_pool.py:592-627`）。
-7. 路由切换最多消耗 `features.routing.max_switches`（默认 2）；同账号重试不消耗切换预算（`routing_safety.py:13-49`, `routing_pipeline.py:651-678`）。
-8. 一旦流式响应已经向客户端 yield 过数据，不再切换实例（`routing_pipeline.py:633-640`, `:649-650`, `:667-668`, `:720-721`）。
+6. 关闭/退役实例必须先关闭 Page，再销毁 BrowserContext，最后触发 realm 级缓存清理（`instance_pool.py:688-732`）。
+7. 路由切换最多消耗 `features.routing.max_switches`（默认 2）；同账号重试不消耗切换预算（`routing_safety.py:14-50`, `routing_pipeline.py:1102-1150`）。
+8. 一旦流式响应已经向客户端 yield 过数据，不再切换实例（`routing_pipeline.py:772-776`, `:788-790`, `:824-825`, `:895-896`）。
 
 ---
 
@@ -104,12 +105,12 @@
 
 `Instance` 只暴露用户 API 需要的字段（`domain/instances.py:18-33`）：
 
-- `id` / `number`：稳定编号，编号在管理器内单调递增（`instance_manager.py:949-973`）。
+- `id` / `number`：稳定编号，编号在管理器内单调递增（`instance_manager.py:1147-1172`）。
 - `account_id`：当前绑定账号。
 - `state`：`starting` / `active` / `sleeping` / `unstarted` / `reclaiming` / `invalid`（`domain/instances.py:9-15`）。
 - `surface`：`chat` / `build`。
 - `min_tier` / `only_tier` / `max_tier`：归一化后的 tier 选择器视图。
-- `in_flight`：来自 slot 的 `active_requests`（`instance_manager.py:1031-1047`）。
+- `in_flight`：来自 slot 的 `active_requests`（`instance_manager.py:1241-1257`）。
 - `latest`：最近一次成功激活的实例。
 - `tier` / `last_used`：来自 slot 的运行态字段。
 
@@ -117,7 +118,7 @@
 
 ### 2.2 Slot 状态机
 
-`SlotState` 定义（`instance_pool.py:38-46`）：
+`SlotState` 定义（`instance_pool.py:39-49`）：
 
 ```text
 UNSTARTED --add_slot--> UNSTARTED
@@ -128,7 +129,7 @@ READY/SLEEPING --close_slot/retire--> RETIRING --close--> UNSTARTED
 READY --page 被关闭--> INVALID
 ```
 
-管理器侧的 `InstanceState` 映射（`instance_manager.py:1016-1029`）：
+管理器侧的 `InstanceState` 映射（`instance_manager.py:1227-1240`）：
 
 | SlotState | InstanceState |
 |---|---|
@@ -139,11 +140,11 @@ READY --page 被关闭--> INVALID
 | `INVALID` | `invalid` |
 | 其他 | `unstarted` |
 
-`_sync_records` 会在列表/查询时把 slot 状态同步到 record，并检测 page 已关闭的 READY slot（`instance_manager.py:999-1014`）。
+`_sync_records` 会在列表/查询时把 slot 状态同步到 record，并检测 page 已关闭的 READY slot（`instance_manager.py:1209-1226`）。
 
 ### 2.3 启动流程
 
-`InstanceManager.startup()`（`instance_manager.py:164-232`）：
+`InstanceManager.startup()`（`instance_manager.py:168-237`）：
 
 ```text
 get_active_account()
@@ -160,26 +161,27 @@ for spec in pool.specs:
 
 关键点：
 
-- `pool.add_slot` 在超过 `max_contexts` 时抛 `InstanceCapacityError`，启动循环记录日志后 `break`（`instance_manager.py:186-191`, `instance_pool.py:344-349`）。
-- 账号选择要求：未使用、enabled、未 expired、满足 tier 区间、auth 文件存在（`instance_manager.py:773-792`）。
+- `pool.add_slot` 在超过 `max_contexts` 时抛 `InstanceCapacityError`，启动循环记录日志后 `break`（`instance_manager.py:196-207`, `instance_pool.py:409-446`）。
+- 账号选择要求：未使用、enabled、未 expired、满足 tier 区间、auth 文件存在（`instance_manager.py:952-972`）。
 - 启动失败不会自动重启；后续只能人工 `restart` / `wake`（`instance_manager.py:1-12`）。
-- 启动完成后选择当前实例、修复 latest/current（`instance_manager.py:221-232`）。
+- 启动完成后选择当前实例、修复 latest/current（`instance_manager.py:229-237`, `:1259-1292`）。
 
 ### 2.4 显式创建、关闭、切换、休眠、唤醒
 
 | 操作 | 行为 | 证据 |
 |---|---|---|
-| `create` | 校验账号；同账号已有实例则拒绝；按账号 tier 选 lane；按账号 tier 匹配 spec；异步启动 | `instance_manager.py:287-317` |
-| `close` | `STARTING` 取消任务；`active_requests>0` 拒绝；否则 `close_slot` 并删除 record | `instance_manager.py:319-353` |
-| `switch_to` | 同一 surface 直接激活；跨 surface 先关旧 Page/Context，再激活新 surface；失败回滚旧 surface | `instance_manager.py:355-387` |
-| `reassign` | 校验 lane/tier/重复账号/忙；激活新账号；失败回滚旧账号 | `instance_manager.py:389-425` |
-| `restart` | 忙则拒绝；重新激活当前账号 | `instance_manager.py:427-438` |
-| `sleep` | 忙则拒绝；关闭运行态并保留槽位 | `instance_manager.py:440-449` |
-| `wake` | 仅 `UNSTARTED` / `SLEEPING` 可唤醒；要求账号 enabled | `instance_manager.py:451-463` |
-| `wake_eligible` | 消息到达时唤醒同 lane/surface 的所有可唤醒实例 | `instance_manager.py:465-505` |
-| `rebind_account` | D-05 控制面改绑：旧实例进入 RETIRING、有界 drain、超时强制关闭，成功后切换账号 | `instance_manager.py:507-608` |
+| `create` | 校验账号；同账号已有实例则拒绝；按账号 tier 选 lane；按账号 tier 匹配 spec；异步启动 | `instance_manager.py:291-352` |
+| `close` | `STARTING` 取消任务；`active_requests>0` 拒绝；否则 `close_slot` 并删除 record | `instance_manager.py:354-389` |
+| `switch_to` | 同一 surface 直接激活；跨 surface 先关旧 Page/Context，再激活新 surface；失败回滚旧 surface | `instance_manager.py:390-423` |
+| `reassign` | 校验 lane/tier/重复账号/忙；激活新账号；失败回滚旧账号 | `instance_manager.py:424-478` |
+| `restart` | 忙则拒绝；重新激活当前账号 | `instance_manager.py:480-492` |
+| `sleep` | 忙则拒绝；关闭运行态并保留槽位 | `instance_manager.py:493-503` |
+| `wake` | 仅 `UNSTARTED` / `SLEEPING` 可唤醒；要求账号 enabled | `instance_manager.py:504-517` |
+| `wake_eligible` | 消息到达时唤醒同 lane/surface 的所有可唤醒实例 | `instance_manager.py:518-558` |
+| `rebind_account` | D-05 控制面改绑：旧实例进入 RETIRING、有界 drain、超时强制关闭，成功后切换账号 | `instance_manager.py:560-661` |
+| `sync_account_tier` | 手动 tier 变化：同 lane 原位同步；跨 lane 退役旧绑定并在新 lane 重绑 | `instance_manager.py:738-862`, `instance_pool.py:288-368` |
 
-`_activate` 的失败分类（`instance_manager.py:843-898`）：
+`_activate` 的失败分类（`instance_manager.py:1022-1080`）：
 
 - tier 不匹配 -> `InstanceInvalidAccountError`，record=`INVALID`。
 - pool busy -> `InstanceBusyError`，record 恢复原状态。
@@ -188,19 +190,19 @@ for spec in pool.specs:
 
 ### 2.5 PooledSession 生命周期
 
-`PooledSession.bootstrap`（`pooled_session.py:64-114`）：
+`PooledSession.bootstrap`（`pooled_session.py:80-140`）：
 
 1. 在指定 Context 创建 Page，`block_assets=True`。
-2. 加载 cookie 到 Page，导航到 AI Studio。
+2. 导航前注入按账号确定性桌面指纹（`apply_fingerprint`），再加载 cookie、导航到 AI Studio。
 3. 运行 BotGuard + 模板捕获，带 90s 超时。
 4. 从 auth 元数据读取 tier，构造 `SessionContext`。
 5. 返回持有 `XHRStreamTransport` 的 session。
 
-`request_scope`（`pooled_session.py:128-136`）维护会话内部 `_in_flight` 与 `SessionContext.in_flight`；`generate_content` / `stream_generate_content` 都包在该 scope 内（`instance_client.py:136-171`, `:241-265`）。
+`request_scope`（`pooled_session.py:153-161`）维护会话内部 `_in_flight` 与 `SessionContext.in_flight`；`generate_content` / `stream_generate_content` 都包在该 scope 内（`instance_client.py:136-171`, `:241-265`）。
 
 注意：`PooledSession._in_flight` 与 `InstanceSlot.active_requests` 是两个层次。前者是会话内部计数，后者是池级请求句柄；路由/关闭/退役判断使用后者。
 
-`close` 清空模板缓存并关闭 Page（`pooled_session.py:264-267`）。
+`close` 清空模板缓存并关闭 Page（`pooled_session.py:324-326`）。
 
 ---
 
@@ -208,59 +210,59 @@ for spec in pool.specs:
 
 ### 3.1 lane 的推导
 
-`model_access.py:40-61`：
+`model_access.py:40-52`：
 
 - `PAID_TIERS = {pro, ultra, plus, paid, ultra_20x}`。
 - `_TIER_RANK`：`free=0, plus=1, pro=2, ultra=3, ultra_20x=4, paid=2`。
-- `instance_lane_for_tier(tier)`：paid tier -> `"paid"`，其余 -> `"free"`（`model_access.py:283-285`）。
+- `instance_lane_for_tier(tier)`：paid tier -> `"paid"`，其余 -> `"free"`（`model_access.py:327-330`）。
 
 因此 lane 只看账号 tier，不看模型名，也不看请求路径。
 
 ### 3.2 选择器本身带 lane
 
-`TierSelector` 包含 `lane`、`only_tier`、`min_tier`、`max_tier`（`model_access.py:71-86`）。`resolve_tier_selector` 的返回值始终带 lane（`model_access.py:119-188`）：
+`TierSelector` 包含 `lane`、`only_tier`、`min_tier`、`max_tier`（`model_access.py:90-105`）。`resolve_tier_selector` 的返回值始终带 lane（`model_access.py:163-233`）：
 
 - Free 选择器 -> `lane="free"`。
 - 付费选择器 -> `lane="paid"`。
-- Free/paid 混合 -> 抛 `TierSelectorError`（`model_access.py:172-176`）。
+- Free/paid 混合 -> 抛 `TierSelectorError`（`model_access.py:217-221`）。
 
 ### 3.3 入池时的强制校验
 
-`InstanceSpec.from_mapping` 解析选择器（`instance_pool.py:61-97`）；`InstanceSpec.lane` 返回 `selector.lane`（`instance_pool.py:108-110`）。
+`InstanceSpec.from_mapping` 解析选择器（`instance_pool.py:63-99`）；`InstanceSpec.lane` 返回 `selector.lane`（`instance_pool.py:110-111`）。
 
-`InstancePool.add_slot`（`instance_pool.py:327-364`）：
+`InstancePool.add_slot`（`instance_pool.py:409-446`）：
 
 - surface 必须为 `chat`/`build`。
 - lane 必须为 `free`/`paid`。
 - `normalized.lane != lane` -> `ValueError("instance tier selector lane ... cannot use ... slot")`。
 - 超过 `max_contexts` -> `InstanceCapacityError`。
 
-`InstancePool.activate`（`instance_pool.py:366-460`）：
+`InstancePool.activate`（`instance_pool.py:448-547`）：
 
 - `account_lane != slot.lane` -> `InstanceTierError`。
 - `not slot.accepts_tier(tier)` -> `InstanceTierError`。
-- 已 READY 且账号/auth/surface 相同且 Page 未关闭 -> 复用，不重启（`:404-412`）。
-- `active_requests > 0` -> `InstanceBusyError`（`:414-417`）。
-- 否则关闭旧运行态、置 STARTING、启动（`:419-447`）。
+- 已 READY 且账号/auth/surface 相同且 Page 未关闭 -> 复用，不重启（`:488-495`）。
+- `active_requests > 0` -> `InstanceBusyError`（`:497-501`）。
+- 否则关闭旧运行态、置 STARTING、启动（`:502-547`）。
 
 ### 3.4 管理器层的跨池拒绝
 
-- `create`：`lane = instance_lane_for_tier(account.tier)`，再用 `_matching_spec` 找同 surface 且接受该 tier 的 spec（`instance_manager.py:295-304`）。
-- `reassign`：`instance_lane_for_tier(account.tier) != record.lane` -> `InstanceInvalidAccountError("Free/paid 实例池互相隔离，不能跨池改绑账号")`（`instance_manager.py:395-398`）。
-- `reassign` 还要求 `record.accepts_tier(account.tier)`（`:399-404`）。
-- `_activate` 再次检查 `record.accepts_tier`（`:851-856`）。
-- `eligible_instances(paid=...)` 只返回对应 lane（`instance_manager.py:249-267`）。
-- `discovery_sessions` 固定 Paid 优先、同 lane 空闲优先（`instance_manager.py:628-651`）。
+- `create`：`lane = instance_lane_for_tier(account.tier)`，再用 `_matching_spec` 找同 surface 且接受该 tier 的 spec（`instance_manager.py:299-311`）。
+- `reassign`：`instance_lane_for_tier(account.tier) != record.lane` -> `InstanceInvalidAccountError("Free/paid 实例池互相隔离，不能跨池改绑账号")`（`instance_manager.py:432-441`）。
+- `reassign` 还要求 `record.accepts_tier(account.tier)`（`:442-449`）。
+- `_activate` 再次检查 `record.accepts_tier`（`:1033-1039`）。
+- `eligible_instances(paid=...)` 只返回对应 lane（`instance_manager.py:253-272`）。
+- `discovery_sessions` 固定 Paid 优先、同 lane 空闲优先（`instance_manager.py:681-705`）。
 
 ### 3.5 Paid 的 chat-only 限制
 
-`is_chat_only_model` 对 Paid 模型返回 True（`model_access.py:255-261`），`surface_capability` 把能力面限制为 `chat`（`model_access.py:328-338`）。`resolve_model_route` 在 surface 不在能力面时抛 `SurfaceCapacityError`，错误消息带 `[ROUTING-RULE: PAID_CHAT_ONLY]`（`routing_eligibility.py:221-233`）。
+`is_chat_only_model` 对 Paid 模型返回 True（`model_access.py:299-306`），`surface_capability` 把能力面限制为 `chat`（`model_access.py:372-385`）。`resolve_model_route` 在 surface 不在能力面时抛 `SurfaceCapacityError`，错误消息带 `[ROUTING-RULE: PAID_CHAT_ONLY]`（`routing_eligibility.py:221-233`）。
 
-`RoutingPipeline.begin` 还显式拒绝 `build` surface（`routing_pipeline.py:326-330`），因此当前版本 Paid 模型不会落到 build 实例。
+`RoutingPipeline.begin` 还显式拒绝 `build` surface（`routing_pipeline.py:392-396`），因此当前版本 Paid 模型不会落到 build 实例。
 
 ### 3.6 默认配置
 
-`defaults/config.yaml:8-18` 默认两条实例：
+`defaults/config.yaml:28-37` 默认两条实例：
 
 ```yaml
 instances:
@@ -281,7 +283,7 @@ max_contexts: 2
 
 ### 4.1 规范化输入
 
-`canonical_tier` 将输入 trim、转小写、空格/连字符转下划线，再映射到规范标签（`model_access.py:88-93`）：
+`canonical_tier` 将输入 trim、转小写、空格/连字符转下划线，再映射到规范标签（`model_access.py:107-113`）：
 
 | 输入示例 | 规范标签 |
 |---|---|
@@ -291,48 +293,48 @@ max_contexts: 2
 | `ultra` | `Ultra` |
 | `ultra_20x` / `ultra20x` | `Ultra_20X` |
 
-`_selector_label` 对非字符串、未知 tier 直接抛 `TierSelectorError`（`model_access.py:96-116`）；空字符串视为未提供。
+`_selector_label` 对非字符串、未知 tier 直接抛 `TierSelectorError`（`model_access.py:140-161`）；空字符串视为未提供。
 
 ### 4.2 归一化规则总表
 
-`resolve_tier_selector`（`model_access.py:119-188`）：
+`resolve_tier_selector`（`model_access.py:163-233`）：
 
 | 输入 | lane | 结果区间 | 说明 |
 |---|---|---|---|
-| 三者都没有 | — | 抛错 | 至少需要一个选择器（`:135-138`） |
-| `only_tier: Free` | free | `Free..Free` | `:141-142`, `:154-155` |
-| `only_tier: Ultra` | paid | `Ultra..Ultra_20X` | `:143-144`，Ultra 家族整体接受 |
-| `only_tier: Pro` / `Plus` / `Ultra_20X` | paid | 精确单 tier | `:145-146` |
-| `only_tier` + 非等价 min/max | — | 抛错 | `:147-153` |
-| `max_tier: Free`（无 min/only） | free | `Free..Free` | `:157-159` |
-| `max_tier` 单独且低于 Pro | — | 抛错 | `:160-164` |
-| `max_tier` 单独且 >= Pro | paid | `Pro..max` | `:165` |
-| `min_tier: Free`（无 max/only） | free | `Free..Free` | `:167-169` |
-| `min_tier` 单独且为付费 tier | paid | `min..Ultra_20X` | `:170` |
-| `min=Free, max!=Free` 或 `max=Free, min!=Free` | — | 抛错 | Free/Paid 不能混合（`:172-176`） |
-| `min=Free, max=Free` | free | `Free..Free` | `:174-175` |
-| `min > max` | — | 抛错 | `:177-180` |
-| 付费 `min < Plus` | — | 抛错 | `:181-182` |
-| 付费 `max < Pro` | — | 抛错 | `:183-187` |
-| 合法付费 `min..max` | paid | `min..max` | `:188` |
+| 三者都没有 | — | 抛错 | 至少需要一个选择器 |
+| `only_tier: Free` | free | `Free..Free` | 归一为 `only=Free,min=Free,max=Free` |
+| `only_tier: Ultra` | paid | `Ultra..Ultra_20X` | Ultra 家族整体接受 |
+| `only_tier: Pro` / `Plus` / `Ultra_20X` | paid | 精确单 tier | 不折叠到相邻 tier |
+| `only_tier` + 非等价 min/max | — | 抛错 | 不允许矛盾组合 |
+| `max_tier: Free`（无 min/only） | free | `Free..Free` | Free 上限只能是 Free |
+| `max_tier` 单独且低于 Pro | — | 抛错 | 付费下界默认 Pro |
+| `max_tier` 单独且 >= Pro | paid | `Pro..max` | 单独上界 |
+| `min_tier: Free`（无 max/only） | free | `Free..Free` | 等价 Free 精确 |
+| `min_tier` 单独且为付费 tier | paid | `min..Ultra_20X` | 单独下界 |
+| `min=Free, max!=Free` 或 `max=Free, min!=Free` | — | 抛错 | Free/Paid 不能混合 |
+| `min=Free, max=Free` | free | `Free..Free` | 标准化 Free |
+| `min > max` | — | 抛错 | 闭区间顺序错误 |
+| 付费 `min < Plus` | — | 抛错 | Plus 槽位必须显式 `only_tier` |
+| 付费 `max < Pro` | — | 抛错 | 付费上界不得低于 Pro |
+| 合法付费 `min..max` | paid | `min..max` | 闭区间 |
 
 关键设计：
 
-- `only_tier: Ultra` 被展开为 `Ultra..Ultra_20X`，而不是单个 `Ultra`；这是为了接受规范化的 Ultra 家族标签（`model_access.py:71-80`, `:143-144`）。
-- `only_tier: Pro` 保持精确 Pro，不会接受 Ultra（`model_access.py:145-146`）。
-- `max_tier` 单独配置默认下界为 Pro，避免出现无法满足付费准入的区间（`model_access.py:160-165`）。
-- Free 选择器统一归一为 `only=Free,min=Free,max=Free`，用于配置合并（`model_defaults.py:345-353`）。
+- `only_tier: Ultra` 被展开为 `Ultra..Ultra_20X`，而不是单个 `Ultra`；这是为了接受规范化的 Ultra 家族标签（`model_access.py:163-233`）。
+- `only_tier: Pro` 保持精确 Pro，不会接受 Ultra。
+- `max_tier` 单独配置默认下界为 Pro，避免出现无法满足付费准入的区间。
+- Free 选择器统一归一为 `only=Free,min=Free,max=Free`，用于配置合并（`model_defaults.py:388-452`）。
 
 ### 4.3 配置层 fail-fast 与合并键
 
-`_normalize_instance_specs`（`model_defaults.py:261-392`）：
+`_normalize_instance_specs`（`model_defaults.py:317-452`）：
 
-- 非 dict 项、非法 count、非法 surface 会被跳过并 warning（`:283-298`）。
-- `only_tier`/`min_tier`/`max_tier` 任一非字符串 -> `ConfigValidationError`（`:303-315`）。
-- 未知 tier -> `ConfigValidationError`（`:316-321`）。
-- 三者全缺失 -> `ConfigValidationError`（`:322-332`）。
-- 调用 `resolve_tier_selector`，把 `TierSelectorError` 转为 `ConfigValidationError`（`:334-343`）。
-- 合并键（`:345-375`）：
+- 非 dict 项、非法 count、非法 surface 会被跳过并 warning（`:319-346`）。
+- `only_tier`/`min_tier`/`max_tier` 任一非字符串 -> `ConfigValidationError`（`:348-365`）。
+- 未知 tier -> `ConfigValidationError`（`:366-375`）。
+- 三者全缺失 -> `ConfigValidationError`（`:376-386`）。
+- 调用 `resolve_tier_selector`，把 `TierSelectorError` 转为 `ConfigValidationError`（`:387-397`）。
+- 合并键（`:398-437`）：
   - Free：`(surface, "Free", "Free", "Free")`。
   - `only_tier` 非 Free：`(surface, only, "", "")`。
   - 纯 min/max：`(surface, "", min, max if 显式 max else "")`。
@@ -342,18 +344,18 @@ max_contexts: 2
 
 ### 4.4 运行期匹配
 
-`tier_matches_selector`（`model_access.py:191-196`）：
+`tier_matches_selector`（`model_access.py:235-241`）：
 
 ```text
 lane(account_tier) == selector.lane
 AND rank(selector.min_tier) <= rank(account_tier) <= rank(selector.max_tier)
 ```
 
-`InstanceSpec.accepts_tier` / `InstanceSlot.accepts_tier` 都调用该函数（`instance_pool.py:112-113`, `:189-190`），确保池层与管理器层使用同一套匹配逻辑。
+`InstanceSpec.accepts_tier` / `InstanceSlot.accepts_tier` 都调用该函数（`instance_pool.py:113-114`, `:190-192`），确保池层与管理器层使用同一套匹配逻辑。
 
 ### 4.5 max_contexts
 
-`get_configured_max_contexts` 缺省为 `instances` count 之和，上限 16（`model_defaults.py:398-416`, `:1524-1531`）。`InstancePool.max_contexts` 取 provider 或静态值，至少 1（`instance_pool.py:269-273`）。`InstanceManager.max_instances` 同样至少 1（`instance_manager.py:160-162`）。
+`get_configured_max_contexts` 缺省为 `instances` count 之和，上限 16（`model_defaults.py:454-473`, `:1645-1652`）。`InstancePool.max_contexts` 取 provider 或静态值，至少 1（`instance_pool.py:271-277`）。`InstanceManager.max_instances` 同样至少 1（`instance_manager.py:165-166`）。
 
 ---
 
@@ -361,13 +363,13 @@ AND rank(selector.min_tier) <= rank(account_tier) <= rank(selector.max_tier)
 
 ### 5.1 字段与语义
 
-`InstanceSlot` 关键字段（`instance_pool.py:138-166`）：
+`InstanceSlot` 关键字段（`instance_pool.py:140-168`）：
 
 - `active_requests: int = 0`
 - `active_zero: asyncio.Event`，初始 set。
 - `lifecycle_lock: asyncio.Lock`，串行化激活/关闭/退役。
 
-`acquire_request`（`:205-208`）：
+`acquire_request`（`:206-210`）：
 
 ```text
 active_requests += 1
@@ -375,7 +377,7 @@ active_zero.clear()
 last_used = monotonic()
 ```
 
-`release_request`（`:210-214`）：
+`release_request`（`:211-218`）：
 
 ```text
 active_requests = max(0, active_requests - 1)
@@ -383,34 +385,34 @@ last_used = monotonic()
 if active_requests == 0: active_zero.set()
 ```
 
-`ActiveRequest.release` 是幂等的；重复调用不会重复减计数（`instance_pool.py:116-135`）。
+`ActiveRequest.release` 是幂等的；重复调用不会重复减计数（`instance_pool.py:118-138`）。
 
 ### 5.2 获取句柄
 
-`InstancePool.begin_request`（`instance_pool.py:498-512`）：
+`InstancePool.begin_request`（`instance_pool.py:586-600`）：
 
 1. slot 必须存在。
 2. state 必须 `READY`。
 3. Page 未关闭；若已关闭则把 slot 置 `INVALID` 并抛 `InstanceCapacityError`。
 4. `acquire_request()`，返回 `ActiveRequest`。
 
-`InstanceManager.begin_request`（`instance_manager.py:610-617`）先检查 record 为 `ACTIVE`，再调用 pool；pool busy 转为 `InstanceBusyError`。
+`InstanceManager.begin_request`（`instance_manager.py:663-670`）先检查 record 为 `ACTIVE`，再调用 pool；pool busy 转为 `InstanceBusyError`。
 
 ### 5.3 忙时拒绝与有界 drain
 
 | 操作 | 忙时行为 | 证据 |
 |---|---|---|
-| `activate` | `InstanceBusyError`，不覆盖运行态 | `instance_pool.py:414-417` |
-| `sleep` | `InstanceCapacityError` -> 管理器转 `InstanceBusyError` | `instance_pool.py:519-525`, `instance_manager.py:440-449` |
-| `close_slot` | 抛 `InstanceCapacityError`，不删除 | `instance_pool.py:563-575` |
-| `retire_runtime` | 置 RETIRING；等待 `active_zero`，超时后强制关闭并返回 True | `instance_pool.py:527-561` |
-| 管理器 `close`/`switch`/`reassign`/`restart` | 先检查 `slot.active_requests > 0` 并拒绝 | `instance_manager.py:340-342`, `:369-371`, `:407-409`, `:432-434` |
+| `activate` | `InstanceBusyError`，不覆盖运行态 | `instance_pool.py:497-501` |
+| `sleep` | `InstanceCapacityError` -> 管理器转 `InstanceBusyError` | `instance_pool.py:602-614`, `instance_manager.py:493-503` |
+| `close_slot` | 抛 `InstanceCapacityError`，不删除 | `instance_pool.py:659-672` |
+| `retire_runtime` | 置 RETIRING；等待 `active_zero`，超时后强制关闭并返回 True | `instance_pool.py:615-658` |
+| 管理器 `close`/`switch`/`reassign`/`restart` | 先检查 `slot.active_requests > 0` 并拒绝 | `instance_manager.py:372-376`, `:401-405`, `:455-459`, `:484-488` |
 
-`retire_runtime` 的 drain 超时来自 `InstanceManager._drain_timeout_s`，默认 12 秒（`instance_manager.py:39`, `:144-150`），由 `_retire_record` 传入（`instance_manager.py:900-916`）。
+`retire_runtime` 的 drain 超时来自 `InstanceManager._drain_timeout_s`，默认 12 秒（`instance_manager.py:141-150`），由 `_retire_record` 传入（`instance_manager.py:1081-1098`）。
 
 ### 5.4 关闭顺序
 
-`_close_runtime`（`instance_pool.py:592-627`）：
+`_close_runtime`（`instance_pool.py:688-732`）：
 
 1. 保存旧 `session` / `context_id` / `cdp` / `realm_id`。
 2. 先 `session.close()`，即关闭 Page。
@@ -422,7 +424,7 @@ if active_requests == 0: active_zero.set()
 
 ### 5.5 发现会话不使用 `active_requests`
 
-`discovery_sessions` 只返回 READY、session 非空、Page 未关闭的槽位；排序 Paid 优先、空闲优先（`instance_manager.py:628-651`）。它不获取 `active_requests`，不关闭/退役/改 lane（`:632-636`）。因此模型发现可以在不影响请求调度的前提下复用现有 Page。
+`discovery_sessions` 只返回 READY、session 非空、Page 未关闭的槽位；排序 Paid 优先、空闲优先（`instance_manager.py:681-705`）。它不获取 `active_requests`，不关闭/退役/改 lane（`:685-689`）。因此模型发现可以在不影响请求调度的前提下复用现有 Page。
 
 ---
 
@@ -438,7 +440,7 @@ if active_requests == 0: active_zero.set()
 
 ### 6.2 `begin` 的准入顺序
 
-`RoutingPipeline.begin`（`routing_pipeline.py:313-393`）：
+`RoutingPipeline.begin`（`routing_pipeline.py:379-470`）：
 
 ```text
 ensure_started()
@@ -462,18 +464,18 @@ return RouteContext(route, candidates, budget, max_retries)
 
 逐段说明：
 
-1. `_ensure_started` 在 instance manager 尚未配置 surface 时调用 `startup()`（`routing_pipeline.py:504-513`）。
+1. `_ensure_started` 在 instance manager 尚未配置 surface 时调用 `startup()`（`routing_pipeline.py:583-592`）。
 2. `resolve_model_route` 冻结 surface、lane、`required_tiers`、`required_tier`、`tier`（`routing_eligibility.py:207-260`）。
-3. `build` surface 目前显式拒绝，不会静默换面（`routing_pipeline.py:326-330`）。
-4. `_wake` 只唤醒同 lane/surface 的 `UNSTARTED`/`SLEEPING`（`routing_pipeline.py:515-524`, `instance_manager.py:465-505`）。
-5. `eligible_instances` 已按 lane/surface 过滤，并包含 `UNSTARTED`/`SLEEPING`/`STARTING`/`ACTIVE`（`instance_manager.py:249-267`）。
-6. `tier_allows` 按模型 `required_tiers` 做最低要求过滤（`routing_eligibility.py:263-264`, `model_access.py:307-317`）。
-7. `_account_available` 通过 rotator 检查账号 enabled/expired/session/cooldown（`routing_pipeline.py:469-481`, `account_rotator.py:634-646`）。
-8. 若 Paid 请求没有可用账号，先用 `_current_tier` 判断是否属于 tier 不足，再决定 403 还是 503（`routing_pipeline.py:336-347`, `:354-360`）。
+3. `build` surface 目前显式拒绝，不会静默换面（`routing_pipeline.py:392-396`）。
+4. `_wake` 只唤醒同 lane/surface 的 `UNSTARTED`/`SLEEPING`（`routing_pipeline.py:594-605`, `instance_manager.py:518-558`）。
+5. `eligible_instances` 已按 lane/surface 过滤，并包含 `UNSTARTED`/`SLEEPING`/`STARTING`/`ACTIVE`（`instance_manager.py:253-272`）。
+6. `tier_allows` 按模型 `required_tiers` 做最低要求过滤（`routing_eligibility.py:263-264`, `model_access.py:351-362`）。
+7. `_account_available` 通过 rotator 检查账号 enabled/expired/session/cooldown（`routing_pipeline.py:540-558`, `account_rotator.py:634-646`）。
+8. 若 Paid 请求没有可用账号，先用 `_current_tier` 判断是否属于 tier 不足，再决定 403 还是 503（`routing_pipeline.py:402-413`, `:420-426`, `:520-538`）。
 
 ### 6.3 候选排序
 
-`_order`（`routing_pipeline.py:395-438`）构造的排序键严格为：
+`_order`（`routing_pipeline.py:466-506`）构造的排序键严格为：
 
 ```python
 (
@@ -492,14 +494,14 @@ return RouteContext(route, candidates, budget, max_retries)
 
 | 键 | 方向 | 语义 | 来源 |
 |---|---|---|---|
-| `in_flight` | 升序 | 空闲实例优先 | `RouteCandidate.in_flight`（`:157`, `:170-183`） |
-| `account_tier_rank` | 升序 | 最小满足 tier 优先 | `tier_rank(self.tier)`（`:164-167`, `model_access.py:277-280`） |
-| `total_requests` | 升序 | 总请求数更少优先 | rotator `get_account_stats().total_requests`（`:413-418`） |
-| `model_requests` | 升序 | 该模型今日请求数更少优先 | `stats.model_requests_total(route.model)`（`:419-423`） |
+| `in_flight` | 升序 | 空闲实例优先 | `RouteCandidate.in_flight`（`:176-237`） |
+| `account_tier_rank` | 升序 | 最小满足 tier 优先 | `tier_rank(self.tier)`（`:484-492`, `model_access.py:321-325`） |
+| `total_requests` | 升序 | 总请求数更少优先 | rotator `get_account_stats().total_requests`（`:484-492`） |
+| `model_requests` | 升序 | 该模型今日请求数更少优先 | `stats.model_requests_total(route.model)`（`:484-492`） |
 | `last_used` | 升序 | 最久未使用优先（LRU） | `candidate.last_used`（slot 的 monotonic） |
-| `warm` | 升序 | `ACTIVE` 先于非 ACTIVE | `0 if ACTIVE else 1`（`:424`） |
-| `sticky` | 升序 | 当前实例作为最终 tie-breaker | `0 if id == current_instance_id else 1`（`:425`） |
-| `number` | 升序 | 稳定编号兜底 | `candidate.number`（`:434`） |
+| `warm` | 升序 | `ACTIVE` 先于非 ACTIVE | `0 if ACTIVE else 1`（`:493-506`） |
+| `sticky` | 升序 | 当前实例作为最终 tie-breaker | `0 if id == current_instance_id else 1`（`:493-506`） |
+| `number` | 升序 | 稳定编号兜底 | `candidate.number`（`:493-506`） |
 
 注意：
 
@@ -511,28 +513,29 @@ return RouteContext(route, candidates, budget, max_retries)
 
 模型侧：
 
-- `resolve_model_route` 用 `resolve_required_tiers` 得到允许 tier 集合，再取 `minimum_required_tier` 作为 `required_tier`（`routing_eligibility.py:234-260`, `model_access.py:295-304`）。
-- `tier_allows(account_tier, route)` 只要求 `tier_rank(account_tier) >= tier_rank(minimum_required_tier)`（`model_access.py:307-317`, `routing_eligibility.py:263-264`）。
+- `resolve_model_route` 用 `resolve_required_tiers` 得到允许 tier 集合，再取 `minimum_required_tier` 作为 `required_tier`（`routing_eligibility.py:234-260`, `model_access.py:339-350`）。
+- `tier_allows(account_tier, route)` 只要求 `tier_rank(account_tier) >= tier_rank(minimum_required_tier)`（`model_access.py:351-362`, `routing_eligibility.py:263-264`）。
 
 实例侧：
 
-- `_order` 在所有满足 `tier_allows` 的候选中按 `account_tier_rank` 升序，因此优先选择“刚好满足”的最低等级账号（`routing_pipeline.py:426-435`）。
+- `_order` 在所有满足 `tier_allows` 的候选中按 `account_tier_rank` 升序，因此优先选择“刚好满足”的最低等级账号（`routing_pipeline.py:484-506`）。
 - 例如 Paid 模型要求 Pro：Pro 排在 Ultra/Ultra_20X 之前；Free 账号不会进入 Paid lane。
 - `Plus` 的 rank 为 1，但 Paid 路由的最低要求通常是 Pro（rank 2），因此 Plus 不能承接 Pro 模型。
 
 ### 6.5 `_current_tier` 与 403 判定
 
-`_current_tier` 取候选实例 tier 与 enabled/未 expired 账号 tier 的最高值（`routing_pipeline.py:449-467`）。因此：
+`_current_tier` 取候选实例 tier 与 enabled/未 expired 账号 tier 的最高值（`routing_pipeline.py:520-538`）。因此：
 
 - Paid lane 没有候选但存在一个可用的 Pro/Ultra 账号时，不会误报 403，而是可能报 `SurfaceCapacityError`（实例容量/账号冷却）。
 - 只有当“最高可用 tier”也不满足模型要求时才报 `TierRequiredError`。
 
 ### 6.6 切换预算与重试上限
 
-- `max_switches`：来自 `features.routing.max_switches`，默认 2；非法值回退 2（`model_defaults.py:1420-1447`, `defaults/config.yaml:43-46`）。
-- `max_retries`：来自 `rotator.max_retries`，默认 5，最小 1（`routing_pipeline.py:496-502`, `defaults/config.yaml:33-41`）。
-- `RoutingBudget` 只统计 switch；`record_retry` 单独统计同账号重试（`routing_safety.py:13-49`）。
-- `can_continue` 需要同时满足 `total_attempts < max_retries` 且 `budget.can_switch()`（`routing_pipeline.py:891-894`）。
+- `max_switches`：来自 `features.routing.max_switches`，默认 2；非法值回退 2（`model_defaults.py:1498-1533`, `defaults/config.yaml:87-89`）。
+- `retry_same_delay_sec`：429 同账号首次重试退避，默认 2.0s，范围 0..30；`AISTUDIO_RETRY_SAME_DELAY_SEC` 可覆盖（`model_defaults.py:989-1051`, `routing_pipeline.py:445-454`, `defaults/config.yaml:85-89`）。
+- `max_retries`：来自 `rotator.max_retries`，默认 5，最小 1（`routing_pipeline.py:575-581`, `defaults/config.yaml:73-74`）。
+- `RoutingBudget` 只统计 switch；`record_retry` 单独统计同账号重试（`routing_safety.py:14-50`）。
+- `can_continue` 需要同时满足 `total_attempts < max_retries` 且 `budget.can_switch()`（`routing_pipeline.py:1102-1150`）。
 
 ---
 
@@ -540,9 +543,9 @@ return RouteContext(route, candidates, budget, max_retries)
 
 ### 7.1 `acquire`
 
-`RoutingPipeline.acquire`（`routing_pipeline.py:528-584`）：
+`RoutingPipeline.acquire`（`routing_pipeline.py:607-663`）：
 
-1. `next_candidate`：跳过已尝试实例和 `failed_accounts`（`routing_pipeline.py:199-206`）。
+1. `next_candidate`：跳过已尝试实例和 `failed_accounts`（`routing_pipeline.py:209-217`）。
 2. 若候选为 `UNSTARTED` / `SLEEPING`，先 `wake`（`:537-545`）。
 3. `manager.begin_request(instance_id)` 获取句柄（`:546-548`）。
 4. 若 session 为空，释放句柄并抛 `SurfaceCapacityError`（`:549-552`）。
@@ -553,28 +556,28 @@ return RouteContext(route, candidates, budget, max_retries)
 
 ### 7.2 `handle_error` 决策表
 
-`handle_error`（`routing_pipeline.py:619-735`）返回 `"retry_same"` / `"switch"` / `"raise"`：
+`handle_error`（`routing_pipeline.py:754-910`）返回 `"retry_same"` / `"switch"` / `"raise"`：
 
 | 异常 | 首次处理 | 二次处理 | 已 yield 数据 | 证据 |
 |---|---|---|---|---|
-| `TierRequiredError` | 直接抛出 | — | — | `:628-629` |
-| `ValueError` | 转 `RequestError(400)` | — | — | `:630-631` |
-| `SessionExpiredError` | 记录 `session_expired`；清模板；立即 `_switch_or_raise` | 预算/候选耗尽后抛出 | 抛出，不切换 | `:633-640` |
-| `AuthError`（403） | 若候选 tier 不满足 -> `TierRequiredError`；否则记录 `auth_error`、清模板；`same_retries==0` 且未超 max_retries -> `retry_same` | 第二次 -> `_switch_or_raise(reason="auth_error")` | 抛出，不切换 | `:642-663` |
-| `UsageLimitExceeded`（429） | 记录 `rate_limited`；`same_retries==0` 且未超 max_retries -> `retry_same` | 第二次 -> `_switch_or_raise(reason="429", quota_exhausted=True)` | 抛出，不切换 | `:665-685` |
-| `RequestError(204)` | 同账号重试一次（清模板） | 仍空 -> `BrowserTransportError` | 抛出，不切换 | `:687-715` |
-| `RequestError(404)` 且 transient RPC | 同账号重试一次 | 仍失败 -> 抛出 | 抛出，不切换 | `:687-715` |
-| 非 transient `RequestError(404)` | 直接抛出 | — | — | `:689-693` |
-| 浏览器会话挂起 | 记录、清模板；未 yield -> `_switch_or_raise(reason="session_hang")` | 预算/候选耗尽 -> 抛出 | 抛出，不切换 | `:717-724` |
-| 其他 `RequestError` | 直接抛出 | — | — | `:726-728` |
-| 其他 `AistudioError` / `BrowserTransportError` | 直接抛出 | — | — | `:730-732` |
-| 未知异常 | 记录后抛出 | — | — | `:734-735` |
+| `TierRequiredError` | 直接抛出 | — | — | `:763-764` |
+| `ValueError` | 转 `RequestError(400)` | — | — | `:765-766` |
+| `SessionExpiredError` | 记录 `session_expired`；清模板；立即 `_switch_or_raise` | 预算/候选耗尽后抛出 | 抛出，不切换 | `:769-776` |
+| `AuthError`（403） | 若候选 tier 不满足 -> `TierRequiredError`；否则记录 `auth_error`、清模板；`_refresh_auth_state` 成功后 `same_retries==0` -> `retry_same`；刷新失败直接切号/报错 | 第二次 -> `_switch_or_raise(reason="auth_error")` | 抛出，不切换 | `:778-820`、`:912-954` |
+| `UsageLimitExceeded`（429） | 记录 `rate_limited`；`same_retries==0` 且未超 max_retries -> 按 `retry_same_delay_sec`（默认 2.0s）退避后 `retry_same` | 第二次 -> `_switch_or_raise(reason="429", quota_exhausted=True)` | 抛出，不切换 | `:822-853` |
+| `RequestError(204)` | 同账号重试一次（清模板） | 仍空 -> `BrowserTransportError` | 抛出，不切换 | `:855-890` |
+| `RequestError(404)` 且 transient RPC | 同账号重试一次 | 仍失败 -> 抛出 | 抛出，不切换 | `:855-890` |
+| 非 transient `RequestError(404)` | 直接抛出 | — | — | `:855-861` |
+| 浏览器会话挂起 | 记录、清模板；未 yield -> `_switch_or_raise(reason="session_hang")` | 预算/候选耗尽 -> 抛出 | 抛出，不切换 | `:892-899` |
+| 其他 `RequestError` | 直接抛出 | — | — | `:901-903` |
+| 其他 `AistudioError` / `BrowserTransportError` | 直接抛出 | — | — | `:905-907` |
+| 未知异常 | 记录后抛出 | — | — | `:909-910` |
 
-同账号重试使用 `budget.record_retry(...)`，不消耗 switch 预算（`:654`, `:672`, `:701`）。切换使用 `budget.record_switch(...)`（`:853`, `:908`）。
+同账号重试使用 `budget.record_retry(...)`，不消耗 switch 预算（`:797`, `:829`, `:873`）。切换使用 `budget.record_switch(...)`（`:1102-1150`）。
 
 ### 7.3 `_switch_or_raise` 与 `_try_rebind`
 
-`_switch_or_raise`（`routing_pipeline.py:879-917`）：
+`_switch_or_raise`（`routing_pipeline.py:1102-1150`）：
 
 ```text
 if not attempt.account_id: raise exc
@@ -593,21 +596,21 @@ await _wake(route)
 return "switch"
 ```
 
-`_try_rebind`（`routing_pipeline.py:737-867`）的前提与步骤：
+`_try_rebind`（`routing_pipeline.py:956-1100`）的前提与步骤：
 
-1. manager 必须有 `reassign`，rotator 必须有 `select_rebind_account`；否则返回 False（`:766-770`）。
-2. 排除集合：`failed_accounts ∪ attempted_accounts ∪ {当前账号} ∪ 其他实例已绑定账号`（`:772-790`）。
-3. 先 `release(attempt)` 释放 `active_requests`，因为 pool 在忙时拒绝激活（`:792-795`）。
-4. 若释放后实例仍有在途请求，跳过改绑（`:796-801`）。
+1. manager 必须有 `reassign`，rotator 必须有 `select_rebind_account`；否则返回 False（`:982-987`）。
+2. 排除集合：`failed_accounts ∪ attempted_accounts ∪ {当前账号} ∪ 其他实例已绑定账号`（`:989-1007`）。
+3. 先 `release(attempt)` 释放 `active_requests`，因为 pool 在忙时拒绝激活（`:1009-1012`）。
+4. 若释放后实例仍有在途请求，跳过改绑（`:1013-1018`）。
 5. 循环调用 `select_rebind_account`：
    - 传入 lane、model、surface、排除集合、only/min/max、required_tiers。
-   - 选择器按 `(tier_rank, total_requests, model_requests_total, last_used)` 取最小（`account_rotator.py:700-710`）。
-6. `reassign(instance_id, target_id)`；失败则把目标账号加入 `failed_accounts` 和排除集合后继续（`:823-835`）。
-7. 成功后用新 `Instance` 更新 `RouteContext.candidates` 中同 instance_id 的候选（`:837-850`）。
-8. 单槽 `reuse=True` 时从 `attempted_instances` 移除该实例，使 `next_candidate` 能再次选中它（`:851-852`）。
-9. `budget.record_switch(reason)`；清模板；返回 True（`:853-866`）。
+   - 选择器按 `(tier_rank, total_requests, model_requests_total, last_used)` 取最小（`account_rotator.py:648-710`）。
+6. `reassign(instance_id, target_id)`；失败则把目标账号加入 `failed_accounts` 和排除集合后继续（`:1040-1053`）。
+7. 成功后用新 `Instance` 更新 `RouteContext.candidates` 中同 instance_id 的候选（`:1055-1068`）。
+8. 单槽 `reuse=True` 时从 `attempted_instances` 移除该实例，使 `next_candidate` 能再次选中它（`:1069-1072`）。
+9. `budget.record_switch(reason)`；清模板；返回 True（`:1073-1087`）。
 
-`reassign` 本身（`instance_manager.py:389-425`）：
+`reassign` 本身（`instance_manager.py:424-478`）：
 
 - 同账号直接返回。
 - 跨 lane 拒绝。
@@ -632,11 +635,11 @@ return "switch"
 
 ### 7.5 429 耗尽错误
 
-`UsageLimitExceeded` 在无法继续时，`_switch_or_raise(quota_exhausted=True)` 抛 `SurfaceSwitchExhaustedError`（`routing_pipeline.py:902-907`）。该错误 `status_code = 503`，code=`surface_switch_exhausted`（`domain/errors.py:119-138`）。因此路由层不会把 429 直接作为最终响应；最终是 503。
+`UsageLimitExceeded` 在无法继续时，`_switch_or_raise(quota_exhausted=True)` 抛 `SurfaceSwitchExhaustedError`（`routing_pipeline.py:1125-1137`）。该错误 `status_code = 503`，code=`surface_switch_exhausted`（`domain/errors.py:119-138`）。因此路由层不会把 429 直接作为最终响应；最终是 503。
 
 ### 7.6 成功记录
 
-`record_success`（`routing_pipeline.py:589-617`）：
+`record_success`（`routing_pipeline.py:668-698`）：
 
 - 清 `retry_same`，`last_reason="success"`。
 - 调 `record_rotator_event("success", ...)` 更新账号统计与用量。
@@ -655,7 +658,7 @@ return "switch"
 - `"account"`（默认）：同一账号的 chat/build 共用同一模型键。
 - `"account_surface"`：按 `surface::model` 分开记账。
 
-配置解析（`model_defaults.py:1472-1483`）：非法值 warning 并回退 `"account"`。默认配置 `defaults/config.yaml:33-41` 写 `quota_scope: account`。
+配置解析（`model_defaults.py:1593-1605`）：非法值 warning 并回退 `"account"`。默认配置 `defaults/config.yaml:73-80` 写 `quota_scope: account`。
 
 ### 8.2 键构造
 
@@ -688,7 +691,7 @@ return (primary,) if primary == legacy else (primary, legacy)
 
 ### 8.4 软额度不是硬禁用
 
-账号可用性只看 enabled、expired、session_expired、auth_cooldown、模型冷却；软额度超限不会禁用账号（`account_rotator.py:237-245` 的 docstring，`:634-646` 的实现）。`resolve_tier_quota` 只用于仪表盘百分比展示（`account_rotator.py:758-761`, `model_defaults.py:1283-1299`）。
+账号可用性只看 enabled、expired、session_expired、auth_cooldown、模型冷却；软额度超限不会禁用账号（`account_rotator.py:237-245` 的 docstring，`:634-646` 的实现）。`resolve_tier_quota` 只用于仪表盘百分比展示（`account_rotator.py:758-761`, `model_defaults.py:1361-1431`）。
 
 ### 8.5 429 冷却
 
@@ -720,11 +723,11 @@ return (primary,) if primary == legacy else (primary, legacy)
 
 `RoutingPipeline` 只在本地准入阶段抛该错误：
 
-1. Paid lane 完全没有候选，且 `_current_tier` 不满足要求（`routing_pipeline.py:336-347`）。
-2. Paid lane 有候选但没有任何候选满足 `tier_allows`，且 `_current_tier` 不满足要求（`:354-360`）。
-3. 已选实例返回 `AuthError`，但该实例 tier 不满足路由要求（`:642-646`）。
+1. Paid lane 完全没有候选，且 `_current_tier` 不满足要求（`routing_pipeline.py:402-413`）。
+2. Paid lane 有候选但没有任何候选满足 `tier_allows`，且 `_current_tier` 不满足要求（`:420-426`）。
+3. 已选实例返回 `AuthError`，但该实例 tier 不满足路由要求（`:779-786`）。
 
-`_tier_error`（`:440-447`）：
+`_tier_error`（`:511-519`）：
 
 ```python
 required = route.required_tier or "Pro"
@@ -740,11 +743,11 @@ TierRequiredError(
 
 ### 9.3 不触发切换
 
-`handle_error` 对 `TierRequiredError` 直接 `raise exc`（`routing_pipeline.py:628-629`），不进入同账号重试或切号。这与“tier 不足不是运行时故障，而是请求不合法”的契约一致。
+`handle_error` 对 `TierRequiredError` 直接 `raise exc`（`routing_pipeline.py:763-764`），不进入同账号重试或切号。这与“tier 不足不是运行时故障，而是请求不合法”的契约一致。
 
 ### 9.4 协议渲染
 
-`api/error_mapping.py:60-81` 统一映射：
+`api/error_mapping.py:125-150` 统一映射（入口 `format_errors.py:206-244`）：
 
 - Gemini：`403`，`error.status=PERMISSION_DENIED`，`error` 内合并四个字段。
 - Claude：`403`，`type=error`，`error.type=permission_error`，合并四个字段。
@@ -900,18 +903,18 @@ begin(paid_model)
 
 ## 11. 残余限制
 
-1. **无后台自愈**：改绑只发生在请求路径；没有后台 rebind/rebalance，也没有 idle 回收（`instance_manager.py:7-12`, `routing_pipeline.py:745-755`）。
-2. **单槽改绑依赖 rotator**：若没有 `select_rebind_account` 或没有同 lane 健康账号，`_try_rebind` 返回 False，原错误继续上抛（`routing_pipeline.py:766-770`, `:818-819`）。
+1. **无后台自愈**：改绑只发生在请求路径；没有后台 rebind/rebalance，也没有 idle 回收（`instance_manager.py:1-12`, `routing_pipeline.py:956-1007`）。
+2. **单槽改绑依赖 rotator**：若没有 `select_rebind_account` 或没有同 lane 健康账号，`_try_rebind` 返回 False，原错误继续上抛（`routing_pipeline.py:982-987`, `:1035-1038`）。
 3. **改绑排除集合较宽**：其他实例已绑定账号也会被排除（`:777-790`），因此多槽场景下可用改绑账号可能少于账号总数。
 4. **释放句柄后仍有忙检查**：`_try_rebind` 先 release，再检查 `active_requests`；若同一槽位被其他并发请求重新占用，则放弃改绑（`:792-801`）。这是有意的安全阀，但会让改绑在极端并发下跳过。
 5. **多槽改绑不重用失败槽**：`reuse=False` 时当前请求继续使用其他候选，不会立即回到刚改绑的槽位；这避免在刚失败的槽位上重复等待，但也意味着新账号的实际验证延后到下一个请求。
-6. **tier 错误字段的语义**：`tier` 与 `required_tier` 通常相同（都来自最低 required tier）；如果调用方需要“模型自身 tier”与“最低要求 tier”的区分，当前契约没有提供额外字段（`routing_pipeline.py:440-447`）。
+6. **tier 错误字段的语义**：`tier` 与 `required_tier` 通常相同（都来自最低 required tier）；如果调用方需要“模型自身 tier”与“最低要求 tier”的区分，当前契约没有提供额外字段（`routing_pipeline.py:511-519`）。
 7. **`_current_tier` 包含未绑定账号**：403 的 `current_tier` 可能来自账号库中一个尚未绑定实例的高 tier 账号，而不是当前槽位 tier（`:449-467`）。这是“可用能力”口径，不是“当前实例”口径。
-8. **`build` surface 未实现**：`begin` 直接拒绝，不会切换（`:326-330`）。
-9. **`max_contexts` 上限 16**：超过上限配置会被截断并 warning（`model_defaults.py:395-416`）；启动时达到上限会停止创建后续实例（`instance_manager.py:186-191`）。
-10. **`in_flight` 是槽位级而非账号级**：同一账号不能有两个实例，因此槽位级与账号级在当前模型下等价；但如果未来允许同账号多实例，需要重新审视（`instance_manager.py:291-294`, `:405-406`）。
-11. **`last_used` 是 monotonic**：进程重启后不保留；跨进程的“最久未使用”语义只依赖 rotator 的持久化 `last_used` 统计，而排序键用的是 slot monotonic（`instance_pool.py:159`, `routing_pipeline.py:431`）。
-12. **rotator 缺失时排序信息退化**：`total_requests` / `model_requests` 为 0，候选只在 `in_flight/tier/last_used/warm/sticky/number` 上排序（`routing_pipeline.py:413-424`）。
+8. **`build` surface 当前显式拒绝**：`begin` 在路由层直接抛 `SurfaceCapacityError`，不会静默换面（`routing_pipeline.py:392-396`）。
+9. **`max_contexts` 上限 16**：超过上限配置会被截断并 warning（`model_defaults.py:454-473`）；启动时达到上限会停止创建后续实例（`instance_manager.py:196-207`）。
+10. **`in_flight` 是槽位级而非账号级**：同一账号不能有两个实例，因此槽位级与账号级在当前模型下等价；但如果未来允许同账号多实例，需要重新审视（`instance_manager.py:291-352`, `:424-478`）。
+11. **`last_used` 是 monotonic**：进程重启后不保留；跨进程的“最久未使用”语义只依赖 rotator 的持久化 `last_used` 统计，而排序键用的是 slot monotonic（`instance_pool.py:166`, `routing_pipeline.py:502`）。
+12. **rotator 缺失时排序信息退化**：`total_requests` / `model_requests` 为 0，候选只在 `in_flight/tier/last_used/warm/sticky/number` 上排序（`routing_pipeline.py:484-493`）。
 13. **403 的“首次同账号重签”不是无限制**：受 `max_retries` 约束；如果 `total_attempts` 已达上限，第二次 403 直接进入切换/抛出（`:651-663`）。
 14. **409/503 的区分依赖调用链**：`InstanceBusyError`/`InstanceNotReadyError` 等管理器错误在路由层可能被归入通用异常并继续尝试其他候选（`routing_pipeline.py:570-579`），最终可能表现为 `SurfaceCapacityError`，而不是原始 409。
 
@@ -922,18 +925,61 @@ begin(paid_model)
 | 主题 | 主要证据 |
 |---|---|
 | 实例契约 | `src/aistudio_api/domain/instances.py:9-41` |
-| Slot/ActiveRequest | `src/aistudio_api/infrastructure/gateway/instance_pool.py:116-214` |
-| Pool 生命周期 | `instance_pool.py:327-364`, `:366-460`, `:498-575`, `:592-627` |
-| Manager 生命周期 | `src/aistudio_api/application/instance_manager.py:164-232`, `:287-505`, `:507-608` |
-| 状态映射 | `instance_manager.py:999-1047` |
-| lane 推导 | `src/aistudio_api/domain/model_access.py::account_is_paid`, `::tier_rank`, `::instance_lane_for_tier` |
-| tier 归一化 | `domain/model_access.py:71-188`, `:191-196` |
-| 配置归一化/合并 | `src/aistudio_api/infrastructure/gateway/model_defaults.py:261-416` |
-| 路由准入 | `src/aistudio_api/application/routing_pipeline.py:313-393` |
-| 候选排序 | `routing_pipeline.py:395-438` |
-| 错误处理 | `routing_pipeline.py:619-735` |
-| 改绑 | `routing_pipeline.py:737-917`, `instance_manager.py:389-425` |
-| 预算 | `src/aistudio_api/application/routing_safety.py:13-49` |
-| quota_scope | `src/aistudio_api/application/account_rotator.py:70-101`, `:215-282`, `:544-552`; `model_defaults.py:1472-1483` |
-| 403 契约 | `src/aistudio_api/domain/errors.py:24-62`; `src/aistudio_api/api/error_mapping.py::classify_gemini_error_payload`; `src/aistudio_api/api/gemini_service.py::format_sse_error` |
-| 默认配置 | `defaults/config.yaml:8-18`, `:33-46` |
+| Slot/ActiveRequest | `src/aistudio_api/infrastructure/gateway/instance_pool.py:118-218` |
+| Pool 生命周期 | `instance_pool.py:409-446`, `:448-547`, `:586-672`, `:688-732` |
+| Manager 生命周期 | `src/aistudio_api/application/instance_manager.py:168-237`, `:291-558`, `:560-661`, `:738-862` |
+| 状态映射 | `instance_manager.py:1209-1257` |
+| lane 推导 | `src/aistudio_api/domain/model_access.py:317-330` |
+| tier 归一化 | `domain/model_access.py:90-241` |
+| 配置归一化/合并 | `src/aistudio_api/infrastructure/gateway/model_defaults.py:317-473` |
+| 路由准入 | `src/aistudio_api/application/routing_pipeline.py:379-470` |
+| 候选排序 | `routing_pipeline.py:466-506` |
+| 错误处理 | `routing_pipeline.py:754-910` |
+| 改绑 | `routing_pipeline.py:956-1150`, `instance_manager.py:424-478` |
+| 预算 | `src/aistudio_api/application/routing_safety.py:14-50` |
+| quota_scope | `src/aistudio_api/application/account_rotator.py:70-101`, `:215-282`, `:544-552`; `model_defaults.py:1593-1605` |
+| 403 契约 | `src/aistudio_api/domain/errors.py:24-62`; `src/aistudio_api/api/error_mapping.py:125-150`; `src/aistudio_api/api/gemini_service.py:185-200` |
+| 默认配置 | `defaults/config.yaml:28-37`, `:73-89` |
+
+---
+
+## 13. C1b：Tier 单源、tier 同步与 403/429 加固
+
+### 13.1 Tier 单源
+
+`domain/model_access.py` 是 tier/lane 的唯一事实源：
+
+- `normalize_tier` / `canonical_tier` 统一大小写、空格/连字符与 `ultra20x` 等别名（`model_access.py:107-117`）。
+- `tier_header_value` 统一 `X-AIStudio-G1-Tier` 映射；Free 返回 `None`（`model_access.py:130-137`、`:73-80`）。
+- `benefit_tier_from_code` 统一上游 `GetAiStudioBenefitTier` 整数码（`model_access.py:120-127`、`:66-71`）。
+- `resolve_tier_selector` / `tier_matches_selector` / `tier_rank` / `instance_lane_for_tier` 被实例池、管理器、路由与配置校验共同调用，不允许各层再声明本地副本。
+- Cookie 解析、transport、模型发现、账号刷新与 tier 同步都引用该单源。
+
+### 13.2 `sync_account_tier`
+
+手动刷新或账号页探测到 tier 变化时，`InstanceManager.sync_account_tier(account_id, tier)`（`instance_manager.py:738-862`）执行：
+
+1. `canonical_tier` 归一目标 tier，计算目标 lane。
+2. 在 `_lifecycle_lock` 内同步记录，并调用 `InstancePool.sync_account_tier`（`instance_pool.py:288-368`）。
+3. **同 lane**：原位更新 slot 与 `SessionContext` 的 tier，不重启 Page。
+4. **跨 lane**：旧 slot 进入 `RETIRING`/有界 drain，关闭旧 Page/Context 并解绑；从原 lane 重新挑选账号补位；再把恢复的账号绑定到新 lane 的空闲槽位。
+5. 没有可绑定槽位时保留账号未绑定状态，不强行跨 lane 复用。
+6. 返回受影响的槽位数；路由/实例视图随即反映新 tier。
+
+### 13.3 403 同号重签前强制刷新 Cookie
+
+`RoutingPipeline.handle_error` 对首次 403 不再直接重发旧凭据：
+
+1. 调 `attempt.client.refresh_auth_state()` → `PooledSession.refresh_auth_state()` / `BrowserSession.refresh_auth_state()`
+   → `transport.refresh_page_auth_state(page)`（`routing_pipeline.py:912-954`、`pooled_session.py:237-248`、`session.py:515-527`、`transport.py:157-183`）。
+2. `refresh_page_auth_state` 清空 `page._cached_cookies`，重新 `Network.getCookies`，并确认新 Cookie 仍含 `SAPISID`。
+3. 刷新成功：`same_retries += 1`、清模板、同账号重新签名重试。
+4. 刷新失败：不重发过期凭据，直接 `_switch_or_raise(reason="auth_error")`。
+5. 该刷新同时把 `_force_snapshot_warmup=True`，下一次快照先走本地预热。
+6. Paid tier 不足的 403 仍直接转 `TierRequiredError`，不触发切号。
+
+### 13.4 429 默认 2.0s 退避
+
+`features.routing.retry_same_delay_sec` 默认 `2.0`，范围 `0..30`，可用 `AISTUDIO_RETRY_SAME_DELAY_SEC` 覆盖
+（`defaults/config.yaml:85-89`、`model_defaults.py:989-1051`、`routing_pipeline.py:59`、`:445-454`）。
+首次 429 同账号重试前按该值 `asyncio.sleep` 退避（`routing_pipeline.py:822-846`）；第二次 429 才进入切号/改绑，预算耗尽返回 503。
