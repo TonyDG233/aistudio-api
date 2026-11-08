@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, toRef, onMounted, watch } from 'vue'
 import type { AccountWithStats } from '@/types/accounts.ts'
+import type { Instance } from '@/types/instances.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
@@ -10,7 +11,7 @@ import { useCookieGroups, type CookieGroup } from './useCookieGroups.ts'
 import CookieGroupBlock from './CookieGroupBlock.vue'
 import AccountRow from './AccountRow.vue'
 import { accountStatus } from '@/utils/accountStatus.ts'
-import { boundInstanceFor } from '@/utils/instances.ts'
+import { boundInstanceFor, runningInstancesForAccounts } from '@/utils/instances.ts'
 import {
   Cookie,
   Users,
@@ -216,6 +217,18 @@ function toggleAllFiltered() {
     filteredAccounts.value.forEach((acc) => next.add(acc.id))
   }
   selectedIds.value = next
+}
+
+/**
+ * Running instances whose bound account belongs to this cookie group.
+ * Derived from the instances store so every running slot (#1, #2, ...) is
+ * highlighted instead of the single legacy active account id.
+ */
+function activeInstancesFor(group: CookieGroup): Instance[] {
+  return runningInstancesForAccounts(
+    group.accounts.map((acc) => acc.id),
+    instancesStore.instances,
+  )
 }
 
 function groupSelectedCount(group: CookieGroup): number {
@@ -538,6 +551,7 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         :batch-mode="batchMode"
         :selected-count="groupSelectedCount(group)"
         :total-count="group.accounts.length"
+        :active-instances="activeInstancesFor(group)"
         @toggle="toggleCookieGroup(group.id)"
         @delete-group="handleDeleteCookieGroup(group)"
         @toggle-select-group="toggleSelectGroup(group)"

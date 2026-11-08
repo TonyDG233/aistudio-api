@@ -113,7 +113,7 @@ function close() {
             :key="account.id"
             :value="account.id"
           >
-            {{ account.email || account.name || `编号：${account.id}` }} · {{ tierLabel(account.tier) }}
+            {{ account.email || account.name || `ID: ${account.id}` }} · {{ tierLabel(account.tier) }}
           </option>
         </select>
         <p

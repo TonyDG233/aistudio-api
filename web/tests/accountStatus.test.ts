@@ -6,6 +6,8 @@ import {
   boundInstanceFor,
   instanceStateLabel,
   isSlotOccupied,
+  runningInstancesForAccounts,
+  tierShortLabel,
 } from '../src/utils/instances.ts'
 
 function account(overrides: Partial<AccountWithStats> = {}): AccountWithStats {
@@ -181,6 +183,50 @@ describe('instance state labels and occupancy', () => {
     ]
     expect(boundInstanceFor('acc', instances)?.id).toBe('i-retiring')
     expect(bindingInstanceFor('acc', instances)).toBeNull()
+  })
+
+  test('active slot wins over an earlier retiring slot for the same account', () => {
+    const instances = [
+      instance({ id: 'i-retiring', number: 6, account_id: 'acc', state: 'retiring' }),
+      instance({ id: 'i-active', number: 10, account_id: 'acc', state: 'active' }),
+    ]
+    const bound = boundInstanceFor('acc', instances)
+    expect(bound?.id).toBe('i-active')
+    expect(bound?.number).toBe(10)
+    expect(bound?.state).toBe('active')
+    expect(accountStatus(account({ id: 'acc' }), instances, null)).toMatchObject({
+      key: 'instance',
+      instance: bound,
+    })
+  })
+
+  test('falls back to retiring only when no active slot exists', () => {
+    const instances = [
+      instance({ id: 'i-retiring', number: 6, account_id: 'acc', state: 'retiring' }),
+      instance({ id: 'i-sleeping', number: 7, account_id: 'acc', state: 'sleeping' }),
+    ]
+    expect(boundInstanceFor('acc', instances)?.id).toBe('i-retiring')
+    expect(
+      accountStatus(account({ id: 'acc' }), instances, null).instance?.id,
+    ).toBe('i-retiring')
+  })
+
+  test('finds every running instance bound to a group, ignoring idle slots', () => {
+    const instances = [
+      instance({ id: 'i1', number: 1, account_id: 'acc-a', state: 'active' }),
+      instance({ id: 'i2', number: 2, account_id: 'acc-b', state: 'active' }),
+      instance({ id: 'i3', number: 3, account_id: 'acc-a', state: 'sleeping' }),
+      instance({ id: 'i4', number: 4, account_id: 'other', state: 'active' }),
+    ]
+    const running = runningInstancesForAccounts(['acc-a', 'acc-b'], instances)
+    expect(running.map((item) => item.number)).toEqual([1, 2])
+    expect(runningInstancesForAccounts([], instances)).toEqual([])
+  })
+
+  test('tier badges use short identifiers while forms keep long labels', () => {
+    expect(tierShortLabel('free')).toBe('Free')
+    expect(tierShortLabel('Pro')).toBe('Pro')
+    expect(tierShortLabel('ultra_20x')).toBe('Ultra_20X')
   })
 
   test('binding occupancy ignores stale invalid/retiring slots', () => {

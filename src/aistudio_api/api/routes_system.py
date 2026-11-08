@@ -100,7 +100,11 @@ def default_text_model(runtime_state: RuntimeState) -> str:
 
 def stats_response() -> StatsResponse:
     from aistudio_api.api.response_models import AccountBreakdownItem
-    from aistudio_api.api.state import is_reserved_stats_key, runtime_state
+    from aistudio_api.api.state import (
+        is_reserved_stats_key,
+        normalize_model_name,
+        runtime_state,
+    )
     from aistudio_api.domain.model_access import is_paid_model
     from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
 
@@ -110,7 +114,9 @@ def stats_response() -> StatsResponse:
     stats = {
         name: item
         for name, item in raw_stats.items()
-        if name and not is_reserved_stats_key(name)
+        if name
+        and not is_reserved_stats_key(name)
+        and not is_reserved_stats_key(normalize_model_name(name))
     }
     rotator = runtime_state.rotator
     account_svc = runtime_state.account_service

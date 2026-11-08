@@ -42,7 +42,7 @@ const snapshotModalOpen = ref(false)
 const snapshotName = ref('')
 const snapshotDesc = ref('')
 function groupLabel(group: string): string {
-  return group === 'default' ? '默认分组' : group
+  return group || 'default'
 }
 
 const selectedGroup = ref<string>('ALL')

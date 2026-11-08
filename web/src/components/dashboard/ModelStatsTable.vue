@@ -153,7 +153,7 @@ const statList = computed(() => normalizeModelStats(props.stats))
                 </span>
               </td>
               <td class="py-3.5 px-4 text-center text-gray-600">
-                <span :title="`输入 Tokens: ${(item.prompt_tokens || 0).toLocaleString()} / 输出 Tokens: ${(item.completion_tokens || 0).toLocaleString()}`">
+                <span :title="`Prompt: ${(item.prompt_tokens || 0).toLocaleString()} / Completion: ${(item.completion_tokens || 0).toLocaleString()}`">
                   {{ (item.total_tokens || 0).toLocaleString() }}
                 </span>
               </td>

@@ -38,6 +38,16 @@ export function tierLabel(value: string | null | undefined): string {
   return TIER_LABELS[canonical] || '其他等级'
 }
 
+/** Short machine-style tier identifier for badges (Free/Plus/Pro/Ultra). */
+export function tierShortLabel(value: string | null | undefined): string {
+  const key = String(value || 'Free')
+  return (
+    TIER_OPTIONS.find(
+      (item) => item.toLowerCase() === key.toLowerCase().replace(/[\s-]+/g, '_'),
+    ) || key
+  )
+}
+
 export function tierRank(tier: string | null | undefined): number {
   const key = (tier || 'Free').toLowerCase().replace(/[\s-]+/g, '_')
   return TIER_RANK[key] ?? 0
@@ -66,14 +76,14 @@ export function isTierCompatible(
 
 export function slotSummary(instance: Instance): string {
   if (instance.only_tier) {
-    return `仅限 ${tierLabel(instance.only_tier)}`
+    return `仅限 ${tierShortLabel(instance.only_tier)}`
   }
   const min = instance.min_tier || 'Free'
   const max = instance.max_tier || min
   if (tierRank(min) === tierRank(max)) {
-    return `仅限 ${tierLabel(min)}`
+    return `仅限 ${tierShortLabel(min)}`
   }
-  return `${tierLabel(min)} 至 ${tierLabel(max)}`
+  return `${tierShortLabel(min)} 至 ${tierShortLabel(max)}`
 }
 
 export function fingerprintSummary(instance: Instance): string {
@@ -137,19 +147,40 @@ export function isSlotOccupied(instance: Instance): boolean {
 /**
  * Display-only association: invalid/reclaiming bindings are stale, while a
  * retiring slot is still shown with its exact state label (排空).
+ *
+ * A running slot always wins over a stale retiring binding so the row border,
+ * status pill and group header (which is ACTIVE-only) cannot disagree.
  */
 export function boundInstanceFor(
   accountId: string,
   instances: Instance[],
 ): Instance | null {
   if (!accountId) return null
-  return (
-    instances.find(
-      (instance) =>
-        instance.account_id === accountId &&
-        instance.state !== 'reclaiming' &&
-        instance.state !== 'invalid',
-    ) || null
+  const candidates = instances.filter(
+    (instance) =>
+      instance.account_id === accountId &&
+      instance.state !== 'reclaiming' &&
+      instance.state !== 'invalid',
+  )
+  return candidates.find((instance) => instance.state === 'active') ?? candidates[0] ?? null
+}
+
+/**
+ * Every running instance (#1, #2, ...) bound to one of the given accounts.
+ * Used by group headers and row highlighting so multi-instance pools are not
+ * collapsed into the single legacy active account id.
+ */
+export function runningInstancesForAccounts(
+  accountIds: Iterable<string>,
+  instances: Instance[],
+): Instance[] {
+  const ids = new Set(accountIds)
+  if (ids.size === 0) return []
+  return instances.filter(
+    (instance) =>
+      instance.state === 'active' &&
+      Boolean(instance.account_id) &&
+      ids.has(instance.account_id),
   )
 }
 

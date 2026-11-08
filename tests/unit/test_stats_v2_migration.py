@@ -81,6 +81,111 @@ def test_v2_envelope_loads_models_and_daily(monkeypatch, tmp_path):
     assert not stats_file.with_name("stats.json.bak").exists()
 
 
+def test_v2_top_level_ghost_counters_never_become_models(monkeypatch, tmp_path):
+    stats_file = _use_stats_file(monkeypatch, tmp_path)
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    original = {
+        "schema_version": 2,
+        "models": {"gemini-3.8-flash": {"requests": 4, "success": 4}},
+        "daily": {},
+        # Legacy aggregate counters that used to leak into the model table.
+        "finish_reasons": {"STOP": 12, "MAX_TOKENS": 3},
+        "count_tokens": {"requests": 8},
+        "client": {"requests": 1},
+        "attempt": {"requests": 2},
+        "range": {"requests": 3},
+        "events": {"requests": 4},
+        "quota_scope": {"requests": 5},
+        "updated_at": {"requests": 6},
+        "account_breakdown": {"requests": 7},
+    }
+    stats_file.write_text(json.dumps(original), encoding="utf-8")
+
+    state = RuntimeState()
+
+    assert set(state.model_stats) == {"gemini-3.8-flash"}
+    assert state.model_stats["gemini-3.8-flash"].requests == 4
+    backup = stats_file.with_name("stats.json.bak")
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+    rewritten = json.loads(stats_file.read_text(encoding="utf-8"))
+    assert set(rewritten["models"]) == {"gemini-3.8-flash"}
+    for ghost in ("finish_reasons", "count_tokens", "client", "quota_scope"):
+        assert ghost not in rewritten
+
+
+def test_v2_polluted_models_entry_is_cleaned_but_real_models_kept(
+    monkeypatch, tmp_path
+):
+    stats_file = _use_stats_file(monkeypatch, tmp_path)
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    stats_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "models": {
+                    "finish_reasons": {"STOP": 999},
+                    "models/count_tokens": {"requests": 1},
+                    "gemini-3.7-flash": {"requests": 6, "success": 6},
+                    "gemini-4-argon": {"requests": 2, "errors": 1},
+                },
+                "daily": {
+                    "2026-11-07": {
+                        "finish_reasons": {"STOP": 5},
+                        "gemini-3.7-flash": {"requests": 6},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = RuntimeState()
+
+    assert set(state.model_stats) == {"gemini-3.7-flash", "gemini-4-argon"}
+    assert set(state.daily_stats["2026-11-07"]) == {"gemini-3.7-flash"}
+    rewritten = json.loads(stats_file.read_text(encoding="utf-8"))
+    assert set(rewritten["models"]) == {"gemini-3.7-flash", "gemini-4-argon"}
+    assert "finish_reasons" not in rewritten["models"]
+
+
+def test_v1_flat_ghost_counters_are_skipped(monkeypatch, tmp_path):
+    stats_file = _use_stats_file(monkeypatch, tmp_path)
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    stats_file.write_text(
+        json.dumps(
+            {
+                "gemini-3.8-flash": {"requests": 9, "success": 9},
+                "finish_reasons": {"STOP": 9},
+                "count_tokens": {"requests": 1},
+                "account_breakdown": {"requests": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = RuntimeState()
+
+    assert set(state.model_stats) == {"gemini-3.8-flash"}
+    assert state.model_stats["gemini-3.8-flash"].requests == 9
+
+
+def test_save_stats_never_writes_reserved_ghost_keys(monkeypatch, tmp_path):
+    stats_file = _use_stats_file(monkeypatch, tmp_path)
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    state = RuntimeState()
+
+    from aistudio_api.api.state import ModelStatsItem
+
+    state.model_stats["gemini-3.8-flash"] = ModelStatsItem(requests=3, success=3)
+    state.model_stats["finish_reasons"] = ModelStatsItem(requests=50)
+    state.model_stats["count_tokens"] = ModelStatsItem(requests=10)
+    state.save_stats()
+
+    saved = json.loads(stats_file.read_text(encoding="utf-8"))
+    assert set(saved["models"]) == {"gemini-3.8-flash"}
+    assert saved["models"]["gemini-3.8-flash"]["requests"] == 3
+
+
 def test_ghost_keys_are_skipped_and_clean_structure_written(monkeypatch, tmp_path):
     stats_file = _use_stats_file(monkeypatch, tmp_path)
     stats_file.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +259,10 @@ def test_stats_response_filters_reserved_keys(monkeypatch):
             "schema_version": ModelStatsItem(requests=20),
             "totals": ModelStatsItem(requests=10),
             "version": ModelStatsItem(requests=1),
+            "finish_reasons": ModelStatsItem(requests=9),
+            "count_tokens": ModelStatsItem(requests=8),
+            "account_breakdown": ModelStatsItem(requests=7),
+            "models/finish_reasons": ModelStatsItem(requests=6),
             "gemini-3.8-flash": ModelStatsItem(requests=5, success=4),
         },
     )

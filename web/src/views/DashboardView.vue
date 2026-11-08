@@ -17,7 +17,7 @@ import {
   successRatePercent,
   totalTokenCount,
 } from '@/components/dashboard/dashboardMetrics.ts'
-import { instanceStateLabel, instanceStateTone } from '@/utils/instances.ts'
+import { instanceStateLabel, instanceStateTone, tierShortLabel } from '@/utils/instances.ts'
 import {
   Users,
   Activity,
@@ -87,11 +87,11 @@ function accountIdDisplay(instance: Instance): string {
 }
 
 function instanceTier(instance: Instance): string {
-  return (
+  return tierShortLabel(
     instance.account_tier ||
-    instance.tier ||
-    accountFor(instance)?.tier ||
-    'Free'
+      instance.tier ||
+      accountFor(instance)?.tier ||
+      'Free',
   )
 }
 

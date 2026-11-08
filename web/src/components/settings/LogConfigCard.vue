@@ -27,10 +27,10 @@ const dumpDir = computed(() => asString(logging.value.dump_dir, 'dumps'))
 const uiDebug = computed(() => asBool(diagnostics.value.ui_debug, false))
 
 const logLevels = [
-  { value: 'DEBUG', label: '调试', description: '输出详细的底层运行跟踪' },
-  { value: 'INFO', label: '信息', description: '输出标准运行信息（推荐）' },
-  { value: 'WARNING', label: '警告', description: '仅输出警告与错误' },
-  { value: 'ERROR', label: '错误', description: '仅输出严重错误' },
+  { value: 'DEBUG', label: '调试 (DEBUG)', description: '输出详细的底层运行跟踪' },
+  { value: 'INFO', label: '信息 (INFO)', description: '输出标准运行信息（推荐）' },
+  { value: 'WARNING', label: '警告 (WARNING)', description: '仅输出警告与错误' },
+  { value: 'ERROR', label: '错误 (ERROR)', description: '仅输出严重错误' },
 ]
 
 function patchLogging(key: string, value: unknown) {

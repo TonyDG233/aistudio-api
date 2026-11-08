@@ -136,7 +136,7 @@ function close() {
     <div class="space-y-3 text-sm">
       <div class="p-2.5 rounded-xl bg-gray-50 border border-gray-200 text-[11px] flex items-center gap-2 flex-wrap">
         <span class="font-medium text-gray-800">
-          {{ account?.email || account?.name || (account ? `编号：${account.id}` : '') }}
+          {{ account?.email || account?.name || (account ? `ID: ${account.id}` : '') }}
         </span>
         <span class="px-1.5 py-0.5 rounded bg-white border border-gray-200 font-mono">
           {{ tierLabel(account?.tier) }}

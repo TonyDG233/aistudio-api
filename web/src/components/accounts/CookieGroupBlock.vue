@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import type { Instance } from '@/types/instances.ts'
 import type { CookieGroup } from './useCookieGroups.ts'
 import { formatDate } from '@/utils/format.ts'
 import {
@@ -16,11 +17,13 @@ const props = withDefaults(
     batchMode?: boolean
     selectedCount?: number
     totalCount?: number
+    activeInstances?: Instance[]
   }>(),
   {
     batchMode: false,
     selectedCount: 0,
     totalCount: 0,
+    activeInstances: () => [],
   },
 )
 
@@ -39,6 +42,12 @@ const expiredCount = computed(
     ).length,
 )
 
+const runningInstances = computed(() =>
+  props.activeInstances.filter((instance) => instance.state === 'active'),
+)
+
+const hasRunningInstance = computed(() => runningInstances.value.length > 0)
+
 const allSelected = computed(
   () => props.totalCount > 0 && props.selectedCount >= props.totalCount,
 )
@@ -54,7 +63,7 @@ const someSelected = computed(
     <div
       class="px-5 py-3.5 flex items-center justify-between gap-3 cursor-pointer select-none transition-colors"
       :class="[
-        group.hasActive ? 'bg-brand-50/30 hover:bg-brand-50/50' : 'bg-white hover:bg-gray-50/80',
+        hasRunningInstance ? 'bg-emerald-50/30 hover:bg-emerald-50/50' : 'bg-white hover:bg-gray-50/80',
       ]"
       @click="emit('toggle')"
     >
@@ -88,7 +97,7 @@ const someSelected = computed(
         <!-- Cookie Icon -->
         <div
           class="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 shadow-2xs"
-          :class="group.hasActive ? 'bg-brand-500 text-white' : 'bg-gray-100 text-gray-600'"
+          :class="hasRunningInstance ? 'bg-emerald-500 text-white' : 'bg-gray-100 text-gray-600'"
         >
           <Cookie class="w-4 h-4" />
         </div>
@@ -109,10 +118,11 @@ const someSelected = computed(
               ⚠ {{ expiredCount }} 个失效
             </span>
             <span
-              v-if="group.hasActive"
-              class="px-2 py-0.5 text-[10px] font-semibold rounded-full bg-emerald-100 text-emerald-800"
+              v-for="instance in runningInstances"
+              :key="instance.id"
+              class="px-2 py-0.5 text-[10px] font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200"
             >
-              当前激活
+              激活实例 #{{ instance.number }}
             </span>
           </div>
           <div class="text-[11px] text-gray-400 font-mono flex items-center gap-2 mt-0.5">
