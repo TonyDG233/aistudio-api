@@ -138,17 +138,29 @@ async def list_instances(
 ) -> InstanceListResponse:
     result: InstanceList = await manager.list_instances()
     engine_status: dict[str, object] = {}
-    switcher = runtime_state.engine_switcher
-    getter = getattr(switcher, "status", None)
-    if callable(getter):
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    sandbox_getter = getattr(sandbox, "engine_status", None)
+    if callable(sandbox_getter):
         try:
-            raw_engine_status = getter()
+            raw_sandbox_status = sandbox_getter()
         except Exception:
-            raw_engine_status = {}
-        if isinstance(raw_engine_status, dict):
+            raw_sandbox_status = {}
+        if isinstance(raw_sandbox_status, dict):
             engine_status = {
-                str(key): value for key, value in raw_engine_status.items()
+                str(key): value for key, value in raw_sandbox_status.items()
             }
+    if not engine_status:
+        switcher = runtime_state.engine_switcher
+        getter = getattr(switcher, "status", None)
+        if callable(getter):
+            try:
+                raw_engine_status = getter()
+            except Exception:
+                raw_engine_status = {}
+            if isinstance(raw_engine_status, dict):
+                engine_status = {
+                    str(key): value for key, value in raw_engine_status.items()
+                }
     return InstanceListResponse(
         max_instances=result.max_instances,
         latest_instance_id=result.latest_instance_id,

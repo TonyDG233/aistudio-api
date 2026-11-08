@@ -748,3 +748,57 @@ async def test_recover_and_detect_clear_expired_and_session_state(ui_debug):
             json={"account_id": "acc_pro_session"},
         )
         assert bound.status_code == 200, bound.text
+
+
+@pytest.mark.asyncio
+async def test_engine_config_switch_and_health_in_sandbox(ui_debug):
+    async with ui_debug, _client() as client:
+        config = (await client.get("/config")).json()
+        document = yaml.safe_load(config["yaml_content"])
+        engine = document["engine"]
+        assert engine["mode"] == "browser"
+
+        health = (await client.post("/api/engine/health-check")).json()
+        assert health["ok"] is True
+        assert health["engine"] == "browser"
+
+        engine["mode"] = "browserless"
+        engine["browserless"]["signer"]["auto_start"] = False
+        patched = await client.patch("/config", json={"updates": {"engine": engine}})
+        assert patched.status_code == 200, patched.text
+
+        status = (await client.get("/api/system/status")).json()
+        assert status["engine"] == "browserless"
+        assert status["engine_phase"] == "idle"
+
+        listing = (await client.get("/api/instances")).json()
+        assert listing["engine"] == "browserless"
+        assert listing["engine_target"] == "browserless"
+
+        probe = (await client.post("/api/engine/health-check")).json()
+        assert probe["ok"] is True
+        assert probe["engine"] == "browserless"
+        assert probe["workers"] >= 1
+        assert probe["maxWorkers"] >= 1
+        assert probe["elapsed_ms"] >= 0
+
+        failing = (
+            await client.post(
+                "/api/debug/ui-scenario", json={"action": "engine_health_fail"}
+            )
+        ).json()
+        assert failing["engine_health"]["ok"] is False
+        fail_probe = (await client.post("/api/engine/health-check")).json()
+        assert fail_probe["ok"] is False
+        assert fail_probe["error"]
+
+        await client.post("/api/debug/ui-scenario", json={"action": "engine_switching"})
+        switching = (await client.get("/api/instances")).json()
+        assert switching["engine_phase"] == "rebuilding"
+        assert switching["engine_target"] == "browser"
+
+        await client.post(
+            "/api/debug/ui-scenario", json={"action": "engine_switch_done"}
+        )
+        done = (await client.post("/api/engine/health-check")).json()
+        assert done["engine"] == "browser"

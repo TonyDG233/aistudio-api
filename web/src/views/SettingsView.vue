@@ -3,7 +3,10 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { systemApi } from '@/api/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
+import { useInstancesStore } from '@/stores/instances.ts'
+import { useSystemStore } from '@/stores/system.ts'
 import type { SystemConfig } from '@/types/system.ts'
+import { gateEngineSwitch, type SettingsMode } from '@/views/settingsEngineGuard.ts'
 import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import SecurityBrowserCard from '@/components/settings/SecurityBrowserCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
@@ -20,6 +23,7 @@ import {
   isYamlDirty,
   parseYamlDoc,
   pickSection,
+  sectionsEqual,
   stringifyYamlDoc,
   type ConfigDoc,
   type ConfigSectionKey,
@@ -34,9 +38,9 @@ import {
   Puzzle,
 } from 'lucide-vue-next'
 
-type SettingsMode = 'visual' | 'yaml'
-
 const toast = useToastStore()
+const instancesStore = useInstancesStore()
+const systemStore = useSystemStore()
 
 const config = ref<SystemConfig | null>(null)
 const baseline = ref<ConfigDoc>({})
@@ -56,6 +60,8 @@ const isDirty = computed(() => visualDirty.value || yamlDirty.value)
 
 const securityModel = computed(() => pickSection(draft.value, 'security'))
 const loggingModel = computed(() => pickSection(draft.value, 'logging'))
+const engineModel = computed(() => pickSection(draft.value, 'engine'))
+const engineDirty = computed(() => !sectionsEqual(draft.value, baseline.value, 'engine'))
 const schedulingModel = computed(() => pickSection(draft.value, 'scheduling'))
 const protocolModel = computed(() => pickSection(draft.value, 'protocol'))
 const modelDefaultModel = computed(() =>
@@ -97,6 +103,10 @@ function applySecurity(value: Record<string, unknown>) {
 
 function applyLogging(value: Record<string, unknown>) {
   applyScoped('logging', value)
+}
+
+function applyEngine(value: Record<string, unknown>) {
+  applyScoped('engine', value)
 }
 
 function applyScheduling(value: Record<string, unknown>) {
@@ -170,10 +180,25 @@ async function saveSection(section: ConfigSectionKey) {
       yamlText.value = stringifyYamlDoc(draft.value)
     }
 
+    if (section === 'engine') {
+      await Promise.all([
+        instancesStore.fetchAll(),
+        systemStore.fetchStatus(),
+      ])
+    }
+
     if (visualDirty.value || yamlDirty.value) {
-      toast.warning('当前卡片已保存，其他卡片仍有未保存的修改')
+      toast.warning(
+        section === 'engine'
+          ? '引擎配置已保存，其他卡片仍有未保存的修改'
+          : '当前卡片已保存，其他卡片仍有未保存的修改',
+      )
     } else {
-      toast.success('配置已保存并热重载')
+      toast.success(
+        section === 'engine'
+          ? '引擎配置已保存，实例槽位已按目标引擎重建'
+          : '配置已保存并热重载',
+      )
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '保存配置失败'
@@ -185,18 +210,34 @@ async function saveSection(section: ConfigSectionKey) {
 
 async function saveGlobal() {
   if (savingGlobal.value) return
+
   let content = yamlText.value
+  let parsedYaml: ConfigDoc | null = null
   if (activeMode.value === 'visual') {
     content = stringifyYamlDoc(draft.value)
   } else {
     try {
-      parseYamlDoc(yamlText.value)
+      parsedYaml = parseYamlDoc(yamlText.value)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'YAML 语法错误'
       toast.error(`YAML 格式错误：${msg}`)
       return
     }
   }
+
+  const proceed = gateEngineSwitch(
+    {
+      mode: activeMode.value,
+      engineDirty: engineDirty.value,
+      parsedYaml,
+      baseline: baseline.value,
+    },
+    () =>
+      confirm(
+        '检测到运行引擎配置有修改。保存并热重载会排空在途请求、销毁旧引擎并按目标引擎重建全部实例槽位，期间新请求返回 503，失败会自动回滚。确定继续吗？',
+      ),
+  )
+  if (!proceed) return
 
   savingGlobal.value = true
   try {
@@ -506,8 +547,13 @@ onBeforeRouteLeave((_to, _from, next) => {
         <SchedulingCard
           :model-value="schedulingModel"
           :saving="isSaving('scheduling')"
+          :engine-model="engineModel"
+          :engine-saving="isSaving('engine')"
+          :engine-dirty="engineDirty"
           @update:model-value="applyScheduling"
+          @update:engine-model="applyEngine"
           @save="saveSection('scheduling')"
+          @save-engine="saveSection('engine')"
         />
 
         <ProtocolAtgCard

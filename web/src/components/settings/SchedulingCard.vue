@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { systemApi } from '@/api/system.ts'
+import { useToastStore } from '@/stores/toast.ts'
 import ConfigInput from '@/components/config/ConfigInput.vue'
 import ConfigSelect from '@/components/config/ConfigSelect.vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
@@ -11,6 +13,8 @@ import {
   asRecord,
   asString,
   deepClone,
+  patchEngineSection,
+  readEngineBlock,
 } from '@/components/config/configDraft.ts'
 import {
   Scale,
@@ -20,6 +24,8 @@ import {
   ChevronRight,
   Info,
   AlertTriangle,
+  Cpu,
+  Activity,
 } from 'lucide-vue-next'
 
 type SlotMode = 'single' | 'min' | 'range'
@@ -27,15 +33,141 @@ type SlotMode = 'single' | 'min' | 'range'
 const props = defineProps<{
   modelValue: Record<string, unknown>
   saving: boolean
+  engineModel?: Record<string, unknown>
+  engineSaving?: boolean
+  engineDirty?: boolean
 }>()
 
 const emit = defineEmits<{
   'update:modelValue': [value: Record<string, unknown>]
+  'update:engineModel': [value: Record<string, unknown>]
   save: []
+  saveEngine: []
 }>()
+
+const toast = useToastStore()
 
 const advancedOpen = ref(false)
 const newOverrideName = ref('')
+const testingConnection = ref(false)
+const connectionResult = ref<{ ok: boolean; text: string } | null>(null)
+
+// ── 运行引擎（独立于调度配置的保存/切换） ──
+// engineModel is the section model from pickSection(doc, 'engine'), i.e.
+// { engine: {...} }; read the inner block and re-wrap on emit.
+const engineSectionModel = computed(() => asRecord(props.engineModel))
+const engine = computed(() => readEngineBlock(engineSectionModel.value))
+const engineSaving = computed(() => Boolean(props.engineSaving))
+const engineDirty = computed(() => Boolean(props.engineDirty))
+const engineMode = computed(() => asString(engine.value.mode, 'browser'))
+const browserless = computed(() => asRecord(engine.value.browserless))
+const signer = computed(() => asRecord(browserless.value.signer))
+const transport = computed(() => asRecord(browserless.value.transport))
+const signerMode = computed(() => asString(signer.value.mode, 'local_subprocess'))
+const transportMode = computed(() => asString(transport.value.mode, 'signer_rpc'))
+
+const ENGINE_MODE_OPTIONS = [
+  { value: 'browser', label: 'CloakBrowser（传统浏览器）' },
+  { value: 'browserless', label: '无浏览器 WAA（轻量沙盒）' },
+]
+const SIGNER_MODE_OPTIONS = [
+  { value: 'local_subprocess', label: '本地子进程' },
+  { value: 'remote_http', label: '远程 HTTP 节点' },
+]
+const TRANSPORT_MODE_OPTIONS = [
+  { value: 'signer_rpc', label: 'Signer RPC（Firefox 152 指纹）' },
+  { value: 'direct_http', label: 'HTTP/2 直连（降级）' },
+]
+
+function updateEngine(next: Record<string, unknown>) {
+  emit(
+    'update:engineModel',
+    patchEngineSection(engineSectionModel.value, next),
+  )
+}
+
+function setEngineMode(mode: string) {
+  if (mode === engineMode.value) return
+  updateEngine({ mode })
+}
+
+function updateSigner(patch: Record<string, unknown>) {
+  updateEngine({
+    browserless: {
+      ...browserless.value,
+      signer: { ...signer.value, ...patch },
+    },
+  })
+}
+
+function updateTransport(patch: Record<string, unknown>) {
+  updateEngine({
+    browserless: {
+      ...browserless.value,
+      transport: { ...transport.value, ...patch },
+    },
+  })
+}
+
+function setEndpoint(raw: string) {
+  updateSigner({ endpoint: raw.trim() })
+}
+
+function onEndpointInput(event: Event) {
+  setEndpoint((event.target as HTMLInputElement).value)
+}
+
+function setWorkerNumber(key: string, raw: unknown, fallback: number, min = 1, max = 64) {
+  const value = Math.min(max, Math.max(min, Math.trunc(asNumber(raw, fallback))))
+  updateSigner({ [key]: value })
+}
+
+async function testConnection() {
+  if (testingConnection.value) return
+  testingConnection.value = true
+  connectionResult.value = null
+  try {
+    const res = await systemApi.engineHealthCheck()
+    const elapsed =
+      typeof res.elapsed_ms === 'number' ? `${res.elapsed_ms.toFixed(1)} ms` : '—'
+    const workers =
+      typeof res.workers === 'number'
+        ? `${res.workers}/${typeof res.maxWorkers === 'number' ? res.maxWorkers : 0}`
+        : '—'
+    if (res.ok) {
+      connectionResult.value = {
+        ok: true,
+        text: `连接成功 · 耗时 ${elapsed} · 活跃 Worker ${workers}`,
+      }
+      toast.success(`签名服务连接成功（耗时 ${elapsed}，活跃 Worker ${workers}）`)
+    } else {
+      const reason = res.error || '签名服务不可用'
+      connectionResult.value = { ok: false, text: `连接失败：${reason}` }
+      toast.error(`签名服务连接失败：${reason}`)
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '健康检查请求失败'
+    connectionResult.value = { ok: false, text: `连接失败：${msg}` }
+    toast.error(`签名服务连接失败：${msg}`)
+  } finally {
+    testingConnection.value = false
+  }
+}
+
+function handleEngineSave() {
+  if (!engineDirty.value || engineSaving.value) return
+  const target = engineMode.value === 'browserless' ? '无浏览器 WAA' : 'CloakBrowser'
+  const confirmed = confirm(
+    `确定切换到「${target}」引擎吗？\n\n` +
+      '切换过程会：\n' +
+      '· 有界等待在途请求排空\n' +
+      '· 销毁旧引擎的实例与进程\n' +
+      '· 按目标引擎重建全部实例槽位\n\n' +
+      '切换期间新请求返回 503，失败会自动回滚旧引擎与旧配置。',
+  )
+  if (!confirmed) return
+  emit('saveEngine')
+}
 
 const features = computed(() => asRecord(props.modelValue.features))
 const routing = computed(() => asRecord(features.value.routing))
@@ -428,6 +560,244 @@ function handleSave() {
       >
         💾 保存调度配置
       </button>
+    </div>
+
+    <!-- Runtime engine (independent dirty/save from scheduling) -->
+    <div class="rounded-2xl border border-gray-200/80 bg-gray-50/60 p-3.5 sm:p-4 space-y-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-1.5 flex-wrap min-w-0">
+          <Cpu class="w-4 h-4 text-indigo-600" />
+          <span class="text-xs font-bold text-gray-900">运行引擎</span>
+          <FieldHelpTip schema-key="engine.mode" />
+          <span
+            v-if="engineDirty"
+            class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200"
+          >
+            ● 引擎配置未保存
+          </span>
+          <span
+            v-else
+            class="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+          >
+            已同步
+          </span>
+        </div>
+
+        <button
+          type="button"
+          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+          :disabled="engineSaving || !engineDirty"
+          @click="handleEngineSave"
+        >
+          {{ engineSaving ? '切换中...' : '💾 保存并切换引擎' }}
+        </button>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-1 p-1 bg-gray-100 rounded-xl text-[11px] font-medium">
+        <button
+          v-for="option in ENGINE_MODE_OPTIONS"
+          :key="option.value"
+          type="button"
+          class="px-2 py-1.5 rounded-lg transition-all cursor-pointer leading-tight"
+          :class="engineMode === option.value
+            ? 'bg-white text-indigo-700 shadow-2xs font-semibold'
+            : 'text-gray-600 hover:text-gray-900'"
+          @click="setEngineMode(option.value)"
+        >
+          {{ option.label }}
+        </button>
+      </div>
+
+      <div
+        v-if="engineMode === 'browser'"
+        class="flex items-start gap-2 p-3 bg-white border border-gray-200/70 rounded-xl text-[11px] text-gray-600 leading-relaxed"
+      >
+        <Info class="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5" />
+        <span>
+          CloakBrowser 通过 CDP 驱动真实 Chromium，兼容所有页面能力；每个实例占用一个
+          BrowserContext 与 Page，内存与 CPU 开销较高。适合需要真实页面交互与完整指纹的场景。
+        </span>
+      </div>
+
+      <div
+        v-else
+        class="space-y-4"
+      >
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigSelect
+                :model-value="signerMode"
+                label="签名器运行模式"
+                :options="SIGNER_MODE_OPTIONS"
+                @update:model-value="updateSigner({ mode: String($event || 'local_subprocess') })"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.mode"
+              class="mt-4 shrink-0"
+            />
+          </div>
+
+          <div class="space-y-1.5 min-w-0">
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs font-semibold text-gray-700">签名服务地址</span>
+              <FieldHelpTip schema-key="engine.browserless.signer.endpoint" />
+            </div>
+            <div class="flex flex-col sm:flex-row gap-2">
+              <input
+                :value="asString(signer.endpoint, 'http://127.0.0.1:8081')"
+                type="text"
+                placeholder="http://127.0.0.1:8081"
+                class="flex-1 min-w-0 px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+                @input="onEndpointInput"
+              >
+              <button
+                type="button"
+                class="inline-flex items-center justify-center gap-1 px-2.5 py-2 text-[11px] font-medium rounded-xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                :disabled="testingConnection"
+                @click="testConnection"
+              >
+                <Activity
+                  class="w-3.5 h-3.5"
+                  :class="{ 'animate-pulse': testingConnection }"
+                />
+                {{ testingConnection ? '测试中...' : '测试连接' }}
+              </button>
+            </div>
+            <div
+              v-if="connectionResult"
+              class="text-[11px] font-medium"
+              :class="connectionResult.ok ? 'text-emerald-700' : 'text-rose-600'"
+            >
+              {{ connectionResult.text }}
+            </div>
+          </div>
+        </div>
+
+        <div
+          v-if="signerMode === 'local_subprocess'"
+          class="grid grid-cols-1 sm:grid-cols-2 gap-3"
+        >
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigSwitch
+                :model-value="asBool(signer.auto_start, true)"
+                label="自动拉起本地进程"
+                description="由本服务启动并托管 waa-signer"
+                @update:model-value="updateSigner({ auto_start: $event })"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.auto_start"
+              class="mt-2 shrink-0"
+            />
+          </div>
+
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigInput
+                :model-value="asString(signer.binary_path, 'waa-signer/bin/waa-signer')"
+                label="本地二进制路径"
+                placeholder="waa-signer/bin/waa-signer"
+                @update:model-value="updateSigner({ binary_path: String($event || '') })"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.binary_path"
+              class="mt-4 shrink-0"
+            />
+          </div>
+        </div>
+
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0">
+            <ConfigSelect
+              :model-value="transportMode"
+              label="请求传输通道"
+              :options="TRANSPORT_MODE_OPTIONS"
+              @update:model-value="updateTransport({ mode: String($event || 'signer_rpc') })"
+            />
+          </div>
+          <FieldHelpTip
+            schema-key="engine.browserless.transport.mode"
+            class="mt-4 shrink-0"
+          />
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigInput
+                :model-value="asNumber(signer.max_workers, 8)"
+                label="最大工作池数量"
+                type="number"
+                @update:model-value="setWorkerNumber('max_workers', $event, 8, 1, 64)"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.max_workers"
+              class="mt-4 shrink-0"
+            />
+          </div>
+
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigInput
+                :model-value="asNumber(signer.idle_ttl_s, 900)"
+                label="闲置回收时间 (秒)"
+                type="number"
+                @update:model-value="setWorkerNumber('idle_ttl_s', $event, 900, 1, 86400)"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.idle_ttl_s"
+              class="mt-4 shrink-0"
+            />
+          </div>
+
+          <div
+            v-if="signerMode === 'local_subprocess'"
+            class="flex items-start gap-1.5 min-w-0"
+          >
+            <div class="flex-1 min-w-0">
+              <ConfigInput
+                :model-value="asNumber(signer.startup_timeout_s, 30)"
+                label="启动超时 (秒)"
+                type="number"
+                @update:model-value="setWorkerNumber('startup_timeout_s', $event, 30, 1, 600)"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.startup_timeout_s"
+              class="mt-4 shrink-0"
+            />
+          </div>
+
+          <div class="flex items-start gap-1.5 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ConfigInput
+                :model-value="asNumber(signer.request_timeout_s, 90)"
+                label="请求超时 (秒)"
+                type="number"
+                @update:model-value="setWorkerNumber('request_timeout_s', $event, 90, 1, 600)"
+              />
+            </div>
+            <FieldHelpTip
+              schema-key="engine.browserless.signer.request_timeout_s"
+              class="mt-4 shrink-0"
+            />
+          </div>
+        </div>
+
+        <div class="flex items-start gap-2 p-3 bg-white border border-gray-200/70 rounded-xl text-[11px] text-gray-500 leading-relaxed">
+          <Info class="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5" />
+          <span>
+            WAA 引擎不启动 Chromium；每个实例槽位独立持有 Cookie、确定性 Firefox 152
+            指纹、proof 铸造器与传输器。切换前请确认签名服务可用、最大工作池数量不少于槽位总数。
+          </span>
+        </div>
+      </div>
     </div>
 
     <div

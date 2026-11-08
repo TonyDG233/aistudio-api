@@ -12,6 +12,7 @@ import type {
   UpdateLoggingConfigResponse,
   HealthCheckResponse,
   SystemStatusResponse,
+  EngineHealthResponse,
 } from '@/types'
 
 
@@ -45,6 +46,12 @@ export const systemApi = {
     })
   },
 
+
+  engineHealthCheck(): Promise<EngineHealthResponse> {
+    return request<EngineHealthResponse>('/api/engine/health-check', {
+      method: 'POST',
+    })
+  },
 
   getConfig(): Promise<SystemConfig> {
     return request<SystemConfig>('/config')

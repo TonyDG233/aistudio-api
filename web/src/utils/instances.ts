@@ -207,3 +207,33 @@ export function isAccountEligible(account: AccountWithStats): boolean {
     account.session_expired !== true
   )
 }
+
+export const ENGINE_LABELS: Record<string, string> = {
+  browser: 'CloakBrowser',
+  browserless: 'WAA 无浏览器',
+}
+
+export function engineLabel(value: string | null | undefined): string {
+  const key = String(value || 'browser')
+  return ENGINE_LABELS[key] || key
+}
+
+const ENGINE_PHASE_LABELS: Record<string, string> = {
+  idle: '空闲',
+  preflight: '预检新引擎',
+  draining: '排空在途请求',
+  destroying: '销毁旧引擎',
+  rebuilding: '重建实例槽位',
+  committing: '提交配置',
+  rolling_back: '回滚旧引擎',
+  failed: '切换失败',
+}
+
+export function enginePhaseLabel(value: string | null | undefined): string {
+  const key = String(value || 'idle')
+  return ENGINE_PHASE_LABELS[key] || key
+}
+
+export function isEngineSwitching(value: string | null | undefined): boolean {
+  return Boolean(value) && value !== 'idle'
+}

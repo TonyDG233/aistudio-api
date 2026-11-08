@@ -92,14 +92,53 @@ const defaultRecommended: Record<string, unknown> = {
   'features.atg.non_text_model_pattern':
     defaults.features.atg.non_text_model_pattern,
   'profile.is_image_model': imageProfile.is_image_model,
-  'generation.image_output_mode':
-    imageProfile.generation_config_defaults.image_output_mode,
-  'generation.thinking_level':
-    imageProfile.generation_config_defaults.thinking_config.level,
-  'generation.clear_indexes': imageProfile.clear_generation_config_indexes,
   'safety.disable_safety_settings': imageProfile.disable_safety_settings,
   'safety.settings': geminiProfile.safety_settings,
   'paid_model_rules': defaults.paid_model_rules,
+  // Stage 2.1 engine block: schema recommendations must match distribution defaults.
+  'engine.mode': defaults.engine.mode,
+  'engine.switch.drain_timeout_s': defaults.engine.switch.drain_timeout_s,
+  'engine.switch.startup_concurrency': defaults.engine.switch.startup_concurrency,
+  'engine.switch.switch_timeout_s': defaults.engine.switch.switch_timeout_s,
+  'engine.switch.rollback_on_partial_failure':
+    defaults.engine.switch.rollback_on_partial_failure,
+  'engine.browserless.signer.mode': defaults.engine.browserless.signer.mode,
+  'engine.browserless.signer.endpoint': defaults.engine.browserless.signer.endpoint,
+  'engine.browserless.signer.auto_start': defaults.engine.browserless.signer.auto_start,
+  'engine.browserless.signer.binary_path':
+    defaults.engine.browserless.signer.binary_path,
+  'engine.browserless.signer.startup_timeout_s':
+    defaults.engine.browserless.signer.startup_timeout_s,
+  'engine.browserless.signer.request_timeout_s':
+    defaults.engine.browserless.signer.request_timeout_s,
+  'engine.browserless.signer.state_dir': defaults.engine.browserless.signer.state_dir,
+  'engine.browserless.signer.max_workers': defaults.engine.browserless.signer.max_workers,
+  'engine.browserless.signer.idle_ttl_s': defaults.engine.browserless.signer.idle_ttl_s,
+  'engine.browserless.signer.locale': defaults.engine.browserless.signer.locale,
+  'engine.browserless.signer.timezone': defaults.engine.browserless.signer.timezone,
+  'engine.browserless.transport.mode': defaults.engine.browserless.transport.mode,
+  'engine.browserless.transport.http2': defaults.engine.browserless.transport.http2,
+  'engine.browserless.transport.max_connections':
+    defaults.engine.browserless.transport.max_connections,
+  'engine.browserless.transport.connect_timeout_s':
+    defaults.engine.browserless.transport.connect_timeout_s,
+  'engine.browserless.transport.read_timeout_s':
+    defaults.engine.browserless.transport.read_timeout_s,
+}
+
+// 2.1-A removed profile-level generation defaults from defaults/config.yaml on
+// purpose (no default thinking/image injection). Only assert them when the
+// distribution config still ships them, so this test cannot go stale again.
+const imageGenerationDefaults = imageProfile.generation_config_defaults
+if (imageGenerationDefaults) {
+  defaultRecommended['generation.image_output_mode'] =
+    imageGenerationDefaults.image_output_mode
+  defaultRecommended['generation.thinking_level'] =
+    imageGenerationDefaults.thinking_config?.level
+}
+if (imageProfile.clear_generation_config_indexes) {
+  defaultRecommended['generation.clear_indexes'] =
+    imageProfile.clear_generation_config_indexes
 }
 
 test('schema recommended values match defaults/config.yaml', () => {

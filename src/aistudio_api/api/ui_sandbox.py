@@ -58,6 +58,12 @@ SCENARIOS = ("all_states", "mass_accounts", "narrow_edge", "empty", "all_429")
 DASHBOARD_SCENARIOS = ("all_states", "mass_accounts", "all_429", "empty")
 DASHBOARD_ACTIONS = ("simulate_requests", "simulate_429", "toggle_formats")
 _SANDBOX_DRAIN_TIMEOUT_S = 0.05
+ENGINE_ACTIONS = (
+    "engine_health_ok",
+    "engine_health_fail",
+    "engine_switching",
+    "engine_switch_done",
+)
 ACTIONS = (
     "reset",
     "instance_inflight",
@@ -65,6 +71,7 @@ ACTIONS = (
     "instance_cooldown",
     "keepalive_partial",
     *DASHBOARD_ACTIONS,
+    *ENGINE_ACTIONS,
 )
 _SANDBOX_MAX_CONTEXTS = 10
 
@@ -312,6 +319,37 @@ class _SandboxInstance:
 
     def accepts_tier(self, tier: object) -> bool:
         return tier_matches_selector(tier, self.selector)
+
+
+def _sandbox_engine_settings() -> dict[str, object]:
+    """Read the (temp, sandbox) engine block; never construct a real runtime."""
+    try:
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_engine_settings,
+        )
+
+        return dict(get_configured_engine_settings())
+    except Exception:
+        return {"mode": "browser"}
+
+
+def _coerce_int(value: object, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return int(value)
+
+
+def _nested(block: object, *keys: str) -> dict[str, object]:
+    current: object = block
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return (
+        {str(key): value for key, value in current.items()}
+        if isinstance(current, dict)
+        else {}
+    )
 
 
 def _sandbox_cookie_state() -> dict[str, object]:
@@ -1109,6 +1147,16 @@ class UISandbox:
             self._formats_all_on: bool | None = None
             self._flags: dict[str, dict[str, Any]] = {}
             self._closed = False
+            self._engine_settings = _sandbox_engine_settings()
+            engine_mode = str(self._engine_settings.get("mode") or "browser")
+            self.engine_phase = "idle"
+            self.engine_target = engine_mode
+            self.engine_epoch = 1
+            self.engine_rebuilt = 0
+            self.engine_total = 0
+            self.engine_error: str | None = None
+            self.engine_health_fail = False
+            self.engine_health_latency_ms = 12.5
             self.reset("all_states")
         except Exception:
             shutil.rmtree(self.root, ignore_errors=True)
@@ -1121,6 +1169,121 @@ class UISandbox:
         self._closed = True
         self.manager.reset()
         shutil.rmtree(self.root, ignore_errors=True)
+
+    # ---------------------------------------------------------------- engine
+    def engine_settings(self) -> dict[str, object]:
+        """Return the sandbox engine block (never a real runtime)."""
+        return dict(self._engine_settings)
+
+    def engine_mode(self) -> str:
+        return str(self._engine_settings.get("mode") or "browser")
+
+    def engine_status(self) -> dict[str, object]:
+        """Status payload mirroring ``EngineSwitcher.status()`` + epoch fields."""
+        mode = self.engine_mode()
+        return {
+            "engine": mode,
+            "engine_phase": self.engine_phase,
+            "engine_target": self.engine_target or mode,
+            "engine_epoch": self.engine_epoch,
+            "rebuilt": self.engine_rebuilt,
+            "total": self.engine_total,
+            "transport_state": "ready" if mode == "browserless" else "",
+            "worker_state": "ready" if mode == "browserless" else "",
+            "proof_latency_ms": (
+                self.engine_health_latency_ms if mode == "browserless" else None
+            ),
+            "fingerprint_profile": (
+                "Firefox 152 (WAA)" if mode == "browserless" else ""
+            ),
+            "engine_error": self.engine_error,
+            "orphaned_rollbacks": 0,
+        }
+
+    def engine_health(self) -> dict[str, object]:
+        """Deterministic health probe for the active sandbox engine."""
+        mode = self.engine_mode()
+        if mode == "browser":
+            return {
+                "ok": True,
+                "engine": "browser",
+                "elapsed_ms": 3.0,
+                "workers": 0,
+                "maxWorkers": 0,
+                "version": "cloakbrowser-sandbox",
+                "error": None,
+            }
+        signer = _nested(self._engine_settings, "browserless", "signer")
+        max_workers = _coerce_int(signer.get("max_workers"), 8)
+        workers = min(max_workers, max(1, len(self.manager.records())))
+        if self.engine_health_fail:
+            return {
+                "ok": False,
+                "engine": "browserless",
+                "elapsed_ms": self.engine_health_latency_ms,
+                "workers": 0,
+                "maxWorkers": max_workers,
+                "version": "waa-signer sandbox",
+                "error": "sandbox: signer connection refused",
+            }
+        return {
+            "ok": True,
+            "engine": "browserless",
+            "elapsed_ms": self.engine_health_latency_ms,
+            "workers": workers,
+            "maxWorkers": max_workers,
+            "version": "waa-signer sandbox",
+            "error": None,
+        }
+
+    def set_engine(self, settings_block: object) -> dict[str, object]:
+        """Simulate a completed engine switch (no real signer/browser)."""
+        previous = self.engine_mode()
+        block = (
+            {str(key): value for key, value in settings_block.items()}
+            if isinstance(settings_block, dict)
+            else {}
+        )
+        if block:
+            self._engine_settings = block
+        mode = self.engine_mode()
+        switched = mode != previous
+        self.engine_target = mode
+        self.engine_phase = "idle"
+        self.engine_error = None
+        if switched:
+            self.engine_epoch += 1
+            total = len(self.manager.records())
+            self.engine_rebuilt = total
+            self.engine_total = total
+        return {
+            "switched": switched,
+            "engine": mode,
+            "engine_epoch": self.engine_epoch,
+            "rebuilt": self.engine_rebuilt,
+            "total": self.engine_total,
+        }
+
+    def _action_engine_health_ok(self) -> None:
+        self.engine_health_fail = False
+        self.engine_health_latency_ms = 9.0
+
+    def _action_engine_health_fail(self) -> None:
+        self.engine_health_fail = True
+        self.engine_health_latency_ms = 1200.0
+
+    def _action_engine_switching(self) -> None:
+        total = len(self.manager.records())
+        self.engine_phase = "rebuilding"
+        self.engine_target = (
+            "browserless" if self.engine_mode() == "browser" else "browser"
+        )
+        self.engine_total = total
+        self.engine_rebuilt = max(0, total - 1)
+        self.engine_error = None
+
+    def _action_engine_switch_done(self) -> None:
+        self.set_engine({**self._engine_settings, "mode": self.engine_target})
 
     # -------------------------------------------------------------- scenario
     def _configured_formats_payload(self) -> dict[str, bool]:
@@ -1461,6 +1624,14 @@ class UISandbox:
             self._action_simulate_429()
         elif action == "toggle_formats":
             self._action_toggle_formats()
+        elif action == "engine_health_ok":
+            self._action_engine_health_ok()
+        elif action == "engine_health_fail":
+            self._action_engine_health_fail()
+        elif action == "engine_switching":
+            self._action_engine_switching()
+        elif action == "engine_switch_done":
+            self._action_engine_switch_done()
         return self.snapshot()
 
     def snapshot(self) -> dict[str, object]:
@@ -1471,8 +1642,14 @@ class UISandbox:
             "scenario": self.scenario,
             "scenarios": list(SCENARIOS),
             "dashboard_scenarios": list(DASHBOARD_SCENARIOS),
-            "quick_actions": [action for action in ACTIONS if action != "reset"],
+            "quick_actions": [
+                action
+                for action in ACTIONS
+                if action != "reset" and action not in ENGINE_ACTIONS
+            ],
             "dashboard_actions": list(DASHBOARD_ACTIONS),
+            "engine": self.engine_status(),
+            "engine_health": self.engine_health(),
             "formats": self.formats_payload(),
             "default_text_model": self.default_text_model(),
             "stats": self.stats_payload(),
@@ -2322,6 +2499,7 @@ __all__ = [
     "ACTIONS",
     "DASHBOARD_ACTIONS",
     "DASHBOARD_SCENARIOS",
+    "ENGINE_ACTIONS",
     "SCENARIOS",
     "SandboxAccountRefresher",
     "SandboxInstanceManager",

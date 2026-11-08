@@ -253,6 +253,7 @@ uv run python3 main.py server --port 8080
 - 多实例池启用时，启动预热只允许由 `InstanceManager.startup()` 在池会话（`PooledSession`）上完成；控制面 `client.session` 不得在启动时自动开页/跑 BotGuard。控制面仅在按需场景（无活跃实例、手动导入 Cookie、保活）打开，且保持单页。
 - 离线开发/回归默认 mock/fixture，不得以“验证启动”为名启动真实服务、真实浏览器或发起网络请求。
 - **前端 UI Debug 沙盒例外（强制规范）**：严禁在默认生产模式（`ui_debug=false`）下启动服务或拉起真实浏览器；凡涉及前端 UI 变更，Worker 与 Reviewer 必须在强制注入环境变量 `AISTUDIO_UI_DEBUG=1`（开启 `diagnostics.ui_debug=true` 的纯内存/临时目录隔离沙盒，100% 阻断真实浏览器与外网请求）的前提下，在 `127.0.0.1:<随机空闲端口>` 启动临时沙盒服务，使用 Playwright 等浏览器工具在多分辨率（`1440x900` / `1024x900` / `768x900`）下实测页面交互与检查样式；测试结束后必须在 `finally` 中立即关闭临时服务进程，并确认端口关闭、无进程残留、临时目录已清理。
+- **Windows UI Debug 启动方式（强制）**：今后一律使用 `uv run python main.py server --port <port> --ui-debug`，不得依赖后台命令内联环境变量传递 `AISTUDIO_UI_DEBUG`。
 
 ### 4.7 浏览器进程与 CDP（D-02/D-03）
 

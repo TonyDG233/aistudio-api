@@ -44,6 +44,10 @@ class UIScenarioRequest(BaseModel):
             "account_expired",
             "instance_cooldown",
             "keepalive_partial",
+            "engine_health_ok",
+            "engine_health_fail",
+            "engine_switching",
+            "engine_switch_done",
         ]
         | None
     ) = None

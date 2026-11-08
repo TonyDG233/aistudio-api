@@ -25,6 +25,7 @@
 - [协议矩阵](#协议矩阵)
 - [技术架构](#技术架构)
 - [多实例池与账号调度](#多实例池与账号调度)
+- [双引擎（Browser / Browserless）](#双引擎browser--browserless)
 - [大上下文工具调用与 SillyTavern](#大上下文工具调用与-sillytavern)
 - [浏览器指纹与保活](#浏览器指纹与保活)
 - [快速开始](#快速开始)
@@ -48,6 +49,8 @@
 |---|---|
 | **四协议统一网关** | 同一套协议中立生成管线对外提供 Gemini `/v1beta`、OpenAI `/v1/chat/completions`、Claude `/v1/messages` 与 OpenAI Responses `/v1/responses`。Gemini 常驻开启，OpenAI / Claude / Responses 默认开启，可在 `features.formats` 中显式关闭。 |
 | **多实例账号池** | 1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（chat 或 build）。实例按 `count`、`surface` 与 tier 选择器声明，Free 与 Paid lane 相互隔离。 |
+| **双引擎热切换** | `browser`（CloakBrowser/CDP）与 `browserless`（内置 waa-signer，无 Chromium）全局二选一；设置页保存后执行 Validate → Preflight → Drain → Destroy → Rebuild → Commit，失败自动回滚，切换期间新请求返回 503 + `Retry-After`。 |
+| **内置 WAA 签名器** | browserless 模式由 waa-signer 以 SpiderMonkey 152 执行 BotGuard 挑战，并通过 uTLS/HTTP2/HTTP3 直接发送受保护 RPC；支持本地子进程自动拉起或显式远程 endpoint。 |
 | **Tier 精准准入** | `only_tier` / `min_tier` / `max_tier` 组成闭区间；Free 模型只命中 Free 实例，付费模型只命中满足 tier 的实例。付费模型 tier 不足返回本地 403，不切号、不降级。 |
 | **429 / 403 弹性调度** | 429 优先同账号短退避重试，再唤醒或切换池内实例；连续切号有上限。403 不做硬冷却，首次重新签名并原位重试，第二次才切换健康账号。 |
 | **大上下文工具调用** | PG-01 思维签名缓存、PG-04 工具载荷 Struct 强制、PG-08 宽松工具历史兼容，保障长会话与工具链在 Gemini 上游稳定落地。 |
@@ -121,10 +124,14 @@ features:
 ┌──────────────────────────────▼───────────────────────────────┐
 │   InstancePool：1 实例 = 1 账号 + 1 Context + 1 Page + 1 surface │
 └──────────────────────────────┬───────────────────────────────┘
-                               │ CDP WebSocket
-┌──────────────────────────────▼───────────────────────────────┐
-│       受控 CloakBrowser（Chromium）页面内 XHR Replay          │
-└──────────────────────────────┬───────────────────────────────┘
+                               │ 引擎全局二选一
+        ┌──────────────────────┴───────────────────────┐
+        │ browser（默认）                               │ browserless
+┌───────▼──────────────────────────────┐  ┌────────────▼──────────────────────────────┐
+│ 受控 CloakBrowser（Chromium）          │  │ 内置 waa-signer（SpiderMonkey 152）        │
+│ 页面内 XHR Replay + CDP                │  │ Proof 铸造 + uTLS/HTTP2/HTTP3 原生 RPC     │
+└───────┬──────────────────────────────┘  └────────────┬──────────────────────────────┘
+        └──────────────────────┬───────────────────────┘
                                │ HTTPS / RPC
 ┌──────────────────────────────▼───────────────────────────────┐
 │                Google AI Studio（alkalimakersuite）           │
@@ -187,6 +194,66 @@ max_contexts: 2
 - `account_surface`：chat 与 build 分开记账。
 
 该开关只影响统计键、配额展示与 429 冷却口径，不新增实例。
+
+---
+
+## 双引擎（Browser / Browserless）
+
+### 引擎边界
+
+全局仅二选一，由 `engine.mode` 指定，默认 `browser`：
+
+- **browser**：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface，使用受控 CloakBrowser（Chromium）与页面内 XHR Replay。
+- **browserless**：1 实例 = 1 账号 + 1 BrowserlessSession + 1 surface，不启动 Chromium；每个槽位独立持有 Cookie、确定性指纹、proof 铸造器与传输器，严禁跨槽共享会话或响应头。
+
+两种引擎共享同一套协议面、路由、账号、统计、保活与日志；切换引擎不改变实例槽位数量与 tier 选择器。
+
+### 设置页热切换
+
+在 Web 管理台的「系统与模型配置」页保存 `engine.mode` 后，后端按事务执行：
+
+1. **Validate**：校验目标引擎配置与实例拓扑；非法配置返回 422。
+2. **Preflight**：先用新引擎建立一次可用会话；失败返回 503，旧引擎继续服务。
+3. **Drain**：有界等待在途请求结束，超时则中止并回滚。
+4. **Destroy**：关闭旧槽位与旧引擎（切离 browser 时一并关闭 CloakBrowser 进程）。
+5. **Rebuild**：按新引擎重建原槽位拓扑并重新绑定账号。
+6. **Commit**：提交新配置与引擎 epoch；任一步失败自动回滚旧引擎与旧配置。
+
+切换窗口内新请求返回 503 并带 `Retry-After`；`GET /api/system/status`、`GET /api/instances` 与 `POST /api/engine/health-check` 暴露引擎、切换阶段与探活结果。
+
+### WAA 签名器：本地与远程
+
+browserless 的证明签名由 waa-signer 完成，支持两种部署方式：
+
+```yaml
+engine:
+  mode: browserless
+  browserless:
+    signer:
+      mode: local_subprocess      # local_subprocess | remote_http
+      endpoint: http://127.0.0.1:8081
+      binary_path: waa-signer/bin/waa-signer
+      auto_start: true
+      state_dir: data/waa/workers
+      max_workers: 8
+      idle_ttl_s: 900
+      locale: en-US
+      timezone: America/Los_Angeles
+```
+
+- `local_subprocess`：`binary_path` 相对仓库根目录解析；`auto_start: true` 时由主服务拉起进程并等待 `/health` 就绪。
+- `remote_http`：显式配置远程 `endpoint`，主服务不拉起本地进程；远程节点需自行运行 waa-signer。
+- `state_dir` 用于 Worker 指纹与解释器缓存，相对进程工作目录解析（Docker 下为 `/app/data/waa/workers`，随数据卷持久化）。
+- `max_workers` 必须覆盖实例槽位数；`locale` 与 `timezone` 应与账号声明环境保持一致。
+
+### Docker 单镜像双引擎
+
+官方镜像同时内置 CloakBrowser 与 waa-signer：
+
+- waa-signer 由多阶段构建产出静态二进制，落在 `/app/waa-signer/bin/waa-signer`，与 `engine.browserless.signer.binary_path` 默认值一致。
+- 默认 `local_subprocess` + `auto_start`，切换到 browserless 时由主服务自动拉起，无需额外容器或挂载。
+- 需要独立部署 signer 时，将 `mode` 改为 `remote_http` 并设置 `endpoint` 即可。
+- 两种引擎共用同一镜像与同一数据卷，切换引擎无需重建镜像。
 
 ---
 
@@ -330,7 +397,7 @@ uv run python3 main.py server --port 8080
 
 ### Docker / Compose
 
-镜像内置 CloakBrowser 运行时：
+镜像同时内置 CloakBrowser（browser 引擎）与 waa-signer（browserless 引擎），一个容器即可在两种引擎间热切换：
 
 ```bash
 docker run -d \
@@ -339,10 +406,10 @@ docker run -d \
   -p 8080:8080 \
   -v aistudio-api-data:/app/data \
   -e AISTUDIO_WEB_PASSWORD=your-console-password \
-  ghcr.io/tonydg233/aistudio-api:2.0.0
+  ghcr.io/tonydg233/aistudio-api:2.1.0
 ```
 
-GHCR 同时提供固定基准版本 `ghcr.io/tonydg233/aistudio-api:2.0.0` 与滚动标签 `ghcr.io/tonydg233/aistudio-api:latest`。使用 `docker run` 时，首次启动会自动从 `/app/defaults/config.yaml` 初始化 `/app/data/config.yaml`。
+GHCR 同时提供固定基准版本 `ghcr.io/tonydg233/aistudio-api:2.1.0` 与滚动标签 `ghcr.io/tonydg233/aistudio-api:latest`。使用 `docker run` 时，首次启动会自动从 `/app/defaults/config.yaml` 初始化 `/app/data/config.yaml`。waa-signer 位于 `/app/waa-signer/bin/waa-signer`，默认随 browserless 引擎自动拉起，无需额外容器或挂载。
 
 使用仓库根目录的 `docker-compose.yml` 前，必须先在宿主机准备 `config.yaml`；该文件会以 bind mount 覆盖容器内 `/app/config.yaml`。若文件不存在，Docker 会创建同名目录，入口脚本无法把模板落成 `/app/config.yaml` 文件：
 
@@ -372,6 +439,7 @@ docker compose up -d
 |---|---|
 | `api_keys` / `security` | 对外 API Key 与是否允许匿名 |
 | `instances` / `max_contexts` | 实例池规格与全局上限 |
+| `engine` | 请求引擎（browser / browserless）、热切换事务、WAA signer 与传输参数 |
 | `rotator` | 重试、429 冷却与 quota scope |
 | `features.routing` | 连续切号上限与 429 同号退避 |
 | `features.keepalive` | 24h 鉴权与元数据刷新节奏 |
@@ -430,7 +498,7 @@ docker compose up -d
 
 1. **控制面板**：实例运行状态、在途请求、账号与额度概览、模型调用统计、按 7 / 30 / 90 天的请求与 Token 趋势图，以及快速调用示例。统计按 Asia/Shanghai 自然日保留最近 90 天，并区分客户端请求与节点尝试两种分母口径。
 2. **账号管理**：Cookie 文本与凭据包批量导入、子账号探活、实例槽位创建/换绑/重启、账号启用与分组、预设方案、配额与 429 状态、保活手动触发。
-3. **系统与模型配置**：API Key 管理、安全与浏览器、调度与重试、协议开关与 ATG、日志配置、模型规则与 YAML 源文编辑；保存后热重载。
+3. **系统与模型配置**：API Key 管理、请求引擎（browser / browserless 热切换）、安全与浏览器、调度与重试、协议开关与 ATG、日志配置、模型规则与 YAML 源文编辑；保存后热重载，引擎变更按事务切换并支持回滚。
 4. **日志**：实时 SSE 日志流、级别过滤、搜索、暂停与 1 / 3 / 7 天导出。
 
 ### UI Debug 离线沙盒
@@ -609,6 +677,7 @@ cd android
 - [系统架构设计](./docs/ARCHITECTURE.md)：四层架构、请求生命周期、实例池、路由与日志。
 - [Wire 协议逆向规范](./docs/WIRE_SPECIFICATION.md)：Protobuf-JSON 数组映射、字段索引、多模态 Part 与 Schema 编码。
 - [BotGuard 验证链路](./docs/BOTGUARD_VERIFICATION_CHAIN.md)：WAA 挑战握手、Wasm 动态签名与内容哈希。
+- [WAA Signer 独立签名服务](./waa-signer/README.md)：SpiderMonkey 152 运行时、HTTP 接口、手动编译与 Docker 内置说明。
 - [实例池与路由规范](./docs/INSTANCE_POOL_AND_ROUTING_SPEC.md)：实例、tier 选择器、429 / 403 与 surface 路由。
 - [保活与日志规范](./docs/KEEPALIVE_AND_LOGGING_SPEC.md)：24h 保活、日志三 Sink 与脱敏。
 - [协议适配与工具调用规范](./docs/PROTOCOL_AND_TOOLCALL_SPEC.md)：四协议转换、PG-01/04/08、ATG 与 countTokens。

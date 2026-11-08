@@ -10,6 +10,7 @@ export type ConfigDoc = Record<string, unknown>
 export const SECTION_PATHS = {
   security: ['security', 'browser'],
   logging: ['logging', 'diagnostics.ui_debug'],
+  engine: ['engine'],
   scheduling: [
     'instances',
     'max_contexts',
@@ -157,6 +158,27 @@ export function applySection(
   const next = deepClone(doc)
   assignPaths(next, scoped, SECTION_PATHS[section])
   return next
+}
+
+/**
+ * Unwrap the inner engine block from a section model produced by
+ * ``pickSection(doc, 'engine')`` (shape: ``{ engine: {...} }``).
+ */
+export function readEngineBlock(sectionModel: ConfigDoc): ConfigDoc {
+  return asRecord(sectionModel.engine)
+}
+
+/** Wrap an engine block back into the section-model shape applySection expects. */
+export function writeEngineSection(engineBlock: ConfigDoc): ConfigDoc {
+  return { engine: deepClone(engineBlock) }
+}
+
+/** Merge a patch into the inner engine block and keep the ``{ engine: ... }`` wrapper. */
+export function patchEngineSection(
+  sectionModel: ConfigDoc,
+  patch: ConfigDoc,
+): ConfigDoc {
+  return writeEngineSection({ ...readEngineBlock(sectionModel), ...patch })
 }
 
 export function sectionsEqual(

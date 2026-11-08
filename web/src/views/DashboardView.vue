@@ -17,7 +17,14 @@ import {
   successRatePercent,
   totalTokenCount,
 } from '@/components/dashboard/dashboardMetrics.ts'
-import { instanceStateLabel, instanceStateTone, tierShortLabel } from '@/utils/instances.ts'
+import {
+  engineLabel,
+  enginePhaseLabel,
+  instanceStateLabel,
+  instanceStateTone,
+  isEngineSwitching,
+  tierShortLabel,
+} from '@/utils/instances.ts'
 import {
   Users,
   Activity,
@@ -53,6 +60,13 @@ const overview = computed(() =>
     instances.value,
     accountsStore.activeId,
   ),
+)
+const engineSwitching = computed(() => isEngineSwitching(instancesStore.enginePhase))
+const engineName = computed(() =>
+  engineLabel(instancesStore.engine || instancesStore.engineTarget || 'browser'),
+)
+const engineTargetName = computed(() =>
+  engineLabel(instancesStore.engineTarget || instancesStore.engine || 'browser'),
 )
 const statsTotals = computed(() => systemStore.stats?.totals || null)
 const totalRequests = computed(() => statsTotals.value?.requests || 0)
@@ -117,14 +131,32 @@ usePolling(loadData, 10000)
       <section class="bg-white border border-gray-200/80 rounded-2xl p-5 shadow-xs xl:row-span-2 flex flex-col min-w-0">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
               <Server class="w-4 h-4 text-brand-600 shrink-0" />
               <h3 class="font-semibold text-gray-900 text-sm">
                 当前运行实例
               </h3>
+              <span
+                class="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
+                :class="instancesStore.engine === 'browserless'
+                  ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                  : 'bg-sky-50 text-sky-700 border-sky-200'"
+              >
+                引擎: {{ engineName }}
+              </span>
             </div>
             <p class="mt-1 text-xs text-gray-500">
               槽位容量 {{ capacity }} · 当前在途 {{ inFlightCount }} 请求
+            </p>
+            <p
+              v-if="engineSwitching"
+              class="mt-1 text-[11px] font-medium text-amber-700"
+            >
+              正在切换引擎：{{ enginePhaseLabel(instancesStore.enginePhase) }} →
+              {{ engineTargetName }}
+              <template v-if="instancesStore.engineTotal > 0">
+                （{{ instancesStore.engineRebuilt }}/{{ instancesStore.engineTotal }}）
+              </template>
             </p>
           </div>
           <RouterLink

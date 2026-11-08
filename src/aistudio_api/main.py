@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,15 +18,25 @@ def build_parser() -> argparse.ArgumentParser:
     server_parser.add_argument(
         "--browser-port", type=int, default=settings.browser_port
     )
+    server_parser.add_argument(
+        "--ui-debug",
+        action="store_true",
+        help="启动纯离线 UI Debug 沙盒（禁止真实浏览器/账号/外网）",
+    )
 
     return parser
 
 
 def main():
+    # Must be set before importing aistudio_api.config/app, because Windows
+    # shells can mangle inline environment assignments in background runners.
+    if "--ui-debug" in sys.argv:
+        os.environ["AISTUDIO_UI_DEBUG"] = "1"
+
     parser = build_parser()
     args = parser.parse_args()
-
-    import sys
+    if getattr(args, "ui_debug", False):
+        os.environ["AISTUDIO_UI_DEBUG"] = "1"
 
     from aistudio_api.api.app import main as server_main
 

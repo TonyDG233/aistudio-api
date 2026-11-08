@@ -9,6 +9,15 @@ export const useInstancesStore = defineStore('instances', () => {
   const maxInstances = ref(0)
   const latestInstanceId = ref<string | null>(null)
   const currentInstanceId = ref<string | null>(null)
+  const engine = ref('')
+  const enginePhase = ref('')
+  const engineTarget = ref('')
+  const engineRebuilt = ref(0)
+  const engineTotal = ref(0)
+  const transportState = ref('')
+  const workerState = ref('')
+  const proofLatencyMs = ref<number | null>(null)
+  const fingerprintProfile = ref('')
   const loading = ref(false)
   const creating = ref(false)
   const busyIds = ref<Record<string, boolean>>({})
@@ -27,6 +36,16 @@ export const useInstancesStore = defineStore('instances', () => {
       maxInstances.value = res.max_instances || 0
       latestInstanceId.value = res.latest_instance_id || null
       currentInstanceId.value = res.current_instance_id || null
+      engine.value = res.engine || ''
+      enginePhase.value = res.engine_phase || ''
+      engineTarget.value = res.engine_target || ''
+      engineRebuilt.value = res.rebuilt || 0
+      engineTotal.value = res.total || 0
+      transportState.value = res.transport_state || ''
+      workerState.value = res.worker_state || ''
+      proofLatencyMs.value =
+        typeof res.proof_latency_ms === 'number' ? res.proof_latency_ms : null
+      fingerprintProfile.value = res.fingerprint_profile || ''
     } catch {
       // keep the previous snapshot when the instances API is unavailable
     } finally {
@@ -124,6 +143,15 @@ export const useInstancesStore = defineStore('instances', () => {
     maxInstances,
     latestInstanceId,
     currentInstanceId,
+    engine,
+    enginePhase,
+    engineTarget,
+    engineRebuilt,
+    engineTotal,
+    transportState,
+    workerState,
+    proofLatencyMs,
+    fingerprintProfile,
     loading,
     creating,
     busyIds,
