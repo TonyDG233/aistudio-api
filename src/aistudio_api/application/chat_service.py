@@ -354,9 +354,32 @@ def _normalize_gemini_modalities(
     return AistudioImageOutputMode.image_only()
 
 
+_REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
+    "MINIMAL": ThinkingLevel.MINIMAL,
+    "LOW": ThinkingLevel.LOW,
+    "MEDIUM": ThinkingLevel.MEDIUM,
+    "HIGH": ThinkingLevel.HIGH,
+}
+
+
+def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
+    if raw_level is None:
+        return None
+    if isinstance(raw_level, ThinkingLevel):
+        return raw_level
+    if isinstance(raw_level, int) and not isinstance(raw_level, bool):
+        return ThinkingLevel(raw_level)
+    label = str(raw_level).strip().upper()
+    if not label or label in ("NONE", "OFF", "DISABLE", "DISABLED", "0"):
+        return None
+    if label in _REASONING_EFFORT_TO_LEVEL:
+        return _REASONING_EFFORT_TO_LEVEL[label]
+    return ThinkingLevel[label]
+
+
 def _normalize_gemini_thinking_config(
     value: object,
-) -> list[object] | dict[str, object] | None:
+) -> list[object] | None:
     if value is None or isinstance(value, list):
         return value
     if not isinstance(value, dict):
@@ -364,15 +387,46 @@ def _normalize_gemini_thinking_config(
             "generationConfig.thinkingConfig must be an object or wire array"
         )
 
-    raw_level = value.get("thinkingLevel", value.get("level", ThinkingLevel.HIGH))
-    raw_mode = value.get("mode", 1)
-    if isinstance(raw_level, ThinkingLevel):
-        level = raw_level
-    elif isinstance(raw_level, int):
-        level = ThinkingLevel(raw_level)
-    else:
-        level = ThinkingLevel[str(raw_level).strip().upper()]
-    return AistudioThinkingConfig(level=level, mode=int(raw_mode)).to_wire()
+    raw_level = value.get(
+        "thinkingLevel", value.get("thinking_level", value.get("level"))
+    )
+    raw_budget = value.get(
+        "thinkingBudget", value.get("thinking_budget", value.get("budget"))
+    )
+    raw_mode = value.get("mode")
+    raw_include = value.get("includeThoughts", value.get("include_thoughts"))
+
+    if isinstance(raw_level, str) and raw_level.strip().upper() in (
+        "NONE",
+        "OFF",
+        "DISABLE",
+        "DISABLED",
+    ):
+        return None
+    if (
+        raw_include is False
+        and raw_level is None
+        and raw_budget is None
+        and raw_mode is None
+    ):
+        return None
+
+    level = _parse_thinking_level(raw_level)
+    budget: int | None = None
+    if raw_budget is not None and not isinstance(raw_budget, bool):
+        budget = int(str(raw_budget))
+        if budget == 0 and level is None and raw_mode is None:
+            return None
+
+    if level is None and budget is None and raw_mode is None:
+        return None
+
+    mode = (
+        int(str(raw_mode))
+        if raw_mode is not None and not isinstance(raw_mode, bool)
+        else 1
+    )
+    return AistudioThinkingConfig(level=level, mode=mode, budget=budget).to_wire()
 
 
 def _normalize_gemini_image_config(
@@ -599,9 +653,7 @@ def _tool_mode(req: GeminiGenerateContentRequest) -> str | None:
     config = req.toolConfig
     if not isinstance(config, dict):
         return None
-    fcc = config.get("functionCallingConfig") or config.get(
-        "function_calling_config"
-    )
+    fcc = config.get("functionCallingConfig") or config.get("function_calling_config")
     if not isinstance(fcc, dict):
         return None
     mode = fcc.get("mode")
@@ -717,9 +769,7 @@ def _emit_toolshape(
     )
 
 
-def _historical_function_call_signature(
-    role: str, part: GeminiPart
-) -> str | None:
+def _historical_function_call_signature(role: str, part: GeminiPart) -> str | None:
     """Return the signature to attach to a historical model functionCall.
 
     Only model-role ``functionCall`` parts receive a fallback; text and
@@ -1014,9 +1064,13 @@ def normalize_gemini_request(
                 generation_config.mediaResolution
             )
         if generation_config.thinkingConfig is not None:
-            generation_config_overrides["thinking_config"] = (
-                _normalize_gemini_thinking_config(generation_config.thinkingConfig)
+            normalized_thinking = _normalize_gemini_thinking_config(
+                generation_config.thinkingConfig
             )
+            if normalized_thinking is not None:
+                generation_config_overrides["thinking_config"] = normalized_thinking
+            elif "thinking_config" in generation_config_overrides:
+                generation_config_overrides["thinking_config"] = None
         if generation_config.responseModalities is not None:
             image_output_mode = _normalize_gemini_modalities(
                 generation_config.responseModalities,

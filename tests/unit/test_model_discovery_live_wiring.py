@@ -93,9 +93,7 @@ class _DiscoveryManager:
         return self._session
 
 
-def _slot(
-    lane: str, *, closed: bool = False, active_requests: int = 0
-) -> InstanceSlot:
+def _slot(lane: str, *, closed: bool = False, active_requests: int = 0) -> InstanceSlot:
     slot = InstanceSlot(
         slot_id=f"slot-{lane}-{int(closed)}-{active_requests}",
         surface="chat",
@@ -207,13 +205,7 @@ async def test_live_paid_item_absent_from_static_rules_flows_to_routing(monkeypa
 async def test_live_free_model_stays_free(monkeypatch):
     service = discovery_module.model_discovery
     parsed = service._parse_raw_models(
-        [
-            [
-                _raw_model(
-                    "gemini-9-free-demo", access_tier=1, access_modes=[1]
-                )
-            ]
-        ]
+        [[_raw_model("gemini-9-free-demo", access_tier=1, access_modes=[1])]]
     )
     assert parsed[0]["paid"] is False
 
@@ -270,8 +262,7 @@ def test_live_free_truth_overrides_static_image_rule():
     _install_evidence_snapshot()
 
     assert (
-        resolve_required_tiers("gemini-3.1-flash-lite-image", rules=_IMAGE_RULE)
-        == ()
+        resolve_required_tiers("gemini-3.1-flash-lite-image", rules=_IMAGE_RULE) == ()
     )
     route = resolve_model_route("gemini-3.1-flash-lite-image", rules=_IMAGE_RULE)
     assert route.paid is False
@@ -292,12 +283,9 @@ def test_live_paid_truth_from_evidence_uses_paid_lane():
     assert route.paid is True
     assert route.lane == "paid"
     assert route.required_tiers == ("Pro", "Ultra", "Ultra_20X")
-    assert (
-        discovery_module.model_discovery.get_required_tiers(
-            "antigravity-preview-09-2026"
-        )
-        == ["Pro", "Ultra", "Ultra_20X"]
-    )
+    assert discovery_module.model_discovery.get_required_tiers(
+        "antigravity-preview-09-2026"
+    ) == ["Pro", "Ultra", "Ultra_20X"]
 
 
 def test_live_free_gemini_pro_preview_is_not_paid_from_name():
@@ -315,9 +303,10 @@ def test_fallback_free_is_not_a_live_free_truth():
     mark_discovery_source(fallback, "fallback")
     discovery_module.model_discovery._cached_models = fallback
 
-    assert (
-        resolve_required_tiers("fallback-image-model", rules=_IMAGE_RULE)
-        == ("Pro", "Ultra", "Ultra_20X")
+    assert resolve_required_tiers("fallback-image-model", rules=_IMAGE_RULE) == (
+        "Pro",
+        "Ultra",
+        "Ultra_20X",
     )
     route = resolve_model_route("fallback-image-model", rules=_IMAGE_RULE)
     assert route.paid is True
@@ -408,17 +397,11 @@ async def test_gemini_and_openai_model_routes_use_pool_session(monkeypatch):
         seen.append(kwargs.get("sessions"))
         return [{"id": "pool-model", "displayName": "Pool Model"}]
 
-    monkeypatch.setattr(
-        discovery_module.model_discovery, "get_models", _get_models
-    )
+    monkeypatch.setattr(discovery_module.model_discovery, "get_models", _get_models)
     saved_manager = runtime_state.instance_manager
     saved_client = runtime_state.client
-    runtime_state.instance_manager = cast(
-        Any, _DiscoveryManager(pool_session)
-    )
-    runtime_state.client = cast(
-        Any, SimpleNamespace(_session=control_session)
-    )
+    runtime_state.instance_manager = cast(Any, _DiscoveryManager(pool_session))
+    runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
     try:
         await routes_models.list_models(runtime_state=runtime_state)
         await routes_openai.list_models(state=runtime_state)
@@ -427,3 +410,51 @@ async def test_gemini_and_openai_model_routes_use_pool_session(monkeypatch):
         runtime_state.client = saved_client
 
     assert seen == [(pool_session,), (pool_session,)]
+
+
+@pytest.mark.asyncio
+async def test_browserless_discovery_never_touches_a_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    auth_file = tmp_path / "acc.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "SAPISID",
+                        "value": "v",
+                        "domain": ".google.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    page_access: list[int] = []
+
+    class _BrowserlessSession:
+        engine = "browserless"
+        _auth_file = str(auth_file)
+        active_context = SimpleNamespace(
+            auth_file=str(auth_file), auth_user="0", tier="Free"
+        )
+
+        @property
+        def page(self) -> object:
+            page_access.append(1)
+            raise AssertionError("browserless page must never be touched")
+
+    service = ModelDiscoveryService()
+    page_fetch = AsyncMock(side_effect=AssertionError("live_page must not run"))
+    http_fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(service, "_fetch_via_page", page_fetch)
+    monkeypatch.setattr(service, "_fetch_via_http", http_fetch)
+
+    await service.get_models(force_refresh=True, sessions=[_BrowserlessSession()])
+
+    assert page_access == []
+    assert page_fetch.await_count == 0
+    assert http_fetch.await_count >= 1

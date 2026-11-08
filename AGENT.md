@@ -197,7 +197,9 @@ uv run python3 main.py server --port 8080
 
 ### 4.1 实例定义（不可再改的边界）
 
-- **1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（chat 或 build）**。
+- **双引擎全局二选一（默认 `browser`）**，1 实例边界按引擎定义：
+  - **`browser` 模式**：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（chat 或 build）。
+  - **`browserless` 模式**：1 实例 = 1 账号 + 1 BrowserlessSession（无 Chromium Context/Page）+ 1 surface；每个槽位独立持有 Cookie、确定性指纹、proof 铸造器与传输器。
 - 同一账号的 chat/build 不并存；需要切换就关闭当前实例再重建，或换账号。
 - 实例是调度与用量单位；Context/Page 是实现细节，不作为用户可配置项。
 - 实例配置使用 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器；全局只做总上限。

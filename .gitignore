@@ -45,6 +45,10 @@ web/dist/
 repomix-output.*
 repomix.config.*
 
+# WAA signer build outputs (源码、assets、构建脚本与文档仍需入库)
+waa-signer/bin/
+waa-signer/.deps/
+
 # Android / Gradle
 .gradle/
 android/.gradle/

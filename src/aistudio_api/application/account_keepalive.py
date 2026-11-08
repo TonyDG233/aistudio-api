@@ -137,10 +137,35 @@ class AccountKeepaliveService:
         self._last_results: dict[str, dict[str, object]] = {}
         self._last_error: str | None = None
         self._next_due: dict[str, float] = {}
+        self._paused = False
 
     @property
     def running(self) -> str | None:
         return self._running
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    async def pause_and_wait(self, timeout_s: float = 10.0) -> bool:
+        """Pause scheduled jobs and wait (bounded) for any in-flight job.
+
+        Used by the engine hot switch before draining/destroying slot sessions.
+        """
+        self._paused = True
+        if not self._job_lock.locked():
+            return True
+        try:
+            await asyncio.wait_for(
+                self._idle_event.wait(), timeout=max(0.1, float(timeout_s))
+            )
+        except TimeoutError:
+            log.warning("[Keepalive] pause wait timed out; job still running")
+            return False
+        return True
+
+    def resume(self) -> None:
+        self._paused = False
 
     def _settings(self) -> KeepaliveSettings:
         return KeepaliveSettings.from_config()
@@ -167,8 +192,7 @@ class AccountKeepaliveService:
         self._next_due = {
             "metadata_refresh": (
                 now
-                if settings.metadata_refresh_on_startup
-                and not startup_metadata_done
+                if settings.metadata_refresh_on_startup and not startup_metadata_done
                 else now + settings.metadata_refresh_seconds
             ),
             "auth_update": now,
@@ -223,6 +247,8 @@ class AccountKeepaliveService:
         return min(NO_ACTIVE_PAGE_RETRY_SECONDS, interval)
 
     async def _run_due(self, settings: KeepaliveSettings) -> None:
+        if self._paused:
+            return
         now = self._clock()
         jobs: list[tuple[str, bool, float]] = [
             (
@@ -259,10 +285,16 @@ class AccountKeepaliveService:
     ) -> dict[str, object]:
         if task not in TASKS:
             return {"ok": False, "task": task, "reason": "unknown_task"}
+        if self._paused:
+            return {"ok": False, "task": task, "reason": "paused"}
         if self._job_lock.locked():
             return {"ok": False, "task": task, "reason": "busy"}
 
         async with self._job_lock:
+            # Re-check after acquiring the lock: a pause may have been requested
+            # while this caller waited behind an in-flight job.
+            if self._paused:
+                return {"ok": False, "task": task, "reason": "paused"}
             self._idle_event.clear()
             self._running = task
             current = settings or self._settings()

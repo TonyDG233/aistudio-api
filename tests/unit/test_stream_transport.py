@@ -40,9 +40,7 @@ async def test_explicit_free_tier_header_is_not_replaced_by_active_pro(
 
     page = MagicMock(spec=CDPPage)
     page._cached_cookies = {"SAPISID": "test_sapisid"}
-    monkeypatch.setattr(
-        transport_module, "_get_active_account_tier", lambda: "Pro"
-    )
+    monkeypatch.setattr(transport_module, "_get_active_account_tier", lambda: "Pro")
 
     headers = await transport_module._ensure_authorization_header(
         page,
@@ -64,9 +62,7 @@ async def test_supplied_paid_tier_wins_over_active_account_tier(monkeypatch):
 
     page = MagicMock(spec=CDPPage)
     page._cached_cookies = {"SAPISID": "test_sapisid"}
-    monkeypatch.setattr(
-        transport_module, "_get_active_account_tier", lambda: "Free"
-    )
+    monkeypatch.setattr(transport_module, "_get_active_account_tier", lambda: "Free")
 
     headers = await transport_module._ensure_authorization_header(
         page, {}, tier="Ultra"
@@ -82,13 +78,9 @@ async def test_blank_tier_falls_back_to_active_account_tier(monkeypatch):
 
     page = MagicMock(spec=CDPPage)
     page._cached_cookies = {"SAPISID": "test_sapisid"}
-    monkeypatch.setattr(
-        transport_module, "_get_active_account_tier", lambda: "Pro"
-    )
+    monkeypatch.setattr(transport_module, "_get_active_account_tier", lambda: "Pro")
 
-    headers = await transport_module._ensure_authorization_header(
-        page, {}, tier="  "
-    )
+    headers = await transport_module._ensure_authorization_header(page, {}, tier="  ")
 
     assert headers["X-AIStudio-G1-Tier"] == tier_header_value("Pro")
 
@@ -500,9 +492,7 @@ async def test_pg03_tool_stream_idle_after_open_connection_synthesizes_stop(
         finally:
             closed = True
 
-    mock_session.send_streaming_request = MagicMock(
-        side_effect=stalled_tool_stream
-    )
+    mock_session.send_streaming_request = MagicMock(side_effect=stalled_tool_stream)
 
     started = time.monotonic()
     events = [
@@ -523,3 +513,86 @@ async def test_pg03_tool_stream_idle_after_open_connection_synthesizes_stop(
     assert events[-1] == ("done", None)
     assert elapsed < 2.0
     assert closed is True
+
+
+def _captured_stream_request() -> CapturedRequest:
+    return CapturedRequest(
+        url="https://alkalimakersuite-pa.clients6.google.com/$rpc/GenerateContent",
+        headers={},
+        body='["models/gemini-3.7-flash"]',
+        model="models/gemini-3.7-flash",
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_gateway_raises_transport_error_for_error_event():
+    """An ('error', ...) transport frame must raise, never surface as HTTP 0."""
+    mock_session = MagicMock(spec=BrowserSession)
+
+    async def error_stream(**_kwargs):
+        yield ("error", "ReadTimeout")
+
+    mock_session.send_streaming_request = MagicMock(side_effect=error_stream)
+    gateway = StreamingGateway(session=mock_session)
+
+    with pytest.raises(BrowserTransportError, match="ReadTimeout"):
+        async for _ in gateway.stream_chat(
+            captured=_captured_stream_request(), model="models/gemini-3.7-flash"
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events",
+    [
+        [("chunk", b"[[]]")],
+        [("status", 0), ("chunk", b"[[]]")],
+    ],
+)
+async def test_streaming_gateway_raises_when_http_status_never_arrives(events):
+    """A stream that ends without a real HTTP status must raise instead of HTTP 0."""
+    mock_session = MagicMock(spec=BrowserSession)
+
+    async def broken_stream(**_kwargs):
+        for event in events:
+            yield event
+
+    mock_session.send_streaming_request = MagicMock(side_effect=broken_stream)
+    gateway = StreamingGateway(session=mock_session)
+
+    with pytest.raises(BrowserTransportError, match="status arrived"):
+        async for _ in gateway.stream_chat(
+            captured=_captured_stream_request(), model="models/gemini-3.7-flash"
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_rpc_signing_uses_minimal_cookie_whitelist(monkeypatch):
+    """SAPISIDHASH signing only needs auth cookies; the page jar stays untouched."""
+    from aistudio_api.infrastructure.gateway import transport as transport_module
+
+    page = MagicMock(spec=CDPPage)
+    full_jar = {
+        "SAPISID": "sapisid",
+        "SID": "sid",
+        "LSID": "account-cookie",
+        "__Host-GAPS": "host-cookie",
+        "_ga": "telemetry",
+        "OSID": "studio",
+    }
+    page._cached_cookies = dict(full_jar)
+    seen: dict[str, str] = {}
+
+    def fake_hash(cookies: dict[str, str]) -> str:
+        seen.update(cookies)
+        return "SAPISIDHASH 1_test"
+
+    monkeypatch.setattr(transport_module, "calculate_sapisid_hash", fake_hash)
+
+    headers = await transport_module._ensure_authorization_header(page, {}, tier="Free")
+
+    assert headers["Authorization"] == "SAPISIDHASH 1_test"
+    assert seen == {"SAPISID": "sapisid", "SID": "sid"}
+    assert page._cached_cookies == full_jar

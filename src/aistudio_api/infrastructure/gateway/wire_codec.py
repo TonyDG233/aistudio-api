@@ -219,16 +219,9 @@ class AistudioWireCodec:
         body[self.TIMEZONE_INDEX] = request.location
 
         model_defaults = resolve_model_defaults(request.model)
-        if model_defaults.is_image_model:
-            gc = body[self.GENERATION_CONFIG_INDEX]
-            if isinstance(gc, list):
-                # Different image-capable models reject some text-model carry-over slots.
-                for idx in model_defaults.clear_generation_config_indexes:
-                    if idx < len(gc):
-                        gc[idx] = None
-            if model_defaults.disable_safety_settings:
-                body[self.SAFETY_INDEX] = None
-        else:
+        if model_defaults.disable_safety_settings:
+            body[self.SAFETY_INDEX] = None
+        if not model_defaults.is_image_model:
             if request.tools or request.location is not None:
                 self._ensure_len(body, self.TIMEZONE_INDEX + 1)
                 tz_str = settings.timezone
@@ -289,6 +282,8 @@ class AistudioWireCodec:
         defaults = model_defaults.generation_config_overrides()
         for attr, value in defaults.items():
             setattr(request.generation_config, attr, value)
+        for idx in model_defaults.clear_generation_config_indexes:
+            request.generation_config._set_slot(idx, None)
         if model_defaults.safety_settings is not None:
             request.safety_settings = model_defaults.safety_settings_overrides()
         if safety_settings is not None:
@@ -305,25 +300,12 @@ class AistudioWireCodec:
         for attr, value in (generation_config_overrides or {}).items():
             if not hasattr(request.generation_config, attr):
                 continue
-            if value is None and attr != "thinking_config":
-                continue
             setattr(request.generation_config, attr, value)
-        explicit_thinking_null = (
-            "thinking_config" in defaults and defaults["thinking_config"] is None
-        ) or (
-            generation_config_overrides is not None
-            and "thinking_config" in generation_config_overrides
-            and generation_config_overrides["thinking_config"] is None
-        )
-        if not explicit_thinking_null:
-            request.generation_config.enable_default_thinking()
 
         # OpenAI chat compatibility should not inherit browser-side structured output
         # or explicit reasoning settings from a previously captured AI Studio request.
         if sanitize_plain_text and not model_defaults.is_image_model:
             request.generation_config.sanitize_for_plain_text()
-            if not explicit_thinking_null:
-                request.generation_config.enable_default_thinking()
         if safety_off:
             request.safety_settings = [[None, None, cat, 5] for cat in [7, 8, 9, 10]]
 

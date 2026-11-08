@@ -95,6 +95,42 @@ DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Minimal authentication cookie set accepted by Google RPC / SAPISIDHASH signing.
+# This is only for outbound signed RPC requests; browser session cookies and DOM
+# storage must keep the full jar (see parse_storage_state / build_google_cookie_list).
+MINIMAL_COOKIE_WHITELIST: frozenset[str] = frozenset(
+    {
+        "SID",
+        "HSID",
+        "SSID",
+        "APISID",
+        "SAPISID",
+        "__Secure-1PSID",
+        "__Secure-3PSID",
+        "__Secure-1PAPISID",
+        "__Secure-3PAPISID",
+        "__Secure-1PSIDTS",
+        "__Secure-3PSIDTS",
+        "SIDCC",
+        "__Secure-1PSIDCC",
+        "__Secure-3PSIDCC",
+        "NID",
+    }
+)
+
+
+def filter_minimal_cookies(cookies: dict[str, str]) -> dict[str, str]:
+    """Filter a cookie jar down to the authentication cookies a signed RPC needs.
+
+    The returned dict is a new mapping; the caller's jar is never mutated, so a
+    browser session keeps its full cross-domain cookie set.
+    """
+    return {
+        name: value
+        for name, value in cookies.items()
+        if name in MINIMAL_COOKIE_WHITELIST and value
+    }
+
 
 _STUDIO_SCOPED_COOKIES = frozenset({"OSID", "__Secure-OSID", "__Secure-BUCKET"})
 _ACCOUNT_SCOPED_COOKIES = frozenset(

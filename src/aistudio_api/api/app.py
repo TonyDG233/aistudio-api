@@ -26,8 +26,10 @@ from aistudio_api.config import resolve_data_dir, resolve_ui_debug
 from aistudio_api.domain.errors import AistudioError, RoutingError, TierRequiredError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
+    get_configured_engine_settings,
     get_configured_logging_settings,
     validate_config,
+    write_config_text,
 )
 from aistudio_api.infrastructure.utils.logger import (
     dump_request_exchange,
@@ -315,11 +317,18 @@ async def _shutdown_runtime(
 
     await _call_lifecycle_method(state.keepalive, "stop")
     await _call_lifecycle_method(state.instance_manager, "close")
+    # Per-slot transports/minter are released by instance_manager.close();
+    # then the engine runtime (self-owned signer daemon) and finally the
+    # control-plane browser.
+    await _call_lifecycle_method(getattr(state, "engine_runtime", None), "close")
     await _call_lifecycle_method(state.client, "close")
 
     state.keepalive = None
     state.instance_manager = None
     state.routing_pipeline = None
+    state.engine_runtime = None
+    state.engine_switcher = None
+    state.engine_settings = None
     state.client = None
     state.account_service = None
     state.account_refresher = None
@@ -444,18 +453,26 @@ async def lifespan(_app: FastAPI):
     )
 
     # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
+    from aistudio_api.application.engine_switch import EngineSwitcher
     from aistudio_api.application.instance_manager import InstanceManager
     from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_instance_specs,
         get_configured_max_contexts,
     )
+    from aistudio_api.infrastructure.waa.engine_runtime import build_engine_runtime
 
     # 显式分流：多实例池启用时只允许 InstanceManager.startup() 预热池会话；
     # 控制面 client.session 不得在启动时自动开页/跑 BotGuard。只有配置中
     # 完全没有任何实例（真正的 pool-disabled legacy 模式）才允许控制面预热。
+
     pool_specs = get_configured_instance_specs()
     pool_enabled = bool(pool_specs)
+    engine_settings = get_configured_engine_settings()
+    engine_mode = str(engine_settings.get("mode") or "browser")
+    runtime_state.engine_settings = engine_settings
+    # Control-plane helpers must never open CloakBrowser in browserless mode.
+    client.session.engine = engine_mode
     if pool_enabled:
         logger.info(
             "实例池已启用 (%d 组配置)：跳过控制面预热，启动仅由 "
@@ -464,7 +481,17 @@ async def lifespan(_app: FastAPI):
         )
     else:
         logger.info("实例池未配置：使用 legacy 控制面预热（不创建池会话）")
-    warmup_task = _start_control_warmup(client, pool_enabled=pool_enabled)
+    if engine_mode == "browserless":
+        warmup_task = None
+        logger.info("browserless 引擎：不创建控制面/不拉起 Chromium")
+    else:
+        warmup_task = _start_control_warmup(client, pool_enabled=pool_enabled)
+
+    engine_runtime = build_engine_runtime(
+        engine_settings, client=client, account_store=account_store
+    )
+    await engine_runtime.start()
+    runtime_state.engine_runtime = engine_runtime
 
     def _on_slot_retired(_realm_id: str) -> None:
         client.clear_templates()
@@ -473,6 +500,8 @@ async def lifespan(_app: FastAPI):
         client.session.ensure_cdp_client,
         specs_provider=get_configured_instance_specs,
         max_contexts_provider=get_configured_max_contexts,
+        engine_runtime=engine_runtime,
+        engine=engine_mode,
         on_slot_retired=_on_slot_retired,
     )
     instance_manager = InstanceManager(
@@ -480,6 +509,48 @@ async def lifespan(_app: FastAPI):
         account_store,
     )
     runtime_state.instance_manager = instance_manager
+
+    def _engine_runtime_factory(settings_block: dict[str, object]) -> object:
+        return build_engine_runtime(
+            settings_block, client=client, account_store=account_store
+        )
+
+    def _set_engine_runtime(runtime: object) -> None:
+        runtime_state.engine_runtime = runtime
+        client.session.engine = str(getattr(runtime, "mode", "browser") or "browser")
+
+    def _write_engine_config(text: str) -> None:
+        write_config_text(text)
+
+    def _set_engine_settings(settings_block: dict[str, object]) -> None:
+        runtime_state.engine_settings = dict(settings_block)
+
+    async def _pause_keepalive_for_switch() -> bool:
+        keepalive_service = runtime_state.keepalive
+        pause = getattr(keepalive_service, "pause_and_wait", None)
+        if callable(pause):
+            return bool(await cast("Any", pause)())
+        return True
+
+    def _resume_keepalive_after_switch() -> None:
+        keepalive_service = runtime_state.keepalive
+        resume = getattr(keepalive_service, "resume", None)
+        if callable(resume):
+            resume()
+
+    engine_switcher = EngineSwitcher(
+        pool=instance_pool,
+        manager=instance_manager,
+        runtime_factory=_engine_runtime_factory,
+        runtime_getter=lambda: runtime_state.engine_runtime,
+        runtime_setter=_set_engine_runtime,
+        current_settings=engine_settings,
+        config_writer=_write_engine_config,
+        settings_setter=_set_engine_settings,
+        keepalive_pause=_pause_keepalive_for_switch,
+        keepalive_resume=_resume_keepalive_after_switch,
+    )
+    runtime_state.engine_switcher = engine_switcher
 
     from aistudio_api.application.routing_pipeline import RoutingPipeline
 
@@ -524,9 +595,7 @@ async def lifespan(_app: FastAPI):
                     "keepalive 启动 metadata 刷新未覆盖批次: reason=%s",
                     result.get("reason"),
                 )
-        await _refresh_startup_account_metadata(
-            account_store, covered_ids=covered_ids
-        )
+        await _refresh_startup_account_metadata(account_store, covered_ids=covered_ids)
 
     tier_task = asyncio.create_task(_startup_metadata_and_tiers())
 
@@ -592,7 +661,9 @@ def _protocol_for_request(request: Request) -> ApiFormat:
 async def routing_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """D-04/D-06: tier 403 and routing 503 are rendered by the protocol adapter."""
     status, body = error_payload(exc, _protocol_for_request(request))
-    return JSONResponse(status_code=status, content=body)
+    retry_after = getattr(exc, "retry_after", None)
+    headers = {"Retry-After": str(retry_after)} if retry_after else None
+    return JSONResponse(status_code=status, content=body, headers=headers)
 
 
 @app.exception_handler(AistudioError)
@@ -626,9 +697,7 @@ async def starlette_http_exception_handler(
             detail=exc.detail,
             headers=getattr(exc, "headers", None),
         )
-        return _attach_exception_headers(
-            format_error_response(wrapped, protocol), exc
-        )
+        return _attach_exception_headers(format_error_response(wrapped, protocol), exc)
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
@@ -837,9 +906,7 @@ async def logging_and_dump_middleware(request, call_next):
             response_text=resp_text,
             is_stream=is_event_stream,
         )
-    elif not is_static and not (
-        path == "/health" and response.status_code == 200
-    ):
+    elif not is_static and not (path == "/health" and response.status_code == 200):
         # Health probes are polled continuously; successful probes emit no
         # access log record at all (no INFO, no DEBUG, no broadcast ring entry).
         logger.info(
@@ -951,5 +1018,9 @@ def main():
 
     import uvicorn
 
-    logger.info("启动服务: 监听端口=%d, 浏览器调试端口=%d", args.port, runtime_state.browser_port)
+    logger.info(
+        "启动服务: 监听端口=%d, 浏览器调试端口=%d",
+        args.port,
+        runtime_state.browser_port,
+    )
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")

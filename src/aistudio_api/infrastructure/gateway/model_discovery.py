@@ -20,6 +20,7 @@ from aistudio_api.domain.model_access import (
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
+    filter_minimal_cookies,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
@@ -447,9 +448,7 @@ class ModelDiscoveryService:
             candidates: list[Any] = []
             if sessions is not None:
                 try:
-                    candidates.extend(
-                        item for item in sessions if item is not None
-                    )
+                    candidates.extend(item for item in sessions if item is not None)
                 except TypeError:
                     candidates.append(sessions)
             elif session is not None:
@@ -458,6 +457,14 @@ class ModelDiscoveryService:
             session_cookies: dict[str, str] = {}
             for candidate in candidates:
                 try:
+                    auth_file = _session_auth_file(candidate)
+                    candidate_cookies = _cookies_from_auth_file(auth_file)
+                    if not session_cookies:
+                        session_cookies = candidate_cookies
+                    if getattr(candidate, "engine", "browser") == "browserless":
+                        # Browserless has no page and must use the HTTP/signer
+                        # path below; never a hidden Chromium fallback.
+                        raise RuntimeError("browserless session has no page")
                     page = getattr(candidate, "page", None) or getattr(
                         candidate, "_page", None
                     )
@@ -465,12 +472,10 @@ class ModelDiscoveryService:
                         raise RuntimeError("session has no page")
                     if page.is_closed():
                         raise RuntimeError("session page is closed")
-                    auth_file = _session_auth_file(candidate)
-                    candidate_cookies = _cookies_from_auth_file(auth_file)
-                    if not session_cookies:
-                        session_cookies = candidate_cookies
                     auth_header = (
-                        calculate_sapisid_hash(candidate_cookies)
+                        calculate_sapisid_hash(
+                            filter_minimal_cookies(candidate_cookies)
+                        )
                         if candidate_cookies
                         else None
                     )
@@ -804,8 +809,9 @@ class ModelDiscoveryService:
         """通过 HTTP 客户端携带 SAPISIDHASH 拉取。"""
         import httpx
 
-        auth_header = calculate_sapisid_hash(cookies)
-        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        minimal_cookies = filter_minimal_cookies(cookies)
+        auth_header = calculate_sapisid_hash(minimal_cookies)
+        cookie_header = "; ".join(f"{k}={v}" for k, v in minimal_cookies.items())
         headers = {
             "Content-Type": "application/json+protobuf",
             "X-User-Agent": GRPC_WEB_USER_AGENT,

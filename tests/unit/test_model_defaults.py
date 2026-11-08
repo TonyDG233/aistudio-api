@@ -5,7 +5,7 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioImageOutputMo
 def test_resolve_model_defaults_uses_repo_config_for_gemma():
     defaults = resolve_model_defaults("models/gemma-4-31b-it")
 
-    assert defaults.default_tools == ("google_search",)
+    assert defaults.default_tools == ()
     assert defaults.is_image_model is False
     assert defaults.safety_settings == (
         (None, None, 7, 5),
@@ -170,6 +170,59 @@ model_defaults:
 
     assert defaults.default_tools == ("code_execution",)
     assert defaults.disable_safety_settings is False
+
+
+def test_resolve_model_defaults_does_not_inject_default_generation_values(tmp_path):
+    """Empty image/thinking defaults must not become HIGH level or image prompts."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model_defaults:
+  profiles:
+    - name: image_models
+      match:
+        contains: [image]
+      is_image_model: true
+      generation_config_defaults:
+        thinking_config: {}
+        image_output_mode: null
+        media_resolution: null
+  models: {}
+"""
+    )
+
+    defaults = resolve_model_defaults(
+        "models/gemini-3.1-flash-image-preview", config_path=config_path
+    )
+
+    assert defaults.generation_config_defaults == {
+        "thinking_config": None,
+        "image_output_mode": None,
+        "media_resolution": None,
+    }
+
+
+def test_resolve_model_defaults_coerces_optional_thinking_budget(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model_defaults:
+  profiles:
+    - name: gemini_models
+      match:
+        prefixes: [gemini-]
+      generation_config_defaults:
+        thinking_config:
+          thinkingBudget: 2048
+  models: {}
+"""
+    )
+
+    defaults = resolve_model_defaults(
+        "models/gemini-3.8-flash", config_path=config_path
+    )
+
+    assert defaults.generation_config_defaults["thinking_config"] == [1, 2048]
 
 
 def test_resolve_model_defaults_drop_unsupported_params_inheritance(tmp_path):

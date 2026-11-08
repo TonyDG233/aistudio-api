@@ -26,6 +26,7 @@
 - A/B 阶段已完成并提交；B7 配置自愈、分层解耦与文档审计已收口。
 - C 阶段按 2026-11-01 新顺序执行：C1 → C2 → C3 → C4 → C5；旧顺序（C1=P4 Build → P8/UI → Claude/Responses → 统计页 → P10）已于 2026-11-01 被取代，见 `06` 同日决策节；`06` 的 D5 旧顺序已修，发现旧顺序或旧 D-14 残留先停。
 - A / B / C（C1~C5）阶段全部完成，已合并提升至主仓 `master`（基准版本 `2.0.0`）并结束双 worktree 模式；后续在单工作区开展 Post-C（上游 Browserless `waa-signer` 新提交对账评估与 Docker 镜像分发优化）。
+- 2026-11-08 用户裁决新增版本化阶段 Stage 2.1.0（双引擎共存与引擎切换）与 Stage 2.2.0（WAA 稳定后 Android App/APK 服务端化）；两者接在 Post-C 之后，不重写 C1~C5 历史，仍在单工作区 `master` 推进。详见 §4.2。
 - Build（P4/P3-F）不再是 C1 阻塞项：渠道修复/永久废弃决策移到 Post-C（单仓独立阶段）处理；历史事故记录 `INC-20261028-01` 保留。
 - 管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空 = 免密）；D-14 不重开。
 
@@ -36,6 +37,7 @@
 - B 实现：P9-pre → B0 目标 `AGENT.md` → P1 → P3-D03 → P3-D04 → P2 → P6 → P7 → B5a → B5b。
 - C 扩展（2026-11-01 重排）：C1 浏览器按账号指纹加固 + `/v1beta/models` 401 噪音根因修复 + B7-P1 Tier/发现单源收敛 → C2 P8 API/Web 管理台增量（先确认 UI 预设计清单）→ C3 Claude/Responses 协议适配 → C4 P7 统计页（单一事件账本 + client/attempt 分母分离）→ C5 P10 收尾。
 - Post-C（单仓独立阶段）：browserless（WAA/BotGuard 纯沙箱）探索；Build 渠道修复/永久废弃决策；不阻塞 C1-C5。
+- Stage 2.1.0 / Stage 2.2.0（2026-11-08 用户裁决）：Post-C 之后的版本化阶段；双引擎二选一先行，WAA 稳定后再做 Android 服务端化；保持单工作区与 C1~C5 历史不变。
 - 顺序 P6 → P7 → B5a → B5b 固定；每阶段前一步审计通过才进下一步。
 
 ### 4.1 步骤详情
@@ -66,6 +68,29 @@
 | Post-C | 单仓独立阶段 | browserless（WAA/BotGuard 纯沙箱）探索；Build 渠道修复/永久废弃决策；不阻塞 C1-C5 |
 
 每个 Step 的审计通过并经用户确认后才 commit；前一 Step 未通过不进入下一 Step。
+
+### 4.2 Stage 2.1.0 / 2.2.0（2026-11-08 用户裁决）
+
+#### Stage 2.1.0 双引擎共存与引擎切换
+
+- **范围**：在保留传统浏览器模式（`browser` / CloakBrowser CDP）的前提下，引入无浏览器模式（`browserless` / WAA Signer）；双引擎**全局二选一**，默认 `browser`。严禁照上游删除传统浏览器模式、`cdp_client.py`、capture/replay 或四协议代码。
+- **上游修复吸收（用户授权，不判超范围）**：以下三项是用户在 Step 2.1-A 明确授权吸收并保留的上游修复，Reviewer 不再判为超出 Step 范围：
+  - `43adc28` 停止注入未请求的默认 thinking level / tools / image generation 参数。边界：仅当客户端未显式请求时不再补默认值，显式参数照常透传。
+  - `f4fab52` 账号导入自动识别 Tampermonkey grabber 导出 JSON 中的 `authUser` / `g1Tier`。边界：仅扩展导入解析，字段缺失时按原逻辑回退。
+  - `e707072` 最小化 RPC Cookie 过滤（并对齐 Chrome/151 UA 以匹配 WAA proof token）。边界：只影响浏览器/RPC 请求携带的 Cookie 子集与 UA，不改变账号持久化 Cookie 的全量保真。
+- **UI**：在现有「系统与模型配置」卡片增量提供引擎选择（`browser` / `browserless`）与 WAA Signer 设置（地址/超时等）；遵守 D-12 不重排导航。涉及 UI 的改动先提交《UI 页面与交互设计清单》并经用户确认后再改 `.vue`。
+- **保存流程（硬约束）**：Preflight 校验（新引擎可用性、配置合法性、槽位拓扑）→ 有界排空在途 `active_requests` → 销毁全部旧引擎实例（切离 `browser` 时一并关闭 CloakBrowser 进程）→ 按**原实例槽位拓扑与绑定账号**重建全部实例 → 任一步失败回滚到原引擎/原配置，不得留下半切换状态。
+- **验证**：`AISTUDIO_UI_DEBUG=1` 纯离线沙盒 + Playwright 在 `1440x900` / `1024x900` / `768x900` 验收；最终提交前由主控/用户执行**一次**受控本地实机消息测试（禁止反复重启触发风控）。
+- **退出条件**：全部检查（ruff/pyright/pytest/前端 build/UI 验收/单次实机）通过后打 `2.1.0` Tag。
+- **边界**：不改实例槽位定义与 `active_requests` 唯一并发原语；不新增第二套账本；不删除 android/ 与四协议。
+
+#### Stage 2.2.0 Android App / APK 服务端化
+
+- **前提**：WAA 在 2.1.0 中稳定后才启动；2.1.0 未通过不得进入。
+- **范围**：把 browserless/WAA 服务端化并打包为独立 Android App/APK；APK 内**禁用传统桌面浏览器模式**，彻底脱离 Termux/proot 依赖；现有 `android/` Cookie 提取器保留。
+- **后台保活**：采用类音乐播放器式的 Android 后台媒体播放 + 前台常驻服务保活；不提供悬浮小窗。
+- **环境对齐（硬约束）**：WebView/真实移动端的 UA、屏幕、时区、语言等环境探测必须与 WAA/BotGuard 签名严格一致；禁止用桌面或服务器环境冒充移动端造成环境错配、增加风控。
+- **边界**：不修改 2.1.0 已冻结的双引擎服务端契约。
 
 ## 5. Agent 执行与审计规则
 

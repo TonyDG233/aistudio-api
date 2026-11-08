@@ -41,6 +41,9 @@ _AUTH_HEADER_RE = re.compile(
     r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(bearer\s+)?([^\s,;\"']+)"
 )
 _SET_COOKIE_RE = re.compile(r"(?i)(\bset-cookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
+_WAA_SET_COOKIES_RE = re.compile(
+    r"(?i)(\bx-waa-set-cookies\b[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)"
+)
 _COOKIE_HEADER_RE = re.compile(r"(?i)(\bcookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
 _COOKIE_TOKEN_RE = re.compile(
     r"(?i)\b(sapisidhash|sapisid|hsid|ssid|apisid|sid)\s*=\s*([^;\s\"',]+)"
@@ -65,6 +68,7 @@ def sanitize_log_message(message: str) -> str:
     text = _AUTH_HEADER_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2) or ''}{_MASK}", text
     )
+    text = _WAA_SET_COOKIES_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _SET_COOKIE_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     # Cookie headers are masked wholesale: even non-auth cookie names can carry
     # session material, so no cookie value may reach the ring or archive sink.

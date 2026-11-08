@@ -682,7 +682,9 @@ async def test_reassign_unbound_slot_binds_account(tmp_path) -> None:
     manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
     await manager.startup()
     unbound = next(
-        item for item in (await manager.list_instances()).instances if not item.account_id
+        item
+        for item in (await manager.list_instances()).instances
+        if not item.account_id
     )
     assert unbound.state is InstanceState.UNSTARTED
     free2 = store.save_account(
@@ -812,7 +814,9 @@ async def test_unbound_restart_and_wake_raise_clear_account_error(tmp_path) -> N
     await manager.startup()
 
     unbound = next(
-        item for item in (await manager.list_instances()).instances if not item.account_id
+        item
+        for item in (await manager.list_instances()).instances
+        if not item.account_id
     )
     with pytest.raises(InstanceInvalidAccountError, match="账号"):
         await manager.restart(unbound.id)
@@ -869,17 +873,13 @@ async def test_sync_account_tier_moves_promoted_account_to_paid_and_refills_free
     assert spare.min_tier == "Free"
     assert spare.state is InstanceState.ACTIVE
     assert spare.tier == "Free"
-    assert sum(
-        1 for item in after if item.account_id == accounts["promoted"].id
-    ) == 1
+    assert sum(1 for item in after if item.account_id == accounts["promoted"].id) == 1
 
     slots = manager._pool.slots()
     promoted_slot = next(
         slot for slot in slots if slot.account_id == accounts["promoted"].id
     )
-    spare_slot = next(
-        slot for slot in slots if slot.account_id == accounts["spare"].id
-    )
+    spare_slot = next(slot for slot in slots if slot.account_id == accounts["spare"].id)
     assert promoted_slot.lane == "paid"
     assert promoted_slot.session is not None
     assert promoted_slot.session.active_context.tier == "Pro"
@@ -890,11 +890,14 @@ async def test_sync_account_tier_moves_promoted_account_to_paid_and_refills_free
     await manager.sync_account_tier(accounts["promoted"].id, "Pro")
     account_ids = [slot.account_id for slot in manager._pool.slots() if slot.account_id]
     assert len(account_ids) == len(set(account_ids))
-    assert next(
-        item
-        for item in (await manager.list_instances()).instances
-        if item.account_id == accounts["promoted"].id
-    ).min_tier == "Pro"
+    assert (
+        next(
+            item
+            for item in (await manager.list_instances()).instances
+            if item.account_id == accounts["promoted"].id
+        ).min_tier
+        == "Pro"
+    )
 
 
 @pytest.mark.asyncio
@@ -954,7 +957,10 @@ async def test_sync_account_tier_binds_restored_pro_to_unstarted_paid_slot(
     await manager.startup()
 
     before = (await manager.list_instances()).instances
-    assert next(item for item in before if item.min_tier == "Pro").state is InstanceState.UNSTARTED
+    assert (
+        next(item for item in before if item.min_tier == "Pro").state
+        is InstanceState.UNSTARTED
+    )
 
     store.update_account_tier(accounts["dormant"].id, "Pro")
     await manager.sync_account_tier(accounts["dormant"].id, "Pro")
@@ -973,9 +979,7 @@ async def test_sync_account_tier_binds_restored_pro_to_unstarted_paid_slot(
 
 @pytest.mark.asyncio
 async def test_sync_account_tier_same_lane_updates_without_restart(tmp_path) -> None:
-    store, accounts = _store_with_accounts(
-        tmp_path, ("pro", "pro@example.com", "Pro")
-    )
+    store, accounts = _store_with_accounts(tmp_path, ("pro", "pro@example.com", "Pro"))
     cdp = FakeCDP()
     manager = _manager(store, cdp, specs=[_paid_spec()], max_contexts=1)
     await manager.startup()
@@ -1020,3 +1024,106 @@ async def test_ready_slot_for_account_reuses_existing_page(tmp_path) -> None:
     assert len(cdp.created) == created_before
     assert manager.ready_slot_for_account("missing-account") is None
     assert len(cdp.created) == created_before
+
+
+@pytest.mark.asyncio
+async def test_rebuild_keeps_disabled_bound_account_unstarted(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free", "free@example.com", "Free"),
+        ("spare", "spare@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    bound_account = record.account_id
+    assert bound_account == accounts["free"].id
+
+    store.toggle_account_enabled(bound_account, False)
+    await manager.destroy_runtimes()
+    rebuilt, total = await manager.rebuild_runtimes()
+
+    assert (rebuilt, total) == (0, 1)
+    listed = (await manager.list_instances()).instances[0]
+    assert listed.state is InstanceState.UNSTARTED
+    assert listed.account_id == bound_account  # Q-05: no silent rebind
+    slot = manager._pool.slots()[0]
+    assert slot.account_id == bound_account
+    assert slot.session is None
+
+
+@pytest.mark.asyncio
+async def test_destroy_and_rebuild_take_lifecycle_lock(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+
+    await manager._lifecycle_lock.acquire()
+    destroy = asyncio.create_task(manager.destroy_runtimes())
+    await asyncio.sleep(0)
+    assert not destroy.done()
+    manager._lifecycle_lock.release()
+    assert await destroy == 1
+
+    await manager._lifecycle_lock.acquire()
+    rebuild = asyncio.create_task(manager.rebuild_runtimes())
+    await asyncio.sleep(0)
+    assert not rebuild.done()
+    manager._lifecycle_lock.release()
+    assert await rebuild == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_scope_blocks_manual_rebind(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free1", "free1@example.com", "Free"),
+        ("free2", "free2@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_scope() -> None:
+        async with manager.lifecycle_scope():
+            entered.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_scope())
+    await entered.wait()
+    manual = asyncio.create_task(
+        manager.rebind_account(
+            accounts["free2"].id,
+            previous_account_id=accounts["free1"].id,
+            reason="concurrency-test",
+        )
+    )
+    await asyncio.sleep(0)
+    assert not manual.done()
+
+    release.set()
+    await holder
+    rebound = await manual
+    assert rebound.account_id == accounts["free2"].id
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_scope_is_reentrant_for_destroy_and_rebuild(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+
+    async with manager.lifecycle_scope():
+        assert await manager.destroy_runtimes() == 1
+        assert await manager.rebuild_runtimes() == (1, 1)
+    assert manager._lifecycle_depth == 0

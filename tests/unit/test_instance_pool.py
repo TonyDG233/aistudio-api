@@ -362,7 +362,9 @@ def test_legacy_lease_and_pinned_surface_is_gone() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_account_tier_cross_lane_unbinds_free_slot_and_keeps_same_lane() -> None:
+async def test_sync_account_tier_cross_lane_unbinds_free_slot_and_keeps_same_lane() -> (
+    None
+):
     cdp = FakeCDP()
     retired: list[str] = []
     pool = _pool(cdp, on_slot_retired=retired.append)
@@ -418,3 +420,27 @@ async def test_snapshot_has_no_lease_or_page_budget_fields() -> None:
         "last_error",
     }
     assert item["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pause_requests_rejects_begin_with_503_retry_after() -> None:
+    from aistudio_api.domain.errors import EngineSwitchingError
+
+    cdp = FakeCDP()
+    pool = _pool(cdp)
+    free = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, free.slot_id, account_id="free-acc", tier="Free")
+
+    pool.pause_requests()
+    with pytest.raises(EngineSwitchingError) as excinfo:
+        await pool.begin_request(free.slot_id)
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.retry_after == 1
+    assert pool.total_active_requests() == 0
+
+    pool.resume_requests()
+    handle = await pool.begin_request(free.slot_id)
+    assert handle.generation == free.generation
+    assert handle.epoch == pool.engine_epoch
+    handle.release()
+    assert pool.total_active_requests() == 0

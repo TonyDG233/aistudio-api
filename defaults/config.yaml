@@ -14,6 +14,39 @@ api_keys: []
 security:
   api_allow_anonymous: false
 
+# 请求引擎（Stage 2.1 双引擎二选一；默认传统浏览器模式）。
+# mode: browser（CloakBrowser/CDP）| browserless（waa-signer，无 Chromium）。
+# 切换时后端执行 Validate -> Preflight -> Drain -> Destroy -> Rebuild -> Commit，
+# 任一步失败回滚旧引擎与旧配置；期间新请求返回 503 + Retry-After。
+engine:
+  mode: browser
+  switch:
+    drain_timeout_s: 12
+    startup_concurrency: 2
+    switch_timeout_s: 120
+    rollback_on_partial_failure: true
+  browserless:
+    signer:
+      # local_subprocess：由服务按 binary_path 拉起；remote_http：显式远程地址。
+      mode: local_subprocess
+      endpoint: http://127.0.0.1:8081
+      binary_path: waa-signer/bin/waa-signer
+      auto_start: true
+      startup_timeout_s: 30
+      request_timeout_s: 90
+      state_dir: data/waa/workers
+      max_workers: 8
+      idle_ttl_s: 900
+      locale: en-US
+      timezone: America/Los_Angeles
+    transport:
+      # signer_rpc：走 waa-signer uTLS 通道（优先）；direct_http：显式降级 httpx。
+      mode: signer_rpc
+      http2: true
+      max_connections: 6
+      connect_timeout_s: 15
+      read_timeout_s: 120
+
 # 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface。
 # - count：该槽位的实例数量（正整数）；相同 tier 区间会合并计数。
 # - surface：chat 或 build；同一账号的 chat/build 不会同时存活。
@@ -174,18 +207,6 @@ model_defaults:
           - image
           - imagen
       is_image_model: true
-      default_tools:
-        - google_search_and_image_search
-      generation_config_defaults:
-        response_mime_type: null
-        image_output_mode: image_only
-        thinking_config:
-          level: MINIMAL
-          mode: 1
-      clear_generation_config_indexes:
-        - 7
-        - 13
-        - 17
       disable_safety_settings: true
     - name: video_models
       match:
@@ -198,8 +219,6 @@ model_defaults:
       match:
         prefixes:
           - gemma-
-      default_tools:
-        - google_search
       safety_settings:
         Harassment: 5
         Hate: 5
@@ -209,8 +228,6 @@ model_defaults:
       match:
         prefixes:
           - gemini-
-      default_tools:
-        - google_search
       safety_settings:
         Harassment: 5
         Hate: 5

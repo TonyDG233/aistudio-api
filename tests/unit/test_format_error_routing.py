@@ -30,12 +30,15 @@ def test_tier_403_has_four_fields_and_is_403(protocol) -> None:
     error = body.get("error")
     assert isinstance(error, dict)
     for field in ("tier", "model", "required_tier", "current_tier"):
-        assert error[field] == {
-            "tier": "Pro",
-            "model": "gemini-4-argon",
-            "required_tier": "Pro",
-            "current_tier": "Free",
-        }[field]
+        assert (
+            error[field]
+            == {
+                "tier": "Pro",
+                "model": "gemini-4-argon",
+                "required_tier": "Pro",
+                "current_tier": "Free",
+            }[field]
+        )
     assert status != 429 and status != 503
 
 
@@ -110,3 +113,13 @@ async def test_openai_route_tier_403_keeps_four_fields() -> None:
     assert error["required_tier"] == "Pro"
     assert error["current_tier"] == "Free"
     assert response.status_code not in (429, 503)
+
+
+@pytest.mark.parametrize("api_format", ["openai", "claude", "responses", "gemini"])
+def test_engine_switching_503_carries_retry_after(api_format: str) -> None:
+    from aistudio_api.api.format_errors import format_error_response
+    from aistudio_api.domain.errors import EngineSwitchingError
+
+    response = format_error_response(EngineSwitchingError("switch"), api_format)  # type: ignore[arg-type]
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"

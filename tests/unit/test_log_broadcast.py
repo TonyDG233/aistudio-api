@@ -197,3 +197,12 @@ def test_ring_buffer_masks_cookie_authorization_and_api_key_values():
     assert "theme=dark" not in message
     assert "Authorization: Bearer ***" in message
     assert "Cookie: ***" in message
+
+
+def test_sanitize_masks_x_waa_set_cookies_payload() -> None:
+    sanitized = sanitize_log_message(
+        "X-WAA-Set-Cookies: eyJjb29raWVzIjpbXX0= response ok"
+    )
+    assert "eyJjb29raWVzIjpbXX0=" not in sanitized
+    assert "X-WAA-Set-Cookies" in sanitized
+    assert "***" in sanitized

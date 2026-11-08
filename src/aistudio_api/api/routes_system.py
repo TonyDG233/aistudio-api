@@ -18,9 +18,13 @@ from aistudio_api.api.response_models import (
 from aistudio_api.config import resolve_default_config_template
 from aistudio_api.infrastructure.gateway.model_defaults import (
     ConfigValidationError,
+    _default_config,
     _resolve_config_path,
+    engine_settings_hash,
     get_configured_logging_settings,
     merge_config_documents,
+    validate_config_mapping,
+    validate_engine_settings,
     write_config_text,
 )
 from aistudio_api.infrastructure.utils.logger import (
@@ -117,7 +121,9 @@ def stats_response(days: int | None = None) -> StatsResponse:
     is_sandbox = isinstance(source, dict)
     raw_stats = source if is_sandbox else runtime_state.model_stats
     daily_source = getattr(sandbox, "daily_stats", None) if is_sandbox else None
-    raw_daily = daily_source if isinstance(daily_source, dict) else runtime_state.daily_stats
+    raw_daily = (
+        daily_source if isinstance(daily_source, dict) else runtime_state.daily_stats
+    )
     count_source = getattr(sandbox, "count_tokens", None) if is_sandbox else None
     count_stats = (
         count_source
@@ -147,9 +153,7 @@ def stats_response(days: int | None = None) -> StatsResponse:
                         if daily_model != clean_m:
                             continue
                         quota = resolve_tier_quota(acc.tier, daily_model)
-                        used_pct = round(
-                            (m_daily.requests / max(1, quota)) * 100, 1
-                        )
+                        used_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
                         cd_rem = (
                             max(0, int(m_daily.cooldown_until - time.time()))
                             if m_daily.cooldown_until > time.time()
@@ -226,6 +230,26 @@ async def system_status(
             instances = len(getattr(manager, "records", lambda: ())())
         except Exception:
             instances = 0
+    engine_status: dict[str, object] = {}
+    switcher = runtime_state.engine_switcher
+    getter: Any = getattr(switcher, "status", None)
+    if callable(getter):
+        try:
+            raw_engine_status = getter()
+        except Exception as exc:
+            logger.debug("engine status unavailable: %s", exc)
+        else:
+            if isinstance(raw_engine_status, dict):
+                engine_status = {
+                    str(key): value for key, value in raw_engine_status.items()
+                }
+    if not engine_status:
+        settings_block = runtime_state.engine_settings or {}
+        engine_status = {
+            "engine": str(settings_block.get("mode") or "browser"),
+            "engine_phase": "idle",
+            "engine_target": str(settings_block.get("mode") or "browser"),
+        }
     return {
         "status": "ok",
         "busy": bool(getattr(runtime_state, "ui_sandbox", None) is not None),
@@ -235,7 +259,60 @@ async def system_status(
         "instances": instances,
         "formats": formats_status(runtime_state),
         "default_text_model": default_text_model(runtime_state),
+        **engine_status,
     }
+
+
+@protected_router.post("/api/engine/health-check")
+async def engine_health_check(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """Probe the active engine runtime (WAA signer health for browserless)."""
+    started = time.perf_counter()
+    runtime = runtime_state.engine_runtime
+    probe: Any = getattr(runtime, "health", None)
+    if not callable(probe):
+        mode = str((runtime_state.engine_settings or {}).get("mode") or "browser")
+        return {
+            "ok": mode == "browser",
+            "engine": mode,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "workers": 0,
+            "maxWorkers": 0,
+            "version": "",
+            "error": None if mode == "browser" else "engine runtime unavailable",
+        }
+    try:
+        result: Any = await cast("Any", probe)()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "engine": "browserless",
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "workers": 0,
+            "maxWorkers": 0,
+            "version": "",
+            "error": str(exc),
+        }
+    as_dict = getattr(result, "as_dict", None)
+    raw_payload: Any = as_dict() if callable(as_dict) else {}
+    payload: dict[str, object] = (
+        {str(key): value for key, value in raw_payload.items()}
+        if isinstance(raw_payload, dict)
+        else {}
+    )
+    payload["engine"] = "browserless"
+    payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    payload.setdefault("error", None)
+    return payload
+
+
+@protected_router.post("/config/waa/health-check")
+async def waa_health_check_alias(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """Backwards/2.1-B friendly alias for the engine health probe."""
+    return await engine_health_check(runtime_state)
 
 
 # ========== 调度与配额管理 API ==========
@@ -294,7 +371,11 @@ async def clear_cooldown(
             store.update_account_refresh(req.account_id, expired=False)
     else:
         rotator.clear_all_cooldowns()
-    logger.info("已清除冷却状态: 账号=%s, 模型=%s", req.account_id or "全部", req.model or "全部")
+    logger.info(
+        "已清除冷却状态: 账号=%s, 模型=%s",
+        req.account_id or "全部",
+        req.model or "全部",
+    )
 
     return {"ok": True, "accounts": rotator.get_all_stats()}
 
@@ -393,6 +474,76 @@ class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
 
 
+def _engine_settings_for_mapping(parsed: dict[str, object]) -> dict[str, object]:
+    """Validate the engine block of a merged config document (422 on failure)."""
+    raw_instances = parsed.get("instances")
+    specs: list[dict[str, object]] = []
+    if isinstance(raw_instances, list):
+        for item in raw_instances:
+            if isinstance(item, dict):
+                try:
+                    specs.append({"count": max(1, int(item.get("count", 1)))})
+                except (TypeError, ValueError):
+                    specs.append({"count": 1})
+    raw_max = parsed.get("max_contexts")
+    max_contexts = (
+        int(raw_max)
+        if isinstance(raw_max, int) and not isinstance(raw_max, bool) and raw_max > 0
+        else None
+    )
+    return validate_engine_settings(
+        parsed.get("engine"), specs=specs, max_contexts=max_contexts
+    )
+
+
+async def _run_engine_switch(
+    runtime_state: RuntimeState,
+    *,
+    target_engine: dict[str, object],
+    target_config_text: str,
+) -> dict[str, object] | None:
+    """Apply the transactional engine switch; ``None`` means plain write.
+
+    Returns the switch result when a switch actually ran (the config has already
+    been atomically written by the commit step), or ``None`` for ui-debug /
+    unchanged-engine paths where the caller writes the config normally.
+    """
+    switcher = runtime_state.engine_switcher
+    if switcher is None:
+        return None
+    current = getattr(switcher, "current_settings", None)
+    if not isinstance(current, dict):
+        current = runtime_state.engine_settings or {}
+    if engine_settings_hash(current) == engine_settings_hash(target_engine):
+        return None
+    from aistudio_api.application.engine_switch import (
+        EngineSwitchConflictError,
+        EngineSwitchError,
+    )
+
+    try:
+        result = await switcher.switch(  # type: ignore[attr-defined]
+            target_engine, target_config_text=target_config_text
+        )
+    except EngineSwitchConflictError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+    except EngineSwitchError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ConfigValidationError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    return {
+        "switched": bool(getattr(result, "switched", False)),
+        "engine": getattr(result, "engine", target_engine.get("mode")),
+        "engine_epoch": getattr(result, "epoch", 0),
+        "rebuilt": getattr(result, "rebuilt", 0),
+        "total": getattr(result, "total", 0),
+    }
+
+
 def _apply_logging_runtime(parsed: object) -> None:
     """Apply the persisted logging block to the live logger runtime."""
     if not isinstance(parsed, dict) or "logging" not in parsed:
@@ -423,10 +574,13 @@ async def get_system_config(
     if config_yaml_path.exists():
         with contextlib.suppress(Exception):
             yaml_content = config_yaml_path.read_text(encoding="utf-8")
+    engine_settings = runtime_state.engine_settings or {}
     return {
         "port": settings.port,
         "browser_port": settings.browser_port,
         "browser_headless": settings.browser_headless,
+        "engine": str(engine_settings.get("mode") or "browser"),
+        "engine_settings": engine_settings,
         "proxy_configured": bool(settings.proxy_url),
         "auth_enabled": settings.auth_enabled,
         "yaml_content": yaml_content,
@@ -441,7 +595,10 @@ async def get_system_config(
 
 
 @protected_router.put("/config/yaml")
-async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
+async def update_config_yaml(
+    req: ConfigYamlUpdateRequest,
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
     """更新 config.yaml 文件内容并热重载默认配置。"""
 
     try:
@@ -450,19 +607,50 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    merged_for_engine_raw = merge_config_documents(_default_config(), parsed or {})
+    merged_for_engine = (
+        cast("dict[str, object]", merged_for_engine_raw)
+        if isinstance(merged_for_engine_raw, dict)
+        else {}
+    )
     try:
-        write_config_text(req.yaml_content)
+        target_engine = _engine_settings_for_mapping(merged_for_engine)
     except ConfigValidationError as e:
-        raise HTTPException(400, detail=str(e)) from e
-    except OSError as e:
-        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        raise HTTPException(422, detail=str(e)) from e
+    switcher = runtime_state.engine_switcher
+    current_engine = getattr(switcher, "current_settings", None)
+    engine_changes = (
+        switcher is not None
+        and isinstance(current_engine, dict)
+        and engine_settings_hash(current_engine) != engine_settings_hash(target_engine)
+    )
+    if engine_changes:
+        try:
+            validate_config_mapping(parsed or {})
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+    switched = await _run_engine_switch(
+        runtime_state,
+        target_engine=target_engine,
+        target_config_text=req.yaml_content,
+    )
+    if switched is None:
+        try:
+            write_config_text(req.yaml_content)
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+        except OSError as e:
+            raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     try:
         _apply_logging_runtime(parsed)
     except Exception as e:
         raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
     logger.info("配置文件 config.yaml 已更新并重新加载")
-    return {"ok": True, "message": "配置已保存并重载"}
+    payload: dict[str, object] = {"ok": True, "message": "配置已保存并重载"}
+    if switched is not None:
+        payload["engine_switch"] = switched
+    return payload
 
 
 class ConfigPatchRequest(BaseModel):
@@ -499,15 +687,36 @@ async def patch_config(
     if not isinstance(merged, dict):
         raise HTTPException(400, detail="配置合并结果必须为字典结构")
 
+    target_text = yaml.dump(merged, allow_unicode=True, sort_keys=False)
     try:
-        write_config_text(
-            yaml.dump(merged, allow_unicode=True, sort_keys=False),
-            config_path=config_path,
-        )
+        target_engine = _engine_settings_for_mapping(merged)
     except ConfigValidationError as e:
-        raise HTTPException(400, detail=str(e)) from e
-    except OSError as e:
-        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        raise HTTPException(422, detail=str(e)) from e
+    switcher = runtime_state.engine_switcher
+    current_engine = getattr(switcher, "current_settings", None)
+    engine_changes = (
+        switcher is not None
+        and isinstance(current_engine, dict)
+        and engine_settings_hash(current_engine) != engine_settings_hash(target_engine)
+    )
+    if engine_changes:
+        try:
+            validate_config_mapping(merged)
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+
+    switched = await _run_engine_switch(
+        runtime_state,
+        target_engine=target_engine,
+        target_config_text=target_text,
+    )
+    if switched is None:
+        try:
+            write_config_text(target_text, config_path=config_path)
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+        except OSError as e:
+            raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     try:
         _apply_logging_runtime(merged)
@@ -518,6 +727,8 @@ async def patch_config(
     payload = await get_system_config(runtime_state)
     payload["ok"] = True
     payload["message"] = "配置已保存并热重载"
+    if switched is not None:
+        payload["engine_switch"] = switched
     return payload
 
 
@@ -564,15 +775,35 @@ async def reset_config(
         diagnostics_map["ui_debug"] = True
         template["diagnostics"] = diagnostics_map
 
+    target_text = yaml.dump(template, allow_unicode=True, sort_keys=False)
     try:
-        write_config_text(
-            yaml.dump(template, allow_unicode=True, sort_keys=False),
-            config_path=config_path,
-        )
+        target_engine = _engine_settings_for_mapping(template)
     except ConfigValidationError as e:
-        raise HTTPException(400, detail=str(e)) from e
-    except OSError as e:
-        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        raise HTTPException(422, detail=str(e)) from e
+    switcher = runtime_state.engine_switcher
+    current_engine = getattr(switcher, "current_settings", None)
+    if (
+        switcher is not None
+        and isinstance(current_engine, dict)
+        and engine_settings_hash(current_engine) != engine_settings_hash(target_engine)
+    ):
+        try:
+            validate_config_mapping(template)
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+
+    switched = await _run_engine_switch(
+        runtime_state,
+        target_engine=target_engine,
+        target_config_text=target_text,
+    )
+    if switched is None:
+        try:
+            write_config_text(target_text, config_path=config_path)
+        except ConfigValidationError as e:
+            raise HTTPException(400, detail=str(e)) from e
+        except OSError as e:
+            raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
     try:
         _apply_logging_runtime(template)
@@ -583,6 +814,8 @@ async def reset_config(
     payload = await get_system_config(runtime_state)
     payload["ok"] = True
     payload["message"] = "已重置为官方默认配置并热重载"
+    if switched is not None:
+        payload["engine_switch"] = switched
     return payload
 
 

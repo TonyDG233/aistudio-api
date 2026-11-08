@@ -15,6 +15,7 @@ from aistudio_api.domain.errors import BrowserTransportError
 from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
+    filter_minimal_cookies,
 )
 from aistudio_api.infrastructure.browser.scripts import (
     HOOKED_REQUEST_JS,
@@ -38,6 +39,7 @@ def _ensure_net_trace(page: CDPPage) -> None:
         return
     page.has_net_trace = True
     logger.debug("已为页面注册 $rpc/ 网络跟踪监听器")
+
     def on_request(data: dict[str, object]) -> None:
         url = str(data.get("url") or "")
         rid = str(data.get("request_id") or "")
@@ -100,6 +102,7 @@ def _log_rpc_net_evidence(page: CDPPage, where: str) -> None:
         where,
         " | ".join(parts),
     )
+
 
 def _transport_error(page: CDPPage, message: str) -> BrowserTransportError:
     exc = BrowserTransportError(message)
@@ -225,7 +228,8 @@ async def _ensure_authorization_header(
         if disk_cookies and any("SAPISID" in k for k in disk_cookies):
             cookie_dict = disk_cookies
             page._cached_cookies = cookie_dict
-    fresh_auth = calculate_sapisid_hash(cookie_dict) if cookie_dict else ""
+    signing_cookies = filter_minimal_cookies(cookie_dict) if cookie_dict else {}
+    fresh_auth = calculate_sapisid_hash(signing_cookies) if signing_cookies else ""
     if fresh_auth:
         clean_headers["Authorization"] = fresh_auth
     elif incoming_auth:
@@ -285,6 +289,7 @@ class XHRStreamTransport:
                             )
             except Exception as e:
                 logger.debug("处理流式推送数据失败: %s", e)
+
         if hasattr(page, "on_binding"):
             page.on_binding("__aistudio_stream_push__", on_stream_push)
         elif hasattr(page, "cdp") and hasattr(page.cdp, "on"):

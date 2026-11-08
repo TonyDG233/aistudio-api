@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
+import json
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -472,6 +474,302 @@ def _normalize_max_contexts(
     return raw
 
 
+_ENGINE_MODES = frozenset({"browser", "browserless"})
+_SIGNER_MODES = frozenset({"local_subprocess", "remote_http"})
+_TRANSPORT_MODES = frozenset({"signer_rpc", "direct_http"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _engine_number(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+    integer: bool = False,
+) -> float | int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigValidationError(
+            f"配置校验失败：engine.{field_name} 必须为数值，当前值为 {value!r}"
+        )
+    numeric = float(value)
+    if integer and not numeric.is_integer():
+        raise ConfigValidationError(
+            f"配置校验失败：engine.{field_name} 必须为整数，当前值为 {value!r}"
+        )
+    number = int(numeric) if integer else numeric
+    if number < minimum or (maximum is not None and number > maximum):
+        bound = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise ConfigValidationError(
+            f"配置校验失败：engine.{field_name} 超出范围 {bound}，当前值为 {value!r}"
+        )
+    return number
+
+
+def _engine_bool(value: object, field_name: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigValidationError(
+            f"配置校验失败：engine.{field_name} 必须为布尔值，当前值为 {value!r}"
+        )
+    return value
+
+
+def _engine_endpoint(value: object, *, mode: str) -> str:
+    from urllib.parse import urlparse
+
+    text = str(value or "").strip()
+    if not text:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer.endpoint 不能为空"
+        )
+    parsed = urlparse(text)
+    allowed_schemes = ("http",) if mode == "local_subprocess" else ("http", "https")
+    if parsed.scheme not in allowed_schemes or not parsed.hostname:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer.endpoint 非法"
+            f"（{text!r}，本地模式仅允许 http）"
+        )
+    if parsed.username or parsed.password:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer.endpoint 不得内嵌凭据"
+        )
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer.endpoint 不允许 path/query/fragment"
+        )
+    host = (parsed.hostname or "").lower()
+    if mode == "local_subprocess" and host not in _LOOPBACK_HOSTS:
+        raise ConfigValidationError(
+            f"配置校验失败：本地 signer 模式 endpoint 必须是回环地址，当前为 {host!r}"
+        )
+    if mode == "remote_http" and host in _LOOPBACK_HOSTS:
+        raise ConfigValidationError(
+            "配置校验失败：远程 signer 模式必须显式配置非回环 endpoint，"
+            "不得回退到本地默认地址"
+        )
+    return text.rstrip("/")
+
+
+def _normalize_engine_settings(
+    raw: object,
+    *,
+    specs: list[dict[str, object]] | None = None,
+    max_contexts: int | None = None,
+) -> dict[str, object]:
+    """Validate/normalize the ``engine`` block; fail fast on illegal values."""
+    if not isinstance(raw, dict):
+        raise ConfigValidationError(
+            f"配置校验失败：engine 必须为字典，当前类型为 {_describe_type(raw)}"
+        )
+    mode = str(raw.get("mode") or "browser").strip().lower()
+    if mode not in _ENGINE_MODES:
+        raise ConfigValidationError(
+            f"配置校验失败：engine.mode 必须为 browser 或 browserless，当前为 {mode!r}"
+        )
+
+    switch = raw.get("switch")
+    if switch is None:
+        switch = {}
+    if not isinstance(switch, dict):
+        raise ConfigValidationError("配置校验失败：engine.switch 必须为字典")
+    drain_timeout_s = _engine_number(
+        switch.get("drain_timeout_s", 12),
+        "switch.drain_timeout_s",
+        minimum=0,
+        maximum=120,
+    )
+    startup_concurrency = _engine_number(
+        switch.get("startup_concurrency", 2),
+        "switch.startup_concurrency",
+        minimum=1,
+        maximum=16,
+        integer=True,
+    )
+    switch_timeout_s = _engine_number(
+        switch.get("switch_timeout_s", 120),
+        "switch.switch_timeout_s",
+        minimum=1,
+    )
+    rollback_on_partial_failure = _engine_bool(
+        switch.get("rollback_on_partial_failure"),
+        "switch.rollback_on_partial_failure",
+        default=True,
+    )
+
+    browserless = raw.get("browserless")
+    if browserless is None:
+        browserless = {}
+    if not isinstance(browserless, dict):
+        raise ConfigValidationError("配置校验失败：engine.browserless 必须为字典")
+
+    signer = browserless.get("signer")
+    if signer is None:
+        signer = {}
+    if not isinstance(signer, dict):
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer 必须为字典"
+        )
+    signer_mode = str(signer.get("mode") or "local_subprocess").strip().lower()
+    if signer_mode not in _SIGNER_MODES:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.signer.mode 必须为 "
+            f"local_subprocess 或 remote_http，当前为 {signer_mode!r}"
+        )
+    endpoint = _engine_endpoint(
+        signer.get("endpoint", "http://127.0.0.1:8081"), mode=signer_mode
+    )
+    binary_path = str(signer.get("binary_path") or "waa-signer/bin/waa-signer")
+    auto_start = _engine_bool(
+        signer.get("auto_start"), "browserless.signer.auto_start", default=True
+    )
+    startup_timeout_s = _engine_number(
+        signer.get("startup_timeout_s", 30),
+        "browserless.signer.startup_timeout_s",
+        minimum=1,
+    )
+    request_timeout_s = _engine_number(
+        signer.get("request_timeout_s", 90),
+        "browserless.signer.request_timeout_s",
+        minimum=1,
+    )
+    state_dir = str(signer.get("state_dir") or "data/waa/workers")
+    max_workers = _engine_number(
+        signer.get("max_workers", 8),
+        "browserless.signer.max_workers",
+        minimum=1,
+        maximum=64,
+        integer=True,
+    )
+    idle_ttl_s = _engine_number(
+        signer.get("idle_ttl_s", 900),
+        "browserless.signer.idle_ttl_s",
+        minimum=1,
+    )
+    locale = str(signer.get("locale") or "en-US")
+    timezone = str(signer.get("timezone") or "America/Los_Angeles")
+
+    transport = browserless.get("transport")
+    if transport is None:
+        transport = {}
+    if not isinstance(transport, dict):
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.transport 必须为字典"
+        )
+    transport_mode = str(transport.get("mode") or "signer_rpc").strip().lower()
+    if transport_mode not in _TRANSPORT_MODES:
+        raise ConfigValidationError(
+            "配置校验失败：engine.browserless.transport.mode 必须为 "
+            f"signer_rpc 或 direct_http，当前为 {transport_mode!r}"
+        )
+    http2 = _engine_bool(
+        transport.get("http2"), "browserless.transport.http2", default=True
+    )
+    max_connections = _engine_number(
+        transport.get("max_connections", 6),
+        "browserless.transport.max_connections",
+        minimum=1,
+        maximum=64,
+        integer=True,
+    )
+    connect_timeout_s = _engine_number(
+        transport.get("connect_timeout_s", 15),
+        "browserless.transport.connect_timeout_s",
+        minimum=1,
+    )
+    read_timeout_s = _engine_number(
+        transport.get("read_timeout_s", 120),
+        "browserless.transport.read_timeout_s",
+        minimum=1,
+    )
+
+    if mode == "browserless":
+        needed = 1
+        if specs is not None:
+            total_slots = (
+                sum(int(str(item.get("count", 1) or 1)) for item in specs) or 1
+            )
+            needed = min(max_contexts or total_slots, total_slots)
+        if int(max_workers) < needed:
+            raise ConfigValidationError(
+                "配置校验失败：engine.browserless.signer.max_workers="
+                f"{max_workers} 不足以覆盖 {needed} 个实例槽位"
+            )
+        if signer_mode == "local_subprocess" and auto_start:
+            from aistudio_api.infrastructure.waa.local_daemon import (
+                resolve_binary_path,
+            )
+
+            binary = resolve_binary_path(binary_path)
+            if not binary.is_file():
+                raise ConfigValidationError(
+                    "配置校验失败：engine.browserless.signer.binary_path 不存在："
+                    f"{binary}"
+                )
+
+    return {
+        "mode": mode,
+        "switch": {
+            "drain_timeout_s": float(drain_timeout_s),
+            "startup_concurrency": int(startup_concurrency),
+            "switch_timeout_s": float(switch_timeout_s),
+            "rollback_on_partial_failure": rollback_on_partial_failure,
+        },
+        "browserless": {
+            "signer": {
+                "mode": signer_mode,
+                "endpoint": endpoint,
+                "binary_path": binary_path,
+                "auto_start": auto_start,
+                "startup_timeout_s": float(startup_timeout_s),
+                "request_timeout_s": float(request_timeout_s),
+                "state_dir": state_dir,
+                "max_workers": int(max_workers),
+                "idle_ttl_s": float(idle_ttl_s),
+                "locale": locale,
+                "timezone": timezone,
+            },
+            "transport": {
+                "mode": transport_mode,
+                "http2": http2,
+                "max_connections": int(max_connections),
+                "connect_timeout_s": float(connect_timeout_s),
+                "read_timeout_s": float(read_timeout_s),
+            },
+        },
+    }
+
+
+def engine_settings_hash(engine_settings: object) -> str:
+    """Stable hash used to make an identical engine PATCH a no-op."""
+    payload = json.dumps(engine_settings, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_configured_engine_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Return the validated, normalized ``engine`` block."""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    specs = _normalize_instance_specs(config.get("instances"))
+    max_contexts = _normalize_max_contexts(config, specs)
+    return _normalize_engine_settings(
+        config.get("engine"), specs=specs, max_contexts=max_contexts
+    )
+
+
+def validate_engine_settings(
+    raw: object,
+    *,
+    specs: list[dict[str, object]] | None = None,
+    max_contexts: int | None = None,
+) -> dict[str, object]:
+    """Public wrapper used by the config routes before starting a hot switch."""
+    return _normalize_engine_settings(raw, specs=specs, max_contexts=max_contexts)
+
+
 def validate_config_mapping(raw_dict: object) -> dict[str, object]:
     """校验合并后的配置映射，返回应用了非关键回退的配置副本。"""
     if raw_dict is None:
@@ -590,7 +888,10 @@ def validate_config_mapping(raw_dict: object) -> dict[str, object]:
         )
 
     specs = _normalize_instance_specs(config.get("instances"))
-    _normalize_max_contexts(config, specs)
+    max_contexts = _normalize_max_contexts(config, specs)
+    config["engine"] = _normalize_engine_settings(
+        config.get("engine"), specs=specs, max_contexts=max_contexts
+    )
 
     api_keys = config.get("api_keys")
     if not isinstance(api_keys, (list, str)):
@@ -692,8 +993,7 @@ def _read_config_file(config_path: Path) -> dict[str, object]:
         return {}
     if not isinstance(loaded, dict):
         raise ConfigValidationError(
-            "配置校验失败：配置顶层必须为字典，"
-            f"当前类型为 {_describe_type(loaded)}"
+            f"配置校验失败：配置顶层必须为字典，当前类型为 {_describe_type(loaded)}"
         )
     return cast("dict[str, object]", loaded)
 
@@ -890,13 +1190,38 @@ def _coerce_generation_defaults(raw: dict[str, object] | None) -> dict[str, obje
     coerced: dict[str, object] = {}
     for key, value in raw.items():
         if key == "thinking_config" and isinstance(value, dict):
-            level = _coerce_thinking_level(value.get("level", ThinkingLevel.HIGH))
-            mode = int(value.get("mode", 1))
-            coerced[key] = AistudioThinkingConfig(level=level, mode=mode).to_wire()
+            raw_level = value.get(
+                "level", value.get("thinkingLevel", value.get("thinking_level"))
+            )
+            raw_budget = value.get(
+                "budget", value.get("thinkingBudget", value.get("thinking_budget"))
+            )
+            raw_mode = value.get("mode")
+            level = _coerce_thinking_level(raw_level) if raw_level is not None else None
+            budget = (
+                int(str(raw_budget))
+                if raw_budget is not None and not isinstance(raw_budget, bool)
+                else None
+            )
+            if level is not None or budget is not None or raw_mode is not None:
+                mode = (
+                    int(str(raw_mode))
+                    if raw_mode is not None and not isinstance(raw_mode, bool)
+                    else 1
+                )
+                coerced[key] = AistudioThinkingConfig(
+                    level=level, mode=mode, budget=budget
+                ).to_wire()
+            else:
+                coerced[key] = None
         elif key == "image_output_mode":
-            coerced[key] = _coerce_image_output_mode(value)
+            coerced[key] = (
+                _coerce_image_output_mode(value) if value is not None else None
+            )
         elif key == "media_resolution":
-            coerced[key] = _coerce_media_resolution(value)
+            coerced[key] = (
+                _coerce_media_resolution(value) if value is not None else None
+            )
         else:
             coerced[key] = value
     return coerced
@@ -1013,9 +1338,7 @@ def _normalize_retry_same_delay(raw_routing: dict[str, object]) -> float:
     migration; :func:`_resolve_retry_same_delay` layers the env value on top
     when the routing settings are actually consumed.
     """
-    raw_delay = raw_routing.get(
-        "retry_same_delay_sec", _RETRY_SAME_DELAY_DEFAULT_SEC
-    )
+    raw_delay = raw_routing.get("retry_same_delay_sec", _RETRY_SAME_DELAY_DEFAULT_SEC)
     delay = _coerce_retry_same_delay(raw_delay)
     if delay is None:
         logger.warning(
@@ -1598,9 +1921,7 @@ def resolve_quota_scope(
     raw_scope = rotator.get("quota_scope", "account")
     if raw_scope in ("account", "account_surface"):
         return str(raw_scope)
-    logger.warning(
-        "配置 rotator.quota_scope 非法（%r），回退默认 account", raw_scope
-    )
+    logger.warning("配置 rotator.quota_scope 非法（%r），回退默认 account", raw_scope)
     return "account"
 
 

@@ -61,9 +61,7 @@ STATS_RESERVED_KEYS = frozenset(
         "account_breakdown",
     }
 )
-_STATS_ENVELOPE_KEYS = frozenset(
-    {"schema_version", "models", "daily", "count_tokens"}
-)
+_STATS_ENVELOPE_KEYS = frozenset({"schema_version", "models", "daily", "count_tokens"})
 _CHANNEL_PREFIXES = {"pg", "chat", "playground", "build", "official"}
 
 
@@ -529,8 +527,10 @@ def build_stats_payload(
     window and returns exactly ``N`` consecutive daily points.
     """
     models = _normalized_models(model_stats)
-    window = STATS_DAILY_WINDOW_DAYS if days is None else max(
-        1, min(int(days), STATS_DAILY_WINDOW_DAYS)
+    window = (
+        STATS_DAILY_WINDOW_DAYS
+        if days is None
+        else max(1, min(int(days), STATS_DAILY_WINDOW_DAYS))
     )
     keys = daily_keys(window)
 
@@ -593,6 +593,9 @@ class RuntimeState:
     instance_manager: object | None = None
     routing_pipeline: object | None = None
     keepalive: object | None = None
+    engine_settings: dict[str, object] | None = None
+    engine_runtime: object | None = None
+    engine_switcher: object | None = None
     ui_debug: bool = False
     ui_sandbox: object | None = None
     model_stats: dict[str, ModelStatsItem] = field(
@@ -650,9 +653,7 @@ class RuntimeState:
             is_v2 = any(key in data for key in ("schema_version", "models", "daily"))
             if is_v2:
                 models_map = raw_models if isinstance(raw_models, dict) else {}
-                models_ghosts = any(
-                    is_reserved_stats_key(name) for name in models_map
-                )
+                models_ghosts = any(is_reserved_stats_key(name) for name in models_map)
                 if "models" in data and not isinstance(raw_models, dict):
                     needs_migration = True
                 for name, raw in models_map.items():
@@ -678,9 +679,7 @@ class RuntimeState:
                                 _merge_item(bucket, name, item)
                         if bucket:
                             self.daily_stats[str(day)] = bucket
-                self.count_tokens = CountTokensStats.from_dict(
-                    data.get("count_tokens")
-                )
+                self.count_tokens = CountTokensStats.from_dict(data.get("count_tokens"))
                 extras = set(data) - _STATS_ENVELOPE_KEYS
                 pruned = prune_daily_map(self.daily_stats)
                 needs_migration = bool(
@@ -720,7 +719,9 @@ class RuntimeState:
         except Exception as e:
             # Never clear history: in-memory stats are already loaded; the
             # original file (and backup when written) remains untouched.
-            logger.warning("妯″瀷缁熻鏂囦欢杩佺Щ澶辫触锛屼繚鐣欏師鏂囦欢涓庡唴瀛樻暟鎹? %s", e)
+            logger.warning(
+                "妯″瀷缁熻鏂囦欢杩佺Щ澶辫触锛屼繚鐣欏師鏂囦欢涓庡唴瀛樻暟鎹? %s", e
+            )
 
     def save_stats(self) -> None:
         """Persist statistics as a clean schema v2 envelope (no ghost keys)."""
@@ -849,9 +850,7 @@ class RuntimeState:
         finish_reason: str | None = None,
     ) -> None:
         """Record one **attempt** (real upstream execution) outcome."""
-        self._record_attempt(
-            model, result, usage=usage, finish_reason=finish_reason
-        )
+        self._record_attempt(model, result, usage=usage, finish_reason=finish_reason)
 
     def record_client(
         self,

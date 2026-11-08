@@ -91,7 +91,6 @@ def test_normalize_gemini_request_exposes_generation_config_overrides():
         "frequency_penalty": 0.2,
         "response_logprobs": True,
         "logprobs": 5,
-        "image_output_mode": AistudioImageOutputMode.image_only(),
         "media_resolution": 2,
         "thinking_config": [1, None, None, 3],
     }
@@ -213,14 +212,46 @@ def test_normalize_gemini_request_encodes_function_declarations_to_wire_tools():
     ]
 
 
-def test_normalize_gemini_request_applies_gemma_default_tools():
+def test_normalize_gemini_request_does_not_inject_unrequested_default_tools():
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])],
     )
 
-    normalized = normalize_gemini_request(req, "models/gemma-4-31b-it")
+    assert normalize_gemini_request(req, "models/gemma-4-31b-it").tools is None
+    assert normalize_gemini_request(req, "models/gemini-3.8-flash").tools is None
 
-    assert normalized.tools == [[None, None, None, [None, [[]]]]]
+    image_normalized = normalize_gemini_request(
+        req, "models/gemini-3.1-flash-image-preview"
+    )
+    assert image_normalized.tools is None
+    assert image_normalized.generation_config_overrides is None
+
+
+def test_normalize_gemini_request_thinking_config_only_when_requested():
+    def _normalize(thinking: object):
+        req = GeminiGenerateContentRequest.model_validate(
+            {
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {"thinkingConfig": thinking},
+            }
+        )
+        return normalize_gemini_request(req, "models/gemini-3.8-flash")
+
+    for empty_tc in (
+        {},
+        {"includeThoughts": True},
+        {"includeThoughts": False},
+        {"thinkingBudget": 0},
+        {"thinkingLevel": "NONE"},
+    ):
+        assert _normalize(empty_tc).generation_config_overrides is None
+
+    assert _normalize({"thinkingBudget": 2048}).generation_config_overrides == {
+        "thinking_config": [1, 2048]
+    }
+    assert _normalize({"thinkingLevel": "LOW"}).generation_config_overrides == {
+        "thinking_config": [1, None, None, 1]
+    }
 
 
 def test_normalize_gemini_request_encodes_builtin_tools_to_wire():
@@ -1074,9 +1105,7 @@ def test_pg04_toolshape_diagnostic_redacts_plaintext_values(caplog):
         }
     )
 
-    caplog.set_level(
-        logging.INFO, logger="aistudio.application.chat_service"
-    )
+    caplog.set_level(logging.INFO, logger="aistudio.application.chat_service")
     normalize_gemini_request(req, "gemini-3.7-flash")
 
     messages = [
