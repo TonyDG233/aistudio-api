@@ -260,7 +260,6 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     description: '是否自动丢弃下游客户端传入的未知安全类别或该模型不支持的内置工具与高级参数。',
     explanation: '部分第三方 SDK 或客户端默认携带官方完整安全类别或不兼容的工具，开启此项后系统会自动过滤多余/未知参数，防止 Google 上游返回 400 阻断请求。',
     defaultValue: false,
-    recommendedValue: true,
     tags: ['兼容性', '容错', '防拦截'],
   },
   'system.drop_unsupported_params': {
@@ -271,7 +270,6 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     description: '在全局维度自动丢弃下游客户端传入的未知安全类别或模型不兼容工具。',
     explanation: '当特定模型或 Profile 未单独指定 drop_unsupported_params 时，默认以此全局设置为准，避免上游 400 报错。',
     defaultValue: false,
-    recommendedValue: true,
     tags: ['全局配置', '防拦截'],
   },
   'model.override': {
@@ -454,8 +452,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'instances',
     type: 'string',
     description: '指定单一等级、最低等级或最低加最高等级，形成账号可落入的等级区间。',
-    explanation: '账号等级必须先匹配免费或付费通道，再满足最低到最高等级范围。未知或非字符串等级会直接报错，不会静默漂移到其他通道。',
-    recommendedValue: '指定单一等级为 Free，或最低等级为 Pro',
+    explanation: '账号等级必须先匹配免费或付费通道，再满足最低到最高等级范围。未知或非字符串等级会直接报错，不会静默漂移到其他通道。默认槽位为 Free 精确匹配，或 Pro 起步的付费区间。',
     tags: ['实例', '规则'],
   },
   'max_contexts': {
@@ -576,6 +573,10 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
         contains: ['veo', 'ultra'],
         required_tiers: ['Ultra', 'Ultra_20X'],
       },
+      pro_required: {
+        contains: ['argon', 'gemini-4', 'imagen'],
+        required_tiers: ['Pro', 'Ultra', 'Ultra_20X'],
+      },
     },
     tags: ['付费模型', '403'],
   },
@@ -585,9 +586,8 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'tags',
     description: '每个规则条目的 contains / prefixes / exact 匹配条件。',
-    explanation: 'contains 为子串匹配，prefixes 为前缀匹配，exact 为归一化后全名精确匹配；三者任一命中即应用该条规则。',
+    explanation: 'contains 为子串匹配，prefixes 为前缀匹配，exact 为归一化后全名精确匹配；三者任一命中即应用该条规则。默认包含 veo/ultra 与 argon/gemini-4/imagen 两组规则。',
     defaultValue: {},
-    recommendedValue: { contains: ['veo', 'argon', 'gemini-4', 'imagen'] },
     tags: ['付费模型', '匹配'],
   },
   'paid_model_rules.required_tiers': {
@@ -596,9 +596,8 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'tags',
     description: '命中该规则时账号必须具备的会员等级列表。',
-    explanation: '例如 veo/ultra 要求 Ultra/Ultra_20X；argon/gemini-4/imagen 要求 Pro 及以上。',
+    explanation: '例如 veo/ultra 要求 Ultra/Ultra_20X；argon/gemini-4/imagen 要求 Pro 及以上。具体等级随规则条目不同。',
     defaultValue: ['Pro', 'Ultra', 'Ultra_20X'],
-    recommendedValue: ['Pro', 'Ultra', 'Ultra_20X'],
     tags: ['付费模型', '会员等级'],
   },
   'tier_quotas': {
@@ -607,9 +606,8 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'string',
     description: '每个会员等级的规则桶、每日额度与默认额度。',
-    explanation: '软配额只用于仪表盘百分比与调度权重，超额绝不禁用账号；顶层的单模型覆盖可按精确模型名调整额度。',
+    explanation: '软配额只用于仪表盘百分比与调度权重，超额绝不禁用账号；顶层的单模型覆盖可按精确模型名调整额度。各等级默认额度见 defaults/config.yaml（Free 20、Plus/Pro 50、Ultra 250、Ultra_20X 1000）。',
     defaultValue: {},
-    recommendedValue: '按套餐档位递增：Free 低、Plus/Pro 中、Ultra/Ultra_20X 高',
     tags: ['软配额', '仪表盘'],
   },
   'tier_quotas.bucket': {
@@ -620,7 +618,6 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     description: '每个规则桶包含模型匹配关键词与每日额度。',
     explanation: '按模型名命中规则桶后使用其每日额度；未命中任何桶时回退该会员等级的默认额度。',
     defaultValue: '例如：Flash 系列模型每日 100 次',
-    recommendedValue: '例如：Flash 系列模型每日 100 次',
     tags: ['软配额', '匹配'],
   },
   'tier_quotas.default_limit': {
@@ -631,7 +628,6 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     description: '该会员等级未命中任何规则桶时的每日额度。',
     explanation: '默认值按会员等级不同（Free 20、Plus 50、Pro 50、Ultra 250、Ultra_20X 1000），仅用于展示与权重。',
     defaultValue: 20,
-    recommendedValue: 20,
     tags: ['软配额', '回退'],
   },
   'tier_quotas.overrides': {
@@ -640,9 +636,8 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'string',
     description: '按模型名直接指定每日额度，优先级最高。',
-    explanation: '例如 { "gemini-3.8-flash": 500 }；用于临时调高/调低特定模型的展示额度。',
+    explanation: '例如 { "gemini-3.8-flash": 500 }；用于临时调高/调低特定模型的展示额度。默认空对象。',
     defaultValue: {},
-    recommendedValue: '仅对需要偏离会员等级默认额度的模型配置',
     tags: ['软配额', '覆盖'],
   },
 
@@ -776,9 +771,9 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'protocol',
     type: 'boolean',
     description: '是否开放 Claude 兼容协议面。',
-    explanation: 'C3 阶段适配后启用；默认关闭，避免未完成的协议映射对外暴露。',
-    defaultValue: false,
-    recommendedValue: false,
+    explanation: 'C3 阶段适配后启用；默认开启，关闭后对应路由返回未启用错误。',
+    defaultValue: true,
+    recommendedValue: true,
     tags: ['协议', 'Claude'],
   },
   'features.formats.responses': {
@@ -787,9 +782,9 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'protocol',
     type: 'boolean',
     description: '是否开放 Responses 协议面。',
-    explanation: 'C3 阶段适配后启用；默认关闭。',
-    defaultValue: false,
-    recommendedValue: false,
+    explanation: 'C3 阶段适配后启用；默认开启，关闭后对应路由返回未启用错误。',
+    defaultValue: true,
+    recommendedValue: true,
     tags: ['协议', 'Responses'],
   },
   'features.formats.media.allow_private_urls': {

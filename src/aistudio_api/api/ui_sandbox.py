@@ -1229,6 +1229,7 @@ class UISandbox:
             stats = _all_states_model_stats()
         self.model_stats = stats
         for item in self.model_stats.values():
+            _normalize_stats_item(item)
             item.client = _client_from_attempts(item)
         self._seed_daily_stats(stats)
         total_requests = sum(item.requests for item in stats.values())
@@ -1245,16 +1246,26 @@ class UISandbox:
         for model_index, (model, item) in enumerate(stats.items()):
             phase = model_index * 0.73
             attempts = _distribute(item.requests, weights, phase=phase)
-            success = _distribute(item.success, weights, phase=phase, cap=attempts)
-            rate_limited = _distribute(
-                item.rate_limited, weights, phase=phase
+            success = _allocate(item.success, attempts, weights, phase=phase + 0.4)
+            remaining = [
+                max(0, attempt - won)
+                for attempt, won in zip(attempts, success, strict=True)
+            ]
+            rate_limited = _allocate(
+                item.rate_limited, remaining, weights, phase=phase + 1.7
             )
-            errors = _distribute(item.errors, weights, phase=phase)
+            errors = [
+                max(0, left - limited)
+                for left, limited in zip(remaining, rate_limited, strict=True)
+            ]
             prompt = _distribute(item.prompt_tokens, weights, phase=phase)
             completion = _distribute(item.completion_tokens, weights, phase=phase)
-            reasoning = _distribute(item.reasoning_tokens, weights, phase=phase)
-            cached = _distribute(item.cached_tokens, weights, phase=phase)
-            total = _distribute(item.total_tokens, weights, phase=phase)
+            cached = _allocate(
+                item.cached_tokens, prompt, weights, phase=phase + 2.1
+            )
+            reasoning = _allocate(
+                item.reasoning_tokens, completion, weights, phase=phase + 3.3
+            )
             for index, key in enumerate(keys):
                 day_item = ModelStatsItem(
                     requests=attempts[index],
@@ -1265,7 +1276,7 @@ class UISandbox:
                     completion_tokens=completion[index],
                     reasoning_tokens=reasoning[index],
                     cached_tokens=cached[index],
-                    total_tokens=total[index],
+                    total_tokens=prompt[index] + completion[index],
                     last_used=f"{key} 12:00:00",
                 )
                 if day_item.success:
@@ -1292,24 +1303,27 @@ class UISandbox:
             for share, offset in buckets:
                 account = accounts[(model_index + offset) % len(accounts)]
                 daily = self._account_daily(account.id, model)
-                daily.requests += int(item.requests * share)
-                daily.success += int(item.success * share)
-                daily.rate_limited += int(item.rate_limited * share)
-                daily.errors += int(item.errors * share)
-                daily.prompt_tokens += int(item.prompt_tokens * share)
-                daily.completion_tokens += int(item.completion_tokens * share)
+                success = int(item.success * share)
+                rate_limited = int(item.rate_limited * share)
+                errors = int(item.errors * share)
+                prompt = int(item.prompt_tokens * share)
+                completion = int(item.completion_tokens * share)
+                daily.requests += success + rate_limited + errors
+                daily.success += success
+                daily.rate_limited += rate_limited
+                daily.errors += errors
+                daily.prompt_tokens += prompt
+                daily.completion_tokens += completion
                 daily.reasoning_tokens += int(item.reasoning_tokens * share)
                 daily.cached_tokens += int(item.cached_tokens * share)
-                daily.total_tokens += int(item.total_tokens * share)
+                daily.total_tokens = daily.prompt_tokens + daily.completion_tokens
                 daily.last_used = time.time()
                 stats_for_account = self.rotator.get_account_stats(account.id)
                 if stats_for_account is not None:
-                    stats_for_account.total_requests += int(item.requests * share)
-                    stats_for_account.total_success += int(item.success * share)
-                    stats_for_account.total_rate_limited += int(
-                        item.rate_limited * share
-                    )
-                    stats_for_account.total_errors += int(item.errors * share)
+                    stats_for_account.total_requests += success + rate_limited + errors
+                    stats_for_account.total_success += success
+                    stats_for_account.total_rate_limited += rate_limited
+                    stats_for_account.total_errors += errors
 
     def _account_daily(
         self, account_id: str, model: str
@@ -1330,10 +1344,10 @@ class UISandbox:
         item.requests += 10
         item.success += 10
         item.prompt_tokens += 32_000
-        item.completion_tokens += 12_000
-        item.reasoning_tokens += 4_000
+        item.completion_tokens += 18_000
+        item.reasoning_tokens += 5_000
         item.cached_tokens += 2_000
-        item.total_tokens += 50_000
+        item.total_tokens = item.prompt_tokens + item.completion_tokens
         item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         for _ in range(10):
             item.client.record("success")
@@ -1341,10 +1355,12 @@ class UISandbox:
         daily_item.requests += 10
         daily_item.success += 10
         daily_item.prompt_tokens += 32_000
-        daily_item.completion_tokens += 12_000
-        daily_item.reasoning_tokens += 4_000
+        daily_item.completion_tokens += 18_000
+        daily_item.reasoning_tokens += 5_000
         daily_item.cached_tokens += 2_000
-        daily_item.total_tokens += 50_000
+        daily_item.total_tokens = (
+            daily_item.prompt_tokens + daily_item.completion_tokens
+        )
         daily_item.last_used = item.last_used
         for _ in range(10):
             daily_item.client.record("success")
@@ -1361,10 +1377,10 @@ class UISandbox:
             daily.requests += 10
             daily.success += 10
             daily.prompt_tokens += 32_000
-            daily.completion_tokens += 12_000
-            daily.reasoning_tokens += 4_000
+            daily.completion_tokens += 18_000
+            daily.reasoning_tokens += 5_000
             daily.cached_tokens += 2_000
-            daily.total_tokens += 50_000
+            daily.total_tokens = daily.prompt_tokens + daily.completion_tokens
             daily.last_used = time.time()
 
     def _action_simulate_429(self) -> None:
@@ -1980,6 +1996,95 @@ def _natural_weights(days: int) -> list[float]:
         ramp = 0.72 + 0.28 * (index / span)
         weights.append(weekend * ramp)
     return weights
+
+
+def _normalize_stats_item(item: ModelStatsItem) -> None:
+    """Enforce the stats ledger identities on a synthetic sandbox row.
+
+    ``attempts = success + rate_limited + errors``,
+    ``prompt_tokens = cached_tokens + uncached_prompt_tokens`` and
+    ``total_tokens = prompt_tokens + completion_tokens`` (completion already
+    includes reasoning).  Counters are clamped instead of silently drifting.
+    """
+    requests = max(0, item.requests)
+    success = min(max(0, item.success), requests)
+    rate_limited = min(max(0, item.rate_limited), requests - success)
+    prompt = max(0, item.prompt_tokens)
+    completion = max(0, item.completion_tokens)
+    item.requests = requests
+    item.success = success
+    item.rate_limited = rate_limited
+    item.errors = requests - success - rate_limited
+    item.prompt_tokens = prompt
+    item.completion_tokens = completion
+    item.cached_tokens = min(max(0, item.cached_tokens), prompt)
+    item.reasoning_tokens = min(max(0, item.reasoning_tokens), completion)
+    item.total_tokens = prompt + completion
+
+
+def _allocate(
+    total: int,
+    caps: list[int],
+    weights: list[float],
+    *,
+    phase: float = 0.0,
+) -> list[int]:
+    """Split ``total`` across at most ``caps[i]`` per bucket, exactly.
+
+    The result sums to ``min(total, sum(caps))`` and never exceeds a cap.  A
+    water-filling pass removes saturated buckets, then the final fractional
+    remainders are resolved deterministically by largest remainder.
+    """
+    count = len(caps)
+    if count == 0:
+        return []
+    target = max(0, min(int(total), sum(caps)))
+    values = [0] * count
+    if target == 0:
+        return values
+    adjusted = [
+        max(0.0, weight * (0.84 + 0.16 * math.sin(phase + index * 0.9)))
+        for index, weight in enumerate(weights)
+    ]
+    active = [index for index in range(count) if caps[index] > 0 and adjusted[index] > 0]
+    if not active:
+        adjusted = [1.0] * count
+        active = [index for index in range(count) if caps[index] > 0]
+    remaining = target
+    while remaining > 0 and active:
+        weight_sum = sum(adjusted[index] for index in active)
+        if weight_sum <= 0:
+            adjusted = [1.0] * count
+            weight_sum = float(len(active))
+        shares = {
+            index: remaining * adjusted[index] / weight_sum for index in active
+        }
+        overflow = [
+            index
+            for index in active
+            if values[index] + shares[index] > caps[index] + 1e-9
+        ]
+        if overflow:
+            overflow_set = set(overflow)
+            for index in overflow:
+                remaining -= caps[index] - values[index]
+                values[index] = caps[index]
+            active = [index for index in active if index not in overflow_set]
+            continue
+        floors = {index: int(shares[index]) for index in active}
+        assigned = sum(floors.values())
+        for index in active:
+            values[index] += floors[index]
+        leftover = remaining - assigned
+        order = sorted(
+            active,
+            key=lambda index: shares[index] - floors[index],
+            reverse=True,
+        )
+        for position in range(max(0, leftover)):
+            values[order[position % len(order)]] += 1
+        remaining = 0
+    return values
 
 
 def _distribute(

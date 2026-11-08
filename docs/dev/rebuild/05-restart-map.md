@@ -25,7 +25,7 @@
 
 - A/B 阶段已完成并提交；B7 配置自愈、分层解耦与文档审计已收口。
 - C 阶段按 2026-11-01 新顺序执行：C1 → C2 → C3 → C4 → C5；旧顺序（C1=P4 Build → P8/UI → Claude/Responses → 统计页 → P10）已于 2026-11-01 被取代，见 `06` 同日决策节；`06` 的 D5 旧顺序已修，发现旧顺序或旧 D-14 残留先停。
-- C1、C2（C2a/C2b/C2c）、C3（Claude `/v1/messages` / OpenAI Responses `/v1/responses` 协议适配）与 C4（统计台账与趋势图表）已完成并提交；当前执行 C4b 收口（设置页 Tooltip 推荐值与视口防溢出、沙盒每日算术自洽、N-7 文案），随后进入 C5。
+- C1、C2（C2a/C2b/C2c）、C3（Claude `/v1/messages` / OpenAI Responses `/v1/responses` 协议适配）、C4（统计台账与趋势图表）与 C4b（Tooltip 推荐值/视口防溢出、沙盒统计自洽、N-7）已完成并提交；当前进入 C5a：P10 全量文档收官（README、docs 7 份、AGENT 常态化、Docker Tag 与 Gradle 超时），随后执行 C5b 分支扶正、2.0.0 打标与 worktree 清理。
 - Build（P4/P3-F）不再是 C1 阻塞项：渠道修复/永久废弃决策移到 Post-C（单仓独立阶段）处理；历史事故记录 `INC-20261028-01` 保留。
 - 管理页只由 `AISTUDIO_WEB_PASSWORD` 控制（空 = 免密）；D-14 不重开。
 
