@@ -1,71 +1,114 @@
-# API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 接口鉴权)
-# 留空 [] 表示对外 API 免 Key 开放调用；配置密钥后客户端必须携带对应 Key 访问。
+# ============================================================================
+# aistudio-api 分发默认配置（唯一 tracked 基准）
+# 运行时通过 AISTUDIO_CONFIG_PATH 指向本地 config.yaml；缺失时从本模板复制。
+# 本文件同时是配置默认值的唯一来源，修改后会被启动校验按默认模板深合并。
+# ============================================================================
+
+# API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 与 /v1/... 接口鉴权)。
+# 元素可为字符串，或 {name, key, created_at} 结构；[] 或缺失表示请求必须携带 Key。
 api_keys: []
 
-# ============================================================================
-# 功能开关 (features) — 编排/fallback/活动类默认关闭；WP10 凭证与账号信息保活默认开启。
-# 本段可在 Web 管理控制台可视化编辑并热重载 (PUT /config/yaml -> 立即生效)，
-# 无需重启进程。同名环境变量 (AISTUDIO_*) 仅作为启动基线兜底：
-# 优先级为 本段 features.* > AISTUDIO_* 环境变量 > 内置默认值。
-# ============================================================================
+# 对外 API 鉴权（D-14）：默认关闭免密。
+# false：必须携带有效 API Key；true：允许无 Key 匿名请求（高风险，需显式确认）。
+# 管理页密码只由环境变量 AISTUDIO_WEB_PASSWORD 控制，与本开关和 API Key 完全独立。
+security:
+  api_allow_anonymous: false
+
+# 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface。
+# - count：该槽位的实例数量（正整数）；相同 tier 区间会合并计数。
+# - surface：chat 或 build；同一账号的 chat/build 不会同时存活。
+# tier 选择器（only_tier / min_tier / max_tier 至少一个非空，闭区间语义）：
+# - only_tier：精确钉住。Free 归一 Free..Free；Ultra 展开 Ultra..Ultra_20X；
+#   Plus/Pro 保持精确；不得与不同的 min_tier/max_tier 同时配置。
+# - min_tier 单独：Free -> Free..Free；付费 -> min..Ultra_20X。
+# - max_tier 单独：Free -> Free..Free；付费下界默认 Pro，且上界不得低于 Pro；
+#   确需 Plus 槽位请显式 only_tier: Plus。
+# - min_tier + max_tier：形成闭区间，要求 min <= max。
+# - Free 与付费 lane 不得混合；未知/非字符串 tier 会 fail-fast。
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Free
+  - count: 1
+    surface: chat
+    min_tier: Pro
+
+# 全局实例/Context 上限（1-16）；缺省等于 instances count 之和，超出按 16 截断。
+max_contexts: 2
+
+# 诊断开关（D-09）：snapshot hash 是否包含 executable_code / code_execution_result。
+# 默认开启；出现严重路由异常时优先怀疑该 hash，可临时置 false 回退上游行为。
+# 仅诊断用，不进入普通用户 UI；也可用 AISTUDIO_HASH_INCLUDE_CODE 环境变量覆盖。
+diagnostics:
+  hash_include_code: true
+  # C2a 纯离线 UI 调试沙箱：true 时不启动真实浏览器/账号/网络，使用内存沙箱与
+  # 临时目录配置，保存操作不会触碰真实 config.yaml。
+  # 也可用 AISTUDIO_UI_DEBUG=1/true 环境变量临时覆盖；交互式改动下次启动生效。
+  ui_debug: false
+
+# 浏览器指纹伪装（P3-F）：按账号确定性生成 Windows 桌面指纹，并在页面导航前
+# 通过 CDP 注入。默认开启；显式置 false 时不注入任何脚本/屏幕指标。
+browser:
+  fingerprint_spoof_enabled: true
+
+# 服务端日志与请求转储调试配置。
+# level：DEBUG（详细底层跟踪）/ INFO（标准运行信息）/ WARNING（仅警告与错误）/
+#        ERROR（仅严重错误）；非法值启动时回退 INFO 并记录 warning。
+# dump_requests：在标准输出打印请求/响应详情（仅 safe_*，禁止明文敏感字段）。
+# dump_to_file：把报文写入 dump_dir 下的独立文件；默认关闭。
+# dump_dir：转储目录；相对路径按进程工作目录解析。
+logging:
+  level: INFO
+  dump_requests: false
+  dump_to_file: false
+  dump_dir: dumps
+
+# 账号调度、重试与 429 冷却。
+# max_retries：单次请求的调度重试上限（非负整数）。
+# quota_scope（D-01）：account（默认，chat/build 共用额度）或 account_surface（分开）。
+#   只影响 AccountStats 记账键与 /stats、配额展示、429 冷却口径；不新增实例。
+# cooldowns（单位：秒）：rate_limited_short 短时限流冷却；
+#   rate_limited_drip 持续滴流冷却；rate_limited_drip_extended 延长冷却；
+#   auth_error 为历史死开关，403 不做硬冷却，保持 0。
+rotator:
+  max_retries: 5
+  quota_scope: account
+  cooldowns:
+    rate_limited_short: 60
+    rate_limited_drip: 300
+    rate_limited_drip_extended: 600
+    auth_error: 0
+
 features:
-  # Build 页面直连面总开关 (对应 Ark MAKERSUITE_DIRECT / 环境变量 AISTUDIO_BUILD_SURFACE)。
-  # 开=free 档账号走 Build 宿主页直连通道；关=仅使用现有聊天面 (零行为变化)。
-  # 何时开：需要通过免费档账号调用 Build 专属额度时。失败怎么办：面内失败显式报错，不改道。
-  # 兼容说明：这是 legacy alias；若下方 channels.build.enabled 显式配置，则以 channels 为准。
-  build_surface: false
+  # P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）。
+  # max_switches：连续切号上限（0 表示不切号）。
+  # retry_same_delay_sec：429 同账号首次重试前的退避秒数，范围 0..30，默认 2.0；
+  #   可用 AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
+  routing:
+    max_switches: 2
+    retry_same_delay_sec: 2.0
 
-  # 是否按账号档位 (tier) 路由到不同面 (对应环境变量 AISTUDIO_ROUTE_BY_TIER)。
-  # 开=按 features.groups/档位策略把请求分发到允许的面；关=始终使用聊天面默认路由。
-  route_by_tier: false
+  # P6 保活节奏：auth/metadata 默认 24h 刷新一次。
+  # active_activity 默认关闭（不启用 idle 回收）；active_activity_seconds 为判定窗口。
+  keepalive:
+    auth_update: true
+    auth_update_hours: 24
+    metadata_refresh: true
+    metadata_refresh_hours: 24
+    metadata_refresh_on_startup: true
+    active_activity: false
+    active_activity_seconds: 60
 
-  # 批量账号信息刷新 (email/tier/过期) 的并发工作池大小 (对应 Ark REFRESH_CONCURRENCY)。
-  # 越大刷新越快但并发请求越多；默认 3 为 Ark 实测的稳妥值。失败怎么办：单账号失败不影响其余。
-  account_refresh_concurrency: 3
+  # 模型发现刷新节奏：live_page 成功后默认 24h 刷新一次；其他来源
+  # （fallback/snapshot/live_http）按较短间隔重试，默认 600s。
+  model_discovery:
+    live_refresh_interval_sec: 86400
+    fallback_refresh_interval_sec: 600
 
-  # 定时自动切换账号总开关 (对应 Ark ENABLE_AUTO_SWITCH / 环境变量 AISTUDIO_AUTO_SWITCH)。
-  # 开=按下方间隔周期性轮换账号；关=仅按用量/失败/冷却触发切换。默认关，避免打扰。
-  auto_switch: false
-
-  # 自动切换周期间隔 (小时，支持小数，最小 0.1；对应 Ark AUTO_SWITCH_INTERVAL_HOURS)。
-  # 仅在 auto_switch=true 时生效；默认 3 小时与 Ark 一致。
-  # 选号规则：优先切到 auth_saved_at 最久未回写的可用账号，兼顾均衡与凭证保活。
-  auto_switch_interval_hours: 3.0
-
-  # 自动刷新 Auth / 凭证回写 (对应 Ark ENABLE_AUTH_UPDATE，默认开)。
-  # 开=把浏览器当前 cookies/origins 原子合并写回 per-account auth.json；
-  # 触发：切号前、切号后、初始化/重连、下方 24h 周期、浏览器关闭前。
-  # 关=仅保留现有登录/切号时的自然回写。此开关不写 meta。
-  keepalive_auth_update: true
-
-  # 凭证回写周期 (小时，最小 0.1；默认 24h，对齐 Ark 健康巡检)。
-  # 仅作用于当前活跃账号；非活跃账号在 auto_switch 轮转到它时回写。
-  keepalive_auth_update_hours: 24.0
-
-  # 自动更新账号信息 (tier/email/expired，默认开；写 registry.json/meta.json)。
-  # 与手动 POST /accounts/refresh 共用同一刷新器与 409 互斥；失败不误杀账号。
-  keepalive_metadata_refresh: true
-
-  # 账号信息刷新周期 (小时，最小 0.1；默认 24h)。
-  keepalive_metadata_refresh_hours: 24.0
-
-  # 启动时是否补刷缺失/过期的账号信息 (默认开)；只刷到期账号，不阻塞启动。
-  keepalive_metadata_refresh_on_startup: true
-
-  # 活跃页轻量活动 (默认关)。开=周期滚动页面并刷新空闲计时器，保持当前会话活跃；
-  # 代价是浏览器不会被空闲回收。凭证保活本身不依赖此开关。
-  keepalive_active_activity: false
-
-  # 活跃页活动间隔 (秒，最小 10；默认 60)。
-  keepalive_active_activity_seconds: 60.0
-
-  # --------------------------------------------------------------------------
-  # OpenAI / Claude 协议面 (WP8)。默认开启（对齐 Ark 无条件端点注册）；
-# 仍保留开关用于运维临时关闭。
-  # openai: 控制 /v1/chat/completions 与 /v1/models。
-  # claude: 控制 /v1/messages 与 /v1/messages/count_tokens（上游真实计数）。
-  # media.allow_private_urls: 允许代理下载私网/回环图片 URL；默认 false 防 SSRF。
-  # --------------------------------------------------------------------------
+  # 协议开关（协议面）。Gemini 核心协议面常驻开启，无独立开关。
+  # openai / claude / responses：默认启用，可显式设为 false 关闭对应协议面。
+  # media.allow_private_urls：是否允许抓取私网/回环 URL 作为多模态输入；
+  #   默认 false（防 SSRF），确需内网资源时才可开启。
   formats:
     openai: true
     claude: true
@@ -73,243 +116,99 @@ features:
     media:
       allow_private_urls: false
 
-  # --------------------------------------------------------------------------
-  # 渠道注册表 (channels，WP5 二期)
-  # chat=聊天/Playground 面 (别名 pg/playground)；build=Build 宿主页；
-  # official=官网消费者端，WP9 前仅注册、不实现 (请求会显式 403)。
-  # enabled: 渠道是否参与路由；关=该渠道请求显式拒绝，不静默换面。
-  # max_pages: 渠道同时存活的页面数上限 (0-16)；chat/build 实际取 max_instances，
-  #   且总页面预算受 routing.max_contexts 限制。
-  # max_instances: 该渠道的实例硬上限；总实例上限由 routing.max_contexts 控制。
-  # quota_pool: 该渠道要求的额度池 (free/pro/official)；null/any=不限制。
-  #   零配置保持 null，确保 free 账号仍可 chat；黄金模板显式配 chat=pro/build=free。
-  # 裸名在多渠道启用时按候选资格推导，系统不硬编码默认渠道。
-  # --------------------------------------------------------------------------
-  channels:
-    chat:
-      enabled: true
-      max_pages: 1
-      max_instances: 2
-      quota_pool: null
-    build:
-      # 未显式配置时继承上方 build_surface；此处显式值优先。
-      enabled: false
-      max_pages: 1
-      max_instances: 2
-      quota_pool: null
-    official:
-      enabled: false
-      max_pages: 0
-      max_instances: 0
-      quota_pool: null
-
-  # --------------------------------------------------------------------------
-  # 路由安全与预算 (routing，WP5 二期)
-  # max_switches: 单请求内“换账号/换实例”动作上限；同账号重试仍由
-  #   MAX_RETRIES 控制，两者并存。耗尽时显式 503 surface_switch_exhausted。
-  # global_max_pages: 兼容保留字段；实际全局页面预算 = max_contexts。
-  # max_contexts: 用户可见总实例上限（1-16）；默认 1，也是启动预启动数量。
-  # borrow: 主槽不可用时是否允许首字节前临时借入其它就绪槽；默认关。
-  # prewarm: 备用实例预热；默认关 (黄金模板可开)。
-  # circuit_breaker: 滚动窗口内失败切换达到阈值 -> 全局冷却，期间显式 503。
-  # --------------------------------------------------------------------------
-  routing:
-    max_switches: 2
-    global_max_pages: 2
-    max_contexts: 1
-    borrow: false
-    prewarm: false
-    circuit_breaker:
-      window_seconds: 600
-      failure_threshold: 5
-      cooldown_seconds: 300
-
-  # --------------------------------------------------------------------------
-  # 槽位表 (slots，WP5 二期)
-  # 每行 = 为 (账号 × 渠道) 预留的页面实例位；同一账号可占多行。
-  # “实例数（当前/计划）”的计划值 = 启用槽位行数；槽位不绕过四层预算。
-  # 示例：
-  # slots:
-  #   - { account_id: acc_xxxx, channel: chat, enabled: true, note: pro-chat }
-  #   - { account_id: acc_yyyy, channel: build, enabled: true, note: free-build }
-  # --------------------------------------------------------------------------
-  slots: []
-
-  # --------------------------------------------------------------------------
-  # 账号分组与面编排 (groups，WP5) — 按账号档位 (tier) / 邮箱正则把账号分组，
-  # 为每组指定允许的面 (chat/build) 与页面上限。未显式分组的账号由编排器按
-  # tier 默认规则兜底 (free→build、pro/ultra/plus→chat)，本段留空即全部走默认。
-  # --------------------------------------------------------------------------
-  # 每个分组字段：
-  #   name:                 组名 (缺省按序号 group-N)
-  #   enabled:              是否启用 (默认 true)；停用/空组视同不存在，继续匹配后续组或 tier 默认组
-  #   weight:               排序权重 (0.1-100，默认 1.0)；越高获得越多新请求
-  #   match_tier:           命中的账号档位列表 (小写，如 pro/free/ultra/plus)
-  #   match_emails_regex:   命中的邮箱正则 (可选，留空/null 表示不启用)
-  #   allowed_surfaces:     允许的面子集 [chat] / [build] / [chat, build]；空 [] 表示禁用该组
-  #   allowed_quota_pools:  允许的额度池子集 [free, pro]；空 [] 表示不限制
-  #   max_pages:            该组允许并存的页面数上限 (0-16，默认 2)；超限显式拒绝，不排队
-  #   max_page_instances:   WP5 v2 兼容别名；Phase 3 后移除
-  # 组只收窄候选账号/渠道/预算/权重，不能放宽系统推导的模型与渠道能力。
-  # 示例 (两行)：
-  # groups:
-  #   - { name: pro,  enabled: true, weight: 1.0, match_tier: [pro, ultra, plus], allowed_surfaces: [chat],  allowed_quota_pools: [pro],  max_pages: 2 }
-  #   - { name: free, enabled: true, weight: 1.0, match_tier: [free],             allowed_surfaces: [build], allowed_quota_pools: [free], max_pages: 3 }
-  groups: []
-
-  # --------------------------------------------------------------------------
-  # ATG (Anti-Truncation Gateway) 防截断合成工具通道
-  # 通过合成 function-call 通道承载模型答案，绕过文本通道截断/审核后再解包回正文。
-  # 全部默认关闭；仅 mode 不为 off 时模块才启用。字段名对齐 Ark ATG_* 语义。
-  # --------------------------------------------------------------------------
+  # Anti-Truncation Gateway（防截断合成工具网关）。默认关闭。
+  # mode：off（关闭）/ prefer（合成调用缺失时回退纯文本）/ required（缺失则明确失败）。
+  #   YAML 1.1 会把未加引号的 off 解析为布尔 false，运行期等价于 off，建议加引号。
+  # mode_by_format：按协议面覆盖 mode；inherit 表示沿用全局 mode；
+  #   四个键 gemini/openai/claude/responses 固定存在，取值 inherit/off/prefer/required。
+  # tool_prefix：合成工具名前缀，默认 atg_emit_。
+  # control_position：合成控制块插入位置，head（首部）或 tail（尾部，默认）。
+  # strict：严格模式；为 true 时对不完整的合成协议更早报错。
+  # empty_retries：空响应重试次数，范围 0..5，默认 2。
+  # recovery：恢复策略，repair（尝试修复，默认）或 fail（直接失败）。
+  # side_buffer_bytes：侧缓冲字节数，范围 >=0，默认 0（不额外缓存）。
+  # client_synthetic_guard：客户端合成工具调用保护，默认开启。
+  # max_response_bytes：响应体上限，范围 1024..104857600，默认 16777216（16 MiB）。
+  # text_model_pattern：文本模型匹配正则；空串表示不额外限制。
+  # non_text_model_pattern：非文本模型匹配正则；空串表示不额外限制。
   atg:
-    # 运行模式 (对应 Ark ATG_MODE / 环境变量 AISTUDIO_ATG_MODE)。
-    # off=完全禁用 (零管线改动)；prefer=尽力合成，模型忽略合成工具时回退纯文本通道；
-    # required=严格模式，缺少合成工具调用时显式失败而非静默回退。
-    # 何时用：prefer 用于观察命中率；required 用于必须走工具通道的强约束场景。
-    mode: off
-
-    # 分协议面覆盖 (WP8)：inherit 使用上方 mode；off/prefer/required 单独覆盖。
-    # 仅在对应协议面 (openai/claude/responses) 开启后生效。
+    mode: "off"
     mode_by_format:
       gemini: inherit
       openai: inherit
       claude: inherit
       responses: inherit
-
-    # 每次请求的合成工具名前缀 (对应 Ark ATG_TOOL_PREFIX)，须保持稳定以利于过滤与历史清理。
     tool_prefix: atg_emit_
-
-    # 控制提示词的注入位置 (对应 Ark ATG_CONTROL_POSITION)。
-    # tail=置于对话末尾 (推荐，同时修复“模型话轮提前结束”问题)；head=置于对话开头。
     control_position: tail
-
-    # 合成工具参数严格模式 (对应 Ark ATG_TOOL_STRICT)。
-    # 开=参数结构不符合预期即判失败；关=允许宽松解析。默认关，容错优先。
     strict: false
-
-    # 上游返回空/塌陷响应时的最大重试次数 (对应 Ark ATG_EMPTY_RETRIES，范围 0-5)。
-    # 开大=更强的防截断兜底但增加额度消耗；默认 2。
     empty_retries: 2
-
-    # 合成参数解析失败时的恢复策略 (对应 Ark ATG_RECOVERY)。
-    # repair=尝试确定性修复后再解包；fail=直接显式失败。默认 repair。
     recovery: repair
-
-    # 流式旁路缓冲字节数 (对应 Ark ATG_SIDE_BUFFER_BYTES，0..16MB)。
-    # 0=立即透传 (默认)；大于 0=在合成调用到达前先缓冲纯文本，抑制前言泄漏。失败怎么办：超限即透传。
     side_buffer_bytes: 0
-
-    # 客户端自带合成机制守卫 (对应 Ark ATG_CLIENT_SYNTHETIC_GUARD，默认 on)。
-    # 开=当客户端 (如酒馆类扩展) 已自带“经工具回正文”机制时跳过本地包装，防止双通道叠加；
-    # 关=无条件本地包装。默认开，兼容优先。
     client_synthetic_guard: true
-
-    # 合成参数最大字节数 (对应 Ark ATG_MAX_RESPONSE_BYTES，范围 1KB..100MB)。
-    # 超过该上限的合成参数直接判失败，避免异常大载荷拖垮解析；默认 16MB。
-    # 失败怎么办：超限即判失败（不静默截断）。
     max_response_bytes: 16777216
-
-    # 文本模型识别正则 (对应 Ark ATG_TEXT_MODEL_PATTERN)；留空使用内置默认正则。
-    # 命中的模型视为文本模型，才参与 ATG 合成。失败怎么办：留空即用内置规则。
     text_model_pattern: ""
-
-    # 非文本模型识别正则 (对应 Ark ATG_NON_TEXT_MODEL_PATTERN)；留空使用内置默认正则。
-    # 优先于文本正则判定：命中即视为非文本模型 (生图/音频/嵌入等) 并跳过 ATG。
     non_text_model_pattern: ""
 
-  # --------------------------------------------------------------------------
-  # 回落 (fallback) 开关组 — 默认全 off，遵循「零自动回落」决策。
-  # 任何改道行为都必须显式开启，并在日志与响应中可 grep；未开启时一律显式报错。
-  # --------------------------------------------------------------------------
-  fallback:
-    # 配额 (429/限额) 耗尽时是否允许跨面/跨账号回落。开=配额触顶后尝试回落改道；关=显式报错。默认关。
-    on_quota: false
+# 付费模型准入规则（Paid 模型 tier 不足时返回 403，不切号、不降级）。
+# 每个条目：contains/prefixes/exact 匹配模型名，required_tiers 列出允许的 tier。
+# 未命中任何条目的模型按 Free 模型处理。
+paid_model_rules:
+  ultra_required:
+    contains: ["veo", "ultra"]
+    required_tiers: ["Ultra", "Ultra_20X"]
+  pro_required:
+    contains: ["argon", "gemini-4", "imagen"]
+    required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
-    # 请求失败 (非配额类错误) 时是否允许自动回落改道。开=失败即改道重试；关=显式报错。默认关。
-    on_failure: false
-
-    # 是否允许在 chat 与 build 两个面之间跨面回落。开=允许跨面改道；关=面内失败不改道。默认关。
-    cross_surface: false
-
-# 服务端日志与请求转储调试配置
-logging:
-  # 日志输出级别: DEBUG / INFO / WARNING / ERROR
-  level: INFO
-  # 是否转储每次 API 请求与响应的完整报文详情 (支持通过环境变量 DEBUG=true 触发)
-  dump_requests: false
-  # 是否将请求与响应转储落盘为独立文件 (支持环境变量 AISTUDIO_DUMP_FILE=true 触发)
-  dump_to_file: false
-  # 转储文件保存目录 (默认为项目根目录下 dumps/)
-  dump_dir: dumps
-
+# 模型原生默认规则：
+# - drop_unsupported_params：全局过滤下游传来的未知/不兼容参数（默认 false）。
+# - profiles：按 model 名称匹配（contains/prefixes/exact）套用生成默认值、工具与安全策略；
+#   is_image_model 启用生图管线；disable_safety_settings 完全不下发安全配置。
+# - models：按具体模型名精确覆盖 profiles 的默认值。
 model_defaults:
-  # 是否自动丢弃下游客户端传入的未知/不支持参数（如 HARM_CATEGORY_CIVIC_INTEGRITY、不兼容的内置工具等）
-  # 设置为 true 时自动过滤异常参数，避免 Google 上游返回 400 INVALID_ARGUMENT 报错
   drop_unsupported_params: false
-
-  # profiles: 按模型名规则匹配，适合整类模型共用默认配置
   profiles:
-    # 生图模型默认配置
     - name: image_models
       match:
         contains:
           - image
-      # 命中后视为生图模型
+          - imagen
       is_image_model: true
-      # 生图模型可选内置工具名：
-      # - google_search                    仅网页搜索
-      # - image_search                     仅图片搜索
-      # - google_search_and_image_search   网页搜索 + 图片搜索
       default_tools:
         - google_search_and_image_search
-      # generation_config_defaults 会映射到内部 wire generation_config
       generation_config_defaults:
-        # 生图通常不需要显式 response mime type
         response_mime_type: null
-        # image_only 或 text_and_image
         image_output_mode: image_only
-        # thinking_config 最终会编码成 wire 数组
         thinking_config:
-          # LOW / MEDIUM / HIGH / MINIMAL
           level: MINIMAL
           mode: 1
-      # 某些生图模型不接受这些 generation_config 下标，发请求前会清空
       clear_generation_config_indexes:
         - 7
         - 13
         - 17
-      # 当前生图模型默认不下发 safety_settings
       disable_safety_settings: true
-
-    # Gemma 文本模型默认配置
+    - name: video_models
+      match:
+        prefixes:
+          - veo-
+        contains:
+          - veo
+      disable_safety_settings: true
     - name: gemma_models
       match:
         prefixes:
           - gemma-
-      # Gemma 系列只能选这两个内置工具：
-      # - google_search
-      # - code_execution
       default_tools:
         - google_search
-      # 1 = 最严格拦截
-      # 5 = 关闭
       safety_settings:
         Harassment: 5
         Hate: 5
         Sexually Explicit: 5
         Dangerous Content: 5
-
-    # Gemini 文本模型默认配置
     - name: gemini_models
       match:
         prefixes:
           - gemini-
-      # Gemini 系列可选 4 个内置工具：
-      # - google_search
-      # - code_execution
-      # - google_maps
-      # - url_context
       default_tools:
         - google_search
       safety_settings:
@@ -317,14 +216,133 @@ model_defaults:
         Hate: 5
         Sexually Explicit: 5
         Dangerous Content: 5
-      # 自动丢弃下游客户端传入的未知/非法参数（如 HARM_CATEGORY_CIVIC_INTEGRITY），防止上游 400 报错
       drop_unsupported_params: true
-
-  # models: 对单个模型做精确覆盖，优先级高于上面的 profiles
-  # 例如：
-  # models:
-  #   gemini-3.1-flash-image-preview:
-  #     generation_config_defaults:
-  #       image_output_mode: text_and_image
-  #       media_resolution: HIGH
   models: {}
+
+# 按 tier 的每日软额度（只用于仪表盘百分比与调度权重，超额绝不禁用账号）。
+# 每个 tier 下可配置任意规则桶：
+#   <bucket>:
+#     match: {contains/prefixes/exact: [...]}
+#     daily_limit: <int>
+#   default_limit: <int>   # 未命中任何桶时的回退额度
+# overrides：按精确模型名覆盖任意 tier 的额度（优先级最高）。
+# Free/Plus/Pro/Ultra/Ultra_20X 为系统识别的 canonical tier 名称。
+tier_quotas:
+  Free:
+    flash_models:
+      match:
+        contains: ["flash"]
+      daily_limit: 100
+    pro_models:
+      match:
+        contains: ["pro"]
+      daily_limit: 10
+    default_limit: 20
+  Plus:
+    flash_models:
+      match:
+        contains: ["flash"]
+      daily_limit: 300
+    pro_models:
+      match:
+        contains: ["pro"]
+      daily_limit: 30
+    default_limit: 50
+  Pro:
+    argon_models:
+      match:
+        contains: ["argon", "gemini-4"]
+      daily_limit: 50
+    flash_models:
+      match:
+        contains: ["flash"]
+      daily_limit: 150
+    pro_models:
+      match:
+        contains: ["pro"]
+      daily_limit: 50
+    image_models:
+      match:
+        contains: ["image", "imagen"]
+      daily_limit: 50
+    default_limit: 50
+  Ultra:
+    argon_models:
+      match:
+        contains: ["argon", "gemini-4"]
+      daily_limit: 250
+    flash_models:
+      match:
+        contains: ["flash"]
+      daily_limit: 1500
+    pro_models:
+      match:
+        contains: ["pro"]
+      daily_limit: 250
+    image_models:
+      match:
+        contains: ["image", "imagen"]
+      daily_limit: 250
+    video_models:
+      match:
+        contains: ["veo"]
+      daily_limit: 50
+    default_limit: 250
+  Ultra_20X:
+    argon_models:
+      match:
+        contains: ["argon", "gemini-4"]
+      daily_limit: 1000
+    flash_models:
+      match:
+        contains: ["flash"]
+      daily_limit: 5000
+    pro_models:
+      match:
+        contains: ["pro"]
+      daily_limit: 1000
+    image_models:
+      match:
+        contains: ["image", "imagen"]
+      daily_limit: 1000
+    video_models:
+      match:
+        contains: ["veo"]
+      daily_limit: 200
+    default_limit: 1000
+  overrides: {}
+
+# 账号预设方案：
+# - action：enable_all / filter_tier / filter_group。
+# - filter_tier 使用 target_tiers；filter_group 使用 target_groups。
+# - is_system: true 为内置方案，UI 不提供删除。
+account_presets:
+  - id: preset_all
+    name: 全部启用 (最大并发)
+    description: 激活所有可用账号，提供最充沛的并发与负载池
+    action: enable_all
+    is_system: true
+  - id: preset_paid_only
+    name: 纯高阶付费池 (Plus/Pro/Ultra)
+    description: 仅激活具有付费权益的账号，全力保障高阶模型调用
+    action: filter_tier
+    target_tiers: ["Plus", "Pro", "Ultra", "Ultra_20X"]
+    is_system: true
+  - id: preset_ultra_only
+    name: 旗舰专属池 (Ultra 独占)
+    description: 仅激活 Ultra 顶级算力账号，保障最顶尖模型调用
+    action: filter_tier
+    target_tiers: ["Ultra", "Ultra_20X"]
+    is_system: true
+  - id: preset_free_only
+    name: 纯免费节能池 (Free)
+    description: 仅激活 Free 等级账号，用于日常普通模型测试
+    action: filter_tier
+    target_tiers: ["Free"]
+    is_system: true
+  - id: preset_production
+    name: 生产专属集群 (Production)
+    description: 仅激活 group 标记为 production 的核心业务账号
+    action: filter_group
+    target_groups: ["production"]
+    is_system: true

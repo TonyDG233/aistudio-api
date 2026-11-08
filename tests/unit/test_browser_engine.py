@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from aistudio_api.infrastructure.browser.browser_engine import (
+    _OPT_CLOAKBROWSER_DIR,
     _assign_process_to_job,
     _create_windows_job_object,
     _derive_stable_fingerprint_seed,
@@ -105,29 +106,23 @@ def test_find_chromium_executable_strictly_requires_cloakbrowser(tmp_path):
         assert found == str(fake_chrome)
 
     # 4. When CloakBrowser is installed in /opt/cloakbrowser (e.g. Docker container)
-    fake_opt_chrome = tmp_path / "opt_cloak" / "chrome"
-    fake_opt_chrome.parent.mkdir(parents=True)
+    # The production constant pins the system-level location; point it at a real
+    # temp directory so the branch is exercised with native path semantics on
+    # every platform (no POSIX string comparison that breaks on Windows).
+    assert Path("/opt/cloakbrowser") == _OPT_CLOAKBROWSER_DIR
+    fake_opt_dir = tmp_path / "opt_cloakbrowser"
+    fake_opt_chrome = fake_opt_dir / "chrome"
+    fake_opt_dir.mkdir(parents=True)
     fake_opt_chrome.write_text("fake docker cloakbrowser")
     if platform.system() != "Windows":
         fake_opt_chrome.chmod(0o755)
 
-    orig_glob = Path.glob
-
-    def fake_opt_is_dir(self):
-        if self.name == ".cloakbrowser":
-            return False
-        if self == Path("/opt/cloakbrowser"):
-            return True
-        return orig_is_dir(self)
-
-    def fake_opt_glob(self, pat):
-        if self == Path("/opt/cloakbrowser"):
-            return [fake_opt_chrome]
-        return orig_glob(self, pat)
-
     with (
-        patch.object(Path, "is_dir", fake_opt_is_dir),
-        patch.object(Path, "glob", fake_opt_glob),
+        patch(
+            "aistudio_api.infrastructure.browser.browser_engine._OPT_CLOAKBROWSER_DIR",
+            fake_opt_dir,
+        ),
+        patch("pathlib.Path.home", return_value=tmp_path / "empty_home"),
         patch("aistudio_api.config.settings.browser_executable_path", None),
         patch(
             "aistudio_api.infrastructure.browser.browser_engine._is_termux",
@@ -166,19 +161,50 @@ def test_cleanup_stale_chromium_skips_active_api_server():
         assert isinstance(killed, list)
 
 
-def test_spawn_process_watchdog_creates_pipe_and_reaps():
-    """Verify process watchdog companion spawns with pipe and cleans up."""
+def test_spawn_process_watchdog_windows_returns_none():
+    """D-02: Windows uses Job Objects instead of the POSIX pipe watchdog."""
+    if platform.system() != "Windows":
+        pytest.skip("Windows-specific watchdog fallback")
+    assert _spawn_process_watchdog(os.getpid(), target_pgid=None) == (None, None)
+
+
+def test_spawn_process_watchdog_reaps_live_target_on_pipe_eof():
+    """P-01/P-04: closing the pipe write-end must kill a live target process.
+
+    On Windows there are no pipes to close: the watchdog is intentionally
+    disabled in favour of the Job Object path and must report ``(None, None)``.
+    """
+    if platform.system() == "Windows":
+        watcher, pipe_w = _spawn_process_watchdog(os.getpid(), target_pgid=None)
+        assert watcher is None
+        assert pipe_w is None
+        return
+
     import subprocess
+    import sys
 
-    dummy = subprocess.Popen(["true"])
-    dummy.wait()
-
-    watcher, pipe_w = _spawn_process_watchdog(dummy.pid, target_pgid=None)
-    if watcher is not None:
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    watcher = None
+    try:
+        watcher, pipe_w = _spawn_process_watchdog(
+            dummy.pid, target_pgid=os.getpgid(dummy.pid)
+        )
+        assert watcher is not None
         assert pipe_w is not None
+
         os.close(pipe_w)
-        watcher.wait(timeout=2.0)
-        assert watcher.poll() is not None
+        dummy.wait(timeout=5.0)
+        assert dummy.poll() is not None
+    finally:
+        if dummy.poll() is None:
+            dummy.kill()
+            dummy.wait(timeout=5.0)
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.wait(timeout=5.0)
 
 
 def test_build_chromium_args_platform_and_timezone():

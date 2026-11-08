@@ -2,6 +2,10 @@
 
 本文档面向所有参与本项目的代码代理（Coding Agents）与开发者，明确核心架构共识、运行环境约束与代码规范。
 
+适用范围：本仓库主工作区。主工作区即唯一常态开发、审查与交付工作区，所有 Worker/Reviewer 直接在同一工作树内读写、测试与出报告。行为权威是 `docs/dev/rebuild/06-decision-log.md` 全文与 `docs/dev/rebuild/08-09-decision-record.md` 的 D-01..D-14；两者冲突时以 `08-09` 为准。本文只固化工程口径，不新增决策。
+
+历史 `docs/dev/rebuild/` 与旧 `rebuild` 分支只作决策依据与只读失败样本；严禁把旧分支整树 merge、checkout 或覆盖当前代码。
+
 ---
 
 ## 目录
@@ -9,22 +13,25 @@
 - [1. 核心架构与设计原则](#1-核心架构与设计原则)
 - [2. 运行时与环境约束 (Termux)](#2-运行时与环境约束-termux)
 - [3. 代码质量与类型规范](#3-代码质量与类型规范)
-- [4. 并发安全与多账号守则](#4-并发安全与多账号守则)
-- [5. 代码结构索引](#5-代码结构索引)
-- [6. 功能开关规范 (features)](#6-功能开关规范-features)
-- [7. 统计与 Paid 模型访问](#7-统计与-paid-模型访问)
-- [8. 实例、渠道、Tag 与策略组概念口径](#8-实例渠道tag-与策略组概念口径)
+- [4. 实例、池与并发安全（核心）](#4-实例池与并发安全核心)
+- [5. 路由、错误与重试](#5-路由错误与重试)
+- [6. 账号、Cookie、预设与鉴权](#6-账号cookie预设与鉴权)
+- [7. 保活、日志与协议面](#7-保活日志与协议面)
+- [8. 配置口径](#8-配置口径)
+- [9. 代码结构索引](#9-代码结构索引)
+- [10. 智能体工作流与发布纪律](#10-智能体工作流与发布纪律)
 
 ---
 
 ## 1. 核心架构与设计原则
 
-`aistudio-api` 是 Google AI Studio 反向代理网关，提供原生 **Gemini API 兼容接口**（`/v1beta/...`）。
+`aistudio-api` 是 Google AI Studio 反向代理网关。
 
-- **协议面分层**：原生 Gemini API（`/v1beta/...`）是第一协议面；WP8 起提供 OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）与 Anthropic Messages（`/v1/messages`），WP11 增加 OpenAI Responses（`/v1/responses`）与三类真实计数端点。所有请求统一归一到 `GeminiGenerateContentRequest`，响应在格式边界逆变换；核心生成管线不得散落协议判断。
+- **分层边界（硬约束）**：`api` 只做协议校验、鉴权与响应渲染；`application` 编排用例，严禁 import `fastapi` 或 `aistudio_api.api`；`domain` 只放纯模型与错误契约；`infrastructure` 提供浏览器、CDP、存储等适配器，严禁反向 import `aistudio_api.application`。依赖方向固定为 `api → application → domain ← infrastructure`。
+- **协议面**：原生 Gemini API（`/v1beta/...`）、OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）、Claude Messages（`/v1/messages`）与 OpenAI Responses（`/v1/responses`）四种协议面均已完成并默认启用；OpenAI/Claude/Responses 可通过 `features.formats` 关闭。所有协议请求归一到协议中立核心，响应在格式边界逆变换；核心生成管线不得散落协议判断。
 - **轻量 CDP 驱动**：使用纯 Python 异步 WebSocket 直连 Chrome DevTools Protocol（CDP），不依赖 Node.js、Playwright 或 Selenium。
 - **浏览器内 XHR Replay**：在 MakerSuite 页面上下文中执行携带 `withCredentials = true` 的异步 XHR 请求，天然复用完整的 Cookie 会话、BotGuard 快照与环境指纹。
-- **代码即事实标准（Code as Ground Truth）**：通过全量测试验证的代码是系统的事实标准。当技术规范文档与真实代码逻辑出现分歧时以代码为准，并在重构过程中同步更新文档。
+- **代码即事实标准（Code as Ground Truth）**：通过全量测试验证的代码是系统的事实标准。当技术规范文档与真实代码逻辑出现分歧时以代码为准，并在重构过程中同步更新文档；但不得用“代码如此”为违反 `06`/`08-09` 的旧实现辩护。
 - **架构事实优先（Fact & Architecture over Brittle Tests）**：保持架构整洁与低耦合。避免为了迁就耦合了私有变量的脆弱 mock 测试而妥协生产设计；遇冲突时应重构测试以对齐公共接口契约，消除抽象泄露。
 - **协议索引常量化（Specification Constants & No Magic Numbers）**：Protobuf-over-JSON 逆向数组索引统一提取为具备明确语义的规范枚举或常量（如 `wire_spec.py`），杜绝裸数字散落业务逻辑中。
 
@@ -37,7 +44,7 @@ Python 工具链运行在 Termux 宿主（通过 `uv` 管理虚拟环境）；Ch
 ```bash
 # 1. 宿主依赖环境配置与同步
 bash scripts/setup-env.sh
-uv sync
+uv sync --extra dev   # 开发/测试/lint 必须带 dev extra
 
 # 2. 准备受控浏览器运行时（仅首次执行）
 bash scripts/setup-browser.sh
@@ -49,6 +56,7 @@ uv run python3 main.py server --port 8080
 > [!NOTE]
 > - `uv` 会解析 `uv.lock` 中的跨平台镜像索引与预编译 wheel，避免在 Termux 环境因编译 Rust 消耗过多内存导致 OOM。
 > - `scripts/cloakbrowser_termux/run-chrome.sh` 是 Termux 下的 Chromium 包装入口，内部调用 `proot-distro login aistudio-api -- /opt/cloakbrowser/chrome "$@"` 并自动绑定路径。
+> - `uv run pytest` 不会自动安装 dev extra；若项目 venv 未装 pytest/pytest-asyncio，`uv run` 可能回落到系统 pytest。开发与验收一律先 `uv sync --extra dev`。
 
 ### 2.2 前端构建与管理
 
@@ -70,17 +78,21 @@ uv run python3 main.py server --port 8080
 | `[Errno 98] address already in use` | 端口被占用或上一次服务未完全退出 | 执行 `pkill -f 'main.py server'` 后重试，或指定 `--port <other_port>` |
 | `Chromium CDP endpoint on port N not ready` | proot 容器未启动或缺少 apt 依赖 | 重新运行 `bash scripts/setup-browser.sh` |
 | `proot-distro login: container 'aistudio-api' is missing` | 容器尚未创建或被改名 | 运行安装脚本创建容器，或通过 `AISTUDIO_PROOT_NAME` 指定现有容器 |
-| `pydantic-core` 报 `GLIBC_X.Y not found` | 使用了系统 pip 安装而非 `uv` | 清理 `.venv/` 后重新执行 `uv sync` |
+| `pydantic-core` 报 `GLIBC_X.Y not found` | 使用了系统 pip 安装而非 `uv` | 清理 `.venv/` 后重新执行 `uv sync --extra dev` |
+| pytest 报 `Unknown config option: asyncio_default_fixture_loop_scope` | 项目 venv 未装 dev extra，回落到系统 pytest | `uv sync --extra dev` 后重跑 |
+| Windows 报 `UnicodeDecodeError: 'gbk' codec...` | 本机 locale 非 UTF-8，fixture 按 UTF-8 存储 | 设置 `$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'` 后重跑 |
+| Windows `bun.CMD` 报 `\n was unexpected at this time`，或 `/opt/cloakbrowser` 用例失败 | 上游测试的平台适配问题，不是业务代码回归 | 以 Linux/Termux 结果为准；不得为过测试修改契约 |
 
 ### 2.5 临时文件与目录规范 (Termux)
 
 - **避免硬编码 `/tmp`**：Android Termux 环境中不存在系统级 `/tmp` 目录。在代码、测试、脚本或临时分析中严禁硬编码 `/tmp/`，否则会引发 `FileNotFoundError: [Errno 2] No such file or directory: '/tmp'`。
 - **统一使用 `tempfile` / `$TMPDIR`**：所有临时目录或文件操作必须通过 `tempfile.gettempdir()` 或 `tempfile.mkdtemp()` 创建（自动安全解析至 `$TMPDIR` 即 `/data/data/com.termux/files/usr/tmp`），并在操作完成后通过 `try...finally` 与 `shutil.rmtree` 及时清理。
+
 ---
 
 ## 3. 代码质量与类型规范
 
-本项目启用了严格的静态类型检查与代码质量工具链：
+本项目启用了严格的静态类型检查与代码质量工具链。
 
 ### 3.1 类型安全要求
 
@@ -112,14 +124,14 @@ uv run python3 main.py server --port 8080
   - `RUF001` / `RUF002` / `RUF003`：注释与文档字符串中的中文全角标点（项目文档语言为中文）
   - `ASYNC109` / `ASYNC230` / `ASYNC240`：异步函数中的超时参数与本地文件访问（单机自托管场景）
   - `E501`：行宽由 formatter 统一处理
-- **按文件豁免**：`main.py` 豁免 `E402`（启动时需先注入 `sys.path`）；`tests/**` 豁免动态殊性规则
+- **按文件豁免**：`main.py` 豁免 `E402`（启动时需先注入 `sys.path`）；`tests/**` 豁免动态特性规则。
 - **检查与格式化指令**：
   ```bash
-  # 代码风格与 Lint 检查
-  ruff check .
-  # 自动格式化与 import 排序修复
-  ruff check . --fix
+  uv run ruff check .
+  uv run ruff check . --fix
+  uv run ruff format .
   ```
+
 ### 3.3 智能体工具调用与开发工作守则
 
 为保障代码修改的准确性、交互效率并最大化利用大上下文模型能力，智能体与开发者必须严格遵循以下高优先级操作准则：
@@ -134,7 +146,7 @@ uv run python3 main.py server --port 8080
    - 查看文件内容、定位符号与阅读代码必须使用专业的 `read` / `grep` 工具，**严禁使用 `eval` 编写 Python 文件读取脚本来替代 `read`**。
    - `eval` 仅限用于必要的复杂内存原型运算、即时逻辑求值或重现动态执行结果，非必要绝不滥用。
 4. **统一强制使用 `uv` 工具链（Enforce uv）**：
-   - 执行 Python 脚本、测试套件（`uv run pytest`）、代码检查（`uv run ruff check .`）与包同步（`uv sync`）**一律通过 `uv` 调用**。
+   - 执行 Python 脚本、测试套件（`uv run pytest`）、代码检查（`uv run ruff check .`）与包同步（`uv sync --extra dev`）**一律通过 `uv` 调用**。
    - 严禁调用系统裸 `python`、`python3` 或 `pip`，确保所有依赖与环境均在受控的虚拟环境内运行。
 5. **任务清单 (todo) 保持敏捷与批量操作**：
    - 待办事项完成时，**允许并鼓励一次性全部批量划掉**，严禁机械地一轮交互只标记一个任务。
@@ -144,13 +156,16 @@ uv run python3 main.py server --port 8080
    - 避免引入形式主义的胶水层、过度抽象与冗余样板代码，保持代码与文档紧凑精炼。
 7. **交付前全量审查完整 diff（Review Full Diff）**：
    - 每次提交或报告完成前，**必须完整查看整个 `git diff`（不带行数折叠与省略）**，逐行确认所有改动准确无误、没有残留调试代码或意外破损。
-   - 确保 `uv run ruff check .`、`uv run pyright` 和 `uv run pytest` 全部零报错通过后再行提交。
+   - 确保 `uv run ruff check .`、`uv run pyright src tests` 和 `uv run pytest` 全部通过后再行提交；无法通过的必须给出原因、复现命令与平台差异证据。
 8. **微创编辑优先与 Diff 审计守则（Prefer Edit & Mandatory Diff Inspection）**：
    - 局部功能调整或代码重构**一律优先使用精准微创的 `edit`**，避免全文件重写引入非预期的代码格式漂移与无关变动。
    - 仅在新建文件、大型嵌入脚本提取（`src/.../js/*.js`）或结构彻底颠覆时使用 `write`。**使用 `write` 进行文件覆盖后，必须在第一时间执行 `git diff` 进行全量逐行审计**，确保无意外功能遗漏、截断或回退。
 9. **零 Shim 容忍与干净重构（Clean Cutover Refactoring）**：
    - 重构内部函数或类方法签名时，必须实施**一步到位的原子切换（Atomic Cutover）**。
    - **严禁保留 `@deprecated` 向下兼容存根、无意义的历史 shim 别名包装或 `_unused_*` 废弃形参**；全库一次性完整迁移所有调用方和对应测试断言。
+10. **测试与契约纪律**：
+    - 禁止为通过测试修改测试/配置/契约；测试失败必须区分“业务回归”与“本机平台差异”，并给出复现命令。
+    - 历史蓝绿、lease、同账号双页等测试只作行为参考，按 `06-test-disposition.csv` 处置，不得作为当前契约。
 
 ### 3.4 自动化检查命令与执行守则
 
@@ -159,14 +174,15 @@ uv run python3 main.py server --port 8080
 | 工具 / 阶段 | 命令 | 判定标准 |
 |---|---|---|
 | **Python 代码风格与 Lint** | `uv run ruff check .` | 0 errors |
-| **Python 代码格式化** | `uv run ruff format --check .` | 212 files already formatted |
+| **Python 代码格式化** | `uv run ruff format --check .` | 全部文件已格式化 |
 | **Python 类型检查** | `uv run pyright src tests` | 0 errors |
-| **Python 单元测试** | `uv run pytest` | 全部通过 (885 passed) |
+| **Python 单元测试** | `uv sync --extra dev; uv run pytest` | Linux/Termux 全绿；Windows 本机仅允许 2.4 所列平台差异；新增失败必须解释 |
 | **浏览器 JS 语法校验** | `for f in src/aistudio_api/infrastructure/browser/js/*.js; do bun build "$f" --no-bundle >/dev/null; done` | 0 errors |
 | **前端代码规范** | `cd web && bun run lint` | 0 errors, 0 warnings |
 | **前端类型检查** | `cd web && bun run type-check` | 0 errors |
 | **前端生产构建** | `cd web && bun run build` | 构建成功并更新 static 产物 |
-| **Android 静态检查 (Lint & 代码规范)** | `cd android && ./gradlew :app:lintDebug :app:ktlintCheck` 或 `ktlint "android/app/src/main/java/**/*.kt"` | 0 errors |
+| **Android 静态检查** | `cd android && ./gradlew :app:lintDebug :app:ktlintCheck` 或 `ktlint "android/app/src/main/java/**/*.kt"` | 0 errors |
+
 > [!NOTE]
 > **跨平台原生二进制依赖与开发工具**：
 > - `pydantic-core` 等依赖在 PyPI 上无预编译 Android wheel，而 Termux 的 TUR 源无桌面端 wheel。因此 `uv.lock` 纳入 `.gitignore`：桌面端直接从 PyPI 安装对应 wheel；Termux 端通过 `setup-env.sh` 生成本地 `uv.toml` 使用 TUR 源，避免不同平台的 wheel 源锁定冲突，各平台均直接使用二进制 wheel 避免源码编译。
@@ -175,176 +191,265 @@ uv run python3 main.py server --port 8080
 > [!TIP]
 > **避免无效重跑**：若在当前交互轮次中未发生代码或配置文件的实质性变动，无需重复执行全量类型与测试套件检查。
 
-## 4. 并发安全与多账号守则
+---
 
-> [!IMPORTANT]
-> 1. **原子化文件持久化**：所有持久化文件（`registry.json`、`auth.json`、`meta.json` 等）操作必须使用 `account_store._atomic_write_json`（写入临时文件后通过 `os.replace` 原子替换），防止并发写入截断。
-2. **蓝绿会话平滑热切与就绪门机制**：切换账号时，`BrowserSession` 在后台创建独立新标签页，注入 Cookie、完成页面导航与 BotGuard 握手验证；验证通过后原子翻转 `SessionReadinessGate` 并将新上下文设为就绪。旧会话上下文加入退休队列，优雅等待在途流式请求排干（`decr_in_flight()` 触发 `drain_event`）后再行关闭，保障流式请求平滑过渡零中断。
-3. **缓存与模板隔离**：账号切换、429 限流或 403 鉴权重试时，调用 `client.clear_templates()`，避免跨账号复用请求模板。快照签名按每次请求哈希实时生成，绝不跨请求共享。初次握手截获基线模板后，任意目标模型通过 `capture_template(model)` 纯内存动态适配参数。
-4. **鉴权故障快速隔离与自愈**：当遇到 `The caller does not have permission` (403) 时，立即将当前账号置入 `auth_cooldown` 并快速故障转移至健康账号；单账号或备用号耗尽时自动触发在位强制刷新与 BotGuard 重握手自愈。
-5. **无全局 DOM 污染**：页面内 JavaScript 交互使用局部闭包 `Promise` 返回数据，不在 `window` 对象上遗留全局共享状态。
-6. **Cookie 智能精简与天然协商**：外部导入 Cookie 时自动过滤旧设备或跨 IP 绑定的易腐败凭据（`OSID`、`__Secure-OSID`、`SIDCC` 及 `_ga` 等追踪标记），保留核心认证项（`SID`、`SAPISID`、`1PSIDTS`）。浏览器访问 AI Studio 时自动协商出绑定当前网络/TLS 的全新有效 `OSID`，杜绝 403 权限拒绝。
-7. **过期凭据排除调度**：账号信息刷新（`POST /accounts/refresh`，直连 `GetAiStudioBenefitTier`）遇 401 即落 `expired=true` 并自动排除出调度池，直至刷新成功或重新导入 cookies；全部账号过期时显式报错（`credential expired, re-import cookies`），绝不静默跳过；5xx/网络等非权威失败不改动账号状态。
-7. **真实环境伪装与低内存协同**：保留 `--renderer-process-limit=1`、`--in-process-gpu` 与 128MB V8 内存限制以保障 Android 低 RAM 运行；移除 `--disable-software-rasterizer` 并启用 `--use-gl=angle --use-angle=swiftshader` 恢复软件 WebGL 上下文，保留 `--mute-audio` 并移除 `--disable-audio` 保护 AudioContext；统一注入 `--fingerprint-platform=windows` 伪装为 Windows 桌面环境，并通过原生 `--fingerprint-timezone` 与 Wire 协议层保持时区/位置严格一致。
-8. **账号接口解耦与 SPA 缓存隔离**：对外标准 REST 接口统一位于 `/api/accounts`（保持 `/accounts` 向下兼容），并在 SPA 单页应用与 API 响应中下发 `Vary: Accept` 与 `Cache-Control: no-store`，杜绝浏览器与代理网关发生缓存错乱。
-9. **双保活不可互相替代**：定时切号（`auto_switch`，长周期均衡 + 真实页面活动）与自动刷新 Auth（`keepalive_auth_update`，cookies/origins → `auth.json`）必须同时保留；元数据刷新（`keepalive_metadata_refresh`，tier/email/expired → `registry.json`/`meta.json`）只做体检，不能替代凭证回写。三者独立开关。
-10. **切号与回写安全**：自动/手动切号共用 `account_orchestrator` 切号锁；切号门槛必须覆盖 chat `session.in_flight_count` 与 build `in_flight_count`；切号时关闭/重建 build 页；切号前保存旧账号 Auth，切后保存新账号 Auth。手动刷新与自动元数据刷新共用同一 `AccountInfoRefresher` 实例和 409 互斥。
-11. **配置双写**：本地根 `config.yaml` 是运行时实际配置且不被 git 追踪；分发默认配置是 `defaults/config.yaml`（tracked）。任何 `features` 变更必须两处同步，提交与证据以 `defaults/config.yaml` 为准。
+## 4. 实例、池与并发安全（核心）
 
-## 5. 代码结构索引
+### 4.1 实例定义（不可再改的边界）
+
+- **1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（chat 或 build）**。
+- 同一账号的 chat/build 不并存；需要切换就关闭当前实例再重建，或换账号。
+- 实例是调度与用量单位；Context/Page 是实现细节，不作为用户可配置项。
+- 实例配置使用 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器；全局只做总上限。
+- 容量按实例数计算，不再有 reservation 计数。
+
+#### 4.1.1 实例 Tier 选择器（only_tier / min_tier / max_tier）
+
+实例 tier 选择器定义账号可落入的闭区间；实现事实在 `domain/model_access.py` 与 `infrastructure/gateway/model_defaults.py`。
+
+- **至少一个选择器**：`only_tier`/`min_tier`/`max_tier` 至少一个非空；`None`/空字符串视为未提供；显式提供的非空值必须是字符串，非字符串（如数字/列表）或未知 tier 名称一律 fail-fast（`model_access.py:140-160,179-182`、`model_defaults.py:317-448`）。未知/非字符串不得静默忽略，否则槽位会漂移到非预期 lane。
+- **`only_tier` 精确钉住**：`Free` 归一 `Free..Free`；`Ultra` 展开 `Ultra..Ultra_20X`；`Plus`/`Pro` 保持精确。`only_tier` 不得与不同的 `min_tier/max_tier` 同时配置；允许标准化后的同区间写法（如 `only=Free,min=Free,max=Free`）（`model_access.py:184-199`）。
+- **`min_tier` 单独**：`Free` → `Free..Free`；付费 tier → `min..Ultra_20X`（`model_access.py:211-214`）。
+- **`max_tier` 单独**：`Free` → `Free..Free`；付费上限下界默认 `Pro`，不能低于 Pro；确需 Plus 槽位时显式 `only_tier: Plus`（`model_access.py:201-209`）。
+- **`min_tier` + `max_tier`**：形成闭区间；要求 `rank(min) <= rank(max)`；Free 只能 `Free..Free`，不得与付费混合；付费区间 `min` 不能低于 Plus、`max` 不能低于 Pro（`model_access.py:216-232`）。
+- **Lane 规则**：Free 选择器只落 Free lane；任何付费选择器落 paid lane；账号 tier 必须先匹配 lane，再满足 `min..max`（`model_access.py:235-240`、`instance_pool.py:109-114,182-191`）。`InstancePool.add_slot` 与 `InstanceManager.reassign` 都拒绝跨 lane（`instance_pool.py:409-446`、`instance_manager.py:424-478`）。
+- **归一化与合并**：所有 Free 选择器归一为 `only=Free,min=Free,max=Free`，使 `only_tier: Free` 与旧 `min_tier: Free` 合并 count；paid `only_tier` 单独成键；`min/max` 仅在上界显式配置时把上界纳入合并键（`model_defaults.py:401-431`）。
+- **运行时契约**：`InstanceSpec.from_mapping` 归一 spec，`spec.selector` 生成闭区间，`accepts_tier` 校验账号（`instance_pool.py:72-114`）；实例 API 返回 `only_tier/min_tier/max_tier`，前端类型与页面已使用这些字段（`domain/instances.py:20-35`、`instance_manager.py:1241-1253`）。
+
+### 4.2 Free/Pro 多实例池（核心灵魂）
+
+- 池按账号 tier 分层：Free 池与 Pro/Ultra/Plus/Paid 池；Free 模型只能命中 Free 实例；paid 模型只能命中 Pro 及以上实例。
+- Free 账号实例与 Pro 账号实例可以同时在线，各自独立 BrowserContext/Page/Cookie/模板/在途计数；**严禁 Free 模型占用或消耗 Pro 账号配额**。
+- 候选包含 SLEEPING/UNSTARTED 实例；消息到达时唤醒所有合格休眠/未启动实例，不局限于存活实例。
+- 容量按实例数计算；不自动新开实例；容量满按路由/切号/503 处理。
+- 实例数量、surface、tier 区间（`only_tier`/`min_tier`/`max_tier`）只在实例配置设置；不恢复策略组、tag、quota group、affinity 打分。
+
+### 4.3 唯一并发原语：`active_requests`
+
+- 只保留 `active_requests` 计数/句柄；成功、失败、取消、断连、流关闭都在 `finally` 释放。
+- 取消 lease / reservation / 30s/15s 预算 / pinned / defer / slot COOLDOWN / retire_idle / `_runtime_occupancy` / 同账号双页 / 后台自动 rebind / 自动 rebalance。
+- 手动关闭/改绑在有 `active_requests` 时仍可拒绝；禁用账号/应用预设的 rebind 不得直接拒绝（见 4.4）。
+- 不新增第二套并发账本；统计/日志只消费事件，不参与准入。
+
+### 4.4 切换与 rebind（D-05）
+
+- 控制面只负责登录与保活，不是请求实例，不占池容量；控制面保持单页，不做蓝绿。
+- 账号有活动实例时，Cookie 回写走实例页；否则允许独立控制页。
+- 禁用账号/应用预设触发同一控制面 rebind：`RETIRING` → 停止新请求 → 有界等待 `active_requests==0` 或超时强制关闭 → 关闭旧 Page/Context → 切换账号/预设。期间不新建新页；不得无界等待；失败必须显式返回，不得让 registry/UI 与浏览器会话不一致。
+- 手动显式关闭旧实例再重建允许；后台自动 rebind、pinned、自动 rebalance 丢弃。
+- 禁止先建新页再 drain（blue-green）；同一账号最多 1 个 active Page。
+
+### 4.5 Page/Context 清理（D-10/D-11）
+
+- `connect_page`/prune 关闭所有非当前请求、非当前活跃账号的 Page/Context；不允许页面/context 泄露。
+- 只允许一个明确处于 drain 的旧页，且有界等待超时后强制关闭；drain 只发生在旧 Page/Context 上，期间不新建新页；不得把“1 active + 1 drain”当页预算例外。
+- 关闭即释放实例；失败/stale 才手动重启，禁止自动 stale 复活；idle browser 自动回收默认关闭。
+
+### 4.6 实机防风控铁律
+
+- **严禁任何 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程！** 每次冷启动均会触发 BotGuard 探针，短时间重复启停会导致账号被 Google 风控封禁。即使获批执行实机测试，全流程也只允许由主控或用户在单次常驻进程中完成，严禁反复重启服务。
+- 多实例池启用时，启动预热只允许由 `InstanceManager.startup()` 在池会话（`PooledSession`）上完成；控制面 `client.session` 不得在启动时自动开页/跑 BotGuard。控制面仅在按需场景（无活跃实例、手动导入 Cookie、保活）打开，且保持单页。
+- 离线开发/回归默认 mock/fixture，不得以“验证启动”为名启动真实服务、真实浏览器或发起网络请求。
+- **前端 UI Debug 沙盒例外（强制规范）**：严禁在默认生产模式（`ui_debug=false`）下启动服务或拉起真实浏览器；凡涉及前端 UI 变更，Worker 与 Reviewer 必须在强制注入环境变量 `AISTUDIO_UI_DEBUG=1`（开启 `diagnostics.ui_debug=true` 的纯内存/临时目录隔离沙盒，100% 阻断真实浏览器与外网请求）的前提下，在 `127.0.0.1:<随机空闲端口>` 启动临时沙盒服务，使用 Playwright 等浏览器工具在多分辨率（`1440x900` / `1024x900` / `768x900`）下实测页面交互与检查样式；测试结束后必须在 `finally` 中立即关闭临时服务进程，并确认端口关闭、无进程残留、临时目录已清理。
+
+### 4.7 浏览器进程与 CDP（D-02/D-03）
+
+- 保留 pipe watchdog，只负责父进程死亡后的孤儿 Chromium 清理；不得据此做账号 stale 复活、自动 rebind 或自动重启浏览器会话。
+- 只保留 WebSocket ping；不恢复 `set_liveness_checker` 与 `Runtime.evaluate` 轮询；半开连接由命令超时与断线失败兜底；页面崩溃/断线立即失败 pending futures。
+- 页面内 JavaScript 交互使用局部闭包 Promise 返回数据，不在 `window` 上遗留全局共享状态。
+- 保留 CloakBrowser 低内存/伪装参数：`--renderer-process-limit=1`、`--in-process-gpu`、128MB V8 限制、`--use-gl=angle --use-angle=swiftshader`、`--mute-audio`、`--fingerprint-platform=windows`、`--fingerprint-timezone`；移除 `--disable-audio` 与 `--disable-software-rasterizer`。
+- 不访问真实 Google/真实账号/真实 IP，除非用户单独授权；默认 mock/fake CDP/fixture。
+
+### 4.8 禁止恢复清单
+
+- 旧 lease/租约、reservation、pinned、defer、同账号双页、后台自动 rebind、自动 rebalance、策略组 `groups`、`channel_registry`、账号 tag 路由、quota group、`ensure_active_account`/`try_switch_account` 全局回退、死熔断器。
+- 发现旧 fork 代码含上述机制时，只能按 `06`/`08-09` 改写，不得原样搬运。
+
+---
+
+## 5. 路由、错误与重试
+
+- **Free/Pro 分流**：Free 模型走 Free 池；paid 模型必须 Pro 及以上，且先 chat；实例 tier 区间只决定账号能否落槽，不改变模型准入。
+- **Paid 模型 tier 不足（D-04/D-06）**：领域错误 → API 层按 OpenAI/Gemini/Claude/Responses 映射 403；错误体含 `tier/model/required_tier/current_tier`；不切号、不自动降级到 free、不得用 503 表达 tier 不足。
+- **429**：先同账号重试 → 唤醒/切现有池内实例 → 保存消息后切换再重试 → 耗尽 503 + 等待/管理页提示；已出正文不切号。
+- **鉴权 403**：不加硬冷却锁（`auth_cooldown=0.0`）；首次 403 重新签名并原位重试，第二次 403 才切换到健康账号；`auth_errors` 只累加计数，调度准入不读取，不存在动态避让；Paid 模型 `TierRequiredError` 403 不切号。
+- 连续切号上限保留；丢弃全局回退与死熔断器；不请求期切号处理 403。
+- **`quota_scope`（D-01）**：默认 `account`（chat/build 共用额度），可选 `account_surface`（分开）；只影响 `AccountStats` 记账键与 `/stats`/配额展示/429 冷却口径；不新增实例/Context/Page；不请求期自动改口径。
+- 上游瞬态错误：先重试，再路由，再重试；现有实例都试过或触发连续切号上限后报错。
+- 失败/stale 手动重启；不自动换面/换组；拒绝时显式返回 `surface_*` 错误。
+
+---
+
+## 6. 账号、Cookie、预设与鉴权
+
+### 6.1 账号与 Cookie
+
+- 注册表/`auth.json`/`meta.json`/`presets.json` 等持久化必须用 `account_store._atomic_write_json`（临时文件 + `os.replace`）。
+- Cookie 跨域保真：不得把 `accounts.google.com` 的 domain 压平成 `.google.com`；保留 LSID/GAPS/ACCOUNT_CHOOSER 等关键项；导入/解析/注入/回写/探活/删除/重复标记/身份校验保留。
+- 外部导入过滤旧设备/跨 IP 易腐败凭据（`OSID`、`__Secure-OSID`、`SIDCC`、`_ga` 等），保留核心认证项（`SID`、`SAPISID`、`1PSIDTS`）；浏览器访问 AI Studio 时自动协商有效 OSID。
+- tier 以上游原生解析为准，fork 只保存/刷新；24h 调度归 P6。
+
+### 6.2 分组与预设
+
+- 分组 CRUD + 分组过滤 UI 保留；`AccountPreset` 存 `data/accounts/presets.json`。
+- **D-08**：`_load_presets` 与 `_save_presets` 不得在非重入锁内互相调用；写失败必须上报且不得留下半写文件；只读目录/删除文件场景不得死锁；不得静默吞异常换“启动成功”。
+- **D-13**：不实现 `notes` 字段/API；删除 `updateNotes`、`batchToggleGroup` 及后端端点；不保留 notes 列/前端类型。
+
+### 6.3 API 鉴权（D-14）
+
+- 新增 `security.api_allow_anonymous`，默认 false；空 API Key ≠ 开放。
+- 管理页只由 `AISTUDIO_WEB_PASSWORD` 控制：空 = 免密，不报错；管理页不被 API Key 锁死。
+- API Key 与 Web 密码互不复用；不引入 IP/CIDR/设备白名单/“本机-局域网模式”；CF Tunnel 绑定逻辑不变。
+- API Key 只显示掩码；控制台登录用服务端会话，不用 localStorage token。
+
+---
+
+## 7. 保活、日志与协议面
+
+### 7.1 保活（P6）
+
+- 保留 keepalive 服务、24h auth update、24h tier/email 刷新；24h Cookie 回写覆盖池内实例与 build-only，按逐 slot 实际成功记账。
+- 保留 429 额度冷却（60/300/600）与美西午夜跨天重置；手动切号/手动触发保活/状态查询入口保留。
+- 删除后台 auto_switch/rebalance/legacy rotator 回退；请求驱动 429 切号归 P2；手动切号不走蓝绿。
+- `active_activity` 可选（默认关；上游已无 idle 回收，置 disable）；idle browser 自动回收默认关闭；消息唤醒 SLEEPING/UNSTARTED；失败/stale 手动重启。
+- job 锁：单全局串行；busy 跳过且不推进 `next_due`；失败按 job 短重试。
+
+### 7.2 日志（P7）
+
+- 存储：ring 5000 + 每日文件 7 天归档；日志页 SSE；支持级别过滤、搜索、暂停、1/3/7 天导出。
+- dump 只落 `safe_*`，默认关闭；禁止明文 headers/raw_body/cookie/token/API key/authorization。
+- root DEBUG 保留，但必须按命名空间/三方库过滤 WARP/tunnel/CDP/websockets/httpx 噪音。
+- 统计后端单一事件账本：request/attempt/usage/error/latency/account/model/surface/paid；client 与 attempt 分区显示，绝不混算成功率；统计页后置。
+
+### 7.3 协议与生成
+
+- OpenAI Chat、Claude Messages、OpenAI Responses 与 Gemini 四协议已完成并默认启用；不再按阶段先后排序。
+- ATG 保留，默认 off，按协议通过 `mode_by_format` 开启；`text_model_pattern` / `non_text_model_pattern` 仅用于 text/non_text 过滤；tool_calls、thinking、images、usage、response_id、thought_signature 全部保留。
+- chat 继续 capture/replay + wire/JSPB，不改成直接 HTTP。
+- 账号切换、429 限流或 403 鉴权重试时清理模板缓存（`client.clear_templates()`），避免跨账号复用；快照签名按每次请求哈希实时生成，不跨请求共享；初次握手截获基线模板后，任意目标模型通过 `capture_template(model)` 纯内存适配。
+- **PG-01..PG-04 是工具调用硬门槛**：functionCall 缺 thoughtSignature 兜底、首事件前真实 HTTP 4xx/5xx、finish-only/工具流终止兜底、functionResponse/functionCall 强制 Struct + 脱敏 `[toolshape]` 摘要。
+- countTokens：默认把 system/tools/content 统一打包字符串计数；官方 key 仅用于精确 countTokens，不得生成/回显/进日志。
+- 流式首事件统一预读，尽量保留真实 HTTP 状态；已出正文不切号；非流式与同账号空响应重试保留。
+
+---
+
+## 8. 配置口径
+
+- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`defaults/config.schema.json` 覆盖 `defaults/config.yaml` 的顶层键；跨字段语义仍由 `domain/model_access` 与 `model_defaults` 在运行期校验。
+- **D-07**：`_load_yaml_config` 不得浅替换 `rotator` 块；缺失键用默认值深合并；启动时校验类型/必填；请求路径不得抛 `KeyError`；非关键配置回退默认必须显式记录。
+- 删除 `channel_registry`，只保留 `surface=chat/build`；删除旧 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
+- 保留热更新与原子写回；legacy 配置键一次性迁移后删除；关键配置 fail-fast，非关键配置回退默认。
+- **D-12**：新设置按现有 UI（`SettingsView`/`ApiKeyManagerCard` 等）增量承载，不重构 Web 布局/导航；`hash_include_code` 是诊断开关，不进普通用户 UI。
+- **配置跟踪（已迁移）**：根 `config.yaml` 是本地运行时配置，untracked + gitignored（`.gitignore:15:/config.yaml`），不得入库；`defaults/config.yaml` 是唯一 tracked 的分发默认。`git ls-files config.yaml` 为空，与 Q-04/changelog 一致。
+- **B1（P9-pre）迁移**：默认配置以 `defaults/config.yaml` 为 tracked 基准；根 `config.yaml` 已从版本控制移除并加入 ignore；features 变更只提交 `defaults/config.yaml`，根运行态内容不提交。
+
+---
+
+## 9. 代码结构索引
+
+当前主仓结构：
 
 ```text
 aistudio-api/
 ├── web/                           # Web 管理控制台 (Vite + Vue 3 + TS + Tailwind)
 │   ├── src/
-│   │   ├── api/                   # REST 请求封装 (auth, accounts, system, models)
+│   │   ├── api/                   # REST 请求封装
 │   │   ├── types/                 # TypeScript 类型契约
 │   │   ├── stores/                # Pinia 状态管理
 │   │   ├── components/            # UI 与业务解耦组件
-│   │   ├── views/                 # 页面路由视图 (Dashboard, Stats, Accounts, Settings, Login)
-│   │   ├── components/stats/      # 统计页组件 (概览/趋势/模型表/账号状态/count)
+│   │   ├── views/                 # 控制面板 / 账号 / 系统与模型配置 / 日志
 │   │   └── router/                # Vue Router 路由与守卫
 │   └── vite.config.ts             # 构建配置 (输出至 src/aistudio_api/static)
-├── android/                       # Android 伴侣端：多资料凭据提取器 (Jetpack Compose + Material 3)
-│   ├── app/src/main/
-│   │   ├── AndroidManifest.xml    # 声明 BROWSABLE / http / https 意图，适配 Bitwarden
-│   │   └── java/com/aistudio/extractor/
-│   │       ├── MainActivity.kt    # 单 Activity、SAF 导出/备份导入
-│   │       ├── data/              # ProfileItem / AccountBundle / ProfileManager
-│   │       └── ui/                # Material 3 主题、MainScreen、按需挂载的 LoginScreen
-│   ├── build.gradle.kts           # 根构建脚本
-│   └── .editorconfig              # ktlint 代码规范配置
+├── android/                       # Android 伴侣端：多资料凭据提取器
 ├── src/aistudio_api/
-│   ├── api/                       # HTTP 接口层 (FastAPI)
-│   │   ├── app.py                 # 应用生命周期与静态托管
-│   │   ├── dependencies.py        # API Key 与 Token 鉴权注入
-│   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent 路由
-│   │   ├── routes_models.py       # /v1beta/models 模型发现路由
-│   │   ├── routes_openai.py       # /v1/chat/completions 与 /v1/models (WP8)
-│   │   ├── routes_responses.py    # /v1/responses 与 input_tokens (WP11)
-│   │   ├── routes_claude.py       # /v1/messages 与 count_tokens (WP8/WP11)
-│   │   ├── routes_accounts.py     # 账号管理与探活路由
-│   │   ├── routes_keepalive.py    # 保活状态查询与手动触发路由
-│   │   ├── routes_system.py       # 监控指标、/api/stats、日志配置与 config.yaml 热重载路由
-│   │   ├── routes_logs.py         # P5 SSE 日志流 (/logs/stream) 与按天归档导出 (/logs/export)
-│   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)；stats schema v2 与日聚合
-│   │   ├── schemas.py             # Gemini API 请求与校验模型
-│   │   ├── schemas_openai.py      # OpenAI Chat Completions 请求模型 (WP8)
-│   │   ├── schemas_claude.py      # Anthropic Messages 请求模型 (WP8)
-│   │   ├── format_errors.py       # 协议面错误形状、路径分流与格式开关 (WP8)
-│   │   ├── responses.py           # Gemini API 响应格式化辅助工具
-│   │   └── response_models.py     # API Pydantic 响应模型
+│   ├── api/                       # FastAPI 接口层与协议适配
+│   │   ├── app.py                 # 应用生命周期、异常映射与静态托管
+│   │   ├── dependencies.py        # API Key / Web 会话鉴权注入
+│   │   ├── routes_gemini.py       # /v1beta 生成与 countTokens
+│   │   ├── routes_openai.py       # /v1/chat/completions 与 /v1/models
+│   │   ├── routes_claude.py       # /v1/messages 与 count_tokens
+│   │   ├── routes_responses.py    # /v1/responses 与 input_tokens
+│   │   ├── routes_models.py       # 模型发现
+│   │   ├── routes_accounts.py     # 账号管理与探活
+│   │   ├── routes_instances.py    # 实例槽位生命周期
+│   │   ├── routes_keepalive.py    # 保活状态与手动触发
+│   │   ├── routes_system.py       # 统计、配置、API Key 与热重载
+│   │   ├── routes_logs.py         # 日志 SSE 与导出
+│   │   ├── routes_debug*.py       # UI Debug 沙盒接口
+│   │   ├── sse_keepalive.py       # 首事件预读与 SSE 心跳
+│   │   ├── ui_sandbox.py          # 纯离线 UI 调试沙盒
+│   │   ├── format_errors.py       # 四协议错误渲染
+│   │   └── state.py               # 运行时全局单例容器
 │   ├── application/               # 业务应用层
-│   │   ├── account_rotator.py     # 黏性账号调度器 (按模型记录 429 与太平洋午夜重置)
-│   │   ├── model_access.py        # Paid 模型缓存与快照更新 (账号 pro 与模型 Paid 分离)
-│   │   ├── account_service.py     # 账号存储与激活上下文协调
-│   │   ├── account_keepalive.py   # 双保活调度器 (Auth 回写/元数据刷新/定时切号/轻量活动)
-│   │   ├── api_service_gemini.py  # Gemini 协议渲染层 (SSE/响应/错误格式)
-│   │   ├── generation_service.py  # 协议无关生成管线 (ATG/重试/切号/流式事件)
-│   │   ├── upstream_errors.py     # 上游错误分类与重试/切号处理
-│   │   ├── format_converters/     # OpenAI/Claude 请求响应转换、媒体下载、thoughtSignature 缓存
-│   │   ├── account_orchestrator.py# _switch_lock 防雪崩切号与故障转移编排
-│   │   ├── surface_orchestrator.py# 组策略/面能力/组身份与决策链原语
-│   │   ├── channel_registry.py    # 渠道注册表、pg/chat/build/official 前缀解析
-│   │   ├── account_routing.py     # 账号级 routing 覆盖归一化 (只收窄)
-│   │   ├── routing_safety.py      # 请求级切换/顺延预算 + 滚动熔断
-│   │   ├── routing_pipeline.py    # 唯一决策管线 ①能力→②候选→③组→④排序→⑤落地→⑥失败链
-│   │   ├── routing_eligibility.py # 账号资格/渠道选择；Paid 模型要求 pro 凭证 + chat
-│   │   ├── atg/                   # ATG 防截断 (synthetic transport: injector/extractor/stream_extractor/repair/config 等)
-│   │   └── chat_service.py        # 消息规范化与多模态数据处理
+│   │   ├── generation_service.py  # 协议中立生成主链
+│   │   ├── routing_pipeline.py    # 候选、重试、切号与 active_requests
+│   │   ├── routing_eligibility.py # surface / lane / tier 准入
+│   │   ├── routing_safety.py      # 单请求切号预算
+│   │   ├── instance_manager.py    # 实例生命周期与换绑
+│   │   ├── account_keepalive.py   # 24h Cookie / 元数据保活
+│   │   ├── account_rotator.py     # 账号统计、429 冷却与跨天重置
+│   │   ├── account_service.py     # 账号存储与激活协调
+│   │   ├── chat_service.py        # 请求规范化与多模态处理
+│   │   ├── signature_cache.py     # PG-01 思维签名缓存
+│   │   ├── token_counter.py       # countTokens 打包与上游调用
+│   │   ├── contracts/             # 四协议请求/响应 DTO
+│   │   ├── format_converters/     # OpenAI / Claude / Responses 转换
+│   │   └── atg/                   # 防截断合成工具网关
 │   ├── domain/                    # 纯净领域模型与异常体系
-│   │   ├── errors.py              # 业务异常定义 (AuthError, UsageLimitExceeded 等)
-│   │   └── models.py              # 领域数据结构 (Candidate, ModelOutput 等)
+│   │   ├── errors.py              # 业务异常定义
+│   │   ├── instances.py           # Instance / InstanceState
+│   │   ├── model_access.py        # tier 选择器与模型准入
+│   │   └── models.py              # 领域数据结构
 │   ├── infrastructure/            # 基础设施层
-│   │   ├── account/               # Cookie 解析、凭据持久化与账号信息刷新 (account_store, cookie_parser, account_info_refresher)
-│   │   ├── browser/               # 异步 CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine)
-│   │   ├── gateway/               # 会话/就绪门/鉴权、捕获与重放 (capture/replay/transport)、构建面 (build_surface)、模型默认与发现、Wire 编解码与流式管道
-│   │       ├── instance_pool.py   # 账号+渠道用量窗口/单渠道页生命周期/预算/冷启动/borrow
-│   │       └── pooled_session.py  # 单 Context 会话、页面与在途请求复用
-│   │   └── utils/                 # 统一日志 (logger)、线程安全日志广播 ring buffer/SSE 与按天归档 (log_broadcast)
-├── config.yaml                    # 本地运行时配置 (git-ignored; 仅本机验证)
-├── defaults/config.yaml           # 分发默认配置 (tracked; features 变更的提交基准)
+│   │   ├── account/               # Cookie 解析、凭据持久化与元数据刷新
+│   │   ├── browser/               # CDP 客户端、CloakBrowser 进程与指纹
+│   │   ├── gateway/               # 会话/池/捕获/重放/Wire/模型发现
+│   │   └── utils/                 # 统一日志、广播与通用工具
+├── config.yaml                    # 本地运行时配置 (untracked + gitignored；不入库)
+├── defaults/config.yaml           # 单一分发默认配置 (tracked)
 ├── main.py                        # 本地统一启动入口
-└── tests/                        # 单元测试套件 (模块化轻量架构，全量约 30s；当前 885 用例)
-    ├── conftest.py               # 气密性隔离配置 (monkeypatch AISTUDIO_* 数据目录)
-    ├── fixtures/                 # 真实 Protobuf JSON 请求与响应报文
-    └── unit/                     # 按职责严格划分的单元测试模块
-        ├── test_account_*        # 账号调度、并发轮换防雪崩与凭据导入
-        ├── test_api_*            # API 鉴权、响应序列化与模型/系统路由
-        ├── test_browser_*        # Chromium 进程看门狗、CDP 会话与页面生命周期
-        ├── test_wire_*           # Protobuf-over-JSON 编解码、流式解析与模型规则
-        ├── test_format_*         # OpenAI/Claude 请求响应、流式事件与错误形状
-        ├── test_log_*            # 日志 ring buffer、脱敏、按天归档/清理
-        ├── test_logs_routes.py   # SSE 事件/心跳/订阅上限与 /logs/export 单日/跨天/鉴权
-        └── test_signature_cache.py # thoughtSignature 缓存复用/持久化/淘汰
+└── tests/                         # 单元测试套件
+    ├── conftest.py                # 气密性隔离配置
+    ├── fixtures/                  # 真实 Protobuf JSON 请求与响应报文
+    └── unit/                      # 按职责划分的单元测试模块
 ```
-
-## 6. 功能开关规范 (features)
-
-本仓库的运行时功能开关统一收敛到 `config.yaml` 顶层 `features:` 段（`config.py` 的 `Settings` 提供同名 `AISTUDIO_*` 环境变量作为启动基线）。
-
-- **落点**：`config.py` 的 `Settings`（`_load_bool_env` / `_load_int_env` / `_load_float_env` / `_load_choice_env` 模式，`AISTUDIO_*` 前缀）；解析函数 `model_defaults.get_features_config()`（仿 `_load_yaml_config` 的 mtime 缓存 + `invalidate_config_cache()`）；对外经 `GET /config` 响应的 `features` 键暴露。
-- **优先级**：`config.yaml features.*` > `AISTUDIO_*` 环境变量 > 内置默认值。`features` 段是运行时权威配置，`PUT /config/yaml` 后**热重载立即生效**；环境变量仅在进程启动时读取一次，作为缺省兜底。
-- **命名对齐**：YAML 键统一 `snake_case`，语义对齐对面 Ark 的 `.env` 字段（如 `atg.mode`↔`ATG_MODE`、`atg.client_synthetic_guard`↔`ATG_CLIENT_SYNTHETIC_GUARD`、`account_refresh_concurrency`↔`REFRESH_CONCURRENCY`、`auto_switch_interval_hours`↔`AUTO_SWITCH_INTERVAL_HOURS`）。
-- **默认值**：编排/fallback/活动类开关默认关闭（`features.fallback.*` 全 `off`，遵循「零自动回落」决策）；`client_synthetic_guard` 默认 `true`（兼容优先）；WP10 `keepalive_auth_update` / `keepalive_metadata_refresh` / `keepalive_metadata_refresh_on_startup` 默认 `true`（账号保活优先，对齐 Ark `ENABLE_AUTH_UPDATE`），`keepalive_active_activity` 默认 `false`；WP8 `features.formats.openai` / `features.formats.claude` 默认 `true`（对齐 Ark 无条件端点注册），`features.formats.media.allow_private_urls` 默认 `false`，`features.atg.mode_by_format` 默认 `inherit`。非法/未知取值一律静默回退安全默认，禁止让新增顶层键破坏既有 YAML 消费方。
-- **保活开关（WP10）**：`auto_switch`（长周期切号 + 真实活动）、`keepalive_auth_update`（cookies/origins → `auth.json`）、`keepalive_metadata_refresh`（tier/email/expired → `meta.json`）三者独立；切号前/后、初始化、重连、关闭前均回写 Auth；自动/手动切号共用切号锁，门槛覆盖 chat+build 在途；元数据刷新与 `POST /api/accounts/refresh` 共用同一实例和 409 互斥。结构化读写接口：`GET /api/keepalive`、`POST /api/keepalive/run`、`PUT /config/features`。
-- **配置双写**：根 `config.yaml` 是本地运行时配置且被 git-ignore；`defaults/config.yaml` 是分发默认配置（tracked）。任何 `features` 变更必须两处同步；提交、代码评审与证据以 `defaults/config.yaml` 为准。
-- **开关文案自解释约束（强制）**：每个开关在 `web/src/components/config/schema.ts` 的 `CONFIG_SCHEMA` 必须提供 `description`（一句话）+ `explanation`（开=什么 / 关=什么 / 何时用 / 失败怎么办）+ `recommendedValue`（`SchemaDictionaryModal` 自动渲染推荐值徽章），前端经 `FeaturesCard.vue` + `FieldHelpTip.vue` 呈现。
-- **ATG 防截断（features.atg.*）**：synthetic transport 全链路（wrap 注入合成工具与控制指令 → 上游 → unwrap 还原正文）由 `application/atg/` 承载；`mode=off` 零行为变化；`required` 缺失合成调用显式失败（绝不静默）；运行日志可 grep `[ATG]` 获取注入/跳过原因与解包 stats（syntheticHit/syntheticCount/realToolCount/repaired/conflict）；`client_synthetic_guard` 默认开，客户端自带同类机制时自动跳过本地包装。
-- **实例与渠道（WP5 第六轮，2026-10 收敛）**：实例 = 账号 + 渠道的独立用量窗口；同一账号 PG/Build 在总实例上限允许时是两个实例、共享一个 BrowserContext。唯一决策管线在 `application/routing_pipeline.py`。`features.routing.max_contexts` 是用户可见的总实例上限（1-16），总实例数 = `max_contexts`；2c1p、1c2p 以及 `max_contexts>=3` 时的 2c3p 都只是实例组合，只要不超过总实例上限和渠道 `max_instances` 即可。单实例模式（`max_contexts=1`）只能有一个实例、一个 page，PG/Build 顺序切换。渠道 `max_instances` 是该渠道的业务硬上限，`create`/`startup`/`switch_to`/429 换号全部遵守；page 数不是独立预算，渠道 page = 渠道 `max_instances`，全局 page = `max_contexts`。策略组默认隐藏（`features.groups_enabled=false`），隐藏时后端不参与；启用后显式组始终生效，空 `allowed_surfaces` = 命中即拒绝，停用组跳过，未命中回落 tier 默认。渠道准入改为账号 tag + `channels.*.allowed_tags`，`quota_pool` 不再是业务概念。所有拒绝显式返回 `surface_*` 错误，不静默换面/换组。
-- **Build 双路径与 signer**：原生 9998 客户端为默认传输，顶层页面 signer 直连为冗余路径；两者独立健康状态，signer 失败不阻塞原生渠道。signer 结构探测基于 `snapshot + kvc + content` 与 `tokenLike(getMetadata/H/A.snapshot)`，禁止硬编码 `M.Cn/M.GB/M.TB/M.An/M.NB`；不得记录 token/authorization/cookie/API key。原生不可用或显式 `AISTUDIO_BUILD_TRANSPORT=signer` 时才走 signer，首帧前失败可回退，已产出后不重放。
-- **格式面与 thoughtSignature（WP8）**：OpenAI/Claude 请求统一归一到 `GeminiGenerateContentRequest`；历史工具调用优先使用持久化的真实签名（`data/signature_cache.json`，30 天 TTL、4096 条、原子写入），缺失时使用 Ark 同款占位签名 `context_engineering_is_the_way_to_go`。严禁把工具调用降级为不可解析正文，也严禁静默丢弃；Claude thinking 回放不信任外部签名。`features.formats.*` 默认开启，关闭时对应路由显式 403。
-- **前端**：`VisualConfigEditor.vue` 挂载 `FeaturesCard.vue`；整页 YAML 全量 `parse/stringify` 保留未知键，`features` 段不被可视化编辑丢弃。
-
-## 7. 统计与 Paid 模型访问
-
-- **统计**：`state.py` 使用 stats schema v2（`models` + `daily`），记录 client/attempt 两层请求、输入/输出/推理/缓存读写、count_tokens 与 `usage_missing`。模型调用（`requests/attempts`，含重试/换号）是 P1/P4 主指标；客户端请求（`client_*`）为次级；`count_*` Token 计数独立，不计入模型调用。模型名统一去掉 `models/` 前缀并合并历史重复键。`/api/stats`、`/api/stats/timeseries` 只读取服务端状态，不使用本地 tokenizer 估算。
-- **Paid 模型**：`model_access.py` 维护 Paid 模型集合；`model_discovery` 成功拉取 ListModels 后按模型更新（`paid: true` 加入、`paid: false` 移除、缺失保留上次状态），并写入 `data/models_cache.json`。启动时加载快照并后台预热，刷新失败保留旧快照与默认兜底。
-- **模型列表**：单渠道返回裸模型 ID；多渠道同时返回裸 ID（自动路由入口）与 `pg/`、`build/` 前缀（显式渠道入口）。`models/<bare>` 始终按裸模型处理；paid 模型只会出现在 chat 前缀下，chat-only 模型不会出现在 build 前缀下。
-- **语义边界**：`account_is_paid(tier)` 判断凭证档位（pro/ultra/plus/paid）；`model_requires_paid_account(model)` 只看模型 Paid 元数据；`is_chat_only_model(model)` 只表示 surface 只能 chat。模型名中的 `pro` 不再影响账号资格或 surface 判定。
 
 ---
 
-## 8. 实例、渠道、Tag 与策略组概念口径
+## 10. 智能体工作流与发布纪律
 
-本节是账号调度相关概念的唯一口径，后续实现与评审以此为准。
+### 10.1 角色与报告
 
-### 8.1 不可混淆的量
+- **主 agent = integrator**：唯一提交权；负责顺序、分派、回收报告、验收；不得把多个 domain 打包给少量 agent。
+- **worker**：每次只接一个 `Dxx-NNN` 或一个明确文件域；在主工作区直接修改并跑通 `uv run pytest`；不得改 `05/06/08-09`/架构文档；报告必须含改动文件、测试项、预期、实际、命令与结果。
+- **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `domains/Px/reviews/REV-<Step>.md`；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
+- **前端 Review 截图归档（强制）**：凡涉及前端 UI 的审查步骤，Reviewer 必须在 `docs/dev/rebuild/domains/<Domain>/reviews/assets/` 保留 1~2 张最具代表性的完整页面实测截图，并在对应 `REV-*.md` 中引用，便于后续直观追溯 UI 样貌。
+- **复杂任务并行拆分（强制）**：当单步任务涉及多个独立页面或跨模块改动时，主控 Integrator 必须按文件域拆分为多个独立的并行子 Agent（`task`）执行；每个子 Agent 只读取/修改自己职责范围内的少量文件，严禁单 Agent 同时加载全站导致上下文膨胀、质量下降。
+- worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改代码/文档，不自行派下一步。
 
-- **实例**：账号 + 渠道 + 激活态，是用户侧的调度与用量单位；不是后端 Context/Page/Slot。一个实例就是一个用量窗口；同一账号的 PG 与 Build 在总实例上限允许时是两个实例、两个用量窗口，共享一个 Context；单实例模式下两者不会同时存在，只能顺序切换。
-- **总实例上限**：`features.routing.max_contexts`（1-16），总实例数不能超过该值。2c1p（2 实例）、1c2p（2 实例）以及 `max_contexts>=3` 时的 2c3p（3 实例）都只是组合，只要总数和渠道 `max_instances` 允许即可；`max_contexts=1` 只有一个实例、一个 page，PG/Build 顺序切换。单渠道可单独关闭/回收，只有最后一个实例退出才回收 Context。
-- **渠道注册表**：只回答“这个渠道是否实现、是否参与路由”。`enabled`/`implemented` 是能力开关，不是用户限额。
-- **渠道实例数**：`features.channels.<chat|build>.max_instances`，是该渠道最多几个实例，属于业务硬限额。`create`、`startup`、`switch_to`、429 请求期 acquire 全部遵守。
-- **账号 Tag**：账号信息中的自定义 tag 集合；tier 自动派生一个只读 tag（free/pro/ultra/plus/paid）。自定义 tag 可增删；删除 tier 不改变 tag 规则。
-- **渠道准入 Tag**：`features.channels.<chat|build>.allowed_tags`，多选；空 = 不限；账号的 tag（tier 自动 tag + 自定义 tag）至少命中一个才可注册该渠道实例。
-- **策略组**：可选层，默认隐藏且 `features.groups_enabled=false`，隐藏时后端完全忽略 `features.groups`。启用后：显式组始终优先匹配；`allowed_surfaces` 为空 = 命中即拒绝；停用组跳过；未命中回落 tier 默认组。显式组只能收窄 tier，不能放宽。
-- **Tier 默认**：`free -> build`；`pro/ultra/plus/paid -> chat+build`；未知 tier -> chat。用于未命中显式组时的兜底。
-- **Page 数**：不是用户配置项，也不是业务限额。渠道 page = 渠道 `max_instances`；全局 page = 总实例数 = `max_contexts`。`global_max_pages` 仅为兼容保留，实际全局预算由 `max_contexts` 决定；后台只把它当内部页面预算。
-- **quota_pool**：已废弃，不再是业务概念。旧配置中的 `quota_pool` 只做兼容迁移为单 tag；策略组 `allowed_quota_pools`、账号 `quota_pools` 不再参与准入，后续清理。
+### 10.2 每步闭环
 
-### 8.2 请求期资格链（只能收窄）
+- 开工前主 agent 用 10 行以内大白话说明：改哪几个文件、实现什么效果、跑哪几个测试。
+- 先写测试项 + 预期，再实现；实现后报实际；不得预填证据。
+- 跑 `uv run pytest`；必要时跑 ruff/pyright；全量审查 `git diff`。
+- reviewer 独立审；报告落盘；用户审计确认后才 commit；单步问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。
+- **UI 前置设计确认（强制）**：凡涉及前端 UI 界面、设置卡片、按钮或交互变更的步骤，主 Agent 严禁仅给简短摘要就直接派 Worker 改代码。开工前必须先只读盘点并提交《UI 页面与交互设计清单》，至少包含：①所在页面与卡片位置；②控件类型、中文文案、选项与默认值；③点击后的 API 调用、loading/成功/错误反馈与确认弹窗逻辑；④拟清理的废弃组件/按钮。必须等用户审阅并明确确认后，才准派 Worker 修改 .vue 代码；每次 UI 修改完工必须执行 bun run build 更新 src/aistudio_api/static 产物。
+- **UI 验收闭环（强制）**：UI 步骤必须包含 `AISTUDIO_UI_DEBUG=1` 沙盒 + Playwright `1440x900`/`1024x900`/`768x900` 实测；Reviewer 必须归档 1~2 张完整页面截图并在 `REV-*.md` 引用；多页面或跨模块步骤按文件域并行拆分 Worker/Reviewer，禁止单 Agent 一锅炖。
 
-1. 模型能力（paid / chat-only）与渠道 `enabled`/`implemented`。
-2. 账号 tier + 账号 tag，以及渠道 `allowed_tags` 准入。
-3. 可选策略组：`match_tier`/邮箱匹配后的 `allowed_surfaces`。
-4. 渠道实例数、总实例数、冷却与在途预算。
-5. 亲和度、组权重、账号权重、最久未用、请求数、实例编号排序。
+### 10.3 施工阶段顺序（历史追溯）
 
-任何层都不得放宽上游约束；拒绝时显式返回 `surface_*` 错误。
+B0（`AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-D03）→ B2-3（P3-D04 多实例池）→ B2-4（P2/D05 路由）→ B3（P6/D08 保活）→ B4（P7/D09 日志）→ B5a（PG-01..04）→ B5b（P5 最小 OpenAI/Gemini/ATG 闭环）。
 
-### 8.3 启动/切号路径
+该顺序仅用于追溯已完成施工；当前日常工作按单工作区常态增量推进。尚未执行的 C5b 合并、打标与清理流程仍按既定发布口径执行，不因工作区常态化而删除或改写。
 
-- **启动**：`InstanceManager.startup()` 通过 `routing_eligibility.eligible_accounts()` 选账号；槽位先按渠道 `max_instances` 建，再按总实例上限补；已有实例先扣除。
-- **手动创建/换渠道**：`InstanceManager.create()` / `switch_to()` 校验目标渠道 `max_instances`；满了显式报错。
-- **429 换号**：`upstream_errors` -> `RoutingPipeline.record_switch()` -> 下一候选 -> `RoutingPipeline.acquire()` -> `InstancePool.acquire()`。这条路径同样受渠道 `max_instances` 约束，因为 pool 的 page 预算就是渠道实例数。
-- **定时自动换号**：`account_keepalive._auto_switch()` -> `InstanceSwitcher.rebalance()`，只对已存在空闲实例做 rebind，不创建/关闭实例，因此不会突破渠道上限。
+### 10.4 硬禁令
 
-### 8.4 Domain 边界
-
-- **资格**：模型/渠道/tier/tag 准入，纯函数，无浏览器依赖。
-- **请求选路**：请求 -> 渠道 -> 账号 -> 实例的候选排序与预算；排序在 `application/routing_selection.py`。
-- **切号排序**：失败/429/冷却后下一个账号/实例的选择。
-- **容量**：渠道实例数、总实例数、page 派生、Context 生命周期。
-- **策略组**：可选约束层，只做资格收窄与权重，不拥有请求选路或切号排序。
-
-UI 不得暴露 Context/Page/Slot/资格/命中/页面数；不得硬编码 `M.Cn/M.GB/M.TB/M.An/M.NB`；不得记录 token/cookie/authorization/API key。
+- 不预写纸面 PKG；不把台账当施工清单；不把 534 当 MVP。
+- 不因单步失败推翻 `05/06/08-09` 或重写整体方案。
+- 不 merge/checkout 旧 `rebuild`；不 push，除非用户明确授权本次推送并指定分支/范围；不 rewrite history。
+- 不访问真实 Google/真实账号/真实 IP，除非用户单独授权；默认离线 fixture/mock。
+- **实机防风控**：严禁 Worker / 子 Agent 私自启动真实服务（`main.py server`）或拉起真实浏览器进程；获批实机测试也只允许主控/用户在单次常驻进程中完成，严禁反复重启（见 4.6）。
+- 不为过测试修改测试/配置/契约；不伪造审计、不预填证据、不用文档进度冒充迁移进度。
+- 不新增 D-xx/Gate/顺序/范围；需要时停下问用户。
+- 不把函数签名/底层实现甩给用户裁决；向用户汇报用大白话，说明功能保留、执行顺序、可运行结果。
+- `archive/` 下所有文件（含 `batch-drafts-20261029/`）均为历史留底，严禁作为施工依据。

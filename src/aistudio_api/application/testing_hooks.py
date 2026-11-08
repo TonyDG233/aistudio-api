@@ -1,6 +1,6 @@
-"""Deterministic test-only fault injection.
+"""Deterministic test-only fault injection (D05-043).
 
-Production behavior is unchanged unless ``AISTUDIO_TEST_HOOKS=1``. The hook
+Production behavior is unchanged unless ``AISTUDIO_TEST_HOOKS=1``.  The hook
 raises the same ``UsageLimitExceeded`` as an upstream 429, so the normal
 rate-limit switch path runs without consuming real quota.
 """
@@ -8,9 +8,9 @@ rate-limit switch path runs without consuming real quota.
 from __future__ import annotations
 
 import os
-import threading
+from threading import Lock
 
-_lock = threading.Lock()
+_lock = Lock()
 _forced_429_count = 0
 
 

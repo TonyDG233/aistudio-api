@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from aistudio_api.infrastructure.browser.scripts import (
     HOOKED_REQUEST_JS,
     INSTALL_HOOKS_JS,
     SNAPSHOT_GENERATE_JS,
+    SNAPSHOT_PROBE_JS,
     STOP_GENERATION_JS,
     STREAM_CLEANUP_JS,
     STREAMING_INIT_JS,
@@ -171,7 +173,7 @@ def test_js_ast_syntax_with_external_runtime():
         )
 
 
-def test_evaluate_wrapper_expressions_parse_cleanly(tmp_path):
+def test_evaluate_wrapper_expressions_parse_cleanly():
     """Test wrapping each script inside an expression as CDP evaluate() does."""
     runtime = shutil.which("bun") or shutil.which("node")
     if not runtime:
@@ -179,31 +181,54 @@ def test_evaluate_wrapper_expressions_parse_cleanly(tmp_path):
 
     scripts = [
         ("INSTALL_HOOKS_JS", INSTALL_HOOKS_JS, None),
-        ("SNAPSHOT_GENERATE_JS", SNAPSHOT_GENERATE_JS, "sample_hash"),
+        (
+            "SNAPSHOT_GENERATE_JS",
+            SNAPSHOT_GENERATE_JS,
+            {"prompt": "test", "hash": "sample_hash", "warmup": False},
+        ),
         ("STREAMING_INIT_JS", STREAMING_INIT_JS, {"rid": "r1", "url": "http://x"}),
         ("STREAM_CLEANUP_JS", STREAM_CLEANUP_JS, "r1"),
         ("DIALOG_CLEANUP_JS", DIALOG_CLEANUP_JS, None),
         ("DOM_GC_CLEANUP_JS", DOM_GC_CLEANUP_JS, None),
         ("CHECK_IDENTITY_JS", CHECK_IDENTITY_JS, {"email": "a@b.com"}),
+        ("SNAPSHOT_PROBE_JS", SNAPSHOT_PROBE_JS, {"hash": "h1", "timeoutMs": 1000}),
         ("STOP_GENERATION_JS", STOP_GENERATION_JS, None),
         ("EXTRACT_EMAIL_JS", EXTRACT_EMAIL_JS, None),
         ("HOOKED_REQUEST_JS", HOOKED_REQUEST_JS, None),
     ]
 
-    for name, script_text, arg in scripts:
-        expr = script_text.strip()
-        wrapped = f"({expr})({json.dumps(arg)})" if arg is not None else f"({expr})()"
+    prelude = (
+        "globalThis.window = globalThis; "
+        "globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };"
+    )
 
-        prelude = "globalThis.window = globalThis; globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };"
-        code = f"{prelude} try {{ new Function({wrapped!r}); }} catch (e) {{ if (e instanceof SyntaxError) throw e; }}"
-        # Execute through a temp file: passing large JS through the Windows
-        # cmd.exe shim (bun.CMD) command line breaks under cmd quoting rules.
-        script_file = tmp_path / f"{name}.js"
-        script_file.write_text(code, encoding="utf-8")
-        cmd = [runtime, str(script_file)]
-        res = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-        assert res.returncode == 0, (
-            f"SyntaxError in evaluate() wrapper for {name}:\n{res.stderr}"
-        )
+    # Run each probe from a temp file instead of `runtime -e <multiline>` so the
+    # code survives bun.CMD / cmd.exe argument quoting. json.dumps produces a
+    # valid JS string literal, keeping the wrapped expression byte-exact.
+    with tempfile.TemporaryDirectory(prefix="aistudio-js-eval-") as tmp_dir:
+        for name, script_text, arg in scripts:
+            expr = script_text.strip()
+            wrapped = (
+                f"({expr})({json.dumps(arg)})"
+                if arg is not None
+                else f"({expr})()"
+            )
+
+            code = (
+                f"{prelude}\n"
+                f"try {{ new Function({json.dumps(wrapped)}); }}\n"
+                "catch (e) { if (e instanceof SyntaxError) throw e; }\n"
+            )
+            probe_path = Path(tmp_dir) / f"{name}.js"
+            probe_path.write_text(code, encoding="utf-8")
+
+            res = subprocess.run(
+                [runtime, str(probe_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert res.returncode == 0, (
+                f"SyntaxError in evaluate() wrapper for {name}:\n{res.stderr}"
+            )

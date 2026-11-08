@@ -199,12 +199,12 @@ def test_wire_args_nested_struct_encoding():
 
 
 def test_chat_service_does_not_convert_signed_text_into_thought():
-    from aistudio_api.api.schemas import (
+    from aistudio_api.application.chat_service import normalize_gemini_request
+    from aistudio_api.application.contracts.gemini import (
         GeminiContent,
         GeminiGenerateContentRequest,
         GeminiPart,
     )
-    from aistudio_api.application.chat_service import normalize_gemini_request
 
     req = GeminiGenerateContentRequest(
         contents=[

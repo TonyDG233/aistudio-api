@@ -8,24 +8,40 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
-    from aistudio_api.infrastructure.gateway.session import BrowserSession
 
-from aistudio_api.application.model_access import set_paid_models
+from aistudio_api.domain.model_access import (
+    is_paid_model as _is_paid_model,
+    set_paid_models,
+    tier_header_value,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
-    DEFAULT_API_KEY,
-    DEFAULT_EXT_BIN,
-    DEFAULT_ORIGIN,
-    DEFAULT_USER_AGENT,
     calculate_sapisid_hash,
-    get_tier_header_value,
+)
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    AI_STUDIO_ORIGIN,
+    EXT_BIN,
+    GRPC_WEB_USER_AGENT,
+    LIST_MODELS_URL,
+    WEB_API_KEY,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("model_discovery")
+
+
+def _ui_debug_active() -> bool:
+    """Defensive guard: never read accounts or hit the network in ui_debug."""
+    try:
+        from aistudio_api.api.state import runtime_state
+
+        return bool(getattr(runtime_state, "ui_debug", False))
+    except Exception:
+        return False
 
 
 # ListModels field 65 (index 64) 主能力码语义映射
@@ -89,7 +105,93 @@ def _extract_model_aliases(raw: object) -> list[str]:
     return aliases
 
 
-# 本地保底默认模型列表（当网络未就绪或未配置账号时使用）
+def _session_context(session: object | None) -> object | None:
+    return getattr(session, "active_context", None) if session is not None else None
+
+
+def _session_auth_file(session: object | None) -> str | None:
+    if session is None:
+        return None
+    value = getattr(session, "_auth_file", None)
+    if isinstance(value, str) and value:
+        return value
+    context = _session_context(session)
+    if context is not None:
+        value = getattr(context, "auth_file", None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _session_auth_user(session: object | None) -> str:
+    if session is None:
+        return "0"
+    context = _session_context(session)
+    if context is not None:
+        value = getattr(context, "auth_user", None)
+        if isinstance(value, str) and value:
+            return value
+    getter = getattr(session, "get_current_auth_user", None)
+    if callable(getter):
+        try:
+            value = getter()
+            if isinstance(value, str) and value:
+                return value
+        except Exception:
+            pass
+    return "0"
+
+
+def _session_tier(session: object | None) -> str:
+    if session is None:
+        return "Free"
+    context = _session_context(session)
+    if context is not None:
+        value = getattr(context, "tier", None)
+        if isinstance(value, str) and value:
+            return value
+    getter = getattr(session, "get_current_tier", None)
+    if callable(getter):
+        try:
+            value = getter()
+            if isinstance(value, str) and value:
+                return value
+        except Exception:
+            pass
+    return "Free"
+
+
+def _cookies_from_auth_file(auth_file: str | None) -> dict[str, str]:
+    if not auth_file:
+        return {}
+    path = Path(auth_file)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    raw_cookies = data.get("cookies") or []
+    return {
+        str(c.get("name") or ""): str(c.get("value") or "")
+        for c in raw_cookies
+        if isinstance(c, dict) and c.get("name")
+    }
+
+
+def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
+    """Stable, log-safe identity used to decide whether a refresh changed."""
+    return [
+        (
+            str(item.get("id") or item.get("name") or ""),
+            str(item.get("displayName") or ""),
+        )
+        for item in models
+    ]
+
+
+# 本地保底默认模型列表（仅冷启动/网络未就绪时使用；live 数据永远优先）。
+# 与主分支 16 条保底条目及 paid 标记保持一致，禁止把 fallback 冒充 live。
 _FALLBACK_MODELS = [
     {
         "id": "gemini-3.8-flash",
@@ -137,6 +239,7 @@ _FALLBACK_MODELS = [
         "id": "gemini-3.5-flash",
         "displayName": "Gemini 3.5 Flash",
         "description": "Balanced high-performance flash model",
+        "paid": False,
     },
     {
         "id": "gemini-3.1-flash-image",
@@ -188,7 +291,57 @@ _FALLBACK_MODELS = [
     },
 ]
 
-set_paid_models(_FALLBACK_MODELS)
+LIVE_SOURCES = frozenset({"live_page", "live_http"})
+
+# A "truth" record is a real discovery result (live fetch or persisted live
+# snapshot), never the static cold-start fallback.  Routing uses this marker to
+# tell an authoritative live Free result apart from `_FALLBACK_MODELS`.
+DISCOVERY_TRUTH_SOURCES = frozenset({"live_page", "live_http", "snapshot"})
+_DISCOVERY_SOURCE_KEY = "_discovery_source"
+
+
+def mark_discovery_source(
+    models: list[dict[str, object]], source: str
+) -> list[dict[str, object]]:
+    """Attach the provenance marker to every model entry (in place)."""
+    for item in models:
+        item[_DISCOVERY_SOURCE_KEY] = source
+    return models
+
+
+def discovery_entry_source(entry: object) -> str | None:
+    if not isinstance(entry, Mapping):
+        return None
+    raw = entry.get(_DISCOVERY_SOURCE_KEY)
+    return raw if isinstance(raw, str) else None
+
+
+def discovery_entry_is_truth(entry: object) -> bool:
+    """True only for live/snapshot records, never for static fallback."""
+    return discovery_entry_source(entry) in DISCOVERY_TRUTH_SOURCES
+
+
+def discovery_entry_paid_truth(entry: object) -> bool | None:
+    """Return live Paid truth for a real record, or ``None`` when unknown.
+
+    ``True`` = live Paid (``paid is True`` or accessModes 3/4); ``False`` = an
+    explicit live ``paid is False`` with no Paid access mode; ``None`` means the
+    entry is absent, fallback-only, or does not carry an explicit Paid marker.
+    """
+    if not discovery_entry_is_truth(entry):
+        return None
+    assert isinstance(entry, Mapping)
+    raw_modes = entry.get("accessModes")
+    modes = (
+        {int(mode) for mode in raw_modes if isinstance(mode, int)}
+        if isinstance(raw_modes, list)
+        else set()
+    )
+    if entry.get("paid") is True or 3 in modes or 4 in modes:
+        return True
+    if entry.get("paid") is False and 3 not in modes and 4 not in modes:
+        return False
+    return None
 
 
 class ModelDiscoveryService:
@@ -199,6 +352,11 @@ class ModelDiscoveryService:
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
         self._lock = asyncio.Lock()
+        # ``last_source`` must describe where the *returned* models came from.
+        # It is never set to a live value unless a live fetch actually parsed.
+        self.last_source: str = "fallback"
+        self.last_error: str | None = None
+        self._last_refresh_info: str | None = None
         self._load_snapshot()
 
     @property
@@ -220,15 +378,16 @@ class ModelDiscoveryService:
             if not isinstance(models, list):
                 return
             loaded = [dict(item) for item in models if isinstance(item, dict)]
-            if not loaded:
-                return
-            self._cached_models = loaded
-            fetched_at = payload.get("fetched_at")
+            fetched_at = (
+                payload.get("fetched_at") if isinstance(payload, dict) else None
+            )
+            self._cached_models = mark_discovery_source(loaded, "snapshot")
             self._last_fetched_at = (
                 float(fetched_at) if isinstance(fetched_at, (int, float)) else 0.0
             )
-            set_paid_models(loaded)
-            logger.info("从快照加载了 %d 个模型", len(loaded))
+            self.last_source = "snapshot"
+            set_paid_models(self._cached_models)
+            logger.info("从快照加载了 %d 个模型 (source=snapshot)", len(loaded))
         except Exception as e:
             logger.warning("读取模型快照失败: %s", e)
 
@@ -247,7 +406,7 @@ class ModelDiscoveryService:
                 },
             )
         except Exception as e:
-            logger.warning("保存模型快照失败: %s", e)
+            logger.warning("写入模型快照失败: %s", e)
 
     async def get_models(
         self,
@@ -255,9 +414,14 @@ class ModelDiscoveryService:
         force_refresh: bool = False,
         cookies: dict[str, str] | None = None,
         auth_user: str = "0",
-        session: BrowserSession | None = None,
+        session: Any | None = None,
+        sessions: Any | None = None,
     ) -> list[dict[str, object]]:
         """获取可用模型列表。"""
+        if _ui_debug_active():
+            from aistudio_api.api.ui_sandbox import sandbox_model_catalog
+
+            return sandbox_model_catalog()
         now = time.time()
         if (
             not force_refresh
@@ -275,70 +439,87 @@ class ModelDiscoveryService:
             ):
                 return self._cached_models
 
-            # 1. 优先通过当前激活的浏览器 Page 会话发 XHR 拉取 ListModels
-            if session is not None:
-                try:
-                    page = getattr(session, "page", None) or getattr(
-                        session, "_page", None
-                    )
-                    if page is not None and not page.is_closed():
-                        models = await self._fetch_via_page(page)
-                        if models:
-                            self._cached_models = models
-                            set_paid_models(models)
-                            self._save_snapshot(models)
-                            self._last_fetched_at = time.time()
-                            logger.info(
-                                "通过 Page XHR 动态更新了 %d 个模型", len(models)
-                            )
-                            return models
-                except Exception as e:
-                    logger.debug("通过页面 XHR 拉取模型列表失败: %s", e)
+            # The attempt error is kept for honest logging when we fall back.
+            self.last_error = None
+            cached_before = list(self._cached_models)
 
-            # 2. 次选通过直接 HTTP 协议拉取
-            effective_cookies = cookies
+            # 1. 优先通过 READY 池会话（paid 先、Free 后）发 XHR 拉 ListModels
+            candidates: list[Any] = []
+            if sessions is not None:
+                try:
+                    candidates.extend(
+                        item for item in sessions if item is not None
+                    )
+                except TypeError:
+                    candidates.append(sessions)
+            elif session is not None:
+                candidates.append(session)
+
+            session_cookies: dict[str, str] = {}
+            for candidate in candidates:
+                try:
+                    page = getattr(candidate, "page", None) or getattr(
+                        candidate, "_page", None
+                    )
+                    if page is None:
+                        raise RuntimeError("session has no page")
+                    if page.is_closed():
+                        raise RuntimeError("session page is closed")
+                    auth_file = _session_auth_file(candidate)
+                    candidate_cookies = _cookies_from_auth_file(auth_file)
+                    if not session_cookies:
+                        session_cookies = candidate_cookies
+                    auth_header = (
+                        calculate_sapisid_hash(candidate_cookies)
+                        if candidate_cookies
+                        else None
+                    )
+                    models = await self._fetch_via_page(
+                        page,
+                        authorization=auth_header,
+                        auth_user=_session_auth_user(candidate),
+                        tier=_session_tier(candidate),
+                    )
+                    self._accept_live(models, source="live_page")
+                    return models
+                except Exception as e:
+                    self.last_error = f"live_page: {e}"
+                    logger.warning(
+                        "通过页面 XHR 拉取模型列表失败 (session=%s): %s",
+                        type(candidate).__name__,
+                        e,
+                    )
+            if not candidates:
+                self.last_error = "no discovery session available"
+
+            # 2. 次选通过直接 HTTP 协议拉取（使用池会话对应账号的 Cookie）
+            effective_cookies = cookies or session_cookies
             effective_auth_user = auth_user
             effective_tier = "Free"
-            if not effective_cookies:
-                auth_file = (
-                    getattr(session, "_auth_file", None)
-                    if session is not None
-                    else None
-                )
-                if not auth_file:
-                    try:
-                        from aistudio_api.infrastructure.account.account_store import (
-                            AccountStore,
-                        )
+            auth_source = session or (candidates[0] if candidates else None)
+            auth_file = _session_auth_file(auth_source)
+            if auth_source is not None:
+                effective_auth_user = _session_auth_user(auth_source)
+                effective_tier = _session_tier(auth_source)
+            if not auth_file:
+                try:
+                    from aistudio_api.infrastructure.account.account_store import (
+                        AccountStore,
+                    )
 
-                        store = AccountStore()
-                        active = store.get_active_account()
-                        if active:
-                            auth_path = store.get_auth_path_optional(
-                                active.id, require_exists=True
-                            )
-                            auth_file = str(auth_path) if auth_path else None
-                            effective_auth_user = active.auth_user or "0"
-                            effective_tier = getattr(active, "tier", "Free") or "Free"
-                    except Exception:
-                        pass
-                if auth_file and Path(auth_file).is_file():
-                    try:
-                        data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
-                        raw_cookies = data.get("cookies") or []
-                        effective_cookies = {
-                            str(c.get("name") or ""): str(c.get("value") or "")
-                            for c in raw_cookies
-                            if c.get("name")
-                        }
-                        if session is not None and hasattr(
-                            session, "get_current_auth_user"
-                        ):
-                            effective_auth_user = session.get_current_auth_user()
-                        if session is not None and hasattr(session, "get_current_tier"):
-                            effective_tier = session.get_current_tier()
-                    except Exception:
-                        pass
+                    store = AccountStore()
+                    active = store.get_active_account()
+                    if active:
+                        auth_path = store.get_auth_path_optional(
+                            active.id, require_exists=True
+                        )
+                        auth_file = str(auth_path) if auth_path else None
+                        effective_auth_user = active.auth_user or "0"
+                        effective_tier = getattr(active, "tier", "Free") or "Free"
+                except Exception:
+                    pass
+            if not effective_cookies:
+                effective_cookies = _cookies_from_auth_file(auth_file)
 
             if effective_cookies:
                 try:
@@ -347,28 +528,88 @@ class ModelDiscoveryService:
                         effective_auth_user,
                         tier=effective_tier,
                     )
-                    if models:
-                        self._cached_models = models
-                        set_paid_models(models)
-                        self._save_snapshot(models)
-                        self._last_fetched_at = time.time()
-                        logger.info("通过 HTTP RPC 动态更新了 %d 个模型", len(models))
-                        return models
+                    self._accept_live(models, source="live_http")
+                    return models
                 except Exception as e:
-                    logger.debug("通过 HTTP 协议拉取模型列表失败: %s", e)
-            # 3. 保底返回本地默认模型列表
+                    self.last_error = f"live_http: {e}"
+                    logger.warning("通过 HTTP 协议拉取模型列表失败: %s", e)
+
+            # 3. 保底返回本地默认模型列表（仅冷启动；已有快照则保留快照来源）
             if not self._cached_models:
-                self._cached_models = [dict(m) for m in _FALLBACK_MODELS]
+                self._cached_models = mark_discovery_source(
+                    [dict(m) for m in _FALLBACK_MODELS], "fallback"
+                )
                 set_paid_models(self._cached_models)
                 self._last_fetched_at = time.time()
+                self.last_source = "fallback"
+                logger.warning(
+                    "模型发现降级为本地 fallback (source=fallback, error=%s)",
+                    self.last_error or "unknown",
+                )
+            else:
+                logger.warning(
+                    "模型发现保持 %s 缓存 (source=%s, error=%s)",
+                    len(self._cached_models),
+                    self.last_source,
+                    self.last_error or "unknown",
+                )
+            self._log_refresh_summary(
+                source=self.last_source,
+                models=self._cached_models,
+                changed=(
+                    _model_identity(cached_before)
+                    != _model_identity(self._cached_models)
+                ),
+            )
 
             return self._cached_models
 
+    def _log_refresh_summary(
+        self,
+        *,
+        source: str,
+        models: list[dict[str, object]],
+        changed: bool,
+    ) -> None:
+        """Emit one INFO summary per refresh, suppressing identical repeats."""
+        summary = (
+            f"模型发现更新: source={source} count={len(models)} "
+            f"changed={'true' if changed else 'false'}"
+        )
+        if summary == self._last_refresh_info:
+            return
+        self._last_refresh_info = summary
+        logger.info(summary)
+
+    def _accept_live(self, models: list[dict[str, object]], *, source: str) -> None:
+        """Commit a live parse result and persist it with paid metadata."""
+        if not models:
+            raise RuntimeError("live discovery returned no models")
+        changed = _model_identity(self._cached_models) != _model_identity(models)
+        self._cached_models = mark_discovery_source(
+            [dict(item) for item in models], source
+        )
+        set_paid_models(self._cached_models)
+        self._save_snapshot(self._cached_models)
+        self._last_fetched_at = time.time()
+        self.last_source = source
+        self.last_error = None
+        self._log_refresh_summary(
+            source=source, models=self._cached_models, changed=changed
+        )
+
     async def get_model_by_id(
-        self, model_id: str, session: BrowserSession | None = None
+        self,
+        model_id: str,
+        session: Any | None = None,
+        sessions: Any | None = None,
     ) -> Mapping[str, object] | None:
         """根据 model_id 或模型别名获取单个模型元数据（含保底匹配）。"""
-        discovered = await self.get_models(session=session)
+        if _ui_debug_active():
+            from aistudio_api.api.ui_sandbox import sandbox_model_by_id
+
+            return sandbox_model_by_id(model_id)
+        discovered = await self.get_models(session=session, sessions=sessions)
         clean_target = model_id.removeprefix("models/")
         for model_info in discovered:
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")
@@ -400,33 +641,113 @@ class ModelDiscoveryService:
         return None
 
     def is_model_allowed_for_tier(self, model_id: str, tier: str | None) -> bool:
-        """根据缓存的 ListModels accessModes (Field 83) 判断指定订阅等级是否可访问该模型。"""
-        info = self.get_cached_model_info(model_id)
-        if not info:
-            return True
-        raw_modes = info.get("accessModes")
-        if not isinstance(raw_modes, list) or not raw_modes:
-            return True
-        norm_tier = (tier or "Free").strip().capitalize()
-        for mode in raw_modes:
-            if mode == 3 and norm_tier in ("Pro", "Ultra"):
-                return True
-            if mode == 4 and norm_tier == "Ultra":
-                return True
-        # 如果 accessModes 只包含 1 (Paid API key) 且不含 3/4，对所有网页端等级放行尝试
-        return all(m not in (3, 4) for m in raw_modes)
+        """根据 paid_model_rules 与缓存 accessModes 判断指定订阅等级是否可访问该模型。"""
+        from aistudio_api.domain.model_access import tier_satisfies_required
 
-    async def _fetch_via_page(self, page: CDPPage) -> list[dict[str, object]]:
+        req_tiers = self.get_required_tiers(model_id)
+        if req_tiers:
+            return tier_satisfies_required(tier or "Free", req_tiers)
+        return True
+
+    def is_paid_model(self, model_id: str) -> bool:
+        """判定目标模型是否为付费模型（唯一来源：domain.model_access）。"""
+        return _is_paid_model(model_id)
+
+    def get_required_tier(self, model_id: str) -> str:
+        """获取目标模型所需的最低账号层级（兼容现有单层级调用）。"""
+        from aistudio_api.domain.model_access import minimum_required_tier
+
+        tiers = self.get_required_tiers(model_id)
+        return minimum_required_tier(tiers) or "Free"
+
+    def get_required_tiers(self, model_id: str) -> list[str]:
+        """Resolve allowed tiers: live truth -> config rules -> accessModes/paid.
+
+        A real (live/snapshot) ``paid is False`` record is authoritative and is
+        returned as Free before any static substring rule applies, so a static
+        ``image`` style rule can never override live Free truth.  Fallback or
+        unknown models still use the static ``paid_model_rules`` first.
+        """
+        clean_m = model_id.removeprefix("models/").lower()
+
+        info = self.get_cached_model_info(clean_m)
+        truth = discovery_entry_paid_truth(info)
+        if truth is False:
+            return []
+
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_paid_model_rules,
+        )
+
+        rules = get_configured_paid_model_rules()
+        for rule_cfg in rules.values():
+            if not isinstance(rule_cfg, dict):
+                continue
+            contains = [
+                str(c).lower()
+                for c in (rule_cfg.get("contains") or [])
+                if isinstance(c, str)
+            ]
+            prefixes = [
+                str(p).lower()
+                for p in (rule_cfg.get("prefixes") or [])
+                if isinstance(p, str)
+            ]
+            exact = [
+                str(e).removeprefix("models/").lower()
+                for e in (rule_cfg.get("exact") or [])
+                if isinstance(e, str)
+            ]
+            if (
+                (exact and clean_m in exact)
+                or any(clean_m.startswith(p) for p in prefixes)
+                or any(c in clean_m for c in contains)
+            ):
+                req = rule_cfg.get("required_tiers")
+                if isinstance(req, list) and req:
+                    return [str(t) for t in req]
+
+        if info:
+            modes = info.get("accessModes")
+            if isinstance(modes, list):
+                if 4 in modes and 3 not in modes:
+                    return ["Ultra", "Ultra_20X"]
+                if 3 in modes:
+                    return ["Pro", "Ultra", "Ultra_20X"]
+            if bool(info.get("paid")):
+                return ["Pro", "Ultra", "Ultra_20X"]
+
+        if _is_paid_model(clean_m):
+            return ["Pro", "Ultra", "Ultra_20X"]
+        return []
+
+    async def _fetch_via_page(
+        self,
+        page: CDPPage,
+        *,
+        authorization: str | None = None,
+        auth_user: str = "0",
+        tier: str = "Free",
+    ) -> list[dict[str, object]]:
         """在 CDP Page 环境中直接执行 XHR 拉取 ListModels（自动带齐浏览器完整凭据）。"""
         script = """
-        () => {
+        (opts) => {
             return new Promise((resolve) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', 'https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels');
+                xhr.open('POST', opts.url);
                 xhr.setRequestHeader('Content-Type', 'application/json+protobuf');
-                xhr.setRequestHeader('X-User-Agent', 'grpc-web-javascript/0.1');
-                xhr.setRequestHeader('X-Goog-Api-Key', 'AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs');
-                xhr.setRequestHeader('X-Goog-Ext-519733851-bin', 'CAESAUwwATgEQABQBGICSlBwAHgBkAEAmAEB');
+                xhr.setRequestHeader('X-User-Agent', opts.userAgent);
+                xhr.setRequestHeader('X-Goog-Api-Key', opts.apiKey);
+                xhr.setRequestHeader('X-Goog-Ext-519733851-bin', opts.extBin);
+                if (opts && opts.authUser) {
+                    xhr.setRequestHeader('X-Goog-AuthUser', String(opts.authUser));
+                }
+                if (opts && opts.authorization) {
+                    xhr.setRequestHeader('Authorization', String(opts.authorization));
+                }
+                if (opts && opts.tierHeader) {
+                    xhr.setRequestHeader('X-AIStudio-G1-Tier', String(opts.tierHeader));
+                }
                 xhr.withCredentials = true;
                 xhr.timeout = 10000;
                 xhr.onload = () => {
@@ -446,11 +767,32 @@ class ModelDiscoveryService:
             });
         }
         """
-        res = await page.evaluate(script, timeout_s=12.0)
-        if not isinstance(res, dict) or not res.get("ok"):
-            return []
+        res = await page.evaluate(
+            script,
+            args={
+                "authorization": authorization,
+                "authUser": auth_user or "0",
+                "tierHeader": tier_header_value(tier),
+                "url": LIST_MODELS_URL,
+                "apiKey": WEB_API_KEY,
+                "userAgent": GRPC_WEB_USER_AGENT,
+                "extBin": EXT_BIN,
+            },
+            timeout_s=12.0,
+        )
+        if not isinstance(res, dict):
+            raise RuntimeError("ListModels page evaluate returned non-object")
+        if not res.get("ok"):
+            status = res.get("status")
+            error = res.get("error")
+            raise RuntimeError(
+                f"ListModels XHR failed (status={status}, error={error})"
+            )
         raw_data = res.get("data")
-        return self._parse_raw_models(raw_data)
+        models = self._parse_raw_models(raw_data)
+        if not models:
+            raise RuntimeError("ListModels XHR returned no parseable models")
+        return models
 
     async def _fetch_via_http(
         self,
@@ -466,29 +808,32 @@ class ModelDiscoveryService:
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
         headers = {
             "Content-Type": "application/json+protobuf",
-            "X-User-Agent": DEFAULT_USER_AGENT,
-            "X-Goog-Api-Key": DEFAULT_API_KEY,
+            "X-User-Agent": GRPC_WEB_USER_AGENT,
+            "X-Goog-Api-Key": WEB_API_KEY,
             "X-Goog-AuthUser": auth_user or "0",
-            "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+            "X-Goog-Ext-519733851-bin": EXT_BIN,
             "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-            "Origin": DEFAULT_ORIGIN,
-            "Referer": f"{DEFAULT_ORIGIN}/",
+            "Origin": AI_STUDIO_ORIGIN,
+            "Referer": AI_STUDIO_HOME_URL,
             "Cookie": cookie_header,
         }
         if auth_header:
             headers["Authorization"] = auth_header
-        tier_header = get_tier_header_value(tier)
+        tier_header = tier_header_value(tier)
         if tier_header:
             headers["X-AIStudio-G1-Tier"] = tier_header
 
         from aistudio_api.config import settings
 
-        url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
+        url = LIST_MODELS_URL
         async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
             resp = await client.post(url, headers=headers, content="[]")
-            if resp.status_code == 200:
-                return self._parse_raw_models(resp.json())
-        return []
+            if resp.status_code != 200:
+                raise RuntimeError(f"ListModels HTTP status {resp.status_code}")
+            models = self._parse_raw_models(resp.json())
+            if not models:
+                raise RuntimeError("ListModels HTTP returned no parseable models")
+            return models
 
     def _parse_raw_models(self, raw_data: object) -> list[dict[str, object]]:
         """解析 Google ListModels 的原始 protobuf 数组结构。"""
@@ -523,10 +868,6 @@ class ModelDiscoveryService:
                 item[6] if len(item) > 6 and isinstance(item[6], (int, float)) else 0
             )
             methods = item[7] if len(item) > 7 and isinstance(item[7], list) else []
-            # ListModels item[77] maps to protobuf field 78: 2 = Paid (Pro-only).
-            access_tier = (
-                item[77] if len(item) > 77 and isinstance(item[77], int) else None
-            )
             supported_methods = [str(m) for m in methods if isinstance(m, str)]
             temperature = (
                 float(item[8])
@@ -568,6 +909,10 @@ class ModelDiscoveryService:
                     default_thinking_level = t_cfg[5]
                 if len(t_cfg) > 6:
                     thinking_levels = _extract_int_list(t_cfg[6])
+            # ListModels item[77] maps to protobuf field 78: 2 = Paid (Pro-only).
+            access_tier = (
+                item[77] if len(item) > 77 and isinstance(item[77], int) else None
+            )
             access_modes = _extract_int_list(item[82]) if len(item) > 82 else []
 
             # 过滤支持内容生成的模型
@@ -624,12 +969,12 @@ class ModelDiscoveryService:
                     "capabilityCodes": capability_codes,
                     "defaultThinkingLevel": default_thinking_level,
                     "thinkingLevels": thinking_levels,
+                    "paid": access_tier == 2 or 3 in access_modes or 4 in access_modes,
+                    "access_tier": access_tier,
                     "accessModes": access_modes,
                     "is_image_model": is_image,
                     "is_video_model": is_video,
                     "is_audio_model": is_audio,
-                    "paid": access_tier == 2,
-                    "access_tier": access_tier,
                 }
             )
 

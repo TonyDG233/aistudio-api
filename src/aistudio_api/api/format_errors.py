@@ -9,9 +9,12 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from aistudio_api.api.error_mapping import (
+    classify_gemini_error_payload,
+    error_payload,
+)
 from aistudio_api.application.format_converters import ConversionError
-from aistudio_api.application.surface_orchestrator import SurfacePolicyError
-from aistudio_api.application.upstream_errors import classify_gemini_error_payload
+from aistudio_api.domain.errors import RoutingError, TierRequiredError
 
 ApiFormat = Literal["gemini", "openai", "claude", "responses"]
 
@@ -24,6 +27,7 @@ _OPENAI_TYPE_BY_STATUS: dict[int, str] = {
     422: "invalid_request_error",
     429: "rate_limit_error",
     500: "api_error",
+    502: "api_error",
     503: "service_unavailable",
     504: "timeout_error",
 }
@@ -49,6 +53,7 @@ _GEMINI_STATUS_BY_HTTP: dict[int, str] = {
     404: "NOT_FOUND",
     429: "RESOURCE_EXHAUSTED",
     500: "INTERNAL",
+    502: "UNAVAILABLE",
     503: "UNAVAILABLE",
     504: "DEADLINE_EXCEEDED",
 }
@@ -66,6 +71,13 @@ def format_for_path(path: str) -> ApiFormat:
     return "gemini"
 
 
+def _config_flag(value: object) -> bool:
+    """Coerce a config flag, treating string ``false``/``0`` as disabled."""
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0"}
+    return bool(value)
+
+
 def format_enabled(api_format: ApiFormat) -> bool:
     try:
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -78,7 +90,7 @@ def format_enabled(api_format: ApiFormat) -> bool:
     formats = features.get("formats")
     if not isinstance(formats, dict):
         return False
-    return bool(formats.get(api_format, False))
+    return _config_flag(formats.get(api_format, False))
 
 
 def format_media_allow_private() -> bool:
@@ -136,9 +148,14 @@ def classify_format_error(
     api_format: ApiFormat,
 ) -> tuple[int, str, str, str | None]:
     """Return (status, error_type, message, param)."""
-    if isinstance(exc, SurfacePolicyError):
-        status = exc.http_status
-        return status, _type_for_status(status, api_format), str(exc), None
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            message = str(detail.get("message") or detail)
+        else:
+            message = str(detail)
+        status = int(exc.status_code)
+        return status, _type_for_status(status, api_format), message, None
     if isinstance(exc, RequestValidationError):
         return (
             400,
@@ -186,10 +203,29 @@ def claude_error_body(
     }
 
 
+def _domain_payload(
+    exc: Exception, api_format: ApiFormat
+) -> tuple[int, dict[str, object]] | None:
+    """Render domain routing/tier errors with the shared protocol adapter.
+
+    ``routes_openai`` converts every exception raised inside the request body
+    into ``format_error_response`` before FastAPI's app-level handlers can see
+    it.  Without this delegation a ``TierRequiredError`` lost the
+    ``tier/model/required_tier/current_tier`` fields on the OpenAI face.
+    """
+    if isinstance(exc, (TierRequiredError, RoutingError)):
+        return error_payload(exc, api_format)
+    return None
+
+
 def format_error_response(
     exc: Exception,
     api_format: ApiFormat,
 ) -> JSONResponse:
+    domain = _domain_payload(exc, api_format)
+    if domain is not None:
+        status, body = domain
+        return JSONResponse(status_code=status, content=body)
     status, error_type, message, param = classify_format_error(exc, api_format)
     if api_format in {"openai", "responses"}:
         body = openai_error_body(status, message, error_type=error_type, param=param)
@@ -209,12 +245,20 @@ def format_error_response(
 
 
 def openai_sse_error(exc: Exception) -> str:
+    domain = _domain_payload(exc, "openai")
+    if domain is not None:
+        _status, payload = domain
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
     status, error_type, message, _ = classify_format_error(exc, "openai")
     payload = openai_error_body(status, message, error_type=error_type)
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
 def claude_sse_error(exc: Exception) -> str:
+    domain = _domain_payload(exc, "claude")
+    if domain is not None:
+        _status, payload = domain
+        return "event: error\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
     status, error_type, message, _ = classify_format_error(exc, "claude")
     payload = claude_error_body(status, message, error_type=error_type)
     return "event: error\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"

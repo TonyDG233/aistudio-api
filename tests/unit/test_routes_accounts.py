@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import cast
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -25,18 +26,11 @@ def setup_mock_account_service():
         last_used=None,
         auth_user="0",
         cookie_id="cookie_1",
-        tags=["vip"],
     )
     mock_svc.list_accounts.return_value = [sample_acc]
     mock_svc.get_active_account.return_value = sample_acc
-    mock_svc.store.get_account.return_value = sample_acc
-    mock_svc.store.get_account_routing.return_value = {
-        "surfaces": ["chat"],
-        "weight": 2.5,
-        "model_surfaces": {"gemini-3.8-flash": "chat"},
-    }
-    mock_svc.store.update_account_routing.return_value = True
-    mock_svc.store.clear_account_routing.return_value = True
+    mock_svc.get_account.return_value = sample_acc
+    mock_svc.activate_account = AsyncMock(return_value=sample_acc)
 
     orig = runtime_state.account_service
     runtime_state.account_service = mock_svc
@@ -80,6 +74,9 @@ async def test_accounts_json_api_headers():
         assert isinstance(data, list)
         assert len(data) == 1
         assert data[0]["id"] == "acc_1"
+        assert "notes" not in data[0]
+        assert data[0]["expired"] is False
+        assert data[0]["duplicate_of"] is None
 
 
 @pytest.mark.asyncio
@@ -95,31 +92,7 @@ async def test_api_accounts_endpoint_headers():
             data = resp.json()
             assert isinstance(data, list)
             assert len(data) == 1
-        assert data[0]["id"] == "acc_1"
-        assert data[0]["tags"] == ["vip"]
-
-
-@pytest.mark.asyncio
-async def test_batch_delete_accounts_deduplicates_and_deletes(setup_mock_account_service):
-    setup_mock_account_service.get_active_account.return_value = None
-    setup_mock_account_service.delete_account.return_value = True
-    async with _client() as client:
-        resp = await client.post(
-            "/api/accounts/batch-delete",
-            json={"ids": ["acc_1", "acc_2", "acc_1"]},
-        )
-    assert resp.status_code == 200
-    assert resp.json() == {"deleted": 2}
-    assert setup_mock_account_service.delete_account.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_account_tags_catalog_endpoint(setup_mock_account_service):
-    setup_mock_account_service.list_tags.return_value = ["pro", "vip"]
-    async with _client() as client:
-        resp = await client.get("/api/accounts/tags")
-    assert resp.status_code == 200
-    assert resp.json() == ["pro", "vip"]
+            assert data[0]["id"] == "acc_1"
 
 
 @pytest.mark.asyncio
@@ -175,54 +148,65 @@ async def test_api_accounts_active_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_account_routing_get_put_delete():
-    """Account-level routing stays in AccountMeta and is normalized on write."""
-    async with _client() as client:
-        resp = await client.get(
-            "/api/accounts/acc_1/routing", headers={"Accept": "application/json"}
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {
-            "surfaces": ["chat"],
-            "weight": 2.5,
-            "model_surfaces": {"gemini-3.8-flash": "chat"},
-            "quota_pools": [],
-        }
+async def test_activate_reuses_ready_pool_slot_without_control_switch(
+    setup_mock_account_service,
+):
+    """Q5/N12: same-account activation must not open a second control Page."""
+    control_session = SimpleNamespace(
+        switch_auth=AsyncMock(), ensure_botguard_service=AsyncMock()
+    )
+    saved_manager = runtime_state.instance_manager
+    saved_client = runtime_state.client
+    saved_rotator = runtime_state.rotator
+    runtime_state.instance_manager = cast(
+        Any,
+        SimpleNamespace(
+            ready_slot_for_account=MagicMock(return_value=object())
+        ),
+    )
+    runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
+    runtime_state.rotator = None
+    try:
+        async with _client() as client:
+            resp = await client.post("/accounts/acc_1/activate")
+    finally:
+        runtime_state.instance_manager = saved_manager
+        runtime_state.client = saved_client
+        runtime_state.rotator = saved_rotator
 
-        resp = await client.put(
-            "/api/accounts/acc_1/routing",
-            json={
-                "surfaces": ["build", "build", "bogus"],
-                "weight": 500,
-                "model_surfaces": {"models/gemini-3.8-flash": "build"},
-            },
-            headers={"Accept": "application/json"},
-        )
-        assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["surfaces"] == ["build"]
-        assert payload["weight"] == 100.0
-        assert payload["model_surfaces"] == {"gemini-3.8-flash": "build"}
-
-        resp = await client.delete(
-            "/api/accounts/acc_1/routing", headers={"Accept": "application/json"}
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
+    assert resp.status_code == 200
+    setup_mock_account_service.set_active_account.assert_called_once_with("acc_1")
+    control_session.switch_auth.assert_not_awaited()
+    control_session.ensure_botguard_service.assert_not_awaited()
+    setup_mock_account_service.activate_account.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_account_routing_unknown_account_is_404():
-    async with _client() as client:
-        # Fixture returns an account; force the route's lookup to miss.
-        from aistudio_api.api.state import runtime_state
+async def test_activate_without_ready_pool_keeps_control_switch_fallback(
+    setup_mock_account_service,
+):
+    """The no-pool / no-ready-slot path keeps the existing control switch."""
+    control_session = SimpleNamespace(
+        switch_auth=AsyncMock(), ensure_botguard_service=AsyncMock()
+    )
+    saved_manager = runtime_state.instance_manager
+    saved_client = runtime_state.client
+    saved_rotator = runtime_state.rotator
+    runtime_state.instance_manager = cast(
+        Any,
+        SimpleNamespace(ready_slot_for_account=MagicMock(return_value=None)),
+    )
+    runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
+    runtime_state.rotator = None
+    try:
+        async with _client() as client:
+            resp = await client.post("/accounts/acc_1/activate")
+    finally:
+        runtime_state.instance_manager = saved_manager
+        runtime_state.client = saved_client
+        runtime_state.rotator = saved_rotator
 
-        store = cast(
-            MagicMock,
-            runtime_state.account_service.store,  # type: ignore[union-attr]
-        )
-        store.get_account.return_value = None
-        resp = await client.get(
-            "/api/accounts/missing/routing", headers={"Accept": "application/json"}
-        )
-        assert resp.status_code == 404
+    assert resp.status_code == 200
+    setup_mock_account_service.activate_account.assert_awaited_once_with(
+        "acc_1", control_session
+    )

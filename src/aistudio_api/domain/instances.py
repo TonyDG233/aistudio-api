@@ -1,4 +1,4 @@
-"""User-visible instance contract for WP5 v4."""
+"""User-visible instance contract (one account + one Context + one Page)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from enum import StrEnum
 class InstanceState(StrEnum):
     STARTING = "starting"
     ACTIVE = "active"
+    SLEEPING = "sleeping"
+    UNSTARTED = "unstarted"
     RECLAIMING = "reclaiming"
+    RETIRING = "retiring"
+    COOLDOWN = "cooldown"
     INVALID = "invalid"
 
 
@@ -21,9 +25,14 @@ class Instance:
     number: int
     account_id: str
     state: InstanceState
-    channel: str
+    surface: str
+    min_tier: str
     in_flight: int = 0
     latest: bool = False
+    tier: str = ""
+    last_used: float = 0.0
+    only_tier: str = ""
+    max_tier: str = ""
 
 
 @dataclass(frozen=True)

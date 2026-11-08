@@ -1,4 +1,4 @@
-"""Cookie persistence must keep account-scoped auth cookies."""
+"""Cookie persistence must keep account-scoped auth cookies (D02-029..031)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from aistudio_api.infrastructure.account.account_store import write_storage_state
 from aistudio_api.infrastructure.gateway.session_auth import (
     load_cookies_to_page,
     save_browser_cookies,
@@ -66,8 +67,8 @@ async def test_load_cookies_keeps_account_and_osid_cookies(tmp_path: Path) -> No
         _cookie("SAPISID", "sapisid", ".google.com"),
         _cookie("LSID", "lsid", "accounts.google.com"),
         _cookie("ACCOUNT_CHOOSER", "chooser", "accounts.google.com"),
-        _cookie("OSID", "osid", "console.cloud.google.com"),
-        _cookie("__Secure-OSID", "secure-osid", "console.cloud.google.com"),
+        _cookie("OSID", "osid", "aistudio.google.com"),
+        _cookie("__Secure-OSID", "secure-osid", "aistudio.google.com"),
         _cookie("SIDCC", "sidcc", ".google.com"),
     ]
     auth_file.write_text(json.dumps({"cookies": cookies}), encoding="utf-8")
@@ -80,6 +81,7 @@ async def test_load_cookies_keeps_account_and_osid_cookies(tmp_path: Path) -> No
     assert names == {cookie["name"] for cookie in cookies}
     assert {"LSID", "ACCOUNT_CHOOSER", "OSID", "__Secure-OSID", "SIDCC"} <= names
     assert "Network.clearBrowserCookies" in page.cdp.calls
+    assert "Network.clearBrowserCache" in page.cdp.calls
 
 
 @pytest.mark.asyncio
@@ -91,7 +93,7 @@ async def test_save_cookies_merges_missing_account_cookies(tmp_path: Path) -> No
                 "cookies": [
                     _cookie("SID", "old", ".google.com"),
                     _cookie("LSID", "lsid", "accounts.google.com"),
-                    _cookie("OSID", "osid", "console.cloud.google.com"),
+                    _cookie("OSID", "osid", "aistudio.google.com"),
                     _cookie("STALE", "gone", ".google.com", expires=1),
                 ],
                 "origins": [],
@@ -151,3 +153,35 @@ async def test_save_cookies_preserves_cross_domain_twins(tmp_path: Path) -> None
     }
     assert values[("LSID", "accounts.google.com")] == "account"
     assert values[("LSID", ".google.com")] == "root"
+
+
+def test_write_storage_state_preserves_non_cookie_fields(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "cookies": [],
+                "origins": [{"origin": "https://aistudio.google.com", "items": []}],
+                "extra": {"keep": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    write_storage_state(
+        auth_file,
+        cookies=[_cookie("SID", "new", ".google.com")],
+    )
+
+    stored = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert stored["extra"] == {"keep": True}
+    assert stored["origins"] == [{"origin": "https://aistudio.google.com", "items": []}]
+    assert stored["cookies"][0]["name"] == "SID"
+    assert stored["cookies"][0]["value"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_save_browser_cookies_returns_false_without_auth_file() -> None:
+    page: Any = FakePage(cookies=[_cookie("SID", "new", ".google.com")])
+    assert await save_browser_cookies(page, None) is False
+    assert await save_browser_cookies(page, "") is False

@@ -11,14 +11,22 @@ import httpx
 import pytest
 
 from aistudio_api.api.app import app
+from aistudio_api.infrastructure.utils.log_broadcast import (
+    BroadcastHandler,
+    DailyLogFileHandler,
+)
 from aistudio_api.infrastructure.utils.logger import (
+    NoisyLoggerFilter,
     UnifiedFormatter,
     dump_request_exchange,
+    get_dump_dir,
     get_log_level,
     get_logger,
     is_debug_env_active,
     is_dump_requests_enabled,
+    set_dump_dir,
     set_dump_requests,
+    set_dump_to_file,
     set_log_level,
     setup_logging,
 )
@@ -65,25 +73,111 @@ def test_logger_namespace_hierarchy():
     assert logger3.name == "aistudio"
 
 
+def _stderr_handler() -> logging.StreamHandler:
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if (
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, BroadcastHandler)
+            and not isinstance(handler, DailyLogFileHandler)
+        ):
+            return handler
+    raise AssertionError("stderr handler not mounted")
+
+
+def test_setup_logging_mounts_three_sinks_idempotently():
+    setup_logging("INFO")
+    setup_logging("INFO")
+
+    root = logging.getLogger()
+    assert len(root.handlers) == 3
+    assert sum(isinstance(h, BroadcastHandler) for h in root.handlers) == 1
+    assert sum(isinstance(h, DailyLogFileHandler) for h in root.handlers) == 1
+    assert _stderr_handler() is not None
+
+
 def test_dynamic_log_level_switching():
     setup_logging("INFO")
     assert get_log_level() == "INFO"
-    assert logging.getLogger("aistudio").level == logging.INFO
+    # root/aistudio 固定 DEBUG，保证广播与归档 sink 不漏日志。
+    assert logging.getLogger().level == logging.DEBUG
+    assert logging.getLogger("aistudio").level == logging.DEBUG
+    assert _stderr_handler().level == logging.INFO
 
     set_log_level("DEBUG")
     assert get_log_level() == "DEBUG"
     assert logging.getLogger("aistudio").level == logging.DEBUG
+    assert _stderr_handler().level == logging.DEBUG
 
     set_log_level("WARNING")
     assert get_log_level() == "WARNING"
-    assert logging.getLogger("aistudio").level == logging.WARNING
+    assert logging.getLogger().level == logging.DEBUG
+    assert logging.getLogger("aistudio").level == logging.DEBUG
+    assert _stderr_handler().level == logging.WARNING
 
     set_log_level(logging.ERROR)
     assert get_log_level() == "ERROR"
-    assert logging.getLogger("aistudio").level == logging.ERROR
+    assert logging.getLogger("aistudio").level == logging.DEBUG
+    assert _stderr_handler().level == logging.ERROR
 
     # 恢复默认
     set_log_level("INFO")
+
+
+def test_noisy_namespaces_suppressed_while_root_stays_debug():
+    setup_logging("DEBUG")
+    try:
+        assert logging.getLogger().level == logging.DEBUG
+        assert logging.getLogger("aistudio").level == logging.DEBUG
+        for name in (
+            "websockets",
+            "httpx",
+            "httpcore",
+            "uvicorn.access",
+            "playwright",
+            "warp",
+            "tunnel",
+            "cdp",
+            "aistudio.warp",
+            "aistudio.tunnel",
+            "aistudio.browser.cdp",
+        ):
+            assert logging.getLogger(name).getEffectiveLevel() == logging.WARNING
+        # get_logger("cdp") actually resolves to aistudio.cdp; its children inherit.
+        assert get_logger("cdp").name == "aistudio.cdp"
+        assert logging.getLogger("aistudio.cdp").getEffectiveLevel() == logging.WARNING
+        assert (
+            logging.getLogger("aistudio.cdp.events").getEffectiveLevel()
+            == logging.WARNING
+        )
+        assert not logging.getLogger("aistudio.cdp").isEnabledFor(logging.DEBUG)
+        # Business loggers under aistudio must stay at DEBUG.
+        for name in ("aistudio.server", "aistudio.browser", "aistudio.routes.logs"):
+            assert logging.getLogger(name).getEffectiveLevel() == logging.DEBUG
+    finally:
+        setup_logging("INFO")
+
+
+def _log_record(name: str, level: int) -> logging.LogRecord:
+    return logging.LogRecord(
+        name=name,
+        level=level,
+        pathname=__file__,
+        lineno=1,
+        msg="probe",
+        args=(),
+        exc_info=None,
+    )
+
+
+def test_noisy_logger_filter_drops_low_level_noise_only():
+    noisy_filter = NoisyLoggerFilter()
+    for name in ("aistudio.cdp", "aistudio.browser.cdp", "aistudio.warp"):
+        assert noisy_filter.filter(_log_record(name, logging.DEBUG)) is False
+        assert noisy_filter.filter(_log_record(name, logging.INFO)) is False
+    assert noisy_filter.filter(_log_record("aistudio.cdp", logging.WARNING)) is True
+    assert noisy_filter.filter(_log_record("aistudio.server", logging.DEBUG)) is True
+    assert noisy_filter.filter(_log_record("aistudio.browser", logging.DEBUG)) is True
 
 
 def test_debug_env_var_triggers_dump_without_changing_log_level():
@@ -161,7 +255,8 @@ def test_dump_request_exchange_output():
             "请求接口:     POST /v1beta/models/gemini-3.7-flash:generateContent"
             in output
         )
-        assert "Bearer secre..." in output  # 敏感 Token 适度脱敏
+        assert "Bearer ***" in output
+        assert "secret1234567890" not in output
         assert "你好" in output
         assert (
             "-------------------- [响应报文转储: req_test123] --------------------"
@@ -174,6 +269,48 @@ def test_dump_request_exchange_output():
             "==================== [转储结束: req_test123] ===================="
             in output
         )
+    finally:
+        dump_lgr.removeHandler(handler)
+
+
+def test_dump_console_text_masks_key_based_credentials(monkeypatch):
+    """Console dump text must not leak key-based credentials either."""
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.utils.logger.is_dump_to_file_enabled",
+        lambda: False,
+    )
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(UnifiedFormatter(use_color=False))
+    dump_lgr = get_logger("dump")
+    dump_lgr.addHandler(handler)
+    dump_lgr.setLevel(logging.INFO)
+
+    try:
+        dump_request_exchange(
+            req_id="req_secret_probe",
+            method="POST",
+            url="/v1beta/models/test:generateContent",
+            client="127.0.0.1:1",
+            headers={},
+            query_params={},
+            body_text=(
+                '{"password": "body-secret", "nested": {"secret": "s3"},'
+                ' "credentials": "cred", "text": "keep-body"}'
+            ),
+            status_code=200,
+            elapsed_ms=1.0,
+            response_text='{"token": "tok-value", "text": "keep-resp"}',
+            is_stream=False,
+        )
+        output = stream.getvalue()
+
+        assert "body-secret" not in output
+        assert '"secret": "***"' in output
+        assert '"credentials": "***"' in output
+        assert "tok-value" not in output
+        assert "keep-body" in output
+        assert "keep-resp" in output
     finally:
         dump_lgr.removeHandler(handler)
 
@@ -244,18 +381,80 @@ async def test_middleware_request_dump_and_access_log():
         set_dump_requests(False)
 
 
-def test_dump_request_to_file_by_req_id(tmp_path):
-    """验证按照请求 ID 转储为独立 JSON 文件并携带所有必要完整信息。"""
-    from aistudio_api.infrastructure.utils.logger import (
-        get_dump_dir,
-        is_dump_to_file_enabled,
-        set_dump_dir,
-        set_dump_to_file,
+@pytest.mark.asyncio
+async def test_health_success_emits_no_access_log_record(caplog):
+    """Health probes succeed constantly; success must not emit any access record."""
+    set_dump_requests(False)
+    with caplog.at_level(logging.DEBUG):
+        async with _client() as client:
+            resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    success = "HTTP GET /health -> 200"
+    assert not any(success in record.getMessage() for record in caplog.records)
+
+
+def _http_request(path: str):
+    from starlette.requests import Request as StarletteRequest
+
+    return StarletteRequest(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+        }
     )
+
+
+@pytest.mark.asyncio
+async def test_health_non_200_access_log_stays_info(caplog):
+    from starlette.responses import JSONResponse
+
+    from aistudio_api.api.app import logging_and_dump_middleware
+
+    async def _unhealthy(_request):
+        return JSONResponse({"status": "error"}, status_code=503)
+
+    set_dump_requests(False)
+    with caplog.at_level(logging.INFO):
+        response = await logging_and_dump_middleware(_http_request("/health"), _unhealthy)
+
+    assert response.status_code == 503
+    assert any(
+        record.levelno == logging.INFO
+        and "HTTP GET /health -> 503" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_dump_request_to_file_by_req_id_only_writes_safe_fields(tmp_path):
+    """验证按请求 ID 落盘的 JSON 只含 safe_* 字段，绝无原始报文/凭据。"""
+    import json
+
+    from aistudio_api.infrastructure.utils.logger import is_dump_to_file_enabled
 
     dump_test_dir = tmp_path / "test_dumps"
     set_dump_dir(dump_test_dir)
     set_dump_to_file(True)
+
+    forbidden_keys = {
+        "headers",
+        "query_params",
+        "body",
+        "raw_body",
+        "response_headers",
+        "response_body",
+        "raw_response_body",
+    }
 
     try:
         assert is_dump_to_file_enabled() is True
@@ -265,14 +464,16 @@ def test_dump_request_to_file_by_req_id(tmp_path):
         dump_request_exchange(
             req_id=test_req_id,
             method="POST",
-            url="/v1beta/models/gemini-2.5-flash:generateContent",
+            url="/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaSyLeakedKeyValue1234567890",
             client="127.0.0.1:45678",
             headers={
                 "content-type": "application/json",
+                "authorization": "Bearer super-secret-token-123456",
                 "x-goog-api-key": "secret_key",
+                "cookie": "SAPISID=abc123; theme=dark",
             },
-            query_params={"alt": "sse"},
-            body_text='{"contents": [{"role": "user", "parts": [{"text": "测试抗截断"}]}], "tools": [{"functionDeclarations": [{"name": "reply_fn"}]}]}',
+            query_params={"alt": "sse", "key": "AIzaSyLeakedKeyValue1234567890"},
+            body_text='{"contents": [{"role": "user", "parts": [{"text": "测试抗截断"}]}], "tools": [{"functionDeclarations": [{"name": "reply_fn"}]}], "key": "AIzaSyBodyLeakValue1234567890", "password": "body-secret"}',
             status_code=200,
             elapsed_ms=88.5,
             response_headers={"content-type": "application/json"},
@@ -286,24 +487,255 @@ def test_dump_request_to_file_by_req_id(tmp_path):
         assert target_dump_file.exists()
         assert latest_dump_file.exists()
 
-        import json
+        for path in (target_dump_file, latest_dump_file):
+            raw_text = path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+            assert forbidden_keys.isdisjoint(data)
+            assert "safe_headers" in data
+            assert "safe_query_params" in data
+            assert "safe_body" in data
+            assert "safe_response_headers" in data
+            assert "safe_response_body" in data
+            assert "super-secret-token-123456" not in raw_text
+            assert "secret_key" not in raw_text
+            assert "abc123" not in raw_text
+            assert "AIzaSyLeakedKeyValue1234567890" not in raw_text
+            assert "AIzaSyBodyLeakValue1234567890" not in raw_text
+            assert "body-secret" not in raw_text
 
         data = json.loads(target_dump_file.read_text(encoding="utf-8"))
         assert data["req_id"] == test_req_id
         assert data["method"] == "POST"
-        assert data["url"] == "/v1beta/models/gemini-2.5-flash:generateContent"
+        assert data["url"] == "/v1beta/models/gemini-2.5-flash:generateContent?key=***"
         assert data["client"] == "127.0.0.1:45678"
-        assert data["headers"]["content-type"] == "application/json"
-        assert data["query_params"]["alt"] == "sse"
+        assert data["safe_headers"]["content-type"] == "application/json"
+        assert data["safe_headers"]["authorization"] == "Bearer ***"
+        assert data["safe_headers"]["x-goog-api-key"] == "***"
+        assert data["safe_query_params"] == {"alt": "sse", "key": "***"}
         assert data["status_code"] == 200
         assert data["elapsed_ms"] == 88.5
         assert data["is_stream"] is False
-        assert data["body"]["tools"][0]["functionDeclarations"][0]["name"] == "reply_fn"
-        assert "测试抗截断" in data["raw_body"]
+        assert data["safe_body"]["tools"][0]["functionDeclarations"][0]["name"] == (
+            "reply_fn"
+        )
+        assert "测试抗截断" in data["safe_body"]["contents"][0]["parts"][0]["text"]
         assert (
-            data["response_body"]["candidates"][0]["content"]["parts"][0]["text"]
+            data["safe_response_body"]["candidates"][0]["content"]["parts"][0]["text"]
             == "成功"
         )
     finally:
         set_dump_to_file(None)
         set_dump_dir(None)
+
+
+def test_default_and_relative_dump_dirs_resolve_under_data_dir(
+    monkeypatch, tmp_path
+):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("AISTUDIO_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("AISTUDIO_DUMP_DIR", raising=False)
+    set_dump_dir(None)
+    set_dump_to_file(None)
+
+    assert get_dump_dir() == (data_dir / "dumps").resolve()
+
+    set_dump_dir("dumps")
+    try:
+        assert get_dump_dir() == (data_dir / "dumps").resolve()
+    finally:
+        set_dump_dir(None)
+
+
+def test_instance_client_raw_dump_only_writes_safe_fields(monkeypatch, tmp_path):
+    """实例级 raw dump 只保留 safe_* 字段，且默认/相对目录落在 data 下。"""
+    import json
+    from typing import cast
+
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.instance_client import (
+        InstanceRequestClient,
+    )
+    from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
+
+    raw_dir = tmp_path / "raw"
+    monkeypatch.setattr(settings, "dump_raw_response", True)
+    monkeypatch.setattr(settings, "dump_raw_response_dir", str(raw_dir))
+
+    client = InstanceRequestClient(
+        cast(RequestSession, object()),
+        account_id="acc-1",
+        tier="Free",
+        surface="chat",
+    )
+    client._dump_raw_exchange(
+        kind="generate_content",
+        model="gemini-3.7-flash",
+        capture_prompt="Authorization: Bearer super-secret-token",
+        modified_body='{"key": "AIzaSyRawBodyLeak1234567890", "text": "hello"}',
+        raw_response="Cookie: SAPISID=raw-cookie-value",
+    )
+
+    files = list(raw_dir.glob("aistudio_*.json"))
+    assert len(files) == 1
+    raw_text = files[0].read_text(encoding="utf-8")
+    data = json.loads(raw_text)
+    assert data["kind"] == "generate_content"
+    assert data["instance"] == "acc-1"
+    assert data["surface"] == "chat"
+    assert data["model"] == "gemini-3.7-flash"
+    assert "safe_prompt" in data
+    assert data["safe_request_body"]["text"] == "hello"
+    assert "safe_response" in data
+    for key in ("capture_prompt", "modified_body", "raw_response"):
+        assert key not in data
+    assert "super-secret-token" not in raw_text
+    assert "AIzaSyRawBodyLeak1234567890" not in raw_text
+    assert "raw-cookie-value" not in raw_text
+
+
+def test_instance_client_raw_dump_sanitizes_malicious_model(monkeypatch, tmp_path):
+    """桩模型名不得带路径分隔符或 `..`，dump 文件必须留在 dump 目录内。"""
+    from typing import cast
+
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.instance_client import (
+        InstanceRequestClient,
+    )
+    from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
+
+    raw_dir = tmp_path / "raw"
+    monkeypatch.setattr(settings, "dump_raw_response", True)
+    monkeypatch.setattr(settings, "dump_raw_response_dir", str(raw_dir))
+
+    client = InstanceRequestClient(
+        cast(RequestSession, object()),
+        account_id="acc-1",
+        tier="Free",
+        surface="chat",
+    )
+    client._dump_raw_exchange(
+        kind="generate_content",
+        model="..\\evil/../x",
+        capture_prompt="prompt",
+        modified_body='{"text": "hello"}',
+        raw_response="response",
+    )
+
+    written = [path for path in raw_dir.rglob("*") if path.is_file()]
+    assert len(written) == 1
+    dumped = written[0]
+    assert dumped.parent == raw_dir
+    name = dumped.name
+    assert "/" not in name
+    assert "\\" not in name
+    assert ".." not in name
+    assert "evil" in name
+
+
+def test_ai_studio_client_raw_dump_only_writes_safe_fields(monkeypatch, tmp_path):
+    """N-14: control-client raw dump 只写 safe_* 字段且模型文件名已净化。"""
+    import json
+
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+    raw_dir = tmp_path / "raw"
+    monkeypatch.delenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR", raising=False)
+    monkeypatch.setattr(settings, "dump_raw_response", True)
+    monkeypatch.setattr(settings, "dump_raw_response_dir", str(raw_dir))
+
+    client = AIStudioClient(port=9222)
+    client._dump_raw_exchange(
+        kind="generate_content",
+        model="..\\evil/../models/gemini-3.7-flash",
+        capture_prompt="Authorization: Bearer super-secret-token",
+        modified_body='{"key": "AIzaSyRawBodyLeak1234567890", "text": "hello"}',
+        raw_response="Cookie: SAPISID=raw-cookie-value",
+    )
+
+    files = list(raw_dir.glob("aistudio_*.json"))
+    assert len(files) == 1
+    dumped = files[0]
+    assert dumped.parent == raw_dir
+    assert "/" not in dumped.name
+    assert "\\" not in dumped.name
+    assert ".." not in dumped.name
+
+    raw_text = dumped.read_text(encoding="utf-8")
+    data = json.loads(raw_text)
+    assert data["kind"] == "generate_content"
+    assert data["safe_request_body"]["text"] == "hello"
+    assert set(data) == {
+        "kind",
+        "model",
+        "safe_prompt",
+        "safe_request_body",
+        "safe_response",
+    }
+    for key in ("capture_prompt", "modified_body", "raw_response", "headers", "body"):
+        assert key not in data
+    assert "super-secret-token" not in raw_text
+    assert "AIzaSyRawBodyLeak1234567890" not in raw_text
+    assert "raw-cookie-value" not in raw_text
+
+
+def test_set_dump_to_file_runtime_override_does_not_mutate_unrelated_settings(
+    monkeypatch,
+):
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.utils.logger import is_dump_to_file_enabled
+
+    original_dump_to_file = settings.dump_to_file
+    original_dump_requests = settings.dump_requests
+    monkeypatch.delenv("AISTUDIO_DUMP_FILE", raising=False)
+    monkeypatch.delenv("AISTUDIO_DUMP_TO_FILE", raising=False)
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults."
+        "get_configured_logging_settings",
+        dict,
+    )
+    try:
+        set_dump_to_file(True)
+        # Simulate settings drift: the runtime override must still win.
+        monkeypatch.setattr(settings, "dump_to_file", False)
+        assert is_dump_to_file_enabled() is True
+        assert settings.dump_requests == original_dump_requests
+    finally:
+        set_dump_to_file(None)
+        settings.dump_to_file = original_dump_to_file
+
+
+@pytest.mark.asyncio
+async def test_request_validation_log_omits_user_input(caplog):
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from fastapi.exceptions import RequestValidationError
+
+    from aistudio_api.api.app import validation_exception_handler
+
+    secret = "SECRET_INPUT_FRAGMENT_9f3a"
+    exc = RequestValidationError(
+        [
+            {
+                "loc": ("body", "prompt"),
+                "type": "string_type",
+                "msg": "Input should be a valid string",
+                "input": {"text": secret},
+            }
+        ]
+    )
+    request = cast(
+        Any,
+        SimpleNamespace(
+            url=SimpleNamespace(path="/v1beta/models/gemini:generateContent")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        response = await validation_exception_handler(request, exc)
+
+    assert response.status_code == 400
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in logged
+    assert "string_type" in logged

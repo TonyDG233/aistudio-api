@@ -4,22 +4,86 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import cast
 
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,
     decode_data_url,
-    parse_arguments,
 )
 from aistudio_api.application.format_converters.media import MediaFetcher
-from aistudio_api.application.format_converters.signature_cache import (
-    signature_cache,
-)
+from aistudio_api.application.signature_cache import signature_cache
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("format.openai")
 
 _SYSTEM_ROLES = frozenset({"system", "developer"})
 _THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH"})
+_SYNTHETIC_TOOL_NAME = "tool_output"
+
+
+@dataclass
+class _ToolHistory:
+    """Lenient tool-call/tool-result reconciliation for PG-08.
+
+    Chat presets frequently replay fabricated history: assistant tool calls may
+    lose their ids, and tool outputs may arrive without a matching call.  The
+    converter must still emit a legal Gemini tool conversation instead of
+    rejecting the whole request.
+    """
+
+    names: dict[str, str] = field(default_factory=dict)
+    pending: list[tuple[str, str]] = field(default_factory=list)
+    used_ids: set[str] = field(default_factory=set)
+    synthetic_seq: int = 0
+
+    def synthesize_id(self, message_index: int, call_index: int) -> str:
+        base = f"call_auto_{message_index}_{call_index}"
+        candidate = base
+        suffix = 0
+        while candidate in self.used_ids:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+        return candidate
+
+
+def _warn_lenient(reason: str, *, index: int, **fields: object) -> None:
+    detail = " ".join(
+        f"{key}={value}" for key, value in sorted(fields.items())
+    ).strip()
+    logger.warning(
+        "[pg08] lenient tool history reason=%s message=%d%s",
+        reason,
+        index,
+        f" {detail}" if detail else "",
+    )
+
+
+def _lenient_arguments(value: object, *, field: str) -> dict[str, object]:
+    """Decode assistant tool-call arguments without rejecting malformed JSON.
+
+    Valid JSON objects pass through.  A JSON scalar/array or non-JSON text is
+    preserved under ``content`` so PG-04 can still emit a Struct.
+    """
+    del field
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return {"content": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"content": parsed}
+    return {"content": value}
 
 
 def _tool_response(content: object, *, field: str) -> object:
@@ -154,46 +218,48 @@ def _tool_call_parts(
     message: Mapping[str, object],
     *,
     index: int,
-    tool_names: dict[str, str],
+    history: _ToolHistory,
 ) -> list[dict[str, object]]:
     raw_calls = message.get("tool_calls")
     if raw_calls is None:
         return []
     if not isinstance(raw_calls, list):
-        raise ConversionError(
-            "assistant tool_calls must be an array",
-            field=f"messages[{index}].tool_calls",
-        )
+        _warn_lenient("tool_calls-not-array", index=index)
+        return []
 
     parts: list[dict[str, object]] = []
     for call_index, call in enumerate(raw_calls):
         field = f"messages[{index}].tool_calls[{call_index}]"
         if not isinstance(call, dict):
-            raise ConversionError("tool call must be an object", field=field)
+            _warn_lenient("tool-call-not-object", index=index, call=call_index)
+            continue
         function = call.get("function")
         if not isinstance(function, dict):
-            raise ConversionError(
-                "tool call requires a function object", field=f"{field}.function"
-            )
+            _warn_lenient("tool-call-missing-function", index=index, call=call_index)
+            continue
         name = function.get("name")
         if not isinstance(name, str) or not name:
-            raise ConversionError(
-                "tool call requires a function name",
-                field=f"{field}.function.name",
-            )
-        args = parse_arguments(
+            name = _SYNTHETIC_TOOL_NAME
+            _warn_lenient("tool-call-missing-name", index=index, call=call_index)
+        args = _lenient_arguments(
             function.get("arguments"),
             field=f"{field}.function.arguments",
         )
         function_call: dict[str, object] = {"name": name, "args": args}
-        call_id = call.get("id")
-        if not isinstance(call_id, str) or not call_id:
-            raise ConversionError(
-                "historical tool call requires an id", field=f"{field}.id"
+        raw_id = call.get("id")
+        call_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not call_id or call_id in history.used_ids:
+            call_id = history.synthesize_id(index, call_index)
+            _warn_lenient(
+                "tool-call-id-missing" if not raw_id else "tool-call-id-duplicate",
+                index=index,
+                call=call_index,
             )
+        history.used_ids.add(call_id)
         signature = signature_cache.get(call_id)
         function_call["id"] = call_id
-        tool_names[call_id] = name
+        history.names[call_id] = name
+        history.pending.append((call_id, name))
         parts.append(
             {
                 "functionCall": function_call,
@@ -203,36 +269,58 @@ def _tool_call_parts(
     return parts
 
 
+def _match_pending(
+    history: _ToolHistory, *, call_id: str | None, declared_name: str | None
+) -> tuple[str | None, str | None]:
+    if call_id is not None and call_id in history.names:
+        name = history.names[call_id]
+        history.pending = [item for item in history.pending if item[0] != call_id]
+        return call_id, name
+    if declared_name:
+        for position, (pending_id, pending_name) in enumerate(history.pending):
+            if pending_name == declared_name:
+                history.pending.pop(position)
+                return call_id or pending_id, pending_name
+    if history.pending:
+        pending_id, pending_name = history.pending.pop()
+        return call_id or pending_id, pending_name
+    return call_id, None
+
+
 def _tool_result_parts(
     message: Mapping[str, object],
     *,
     index: int,
-    tool_names: dict[str, str],
+    history: _ToolHistory,
 ) -> list[dict[str, object]]:
-    call_id = message.get("tool_call_id")
-    if not isinstance(call_id, str) or not call_id:
-        raise ConversionError(
-            "tool message requires tool_call_id",
-            field=f"messages[{index}].tool_call_id",
-        )
-    name = tool_names.get(call_id)
+    raw_id = message.get("tool_call_id")
+    call_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else None
+    raw_name = message.get("name")
+    declared_name = (
+        raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+    )
+    matched_id, name = _match_pending(
+        history, call_id=call_id, declared_name=declared_name
+    )
+    if matched_id is not None and call_id is None:
+        call_id = matched_id
     if name is None:
-        raise ConversionError(
-            f"tool_call_id '{call_id}' does not match any prior assistant tool call",
-            field=f"messages[{index}].tool_call_id",
+        name = declared_name or _SYNTHETIC_TOOL_NAME
+        history.synthetic_seq += 1
+        if call_id is None:
+            call_id = f"call_output_{index}_{history.synthetic_seq}"
+        _warn_lenient(
+            "isolated-tool-output",
+            index=index,
+            has_id=call_id is not None,
         )
     response = _tool_response(
         message.get("content"), field=f"messages[{index}].content"
     )
-    return [
-        {
-            "functionResponse": {
-                "name": name,
-                "response": response,
-                "id": call_id,
-            }
-        }
-    ]
+    function_response: dict[str, object] = {"name": name, "response": response}
+    if call_id:
+        function_response["id"] = call_id
+    return [{"functionResponse": function_response}]
 
 
 def _function_declaration(
@@ -359,7 +447,7 @@ async def convert_openai_request(
 
     contents: list[dict[str, object]] = []
     system_texts: list[str] = []
-    tool_names: dict[str, str] = {}
+    history = _ToolHistory()
 
     def append_content(role: str, parts: list[dict[str, object]]) -> None:
         if not parts:
@@ -385,7 +473,7 @@ async def convert_openai_request(
         if role == "tool":
             append_content(
                 "user",
-                _tool_result_parts(message, index=index, tool_names=tool_names),
+                _tool_result_parts(message, index=index, history=history),
             )
             continue
 
@@ -398,7 +486,7 @@ async def convert_openai_request(
 
         if role == "assistant":
             parts = await _content_parts(message, field=field, media=media)
-            parts.extend(_tool_call_parts(message, index=index, tool_names=tool_names))
+            parts.extend(_tool_call_parts(message, index=index, history=history))
             append_content("model", parts)
             continue
 

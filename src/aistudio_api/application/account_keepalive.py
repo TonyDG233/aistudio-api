@@ -1,79 +1,91 @@
-"""账号保活调度器：凭证回写、元数据刷新、定时切号与轻量活动。"""
+"""账号保活调度器：24h Cookie 回写、元数据刷新与可选控制页活动。
+
+P6/D08：保留 auth_update 与 metadata_refresh；删除后台 auto_switch、
+InstanceSwitcher.rebalance 与 legacy rotator 兜底。所有 job 共用同一把
+串行锁，busy 时立即返回且不推进 next_due；失败按 job 短周期重试。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshInProgressError,
 )
-from aistudio_api.infrastructure.gateway.model_defaults import get_features_config
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    get_configured_keepalive_settings,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 if TYPE_CHECKING:
-    from aistudio_api.application.account_rotator import AccountRotator
-    from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 log = get_logger("keepalive")
 
-TASKS = ("metadata_refresh", "auth_update", "auto_switch", "active_activity")
+TASKS = ("metadata_refresh", "auth_update", "active_activity")
+NO_ACTIVE_PAGE_RETRY_SECONDS = 60.0
+FAILURE_RETRY_SECONDS = 300.0
+REFRESH_IN_PROGRESS_RETRY_SECONDS = 60.0
+
+DEFAULT_AUTH_UPDATE_HOURS = 24.0
+DEFAULT_METADATA_REFRESH_HOURS = 24.0
+DEFAULT_ACTIVE_ACTIVITY_SECONDS = 60.0
 
 
-def _feature_float(features: dict[str, object], key: str, default: float) -> float:
-    value = features.get(key, default)
-    try:
-        return float(str(value))
-    except (TypeError, ValueError):
+def _as_bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _as_float(value: object, default: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
+    number = float(value)
+    return number if number > 0 else default
 
 
 @dataclass(slots=True)
 class KeepaliveSettings:
-    auto_switch: bool
-    auto_switch_interval_hours: float
-    auth_update: bool
-    auth_update_hours: float
-    metadata_refresh: bool
-    metadata_refresh_hours: float
-    metadata_refresh_on_startup: bool
-    active_activity: bool
-    active_activity_seconds: float
+    """The two 24h jobs plus the optional (default off) control-page activity."""
+
+    auth_update: bool = True
+    auth_update_hours: float = DEFAULT_AUTH_UPDATE_HOURS
+    metadata_refresh: bool = True
+    metadata_refresh_hours: float = DEFAULT_METADATA_REFRESH_HOURS
+    metadata_refresh_on_startup: bool = True
+    active_activity: bool = False
+    active_activity_seconds: float = DEFAULT_ACTIVE_ACTIVITY_SECONDS
 
     @classmethod
-    def from_features(cls, features: dict[str, object]) -> KeepaliveSettings:
+    def from_mapping(cls, raw: dict[str, object]) -> KeepaliveSettings:
         return cls(
-            auto_switch=bool(features.get("auto_switch", False)),
-            auto_switch_interval_hours=_feature_float(
-                features, "auto_switch_interval_hours", 3.0
+            auth_update=_as_bool(raw.get("auth_update"), True),
+            auth_update_hours=_as_float(
+                raw.get("auth_update_hours"), DEFAULT_AUTH_UPDATE_HOURS
             ),
-            auth_update=bool(features.get("keepalive_auth_update", True)),
-            auth_update_hours=_feature_float(
-                features, "keepalive_auth_update_hours", 24.0
+            metadata_refresh=_as_bool(raw.get("metadata_refresh"), True),
+            metadata_refresh_hours=_as_float(
+                raw.get("metadata_refresh_hours"), DEFAULT_METADATA_REFRESH_HOURS
             ),
-            metadata_refresh=bool(features.get("keepalive_metadata_refresh", True)),
-            metadata_refresh_hours=_feature_float(
-                features, "keepalive_metadata_refresh_hours", 24.0
+            metadata_refresh_on_startup=_as_bool(
+                raw.get("metadata_refresh_on_startup"), True
             ),
-            metadata_refresh_on_startup=bool(
-                features.get("keepalive_metadata_refresh_on_startup", True)
-            ),
-            active_activity=bool(features.get("keepalive_active_activity", False)),
-            active_activity_seconds=_feature_float(
-                features, "keepalive_active_activity_seconds", 60.0
+            active_activity=_as_bool(raw.get("active_activity"), False),
+            active_activity_seconds=_as_float(
+                raw.get("active_activity_seconds"), DEFAULT_ACTIVE_ACTIVITY_SECONDS
             ),
         )
 
-    @property
-    def auto_switch_seconds(self) -> float:
-        return self.auto_switch_interval_hours * 3600.0
+    @classmethod
+    def from_config(cls) -> KeepaliveSettings:
+        return cls.from_mapping(get_configured_keepalive_settings())
 
     @property
     def auth_update_seconds(self) -> float:
@@ -98,31 +110,29 @@ def _iso(ts: float) -> str:
 
 
 class AccountKeepaliveService:
-    """单循环保活服务；所有任务通过同一 job 锁串行执行。"""
+    """Single-loop keepalive service; every job runs through one global lock."""
 
     def __init__(
         self,
         store: AccountStore,
-        account_service: AccountService,
-        rotator: AccountRotator,
         client: AIStudioClient,
         refresher: Any,
         *,
+        instance_manager: Any | None = None,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = 1.0,
-        switch_cb: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._store = store
-        self._account_service = account_service
-        self._rotator = rotator
         self._client = client
         self._refresher = refresher
+        self._instance_manager = instance_manager
         self._clock = clock
         self._tick_seconds = max(0.01, tick_seconds)
-        self._switch_cb = switch_cb
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._job_lock = asyncio.Lock()
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
         self._running: str | None = None
         self._last_results: dict[str, dict[str, object]] = {}
         self._last_error: str | None = None
@@ -133,9 +143,23 @@ class AccountKeepaliveService:
         return self._running
 
     def _settings(self) -> KeepaliveSettings:
-        return KeepaliveSettings.from_features(get_features_config())
+        return KeepaliveSettings.from_config()
 
-    async def start(self) -> None:
+    def _pool_slots(self) -> tuple[Any, ...]:
+        manager = self._instance_manager
+        if manager is None:
+            return ()
+        getter = getattr(manager, "pool_slots", None)
+        if not callable(getter):
+            return ()
+        try:
+            slots: Any = getter()
+            return tuple(slots)
+        except Exception as exc:
+            log.warning("[Keepalive] pool slot inspection failed: %s", exc)
+            return ()
+
+    async def start(self, *, startup_metadata_done: bool = False) -> None:
         if self._task is not None and not self._task.done():
             return
         now = self._clock()
@@ -144,22 +168,21 @@ class AccountKeepaliveService:
             "metadata_refresh": (
                 now
                 if settings.metadata_refresh_on_startup
+                and not startup_metadata_done
                 else now + settings.metadata_refresh_seconds
             ),
             "auth_update": now,
-            "auto_switch": now + settings.auto_switch_seconds,
             "active_activity": now + settings.active_activity_seconds,
         }
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run(), name="account_keepalive")
         log.info(
-            "[Keepalive] started auth=%s/%.1fh metadata=%s/%.1fh auto_switch=%s/%.1fh",
+            "[Keepalive] started auth=%s/%.1fh metadata=%s/%.1fh activity=%s",
             settings.auth_update,
             settings.auth_update_hours,
             settings.metadata_refresh,
             settings.metadata_refresh_hours,
-            settings.auto_switch,
-            settings.auto_switch_interval_hours,
+            settings.active_activity,
         )
 
     async def stop(self) -> None:
@@ -175,8 +198,7 @@ class AccountKeepaliveService:
     async def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                settings = self._settings()
-                await self._run_due(settings)
+                await self._run_due(self._settings())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -187,6 +209,19 @@ class AccountKeepaliveService:
                     self._stop_event.wait(), timeout=self._tick_seconds
                 )
 
+    def _retry_delay(
+        self, task: str, result: dict[str, object], interval: float
+    ) -> float:
+        if result.get("ok"):
+            return interval
+        if task == "metadata_refresh":
+            if result.get("reason") == "refresh_in_progress":
+                return REFRESH_IN_PROGRESS_RETRY_SECONDS
+            return FAILURE_RETRY_SECONDS
+        if task == "auth_update":
+            return NO_ACTIVE_PAGE_RETRY_SECONDS
+        return min(NO_ACTIVE_PAGE_RETRY_SECONDS, interval)
+
     async def _run_due(self, settings: KeepaliveSettings) -> None:
         now = self._clock()
         jobs: list[tuple[str, bool, float]] = [
@@ -196,7 +231,6 @@ class AccountKeepaliveService:
                 settings.metadata_refresh_seconds,
             ),
             ("auth_update", settings.auth_update, settings.auth_update_seconds),
-            ("auto_switch", settings.auto_switch, settings.auto_switch_seconds),
             (
                 "active_activity",
                 settings.active_activity,
@@ -207,14 +241,14 @@ class AccountKeepaliveService:
             if not enabled:
                 continue
             due = self._next_due.get(task)
-            if due is None or due <= now:
-                result = await self.run_now(task, trigger="schedule", settings=settings)
-                retry_soon = (
-                    task == "auth_update" and result.get("reason") == "no_active_page"
-                )
-                self._next_due[task] = self._clock() + (
-                    60.0 if retry_soon else interval
-                )
+            if due is not None and due > now:
+                continue
+            result = await self.run_now(task, trigger="schedule", settings=settings)
+            if result.get("reason") == "busy":
+                continue
+            self._next_due[task] = self._clock() + self._retry_delay(
+                task, result, interval
+            )
 
     async def run_now(
         self,
@@ -229,6 +263,7 @@ class AccountKeepaliveService:
             return {"ok": False, "task": task, "reason": "busy"}
 
         async with self._job_lock:
+            self._idle_event.clear()
             self._running = task
             current = settings or self._settings()
             try:
@@ -249,7 +284,16 @@ class AccountKeepaliveService:
                 "at": _iso(self._clock()),
                 "trigger": trigger,
             }
+            self._idle_event.set()
             return self._last_results[task]
+
+    async def run_startup_metadata_refresh(self) -> dict[str, object]:
+        """Run the startup metadata refresh, waiting out an in-flight job."""
+        while True:
+            result = await self.run_now("metadata_refresh", trigger="startup")
+            if result.get("reason") != "busy":
+                return result
+            await self._idle_event.wait()
 
     async def _execute(
         self, task: str, settings: KeepaliveSettings, trigger: str
@@ -258,8 +302,6 @@ class AccountKeepaliveService:
             return await self._metadata_refresh(settings, trigger)
         if task == "auth_update":
             return await self._auth_update(trigger)
-        if task == "auto_switch":
-            return await self._auto_switch(trigger)
         return await self._active_activity(trigger)
 
     async def _metadata_refresh(
@@ -281,7 +323,11 @@ class AccountKeepaliveService:
             return {"ok": True, "reason": "no_due_accounts", "count": 0}
 
         try:
-            results = await self._refresher.refresh_accounts(due, refresh_email=True)
+            results = await self._refresher.refresh_accounts(
+                due,
+                refresh_email=True,
+                skip_fresh_free_tier=True,
+            )
         except RefreshInProgressError:
             log.info("[Keepalive] metadata refresh skipped: already running")
             return {"ok": False, "reason": "refresh_in_progress", "count": 0}
@@ -289,7 +335,7 @@ class AccountKeepaliveService:
         checked_at = _iso(now)
         for result in results:
             self._store.mark_refresh_attempt(
-                result.account_id,
+                str(result.account_id),
                 error=result.error,
                 at=result.checked_at or checked_at,
             )
@@ -308,151 +354,198 @@ class AccountKeepaliveService:
             "accounts": [result.account_id for result in results],
         }
 
-    async def _auth_update(self, trigger: str) -> dict[str, object]:
-        pool = getattr(self._client, "instance_pool", None)
-        if pool is not None:
-            save_pool = cast(
-                "Callable[[], Awaitable[int]] | None",
-                getattr(self._client, "save_pool_cookies", None),
+    async def _save_slot(self, slot: Any) -> tuple[str | None, str, bool]:
+        slot_id = str(getattr(slot, "slot_id", "") or "")
+        account_id = str(getattr(slot, "account_id", "") or "")
+        session = getattr(slot, "session", None)
+        if not account_id or session is None:
+            return None, slot_id, False
+        try:
+            lifecycle_lock = getattr(slot, "lifecycle_lock", None)
+            if lifecycle_lock is not None:
+                async with lifecycle_lock:
+                    saved = bool(await session.save_current_cookies())
+            else:
+                saved = bool(await session.save_current_cookies())
+        except Exception as exc:
+            log.warning(
+                "[Keepalive] slot cookie save failed slot=%s account=%s: %s",
+                slot_id,
+                account_id,
+                exc,
             )
-            saved = int(await save_pool()) if save_pool is not None else 0
-            saved_accounts: list[str] = []
-            for slot in pool.slots():
-                account_id = slot.current_account_id
-                if not account_id or not slot.chat_ready():
-                    continue
-                self._store.mark_auth_saved(account_id)
-                saved_accounts.append(account_id)
-            if saved_accounts:
-                log.info(
-                    "[Keepalive] auth update trigger=%s slots=%s saved=%d",
-                    trigger,
-                    saved_accounts,
-                    saved,
-                )
-                return {
-                    "ok": True,
-                    "reason": "saved",
-                    "count": len(saved_accounts),
-                    "accounts": saved_accounts,
-                }
+            return account_id, slot_id, False
+        return account_id, slot_id, saved
 
-        account = self._account_service.get_active_account()
-        if account is None:
-            return {"ok": False, "reason": "no_active_account"}
-        if getattr(account, "expired", False):
-            return {"ok": False, "reason": "credential_expired", "account": account.id}
-
-        saved = await self._client.save_current_cookies()
-        if not saved:
-            return {"ok": False, "reason": "no_active_page", "account": account.id}
-        self._store.mark_auth_saved(account.id)
-        log.info(
-            "[Keepalive] auth update trigger=%s account=%s saved=1",
-            trigger,
-            account.id,
+    async def _save_control_session(self) -> tuple[str | None, bool, bool]:
+        session = getattr(self._client, "session", None)
+        if session is None:
+            return None, False, False
+        page = getattr(session, "page", None)
+        if page is None or page.is_closed():
+            return None, False, False
+        try:
+            saved = bool(await session.save_current_cookies())
+        except Exception as exc:
+            log.warning("[Keepalive] control session cookie save failed: %s", exc)
+            return None, False, True
+        account_id: str | None = None
+        auth_file = getattr(session, "_auth_file", None) or getattr(
+            session, "auth_file", None
         )
-        return {"ok": True, "reason": "saved", "account": account.id}
+        if auth_file:
+            with contextlib.suppress(Exception):
+                target = Path(str(auth_file)).resolve()
+                for account in self._store.list_accounts():
+                    candidate = self._store.get_auth_path_optional(account.id)
+                    if candidate is not None and candidate.resolve() == target:
+                        account_id = account.id
+                        break
+        if account_id is None:
+            account = self._store.get_active_account()
+            account_id = account.id if account is not None else None
+        return account_id, saved, True
 
-    async def _auto_switch(self, trigger: str) -> dict[str, object]:
-        pool = getattr(self._client, "instance_pool", None)
-        if pool is not None:
-            from aistudio_api.application.instance_switch import InstanceSwitcher
+    async def _auth_update(self, trigger: str) -> dict[str, object]:
+        attempts: dict[str, list[bool]] = {}
+        failed_slots: list[str] = []
+        for slot in self._pool_slots():
+            account_id, slot_id, saved = await self._save_slot(slot)
+            if account_id is None:
+                continue
+            attempts.setdefault(account_id, []).append(saved)
+            if not saved and slot_id:
+                failed_slots.append(slot_id)
 
-            switcher = InstanceSwitcher(
-                pool,
-                self._store,
-                self._account_service,
-                features_provider=get_features_config,
-            )
-            result = await switcher.rebalance()
-            log.info(
-                "[Keepalive] auto switch trigger=%s pool=%s",
+        (
+            control_account,
+            control_saved,
+            control_attempted,
+        ) = await self._save_control_session()
+        if control_attempted and control_account is not None:
+            attempts.setdefault(control_account, []).append(control_saved)
+
+        saved_accounts = [
+            account_id
+            for account_id, results in attempts.items()
+            if results and all(results)
+        ]
+        failed_accounts = [
+            account_id
+            for account_id, results in attempts.items()
+            if not results or not all(results)
+        ]
+        for account_id in saved_accounts:
+            self._store.mark_auth_saved(account_id)
+
+        if not saved_accounts and not (control_attempted and control_saved):
+            any_slot_saved = any(any(values) for values in attempts.values())
+            if failed_accounts and any_slot_saved:
+                result = {
+                    "ok": False,
+                    "reason": "partial",
+                    "count": 0,
+                    "accounts": [],
+                    "failed_accounts": failed_accounts,
+                    "failed_slots": failed_slots,
+                }
+                log.warning(
+                    "[Keepalive] auth update trigger=%s partial saved=[] failed=%s",
+                    trigger,
+                    failed_accounts,
+                )
+                return result
+            return {
+                "ok": False,
+                "reason": "no_active_page",
+                "count": 0,
+                "failed_slots": failed_slots,
+            }
+
+        if failed_accounts:
+            result: dict[str, object] = {
+                "ok": False,
+                "reason": "partial",
+                "count": len(saved_accounts),
+                "accounts": saved_accounts,
+                "failed_accounts": failed_accounts,
+                "failed_slots": failed_slots,
+            }
+            log.warning(
+                "[Keepalive] auth update trigger=%s partial saved=%s failed=%s",
                 trigger,
-                result,
+                saved_accounts,
+                failed_accounts,
             )
             return result
 
-        if self._client.in_flight_count > 0:
-            log.info(
-                "[Keepalive] auto switch skipped: in_flight=%d",
-                self._client.in_flight_count,
-            )
-            return {
-                "ok": False,
-                "reason": "in_flight",
-                "in_flight": self._client.in_flight_count,
-            }
-
-        current = self._account_service.get_active_account()
-        candidate = await self._rotator.get_keepalive_candidate(
-            current.id if current is not None else None
-        )
-        if candidate is None:
-            return {"ok": False, "reason": "no_candidate"}
-
-        switch = self._switch_cb
-        if switch is None:
-            from aistudio_api.application.account_orchestrator import switch_to_account
-
-            switch = switch_to_account
-        ok = await switch(candidate.id)
-        if ok:
-            log.info(
-                "[Keepalive] auto switch trigger=%s from=%s to=%s",
-                trigger,
-                current.id if current is not None else None,
-                candidate.id,
-            )
-            return {
+        if not saved_accounts and control_saved:
+            result = {
                 "ok": True,
-                "reason": "switched",
-                "from": current.id if current is not None else None,
-                "to": candidate.id,
+                "reason": "saved",
+                "count": 1,
+                "accounts": [],
+                "control": True,
             }
-        return {"ok": False, "reason": "switch_failed", "to": candidate.id}
+        else:
+            result = {
+                "ok": True,
+                "reason": "saved",
+                "count": len(saved_accounts),
+                "accounts": saved_accounts,
+                "failed_slots": [],
+            }
+        log.info(
+            "[Keepalive] auth update trigger=%s saved=%s",
+            trigger,
+            saved_accounts or ["control"],
+        )
+        return result
 
     async def _active_activity(self, trigger: str) -> dict[str, object]:
-        if self._client.in_flight_count > 0:
-            return {"ok": False, "reason": "in_flight"}
-        page = self._client.session.page
+        """Optional control-page scroll. No idle reclamation is implemented."""
+        session = getattr(self._client, "session", None)
+        page = getattr(session, "page", None)
         if page is None or page.is_closed():
             return {"ok": False, "reason": "no_active_page"}
         await page.evaluate("() => { window.scrollBy(0, 2); return true; }")
-        self._client.session.touch_activity()
         log.info("[Keepalive] active activity trigger=%s", trigger)
         return {"ok": True, "reason": "activity"}
 
     def status(self) -> dict[str, object]:
         settings = self._settings()
-        chat = self._client.session.in_flight_count
-        build = self._client.build_in_flight_count
-        pool = getattr(self._client, "instance_pool", None)
-        pool_in_flight = sum(slot.in_flight for slot in pool.slots()) if pool else 0
+        slots = self._pool_slots()
+        in_flight = sum(int(getattr(slot, "active_requests", 0) or 0) for slot in slots)
+        enabled_map = {
+            "auth_update": settings.auth_update,
+            "metadata_refresh": settings.metadata_refresh,
+            "active_activity": settings.active_activity,
+        }
         return {
-            "enabled": {
-                "auto_switch": settings.auto_switch,
-                "auth_update": settings.auth_update,
-                "metadata_refresh": settings.metadata_refresh,
-                "active_activity": settings.active_activity,
-            },
+            "enabled": enabled_map,
             "intervals": {
-                "auto_switch_hours": settings.auto_switch_interval_hours,
                 "auth_update_hours": settings.auth_update_hours,
                 "metadata_refresh_hours": settings.metadata_refresh_hours,
                 "active_activity_seconds": settings.active_activity_seconds,
             },
             "next_due": {
-                key: _iso(value) for key, value in sorted(self._next_due.items())
+                key: (_iso(value) if enabled_map.get(key, False) else None)
+                for key, value in sorted(self._next_due.items())
             },
+            "busy": self._job_lock.locked(),
             "running": self._running,
+            "last_run": {
+                task: entry.get("at") for task, entry in self._last_results.items()
+            },
             "last_results": dict(self._last_results),
             "last_error": self._last_error,
-            "in_flight": {
-                "chat": chat,
-                "build": build,
-                "pool": pool_in_flight,
-                "total": chat + build + pool_in_flight,
-            },
-            "pool_slots": pool.snapshot() if pool is not None else [],
+            "in_flight": in_flight,
+            "pool_slots": len(slots),
         }
+
+
+__all__ = [
+    "TASKS",
+    "AccountKeepaliveService",
+    "KeepaliveSettings",
+]

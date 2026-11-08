@@ -21,8 +21,10 @@ class FakeKeepalive:
 
     def status(self) -> dict[str, object]:
         return {
-            "enabled": {"auth_update": True},
-            "last_results": {"auth_update": {"ok": True}},
+            "enabled": {"auth_update": True, "metadata_refresh": True},
+            "next_due": {"auth_update": "2026-10-31T00:00:00+00:00"},
+            "last_run": {},
+            "busy": False,
         }
 
     async def run_now(self, task: str, *, trigger: str) -> dict[str, object]:
@@ -45,9 +47,31 @@ async def test_keepalive_status_reports_service_state():
 
 
 @pytest.mark.asyncio
+async def test_keepalive_status_without_service_reports_settings():
+    original = runtime_state.keepalive
+    runtime_state.keepalive = None
+    try:
+        async with _client() as client:
+            resp = await client.get("/api/keepalive")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is False
+        assert data["settings"]["auth_update"] is True
+    finally:
+        runtime_state.keepalive = original
+
+
+@pytest.mark.asyncio
 async def test_keepalive_run_rejects_unknown_task():
     async with _client() as client:
         resp = await client.post("/api/keepalive/run", json={"task": "not-a-task"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_keepalive_run_rejects_removed_auto_switch_task():
+    async with _client() as client:
+        resp = await client.post("/api/keepalive/run", json={"task": "auto_switch"})
     assert resp.status_code == 400
 
 
@@ -64,6 +88,23 @@ async def test_keepalive_run_maps_busy_to_409():
 
 
 @pytest.mark.asyncio
+async def test_keepalive_run_maps_internal_exception_to_500():
+    original = runtime_state.keepalive
+    runtime_state.keepalive = FakeKeepalive(  # type: ignore[assignment]
+        {"ok": False, "reason": "exception", "error": "boom"}
+    )
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/keepalive/run", json={"task": "auth_update"})
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["error"]["code"] == 500
+        assert body["error"]["message"] == "boom"
+    finally:
+        runtime_state.keepalive = original
+
+
+@pytest.mark.asyncio
 async def test_keepalive_run_returns_result():
     original = runtime_state.keepalive
     runtime_state.keepalive = FakeKeepalive({"ok": True, "reason": "saved"})  # type: ignore[assignment]
@@ -71,6 +112,20 @@ async def test_keepalive_run_returns_result():
         async with _client() as client:
             resp = await client.post("/api/keepalive/run", json={"task": "auth_update"})
         assert resp.status_code == 200
-        assert resp.json()["reason"] == "saved"
+        data = resp.json()
+        assert data["reason"] == "saved"
+        assert data["trigger"] == "api"
+    finally:
+        runtime_state.keepalive = original
+
+
+@pytest.mark.asyncio
+async def test_keepalive_run_without_service_returns_503():
+    original = runtime_state.keepalive
+    runtime_state.keepalive = None
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/keepalive/run", json={"task": "auth_update"})
+        assert resp.status_code == 503
     finally:
         runtime_state.keepalive = original

@@ -8,15 +8,110 @@ export interface Account {
   last_used?: string | null
   auth_user: string
   cookie_id?: string | null
-  tier?: string | null
+  tier?: string
   tier_checked_at?: string | null
   expired?: boolean
   duplicate_of?: string | null
-  tags?: string[]
+  enabled: boolean
+  group: string
+  session_expired?: boolean
+  auth_cooldown?: number
+  is_available?: boolean
+  rebind_required?: boolean
+  previous_active_account_id?: string | null
+  active_account_id?: string | null
+  target_account?: Account | null
 }
 
-export interface AccountWithStats extends Omit<Account, 'last_used'>, Partial<AccountRotationStats> {
-  last_used?: string | null
+export type AccountWithStats = Omit<Account, 'last_used' | 'auth_user' | 'email'> &
+  Partial<AccountRotationStats> & {
+    auth_user: string
+    email: string | null
+    last_used?: string | null
+  }
+
+export interface AccountPreset {
+  id: string
+  name: string
+  description?: string
+  action: 'snapshot' | 'enable_all' | 'disable_all' | 'filter_tier' | 'filter_group' | string
+  account_ids: string[]
+  target_tiers: string[]
+  target_groups: string[]
+  is_system: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CreatePresetRequest {
+  name: string
+  description?: string
+  action?: string
+  account_ids?: string[]
+  target_tiers?: string[]
+  target_groups?: string[]
+}
+
+export interface SnapshotPresetRequest {
+  name: string
+  description?: string
+}
+
+export interface ApplyPresetResponse {
+  ok: boolean
+  preset_id: string
+  preset_name: string
+  enabled_count: number
+  disabled_count: number
+  enabled_account_ids: string[]
+  disabled_account_ids: string[]
+  rebind_required?: boolean
+  previous_active_account_id?: string | null
+  active_account_id?: string | null
+  target_account?: Account | null
+}
+
+export interface RefreshAccountsRequest {
+  account_ids?: string[]
+  all?: boolean
+  refresh_email?: boolean
+}
+
+export interface RefreshAccountResult {
+  id: string
+  ok: boolean
+  tier?: string | null
+  expired?: boolean | null
+  email?: string | null
+  error?: string | null
+  checked_at?: string | null
+}
+
+export interface RefreshAccountsResponse {
+  results: RefreshAccountResult[]
+  refreshed_count: number
+  expired_count: number
+}
+
+export interface BatchDeleteResponse {
+  deleted: number
+}
+
+export interface BatchToggleRequest {
+  ids: string[]
+  enabled: boolean
+}
+
+export interface BatchToggleResult {
+  id: string
+  ok: boolean
+  error?: string | null
+}
+
+export interface BatchToggleResponse {
+  results: BatchToggleResult[]
+  toggled_count: number
+  error_count: number
 }
 
 export interface ImportCookiesRequest {
@@ -34,7 +129,7 @@ export interface ImportCookiesResponse {
   cookie_count: number
   domain_summary: Record<string, number>
   auth_user: string
-  tier?: string | null
+  tier?: string
 }
 
 export interface ProbeAndImportRequest {
@@ -65,33 +160,4 @@ export interface ImportBundleRequest {
 export interface ImportBundleResponse {
   imported_count: number
   accounts: Account[]
-}
-
-export interface RefreshAccountsRequest {
-  account_ids?: string[] | null
-  all?: boolean
-  refresh_email?: boolean
-}
-
-export interface RefreshAccountResult {
-  id: string
-  ok: boolean
-  tier?: string | null
-  expired?: boolean | null
-  email?: string | null
-  error?: string | null
-  checked_at?: string | null
-}
-
-export interface RefreshAccountsResponse {
-  results: RefreshAccountResult[]
-  refreshed_count: number
-  expired_count: number
-}
-
-export interface AccountRouting {
-  surfaces: string[]
-  weight: number
-  model_surfaces: Record<string, string>
-  quota_pools: string[]
 }

@@ -1,17 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import type { AccountRouting, AccountWithStats } from '@/types/accounts.ts'
-import type { FeatureSlotRow } from '@/types/system.ts'
-import type { SurfaceContext } from '@/api/system.ts'
+import type { AccountWithStats } from '@/types/accounts.ts'
+import type { Instance as InstanceType } from '@/types/instances.ts'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
 import ModelQuotaGrid from './ModelQuotaGrid.vue'
-import AccountChannelMatrix from './AccountChannelMatrix.vue'
-import SlotBindPopover from './SlotBindPopover.vue'
-import { channelLabel, slotsForAccount, type ChannelOption } from './accountModes.ts'
 import {
   CheckCircle2,
-  ChevronDown,
   Clock,
   Trash2,
   Edit2,
@@ -19,35 +14,35 @@ import {
   RotateCcw,
   AlertCircle,
   RefreshCw,
-  Mail,
-  Network,
+  Tag,
+  Check,
+  ArrowLeftRight,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
+import { useInstancesStore } from '@/stores/instances.ts'
+import { accountStatus } from '@/utils/accountStatus.ts'
+import { instanceStateLabel, instanceStateTone, tierShortLabel } from '@/utils/instances.ts'
 
 const props = defineProps<{
   account: AccountWithStats
   active: boolean
-  activating?: boolean
   forceExpanded?: boolean
-  multiMode?: boolean
-  contexts?: SurfaceContext[]
-  activeContextAccountId?: string | null
-  channels?: ChannelOption[]
-  slots?: FeatureSlotRow[]
-  routing?: AccountRouting | null
-  refreshState?: 'pending' | 'failed' | null
+  boundInstance?: InstanceType | null
+  batchMode?: boolean
+  selected?: boolean
 }>()
 
 const emit = defineEmits<{
   activate: []
+  changeSlot: []
   delete: []
   editName: []
   clearCooldown: []
   clearModel: [model: string]
+  toggleSelect: []
 }>()
 
 const modelsExpanded = ref(false)
-const matrixExpanded = ref(false)
 
 watch(
   () => props.forceExpanded,
@@ -65,64 +60,77 @@ const todayRequests = computed(() => {
 })
 
 const accountsStore = useAccountsStore()
-const detectingEmail = ref(false)
+const instancesStore = useInstancesStore()
 const detectingTier = ref(false)
+const togglingEnabled = ref(false)
+const editingGroup = ref(false)
+const groupInput = ref('')
+
+const status = computed(() =>
+  accountStatus(props.account, instancesStore.instances, accountsStore.activeId),
+)
+
+const statusInstanceLabel = computed(() => {
+  const instance = status.value.instance
+  return instance ? instanceStateLabel(String(instance.state)) : ''
+})
+
+const refreshing = computed(
+  () => accountsStore.refreshingIds[props.account.id] === true,
+)
 
 const accountTier = computed(() => {
-  const raw = (props.account.tier || '').trim()
-  if (!raw) return '未识别'
-  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase()
+  return props.account.tier || 'Free'
 })
 
-const isExpired = computed(() =>
-  Boolean(props.account.expired || props.account.session_expired),
-)
-const refreshing = computed(() => Boolean(accountsStore.refreshingIds[props.account.id]))
-
-const channelOptions = computed<ChannelOption[]>(() => props.channels || [])
-const slotRows = computed<FeatureSlotRow[]>(() => props.slots || [])
-const contextList = computed<SurfaceContext[]>(() => props.contexts || [])
-
-const accountSlots = computed(() => slotsForAccount(slotRows.value, props.account.id))
-
-const accountContexts = computed(() =>
-  contextList.value.filter((context) => context.account_id === props.account.id),
-)
-const isActiveContext = computed(
-  () => Boolean(props.activeContextAccountId && props.activeContextAccountId === props.account.id),
-)
-const mountedChat = computed(() =>
-  accountContexts.value.some((context) => Boolean(context.chat_ready)),
-)
-const mountedBuild = computed(() =>
-  accountContexts.value.some((context) => Boolean(context.build_ready)),
-)
-const hasMount = computed(() => mountedChat.value || mountedBuild.value)
-const inFlight = computed(() =>
-  accountContexts.value.reduce((sum, context) => sum + (context.in_flight || 0), 0),
-)
-const hit = computed(() => props.active || inFlight.value > 0)
-
-const allowedSurfaces = computed(() => {
-  const all = channelOptions.value.map((channel) => channel.surface)
-  const explicit = props.routing?.surfaces || []
-  return explicit.length ? all.filter((surface) => explicit.includes(surface)) : all
+const isEnabled = computed(() => {
+  return props.account.enabled !== false
 })
-const qualified = computed(
-  () => Boolean(props.routing) && !isExpired.value && allowedSurfaces.value.length > 0,
-)
 
-async function handleDetectEmail() {
-  detectingEmail.value = true
+const isExpired = computed(() => {
+  return props.account.expired === true || props.account.session_expired === true
+})
+
+const primaryLabel = computed(() => {
+  if (props.account.email) return props.account.email
+  return `ID: ${props.account.id}`
+})
+
+const secondaryLabel = computed(() => {
+  if (!props.account.email) return '未记录邮箱'
+  const parts: string[] = []
+  if (props.account.name && props.account.name !== props.account.email) {
+    parts.push(props.account.name)
+  }
+  parts.push(`ID: ${props.account.id}`)
+  return parts.join(' · ')
+})
+
+const boundNumber = computed(() => props.boundInstance?.number ?? null)
+
+const isRunningInstance = computed(() => props.boundInstance?.state === 'active')
+
+async function handleToggleEnabled() {
+  togglingEnabled.value = true
   try {
-    await accountsStore.detectAccountEmail(props.account.id)
+    await accountsStore.toggleAccountEnabled(props.account.id)
   } finally {
-    detectingEmail.value = false
+    togglingEnabled.value = false
   }
 }
 
-async function handleRefresh() {
-  await accountsStore.refreshAccount(props.account.id)
+function startEditGroup() {
+  groupInput.value = props.account.group || ''
+  editingGroup.value = true
+}
+
+async function saveGroup() {
+  if (!editingGroup.value) return
+  const target = groupInput.value.trim() || 'default'
+  editingGroup.value = false
+  if (target !== (props.account.group || 'default')) {
+    await accountsStore.updateAccountGroup(props.account.id, target)
+  }
 }
 
 async function handleDetectTier() {
@@ -133,34 +141,71 @@ async function handleDetectTier() {
     detectingTier.value = false
   }
 }
+
+async function handleRefresh() {
+  if (refreshing.value) return
+  await accountsStore.refreshAccount(props.account.id)
+}
 </script>
 
 <template>
   <div
     class="relative bg-white border rounded-xl p-3 shadow-2xs transition-all hover:shadow-xs"
     :class="[
-      isExpired
-        ? 'border-rose-300 bg-rose-50/20'
-        : active
-          ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
-          : 'border-gray-200/80 hover:border-gray-300',
+      !isEnabled
+        ? 'border-gray-200 bg-gray-50/60 opacity-60'
+        : isExpired
+          ? 'border-rose-300 bg-rose-50/30'
+          : isRunningInstance
+            ? 'border-emerald-300 bg-emerald-50/40 ring-1 ring-emerald-400/20'
+            : batchMode && selected
+              ? 'border-brand-300 bg-brand-50/30 ring-1 ring-brand-300/30'
+              : active
+                ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
+                : 'border-gray-200/80 hover:border-gray-300',
     ]"
   >
     <!-- Sub-Account Header Bar -->
-    <div
-      class="flex flex-col gap-2"
-      :class="multiMode ? '' : 'xl:flex-row xl:items-center xl:justify-between'"
-    >
+    <div class="flex flex-col xl:flex-row xl:items-center justify-between gap-2">
       <div class="flex items-center gap-2.5 min-w-0 flex-1">
+        <!-- Batch Selection -->
+        <input
+          v-if="batchMode"
+          type="checkbox"
+          class="w-3.5 h-3.5 shrink-0 accent-brand-600 cursor-pointer"
+          :checked="selected"
+          title="选择此账号"
+          @change="emit('toggleSelect')"
+        >
+
+        <!-- Enable/Disable Switch -->
+        <button
+          type="button"
+          role="switch"
+          :aria-checked="isEnabled"
+          :disabled="togglingEnabled"
+          class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none"
+          :class="[isEnabled ? 'bg-emerald-500' : 'bg-gray-300', { 'opacity-50 cursor-wait': togglingEnabled }]"
+          title="启用或禁用此账号参与调度"
+          @click="handleToggleEnabled"
+        >
+          <span
+            class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out"
+            :class="isEnabled ? 'translate-x-4' : 'translate-x-0'"
+          />
+        </button>
+
         <!-- User Index Badge: u/0, u/1... -->
         <span
           class="px-2 py-0.5 rounded-full text-xs font-mono font-bold shrink-0"
           :class="[
-            isExpired
-              ? 'bg-rose-100 text-rose-800 border border-rose-200'
-              : active
-                ? 'bg-brand-500 text-white'
-                : 'bg-blue-50 text-blue-700 border border-blue-200/60',
+            !isEnabled
+              ? 'bg-gray-200 text-gray-500'
+              : isExpired
+                ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                : active
+                  ? 'bg-brand-500 text-white'
+                  : 'bg-blue-50 text-blue-700 border border-blue-200/60',
           ]"
         >
           u/{{ account.auth_user }}
@@ -171,7 +216,7 @@ async function handleDetectTier() {
           type="button"
           class="px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold shrink-0 transition-opacity hover:opacity-80 cursor-pointer"
           :class="[
-            accountTier === 'Ultra'
+            accountTier === 'Ultra' || accountTier === 'Ultra_20X'
               ? 'bg-purple-100 text-purple-800 border border-purple-300'
               : accountTier === 'Pro'
                 ? 'bg-amber-100 text-amber-800 border border-amber-300'
@@ -181,43 +226,69 @@ async function handleDetectTier() {
             { 'opacity-50 cursor-wait': detectingTier },
           ]"
           :disabled="detectingTier"
-          title="点击重新探测此子账号的 Google AI 订阅权益等级 (Free / Plus / Pro / Ultra)"
+          title="点击重新探测此子账号的会员等级"
           @click="handleDetectTier"
         >
-          {{ detectingTier ? '...' : accountTier }}
+          {{ detectingTier ? '...' : tierShortLabel(accountTier) }}
         </button>
 
+        <!-- Group Tag / Inline Editor -->
+        <div class="flex items-center shrink-0 max-w-[96px] truncate">
+          <div
+            v-if="editingGroup"
+            class="flex items-center gap-1"
+          >
+            <input
+              v-model="groupInput"
+              type="text"
+              class="px-1.5 py-0.5 text-[11px] font-mono border rounded focus:outline-none focus:ring-1 focus:ring-brand-500 w-20"
+              placeholder="default"
+              @keydown.enter="saveGroup"
+              @blur="saveGroup"
+            >
+            <button
+              type="button"
+              class="text-emerald-600 hover:text-emerald-700"
+              @click="saveGroup"
+            >
+              <Check class="w-3 h-3" />
+            </button>
+          </div>
+          <button
+            v-else
+            type="button"
+            class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium text-gray-500 bg-gray-100 hover:bg-gray-200/80 transition-colors cursor-pointer border border-gray-200 max-w-full truncate"
+            title="点击修改所属分组"
+            @click="startEditGroup"
+          >
+            <Tag class="w-2.5 h-2.5 text-gray-400 shrink-0" />
+            <span class="truncate">{{ account.group || 'default' }}</span>
+          </button>
+        </div>
+
         <!-- Account Name & Memo -->
-        <div class="truncate min-w-0">
-          <div class="flex items-center gap-1.5">
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-1.5 min-w-0">
             <span class="font-semibold text-gray-900 text-xs truncate">
-              {{ account.email || account.name || 'Google Account' }}
+              {{ primaryLabel }}
             </span>
             <button
               type="button"
-              class="text-gray-300 hover:text-gray-600 transition-colors cursor-pointer"
+              class="text-gray-300 hover:text-gray-600 transition-colors cursor-pointer shrink-0"
               title="重命名账号"
               @click="emit('editName')"
             >
               <Edit2 class="w-3 h-3" />
             </button>
           </div>
-          <div class="text-[11px] text-gray-400 font-mono truncate flex items-center gap-1.5">
-            <span
-              v-if="account.email && account.name && account.name !== account.email"
-              class="text-gray-500"
-            >{{ account.name }} ·</span>
-            <span
-              v-else-if="!account.email"
-              class="text-amber-600/90 bg-amber-50 px-1 py-0.2 rounded text-[10px] border border-amber-200/50"
-            >未记录邮箱</span>
-            <span>ID: {{ account.id }}</span>
+          <div class="text-[11px] text-gray-400 font-mono truncate">
+            {{ secondaryLabel }}
           </div>
         </div>
       </div>
 
       <!-- Sub-Account Stats & Controls -->
-      <div class="flex items-center gap-2 sm:gap-3 shrink-0 flex-wrap">
+      <div class="flex items-center gap-2 sm:gap-3 shrink-0 flex-wrap justify-end">
         <div class="flex items-center gap-2 text-xs font-mono">
           <span class="text-gray-700">今日: <strong>{{ todayRequests }}</strong></span>
           <span class="text-gray-400">· 累计: <strong>{{ account.requests || 0 }}</strong></span>
@@ -233,45 +304,17 @@ async function handleDetectTier() {
           >
             429: {{ account.rate_limited || 0 }}
           </Badge>
-          <Badge
-            v-if="account.duplicate_of"
-            variant="red"
-            size="sm"
-            title="同一邮箱存在多个账号；此条为重复项，建议删除冗余账号"
-          >
-            重复
-          </Badge>
-          <Badge
-            v-if="refreshState === 'pending'"
-            variant="amber"
-            size="sm"
-            title="账号信息刷新进行中或尚未返回；tier 以刷新结果为准，可点击行内刷新图标重试"
-          >
-            待刷新
-          </Badge>
-          <button
-            v-else-if="refreshState === 'failed'"
-            type="button"
-            class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-full hover:bg-amber-100 transition-colors cursor-pointer"
-            title="tier 刷新失败，点击重试"
-            :disabled="refreshing"
-            @click="handleRefresh"
-          >
-            <span>tier — · 重试</span>
-          </button>
         </div>
 
-        <!-- Status Pill -->
+        <!-- Status Pill (shared accountStatus precedence) -->
         <div
-          v-if="account.expired"
-          class="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200"
-          title="档位探测返回 401，该账号凭据已过期并被排除出调度；请重新导入 cookies。"
+          v-if="status.key === 'disabled'"
+          class="inline-flex items-center gap-1 text-[11px] font-semibold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full border border-gray-200"
         >
-          <AlertCircle class="w-3 h-3 text-rose-600" />
-          <span>凭据过期</span>
+          <span>已停用</span>
         </div>
         <div
-          v-else-if="account.session_expired"
+          v-else-if="status.key === 'expired'"
           class="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200"
           title="该账号登录态已失效，已被系统禁用。更新 Cookie 凭据后可点击恢复。"
         >
@@ -279,21 +322,29 @@ async function handleDetectTier() {
           <span>登录态失效</span>
         </div>
         <div
-          v-else-if="active"
-          class="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200"
-        >
-          <CheckCircle2 class="w-3 h-3" />
-          <span>当前激活</span>
-        </div>
-        <div
-          v-else-if="account.auth_cooldown && account.auth_cooldown > 0"
+          v-else-if="status.key === 'cooldown'"
           class="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200"
         >
           <Clock class="w-3 h-3" />
           <span>鉴权冷却中</span>
         </div>
         <div
-          v-else-if="account.is_available === false"
+          v-else-if="status.key === 'instance' && status.instance"
+          class="inline-flex items-center gap-1 text-[11px] font-semibold border px-2 py-0.5 rounded-full"
+          :class="instanceStateTone(String(status.instance.state))"
+        >
+          <CheckCircle2 class="w-3 h-3" />
+          <span>实例 #{{ status.instance.number }} {{ statusInstanceLabel }}</span>
+        </div>
+        <div
+          v-else-if="status.key === 'active'"
+          class="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200"
+        >
+          <CheckCircle2 class="w-3 h-3" />
+          <span>当前激活</span>
+        </div>
+        <div
+          v-else-if="status.key === 'quota'"
           class="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200"
         >
           <Clock class="w-3 h-3" />
@@ -308,12 +359,44 @@ async function handleDetectTier() {
 
         <!-- Action Buttons -->
         <div class="flex items-center gap-1.5 ml-1">
-          <!-- 刷新账号信息（档位/过期/邮箱） -->
+          <!-- 恢复按钮 -->
+          <button
+            v-if="isExpired"
+            type="button"
+            class="px-2 py-0.5 text-[11px] font-medium text-rose-700 bg-rose-100 hover:bg-rose-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="刷新登录态并清除失效标记与鉴权冷却"
+            :disabled="refreshing"
+            @click="emit('clearCooldown')"
+          >
+            <RefreshCw class="w-3 h-3" />
+            <span>恢复</span>
+          </button>
+
+          <button
+            v-if="boundNumber !== null"
+            type="button"
+            class="px-2 py-0.5 text-[11px] font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            title="更换该账号绑定的实例槽位"
+            @click="emit('changeSlot')"
+          >
+            <ArrowLeftRight class="w-3 h-3" />
+            <span>换槽</span>
+          </button>
+
+          <Button
+            v-if="!active && !isExpired && isEnabled && boundNumber === null"
+            variant="secondary"
+            size="sm"
+            @click="emit('activate')"
+          >
+            <span>激活</span>
+          </Button>
+
           <button
             type="button"
             class="p-1 text-gray-400 hover:text-brand-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
-            :class="{ 'opacity-50 cursor-not-allowed': refreshing }"
-            title="刷新账号信息（档位 tier / 过期 / 邮箱）"
+            :class="{ 'opacity-50 cursor-wait': refreshing }"
+            title="刷新此账号信息（等级、登录态、邮箱）"
             :disabled="refreshing"
             @click="handleRefresh"
           >
@@ -321,40 +404,6 @@ async function handleDetectTier() {
               class="w-3.5 h-3.5"
               :class="{ 'animate-spin': refreshing }"
             />
-          </button>
-
-          <!-- 登录态失效状态下的快捷恢复按钮 -->
-          <button
-            v-if="account.session_expired"
-            type="button"
-            class="px-2 py-0.5 text-[11px] font-medium text-rose-700 bg-rose-100 hover:bg-rose-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
-            title="解除登录态失效禁用状态并重新测试"
-            @click="emit('clearCooldown')"
-          >
-            <RefreshCw class="w-3 h-3" />
-            <span>恢复</span>
-          </button>
-
-          <Button
-            v-if="!active && !isExpired"
-            variant="secondary"
-            size="sm"
-            :loading="activating"
-            title="将该账号设为默认活跃账号"
-            @click="emit('activate')"
-          >
-            <span>设为默认活跃</span>
-          </Button>
-
-          <button
-            type="button"
-            class="p-1 text-gray-400 hover:text-brand-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
-            :class="{ 'opacity-50 cursor-not-allowed': detectingEmail }"
-            title="自动识别并记录此子账号真实邮箱与订阅等级"
-            :disabled="detectingEmail"
-            @click="handleDetectEmail"
-          >
-            <Mail class="w-3.5 h-3.5" />
           </button>
 
           <button
@@ -379,7 +428,7 @@ async function handleDetectTier() {
 
           <button
             type="button"
-            class="p-1 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+            class="p-1 text-gray-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer border-l border-gray-100 pl-1.5 ml-1"
             title="删除此子账号"
             @click="emit('delete')"
           >
@@ -388,130 +437,6 @@ async function handleDetectTier() {
         </div>
       </div>
     </div>
-
-    <!-- Mode status: slot + three-state badges (multi) / mount line (single) -->
-    <div
-      v-if="multiMode"
-      class="mt-2.5 pt-2.5 border-t border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-    >
-      <div class="flex items-center gap-1.5 flex-wrap text-[11px] min-w-0">
-        <span
-          v-for="entry in accountSlots"
-          :key="`${entry.slot.account_id}-${entry.slot.channel}-${entry.index}`"
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border font-mono"
-          :class="entry.slot.enabled === false
-            ? 'bg-gray-100 text-gray-500 border-gray-200'
-            : 'bg-blue-50 text-blue-700 border-blue-200/70'"
-          :title="`槽位数组第 ${entry.index + 1} 行 · ${channelLabel(entry.slot.channel)}${entry.slot.note ? ` · ${entry.slot.note}` : ''}`"
-        >
-          <span>@槽{{ entry.index + 1 }}</span>
-          <span class="text-[10px] opacity-80">{{ channelLabel(entry.slot.channel) }}</span>
-          <span
-            v-if="entry.slot.enabled === false"
-            class="text-[10px]"
-          >停用</span>
-        </span>
-        <span
-          v-if="!accountSlots.length"
-          class="text-gray-400"
-        >未绑定槽位</span>
-
-        <span class="w-px h-3 bg-gray-200 mx-0.5 hidden sm:inline-block" />
-
-        <span
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
-          :class="qualified
-            ? 'bg-emerald-50 text-emerald-700 border-emerald-200/60'
-            : isExpired
-              ? 'bg-rose-50 text-rose-700 border-rose-200/60'
-              : 'bg-gray-100 text-gray-500 border-gray-200'"
-          title="账号级资格：未过期 + routing surfaces 允许该渠道 + 渠道 enabled；不含策略组运行时收窄。读取中或读取失败时显示 —。"
-        >
-          <span>资格</span>
-          <span class="font-semibold">{{ qualified ? '✓' : isExpired ? '过期' : '—' }}</span>
-        </span>
-
-        <span
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
-          :class="hasMount
-            ? 'bg-sky-50 text-sky-700 border-sky-200/60'
-            : 'bg-gray-100 text-gray-500 border-gray-200'"
-          title="挂载来自 Context 的 chat_ready/build_ready；未挂载不代表账号不可用。"
-        >
-          <span>挂载</span>
-          <span class="font-semibold">{{ hasMount ? '✓' : '—' }}</span>
-        </span>
-
-        <span
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"
-          :class="hit
-            ? 'bg-brand-50 text-brand-700 border-brand-200/60'
-            : 'bg-gray-100 text-gray-500 border-gray-200'"
-          title="当前调度快照：该账号当前为活跃 Context，或该 Context 在途请求 > 0；不是策略组命中。"
-        >
-          <span>命中</span>
-          <span class="font-semibold">{{ hit ? `✓${inFlight > 0 ? ` 在途${inFlight}` : ''}` : '—' }}</span>
-        </span>
-      </div>
-
-      <div class="flex items-center gap-1.5 flex-wrap shrink-0">
-        <SlotBindPopover
-          :account="account"
-          :channels="channelOptions"
-          :slots="slotRows"
-        />
-        <button
-          type="button"
-          class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border border-gray-200 bg-white text-gray-600 hover:text-gray-900 hover:bg-gray-50 transition-colors cursor-pointer"
-          :aria-expanded="matrixExpanded"
-          title="展开账号 × 渠道矩阵：逐格开关 routing surfaces"
-          @click="matrixExpanded = !matrixExpanded"
-        >
-          <Network class="w-3.5 h-3.5" />
-          <span>渠道矩阵</span>
-          <ChevronDown
-            class="w-3 h-3 transition-transform"
-            :class="{ 'rotate-180': matrixExpanded }"
-          />
-        </button>
-      </div>
-    </div>
-
-    <div
-      v-else
-      class="mt-2 pt-2 border-t border-gray-100 text-[11px] flex items-center gap-1.5 flex-wrap"
-    >
-      <span class="text-gray-500">挂载：</span>
-      <template v-if="isActiveContext">
-        <span class="inline-flex items-center gap-1 text-gray-600">
-          PG 页
-          <span :class="mountedChat ? 'text-emerald-600 font-semibold' : 'text-gray-300 font-semibold'">
-            {{ mountedChat ? '✓' : '—' }}
-          </span>
-        </span>
-        <span class="text-gray-300">/</span>
-        <span class="inline-flex items-center gap-1 text-gray-600">
-          BUILD 页
-          <span :class="mountedBuild ? 'text-emerald-600 font-semibold' : 'text-gray-300 font-semibold'">
-            {{ mountedBuild ? '✓' : '—' }}
-          </span>
-        </span>
-      </template>
-      <span
-        v-else
-        class="text-gray-400"
-        title="仅当前活跃 Context 会持有页面；未挂载不代表账号不可用"
-      >—</span>
-    </div>
-
-    <AccountChannelMatrix
-      v-if="multiMode && matrixExpanded"
-      :account="account"
-      :channels="channelOptions"
-      :slots="slotRows"
-      :contexts="contextList"
-      :active="active"
-    />
 
     <!-- Level 3: Per-Model Independent Quota/Rate Limits -->
     <ModelQuotaGrid

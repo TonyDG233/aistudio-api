@@ -17,6 +17,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
+import LogsDebugMenu from '@/components/debug/LogsDebugMenu.vue'
 import { useToastStore } from '@/stores/toast.ts'
 import { clearToken } from '@/api/client.ts'
 import {
@@ -71,6 +72,7 @@ const fromControl = ref(Boolean(route.query.levels || route.query.q))
 let generation = 0
 let controller: AbortController | null = null
 let retryTimer: ReturnType<typeof setTimeout> | null = null
+let pendingDroppedClear = false
 
 function toDateInput(date: Date): string {
   const year = date.getFullYear()
@@ -356,6 +358,7 @@ async function readStream(response: Response, currentGeneration: number): Promis
 
 function scheduleReconnect(message: string) {
   if (!generation) return
+  pendingDroppedClear = true
   connection.value = 'reconnecting'
   connectionError.value = message
   const delay = Math.min(3000 * 2 ** Math.min(retryCount.value, 2), 15000)
@@ -385,6 +388,10 @@ async function connect(): Promise<void> {
     if (currentGeneration !== generation) return
     connection.value = 'connected'
     retryCount.value = 0
+    if (pendingDroppedClear) {
+      droppedNotice.value = null
+      pendingDroppedClear = false
+    }
     await readStream(response, currentGeneration)
     if (currentGeneration === generation) scheduleReconnect('日志流已结束，正在重连')
   } catch (err: unknown) {
@@ -400,6 +407,7 @@ async function connect(): Promise<void> {
 
 function restartStream() {
   retryCount.value = 0
+  pendingDroppedClear = true
   connection.value = 'connecting'
   void connect()
 }
@@ -466,8 +474,8 @@ async function exportRange() {
   exporting.value = true
   try {
     await downloadLogArchive({
-      start: new Date(`${exportStart.value}T00:00:00`).toISOString(),
-      end: new Date(`${exportEnd.value}T23:59:59.999`).toISOString(),
+      start: `${exportStart.value}T00:00:00`,
+      end: `${exportEnd.value}T23:59:59.999`,
     })
     toast.success('日志导出已开始')
   } catch (err: unknown) {
@@ -531,6 +539,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-5">
+    <LogsDebugMenu />
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
         <p class="flex items-center gap-2 text-[11px] text-gray-400">

@@ -1,614 +1,1191 @@
-"""Single routing pipeline for WP5 v3.
+"""P2 request routing over the instance pool.
 
-Resolution order: channel/capability -> per-account eligibility -> candidate
-sort -> pre-dispatch slot acquire -> failure chain. The channel is fixed in step
-1 and never changes inside a request; every denial is explicit.
+Flow: model eligibility (surface/lane/tier) -> wake eligible sleeping/unstarted
+instances -> ordered candidates (sticky + least-used/LRU/FIFO, warm as a tie
+break) -> ``active_requests`` handle.  There is no lease, reservation, defer,
+pinned slot, circuit breaker or background rebalance.
 
-Groups are per-account constraints, not a request-level singleton. The active
-account is only a weak preference; it never decides the group or the channel.
+Error policy:
+* tier/403 admission rejects locally and never switches;
+* 429 retries the same instance first, then switches inside the existing pool,
+  and finally returns a 503 (never 429);
+* 204 / transient RPC 404 retry the same instance without switching;
+* once streaming body data was yielded, no switch happens.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import NoReturn
+from collections.abc import AsyncGenerator, Callable, Iterable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from aistudio_api.application.channel_registry import (
-    build_registry,
-    is_multi_mode,
-    normalize_channel,
-)
+from aistudio_api.application.account_orchestrator import record_rotator_event
 from aistudio_api.application.routing_eligibility import (
-    AccountView,
-    choose_channel,
-    eligible_accounts,
+    ModelRoute,
+    resolve_model_route,
+    tier_allows,
 )
-from aistudio_api.application.routing_safety import CircuitBreaker, RoutingBudget
-from aistudio_api.application.surface_orchestrator import (
-    GroupPolicy,
-    SurfacePolicyError,
+from aistudio_api.application.routing_safety import RoutingBudget
+from aistudio_api.domain.errors import (
+    AistudioError,
+    AuthError,
+    BrowserTransportError,
+    RequestError,
+    RoutingError,
+    SessionExpiredError,
+    SurfaceCapacityError,
+    SurfaceSwitchExhaustedError,
+    TierRequiredError,
+    UsageLimitExceeded,
+    is_browser_session_hang_error,
+    is_transient_rpc_error,
 )
-from aistudio_api.infrastructure.gateway.instance_pool import (
-    InstanceCapacityError,
-    InstanceLease,
-    InstancePool,
+from aistudio_api.domain.instances import Instance, InstanceState
+from aistudio_api.domain.model_access import (
+    best_tier,
+    tier_rank,
+    tier_satisfies_required,
 )
+from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.gateway.instance_client import InstanceRequestClient
+from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
+from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
+from aistudio_api.infrastructure.utils.log_broadcast import sanitize_log_message
 from aistudio_api.infrastructure.utils.logger import get_logger
 
-logger = get_logger("application.routing")
+DEFAULT_RETRY_SAME_DELAY_SEC = 2.0
+
+logger = get_logger("routing")
+
+if TYPE_CHECKING:
+    from aistudio_api.application.account_rotator import AccountRotator
 
 
-@dataclass
-class Candidate:
-    """One eligible account/channel pair, before instance acquisition."""
+class RequestSlot(Protocol):
+    @property
+    def session(self) -> RequestSession | None: ...
+
+
+class RequestHandle(Protocol):
+    @property
+    def slot(self) -> RequestSlot: ...
+
+    def release(self) -> None: ...
+
+
+class InstanceManagerProtocol(Protocol):
+    @property
+    def configured_surfaces(self) -> frozenset[str]: ...
+
+    @property
+    def current_instance_id(self) -> str | None: ...
+
+    def eligible_instances(
+        self, *, paid: bool, surface: str | None = None
+    ) -> tuple[Instance, ...]: ...
+
+    def lane_instances(self, *, paid: bool) -> tuple[Instance, ...]: ...
+
+    async def wake_eligible(
+        self, *, paid: bool, surface: str | None = None
+    ) -> object: ...
+
+    async def wake(self, instance_id: str) -> object: ...
+
+    async def begin_request(self, instance_id: str) -> RequestHandle: ...
+
+
+
+class GenerationClient(Protocol):
+    """Structural client consumed by the Gemini application service."""
 
     account_id: str
-    name: str
-    tier: str | None
-    email: str | None
-    channel: str
+    tier: str
     surface: str
-    group: GroupPolicy
-    quota_pools: tuple[str, ...]
-    affinity: int
-    weight: float
-    available: bool
-    slot_index: int | None = None
-    reason: str = ""
+
+    async def generate_content(
+        self,
+        *,
+        model: str = ...,
+        capture_prompt: str,
+        capture_images: list[str | tuple[str, str]] | None = None,
+        contents: list[AistudioContent] | None = None,
+        system_instruction_content: AistudioContent | None = None,
+        tools: list[list] | None = None,
+        tool_config: list[object] | None = None,
+        safety_settings: list[list] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        max_tokens: int | None = None,
+        generation_config_overrides: dict | None = None,
+        sanitize_plain_text: bool = True,
+        force_refresh_capture: bool = False,
+    ) -> ModelOutput: ...
+
+    def stream_generate_content(
+        self,
+        *,
+        model: str = ...,
+        capture_prompt: str,
+        capture_images: list[str | tuple[str, str]] | None = None,
+        contents: list[AistudioContent] | None = None,
+        system_instruction_content: AistudioContent | None = None,
+        tools: list[list] | None = None,
+        tool_config: list[object] | None = None,
+        safety_settings: list[list] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        max_tokens: int | None = None,
+        generation_config_overrides: dict | None = None,
+        sanitize_plain_text: bool = True,
+        force_refresh_capture: bool = False,
+    ) -> AsyncGenerator[tuple[str, object | None], None]: ...
+
+    async def count_tokens(self, *, packed_body: list[object]) -> int: ...
+
+    def clear_templates(self) -> bool: ...
+
+    async def refresh_auth_state(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class RouteCandidate:
+    instance_id: str
+    account_id: str
+    tier: str
+    surface: str
+    state: InstanceState
+    in_flight: int
+    last_used: float
+    number: int
+    min_tier: str = "Free"
+    only_tier: str = ""
+    max_tier: str = ""
+
+    @property
+    def account_tier_rank(self) -> int:
+        """Rank of the account tier; lower is the smallest sufficient tier."""
+        return tier_rank(self.tier)
+
+    @classmethod
+    def from_instance(cls, instance: Instance) -> RouteCandidate:
+        return cls(
+            instance_id=instance.id,
+            account_id=instance.account_id,
+            tier=instance.tier,
+            surface=instance.surface,
+            state=instance.state,
+            in_flight=instance.in_flight,
+            last_used=instance.last_used,
+            number=instance.number,
+            min_tier=instance.min_tier,
+            only_tier=instance.only_tier,
+            max_tier=instance.max_tier,
+        )
 
 
 @dataclass
 class RouteContext:
-    """Request-scoped routing state; candidates are frozen at begin()."""
-
-    request_id: str
-    model_path: str
-    clean_model: str
-    api_format: str
-    channel: str
-    surface: str
-    candidates: list[Candidate]
+    route: ModelRoute
+    candidates: list[RouteCandidate]
     budget: RoutingBudget
-    breaker: CircuitBreaker
-    multi_mode: bool
-    started_at: float
-    borrow_enabled: bool = False
-    attempted: set[str] = field(default_factory=set)
-    failed: set[str] = field(default_factory=set)
+    max_retries: int
+    attempted_instances: set[str] = field(default_factory=set)
+    attempted_accounts: set[str] = field(default_factory=set)
+    failed_accounts: set[str] = field(default_factory=set)
+    total_attempts: int = 0
     retry_same: bool = False
+    retry_same_delay_sec: float = 0.0
     last_reason: str = "initial"
+    # countTokens reuses the route but must never touch the generation attempt
+    # ledger or consume account generation quota.
+    record_attempts: bool = True
 
-    def next_candidate(self, failed_account_id: str | None = None) -> Candidate | None:
-        if failed_account_id:
-            self.failed.add(failed_account_id)
+    def next_candidate(self) -> RouteCandidate | None:
         for candidate in self.candidates:
-            if candidate.account_id in self.failed:
+            if candidate.instance_id in self.attempted_instances:
                 continue
-            if candidate.account_id in self.attempted:
+            if candidate.account_id in self.failed_accounts:
                 continue
             return candidate
         return None
 
+    def register_attempt(self) -> None:
+        self.total_attempts += 1
+
     def snapshot(self) -> dict[str, object]:
         return {
-            "request_id": self.request_id,
-            "model": self.clean_model,
-            "api_format": self.api_format,
-            "channel": self.channel,
-            "surface": self.surface,
-            "groups": sorted(
-                {
-                    candidate.group.name or candidate.group.source
-                    for candidate in self.candidates
-                }
-            ),
-            "candidates": [
-                {
-                    "account_id": candidate.account_id,
-                    "group": candidate.group.name or candidate.group.source,
-                    "quota_pools": list(candidate.quota_pools),
-                    "affinity": candidate.affinity,
-                }
-                for candidate in self.candidates
-            ],
-            "attempted": sorted(self.attempted),
-            "failed": sorted(self.failed),
+            "model": self.route.model,
+            "surface": self.route.surface,
+            "lane": self.route.lane,
+            "candidates": [candidate.instance_id for candidate in self.candidates],
+            "attempted": sorted(self.attempted_instances),
+            "attempted_accounts": sorted(self.attempted_accounts),
+            "failed_accounts": sorted(self.failed_accounts),
             "budget": self.budget.snapshot(),
-            "circuit": self.breaker.snapshot(),
+            "retry_same": self.retry_same,
+            "last_reason": self.last_reason,
         }
 
 
-def _raise(
-    code: str,
-    *,
-    message: str,
-    advice: str,
-) -> NoReturn:
-    logger.warning("[surface] 策略拒绝 code=%s: %s", code, message)
-    raise SurfacePolicyError(code, message=message, advice=advice)
+@dataclass
+class RouteAttempt:
+    candidate: RouteCandidate
+    handle: RequestHandle
+    client: GenerationClient
+    same_retries: int = 0
+
+    @property
+    def instance_id(self) -> str:
+        return self.candidate.instance_id
+
+    @property
+    def account_id(self) -> str:
+        return self.candidate.account_id
+
+    @property
+    def surface(self) -> str:
+        return self.candidate.surface
+
+
+RoutingSettingsProvider = Callable[[], dict[str, object]]
+
+
+class RoutingPipelineProtocol(Protocol):
+    async def begin(
+        self, *, model_path: str, requested_surface: str | None = None
+    ) -> RouteContext: ...
+
+    async def acquire(self, context: RouteContext) -> RouteAttempt | None: ...
+
+    async def release(self, attempt: RouteAttempt) -> None: ...
+
+    async def handle_error(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exc: Exception,
+        *,
+        has_yielded_data: bool = False,
+    ) -> str: ...
+
+    def record_success(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+    ) -> None: ...
+
+    def record_client(
+        self,
+        model: str,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None: ...
+
+    def record_empty_retry(
+        self, context: RouteContext, attempt: RouteAttempt
+    ) -> None: ...
+
+    def record_count(
+        self, model: str, result: str, *, input_tokens: int = 0
+    ) -> None: ...
+
+
+def _as_int(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _as_float(value: object, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _summarize_error(exc: Exception | None, summary: str | None = None) -> str:
+    """Compact, sanitized upstream reason used in routing/rotator warnings.
+
+    Contains only the exception type, its ``status`` (when present) and the
+    first 160 characters of the collapsed message; cookie/Bearer/API-key
+    material is masked by :func:`sanitize_log_message` before truncation.
+    """
+    text = summary or ""
+    if not text and exc is not None:
+        header = type(exc).__name__
+        status = getattr(exc, "status", None)
+        if status is not None:
+            header = f"{header} status={status}"
+        message = " ".join(str(exc).split())
+        text = f"{header}: {message}" if message else header
+    collapsed = " ".join(str(text).split())
+    return sanitize_log_message(collapsed)[:160]
 
 
 class RoutingPipeline:
-    """Plan and execute one request's route."""
+    """Plan and execute one request's route over existing instances."""
 
     def __init__(
         self,
-        client,
         *,
-        account_store=None,
-        features_provider: Callable[[], dict[str, object]] | None = None,
-        breaker: CircuitBreaker | None = None,
-        rotator=None,
+        instance_manager: InstanceManagerProtocol,
+        account_store: object | None = None,
+        rotator: AccountRotator | None = None,
+        routing_settings_provider: RoutingSettingsProvider | None = None,
+        stats_recorder: Callable[..., None] | None = None,
+        client_recorder: Callable[..., None] | None = None,
+        count_token_recorder: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._client = client
-        self._store = account_store
-        self._features_provider = features_provider
-        self._breaker = breaker or CircuitBreaker(clock=clock)
-        self._rotator_override = rotator
+        self._manager = instance_manager
+        self._accounts = account_store
+        self._rotator = rotator
+        self._routing_settings_provider = routing_settings_provider
+        self._stats_recorder = stats_recorder
+        self._client_recorder = client_recorder
+        self._count_token_recorder = count_token_recorder
         self._clock = clock
-        pool = getattr(client, "instance_pool", None)
-        if pool is None:
-            pool = InstancePool(
-                client._ensure_browser_cdp_client,
-                features_provider=self._features,
-            )
-        self.pool: InstancePool = pool
 
-    def _instance_manager(self):
-        try:
-            from aistudio_api.api.state import runtime_state
+    def _rotator_or_none(self) -> AccountRotator | None:
+        return cast("AccountRotator | None", self._rotator)
 
-            return runtime_state.instance_manager
-        except Exception:
-            return None
+    # --------------------------------------------------------------- planning
 
-    def _store_or_default(self):
-        if self._store is not None:
-            return self._store
-        from aistudio_api.infrastructure.account.account_store import AccountStore
-
-        return AccountStore()
-
-    def _features(self) -> dict[str, object]:
-        if self._features_provider is not None:
-            try:
-                return dict(self._features_provider())
-            except Exception:
-                return {}
-        try:
-            from aistudio_api.infrastructure.gateway.model_defaults import (
-                get_features_config,
-            )
-
-            return dict(get_features_config())
-        except Exception:
-            return {}
-
-    def _rotator(self):
-        if self._rotator_override is not None:
-            return self._rotator_override
-        try:
-            from aistudio_api.api.state import runtime_state
-
-            return runtime_state.rotator
-        except Exception:
-            return None
-
-    def _auth_for(self, account_id: str) -> tuple[str | None, str | None]:
-        try:
-            from aistudio_api.api.state import runtime_state
-
-            service = runtime_state.account_service
-            if service is not None:
-                path = service.get_account_auth_path(account_id)
-                account = service.get_account(account_id)
-                return (
-                    str(path) if path is not None else None,
-                    getattr(account, "auth_user", None),
-                )
-        except Exception:
-            pass
-        return None, None
-
-    def _mounted_channels(self) -> tuple[str, ...]:
-        counts = self.pool.page_counts()
-        mounted = tuple(
-            channel for channel in ("chat", "build") if counts.get(channel, 0) > 0
+    async def begin(
+        self, *, model_path: str, requested_surface: str | None = None
+    ) -> RouteContext:
+        manager = self._manager
+        await self._ensure_started()
+        surfaces = getattr(manager, "configured_surfaces", frozenset()) or frozenset(
+            {"chat"}
         )
-        if mounted:
-            return mounted
-        # Control-plane fallback is only a display hint; it never authorizes a
-        # request instance.
-        return ()
-
-    def _slot_indexes(self, features: dict[str, object]) -> dict[tuple[str, str], int]:
-        raw_slots = features.get("slots")
-        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
-        indexes: dict[tuple[str, str], int] = {}
-        for index, slot in enumerate(slots):
-            if not isinstance(slot, dict) or not bool(slot.get("enabled", True)):
-                continue
-            account_id = str(slot.get("account_id") or "").strip()
-            channel = normalize_channel(slot.get("channel"))
-            if not account_id or channel is None:
-                continue
-            indexes[(account_id, channel)] = index
-        return indexes
-
-    def begin(self, *, model_path: str, api_format: str) -> RouteContext:
-        features = self._features()
-        store = self._store_or_default()
-        accounts = list(store.list_accounts())
-        raw_groups = features.get("groups")
-        groups: list[object] = raw_groups if isinstance(raw_groups, list) else []
-        registry = build_registry(features)
-        raw_slots = features.get("slots")
-        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
-        views = [AccountView.from_account(account) for account in accounts]
-        manager = self._instance_manager()
-        if manager is not None:
-            instance_accounts = manager.instance_account_ids()
-            if instance_accounts:
-                # Keep explicit instances authoritative, but do not drop accounts
-                # just because their instance is temporarily invalid/asleep.
-                views = [
-                    view for view in views if view.account_id in instance_accounts
-                ]
-        selection = choose_channel(
+        route = resolve_model_route(
             model_path,
-            views,
-            features,
-            groups=groups,
-            mounted_channels=self._mounted_channels(),
+            requested_surface=requested_surface,
+            enabled_surfaces=tuple(sorted(surfaces)),
         )
-        channel = selection.channel
-        surface = selection.surface
-        clean_model = selection.clean_model
-        if surface is None:
-            _raise(
-                "surface_channel_disabled",
-                message=f"渠道 '{channel}' 尚未实现，无法处理模型 '{model_path}'。",
-                advice="WP9 前官网渠道不可用；请改用 chat/build 渠道或裸模型名。",
+        if route.surface == "build":
+            raise SurfaceCapacityError(
+                surface="build",
+                message="build surface 尚未实现（P4 接入前显式拒绝），不会静默换面。",
             )
 
-        eligible = eligible_accounts(
-            views,
-            channel,
-            clean_model,
-            features=features,
-            registry=registry,
-            groups=groups,
+        await self._wake(route)
+        lane_candidates = list(
+            manager.eligible_instances(paid=route.paid, surface=route.surface)
         )
+        if not lane_candidates:
+            if route.paid:
+                lane_all = list(manager.lane_instances(paid=True))
+                all_candidates = list(
+                    manager.eligible_instances(paid=True)
+                ) + list(manager.eligible_instances(paid=False))
+                current = self._current_tier(lane_all + all_candidates)
+                if not tier_satisfies_required(
+                    current, route.required_tiers
+                ):
+                    raise self._tier_error(route, current)
+            raise SurfaceCapacityError(surface=route.surface)
+
+        eligible = [
+            instance
+            for instance in lane_candidates
+            if tier_allows(instance.tier, route)
+        ]
         if not eligible:
-            group_names = [
-                str(group.get("name") or f"group-{index}")
-                for index, group in enumerate(groups)
-                if isinstance(group, dict)
-            ]
-            _raise(
-                "surface_no_capable_account",
+            current = self._current_tier(lane_candidates)
+            if route.paid and not tier_satisfies_required(
+                current, route.required_tiers
+            ):
+                raise self._tier_error(route, current)
+            raise SurfaceCapacityError(surface=route.surface)
+
+        available = [
+            instance
+            for instance in eligible
+            if self._account_available(instance.account_id, route)
+        ]
+        if not available:
+            raise SurfaceCapacityError(
+                surface=route.surface,
                 message=(
-                    f"模型 '{clean_model}' / 渠道 '{channel}' 没有合格账号。"
-                    f"已配置组={group_names or ['implicit-global']}。"
-                ),
-                advice=(
-                    "请检查账号 tier/额度池、组 allowed_surfaces/"
-                    "allowed_quota_pools、渠道 quota_pool，或为请求显式指定可用渠道前缀。"
+                    f"渠道 '{route.surface}' 的合格账号均处于 429/403 冷却或"
+                    "登录态失效，请等待额度刷新或前往管理页检查。"
                 ),
             )
 
-        slot_indexes = self._slot_indexes(features)
-        rotator = self._rotator()
-        ready_accounts = {
-            slot.current_account_id
-            for slot in self.pool.slots()
-            if slot.current_account_id
-            and slot.in_flight == 0
-            and (slot.chat_ready() or slot.build_ready())
-        }
-        candidates: list[Candidate] = []
-        for view in eligible:
-            account = view.account
-            available = True
-            if rotator is not None:
-                try:
-                    available = bool(
-                        rotator.is_account_available(
-                            account.account_id, model=clean_model, surface=surface
-                        )
-                    )
-                except Exception:
-                    available = True
-            candidates.append(
-                Candidate(
-                    account_id=account.account_id,
-                    name=account.name,
-                    tier=account.tier,
-                    email=account.email,
-                    channel=channel,
-                    surface=surface,
-                    group=view.group,
-                    quota_pools=view.quota_pools,
-                    affinity=view.affinity,
-                    weight=max(0.1, view.group.weight * account.routing.weight),
-                    available=available,
-                    slot_index=slot_indexes.get((account.account_id, channel)),
-                    reason="eligible",
-                )
-            )
-
-        candidates.sort(
-            key=lambda candidate: (
-                0 if candidate.available else 1,
-                candidate.affinity,
-                -candidate.weight,
-                self._score(candidate, rotator),
-                # Slot/ready reuse is a tie-breaker, not a starvation switch:
-                # an already-warm account must not pin all future requests.
-                0 if candidate.slot_index is not None else 1,
-                0 if candidate.account_id in ready_accounts else 1,
-                candidate.account_id,
-            )
+        ordered = self._order(route, available)
+        settings = self._routing_settings()
+        max_switches = max(0, _as_int(settings.get("max_switches", 2), 2))
+        retry_same_delay_sec = min(
+            30.0,
+            max(0.0, _as_float(settings.get("retry_same_delay_sec", 0.0), 0.0)),
         )
-
-        raw_routing = features.get("routing")
-        routing_cfg = raw_routing if isinstance(raw_routing, dict) else {}
-        try:
-            max_switches = max(0, int(routing_cfg.get("max_switches", 2)))
-        except (TypeError, ValueError):
-            max_switches = 2
-        ctx = RouteContext(
-            request_id=f"route-{int(self._clock() * 1000)}",
-            model_path=model_path,
-            clean_model=clean_model,
-            api_format=api_format,
-            channel=channel,
-            surface=surface,
-            candidates=candidates,
+        context = RouteContext(
+            route=route,
+            candidates=[RouteCandidate.from_instance(item) for item in ordered],
             budget=RoutingBudget(max_switches=max_switches),
-            breaker=self._breaker,
-            multi_mode=is_multi_mode(registry, slots),
-            started_at=self._clock(),
-            borrow_enabled=bool(routing_cfg.get("borrow", False)),
+            max_retries=self._max_retries(),
+            retry_same_delay_sec=retry_same_delay_sec,
         )
         logger.info(
-            "[surface] request=%s model=%s format=%s channel=%s surface=%s "
-            "groups=%s candidates=%s multi_mode=%s step=①->④",
-            ctx.request_id,
-            clean_model,
-            api_format,
-            channel,
-            surface,
-            ",".join(
-                sorted(
-                    {
-                        candidate.group.name or candidate.group.source
-                        for candidate in candidates
-                    }
-                )
-            ),
-            ",".join(candidate.account_id for candidate in candidates),
-            ctx.multi_mode,
+            "[routing] model=%s surface=%s lane=%s candidates=%s max_switches=%d",
+            route.model,
+            route.surface,
+            route.lane,
+            ",".join(candidate.instance_id for candidate in context.candidates),
+            max_switches,
         )
-        return ctx
+        return context
 
-    @staticmethod
-    def _score(candidate: Candidate, rotator) -> tuple:
-        stats = None
-        if rotator is not None:
-            try:
-                stats = rotator.get_account_stats(candidate.account_id)
-            except Exception:
-                stats = None
-        requests = float(getattr(stats, "requests", 0) or 0)
-        last_used = float(getattr(stats, "last_used", 0) or 0)
-        # Last-used is the primary fairness signal. Lifetime request totals must
-        # not starve an older account behind newer accounts forever. Keep a
-        # candidate-identity tie-break in the outer sort so a warm slot can
-        # break an exact fairness tie.
-        return (last_used, requests / candidate.weight)
+    def _order(
+        self, route: ModelRoute, instances: Iterable[Instance]
+    ) -> list[Instance]:
+        """Sort same-lane candidates for balanced dispatch.
 
-    def next_candidate(
-        self, ctx: RouteContext, failed_account_id: str | None = None
-    ) -> Candidate | None:
-        return ctx.next_candidate(failed_account_id)
+        Ordering is load first (idle before busy), then the smallest sufficient
+        account tier (Pro before Ultra when Pro satisfies the route), then
+        least-used/model-used/LRU, and only then warm/sticky/number.  Sticky is
+        therefore a final tie-breaker: it keeps a healthy slot logged in, it
+        never gives one slot a monopoly on traffic.
+        """
+        sticky_id = getattr(self._manager, "current_instance_id", None)
+        rotator = self._rotator
+        rows: list[tuple[tuple[object, ...], Instance]] = []
+        for instance in instances:
+            candidate = RouteCandidate.from_instance(instance)
+            if not tier_allows(candidate.tier, route):
+                continue
+            stats = None
+            if rotator is not None:
+                getter = getattr(rotator, "get_account_stats", None)
+                if callable(getter):
+                    stats = getter(candidate.account_id)
+            total_requests = _as_int(getattr(stats, "total_requests", 0), 0)
+            model_requests = 0
+            if stats is not None:
+                counter = getattr(stats, "model_requests_total", None)
+                if callable(counter):
+                    model_requests = _as_int(counter(route.model), 0)
+            warm = 0 if instance.state is InstanceState.ACTIVE else 1
+            sticky = 0 if instance.id == sticky_id else 1
+            key = (
+                candidate.in_flight,
+                candidate.account_tier_rank,
+                total_requests,
+                model_requests,
+                candidate.last_used,
+                warm,
+                sticky,
+                candidate.number,
+            )
+            rows.append((key, instance))
+        rows.sort(key=lambda item: item[0])
+        return [instance for _key, instance in rows]
 
-    async def acquire(
-        self,
-        ctx: RouteContext,
-        candidate: Candidate,
-        *,
-        require_idle: bool = True,
-    ) -> InstanceLease:
-        """Acquire a ready slot, switching/loading an eligible account first."""
-        del require_idle
-        ctx.attempted.add(candidate.account_id)
-        auth_file, auth_user = self._auth_for(candidate.account_id)
-        first_attempt = not ctx.failed and not ctx.attempted - {candidate.account_id}
-        timeout_s = 30.0 if first_attempt else 15.0
+    def _tier_error(self, route: ModelRoute, current_tier: str) -> TierRequiredError:
+        required = route.required_tier or "Pro"
+        return TierRequiredError(
+            model=route.model,
+            tier=route.tier or required,
+            required_tier=required,
+            current_tier=current_tier or "Free",
+        )
+
+    def _current_tier(self, instances: Iterable[Instance]) -> str:
+        """Best usable tier across instance slots and configured accounts."""
+        tiers = [instance.tier for instance in instances]
+        store = self._accounts
+        if store is not None:
+            lister = getattr(store, "list_accounts", None)
+            if callable(lister):
+                try:
+                    accounts = lister()
+                    if not isinstance(accounts, (list, tuple)):
+                        accounts = []
+                    for account in accounts:
+                        if getattr(account, "enabled", True) and not getattr(
+                            account, "expired", False
+                        ):
+                            tiers.append(getattr(account, "tier", ""))
+                except Exception as exc:
+                    logger.debug("[routing] 读取账号层级失败: %s", exc)
+        return best_tier(tiers)
+
+    def _account_available(self, account_id: str, route: ModelRoute) -> bool:
+        rotator = self._rotator_or_none()
+        if rotator is None:
+            return True
+        checker = getattr(rotator, "is_account_available", None)
+        if not callable(checker):
+            return True
         try:
-            lease = await self.pool.acquire(
-                account_id=candidate.account_id,
-                auth_file=auth_file,
-                auth_user=auth_user,
-                channel=ctx.channel,
-                surface=ctx.surface,
-                timeout_s=timeout_s,
-                group_name=candidate.group.name or candidate.group.source,
-                group_max_pages=candidate.group.max_pages,
+            return bool(
+                checker(account_id, model=route.model, surface=route.surface)
             )
-        except InstanceCapacityError as exc:
-            capacity_code = (
-                "surface_instance_busy"
-                if ctx.channel == "build"
-                else "surface_quota_exceeded"
-            )
-            if not ctx.borrow_enabled:
-                _raise(
-                    capacity_code,
-                    message=(
-                        f"渠道 '{ctx.channel}' 实例预算已满，无法为账号 "
-                        f"'{candidate.account_id}' 装载/切换实例。"
-                    ),
-                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
-                )
-            borrow_ids = {
-                item.account_id
-                for item in ctx.candidates
-                if item.account_id not in ctx.failed
-                and item.account_id not in ctx.attempted
-            }
-            if not borrow_ids:
-                _raise(
-                    capacity_code,
-                    message=f"渠道 '{ctx.channel}' 无空闲可借实例：{exc}",
-                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
-                )
+        except TypeError:
+            return bool(checker(account_id, model=route.model))
+
+    def _routing_settings(self) -> dict[str, object]:
+        if self._routing_settings_provider is not None:
             try:
-                lease = await self.pool.acquire(
+                return dict(self._routing_settings_provider())
+            except Exception as exc:
+                logger.warning(
+                    "[routing] 路由配置读取失败，回退 max_switches=2、"
+                    "retry_same_delay_sec=%.1f: %s",
+                    DEFAULT_RETRY_SAME_DELAY_SEC,
+                    exc,
+                )
+                return {
+                    "max_switches": 2,
+                    "retry_same_delay_sec": DEFAULT_RETRY_SAME_DELAY_SEC,
+                }
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_routing_settings,
+        )
+
+        return get_configured_routing_settings()
+
+    def _max_retries(self) -> int:
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_rotator_settings,
+        )
+
+        raw = get_configured_rotator_settings().get("max_retries", 5)
+        return max(1, _as_int(raw, 5))
+
+    async def _ensure_started(self) -> None:
+        """Create/await instance records before the first request hits the pool."""
+        if getattr(self._manager, "configured_surfaces", frozenset()):
+            return
+        startup = getattr(self._manager, "startup", None)
+        if not callable(startup):
+            return
+        result = startup()
+        if inspect.isawaitable(result):
+            await result
+
+    async def _wake(self, route: ModelRoute) -> None:
+        wake = getattr(self._manager, "wake_eligible", None)
+        if not callable(wake):
+            return
+        try:
+            result = wake(paid=route.paid, surface=route.surface)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("[routing] 唤醒休眠实例失败: %s", exc)
+
+    # -------------------------------------------------------------- execution
+
+    async def acquire(self, context: RouteContext) -> RouteAttempt | None:
+        manager = self._manager
+        last_error: Exception | None = None
+        while True:
+            candidate = context.next_candidate()
+            if candidate is None:
+                return None
+            context.attempted_instances.add(candidate.instance_id)
+            try:
+                if candidate.state in (
+                    InstanceState.UNSTARTED,
+                    InstanceState.SLEEPING,
+                ):
+                    wake_one = getattr(manager, "wake", None)
+                    if callable(wake_one):
+                        wake_result = wake_one(candidate.instance_id)
+                        if inspect.isawaitable(wake_result):
+                            await wake_result
+                handle: RequestHandle = await manager.begin_request(
+                    candidate.instance_id
+                )
+                session = handle.slot.session
+                if session is None:
+                    handle.release()
+                    raise SurfaceCapacityError(surface=context.route.surface)
+                client = InstanceRequestClient(
+                    session,
                     account_id=candidate.account_id,
-                    auth_file=auth_file,
-                    auth_user=auth_user,
-                    channel=ctx.channel,
-                    surface=ctx.surface,
-                    timeout_s=0.0,
-                    borrow_accounts=borrow_ids,
-                    group_name=candidate.group.name or candidate.group.source,
-                    group_max_pages=candidate.group.max_pages,
+                    tier=candidate.tier,
+                    surface=candidate.surface,
                 )
-            except InstanceCapacityError as borrow_exc:
-                _raise(
-                    capacity_code,
-                    message=(f"渠道 '{ctx.channel}' 无可用/可借实例：{borrow_exc}"),
-                    advice="等待当前实例释放；build 不跨账号抢占单实例名额。",
+                context.register_attempt()
+                context.attempted_accounts.add(candidate.account_id)
+                logger.info(
+                    "[routing] acquire instance=%s account=%s attempt=%d",
+                    candidate.instance_id,
+                    candidate.account_id,
+                    context.total_attempts,
                 )
-        logger.info(
-            "[surface] request=%s account=%s channel=%s realm=%s slot=%s borrow=%s step=⑤",
-            ctx.request_id,
-            lease.account_id,
-            lease.channel,
-            lease.realm_id,
-            lease.slot_index,
-            lease.is_borrow,
-        )
-        return lease
+                return RouteAttempt(
+                    candidate=candidate, handle=handle, client=client
+                )
+            except (RoutingError, TierRequiredError):
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "[routing] 实例 %s 不可用，尝试下一个候选: %s",
+                    candidate.instance_id,
+                    exc,
+                )
+                continue
 
-    async def land(
+        raise SurfaceCapacityError(
+            surface=context.route.surface,
+            message=f"没有可用实例: {last_error}" if last_error else None,
+        )
+
+    async def release(self, attempt: RouteAttempt) -> None:
+        attempt.handle.release()
+
+    def record_success(
         self,
-        ctx: RouteContext,
-        candidate: Candidate,
+        context: RouteContext,
+        attempt: RouteAttempt,
         *,
-        require_idle: bool = True,
-    ) -> InstanceLease:
-        """Compatibility alias for v3 acquire."""
-        return await self.acquire(ctx, candidate, require_idle=require_idle)
-
-    async def release(self, ctx: RouteContext, lease: InstanceLease | None) -> None:
-        del ctx
-        if lease is not None:
-            await self.pool.release(lease)
-
-    def record_retry(self, ctx: RouteContext, reason: str) -> None:
-        ctx.budget.record_retry()
-        ctx.last_reason = reason
-        logger.info(
-            "[surface] request=%s retry_same reason=%s budget=%s",
-            ctx.request_id,
-            reason,
-            ctx.budget.snapshot(),
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+    ) -> None:
+        context.retry_same = False
+        context.last_reason = "success"
+        if not context.record_attempts:
+            return
+        record_rotator_event(
+            "success",
+            account_id=attempt.account_id,
+            model=context.route.model,
+            surface=context.route.surface,
+            usage=usage,
+            rotator=self._rotator_or_none(),
         )
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(
+                    context.route.model,
+                    "success",
+                    usage=usage,
+                    finish_reason=finish_reason,
+                )
+            except Exception as exc:
+                logger.debug("[routing] 统计记录失败: %s", exc)
 
-    def record_switch(self, ctx: RouteContext, reason: str) -> None:
-        if self._breaker.is_open():
-            _raise(
-                "surface_switch_exhausted",
-                message="路由熔断已打开，拒绝继续切换账号/实例。",
-                advice="请稍后重试并检查上游账号健康状态；本次请求不继续切换。",
+    def record_empty_retry(
+        self, context: RouteContext, attempt: RouteAttempt
+    ) -> None:
+        """Record one independent attempt for an empty-response retry."""
+        if not context.record_attempts:
+            return
+        record_rotator_event(
+            "error",
+            account_id=attempt.account_id,
+            model=context.route.model,
+            surface=context.route.surface,
+            rotator=self._rotator_or_none(),
+        )
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(context.route.model, "errors")
+            except Exception as exc:
+                logger.debug("[routing] 空响应重试统计记录失败: %s", exc)
+
+    def record_client(
+        self,
+        model: str,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None:
+        """Record one client-request terminal outcome (never per attempt)."""
+        if self._client_recorder is None:
+            return
+        try:
+            self._client_recorder(
+                model,
+                result,
+                usage=usage,
+                finish_reason=finish_reason,
+                rescued=rescued,
             )
-        if not ctx.budget.record_switch():
-            _raise(
-                "surface_switch_exhausted",
-                message=(
-                    "单请求切换预算已耗尽"
-                    f"（max_switches={ctx.budget.snapshot()['max_switches']}）。"
-                ),
-                advice="请调高 features.routing.max_switches 或修复上游账号；本次请求不继续切换。",
+        except Exception as exc:
+            logger.debug("[routing] client 终态记录失败: %s", exc)
+
+    def record_count(
+        self, model: str, result: str, *, input_tokens: int = 0
+    ) -> None:
+        """Record one isolated countTokens terminal (no attempt/quota)."""
+        if self._count_token_recorder is None:
+            return
+        try:
+            self._count_token_recorder(
+                model, result, input_tokens=input_tokens
             )
-        ctx.last_reason = reason
+        except Exception as exc:
+            logger.debug("[routing] countTokens 统计记录失败: %s", exc)
+
+    async def handle_error(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exc: Exception,
+        *,
+        has_yielded_data: bool = False,
+    ) -> Literal["retry_same", "switch", "raise"]:
+        context.last_reason = type(exc).__name__
+        if isinstance(exc, TierRequiredError):
+            raise exc
+        if isinstance(exc, ValueError):
+            raise RequestError(400, str(exc)) from exc
+        reason_summary = _summarize_error(exc)
+
+        if isinstance(exc, SessionExpiredError):
+            self._record_error("session_expired", context, attempt, exc=exc)
+            attempt.client.clear_templates()
+            if has_yielded_data:
+                raise exc
+            return await self._switch_or_raise(
+                context, attempt, exc, reason="session_expired"
+            )
+
+        if isinstance(exc, AuthError):
+            if not tier_allows(attempt.candidate.tier, context.route):
+                # The upstream call really happened and returned 403 on a
+                # tier that cannot satisfy the route: count it as an attempt
+                # before surfacing the tier error.
+                self._record_error("auth_error", context, attempt, exc=exc)
+                raise self._tier_error(
+                    context.route, attempt.candidate.tier
+                ) from exc
+            self._record_error("auth_error", context, attempt, exc=exc)
+            if has_yielded_data:
+                attempt.client.clear_templates()
+                raise exc
+            if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
+                # 403 常见根因是页面缓存的 SAPISID/__Secure-1PSIDTS 已过期；
+                # 先用仍然有效的浏览器会话重新取 cookie，再重新签名重试。
+                if await self._refresh_auth_state(context, attempt, reason_summary):
+                    attempt.same_retries += 1
+                    context.retry_same = True
+                    context.budget.record_retry("403")
+                    attempt.client.clear_templates()
+                    logger.warning(
+                        "[routing] 403 同账号重新签名重试 model=%s surface=%s "
+                        "instance=%s account=%s reason=%s",
+                        context.route.model,
+                        context.route.surface,
+                        attempt.instance_id,
+                        attempt.account_id,
+                        reason_summary,
+                    )
+                    return "retry_same"
+                logger.warning(
+                    "[routing] 403 鉴权刷新失败，拒绝重发过期凭据改走切换/报错 "
+                    "model=%s surface=%s instance=%s account=%s reason=%s",
+                    context.route.model,
+                    context.route.surface,
+                    attempt.instance_id,
+                    attempt.account_id,
+                    reason_summary,
+                )
+            return await self._switch_or_raise(
+                context, attempt, exc, reason="auth_error"
+            )
+
+        if isinstance(exc, UsageLimitExceeded):
+            self._record_error("rate_limited", context, attempt, exc=exc)
+            if has_yielded_data:
+                raise exc
+            if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
+                attempt.same_retries += 1
+                context.retry_same = True
+                context.budget.record_retry("429")
+                logger.warning(
+                    "[routing] 429 同账号重试 model=%s surface=%s "
+                    "instance=%s account=%s reason=%s",
+                    context.route.model,
+                    context.route.surface,
+                    attempt.instance_id,
+                    attempt.account_id,
+                    reason_summary,
+                )
+                if context.retry_same_delay_sec > 0:
+                    logger.info(
+                        "[routing] 429 同账号退避 %.2fs 后重试 instance=%s",
+                        context.retry_same_delay_sec,
+                        attempt.instance_id,
+                    )
+                    await asyncio.sleep(context.retry_same_delay_sec)
+                return "retry_same"
+            return await self._switch_or_raise(
+                context,
+                attempt,
+                exc,
+                reason="429",
+                quota_exhausted=True,
+            )
+
+        if isinstance(exc, RequestError) and exc.status in (204, 404):
+            if (
+                exc.status == 404
+                and not is_transient_rpc_error(exc)
+            ):
+                self._record_error("error", context, attempt, exc=exc)
+                raise exc
+            if (
+                not has_yielded_data
+                and attempt.same_retries == 0
+                and context.total_attempts < context.max_retries
+            ):
+                # Record the failed upstream execution before retrying the
+                # same instance; the retry (and any later success) adds its
+                # own independent attempt.
+                self._record_error("error", context, attempt, exc=exc)
+                attempt.same_retries += 1
+                context.retry_same = True
+                context.budget.record_retry(f"retry_{exc.status}")
+                attempt.client.clear_templates()
+                logger.warning(
+                    "[routing] %s 同账号重试 model=%s instance=%s account=%s "
+                    "reason=%s",
+                    exc.status,
+                    context.route.model,
+                    attempt.instance_id,
+                    attempt.account_id,
+                    reason_summary,
+                )
+                return "retry_same"
+            self._record_error("error", context, attempt, exc=exc)
+            if exc.status == 204:
+                raise BrowserTransportError(
+                    "上游返回 204 空响应，同账号重试后仍为空"
+                ) from exc
+            raise exc
+
+        if is_browser_session_hang_error(exc):
+            self._record_error("error", context, attempt, exc=exc)
+            attempt.client.clear_templates()
+            if has_yielded_data:
+                raise exc
+            return await self._switch_or_raise(
+                context, attempt, exc, reason="session_hang"
+            )
+
+        if isinstance(exc, RequestError):
+            self._record_error("error", context, attempt, exc=exc)
+            raise exc
+
+        if isinstance(exc, (AistudioError, BrowserTransportError)):
+            self._record_error("error", context, attempt, exc=exc)
+            raise exc
+
+        self._record_error("error", context, attempt, exc=exc)
+        raise exc
+
+    async def _refresh_auth_state(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        reason_summary: str,
+    ) -> bool:
+        """Refresh the same instance's cookie/signature state before a 403 retry.
+
+        Returns False when the client cannot refresh or the live cookie jar no
+        longer carries SAPISID material; callers must then fall back to
+        switching accounts/instances instead of resending stale credentials.
+        """
+        refresher = getattr(attempt.client, "refresh_auth_state", None)
+        if not callable(refresher):
+            logger.warning(
+                "[routing] 客户端不支持 403 鉴权刷新 instance=%s account=%s "
+                "reason=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                reason_summary,
+            )
+            return False
+        try:
+            result = refresher()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.warning(
+                "[routing] 403 鉴权刷新异常 instance=%s account=%s error=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                _summarize_error(exc),
+            )
+            return False
+        refreshed = bool(result)
+        if refreshed:
+            logger.info(
+                "[routing] 403 鉴权态已刷新 instance=%s account=%s model=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                context.route.model,
+            )
+        return refreshed
+
+    async def _try_rebind(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        reason: str,
+        *,
+        reuse: bool,
+        summary: str = "",
+    ) -> bool:
+        """Request-triggered single-slot rebind.
+
+        A lane may have only one configured slot while the account store holds
+        several healthy accounts in that lane (e.g. ``1 Free + 1 Pro`` slots and
+        Free accounts A/B).  A 429 on the sole Free slot marks A failed, but
+        ``next_candidate()`` then has no second instance to switch to.  This
+        path releases the active handle first, picks another eligible account in
+        the same lane, rebinds the *existing* slot in place (close Page/Context,
+        activate the new account), clears the old template cache and lets the
+        caller re-acquire the slot.  It is synchronous with the request and
+        never spawns a background rebind.
+
+        With multiple slots the same heal happens immediately after a dead slot
+        error, but the current request keeps moving to another ready candidate
+        (``reuse=False``) instead of re-taking the slot it just failed.
+
+        There is no per-slot one-rebind cap: one slot may rebind A -> B -> C
+        when each account 429s.  Loop and duplicate protection comes from
+        ``attempted_accounts``/``failed_accounts`` plus the per-request
+        ``max_switches`` budget.
+        """
+        manager = self._manager
+        reassign = getattr(manager, "reassign", None)
+        selector = getattr(self._rotator, "select_rebind_account", None)
+        if not callable(reassign) or not callable(selector):
+            return False
+
+        exclusions = (
+            set(context.failed_accounts)
+            | set(context.attempted_accounts)
+            | {attempt.account_id}
+        )
+        bound_fn = getattr(manager, "instance_account_ids", None)
+        if callable(bound_fn):
+            try:
+                raw_bound = bound_fn()
+            except Exception as exc:
+                logger.debug("[routing] 读取已绑定账号失败: %s", exc)
+                raw_bound = ()
+            bound = (
+                {str(item) for item in raw_bound}
+                if isinstance(raw_bound, (list, tuple, set, frozenset))
+                else set()
+            )
+            bound.discard(attempt.account_id)
+            exclusions |= bound
+
+        # The pool refuses to activate while the handle is held; release it
+        # before touching the slot, then let the caller re-acquire it.
+        await self.release(attempt)
+        if self._instance_active_requests(attempt.instance_id) > 0:
+            logger.info(
+                "[routing] 跳过改绑：实例仍有在途请求 instance=%s",
+                attempt.instance_id,
+            )
+            return False
+
+        for _ in range(len(exclusions) + 1):
+            try:
+                account = selector(
+                    lane=context.route.lane,
+                    model=context.route.model,
+                    surface=context.route.surface,
+                    exclude_account_ids=exclusions,
+                    only_tier=attempt.candidate.only_tier,
+                    min_tier=attempt.candidate.min_tier,
+                    max_tier=attempt.candidate.max_tier,
+                    required_tiers=context.route.required_tiers,
+                )
+            except Exception as exc:
+                logger.warning("[routing] 选择改绑账号失败: %s", exc)
+                return False
+            if account is None:
+                return False
+            target_id = str(getattr(account, "id", "") or "")
+            if not target_id:
+                return False
+            try:
+                result = reassign(attempt.instance_id, target_id)
+                instance = await result if inspect.isawaitable(result) else result
+            except Exception as exc:
+                logger.warning(
+                    "[routing] 单槽请求期改绑失败 instance=%s target=%s: %s",
+                    attempt.instance_id,
+                    target_id,
+                    exc,
+                )
+                context.failed_accounts.add(target_id)
+                exclusions.add(target_id)
+                continue
+
+            if isinstance(instance, Instance):
+                updated = RouteCandidate.from_instance(instance)
+            else:
+                updated = replace(
+                    attempt.candidate,
+                    account_id=target_id,
+                    tier=str(getattr(account, "tier", "") or attempt.candidate.tier),
+                    state=InstanceState.ACTIVE,
+                    in_flight=0,
+                )
+            context.candidates = [
+                updated if candidate.instance_id == attempt.instance_id else candidate
+                for candidate in context.candidates
+            ]
+            if reuse:
+                context.attempted_instances.discard(attempt.instance_id)
+            context.budget.record_switch(reason)
+            context.retry_same = False
+            context.last_reason = f"rebind:{reason}"
+            attempt.client.clear_templates()
+            logger.warning(
+                "[routing] 请求期改绑 reason=%s model=%s surface=%s "
+                "instance=%s %s -> %s reuse=%s detail=%s budget=%s",
+                reason,
+                context.route.model,
+                context.route.surface,
+                attempt.instance_id,
+                attempt.account_id,
+                target_id,
+                reuse,
+                summary,
+                context.budget.snapshot(),
+            )
+            return True
+        return False
+
+    def _instance_active_requests(self, instance_id: str) -> int:
+        getter = getattr(self._manager, "instance_active_requests", None)
+        if not callable(getter):
+            return 0
+        try:
+            value = getter(instance_id)
+            return int(value) if isinstance(value, (int, float, str)) else 0
+        except Exception:
+            return 0
+
+    async def _switch_or_raise(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exc: Exception,
+        *,
+        reason: str,
+        quota_exhausted: bool = False,
+    ) -> Literal["switch"]:
+        if not attempt.account_id:
+            raise exc
+        context.failed_accounts.add(attempt.account_id)
+        can_continue = (
+            context.total_attempts < context.max_retries
+            and context.budget.can_switch()
+        )
+        if can_continue:
+            # Heal the failed slot immediately (429-dead slots must not stay in
+            # the pool).  When another candidate exists the request continues on
+            # it; the rebound slot is healthy for subsequent requests.
+            reuse = context.next_candidate() is None
+            if await self._try_rebind(
+                context,
+                attempt,
+                reason,
+                reuse=reuse,
+                summary=_summarize_error(exc),
+            ):
+                return "switch"
+        if not can_continue or context.next_candidate() is None:
+            if quota_exhausted:
+                raise SurfaceSwitchExhaustedError(
+                    surface=context.route.surface
+                ) from exc
+            raise exc
+        context.budget.record_switch(reason)
+        context.retry_same = False
+        await self._wake(context.route)
         logger.warning(
-            "[surface:switch] request=%s reason=%s budget=%s",
-            ctx.request_id,
+            "[routing] 切换实例 reason=%s model=%s surface=%s from=%s "
+            "detail=%s budget=%s",
             reason,
-            ctx.budget.snapshot(),
+            context.route.model,
+            context.route.surface,
+            attempt.instance_id,
+            _summarize_error(exc),
+            context.budget.snapshot(),
         )
+        return "switch"
 
-    def record_switch_failure(self, ctx: RouteContext) -> None:
-        opened = self._breaker.record_switch_failure()
-        if opened:
-            logger.error(
-                "[surface:circuit] opened request=%s snapshot=%s",
-                ctx.request_id,
-                self._breaker.snapshot(),
-            )
-
-    def record_success(self, ctx: RouteContext) -> None:
-        self._breaker.record_switch_success()
-        ctx.retry_same = False
-        logger.info(
-            "[surface] request=%s success account_budget=%s circuit=%s",
-            ctx.request_id,
-            ctx.budget.snapshot(),
-            self._breaker.snapshot(),
+    def _record_error(
+        self,
+        event: str,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        *,
+        exc: Exception | None = None,
+        summary: str | None = None,
+    ) -> None:
+        if not context.record_attempts:
+            return
+        record_rotator_event(
+            event,
+            account_id=attempt.account_id,
+            model=context.route.model,
+            surface=context.route.surface,
+            reason=_summarize_error(exc, summary) or None,
+            rotator=self._rotator_or_none(),
         )
-
-    def snapshot(self) -> dict[str, object]:
-        features = self._features()
-        raw_slots = features.get("slots")
-        slots: list[object] = raw_slots if isinstance(raw_slots, list) else []
-        planned = sum(
-            1
-            for slot in slots
-            if isinstance(slot, dict) and bool(slot.get("enabled", True))
-        )
-        return {
-            "circuit": self._breaker.snapshot(),
-            "instances": {
-                "contexts": self.pool.snapshot(),
-                "max_contexts": self.pool.max_contexts,
-                "pages": self.pool.page_counts(),
-                "budgets": self.pool.budget_snapshot(),
-                "planned_instances": planned,
-            },
-        }
-
-
-_pipeline: RoutingPipeline | None = None
-_pipeline_client = None
-
-
-def get_routing_pipeline() -> RoutingPipeline | None:
-    """Lazy process-wide pipeline bound to the current runtime client."""
-    global _pipeline, _pipeline_client
-    try:
-        from aistudio_api.api.state import runtime_state
-
-        client = runtime_state.client
-    except Exception:
-        client = None
-    if client is None:
-        return None
-    if _pipeline is None or _pipeline_client is not client:
-        _pipeline = RoutingPipeline(client)
-        _pipeline_client = client
-    return _pipeline
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(
+                    context.route.model,
+                    "rate_limited" if event == "rate_limited" else "errors",
+                )
+            except Exception as exc:
+                logger.debug("[routing] 错误统计记录失败: %s", exc)
 
 
 __all__ = [
-    "Candidate",
+    "GenerationClient",
+    "InstanceManagerProtocol",
+    "RequestHandle",
+    "RequestSlot",
+    "RouteAttempt",
+    "RouteCandidate",
     "RouteContext",
     "RoutingPipeline",
-    "get_routing_pipeline",
+    "RoutingPipelineProtocol",
 ]

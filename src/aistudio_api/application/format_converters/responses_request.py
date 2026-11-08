@@ -1,4 +1,19 @@
-"""OpenAI Responses request -> Gemini request conversion."""
+"""OpenAI Responses request -> Gemini request conversion.
+
+The converter is stateless and lenient by design:
+
+* ``previous_response_id`` (when non-empty) and ``item_reference`` are the only
+  stateful inputs that fail, because they cannot be resolved without a server
+  side store.
+* ``store``/``parallel_tool_calls``/``truncation``/``include``/``metadata``/
+  ``user``/``service_tier``/``reasoning.summary``/``seed`` are accepted and
+  ignored (seed is Gemini-only, E-04).
+* Historical tool calls without signatures fall back to ``signature_cache`` and
+  then ``DUMMY_THOUGHT_SIGNATURE`` (PG-01).
+* Tool arguments and function outputs are always emitted as Gemini Structs
+  (dicts), and an unresolved ``function_call_output.call_id`` is mapped from
+  context or a deterministic fallback name instead of being rejected (PG-08).
+"""
 
 from __future__ import annotations
 
@@ -6,19 +21,27 @@ import json
 from collections.abc import Mapping
 from typing import cast
 
-from aistudio_api.api.schemas_openai_responses import ResponsesRequest
+from aistudio_api.application.contracts.responses import ResponsesRequest
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,
     decode_data_url,
-    parse_arguments,
 )
 from aistudio_api.application.format_converters.media import MediaFetcher
-from aistudio_api.application.format_converters.signature_cache import signature_cache
+from aistudio_api.application.signature_cache import signature_cache
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("format.responses")
 
 _SYSTEM_ROLES = frozenset({"system", "developer"})
 _THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH"})
 _TEXT_PART_TYPES = frozenset({"input_text", "output_text", "text", "refusal"})
+_UNKNOWN_TOOL_NAME = "unknown_tool"
+_LENIENT_TOOL_NAME = "unknown_tool"
+
+
+def _warn_ignored(field: str) -> None:
+    logger.warning("[responses] ignored unsupported field: %s", field)
 
 
 def _text_from_content(content: object, *, field: str) -> str:
@@ -47,7 +70,8 @@ def _text_from_content(content: object, *, field: str) -> str:
             texts.append(text)
         else:
             raise ConversionError(
-                f"unsupported content part type: {part_type}", field=f"{field}[{index}]"
+                f"unsupported content part type: {part_type}",
+                field=f"{field}[{index}]",
             )
     return "\n".join(texts)
 
@@ -110,33 +134,67 @@ def _reasoning_text(item: Mapping[str, object]) -> str:
         value = item.get(key)
         if isinstance(value, list):
             for part in value:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    texts.append(cast("str", part["text"]))
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
     return "\n".join(texts)
 
 
-def _function_output(output: object, *, field: str) -> object:
+def _lenient_arguments(value: object) -> dict[str, object]:
+    """Decode historical call arguments into a Gemini Struct.
+
+    Valid JSON objects pass through; scalars, arrays and non-JSON text are
+    wrapped under ``content`` so the upstream always receives an object
+    (PG-04) without rejecting a replayed conversation (PG-08).
+    """
+    if isinstance(value, dict):
+        return cast("dict[str, object]", value)
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed: object = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return {"content": value}
+        if isinstance(parsed, dict):
+            return cast("dict[str, object]", parsed)
+        return {"content": parsed}
+    return {"content": value}
+
+
+def _function_output(output: object) -> dict[str, object]:
+    """Normalise a function_call_output payload into a Gemini Struct (PG-04)."""
     if output is None:
         return {}
+    if isinstance(output, dict):
+        return cast("dict[str, object]", output)
     if isinstance(output, str):
         try:
             parsed: object = json.loads(output)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             return {"result": output}
-        return parsed if isinstance(parsed, (dict, list)) else {"result": parsed}
+        if isinstance(parsed, dict):
+            return cast("dict[str, object]", parsed)
+        return {"result": parsed}
     if isinstance(output, list):
         texts: list[str] = []
-        for index, part in enumerate(output):
-            if not isinstance(part, dict) or not isinstance(part.get("text"), str):
-                raise ConversionError(
-                    "function_call_output parts must be text",
-                    field=f"{field}[{index}]",
-                )
-            texts.append(cast("str", part["text"]))
-        return {"result": "\n".join(texts)}
-    raise ConversionError(
-        "function_call_output must be a string or text parts", field=field
-    )
+        all_text = True
+        for part in output:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(cast("str", part["text"]))
+            elif isinstance(part, str):
+                texts.append(part)
+            else:
+                all_text = False
+                break
+        if all_text:
+            return {"result": "\n".join(texts)}
+        return {"result": output}
+    return {"result": output}
 
 
 def _function_declaration(
@@ -148,14 +206,20 @@ def _function_declaration(
             f"unsupported tool type: {tool_type} (only function tools are supported)",
             field=f"{field}.type",
         )
-    name = tool.get("name")
+    nested = tool.get("function")
+    source = nested if isinstance(nested, dict) else tool
+    name = source.get("name")
     if not isinstance(name, str) or not name:
         raise ConversionError("function name is required", field=f"{field}.name")
+
     declaration: dict[str, object] = {"name": name}
-    description = tool.get("description")
+    description = source.get("description")
     if isinstance(description, str) and description:
         declaration["description"] = description
-    parameters = tool.get("parameters")
+
+    parameters = source.get("parameters")
+    if parameters is None:
+        parameters = source.get("parametersJsonSchema")
     if parameters is not None:
         if not isinstance(parameters, (dict, list)):
             raise ConversionError(
@@ -171,8 +235,7 @@ def _tool_choice(choice: object) -> dict[str, object] | None:
         return None
     if isinstance(choice, str):
         normalized = choice.strip().lower()
-        mode_by_name = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
-        mode = mode_by_name.get(normalized)
+        mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}.get(normalized)
         if mode is None:
             raise ConversionError(
                 f"unsupported tool_choice value: {choice}", field="tool_choice"
@@ -180,15 +243,47 @@ def _tool_choice(choice: object) -> dict[str, object] | None:
         return {"mode": mode}
     if isinstance(choice, dict):
         choice_type = choice.get("type")
-        if choice_type in {"auto", "none", "required"}:
-            mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[
-                cast("str", choice_type)
-            ]
+        if isinstance(choice_type, str) and choice_type in {
+            "auto",
+            "none",
+            "required",
+        }:
+            mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[choice_type]
             return {"mode": mode}
-        name = choice.get("name")
+        nested = choice.get("function")
+        name = nested.get("name") if isinstance(nested, dict) else choice.get("name")
         if choice_type == "function" and isinstance(name, str) and name:
             return {"mode": "ANY", "allowedFunctionNames": [name]}
     raise ConversionError("unsupported tool_choice object", field="tool_choice")
+
+
+def _text_format_config(text: Mapping[str, object]) -> dict[str, object]:
+    config: dict[str, object] = {}
+    fmt = text.get("format")
+    if not isinstance(fmt, dict):
+        return config
+    fmt_type = fmt.get("type")
+    if fmt_type == "json_schema":
+        schema = fmt.get("schema")
+        if schema is None:
+            nested = fmt.get("json_schema")
+            schema = nested.get("schema") if isinstance(nested, dict) else None
+        if not isinstance(schema, (dict, list)):
+            raise ConversionError(
+                "text.format.schema must be a JSON schema object",
+                field="text.format.schema",
+            )
+        config["responseMimeType"] = "application/json"
+        config["responseSchema"] = schema
+    elif fmt_type == "json_object":
+        config["responseMimeType"] = "application/json"
+        config["responseSchema"] = {"type": "object", "properties": {}}
+    elif fmt_type not in {None, "text"}:
+        raise ConversionError(
+            f"unsupported text.format.type: {fmt_type}",
+            field="text.format.type",
+        )
+    return config
 
 
 def _generation_config(req: ResponsesRequest) -> dict[str, object]:
@@ -211,52 +306,165 @@ def _generation_config(req: ResponsesRequest) -> dict[str, object]:
                     field="reasoning.effort",
                 )
             config["thinkingConfig"] = {"thinkingLevel": level}
+        if reasoning.get("summary") is not None:
+            _warn_ignored("reasoning.summary")
 
-    text = req.text
-    if isinstance(text, dict):
-        fmt = text.get("format")
-        if isinstance(fmt, dict):
-            fmt_type = fmt.get("type")
-            if fmt_type == "json_schema":
-                schema = fmt.get("schema")
-                if not isinstance(schema, (dict, list)):
-                    raise ConversionError(
-                        "text.format.schema must be a JSON schema object",
-                        field="text.format.schema",
-                    )
-                config["responseMimeType"] = "application/json"
-                config["responseSchema"] = schema
-            elif fmt_type == "json_object":
-                config["responseMimeType"] = "application/json"
-                config["responseSchema"] = {"type": "object", "properties": {}}
-            elif fmt_type not in {None, "text"}:
-                raise ConversionError(
-                    f"unsupported text.format.type: {fmt_type}",
-                    field="text.format.type",
-                )
+    if req.text is not None:
+        config.update(_text_format_config(req.text))
+
+    if req.seed is not None:
+        # E-04: seed is Gemini-only; Responses must accept and ignore it.
+        _warn_ignored("seed")
     return config
+
+
+def _warn_lenient(reason: str, *, index: int, **fields: object) -> None:
+    detail = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    logger.warning(
+        "[pg08] lenient responses history reason=%s item=%d%s",
+        reason,
+        index,
+        f" {detail}" if detail else "",
+    )
+
+
+def _match_tool_name(
+    names: dict[str, str],
+    pending: list[tuple[str, str]],
+    *,
+    call_id: str,
+    declared_name: str | None,
+) -> tuple[str, str]:
+    """Resolve a function output name without ever rejecting the request."""
+    existing = names.get(call_id)
+    if existing is not None:
+        pending[:] = [item for item in pending if item[0] != call_id]
+        return call_id, existing
+    if declared_name:
+        for position, (_pending_id, pending_name) in enumerate(pending):
+            if pending_name == declared_name:
+                pending.pop(position)
+                names[call_id] = pending_name
+                return call_id, pending_name
+        names[call_id] = declared_name
+        return call_id, declared_name
+    if len(pending) == 1:
+        _pending_id, pending_name = pending.pop()
+        names[call_id] = pending_name
+        return call_id, pending_name
+    names[call_id] = _LENIENT_TOOL_NAME
+    return call_id, _LENIENT_TOOL_NAME
+
+
+def _optional_str(item: Mapping[str, object], key: str) -> str | None:
+    value = item.get(key)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _message_role(item: Mapping[str, object], *, field: str) -> str:
+    role = item.get("role")
+    if not isinstance(role, str):
+        raise ConversionError("message role is required", field=f"{field}.role")
+    return role
+
+
+def _function_call_id(
+    item: Mapping[str, object], *, index: int, call_index: int
+) -> str:
+    raw = _optional_str(item, "call_id") or _optional_str(item, "id")
+    if raw is not None:
+        return raw
+    _warn_lenient("function-call-id-missing", index=index, call=call_index)
+    return f"call_auto_{index}_{call_index}"
+
+
+def _function_call_part(
+    item: Mapping[str, object],
+    *,
+    index: int,
+    call_index: int,
+) -> tuple[str, str, dict[str, object]]:
+    call_id = _function_call_id(item, index=index, call_index=call_index)
+    name = _optional_str(item, "name") or _UNKNOWN_TOOL_NAME
+    if name == _UNKNOWN_TOOL_NAME:
+        _warn_lenient("function-call-name-missing", index=index, call=call_index)
+    args = _lenient_arguments(item.get("arguments"))
+    explicit = _optional_str(item, "thought_signature") or _optional_str(
+        item, "thoughtSignature"
+    )
+    signature = explicit or signature_cache.get(call_id) or DUMMY_THOUGHT_SIGNATURE
+    function_call = {"name": name, "args": args, "id": call_id}
+    part: dict[str, object] = {
+        "functionCall": function_call,
+        "thoughtSignature": signature,
+    }
+    return call_id, name, part
+
+
+def _function_output_part(
+    item: Mapping[str, object],
+    *,
+    index: int,
+    names: dict[str, str],
+    pending: list[tuple[str, str]],
+) -> dict[str, object]:
+    call_id = _optional_str(item, "call_id") or _optional_str(item, "id")
+    if call_id is None:
+        _warn_lenient("function-output-id-missing", index=index)
+        call_id = f"call_output_{index}"
+    declared_name = _optional_str(item, "name")
+    resolved_id, name = _match_tool_name(
+        names, pending, call_id=call_id, declared_name=declared_name
+    )
+    if name == _LENIENT_TOOL_NAME:
+        _warn_lenient("unresolved-function-output", index=index)
+    response = _function_output(item.get("output"))
+    return {
+        "functionResponse": {
+            "name": name,
+            "response": response,
+            "id": resolved_id,
+        }
+    }
 
 
 async def convert_responses_request(
     req: ResponsesRequest, media: MediaFetcher
 ) -> dict[str, object]:
     """Convert a Responses request into a Gemini request-shaped dict."""
-    if req.store:
+    previous = (req.previous_response_id or "").strip()
+    if previous:
         raise ConversionError(
-            "store=true is not supported by this stateless proxy", field="store"
-        )
-    if req.previous_response_id:
-        raise ConversionError(
-            "previous_response_id is not supported by this stateless proxy",
+            "previous_response_id requires server-side state and is not supported "
+            "by this stateless proxy",
             field="previous_response_id",
         )
+    if req.store is not None:
+        _warn_ignored("store")
+    provided = req.model_fields_set
+    for field in (
+        "parallel_tool_calls",
+        "truncation",
+        "include",
+        "metadata",
+        "user",
+        "service_tier",
+    ):
+        if field in provided:
+            _warn_ignored(field)
 
     contents: list[dict[str, object]] = []
     system_texts: list[str] = []
-    tool_names: dict[str, str] = {}
+    names: dict[str, str] = {}
+    pending: list[tuple[str, str]] = []
 
     if req.instructions:
-        system_texts.append(_text_from_content(req.instructions, field="instructions"))
+        text = _text_from_content(req.instructions, field="instructions")
+        if text:
+            system_texts.append(text)
 
     def append_content(role: str, parts: list[dict[str, object]]) -> None:
         if not parts:
@@ -276,10 +484,11 @@ async def convert_responses_request(
     for index, item in enumerate(items):
         field = f"input[{index}]"
         item_type = item.get("type")
+        if item_type is None and item.get("role") is not None:
+            # EasyInputMessage: ``{role, content}`` without a ``type`` field.
+            item_type = "message"
         if item_type == "message":
-            role = item.get("role")
-            if not isinstance(role, str):
-                raise ConversionError("message role is required", field=f"{field}.role")
+            role = _message_role(item, field=field)
             if role in _SYSTEM_ROLES:
                 text = _text_from_content(item.get("content"), field=f"{field}.content")
                 if text:
@@ -296,57 +505,17 @@ async def convert_responses_request(
             continue
 
         if item_type == "function_call":
-            call_id = item.get("call_id")
-            name = item.get("name")
-            if not isinstance(call_id, str) or not call_id:
-                raise ConversionError(
-                    "function_call requires call_id", field=f"{field}.call_id"
-                )
-            if not isinstance(name, str) or not name:
-                raise ConversionError(
-                    "function_call requires name", field=f"{field}.name"
-                )
-            args = parse_arguments(item.get("arguments"), field=f"{field}.arguments")
-            signature = signature_cache.get(call_id) or DUMMY_THOUGHT_SIGNATURE
-            tool_names[call_id] = name
-            append_content(
-                "model",
-                [
-                    {
-                        "functionCall": {"name": name, "args": args, "id": call_id},
-                        "thoughtSignature": signature,
-                    }
-                ],
-            )
+            call_id, name, part = _function_call_part(item, index=index, call_index=0)
+            names[call_id] = name
+            pending.append((call_id, name))
+            append_content("model", [part])
             continue
 
         if item_type == "function_call_output":
-            call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                raise ConversionError(
-                    "function_call_output requires call_id",
-                    field=f"{field}.call_id",
-                )
-            name = tool_names.get(call_id)
-            if name is None:
-                raise ConversionError(
-                    f"call_id '{call_id}' does not match any prior function_call",
-                    field=f"{field}.call_id",
-                )
-            append_content(
-                "user",
-                [
-                    {
-                        "functionResponse": {
-                            "name": name,
-                            "response": _function_output(
-                                item.get("output"), field=f"{field}.output"
-                            ),
-                            "id": call_id,
-                        }
-                    }
-                ],
+            part = _function_output_part(
+                item, index=index, names=names, pending=pending
             )
+            append_content("user", [part])
             continue
 
         if item_type == "reasoning":
@@ -383,3 +552,6 @@ async def convert_responses_request(
     if config:
         body["generationConfig"] = config
     return body
+
+
+__all__ = ["convert_responses_request"]

@@ -7,11 +7,15 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from aistudio_api.api.dependencies import get_runtime_state
+from aistudio_api.api.dependencies import (
+    get_runtime_state,
+    require_api_key_or_web_session,
+)
 from aistudio_api.api.response_models import (
     GeminiModelListResponse,
     GeminiModelResponse,
 )
+from aistudio_api.api.state import discovery_sessions_for
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("routes.models")
@@ -21,10 +25,19 @@ if TYPE_CHECKING:
 router = APIRouter()
 
 
-def _to_gemini_model(
-    model_data: Mapping[str, object], *, id_override: str | None = None
-) -> GeminiModelResponse:
-    raw_id = id_override or str(model_data.get("id") or model_data.get("name") or "")
+def _ui_debug_models(
+    runtime_state: RuntimeState,
+) -> list[dict[str, object]] | None:
+    """Return the built-in offline catalog while ui_debug is enabled."""
+    if not getattr(runtime_state, "ui_debug", False):
+        return None
+    from aistudio_api.api.ui_sandbox import sandbox_model_catalog
+
+    return sandbox_model_catalog()
+
+
+def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
+    raw_id = str(model_data.get("id") or model_data.get("name") or "")
     clean_id = raw_id.removeprefix("models/")
     name = f"models/{clean_id}"
     version = str(model_data.get("version") or "001")
@@ -74,49 +87,74 @@ def _to_gemini_model(
     )
 
 
-@router.get("/v1beta/models", response_model=GeminiModelListResponse)
+@router.get(
+    "/v1beta/models",
+    response_model=GeminiModelListResponse,
+    dependencies=[Depends(require_api_key_or_web_session)],
+)
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelListResponse:
-    session = runtime_state.client._session if runtime_state.client else None
-    from aistudio_api.application.model_catalog import (
-        clean_model_id,
-        project_model_ids,
-        split_catalog_prefix,
-    )
-    from aistudio_api.infrastructure.gateway.model_defaults import get_features_config
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-    discovered = await model_discovery.get_models(session=session)
-    projected = project_model_ids(discovered, get_features_config())
-    by_clean = {
-        clean_model_id(item.get("id") or item.get("name")): item for item in discovered
-    }
-    models = [
-        _to_gemini_model(
-            by_clean[split_catalog_prefix(projected_id)[0]],
-            id_override=projected_id,
+    """Return bare model IDs; discovery owns model/paid metadata."""
+    discovered = _ui_debug_models(runtime_state)
+    if discovered is None:
+        sessions = discovery_sessions_for(runtime_state)
+        from aistudio_api.infrastructure.gateway.model_discovery import (
+            model_discovery,
         )
-        for projected_id in projected
-    ]
-    logger.info("获取模型列表完成 (共发现 %d 个)", len(models))
+
+        discovered = await model_discovery.get_models(sessions=sessions)
+    models = [_to_gemini_model(item) for item in discovered]
+    logger.info("获取模型列表完成: 数量=%d", len(models))
     return GeminiModelListResponse(models=models)
 
 
-@router.get("/v1beta/models/{model_id:path}", response_model=GeminiModelResponse)
+@router.get(
+    "/api/models",
+    response_model=GeminiModelListResponse,
+    dependencies=[Depends(require_api_key_or_web_session)],
+)
+async def list_models_admin(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> GeminiModelListResponse:
+    """Admin model list; ui_debug returns the offline catalog, otherwise 404.
+
+    The production admin UI consumes ``/v1beta/models``; keeping this alias
+    ui_debug-only avoids adding a second real catalog surface.
+    """
+    discovered = _ui_debug_models(runtime_state)
+    if discovered is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return GeminiModelListResponse(
+        models=[_to_gemini_model(item) for item in discovered]
+    )
+
+
+@router.get(
+    "/v1beta/models/{model_id:path}",
+    response_model=GeminiModelResponse,
+    dependencies=[Depends(require_api_key_or_web_session)],
+)
 async def get_model(
     model_id: str,
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelResponse:
-    session = runtime_state.client._session if runtime_state.client else None
-    from aistudio_api.application.model_catalog import resolve_model_request
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+    sandbox_models = _ui_debug_models(runtime_state)
+    if sandbox_models is not None:
+        from aistudio_api.api.ui_sandbox import sandbox_model_by_id
 
-    clean_id, _channel = resolve_model_request(model_id)
-    model_info = await model_discovery.get_model_by_id(clean_id, session=session)
-    if model_info is not None:
-        logger.info("成功获取模型元数据: %s", model_id)
-        return _to_gemini_model(
-            model_info, id_override=model_id.removeprefix("models/")
+        model_info = sandbox_model_by_id(model_id)
+    else:
+        sessions = discovery_sessions_for(runtime_state)
+        from aistudio_api.infrastructure.gateway.model_discovery import (
+            model_discovery,
         )
+
+        model_info = await model_discovery.get_model_by_id(
+            model_id, sessions=sessions
+        )
+    if model_info is not None:
+        logger.info("获取模型详情成功: model=%s", model_id)
+        return _to_gemini_model(model_info)
+    logger.warning("请求的模型未找到: model=%s", model_id)
     raise HTTPException(status_code=404, detail="Model not found")

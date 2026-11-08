@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -41,33 +42,7 @@ def _load_int_env(*names: str, default: int) -> int:
     value = _load_env(*names)
     if value is None:
         return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _load_float_env(*names: str, default: float, minimum: float | None = None) -> float:
-    """读取浮点环境变量；解析失败回退默认值，可选下界钳制（对齐 Ark 语义）。"""
-    value = _load_env(*names)
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if minimum is not None:
-        parsed = max(minimum, parsed)
-    return parsed
-
-
-def _load_choice_env(*names: str, default: str, choices: tuple[str, ...]) -> str:
-    """读取枚举环境变量；非法取值静默回退默认值（大小写不敏感）。"""
-    value = _load_env(*names)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    return normalized if normalized in choices else default
+    return int(value)
 
 
 def _load_web_password() -> str | None:
@@ -86,7 +61,7 @@ def _load_dump_requests_env() -> bool:
 
 
 def _load_dump_to_file_env() -> bool:
-    """检查 AISTUDIO_DUMP_FILE / AISTUDIO_DUMP_TO_FILE 环境变量是否启用请求转储落盘。"""
+    """检查 AISTUDIO_DUMP_FILE / AISTUDIO_DUMP_TO_FILE 环境变量是否启用将请求转储持久化保存到文件。"""
     val = _load_env("AISTUDIO_DUMP_FILE", "AISTUDIO_DUMP_TO_FILE")
     if val is None:
         return False
@@ -100,17 +75,54 @@ _TEMPLATE_CONFIG_PATHS = (
     _PROJECT_ROOT / "defaults" / "config.yaml",
     _DEFAULT_CONFIG_PATH,
 )
+_DOCKER_TEMPLATE_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+# path -> ((mtime_ns, size), enabled).  Kept tiny: one entry per configured path.
+_FINGERPRINT_SPOOF_CACHE: dict[str, tuple[tuple[int, int], bool]] = {}
+_FINGERPRINT_SPOOF_CACHE_LOCK = Lock()
+
+
+def resolve_default_config_template() -> Path:
+    """解析受版本控制的默认配置模板路径（配置默认值的唯一来源）。
+
+    优先级：仓库 ``<root>/defaults/config.yaml`` > 容器内
+    ``/app/defaults/config.yaml``。模板缺失时抛出 :class:`FileNotFoundError`，
+    由调用方转换为配置校验错误，绝不回退到内嵌默认字典。
+    """
+    for candidate in (
+        _PROJECT_ROOT / "defaults" / "config.yaml",
+        _DOCKER_TEMPLATE_CONFIG_PATH,
+    ):
+        if candidate.is_file():
+            return candidate
+    checked = " / ".join(
+        str(path)
+        for path in (
+            _PROJECT_ROOT / "defaults" / "config.yaml",
+            _DOCKER_TEMPLATE_CONFIG_PATH,
+        )
+    )
+    raise FileNotFoundError(
+        f"找不到默认配置模板 defaults/config.yaml（已查找：{checked}）"
+    )
 
 
 def resolve_config_file(config_path: str | os.PathLike[str] | None = None) -> Path:
-    """解析配置文件路径（优先使用 AISTUDIO_CONFIG_FILE 环境变量）。
+    """解析运行时配置文件路径。
 
-    若目标路径配置文件不存在，则自动从内置配置模板初始化复制，绝不覆盖已有配置文件。
+    优先级：显式 ``config_path`` > ``AISTUDIO_CONFIG_PATH`` >
+    ``AISTUDIO_CONFIG_FILE``（向后兼容）> 项目根 ``config.yaml``。
+    ``AISTUDIO_CONFIG_PATH`` 与 ``AISTUDIO_CONFIG_FILE`` 同时存在时前者优先。
+
+    若目标路径配置文件不存在，则自动从内置配置模板（``defaults/config.yaml``）
+    初始化复制并创建父目录，绝不覆盖已有配置文件。
     """
     if config_path is not None:
         target = Path(config_path)
     else:
-        override = os.getenv("AISTUDIO_CONFIG_FILE")
+        override = os.getenv("AISTUDIO_CONFIG_PATH") or os.getenv(
+            "AISTUDIO_CONFIG_FILE"
+        )
         target = Path(override) if override else _DEFAULT_CONFIG_PATH
 
     if not target.exists():
@@ -151,16 +163,6 @@ def resolve_stats_file() -> Path:
     return resolve_data_dir() / "stats.json"
 
 
-def resolve_model_cache_file() -> Path:
-    """解析最后一次模型发现快照路径（优先使用 AISTUDIO_MODEL_CACHE_FILE）。"""
-    override = os.getenv("AISTUDIO_MODEL_CACHE_FILE")
-    if override:
-        path = Path(override).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-    return resolve_data_dir() / "models_cache.json"
-
-
 def resolve_rotator_state_file() -> Path:
     """解析账号调度与 429 冷却状态持久化文件路径（优先使用 AISTUDIO_ROTATOR_STATE_FILE）。"""
     override = os.getenv("AISTUDIO_ROTATOR_STATE_FILE")
@@ -169,6 +171,16 @@ def resolve_rotator_state_file() -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
     return resolve_data_dir() / "rotator_state.json"
+
+
+def resolve_model_cache_file() -> Path:
+    """解析最后一次模型发现快照路径（优先使用 AISTUDIO_MODEL_CACHE_FILE）。"""
+    override = os.getenv("AISTUDIO_MODEL_CACHE_FILE")
+    if override:
+        path = Path(override).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    return resolve_data_dir() / "models_cache.json"
 
 
 _AUTH_SEARCH_ROOTS = [
@@ -188,7 +200,7 @@ def discover_auth_file() -> str | None:
         registry_path = root / "accounts" / "registry.json"
         if registry_path.exists():
             try:
-                registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                registry = json.loads(registry_path.read_text())
                 active_id = registry.get("active_account_id")
                 if active_id:
                     auth_path = root / "accounts" / active_id / "auth.json"
@@ -273,14 +285,107 @@ def resolve_locale() -> str:
     return "en-US"
 
 
-def _resolve_default_idle_timeout() -> int:
-    env_val = os.getenv("AISTUDIO_BROWSER_IDLE_TIMEOUT")
-    if env_val is not None and env_val.strip() != "":
-        return int(env_val)
-    # Disabled by default: a request can always wake the browser, and recycling
-    # while instances exist leaves stale slots/pages. Users who prefer aggressive
-    # memory reclamation can opt in explicitly.
-    return 0
+def resolve_hash_include_code() -> bool:
+    """D-09 诊断开关：snapshot hash 是否包含代码 part（默认开启）。
+
+    仅用于诊断，不进入普通用户 UI。优先级：AISTUDIO_HASH_INCLUDE_CODE 环境变量
+    > ``diagnostics.hash_include_code`` 配置 > 默认 True。
+    """
+    env_value = _load_env("AISTUDIO_HASH_INCLUDE_CODE")
+    if env_value is not None:
+        return env_value.strip().lower() not in ("0", "false", "no", "off")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8")) or {}
+        diagnostics = raw.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            value = diagnostics.get("hash_include_code")
+            if isinstance(value, bool):
+                return value
+    except Exception:
+        pass
+    return True
+
+
+def resolve_ui_debug() -> bool:
+    """C2a 纯离线 UI 调试沙箱开关（默认关闭）。
+
+    优先级：``AISTUDIO_UI_DEBUG`` 环境变量（1/true/yes/on）>
+    ``diagnostics.ui_debug`` 配置 > 默认 False。开启后服务端不得构造真实
+    AIStudioClient/BrowserEngine、组件启动预热或访问真实账号/网络。
+    """
+    env_value = _load_env("AISTUDIO_UI_DEBUG")
+    if env_value is not None:
+        return env_value.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8")) or {}
+        diagnostics = raw.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            value = diagnostics.get("ui_debug")
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return False
+
+
+def resolve_fingerprint_spoof_enabled() -> bool:
+    """P3-F 浏览器指纹伪装开关（默认开启）。
+
+    优先级：``AISTUDIO_FINGERPRINT_SPOOF`` 环境变量 >
+    ``browser.fingerprint_spoof_enabled`` 配置 > 默认 True。配置读取失败、键缺失
+    或值类型不合法时保守回退为开启，避免无意间把 SwiftShader 软渲染指纹暴露给
+    上游页面。
+
+    配置解析结果按 ``(path, mtime_ns, size)`` 缓存：``PooledSession.bootstrap``
+    会在事件循环里高频调用本函数，重复 YAML 解析会形成可见的小文件阻塞读。
+    环境变量覆盖每次动态求值，不进入缓存；配置文件的 mtime/size 一旦变化即
+    自动失效并重新解析，文件不可读时仍安全回退为 True。
+    """
+    env_value = _load_env(
+        "AISTUDIO_FINGERPRINT_SPOOF", "AISTUDIO_FINGERPRINT_SPOOF_ENABLED"
+    )
+    if env_value is not None:
+        return env_value.strip().lower() not in ("0", "false", "no", "off")
+
+    path = resolve_config_file()
+    cache_key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        with _FINGERPRINT_SPOOF_CACHE_LOCK:
+            _FINGERPRINT_SPOOF_CACHE.pop(cache_key, None)
+        return True
+
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+    with _FINGERPRINT_SPOOF_CACHE_LOCK:
+        cached = _FINGERPRINT_SPOOF_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
+    enabled = True
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        browser = raw.get("browser")
+        if isinstance(browser, dict):
+            value = browser.get("fingerprint_spoof_enabled")
+            if isinstance(value, bool):
+                enabled = value
+            elif isinstance(value, str):
+                enabled = value.strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        enabled = True
+
+    with _FINGERPRINT_SPOOF_CACHE_LOCK:
+        _FINGERPRINT_SPOOF_CACHE[cache_key] = (fingerprint, enabled)
+    return enabled
 
 
 @dataclass(slots=True)
@@ -290,16 +395,14 @@ class Settings:
         "AISTUDIO_BROWSER_PORT", default=DEFAULT_BROWSER_PORT
     )
     browser_headless: bool = _load_bool_env("AISTUDIO_BROWSER_HEADLESS", default=True)
+    hash_include_code: bool = resolve_hash_include_code()
+    fingerprint_spoof_enabled: bool = resolve_fingerprint_spoof_enabled()
     browser_executable_path: str | None = os.getenv("AISTUDIO_BROWSER_EXECUTABLE")
-    browser_idle_timeout: int = _resolve_default_idle_timeout()
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())
     proxy_url: str | None = discover_proxy_url()
-    aistudio_app_url: str = os.getenv("AISTUDIO_APP_URL", "")
     web_password: str | None = _load_web_password()
     api_keys: frozenset[str] = frozenset()
-    timeout_replay: int = int(os.getenv("AISTUDIO_TIMEOUT_REPLAY", "120"))
-    timeout_stream: int = int(os.getenv("AISTUDIO_TIMEOUT_STREAM", "120"))
     timezone: str = resolve_timezone()
     locale: str = resolve_locale()
     dump_raw_response: bool = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE", "0") in (
@@ -308,7 +411,7 @@ class Settings:
         "True",
     )
     dump_raw_response_dir: str = os.getenv(
-        "AISTUDIO_DUMP_RAW_RESPONSE_DIR", tempfile.gettempdir()
+        "AISTUDIO_DUMP_RAW_RESPONSE_DIR", str(resolve_data_dir() / "dumps")
     )
     data_dir: str = str(resolve_data_dir())
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
@@ -320,42 +423,8 @@ class Settings:
     persist_rotator: bool = _load_bool_env("AISTUDIO_PERSIST_ROTATOR", default=True)
     dump_requests: bool = _load_dump_requests_env()
     dump_to_file: bool = _load_dump_to_file_env()
-    dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", str(_PROJECT_ROOT / "dumps"))
-    # ===== 功能开关框架（WP1）=====
-    # 进程级基线，仅启动时读取一次；运行时可被 config.yaml 的 features 段热重载覆盖
-    # （优先级：config.yaml features.* > AISTUDIO_* 环境变量 > 内置默认值）。
-    build_surface: bool = _load_bool_env("AISTUDIO_BUILD_SURFACE", default=False)
-    atg_mode: str = _load_choice_env(
-        "AISTUDIO_ATG_MODE", default="off", choices=("off", "prefer", "required")
-    )
-    account_refresh_concurrency: int = _load_int_env(
-        "AISTUDIO_ACCOUNT_REFRESH_CONCURRENCY", default=3
-    )
-    route_by_tier: bool = _load_bool_env("AISTUDIO_ROUTE_BY_TIER", default=False)
-    auto_switch: bool = _load_bool_env("AISTUDIO_AUTO_SWITCH", default=False)
-    auto_switch_interval_hours: float = _load_float_env(
-        "AISTUDIO_AUTO_SWITCH_INTERVAL_HOURS", default=3.0, minimum=0.1
-    )
-    keepalive_auth_update: bool = _load_bool_env(
-        "AISTUDIO_KEEPALIVE_AUTH_UPDATE", default=True
-    )
-    keepalive_auth_update_hours: float = _load_float_env(
-        "AISTUDIO_KEEPALIVE_AUTH_UPDATE_HOURS", default=24.0, minimum=0.1
-    )
-    keepalive_metadata_refresh: bool = _load_bool_env(
-        "AISTUDIO_KEEPALIVE_METADATA_REFRESH", default=True
-    )
-    keepalive_metadata_refresh_hours: float = _load_float_env(
-        "AISTUDIO_KEEPALIVE_METADATA_REFRESH_HOURS", default=24.0, minimum=0.1
-    )
-    keepalive_metadata_refresh_on_startup: bool = _load_bool_env(
-        "AISTUDIO_KEEPALIVE_METADATA_REFRESH_ON_STARTUP", default=True
-    )
-    keepalive_active_activity: bool = _load_bool_env(
-        "AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY", default=False
-    )
-    keepalive_active_activity_seconds: float = _load_float_env(
-        "AISTUDIO_KEEPALIVE_ACTIVE_ACTIVITY_SECONDS", default=60.0, minimum=10.0
+    dump_dir: str = os.getenv(
+        "AISTUDIO_DUMP_DIR", str(resolve_data_dir() / "dumps")
     )
     log_level: str = "INFO"
 

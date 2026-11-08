@@ -14,11 +14,13 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from aistudio_api.api import routes_openai
-from aistudio_api.api.dependencies import get_client, get_runtime_state
-from aistudio_api.api.schemas_openai import OpenAIChatRequest
+from aistudio_api.api.dependencies import get_routing_pipeline, get_runtime_state
+from aistudio_api.api.format_errors import format_enabled
+from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.contracts.openai import OpenAIChatRequest
 from aistudio_api.application.format_converters.common import (
     DUMMY_THOUGHT_SIGNATURE,
     ConversionError,
@@ -31,13 +33,11 @@ from aistudio_api.application.format_converters.openai_response import (
     OpenAIStreamRenderer,
     openai_response,
 )
-from aistudio_api.application.format_converters.signature_cache import (
-    signature_cache,
-)
 from aistudio_api.application.generation_service import (
     GenerationOutcome,
     StreamEvent,
 )
+from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
 from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
@@ -191,37 +191,51 @@ async def test_historical_tool_call_without_signature_uses_dummy_signature():
 
 
 @pytest.mark.asyncio
-async def test_unresolved_tool_call_id_is_rejected():
-    with pytest.raises(ConversionError) as exc_info:
-        await _convert(
-            messages=[
-                {"role": "user", "content": "weather?"},
-                {"role": "tool", "tool_call_id": "call_missing", "content": "x"},
-            ]
-        )
-    assert exc_info.value.field == "messages[1].tool_call_id"
+async def test_unresolved_tool_call_id_becomes_legal_function_response():
+    body = await _convert(
+        messages=[
+            {"role": "user", "content": "weather?"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "x"},
+        ]
+    )
+    contents = _as_list(body["contents"])
+    result = next(
+        _as_dict(part["functionResponse"])
+        for content in contents
+        for part in _as_list(content["parts"])
+        if isinstance(part, dict) and "functionResponse" in part
+    )
+    assert result["name"] == "tool_output"
+    assert result["id"] == "call_missing"
+    assert result["response"] == {"result": "x"}
 
 
 @pytest.mark.asyncio
-async def test_malformed_tool_arguments_is_rejected():
-    with pytest.raises(ConversionError) as exc_info:
-        await _convert(
-            messages=[
-                {"role": "user", "content": "hi"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "f", "arguments": "{not json"},
-                        }
-                    ],
-                },
-            ]
-        )
-    assert exc_info.value.field == "messages[1].tool_calls[0].function.arguments"
+async def test_malformed_tool_arguments_are_preserved_as_content():
+    body = await _convert(
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{not json"},
+                    }
+                ],
+            },
+        ]
+    )
+    contents = _as_list(body["contents"])
+    call = next(
+        _as_dict(part["functionCall"])
+        for content in contents
+        for part in _as_list(content["parts"])
+        if isinstance(part, dict) and "functionCall" in part
+    )
+    assert call["args"] == {"content": "{not json"}
 
 
 @pytest.mark.asyncio
@@ -441,6 +455,7 @@ def _outcome(
     *,
     finish_reason: str = "STOP",
     usage: dict[str, object] | None = None,
+    response_id: str | None = "resp-1",
 ) -> GenerationOutcome:
     return GenerationOutcome(
         output=ModelOutput(
@@ -456,7 +471,7 @@ def _outcome(
         ),
         model="gemini-test",
         finish_reason=finish_reason,
-        response_id="resp-1",
+        response_id=response_id,
         surface="chat",
     )
 
@@ -471,7 +486,7 @@ def test_non_stream_response_fields_finish_reason_and_usage():
     )
 
     assert response["object"] == "chat.completion"
-    assert str(response["id"]).startswith("chatcmpl-")
+    assert response["id"] == "resp-1"
     assert isinstance(response["created"], int)
     assert response["model"] == "client-model"
 
@@ -488,6 +503,15 @@ def test_non_stream_response_fields_finish_reason_and_usage():
     assert usage["total_tokens"] == 18
     assert usage["prompt_tokens_details"] == {"cached_tokens": 3}
     assert usage["completion_tokens_details"] == {"reasoning_tokens": 2}
+
+
+def test_non_stream_response_id_falls_back_to_local_id():
+    response = openai_response(
+        model="client-model",
+        outcome=_outcome(Candidate(text="hello"), response_id=None),
+    )
+
+    assert str(response["id"]).startswith("chatcmpl-")
 
 
 def test_non_stream_tool_calls_set_finish_reason_and_json_arguments():
@@ -603,16 +627,56 @@ def test_stream_chunk_sequence_role_thinking_tools_finish_usage_done():
     assert raw.rstrip().endswith("data: [DONE]")
 
 
+def test_stream_prefers_upstream_response_id_and_keeps_local_fallback():
+    renderer = OpenAIStreamRenderer("client-model")
+    first = _sse_payloads(renderer.render(StreamEvent(kind="body", payload="hel")))
+    assert str(first[0]["id"]).startswith("chatcmpl-")
+
+    second = _sse_payloads(
+        renderer.render(
+            StreamEvent(kind="body", payload="lo", response_id="resp-stream")
+        )
+    )
+    assert second[0]["id"] == "resp-stream"
+
+    terminal = _sse_payloads(
+        renderer.render(
+            StreamEvent(
+                kind="usage",
+                payload={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                finish_reason="STOP",
+                response_id="resp-stream",
+            )
+        )
+    )
+    assert terminal[0]["id"] == "resp-stream"
+
+
+def test_stream_local_id_survives_events_without_response_id():
+    renderer = OpenAIStreamRenderer("client-model")
+    raw = renderer.render(StreamEvent(kind="body", payload="hi"))
+    local_id = _sse_payloads(raw)[0]["id"]
+    raw += renderer.render(StreamEvent(kind="thinking", payload="why"))
+
+    ids = [payload["id"] for payload in _sse_payloads(raw)]
+    assert ids == [local_id, local_id]
+    assert str(local_id).startswith("chatcmpl-")
+
+
 # ========== Routes ==========
 
 
-def _app(*, with_client: bool = True) -> FastAPI:
+def _app(*, with_pipeline: bool = True) -> FastAPI:
     app = FastAPI()
     app.include_router(routes_openai.router)
     app.dependency_overrides[routes_openai.require_openai] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key] = lambda: None
+    app.dependency_overrides[routes_openai.require_api_key_or_web_session] = (
+        lambda: None
+    )
     app.dependency_overrides[get_runtime_state] = lambda: SimpleNamespace(client=None)
-    if with_client:
-        app.dependency_overrides[get_client] = lambda: object()
+    if with_pipeline:
+        app.dependency_overrides[get_routing_pipeline] = lambda: object()
     return app
 
 
@@ -635,7 +699,7 @@ async def test_route_format_disabled_returns_permission_error(monkeypatch):
     )
     app = FastAPI()
     app.include_router(routes_openai.router)
-    app.dependency_overrides[get_client] = lambda: object()
+    app.dependency_overrides[get_routing_pipeline] = lambda: object()
 
     response = await _post(
         app,
@@ -727,6 +791,60 @@ async def test_route_stream_first_event_error_returns_http_status(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_route_synthetic_required_non_stream_returns_502_json(monkeypatch):
+    async def failing_generate(**_kwargs: Any) -> GenerationOutcome:
+        raise SyntheticRequiredError("synthetic tool call required")
+
+    monkeypatch.setattr(routes_openai, "generate", failing_generate)
+    monkeypatch.setattr(
+        "aistudio_api.api.routes_openai.format_media_allow_private",
+        lambda: False,
+    )
+
+    response = await _post(
+        _app(),
+        "/v1/chat/completions",
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 502
+    error = _as_dict(_as_dict(response.json())["error"])
+    assert error["type"] == "api_error"
+    assert "synthetic tool call required" in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_route_synthetic_required_pre_stream_returns_502_json(monkeypatch):
+    async def failing_stream(**_kwargs: Any):
+        raise SyntheticRequiredError("synthetic tool call required")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(routes_openai, "stream_generation", failing_stream)
+    monkeypatch.setattr(
+        "aistudio_api.api.routes_openai.format_media_allow_private",
+        lambda: False,
+    )
+
+    response = await _post(
+        _app(),
+        "/v1/chat/completions",
+        {
+            "model": "m",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 502
+    error = _as_dict(_as_dict(response.json())["error"])
+    assert error["type"] == "api_error"
+    assert "synthetic tool call required" in error["message"]
+
+
+@pytest.mark.asyncio
 async def test_route_models_list_and_single_model(monkeypatch):
     async def fake_models(**_kwargs: Any) -> list[dict[str, object]]:
         return [{"id": "models/gemini-x"}, {"name": "gemini-y"}]
@@ -738,7 +856,7 @@ async def test_route_models_list_and_single_model(monkeypatch):
 
     monkeypatch.setattr(model_discovery, "get_models", fake_models)
     monkeypatch.setattr(model_discovery, "get_model_by_id", fake_model)
-    app = _app(with_client=False)
+    app = _app(with_pipeline=False)
 
     listing = await _get(app, "/v1/models")
     assert listing.status_code == 200
@@ -763,7 +881,9 @@ async def test_route_models_list_and_single_model(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_route_models_list_uses_canonical_prefixes(monkeypatch):
+async def test_route_models_list_bare_by_default_and_prefixed_when_both_enabled(
+    monkeypatch,
+):
     async def fake_models(**_kwargs: Any) -> list[dict[str, object]]:
         return [{"id": "models/gemini-x"}]
 
@@ -777,30 +897,38 @@ async def test_route_models_list_uses_canonical_prefixes(monkeypatch):
 
     monkeypatch.setattr(model_discovery, "get_models", fake_models)
     monkeypatch.setattr(model_discovery, "get_model_by_id", fake_model)
-    monkeypatch.setattr(
-        "aistudio_api.infrastructure.gateway.model_defaults.get_features_config",
-        lambda: {
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1},
-                "build": {"enabled": True, "max_pages": 1},
-                "official": {"enabled": False, "max_pages": 0},
-            }
-        },
-    )
-    app = _app(with_client=False)
+    app = _app(with_pipeline=False)
 
     listing = await _get(app, "/v1/models")
     body = _as_dict(listing.json())
-    assert [item["id"] for item in body["data"]] == [
-        "gemini-x",
-        "pg/gemini-x",
-        "build/gemini-x",
-    ]
+    assert [item["id"] for item in body["data"]] == ["gemini-x"]
 
-    single = await _get(app, "/v1/models/pg/gemini-x")
+    both = FastAPI()
+    both.include_router(routes_openai.router)
+    both.dependency_overrides[routes_openai.require_openai] = lambda: None
+    both.dependency_overrides[routes_openai.require_api_key_or_web_session] = (
+        lambda: None
+    )
+    both.dependency_overrides[get_runtime_state] = lambda: SimpleNamespace(
+        client=None,
+        instance_manager=SimpleNamespace(
+            configured_surfaces=frozenset({"chat", "build"})
+        ),
+    )
+    prefixed = await _get(both, "/v1/models")
+    assert {item["id"] for item in _as_dict(prefixed.json())["data"]} == {
+        "gemini-x",
+        "build/gemini-x",
+    }
+
+    single = await _get(both, "/v1/models/build/gemini-x")
     assert single.status_code == 200
-    assert single.json()["id"] == "pg/gemini-x"
+    assert single.json()["id"] == "build/gemini-x"
     assert calls == ["gemini-x"]
+
+    legacy = await _get(both, "/v1/models/pg/gemini-x")
+    assert legacy.status_code == 404
+    assert calls == ["gemini-x", "pg/gemini-x"]
 
 
 def test_require_openai_raises_http_exception_when_disabled(monkeypatch):
@@ -814,10 +942,6 @@ def test_require_openai_raises_http_exception_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tool_call_thought_signature_is_cached_and_reattached():
-    from aistudio_api.application.format_converters.signature_cache import (
-        signature_cache,
-    )
-
     signature_cache.clear()
     outcome = GenerationOutcome(
         output=ModelOutput(
@@ -871,3 +995,63 @@ async def test_tool_call_thought_signature_is_cached_and_reattached():
     contents = cast("list[dict[str, object]]", body["contents"])
     parts = cast("list[dict[str, object]]", contents[0]["parts"])
     assert parts[0]["thoughtSignature"] == "sig-abc"
+
+
+def _http_request(path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1234),
+            "server": ("test", 80),
+        }
+    )
+
+
+def test_protocol_for_request_uses_shared_format_classifier(monkeypatch):
+    from aistudio_api.api import app as app_module
+
+    monkeypatch.setattr(app_module, "format_for_path", lambda _path: "openai")
+    assert (
+        app_module._protocol_for_request(_http_request("/v1beta/x:generateContent"))
+        == "openai"
+    )
+
+    monkeypatch.setattr(app_module, "format_for_path", lambda _path: "gemini")
+    assert (
+        app_module._protocol_for_request(_http_request("/v1/chat/completions"))
+        == "gemini"
+    )
+    assert not hasattr(app_module, "_is_openai_path")
+
+
+def test_format_enabled_treats_string_false_and_zero_as_disabled(monkeypatch):
+    from aistudio_api.infrastructure.gateway import model_defaults
+
+    monkeypatch.setattr(
+        model_defaults,
+        "get_features_config",
+        lambda: {"formats": {"openai": " FALSE "}},
+    )
+    assert format_enabled("openai") is False
+
+    monkeypatch.setattr(
+        model_defaults,
+        "get_features_config",
+        lambda: {"formats": {"openai": "0"}},
+    )
+    assert format_enabled("openai") is False
+
+    monkeypatch.setattr(
+        model_defaults,
+        "get_features_config",
+        lambda: {"formats": {"openai": " True "}},
+    )
+    assert format_enabled("openai") is True

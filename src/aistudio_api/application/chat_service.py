@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from aistudio_api.api.schemas import GeminiGenerateContentRequest, GeminiTool
+    from aistudio_api.application.contracts.gemini import (
+        GeminiGenerateContentRequest,
+        GeminiPart,
+        GeminiTool,
+    )
 
-from dataclasses import dataclass
-
+from aistudio_api.application.signature_cache import (
+    DUMMY_THOUGHT_SIGNATURE,
+    signature_cache,
+)
 from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
 from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
 from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
@@ -18,6 +27,19 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioPart,
     AistudioThinkingConfig,
     ThinkingLevel,
+    coerce_function_call_args,
+    coerce_function_response,
+)
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("application.chat_service")
+
+_TOOL_SCHEMA_KEYS = (
+    "parameters",
+    "parametersJsonSchema",
+    "parameters_json_schema",
+    "input_schema",
+    "parameters_schema",
 )
 
 
@@ -232,11 +254,11 @@ def encode_schema_to_wire(
     if include_required and isinstance(required, (list, tuple, set)):
         wire[SchemaIndex.REQUIRED] = [str(x) for x in required]
 
-    min_props = schema.get("minProperties") or schema.get("min_properties")
+    min_props = schema.get("minProperties", schema.get("min_properties"))
     if isinstance(min_props, int):
         wire[SchemaIndex.MIN_PROPERTIES] = min_props
 
-    max_props = schema.get("maxProperties") or schema.get("max_properties")
+    max_props = schema.get("maxProperties", schema.get("max_properties"))
     if isinstance(max_props, int):
         wire[SchemaIndex.MAX_PROPERTIES] = max_props
 
@@ -248,11 +270,11 @@ def encode_schema_to_wire(
     if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
         wire[SchemaIndex.MAXIMUM] = maximum
 
-    min_len = schema.get("minLength") or schema.get("min_length")
+    min_len = schema.get("minLength", schema.get("min_length"))
     if isinstance(min_len, int):
         wire[SchemaIndex.MIN_LENGTH] = min_len
 
-    max_len = schema.get("maxLength") or schema.get("max_length")
+    max_len = schema.get("maxLength", schema.get("max_length"))
     if isinstance(max_len, int):
         wire[SchemaIndex.MAX_LENGTH] = max_len
 
@@ -262,11 +284,11 @@ def encode_schema_to_wire(
 
     _encode_schema_combiners(schema, wire, include_required)
 
-    max_items = schema.get("maxItems") or schema.get("max_items")
+    max_items = schema.get("maxItems", schema.get("max_items"))
     if isinstance(max_items, int):
         wire[SchemaIndex.MAX_ITEMS] = max_items
 
-    min_items = schema.get("minItems") or schema.get("min_items")
+    min_items = schema.get("minItems", schema.get("min_items"))
     if isinstance(min_items, int):
         wire[SchemaIndex.MIN_ITEMS] = min_items
 
@@ -542,8 +564,184 @@ def _normalize_gemini_safety_settings(
     return normalized
 
 
+def _short_name_hash(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _part_kind(part: GeminiPart) -> str:
+    if part.text is not None:
+        return "thought" if part.thought else "text"
+    if part.inlineData is not None:
+        return "inlineData"
+    if part.functionCall is not None:
+        return "functionCall"
+    if part.functionResponse is not None:
+        return "functionResponse"
+    if part.executableCode is not None:
+        return "executableCode"
+    if part.codeExecutionResult is not None:
+        return "codeExecutionResult"
+    if part.fileData is not None:
+        return "fileData"
+    return "unknown"
+
+
+def _schema_key(declaration: dict[str, object]) -> str | None:
+    for key in _TOOL_SCHEMA_KEYS:
+        if key in declaration:
+            return key
+    return None
+
+
+def _tool_mode(req: GeminiGenerateContentRequest) -> str | None:
+    config = req.toolConfig
+    if not isinstance(config, dict):
+        return None
+    fcc = config.get("functionCallingConfig") or config.get(
+        "function_calling_config"
+    )
+    if not isinstance(fcc, dict):
+        return None
+    mode = fcc.get("mode")
+    return str(mode).upper() if mode is not None else None
+
+
+def _count_part_kinds(parts: list[GeminiPart] | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for part in parts or []:
+        kind = _part_kind(part)
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _toolshape_summary(
+    req: GeminiGenerateContentRequest,
+    *,
+    model: str,
+    api_format: str,
+    channel: str | None,
+    surface: str | None,
+) -> dict[str, object]:
+    contents: list[dict[str, object]] = []
+    for content in req.contents:
+        call_entries: list[dict[str, object]] = []
+        response_entries: list[dict[str, object]] = []
+        for part in content.parts:
+            fc = part.functionCall
+            if fc is not None:
+                args = fc.args
+                call_entries.append(
+                    {
+                        "name_hash": _short_name_hash(fc.name),
+                        "args_type": type(args).__name__,
+                        "keys": sorted(args) if isinstance(args, dict) else [],
+                        "has_signature": bool(part.thoughtSignature),
+                        "has_id": bool(fc.id),
+                    }
+                )
+            fr = part.functionResponse
+            if fr is not None:
+                response_entries.append(
+                    {
+                        "name_hash": _short_name_hash(fr.name),
+                        "response_type": type(fr.response).__name__,
+                        "has_id": bool(fr.id),
+                        "parts": _count_part_kinds(fr.parts),
+                    }
+                )
+        contents.append(
+            {
+                "role": content.role or "user",
+                "parts": _count_part_kinds(content.parts),
+                "function_calls": call_entries,
+                "function_responses": response_entries,
+            }
+        )
+
+    declarations: list[dict[str, object]] = []
+    for tool in req.tools or []:
+        for declaration in tool.functionDeclarations or []:
+            if not isinstance(declaration, dict):
+                continue
+            declarations.append(
+                {
+                    "name_hash": _short_name_hash(declaration.get("name")),
+                    "schema_key": _schema_key(declaration),
+                    "mode": _tool_mode(req),
+                }
+            )
+
+    return {
+        "api_format": api_format,
+        "channel": channel or surface or "chat",
+        "surface": surface,
+        "model": model,
+        "contents": contents,
+        "tool_declarations": declarations,
+    }
+
+
+def _request_has_tool_activity(req: GeminiGenerateContentRequest) -> bool:
+    """True only when the client actually sent tools or tool history."""
+    if req.tools:
+        return True
+    if getattr(req, "toolConfig", None) is not None:
+        return True
+    return any(
+        part.functionCall is not None or part.functionResponse is not None
+        for content in req.contents
+        for part in content.parts
+    )
+
+
+def _emit_toolshape(
+    req: GeminiGenerateContentRequest,
+    *,
+    model: str,
+    api_format: str,
+    channel: str | None,
+    surface: str | None,
+) -> None:
+    summary = _toolshape_summary(
+        req,
+        model=model,
+        api_format=api_format,
+        channel=channel,
+        surface=surface,
+    )
+    logger.info(
+        "[toolshape] %s",
+        json.dumps(summary, ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _historical_function_call_signature(
+    role: str, part: GeminiPart
+) -> str | None:
+    """Return the signature to attach to a historical model functionCall.
+
+    Only model-role ``functionCall`` parts receive a fallback; text and
+    ``functionResponse`` parts must never be given a synthetic signature.
+    """
+    if role != "model" or part.functionCall is None:
+        return part.thoughtSignature
+    if part.thoughtSignature:
+        return part.thoughtSignature
+    call_id = part.functionCall.id
+    cached = signature_cache.get(call_id) if call_id else None
+    return cached or DUMMY_THOUGHT_SIGNATURE
+
+
 def normalize_gemini_request(
-    req: GeminiGenerateContentRequest, requested_model: str
+    req: GeminiGenerateContentRequest,
+    requested_model: str,
+    *,
+    api_format: str = "gemini",
+    channel: str | None = None,
+    surface: str | None = None,
+    emit_toolshape: bool = True,
 ) -> NormalizedGeminiRequest:
     if not req.contents:
         raise ValueError("contents is required")
@@ -587,19 +785,21 @@ def normalize_gemini_request(
                 continue
             if part.functionCall is not None:
                 fc = part.functionCall
-                args_payload = fc.args if fc.args is not None else {}
+                args_payload = coerce_function_call_args(fc.args)
                 parts.append(
                     AistudioPart(
                         function_call=(fc.name, args_payload, fc.id)
                         if fc.id
                         else (fc.name, args_payload),
-                        thought_signature=part.thoughtSignature,
+                        thought_signature=_historical_function_call_signature(
+                            role, part
+                        ),
                     )
                 )
                 continue
             if part.functionResponse is not None:
                 fr = part.functionResponse
-                resp_payload = fr.response if fr.response is not None else {}
+                resp_payload = coerce_function_response(fr.response)
                 parts.append(
                     AistudioPart(
                         function_response=(fr.name, resp_payload, fr.id)
@@ -752,9 +952,10 @@ def normalize_gemini_request(
         isinstance(tool_config, list)
         and len(tool_config) > 1
         and isinstance(tool_config[1], list)
+        and tool_config[1]
+        and tool_config[1][0] == 3
     ):
-        if tool_config[1] and tool_config[1][0] == 3:
-            is_mode_none = True
+        is_mode_none = True
 
     if is_mode_none:
         tools = None
@@ -806,6 +1007,8 @@ def normalize_gemini_request(
             )
         if generation_config.logprobs is not None:
             generation_config_overrides["logprobs"] = generation_config.logprobs
+        if generation_config.seed is not None:
+            generation_config_overrides["seed"] = generation_config.seed
         if generation_config.mediaResolution is not None:
             generation_config_overrides["media_resolution"] = (
                 generation_config.mediaResolution
@@ -828,6 +1031,15 @@ def normalize_gemini_request(
                     drop_unsupported=model_defaults.drop_unsupported_params,
                 )
             )
+    if emit_toolshape and _request_has_tool_activity(req):
+        _emit_toolshape(
+            req,
+            model=model,
+            api_format=api_format,
+            channel=channel,
+            surface=surface,
+        )
+
     return NormalizedGeminiRequest(
         model=model,
         contents=contents,

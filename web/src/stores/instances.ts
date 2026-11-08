@@ -1,162 +1,121 @@
-import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
+import { computed, ref } from 'vue'
 import { instancesApi } from '@/api/instances.ts'
-import { ApiError } from '@/api/client.ts'
+import type { CreateInstanceRequest, Instance } from '@/types'
 import { useToastStore } from './toast.ts'
-import type { Instance } from '@/types'
 
 export const useInstancesStore = defineStore('instances', () => {
   const instances = ref<Instance[]>([])
-  const maxInstances = ref(1)
+  const maxInstances = ref(0)
   const latestInstanceId = ref<string | null>(null)
   const currentInstanceId = ref<string | null>(null)
   const loading = ref(false)
-  const error = ref<string | null>(null)
-  const creatingAccountId = ref<string | null>(null)
-  const closingInstanceId = ref<string | null>(null)
-  const switchingInstanceId = ref<string | null>(null)
-  const reassigningInstanceId = ref<string | null>(null)
+  const creating = ref(false)
+  const busyIds = ref<Record<string, boolean>>({})
 
-  const byAccount = computed(() => {
-    const map = new Map<string, Instance[]>()
-    for (const instance of instances.value) {
-      const bucket = map.get(instance.account_id) ?? []
-      bucket.push(instance)
-      map.set(instance.account_id, bucket)
-    }
-    return map
-  })
+  const usedCount = computed(() => instances.value.length)
 
-  const occupiedCount = computed(
-    () => instances.value.filter((instance) => instance.state !== 'reclaiming').length,
-  )
-
-  const atCapacity = computed(() => occupiedCount.value >= maxInstances.value)
-
-  function message(err: unknown, fallback: string): string {
-    if (err instanceof ApiError && err.detail) return err.detail
-    return err instanceof Error && err.message ? err.message : fallback
+  function setBusy(id: string, busy: boolean) {
+    busyIds.value = { ...busyIds.value, [id]: busy }
   }
 
-  async function fetch(silent = false) {
-    if (!silent) loading.value = true
+  async function fetchAll() {
+    loading.value = true
     try {
       const res = await instancesApi.list()
-      instances.value = res.instances
-      maxInstances.value = res.max_instances
-      latestInstanceId.value = res.latest_instance_id
-      currentInstanceId.value = res.current_instance_id
-      error.value = null
-    } catch (err: unknown) {
-      error.value = message(err, '实例列表读取失败')
+      instances.value = res.instances || []
+      maxInstances.value = res.max_instances || 0
+      latestInstanceId.value = res.latest_instance_id || null
+      currentInstanceId.value = res.current_instance_id || null
+    } catch {
+      // keep the previous snapshot when the instances API is unavailable
     } finally {
-      if (!silent) loading.value = false
+      loading.value = false
     }
   }
 
-  async function waitForActive(instanceId: string, timeoutMs = 90_000): Promise<Instance | null> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      await fetch(true)
-      const instance = instances.value.find((item) => item.id === instanceId) ?? null
-      if (!instance) return null
-      if (instance.state === 'active' || instance.state === 'invalid') return instance
-      await new Promise((resolve) => window.setTimeout(resolve, 1000))
-    }
-    return instances.value.find((item) => item.id === instanceId) ?? null
-  }
-
-  function instancesForAccount(accountId: string): Instance[] {
-    return byAccount.value.get(accountId) ?? []
-  }
-
-  async function create(accountId: string, channel?: string): Promise<boolean> {
+  async function create(req: CreateInstanceRequest) {
     const toast = useToastStore()
-    creatingAccountId.value = accountId
+    creating.value = true
     try {
-      const instance = await instancesApi.create(accountId, channel)
-      toast.success(`实例 #${instance.number} 正在启动`)
-      const ready = await waitForActive(instance.id)
-      if (!ready) {
-        toast.error('实例启动失败，未留下半实例')
-        await fetch(true)
-        return false
-      }
-      if (ready.state !== 'active') {
-        toast.error('实例启动失败，请查看日志')
-        await fetch(true)
-        return false
-      }
-      return await switchTo(ready.id, channel)
+      const created = await instancesApi.create(req)
+      toast.success(`实例 #${created.number} 已创建`)
+      await fetchAll()
+      return created
     } catch (err: unknown) {
-      toast.error(message(err, '创建实例失败'))
-      await fetch(true)
-      return false
+      const msg = err instanceof Error ? err.message : '创建实例失败'
+      toast.error(msg)
+      return null
     } finally {
-      creatingAccountId.value = null
+      creating.value = false
     }
   }
 
-  async function switchTo(instanceId: string, channel?: string): Promise<boolean> {
+  async function reassign(instanceId: string, accountId: string) {
     const toast = useToastStore()
-    switchingInstanceId.value = instanceId
+    setBusy(instanceId, true)
     try {
-      await instancesApi.switchTo(instanceId, channel)
-      toast.success('已切换当前实例')
-      await fetch()
-      return true
+      const updated = await instancesApi.reassign(instanceId, accountId)
+      toast.success(`实例 #${updated.number} 已换绑账号`)
+      await fetchAll()
+      return updated
     } catch (err: unknown) {
-      toast.error(message(err, '切换实例失败'))
-      await fetch()
-      return false
+      const msg = err instanceof Error ? err.message : '换绑失败'
+      toast.error(msg)
+      return null
     } finally {
-      switchingInstanceId.value = null
+      setBusy(instanceId, false)
     }
   }
 
-  async function close(instanceId: string): Promise<boolean> {
+  async function restart(instanceId: string) {
     const toast = useToastStore()
-    closingInstanceId.value = instanceId
+    setBusy(instanceId, true)
     try {
-      await instancesApi.close(instanceId)
-      toast.success('实例正在回收，容量将自动释放')
-      await fetch()
-      return true
+      const updated = await instancesApi.restart(instanceId)
+      toast.success(`实例 #${updated.number} 已重启`)
+      await fetchAll()
+      return updated
     } catch (err: unknown) {
-      toast.error(message(err, '关闭实例失败'))
-      await fetch()
-      return false
+      const msg = err instanceof Error ? err.message : '重启实例失败'
+      toast.error(msg)
+      return null
     } finally {
-      closingInstanceId.value = null
+      setBusy(instanceId, false)
     }
   }
 
-  async function closeAndWait(instanceId: string, timeoutMs = 30_000): Promise<boolean> {
-    if (!(await close(instanceId))) return false
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      await fetch(true)
-      if (!instances.value.some((item) => item.id === instanceId)) return true
-      await new Promise((resolve) => window.setTimeout(resolve, 500))
-    }
-    useToastStore().error('实例回收超时，请稍后重试')
-    return false
-  }
-
-  async function reassign(instanceId: string, accountId: string): Promise<boolean> {
+  async function wake(instanceId: string) {
     const toast = useToastStore()
-    reassigningInstanceId.value = instanceId
+    setBusy(instanceId, true)
     try {
-      const instance = await instancesApi.reassign(instanceId, accountId)
-      toast.success(`实例 #${instance.number} 正在切换到新账号`)
-      await fetch()
-      return true
+      const updated = await instancesApi.wake(instanceId)
+      toast.success(`实例 #${updated.number} 已唤醒`)
+      await fetchAll()
+      return updated
     } catch (err: unknown) {
-      toast.error(message(err, '切换实例账号失败'))
-      await fetch()
-      return false
+      const msg = err instanceof Error ? err.message : '唤醒实例失败'
+      toast.error(msg)
+      return null
     } finally {
-      reassigningInstanceId.value = null
+      setBusy(instanceId, false)
+    }
+  }
+
+  async function close(instanceId: string) {
+    const toast = useToastStore()
+    setBusy(instanceId, true)
+    try {
+      const updated = await instancesApi.close(instanceId)
+      toast.success(`实例 #${updated.number} 已关闭`)
+      await fetchAll()
+      return updated
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '关闭实例失败'
+      toast.error(msg)
+      return null
+    } finally {
+      setBusy(instanceId, false)
     }
   }
 
@@ -166,20 +125,14 @@ export const useInstancesStore = defineStore('instances', () => {
     latestInstanceId,
     currentInstanceId,
     loading,
-    error,
-    creatingAccountId,
-    closingInstanceId,
-    switchingInstanceId,
-    reassigningInstanceId,
-    byAccount,
-    occupiedCount,
-    atCapacity,
-    fetch,
-    instancesForAccount,
+    creating,
+    busyIds,
+    usedCount,
+    fetchAll,
     create,
-    close,
-    closeAndWait,
-    switchTo,
     reassign,
+    restart,
+    wake,
+    close,
   }
 })

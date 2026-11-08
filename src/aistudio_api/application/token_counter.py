@@ -1,35 +1,28 @@
-"""Real upstream token counting (WP11).
+"""Real upstream token counting for ``:countTokens`` requests.
 
-This module is the single entry point for ``:countTokens`` style requests. It
-reuses the generation routing pipeline and instance-pool leases, but never
-mutates generation templates, captures snapshots, or applies ATG wrapping.
+Counting reuses the routing pipeline and its ``active_requests`` handle, but
+never mutates generation templates, captures snapshots, or applies ATG wrapping.
+The default strategy packs system/tools/contents into one synthetic prompt and
+asks the upstream ``CountTokens`` RPC; no official API key is generated, echoed
+or logged by this module.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass
 from typing import cast
 
-from fastapi import HTTPException
-
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.api.state import runtime_state
-from aistudio_api.application.account_orchestrator import (
-    MAX_RETRIES,
-    ensure_active_account,
-    record_rotator_event,
-)
-from aistudio_api.application.generation_service import (
-    _acquire_candidate_lease,
-    _begin_route,
-    _raise_switch_exhausted,
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
+from aistudio_api.application.routing_pipeline import (
+    RouteAttempt,
+    RoutingPipelineProtocol,
 )
 from aistudio_api.application.testing_hooks import forced_429
-from aistudio_api.application.upstream_errors import handle_attempt_exception
-from aistudio_api.domain.errors import UsageLimitExceeded
-from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.domain.errors import (
+    SurfaceSwitchExhaustedError,
+    UsageLimitExceeded,
+)
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioPart,
@@ -138,169 +131,110 @@ def _packed_body(req: GeminiGenerateContentRequest, model: str) -> list[object]:
 
 
 def build_count_body(req: GeminiGenerateContentRequest, model: str) -> list[object]:
-    """Build the aggregate prompt used for upstream counting.
-
-    System, tools and conversation are serialized into one synthetic contents
-    payload; JSON is compacted and null fields removed to keep the count close
-    to the native structured request.
-    """
+    """Build the aggregate prompt used for upstream counting."""
     return _packed_body(req, model)
 
 
-async def _count_tokens_impl(
+def _record_count(
+    pipeline: RoutingPipelineProtocol,
+    model: str,
+    result: str,
     *,
-    model_path: str,
-    req: GeminiGenerateContentRequest,
-    client: AIStudioClient,
-    api_format: str = "gemini",
-) -> TokenCountOutcome:
-    """Count tokens using the real upstream total, with account failover."""
-    pipe, ctx = _begin_route(model_path, api_format)
-    effective_model_path = ctx.clean_model if ctx is not None else model_path
-    surface = ctx.surface if ctx is not None else "chat"
-    candidate = None
-    lease = None
-    last_error: Exception | None = None
-    body = build_count_body(req, effective_model_path)
-
-    for attempt in range(MAX_RETRIES):
-        if pipe is not None and ctx is not None:
-            if not (ctx.retry_same and candidate is not None):
-                if lease is not None:
-                    await pipe.release(ctx, lease)
-                    lease = None
-                previous = candidate.account_id if candidate is not None else None
-                candidate = pipe.next_candidate(ctx, previous)
-                if candidate is None:
-                    _raise_switch_exhausted(ctx)
-                candidate, lease = await _acquire_candidate_lease(pipe, ctx, candidate)
-            else:
-                ctx.retry_same = False
-        else:
-            await ensure_active_account(attempt, model=model_path, surface=surface)
-
-        try:
-            logger.info(
-                "计数请求: format=%s, model=%s, contents=%d, 尝试第 %d 次",
-                api_format,
-                effective_model_path,
-                len(req.contents),
-                attempt + 1,
-            )
-            account_id = lease.account_id if lease is not None else None
-            if forced_429(
-                account_id=account_id,
-                model=effective_model_path,
-                surface=surface,
-            ):
-                raise UsageLimitExceeded("forced 429 by AISTUDIO_TEST_FORCE_429")
-            total_tokens = await client.count_tokens(
-                packed_body=body,
-                lease=lease,
-            )
-
-            account_id = lease.account_id if lease is not None else None
-            if pipe is not None and ctx is not None:
-                pipe.record_success(ctx)
-                await pipe.release(ctx, lease)
-                lease = None
-            record_rotator_event(
-                "success",
-                model=effective_model_path,
-                surface=surface,
-                account_id=account_id,
-            )
-            logger.info(
-                "计数完成: format=%s, model=%s, totalTokens=%s",
-                api_format,
-                effective_model_path,
-                total_tokens,
-            )
-            return TokenCountOutcome(
-                model=effective_model_path,
-                total_tokens=total_tokens,
-                surface=surface,
-            )
-        except Exception as exc:
-            last_error = exc
-            try:
-                retry = await handle_attempt_exception(
-                    exc,
-                    attempt=attempt,
-                    model_path=model_path,
-                    normalized_model=effective_model_path,
-                    client=client,
-                    api_format=api_format,
-                    surface=surface,
-                    routing=pipe,
-                    route_ctx=ctx,
-                    lease=lease,
-                    record_stats=False,
-                )
-            except BaseException:
-                if pipe is not None and ctx is not None:
-                    await pipe.release(ctx, lease)
-                    lease = None
-                raise
-            if retry:
-                if pipe is not None and ctx is not None and not ctx.retry_same:
-                    await pipe.release(ctx, lease)
-                    lease = None
-                continue
-            if pipe is not None and ctx is not None:
-                await pipe.release(ctx, lease)
-                lease = None
-            raise
-        except BaseException:
-            if pipe is not None and ctx is not None:
-                await pipe.release(ctx, lease)
-                lease = None
-            raise
-
-    if pipe is not None and ctx is not None:
-        await pipe.release(ctx, lease)
-    raise HTTPException(
-        429,
-        detail={
-            "message": (
-                f"All accounts reached daily quota for model '{model_path}'. "
-                "Quota resets at 00:00 PST."
-            ),
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    input_tokens: int = 0,
+) -> None:
+    """Record one isolated countTokens terminal (never a generation attempt)."""
+    recorder = getattr(pipeline, "record_count", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(model, result, input_tokens=input_tokens)
+    except Exception as exc:
+        logger.debug("[token_counter] countTokens 统计记录失败: %s", exc)
 
 
 async def count_tokens(
     *,
     model_path: str,
     req: GeminiGenerateContentRequest,
-    client: AIStudioClient,
+    pipeline: RoutingPipelineProtocol,
     api_format: str = "gemini",
 ) -> TokenCountOutcome:
-    """Count tokens and record one client-level count outcome."""
+    """Count tokens through the real upstream total, with account failover.
+
+    The request reuses routing for transport only: it explicitly disables the
+    generation attempt ledger and rotator quota events, then records a single
+    ``count_tokens`` terminal in its own ledger.
+    """
+    count_model = model_path
+    attempt: RouteAttempt | None = None
+
     try:
-        outcome = await _count_tokens_impl(
-            model_path=model_path,
-            req=req,
-            client=client,
-            api_format=api_format,
-        )
-    except asyncio.CancelledError:
-        runtime_state.record_token_count(
-            model_path, api_format=api_format, outcome="error"
-        )
-        raise
+        context = await pipeline.begin(model_path=model_path)
+        context.record_attempts = False
+        effective_model_path = context.route.model
+        count_model = effective_model_path
+        surface = context.route.surface
+        body = build_count_body(req, effective_model_path)
+
+        try:
+            while True:
+                if attempt is None:
+                    attempt = await pipeline.acquire(context)
+                    if attempt is None:
+                        raise SurfaceSwitchExhaustedError(surface=surface)
+                try:
+                    logger.info(
+                        "count request: format=%s model=%s contents=%d instance=%s",
+                        api_format,
+                        effective_model_path,
+                        len(req.contents),
+                        attempt.instance_id,
+                    )
+                    if forced_429(
+                        account_id=attempt.account_id,
+                        model=effective_model_path,
+                        surface=surface,
+                    ):
+                        raise UsageLimitExceeded(
+                            "forced 429 (AISTUDIO_TEST_HOOKS)"
+                        )
+                    total_tokens = await attempt.client.count_tokens(
+                        packed_body=body
+                    )
+                    _record_count(
+                        pipeline,
+                        effective_model_path,
+                        "success",
+                        input_tokens=total_tokens,
+                    )
+                    logger.info(
+                        "count complete: format=%s model=%s totalTokens=%s",
+                        api_format,
+                        effective_model_path,
+                        total_tokens,
+                    )
+                    return TokenCountOutcome(
+                        model=effective_model_path,
+                        total_tokens=total_tokens,
+                        surface=surface,
+                    )
+                except Exception as exc:
+                    action = await pipeline.handle_error(
+                        context, attempt, exc, has_yielded_data=False
+                    )
+                    if action == "retry_same":
+                        continue
+                    if action == "switch":
+                        await pipeline.release(attempt)
+                        attempt = None
+                        continue
+                    raise
+        finally:
+            if attempt is not None:
+                await pipeline.release(attempt)
     except Exception:
-        runtime_state.record_token_count(
-            model_path, api_format=api_format, outcome="error"
-        )
+        _record_count(pipeline, count_model, "errors")
         raise
-    runtime_state.record_token_count(
-        outcome.model,
-        api_format=api_format,
-        surface=outcome.surface,
-        outcome="success",
-        total_tokens=outcome.total_tokens,
-    )
-    return outcome
+
+
+__all__ = ["TokenCountOutcome", "build_count_body", "count_tokens"]

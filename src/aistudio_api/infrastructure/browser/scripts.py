@@ -12,49 +12,67 @@ def _load_js(filename: str) -> str:
     return (_JS_DIR / filename).read_text(encoding="utf-8")
 
 
-def _load_optional_js(filename: str) -> str | None:
-    try:
-        return _load_js(filename)
-    except FileNotFoundError:
-        return None
-
-
 INSTALL_HOOKS_JS = _load_js("install_hooks.js")
 DIALOG_CLEANUP_JS = _load_js("dialog_cleanup.js")
 STREAMING_INIT_JS = _load_js("streaming_init.js")
 STREAM_CLEANUP_JS = _load_js("stream_cleanup.js")
 HOOKED_REQUEST_JS = _load_js("hooked_request.js")
 SNAPSHOT_GENERATE_JS = _load_js("snapshot_generate.js")
-CHECK_IDENTITY_JS = _load_js("check_identity.js")
 STOP_GENERATION_JS = _load_js("stop_generation.js")
+SNAPSHOT_PROBE_JS = _load_js("snapshot_probe.js")
+CHECK_IDENTITY_JS = _load_js("check_identity.js")
 DOM_GC_CLEANUP_JS = _load_js("dom_gc_cleanup.js")
 EXTRACT_EMAIL_JS = _load_js("extract_email.js")
-BUILD_SIGNER_JS = _load_optional_js("build_signer.js")
+FINGERPRINT_SPOOF_JS = _load_js("fingerprint_spoof.js")
+
+
+SNAPSHOT_PROMPT_TAIL_CHARS = 256
+
+
+def build_snapshot_args(
+    *, prompt: str, content_hash: str, warmup: bool = False
+) -> dict[str, object]:
+    """Prepare SNAPSHOT_GENERATE_JS arguments.
+
+    Only the tail of the prompt is forwarded to the page; the full payload is
+    never materialized in the composer textarea. The hash still covers the full
+    prompt because it is computed before this function is called.
+    """
+    tail = prompt[-SNAPSHOT_PROMPT_TAIL_CHARS:] if prompt else ""
+    return {
+        "prompt": tail,
+        "hash": content_hash,
+        "warmup": bool(warmup),
+    }
+
+
+def build_snapshot_probe_args(*, content_hash: str, timeout_ms: int = 12000) -> dict[str, object]:
+    return {
+        "hash": content_hash,
+        "timeoutMs": timeout_ms,
+    }
 
 
 def build_streaming_init_args(
-    *, url: str, headers: dict[str, str], body: str, timeout_s: float, rid: str
+    *, url: str, headers: dict[str, str], body: str, rid: str
 ) -> dict[str, object]:
     """Prepare argument object for STREAMING_INIT_JS evaluation."""
     return {
-        "url": url,
-        "headers": headers,
-        "body": body,
-        "timeout": timeout_s,
+        **build_hooked_request_args(url=url, headers=headers, body=body),
         "rid": rid,
     }
 
 
 def build_hooked_request_args(
-    *, url: str, headers: dict[str, str], body: str, timeout_s: float
+    *, url: str, headers: dict[str, str], body: str
 ) -> dict[str, object]:
     """Prepare argument object for HOOKED_REQUEST_JS evaluation."""
-    return {
+    args: dict[str, object] = {
         "url": url,
         "headers": headers,
         "body": body,
-        "timeout": timeout_s,
     }
+    return args
 
 
 def build_selector_match_js(selector: str) -> str:

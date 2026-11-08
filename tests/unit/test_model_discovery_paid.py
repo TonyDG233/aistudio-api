@@ -1,3 +1,7 @@
+"""ListModels Paid parsing and public API projection (D02-021..023)."""
+
+from __future__ import annotations
+
 import httpx
 import pytest
 
@@ -55,11 +59,13 @@ async def test_model_api_does_not_expose_paid_marker(monkeypatch) -> None:
             }
         ]
 
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     monkeypatch.setattr(model_discovery.model_discovery, "get_models", _models)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/v1beta/models")
+        response = await client.get(
+            "/v1beta/models", headers={"x-goog-api-key": "test-key"}
+        )
 
     assert response.status_code == 200
     first = response.json()["models"][0]

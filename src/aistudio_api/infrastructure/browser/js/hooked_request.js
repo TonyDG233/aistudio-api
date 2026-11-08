@@ -1,12 +1,5 @@
 (args) => {
     return new Promise((resolve) => {
-        const timeoutMs = (args.timeout || 60) * 1000;
-        const controller = new AbortController();
-        const timer = setTimeout(() => {
-            controller.abort();
-            resolve({status: 0, body: 'timeout'});
-        }, timeoutMs);
-
         const headers = Object.assign({}, args.headers || {});
 
         window.fetch(args.url, {
@@ -14,18 +7,16 @@
             headers: headers,
             body: args.body,
             credentials: 'include',
-            signal: controller.signal,
         }).then(async (response) => {
-            clearTimeout(timer);
             try {
                 const text = await response.text();
                 resolve({status: response.status, body: text});
             } catch (e) {
-                resolve({status: response.status, body: ''});
+                const errMsg = (e && e.message) ? `response body read error: ${e.message}` : 'response body read error';
+                resolve({status: response.status || 0, body: errMsg});
             }
         }).catch((err) => {
-            clearTimeout(timer);
-            const msg = (err && err.name === 'AbortError') ? 'timeout' : 'network error';
+            const msg = (err && err.message) || 'network error';
             resolve({status: 0, body: msg});
         });
     });

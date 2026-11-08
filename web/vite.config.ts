@@ -13,19 +13,14 @@ export default defineConfig({
   },
   server: {
     port: 3000,
-    fs: {
-      allow: [path.resolve(__dirname, '..')],
-    },
     proxy: {
       '/api': 'http://localhost:8080',
       '/auth': 'http://localhost:8080',
+      '/stats': 'http://localhost:8080',
+      '/accounts': 'http://localhost:8080',
       '/rotation': 'http://localhost:8080',
-      '/routing': 'http://localhost:8080',
-      '/surface': 'http://localhost:8080',
       '/config': 'http://localhost:8080',
       '/api-keys': 'http://localhost:8080',
-      '/logs/stream': 'http://localhost:8080',
-      '/logs/export': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
     },
   },

@@ -1,14 +1,12 @@
 export class ApiError extends Error {
   status: number
   detail: string
-  code: string | null
 
-  constructor(status: number, detail: string, code: string | null = null) {
+  constructor(status: number, detail: string) {
     super(detail)
     this.name = 'ApiError'
     this.status = status
     this.detail = detail
-    this.code = code
   }
 }
 
@@ -70,22 +68,22 @@ export async function request<T>(url: string, options: RequestInit = {}): Promis
     }
 
     let errorDetail = `请求失败 (${response.status})`
-    let errorCode: string | null = null
     try {
       const errJson = await response.json()
-      if (errJson && typeof errJson.detail === 'string') {
-        errorDetail = errJson.detail
-      } else if (errJson && typeof errJson.detail?.message === 'string') {
-        errorDetail = errJson.detail.message
-        errorCode = typeof errJson.detail.code === 'string' ? errJson.detail.code : null
-      } else if (errJson && typeof errJson.error?.message === 'string') {
+      const detail = errJson?.detail
+      if (typeof detail === 'string') {
+        errorDetail = detail
+      } else if (detail && typeof detail === 'object' && typeof detail.message === 'string') {
+        errorDetail = detail.message
+      } else if (typeof errJson?.error?.message === 'string') {
         errorDetail = errJson.error.message
-        errorCode = typeof errJson.error.code === 'string' ? errJson.error.code : null
+      } else if (typeof errJson?.message === 'string') {
+        errorDetail = errJson.message
       }
     } catch {
       // ignore json parse error
     }
-    throw new ApiError(response.status, errorDetail, errorCode)
+    throw new ApiError(response.status, errorDetail)
   }
 
   // 204 No Content

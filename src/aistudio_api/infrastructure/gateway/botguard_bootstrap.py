@@ -1,4 +1,7 @@
-"""BotGuard WAA bootstrap probe and base request template interception."""
+"""BotGuard 初始化与模板捕获模块。
+
+通过页面注入的钩子获取 BotGuardService 单例，读取公共 RPC 标头，并通过探针签名验证可用性。
+"""
 
 from __future__ import annotations
 
@@ -14,12 +17,102 @@ from aistudio_api.infrastructure.browser.scripts import (
     INSTALL_HOOKS_JS,
     STOP_GENERATION_JS,
 )
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+)
 from aistudio_api.infrastructure.gateway.session_auth import is_login_page_url
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("session.botguard")
 
 BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
+
+OPEN_PLAYGROUND_JS = """(() => {
+    const clickable = Array.from(document.querySelectorAll('button, mat-card, a, [role="button"], [role="tab"], .nav-item'));
+    const targets = ['Playground', 'Code and Chat', 'Chat prompt', 'New chat', 'Start building', 'Create prompt'];
+    for (const term of targets) {
+        const target = clickable.find(el => (el.innerText || el.textContent || '').includes(term));
+        if (target) { target.click(); return term; }
+    }
+    return '';
+})()"""
+
+ENABLE_TEMPORARY_CHAT_JS = """(() => {
+    try {
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"], mat-slide-toggle, a'));
+        const tempBtn = buttons.find(el => {
+            const s = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('mattooltip') || '')).toLowerCase();
+            return (s.includes('temporary chat') || s.includes('temporary mode') || s.includes('turn on temporary') || s.includes('开启临时'))
+                && !s.includes('data use policy');
+        });
+        if (tempBtn) {
+            tempBtn.click();
+            return true;
+        }
+
+        const moreBtn = buttons.find(el => {
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            const txt = (el.innerText || '').trim();
+            return aria === 'view more actions' || txt === 'more_vert';
+        });
+        if (moreBtn && moreBtn.getAttribute('aria-expanded') !== 'true') {
+            moreBtn.click();
+            const menuItem = Array.from(document.querySelectorAll('[role="menuitem"], .mat-mdc-menu-item')).find(item => {
+                const s = ((item.innerText || '') + ' ' + (item.getAttribute('aria-label') || '')).toLowerCase();
+                return s.includes('temporary') || s.includes('临时');
+            });
+            if (menuItem) {
+                menuItem.click();
+                return true;
+            }
+        }
+    } catch(e) {}
+    return false;
+})()"""
+
+async def enable_temporary_chat(page: CDPPage) -> bool:
+    """Enable Temporary Chat mode in AI Studio to prevent polluting user history."""
+    try:
+        return bool(await page.evaluate(ENABLE_TEMPORARY_CHAT_JS))
+    except Exception as e:
+        log.debug("尝试激活 Temporary chat 异常: %s", e)
+        return False
+
+
+async def click_run_button(page: CDPPage) -> bool:
+    """Find and trigger Run / Build button or dispatch Control+Enter shortcut."""
+    clicked = await page.evaluate(
+        """(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const runBtn = buttons.find(b => {
+                const t = (b.innerText || b.textContent || '').trim();
+                return t === 'Run' || t.startsWith('Run\\n') || t.startsWith('Run Ctrl')
+                    || t === 'Build' || t.startsWith('Build\\n') || t.startsWith('BuildCtrl')
+                    || b.classList.contains('build-button')
+                    || b.classList.contains('ctrl-enter-submits');
+            });
+            if (runBtn) {
+                runBtn.click();
+                return true;
+            }
+            return false;
+        })()"""
+    )
+    if clicked:
+        return True
+
+    if await page.send_control_enter("textarea"):
+        return True
+
+    if await page.click("button.build-button"):
+        return True
+    if await page.click("button.ctrl-enter-submits"):
+        return True
+    if await page.click("button:has-text('Build')"):
+        return True
+    if await page.click("button:has-text('Run')"):
+        return True
+    return await page.click("button:has(mat-icon)")
 
 
 async def install_page_hooks(page: CDPPage) -> str:
@@ -73,83 +166,36 @@ async def install_page_hooks(page: CDPPage) -> str:
     )
 
 
-async def enable_temporary_chat(page: CDPPage) -> bool:
-    """Enable Temporary Chat mode in AI Studio to prevent polluting user history."""
+async def _wait_prompt_box(
+    page: CDPPage,
+    reload_cookies_cb: Callable[[CDPPage], Awaitable[bool]] | None,
+) -> None:
     try:
-        return bool(
-            await page.evaluate(
-                """(() => {
-                    const clickable = Array.from(document.querySelectorAll('button, [role="button"], mat-slide-toggle, a'));
-                    const tempBtn = clickable.find(el => {
-                        const s = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('mattooltip') || '')).toLowerCase();
-                        return (s.includes('temporary chat') || s.includes('temporary mode') || s.includes('turn on temporary'))
-                            && !s.includes('data use policy');
-                    });
-                    if (tempBtn) {
-                        tempBtn.click();
-                        return true;
-                    }
-
-                    const moreBtn = clickable.find(el => {
-                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                        const txt = (el.innerText || '').trim();
-                        return aria === 'view more actions' || txt === 'more_vert';
-                    });
-                    if (moreBtn && moreBtn.getAttribute('aria-expanded') !== 'true') {
-                        moreBtn.click();
-                        const menuItem = Array.from(document.querySelectorAll('[role="menuitem"], .mat-mdc-menu-item')).find(item => {
-                            const s = ((item.innerText || '') + ' ' + (item.getAttribute('aria-label') || '')).toLowerCase();
-                            return s.includes('temporary');
-                        });
-                        if (menuItem) {
-                            menuItem.click();
-                            return true;
-                        }
-                        moreBtn.click();
-                    }
-                    return false;
-                })()"""
+        try:
+            await page.wait_for_selector("ms-prompt-box textarea", timeout_s=15.0)
+        except Exception:
+            await page.wait_for_selector("textarea", timeout_s=5.0)
+    except Exception as err:
+        dbg_url = getattr(page, "url", "") or ""
+        if is_login_page_url(dbg_url):
+            log.warning(
+                "等待输入框期间检测到登录页重定向: %s，尝试重新注入 Cookie...",
+                dbg_url,
             )
-        )
-    except Exception as e:
-        log.debug("尝试激活 Temporary chat 异常: %s", e)
-        return False
-
-
-async def click_run_button(page: CDPPage) -> bool:
-    """Find and trigger Run / Build button or dispatch Control+Enter shortcut."""
-    clicked = await page.evaluate(
-        """(() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const runBtn = buttons.find(b => {
-                const t = (b.innerText || b.textContent || '').trim();
-                return t === 'Run' || t.startsWith('Run\\n') || t.startsWith('Run Ctrl')
-                    || t === 'Build' || t.startsWith('Build\\n') || t.startsWith('BuildCtrl')
-                    || b.classList.contains('build-button')
-                    || b.classList.contains('ctrl-enter-submits');
-            });
-            if (runBtn) {
-                runBtn.click();
-                return true;
-            }
-            return false;
-        })()"""
-    )
-    if clicked:
-        return True
-
-    if await page.send_control_enter("textarea"):
-        return True
-
-    if await page.click("button.build-button"):
-        return True
-    if await page.click("button.ctrl-enter-submits"):
-        return True
-    if await page.click("button:has-text('Build')"):
-        return True
-    if await page.click("button:has-text('Run')"):
-        return True
-    return await page.click("button:has(mat-icon)")
+            if reload_cookies_cb and await reload_cookies_cb(page):
+                await page.wait_for_selector("textarea", timeout_s=15.0)
+                return
+            raise SessionExpiredError(
+                f"Cookie 认证失效，已被重定向到 Google 登录页: {dbg_url}"
+            ) from err
+        if "available-regions" in dbg_url:
+            raise RuntimeError(
+                f"Google AI Studio 地区限制: 访问被重定向至 available-regions ({dbg_url})"
+            ) from err
+        dbg_title = await page.title()
+        raise RuntimeError(
+            f"textarea not found while initializing AI Studio session; url={dbg_url}, title={dbg_title}"
+        ) from err
 
 
 async def bootstrap_botguard_and_template(
@@ -157,12 +203,16 @@ async def bootstrap_botguard_and_template(
     reload_cookies_cb: Callable[[CDPPage], Awaitable[bool]] | None = None,
     is_proc_alive_cb: Callable[[], bool] | None = None,
     max_wait_seconds: int = 45,
+    auth_user: str = "0",
 ) -> tuple[str, dict[str, object]]:
-    """Execute 'say 1' bootstrap probe to capture BotGuardService and baseline wire template."""
+    """Execute 'say 1' bootstrap probe with temporary chat to capture BotGuardService and baseline wire template.
+
+    Never uses fake fallback templates to prevent false positives: captures the real in-page request.
+    """
     current_url = getattr(page, "url", "") or ""
     if "available-regions" in current_url:
         raise RuntimeError(
-            "Google AI Studio 地区限制: 访问被重定向至 available-regions"
+            f"Google AI Studio 地区限制: 访问被重定向至 available-regions ({current_url})"
         )
     if is_login_page_url(current_url):
         raise SessionExpiredError(
@@ -187,44 +237,11 @@ async def bootstrap_botguard_and_template(
 
     unsub = page.on_request(on_req)
     await page.evaluate(DIALOG_CLEANUP_JS)
-    await page.evaluate(
-        """(() => {
-            const clickable = Array.from(document.querySelectorAll('button, mat-card, a, [role="button"], [role="tab"], .nav-item'));
-            const targets = ['Playground', 'Code and Chat', 'Chat prompt', 'New chat', 'Start building', 'Create prompt'];
-            for (const term of targets) {
-                const target = clickable.find(el => (el.innerText || el.textContent || '').includes(term));
-                if (target) { target.click(); return; }
-            }
-        })()"""
-    )
-    await page.wait_for_timeout(800)
+    await page.evaluate(OPEN_PLAYGROUND_JS)
+    await page.wait_for_timeout(600)
+    await _wait_prompt_box(page, reload_cookies_cb)
 
     try:
-        try:
-            await page.wait_for_selector("textarea", timeout_s=15.0)
-        except Exception as err:
-            dbg_url = getattr(page, "url", "") or ""
-            if is_login_page_url(dbg_url):
-                log.warning(
-                    "等待输入框期间检测到登录页重定向: %s，尝试重新注入 Cookie...",
-                    dbg_url,
-                )
-                if reload_cookies_cb and await reload_cookies_cb(page):
-                    await page.wait_for_selector("textarea", timeout_s=15.0)
-                else:
-                    raise SessionExpiredError(
-                        f"Cookie 认证失效，已被重定向到 Google 登录页: {dbg_url}"
-                    ) from err
-            if "available-regions" in dbg_url:
-                raise RuntimeError(
-                    "Google AI Studio 地区限制: 访问被重定向至 available-regions"
-                ) from err
-
-            dbg_title = await page.title()
-            raise RuntimeError(
-                f"textarea not found while capturing BotGuardService; url={dbg_url}, title={dbg_title}"
-            ) from err
-
         original_text = str(
             (
                 await page.evaluate(
@@ -235,15 +252,15 @@ async def bootstrap_botguard_and_template(
         )
         await enable_temporary_chat(page)
         await page.fill("textarea", BOTGUARD_BOOTSTRAP_PROMPT)
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(400)
         await page.evaluate(DIALOG_CLEANUP_JS)
 
         if not await click_run_button(page):
-            raise RuntimeError(
-                "failed to trigger run button while capturing BotGuardService"
-            )
+            log.debug("未定位到 Run 按钮，通过快捷键 Ctrl+Enter 提交")
+            await page.send_control_enter("textarea")
 
-        for i in range(max_wait_seconds):
+        recovery_attempts = 0
+        for _i in range(max_wait_seconds):
             if is_proc_alive_cb and not is_proc_alive_cb():
                 raise RuntimeError("Browser process died during BotGuard capture")
             if page.is_closed():
@@ -251,17 +268,51 @@ async def bootstrap_botguard_and_template(
 
             curr_url = getattr(page, "url", "") or ""
             if is_login_page_url(curr_url):
+                # D03-021: 捕获期间跳登录页时先重新注入 cookie 再继续一次。
                 log.warning(
                     "BotGuard 捕获期间检测到登录页重定向: %s，尝试重新注入 Cookie...",
                     curr_url,
                 )
+                recovery_attempts += 1
+                if recovery_attempts > 2:
+                    raise SessionExpiredError(
+                        f"Cookie 认证失效，登录页重注入已达到上限: {curr_url}"
+                    )
                 if reload_cookies_cb and await reload_cookies_cb(page):
-                    break
+                    # P-03: reload 后重新导航回 AI Studio，并继续轮询捕获；
+                    # 只在有界等待窗口内重试，避免无限循环。
+                    with suppress(Exception):
+                        await page.goto(AI_STUDIO_HOME_URL)
+                    for _ in range(10):
+                        await page.wait_for_timeout(500)
+                        recovered_url = getattr(page, "url", "") or ""
+                        if (
+                            recovered_url
+                            and not is_login_page_url(recovered_url)
+                            and "aistudio.google.com" in recovered_url
+                        ):
+                            break
+                    else:
+                        raise SessionExpiredError(
+                            "Cookie 重注入后仍未回到 AI Studio: "
+                            f"{getattr(page, 'url', '') or curr_url}"
+                        )
+                    # 导航会重建页面上下文，必须重新挂 Hook 并再次触发探测。
+                    snap_key = await install_page_hooks(page)
+                    await page.wait_for_selector("textarea", timeout_s=15.0)
+                    await page.fill("textarea", BOTGUARD_BOOTSTRAP_PROMPT)
+                    await page.wait_for_timeout(600)
+                    await page.evaluate(DIALOG_CLEANUP_JS)
+                    if not await click_run_button(page):
+                        raise RuntimeError(
+                            "failed to re-trigger run button after cookie reload"
+                        )
+                    continue
                 raise SessionExpiredError(
                     f"Cookie 认证失效，已跳转至登录页: {curr_url}"
                 )
 
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(500)
             if await page.evaluate("() => !!window.__AISTUDIO__?.service"):
                 if not captured:
                     with suppress(Exception):
@@ -276,10 +327,8 @@ async def bootstrap_botguard_and_template(
                             captured["url"] = str(in_page_tpl["url"])
                             captured["headers"] = in_page_tpl.get("headers") or {}
                             captured["body"] = str(in_page_tpl["body"])
-                with suppress(Exception):
-                    await page.evaluate(STOP_GENERATION_JS)
                 if not captured:
-                    for _ in range(25):
+                    for _ in range(20):
                         if captured:
                             break
                         with suppress(Exception):
@@ -296,19 +345,35 @@ async def bootstrap_botguard_and_template(
                                 captured["body"] = str(in_page_tpl["body"])
                                 break
                         await page.wait_for_timeout(100)
-                await page.fill("textarea", original_text)
+
+                with suppress(Exception):
+                    await page.evaluate(STOP_GENERATION_JS)
+
+                # 重置输入框表单状态，防留记录
+                await page.evaluate("""(() => {
+                    const box = document.querySelector('ms-prompt-box textarea') || document.querySelector('textarea');
+                    if (box) {
+                        const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                        if (desc && desc.set) desc.set.call(box, '');
+                        else box.value = '';
+                        box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
+                        box.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                })()""")
+
                 with suppress(Exception):
                     await page.evaluate(DOM_GC_CLEANUP_JS)
 
+                # 绝不使用假 fallback 模板，严格要求截获真实上游报文
                 if not captured:
                     raise RuntimeError(
-                        "BotGuard service captured but wire template missing"
+                        "BotGuard 服务已就绪，但未能截获真实请求模板 (拒绝使用假 fallback 防止假阳性)"
                     )
 
                 log.info(
-                    "BotGuard 握手成功并截获模板，耗时 %d 秒 (累计 %.1f 秒)",
-                    i + 1,
+                    "BotGuard 引导就绪: 耗时 %.1f 秒, auth_user=%s",
                     time.time() - t0,
+                    auth_user,
                 )
                 return snap_key, captured
 
@@ -321,3 +386,9 @@ async def bootstrap_botguard_and_template(
             )
         with suppress(Exception):
             await page.fill("textarea", original_text)
+
+
+__all__ = [
+    "bootstrap_botguard_and_template",
+    "install_page_hooks",
+]

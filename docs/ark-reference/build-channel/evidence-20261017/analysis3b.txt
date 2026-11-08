@@ -1,6 +1,0 @@
-
-===== T4 responseFormat : responseFormat =====
-(none)
-
-===== T4 safetySettings enum : HARM_CATEGORY_HARASSMENT =====
-(none)

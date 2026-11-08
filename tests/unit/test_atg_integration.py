@@ -1,36 +1,28 @@
-"""Integration tests: ATG wired into the Gemini service with a mocked client.
+"""Integration tests: ATG wired into the protocol-neutral generation service.
 
 Covers non-stream and stream unwrap, required explicit failure, empty retries,
-the client-synthetic guard skip, and the E5 whitelist survival path.
+the client-synthetic guard skip, and the E5 whitelist survival path.  All
+requests run through an offline scripted routing pipeline; no browser/network.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
 
-from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application import generation_service
-from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
 from aistudio_api.application.atg import create_atg_processor
+from aistudio_api.application.atg.extractor import SyntheticRequiredError
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.gateway.wire_codec import AistudioWireCodec
+from tests.unit.routing_fakes import ScriptedPipeline, make_attempt, make_context
 
 MODEL = "gemini-3.7-flash"
-
-
-def _non_stream(response: object) -> GeminiGenerateContentResponse:
-    return cast("GeminiGenerateContentResponse", response)
-
-
-def _detail(exc: HTTPException) -> dict[str, Any]:
-    return cast("dict[str, Any]", exc.detail)
 
 
 def _enable_atg(monkeypatch, mode="prefer", **overrides):
@@ -41,12 +33,18 @@ def _enable_atg(monkeypatch, mode="prefer", **overrides):
 
 
 def _req(*, tools=None, tool_config=None):
-    body = {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}
+    body: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
+    }
     if tools is not None:
         body["tools"] = tools
     if tool_config is not None:
         body["toolConfig"] = tool_config
     return GeminiGenerateContentRequest.model_validate(body)
+
+
+def _pipeline(client) -> ScriptedPipeline:
+    return ScriptedPipeline([make_attempt(client)], context=make_context())
 
 
 def _wire_names(tools):
@@ -66,11 +64,8 @@ def _synthetic_name(tools):
     return ""
 
 
-async def _collect(response):
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk))
-    return "".join(chunks)
+async def _collect(stream) -> list[Any]:
+    return [event async for event in stream]
 
 
 # ========== Non-streaming ==========
@@ -91,12 +86,11 @@ async def test_non_stream_prefer_unwraps_synthetic(monkeypatch):
         )
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
-    resp = _non_stream(
-        await handle_gemini_generate_content(MODEL, _req(), client, stream=False)
+    outcome = await generation_service.generate(
+        model_path=MODEL, req=_req(), pipeline=_pipeline(client), api_format="gemini"
     )
-    parts = resp.candidates[0].content.parts
-    assert parts[0].text == "FINAL"
-    assert all(part.functionCall is None for part in parts)
+    assert outcome.output.candidates[0].text == "FINAL"
+    assert outcome.output.function_calls == []
 
 
 @pytest.mark.asyncio
@@ -108,10 +102,14 @@ async def test_non_stream_required_text_only_raises(monkeypatch):
         return ModelOutput(candidates=[Candidate(text="just text")], usage={})
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
-    with pytest.raises(HTTPException) as exc:
-        await handle_gemini_generate_content(MODEL, _req(), client, stream=False)
-    assert exc.value.status_code == 500
-    assert "synthetic tool call required" in _detail(exc.value)["message"]
+    with pytest.raises(SyntheticRequiredError) as exc:
+        await generation_service.generate(
+            model_path=MODEL,
+            req=_req(),
+            pipeline=_pipeline(client),
+            api_format="gemini",
+        )
+    assert "synthetic tool call required" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -133,11 +131,11 @@ async def test_non_stream_empty_retry_then_success(monkeypatch):
         )
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
-    resp = _non_stream(
-        await handle_gemini_generate_content(MODEL, _req(), client, stream=False)
+    outcome = await generation_service.generate(
+        model_path=MODEL, req=_req(), pipeline=_pipeline(client), api_format="gemini"
     )
     assert calls["n"] == 3
-    assert resp.candidates[0].content.parts[0].text == "OK"
+    assert outcome.output.candidates[0].text == "OK"
 
 
 @pytest.mark.asyncio
@@ -151,11 +149,11 @@ async def test_non_stream_empty_exhausted_prefer_returns_empty(monkeypatch):
         return ModelOutput(candidates=[Candidate()], usage={})
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
-    resp = _non_stream(
-        await handle_gemini_generate_content(MODEL, _req(), client, stream=False)
+    outcome = await generation_service.generate(
+        model_path=MODEL, req=_req(), pipeline=_pipeline(client), api_format="gemini"
     )
     assert calls["n"] == 2
-    assert resp.candidates[0].content.parts[0].text == ""
+    assert outcome.output.candidates[0].text == ""
 
 
 @pytest.mark.asyncio
@@ -167,10 +165,13 @@ async def test_non_stream_empty_exhausted_required_raises(monkeypatch):
         return ModelOutput(candidates=[Candidate()], usage={})
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
-    with pytest.raises(HTTPException) as exc:
-        await handle_gemini_generate_content(MODEL, _req(), client, stream=False)
-    assert exc.value.status_code == 500
-    assert "synthetic tool call required" in _detail(exc.value)["message"]
+    with pytest.raises(SyntheticRequiredError):
+        await generation_service.generate(
+            model_path=MODEL,
+            req=_req(),
+            pipeline=_pipeline(client),
+            api_format="gemini",
+        )
 
 
 @pytest.mark.asyncio
@@ -185,11 +186,10 @@ async def test_non_stream_guard_skips_injection(monkeypatch):
 
     client.generate_content = AsyncMock(side_effect=fake_generate)
     req = _req(tools=[{"functionDeclarations": [{"name": "atg_emit_client"}]}])
-    resp = _non_stream(
-        await handle_gemini_generate_content(MODEL, req, client, stream=False)
+    outcome = await generation_service.generate(
+        model_path=MODEL, req=req, pipeline=_pipeline(client), api_format="gemini"
     )
-    assert resp.candidates[0].content.parts[0].text == "client-handled"
-    # No synthetic control turn was appended (guard skipped the local wrap).
+    assert outcome.output.candidates[0].text == "client-handled"
     assert len(captured["contents"]) == 1
 
 
@@ -232,10 +232,10 @@ async def test_non_stream_any_pin_keeps_synthetic_in_wire(monkeypatch):
             }
         },
     )
-    resp = _non_stream(
-        await handle_gemini_generate_content(MODEL, req, client, stream=False)
+    outcome = await generation_service.generate(
+        model_path=MODEL, req=req, pipeline=_pipeline(client), api_format="gemini"
     )
-    assert resp.candidates[0].content.parts[0].text == "OK"
+    assert outcome.output.candidates[0].text == "OK"
 
     wire_names = _wire_names(captured["tools"])
     assert "real_tool" in wire_names
@@ -263,16 +263,26 @@ async def test_stream_prefer_unwraps_and_suppresses_preamble(monkeypatch):
         yield ("done", None)
 
     client.stream_generate_content = fake_stream
-    resp = await handle_gemini_generate_content(MODEL, _req(), client, stream=True)
-    text = await _collect(resp)
-    assert "STREAMED" in text
-    assert "preamble" not in text
-    assert "atg_emit_" not in text
-    assert "STOP" in text
+    events = await _collect(
+        generation_service.stream_generation(
+            model_path=MODEL,
+            req=_req(),
+            pipeline=_pipeline(client),
+            api_format="gemini",
+        )
+    )
+    kinds = [event.kind for event in events]
+    payloads = [str(event.payload) for event in events]
+    assert "body" in kinds
+    assert any("STREAMED" in payload for payload in payloads)
+    assert not any("preamble" in payload for payload in payloads)
+    assert not any("atg_emit_" in payload for payload in payloads)
+    assert events[-1].kind == "usage"
+    assert events[-1].finish_reason == "STOP"
 
 
 @pytest.mark.asyncio
-async def test_stream_required_missing_yields_error(monkeypatch):
+async def test_stream_required_missing_raises(monkeypatch):
     _enable_atg(monkeypatch, mode="required")
     client = MagicMock()
 
@@ -281,9 +291,15 @@ async def test_stream_required_missing_yields_error(monkeypatch):
         yield ("done", None)
 
     client.stream_generate_content = fake_stream
-    resp = await handle_gemini_generate_content(MODEL, _req(), client, stream=True)
-    text = await _collect(resp)
-    assert "synthetic tool call required" in text
+    with pytest.raises(SyntheticRequiredError):
+        await _collect(
+            generation_service.stream_generation(
+                model_path=MODEL,
+                req=_req(),
+                pipeline=_pipeline(client),
+                api_format="gemini",
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -304,10 +320,16 @@ async def test_stream_empty_retry_then_success(monkeypatch):
         yield ("done", None)
 
     client.stream_generate_content = fake_stream
-    resp = await handle_gemini_generate_content(MODEL, _req(), client, stream=True)
-    text = await _collect(resp)
+    events = await _collect(
+        generation_service.stream_generation(
+            model_path=MODEL,
+            req=_req(),
+            pipeline=_pipeline(client),
+            api_format="gemini",
+        )
+    )
     assert calls["n"] == 2
-    assert "OK" in text
+    assert any("OK" in str(event.payload) for event in events)
 
 
 # ========== E5 whitelist: wire codec filtering (pitfall + fix) ==========

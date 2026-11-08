@@ -1,39 +1,19 @@
-export interface FeatureChannelConfig {
-  enabled?: boolean
-  max_instances?: number
-  max_pages?: number
-  allowed_tags?: string[]
-  [key: string]: unknown
-}
-
-export interface FeatureSlotRow {
-  account_id: string
-  channel: string
-  enabled?: boolean
-  note?: string
-  [key: string]: unknown
-}
-
-export interface FeaturesConfig {
-  channels?: Record<string, FeatureChannelConfig>
-  slots?: FeatureSlotRow[]
-  [key: string]: unknown
-}
-
 export interface SystemConfig {
   port: number
   browser_port: number
   browser_headless: boolean
   proxy_configured: boolean
   auth_enabled: boolean
-  timeout_stream: number
   yaml_content: string
   log_level?: string
   dump_requests?: boolean
   debug_env_active?: boolean
   dump_to_file?: boolean
   dump_dir?: string
-  features?: FeaturesConfig
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+  ok?: boolean
+  message?: string
 }
 export interface UpdateLoggingConfigRequest {
   level?: string
@@ -53,6 +33,22 @@ export interface UpdateLoggingConfigResponse {
 export interface HealthCheckResponse {
   status: string
   busy: boolean
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+}
+
+export type SystemFormatKey = 'gemini' | 'openai' | 'claude' | 'responses'
+export type SystemFormats = Record<SystemFormatKey, boolean>
+
+export interface SystemStatusResponse {
+  status: string
+  busy: boolean
+  ui_debug?: boolean
+  ui_debug_scenario?: string | null
+  accounts?: number
+  instances?: number
+  formats?: SystemFormats
+  default_text_model?: string
 }
 export interface ApiKeyItem {
   name: string
@@ -67,13 +63,4 @@ export interface CreateApiKeyRequest {
 
 export interface UpdateApiKeyRequest {
   name: string
-}
-
-
-export interface ResourceUsage {
-  available: boolean
-  cpu_percent: number | null
-  memory_mb: number | null
-  memory_total_mb: number | null
-  instances: number
 }

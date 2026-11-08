@@ -1,370 +1,261 @@
-"""Behavior contracts for generation-service routing integration."""
+"""Protocol-neutral generation routing contracts (P5 B5b)."""
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aistudio_api.api.schemas import (
-    GeminiContent,
-    GeminiGenerateContentRequest,
-    GeminiPart,
-)
 from aistudio_api.application import generation_service
-from aistudio_api.application.routing_safety import RoutingBudget
-from aistudio_api.application.surface_orchestrator import SurfacePolicyError
-from aistudio_api.domain.errors import AuthError, RequestError
-from aistudio_api.domain.models import Candidate, ModelOutput
-from aistudio_api.infrastructure.gateway.client import AIStudioClient
-
-
-@dataclass
-class RouteCtx:
-    clean_model: str = "gemini-3.8-flash"
-    surface: str = "chat"
-    retry_same: bool = False
-    budget: RoutingBudget = field(default_factory=lambda: RoutingBudget(2, 2))
-
-
-class FakePipe:
-    def __init__(self, ctx: RouteCtx, *, candidates: list[str] | None = None):
-        self.ctx = ctx
-        self.ids = candidates or ["acc_a"]
-        self.next_calls = 0
-        self.land_calls = 0
-        self.switches: list[str] = []
-        self.retries: list[str] = []
-        self.success = False
-        self.released: list[str] = []
-
-    def next_candidate(self, ctx, failed_account_id=None):
-        self.next_calls += 1
-        index = min(self.next_calls - 1, len(self.ids) - 1)
-        return SimpleNamespace(account_id=self.ids[index])
-
-    async def acquire(self, ctx, candidate, require_idle=True):
-        self.land_calls += 1
-        return SimpleNamespace(
-            account_id=candidate.account_id,
-            realm_id=f"slot-{candidate.account_id}",
-            is_borrow=False,
-        )
-
-    async def land(self, ctx, candidate, require_idle=True):
-        return await self.acquire(ctx, candidate, require_idle=require_idle)
-
-    async def release(self, ctx, lease):
-        if lease is not None:
-            self.released.append(lease.realm_id)
-
-    def record_retry(self, ctx, reason):
-        self.retries.append(reason)
-        ctx.budget.record_retry()
-        ctx.retry_same = True
-
-    def record_switch(self, ctx, reason):
-        if not ctx.budget.record_switch():
-            raise SurfacePolicyError(
-                "surface_switch_exhausted", message="cap", advice="wait"
-            )
-        self.switches.append(reason)
-
-    def record_success(self, ctx):
-        self.success = True
-
-
-class FakeClient:
-    def __init__(self, outcomes: list[Any], surface_log: list[str] | None = None):
-        self.outcomes = outcomes
-        self.surface_log = surface_log if surface_log is not None else []
-        self._session = None
-
-    def clear_templates(self) -> None:
-        pass
-
-    async def generate_content(self, **kwargs):
-        self.surface_log.append(str(kwargs.get("surface")))
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-
-class FakeStreamClient(FakeClient):
-    async def stream_generate_content(self, **kwargs):
-        self.surface_log.append(str(kwargs.get("surface")))
-        yield ("body", "hello")
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
+from aistudio_api.domain.errors import UsageLimitExceeded
+from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
+from tests.unit.routing_fakes import (
+    FakeHandle,
+    ScriptedPipeline,
+    make_attempt,
+    make_context,
+)
 
 
 def _request() -> GeminiGenerateContentRequest:
-    return GeminiGenerateContentRequest(
-        contents=[GeminiContent(role="user", parts=[GeminiPart(text="hi")])]
+    return GeminiGenerateContentRequest.model_validate(
+        {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
     )
 
 
-def _output() -> ModelOutput:
+def _released(attempt: Any) -> bool:
+    return bool(cast("FakeHandle", attempt.handle).released)
+
+
+def _output(text: str = "ok") -> ModelOutput:
     return ModelOutput(
-        candidates=[Candidate(text="hello")],
-        model="gemini-3.8-flash",
-        usage={"prompt_tokens": 1, "completion_tokens": 1},
+        candidates=[Candidate(text=text)],
+        usage={"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        response_id="resp-1",
     )
 
 
-def _install(monkeypatch, pipe: FakePipe, ctx: RouteCtx) -> None:
-    monkeypatch.setattr(
-        generation_service, "_begin_route", lambda model, fmt: (pipe, ctx)
-    )
-    monkeypatch.setattr(
-        generation_service, "record_rotator_event", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        generation_service.runtime_state, "record", lambda *a, **k: None
+@pytest.mark.asyncio
+async def test_generate_uses_pipeline_surface_and_records_success():
+    client = MagicMock()
+    client.generate_content = AsyncMock(return_value=_output())
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    outcome = await generation_service.generate(
+        model_path="gemini-3.7-flash",
+        req=_request(),
+        pipeline=pipeline,
+        api_format="openai",
     )
 
+    assert outcome.output.text == "ok"
+    assert outcome.model == "models/gemini-3.7-flash"
+    assert outcome.surface == "chat"
+    assert outcome.response_id == "resp-1"
+    assert pipeline.successes == [
+        ("inst-1", {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
+    ]
+    assert isinstance(attempt.handle, FakeHandle)
+    assert _released(attempt) is True
 
-async def test_generate_uses_pipeline_surface_and_marks_success(monkeypatch) -> None:
-    ctx = RouteCtx(surface="chat")
-    pipe = FakePipe(ctx)
-    client = FakeClient([_output()], surface_log=[])
-    _install(monkeypatch, pipe, ctx)
-    events: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        generation_service,
-        "record_rotator_event",
-        lambda *_args, **kwargs: events.append(kwargs),
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["images", "reasoning_images"])
+async def test_generate_image_only_output_is_not_empty(field):
+    image = GeneratedImage(mime="image/png", data=b"png", size=3)
+    candidate = (
+        Candidate(images=[image])
+        if field == "images"
+        else Candidate(reasoning_images=[image])
+    )
+    client = MagicMock()
+    client.generate_content = AsyncMock(
+        return_value=ModelOutput(candidates=[candidate], usage={})
+    )
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    outcome = await generation_service.generate(
+        model_path="gemini-3.7-flash",
+        req=_request(),
+        pipeline=pipeline,
+        api_format="openai",
+    )
+
+    assert outcome.output.candidates[0] == candidate
+    assert client.generate_content.await_count == 1
+    assert _released(attempt) is True
+
+
+@pytest.mark.asyncio
+async def test_generate_retries_same_attempt_without_reacquire():
+    calls = 0
+
+    async def fake_generate(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise UsageLimitExceeded("429")
+        return _output("retried")
+
+    client = MagicMock()
+    client.generate_content = AsyncMock(side_effect=fake_generate)
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline(
+        [attempt], actions=["retry_same"], context=make_context()
     )
 
     outcome = await generation_service.generate(
-        model_path="gemini-3.8-flash",
+        model_path="gemini-3.7-flash",
         req=_request(),
-        client=cast("AIStudioClient", client),
-        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+        pipeline=pipeline,
+        api_format="gemini",
     )
 
-    assert outcome.surface == "chat"
-    assert client.surface_log == ["chat"]
-    assert pipe.next_calls == 1
-    assert pipe.land_calls == 1
-    assert pipe.success is True
-    assert pipe.released == ["slot-acc_a"]
-    assert events[-1]["account_id"] == "acc_a"
+    assert outcome.output.text == "retried"
+    assert calls == 2
+    assert pipeline.attempts == []
+    assert _released(attempt) is True
 
 
-async def test_capacity_defer_waits_then_retries(monkeypatch) -> None:
-    ctx = SimpleNamespace(
-        budget=RoutingBudget(max_switches=2, max_defers=2),
-        attempted=set(),
-        request_id="route-defer",
-    )
-    candidate = SimpleNamespace(account_id="acc_a")
-
-    class CapacityPipe:
-        def __init__(self) -> None:
-            self.acquire_calls = 0
-
-        def next_candidate(self, _ctx, _failed_account_id=None):
-            return None
-
-        async def acquire(self, _ctx, _candidate):
-            self.acquire_calls += 1
-            if self.acquire_calls == 1:
-                raise SurfacePolicyError(
-                    "surface_quota_exceeded", message="full", advice="wait"
-                )
-            return SimpleNamespace(
-                account_id="acc_a", realm_id="slot-a", is_borrow=False
-            )
-
-    async def no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", no_sleep)
-    pipe = CapacityPipe()
-    _, lease = await generation_service._acquire_candidate_lease(
-        cast("Any", pipe), cast("Any", ctx), candidate
+@pytest.mark.asyncio
+async def test_generate_switch_releases_first_attempt():
+    first_client = MagicMock()
+    first_client.generate_content = AsyncMock(side_effect=UsageLimitExceeded("429"))
+    second_client = MagicMock()
+    second_client.generate_content = AsyncMock(return_value=_output("second"))
+    first = make_attempt(first_client, instance_id="inst-1")
+    second = make_attempt(second_client, instance_id="inst-2")
+    pipeline = ScriptedPipeline(
+        [first, second], actions=["switch"], context=make_context()
     )
 
-    assert lease.realm_id == "slot-a"
-    assert pipe.acquire_calls == 2
-    assert ctx.budget.snapshot()["defers"] == 1
-
-
-async def test_build_busy_defers_same_candidate_without_switching(monkeypatch) -> None:
-    ctx = SimpleNamespace(
-        budget=RoutingBudget(max_switches=2, max_defers=2),
-        attempted=set(),
-        request_id="route-build-busy",
-    )
-    candidate = SimpleNamespace(account_id="acc_a")
-
-    class BusyPipe:
-        def __init__(self) -> None:
-            self.acquire_calls = 0
-            self.next_calls = 0
-
-        def next_candidate(self, _ctx, _failed_account_id=None):
-            self.next_calls += 1
-            return SimpleNamespace(account_id="acc_b")
-
-        async def acquire(self, _ctx, _candidate):
-            self.acquire_calls += 1
-            if self.acquire_calls == 1:
-                raise SurfacePolicyError(
-                    "surface_instance_busy", message="busy", advice="wait"
-                )
-            return SimpleNamespace(
-                account_id="acc_a", realm_id="slot-build", is_borrow=False
-            )
-
-    async def no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", no_sleep)
-    pipe = BusyPipe()
-    _, lease = await generation_service._acquire_candidate_lease(
-        cast("Any", pipe), cast("Any", ctx), candidate
-    )
-
-    assert lease.realm_id == "slot-build"
-    assert pipe.acquire_calls == 2
-    assert pipe.next_calls == 0
-    assert ctx.budget.snapshot()["defers"] == 1
-
-
-async def test_generate_retries_same_candidate_without_new_switch(monkeypatch) -> None:
-    ctx = RouteCtx()
-    pipe = FakePipe(ctx)
-    client = FakeClient([RequestError(204, "empty"), _output()])
-    _install(monkeypatch, pipe, ctx)
-
-    await generation_service.generate(
-        model_path="gemini-3.8-flash",
+    outcome = await generation_service.generate(
+        model_path="gemini-3.7-flash",
         req=_request(),
-        client=cast("AIStudioClient", client),
-        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+        pipeline=pipeline,
+        api_format="gemini",
     )
 
-    assert pipe.retries == ["empty_response_204"]
-    assert pipe.switches == []
-    assert pipe.next_calls == 1
-    assert pipe.land_calls == 1
+    assert outcome.output.text == "second"
+    assert _released(first) is True
+    assert _released(second) is True
+    assert pipeline.successes[0][0] == "inst-2"
 
 
-async def test_generate_switch_counts_against_budget(monkeypatch) -> None:
-    ctx = RouteCtx()
-    pipe = FakePipe(ctx, candidates=["acc_a", "acc_b"])
-    client = FakeClient([AuthError("403"), _output()])
-    _install(monkeypatch, pipe, ctx)
+@pytest.mark.asyncio
+async def test_generate_failure_releases_attempt_in_finally():
+    client = MagicMock()
+    client.generate_content = AsyncMock(side_effect=RuntimeError("boom"))
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
 
-    await generation_service.generate(
-        model_path="gemini-3.8-flash",
-        req=_request(),
-        client=cast("AIStudioClient", client),
-        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
-    )
-
-    assert pipe.switches == ["auth_error"]
-    assert pipe.next_calls == 2
-    assert pipe.success is True
-
-
-async def test_generate_raises_when_switch_budget_exhausted(monkeypatch) -> None:
-    ctx = RouteCtx(budget=RoutingBudget(max_switches=0))
-    pipe = FakePipe(ctx, candidates=["acc_a", "acc_b"])
-    client = FakeClient([AuthError("403"), _output()])
-    _install(monkeypatch, pipe, ctx)
-
-    with pytest.raises(SurfacePolicyError) as caught:
+    with pytest.raises(RuntimeError):
         await generation_service.generate(
-            model_path="gemini-3.8-flash",
+            model_path="gemini-3.7-flash",
             req=_request(),
-            client=cast("AIStudioClient", client),
-            atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
-        )
-    assert caught.value.code == "surface_switch_exhausted"
-    assert pipe.released == ["slot-acc_a"]
-
-
-async def test_generate_cancel_releases_lease(monkeypatch) -> None:
-    ctx = RouteCtx()
-    pipe = FakePipe(ctx)
-    client = FakeClient([asyncio.CancelledError()])
-    _install(monkeypatch, pipe, ctx)
-
-    with pytest.raises(asyncio.CancelledError):
-        await generation_service.generate(
-            model_path="gemini-3.8-flash",
-            req=_request(),
-            client=cast("AIStudioClient", client),
-            atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+            pipeline=pipeline,
+            api_format="gemini",
         )
 
-    assert pipe.released == ["slot-acc_a"]
+    assert _released(attempt) is True
 
 
-async def test_generate_skips_capacity_denied_candidate(monkeypatch) -> None:
-    ctx = RouteCtx()
-    pipe = FakePipe(ctx, candidates=["acc_a", "acc_b", "acc_c"])
+@pytest.mark.asyncio
+async def test_stream_generation_emits_routing_wait_and_terminal_usage():
+    async def fake_stream(**_kwargs):
+        yield ("body", "answer")
+        yield ("finish_reason", 1)
+        yield (
+            "usage",
+            {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        )
+        yield ("response_id", "resp-stream")
 
-    async def acquire(ctx, candidate, require_idle=True):
-        if candidate.account_id == "acc_b":
-            raise SurfacePolicyError(
-                "surface_quota_exceeded", message="capacity", advice="wait"
-            )
-        return await FakePipe.acquire(pipe, ctx, candidate, require_idle=require_idle)
+    client = MagicMock()
+    client.stream_generate_content = fake_stream
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
 
-    monkeypatch.setattr(pipe, "acquire", acquire)
-    client = FakeClient([AuthError("403"), _output()])
-    _install(monkeypatch, pipe, ctx)
+    events = [
+        event
+        async for event in generation_service.stream_generation(
+            model_path="gemini-3.7-flash",
+            req=_request(),
+            pipeline=pipeline,
+            api_format="openai",
+        )
+    ]
 
-    await generation_service.generate(
-        model_path="gemini-3.8-flash",
+    assert events[0].kind == "routing_wait"
+    assert any(event.kind == "body" and event.payload == "answer" for event in events)
+    terminal = events[-1]
+    assert terminal.kind == "usage"
+    assert terminal.finish_reason == "STOP"
+    assert terminal.response_id == "resp-stream"
+    assert isinstance(terminal.payload, dict)
+    assert cast("dict[str, Any]", terminal.payload)["total_tokens"] == 5
+    assert _released(attempt) is True
+
+
+@pytest.mark.asyncio
+async def test_stream_generation_cancel_releases_attempt():
+    async def open_stream(**_kwargs):
+        yield ("body", "first")
+        await __import__("asyncio").Event().wait()
+
+    client = MagicMock()
+    client.stream_generate_content = open_stream
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    iterator = generation_service.stream_generation(
+        model_path="gemini-3.7-flash",
         req=_request(),
-        client=cast("AIStudioClient", client),
-        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
+        pipeline=pipeline,
+        api_format="gemini",
     )
-
-    assert pipe.next_calls == 3
-    assert pipe.land_calls == 2
-    assert pipe.success is True
-
-
-async def test_stream_cancel_releases_lease(monkeypatch) -> None:
-    ctx = RouteCtx()
-    pipe = FakePipe(ctx)
-    client = FakeStreamClient([])
-    _install(monkeypatch, pipe, ctx)
-
-    stream = generation_service.stream_generation(
-        model_path="gemini-3.8-flash",
-        req=_request(),
-        client=cast("AIStudioClient", client),
-        atg_factory=cast(Any, lambda: SimpleNamespace(enabled=False)),
-    )
-    first = await anext(stream)
+    first = await iterator.__anext__()
     assert first.kind == "routing_wait"
-    second = await anext(stream)
+    second = await iterator.__anext__()
     assert second.kind == "body"
-    assert pipe.released == []
-
-    await cast("Any", stream).aclose()
-    assert pipe.released == ["slot-acc_a"]
+    await iterator.aclose()
+    assert _released(attempt) is True
 
 
-def test_routing_wait_renders_as_sse_comment() -> None:
-    from aistudio_api.application.api_service_gemini import _render_stream_event
-    from aistudio_api.application.format_converters.claude_response import (
-        ClaudeStreamRenderer,
+@pytest.mark.asyncio
+async def test_stream_generation_retries_same_attempt_before_switch():
+    calls = 0
+
+    async def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise UsageLimitExceeded("429 before data")
+        yield ("body", "recovered")
+        yield ("finish_reason", 1)
+        yield ("usage", {"prompt_tokens": 1, "completion_tokens": 1})
+
+    client = MagicMock()
+    client.stream_generate_content = fake_stream
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline(
+        [attempt], actions=["retry_same"], context=make_context()
     )
-    from aistudio_api.application.format_converters.openai_response import (
-        OpenAIStreamRenderer,
-    )
 
-    event = generation_service.StreamEvent(kind="routing_wait", payload="resolving")
-    assert _render_stream_event(event) == ": resolving-instance\n\n"
-    assert OpenAIStreamRenderer("m").render(event) == ": resolving-instance\n\n"
-    assert ClaudeStreamRenderer("m").render(event) == ": resolving-instance\n\n"
+    events = [
+        event
+        async for event in generation_service.stream_generation(
+            model_path="gemini-3.7-flash",
+            req=_request(),
+            pipeline=pipeline,
+            api_format="gemini",
+        )
+    ]
+
+    assert calls == 2
+    assert any(event.kind == "body" and event.payload == "recovered" for event in events)
+    assert _released(attempt) is True

@@ -24,25 +24,7 @@
         }
     }
 
-    const timeoutMs = (args.timeout || 60) * 1000;
-    let timeoutId = setTimeout(() => {
-        push({type: 'error', message: 'timeout'});
-        doAbort();
-    }, timeoutMs);
-
-    function resetTimeout() {
-        clearTimeout(timeoutId);
-        timeoutId = setTimeout(() => {
-            push({type: 'error', message: 'timeout'});
-            doAbort();
-        }, timeoutMs);
-    }
-
     function cleanup() {
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            timeoutId = null;
-        }
         try {
             if (window.__AISTUDIO__?.streams) delete window.__AISTUDIO__.streams[rid];
             if (window.__AISTUDIO__?.streamAbort) delete window.__AISTUDIO__.streamAbort[rid];
@@ -69,7 +51,7 @@
         credentials: 'include',
         signal: abortController.signal,
     }).then(response => {
-        resetTimeout();
+        // Status received
         push({type: 'status', status: response.status || 0});
 
         if (!response.body) {
@@ -96,7 +78,6 @@
                     return;
                 }
                 if (value) {
-                    resetTimeout();
                     const text = decoder.decode(value, {stream: true});
                     if (text) {
                         push({type: 'chunk', text: text});

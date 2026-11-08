@@ -4,6 +4,9 @@ import pytest
 from aistudio_api.api.app import app
 from aistudio_api.config import settings
 
+_AUTH_HEADERS = {"x-goog-api-key": "test-key"}
+_WEB_SESSION_HEADERS = {"authorization": "Bearer admin-pass"}
+
 
 def _build_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -12,10 +15,80 @@ def _build_client() -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
-async def test_list_models_returns_gemini_format(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+async def test_read_only_model_endpoints_accept_web_session_without_api_key(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
     async with _build_client() as client:
-        response = await client.get("/v1beta/models")
+        for path in (
+            "/v1beta/models",
+            "/v1beta/models/gemini-3.7-flash",
+            "/v1/models",
+            "/v1/models/gemini-3.7-flash",
+        ):
+            response = await client.get(path, headers=_WEB_SESSION_HEADERS)
+            assert response.status_code == 200, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_accept_api_key_with_web_password_set(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(path, headers=_AUTH_HEADERS)
+            assert response.status_code == 200, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_reject_missing_credentials(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", None)
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(path)
+            assert response.status_code == 401, path
+
+
+@pytest.mark.asyncio
+async def test_read_only_model_endpoints_reject_invalid_web_session(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    async with _build_client() as client:
+        for path in ("/v1beta/models", "/v1/models"):
+            response = await client.get(
+                path, headers={"authorization": "Bearer wrong-password"}
+            )
+            assert response.status_code == 401, path
+
+
+@pytest.mark.asyncio
+async def test_web_password_alone_does_not_authorize_chat_completions(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    monkeypatch.setattr(settings, "web_password", "admin-pass")
+    monkeypatch.setattr(
+        "aistudio_api.api.format_errors.format_enabled", lambda *_args: True
+    )
+    async with _build_client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers=_WEB_SESSION_HEADERS,
+            json={
+                "model": "gemini-3.7-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_list_models_returns_gemini_format(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
+    async with _build_client() as client:
+        response = await client.get("/v1beta/models", headers=_AUTH_HEADERS)
         assert response.status_code == 200
         data = response.json()
         assert "models" in data
@@ -27,13 +100,17 @@ async def test_list_models_returns_gemini_format(monkeypatch):
         assert "displayName" in first
         assert "supportedGenerationMethods" in first
         assert "generateContent" in first["supportedGenerationMethods"]
+        assert "paid" not in first
+        assert "access_tier" not in first
 
 
 @pytest.mark.asyncio
 async def test_get_single_model_returns_model_object(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models/gemini-3.7-flash")
+        response = await client.get(
+            "/v1beta/models/gemini-3.7-flash", headers=_AUTH_HEADERS
+        )
         assert response.status_code == 200
         data = response.json()
         assert data["name"] == "models/gemini-3.7-flash"
@@ -42,59 +119,18 @@ async def test_get_single_model_returns_model_object(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_multi_channel_model_list_uses_canonical_prefixes(monkeypatch):
-    from aistudio_api.infrastructure.gateway import model_defaults, model_discovery
-
-    monkeypatch.setattr(settings, "api_keys", frozenset())
-    monkeypatch.setattr(
-        model_discovery.model_discovery,
-        "get_models",
-        _discovered_models,
-    )
-    monkeypatch.setattr(
-        model_defaults,
-        "get_features_config",
-        lambda: {
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1},
-                "build": {"enabled": True, "max_pages": 1},
-                "official": {"enabled": False, "max_pages": 0},
-            }
-        },
-    )
-
+async def test_v1_models_endpoint_is_available_with_openai_shape(monkeypatch):
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models")
-        names = [item["name"] for item in response.json()["models"]]
-        assert names == [
-            "models/flash",
-            "models/pg/flash",
-            "models/build/flash",
-        ]
+        unauthorized = await client.get("/v1/models")
+        assert unauthorized.status_code == 401
 
-
-async def _discovered_models(**kwargs):
-    return [
-        {
-            "id": "models/flash",
-            "displayName": "Flash",
-            "supportedGenerationMethods": ["generateContent"],
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_v1_models_can_be_disabled(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
-    monkeypatch.setattr(
-        "aistudio_api.api.format_errors.format_enabled", lambda _fmt: False
-    )
-    async with _build_client() as client:
-        response = await client.get("/v1/models")
-        assert response.status_code == 403
-        error = response.json()["error"]
-        assert error["type"] == "permission_error"
-        assert "features.formats.openai" in error["message"]
+        response = await client.get("/v1/models", headers=_AUTH_HEADERS)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["object"] == "list"
+        assert isinstance(data["data"], list)
+        assert data["data"][0]["object"] == "model"
 
 
 @pytest.mark.asyncio
@@ -113,9 +149,11 @@ async def test_models_endpoint_accepts_query_param_key(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_single_model_not_found_returns_404(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", frozenset())
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
     async with _build_client() as client:
-        response = await client.get("/v1beta/models/non-existent-unknown-model-12345")
+        response = await client.get(
+            "/v1beta/models/non-existent-unknown-model-12345", headers=_AUTH_HEADERS
+        )
         assert response.status_code == 404
         data = response.json()
         assert "error" in data
@@ -211,6 +249,7 @@ async def test_model_discovery_extended_fields_and_aliases():
     assert "google_maps" in caps
     assert "url_context" in caps
     assert m["paid"] is True
+    assert m["access_tier"] == 2
     assert m["accessModes"] == [4]
 
     svc._cached_models = parsed
@@ -232,3 +271,10 @@ async def test_model_discovery_extended_fields_and_aliases():
     assert resp_model.temperature == 0.7
     assert resp_model.topP == 0.9
     assert resp_model.topK == 40
+
+    # topK is integer in the public contract: JSON must be 40, not 40.0.
+    dumped = resp_model.model_dump(mode="json")
+    assert dumped["topK"] == 40
+    assert isinstance(dumped["topK"], int)
+    assert not isinstance(dumped["topK"], bool)
+    assert '"topK":40' in resp_model.model_dump_json()

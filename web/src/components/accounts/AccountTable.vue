@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import { ref, computed, toRef, onMounted } from 'vue'
-import type { AccountRouting, AccountWithStats } from '@/types/accounts.ts'
-import type { FeatureSlotRow } from '@/types/system.ts'
-import type { SurfaceContext } from '@/api/system.ts'
+import { ref, computed, toRef, onMounted, watch } from 'vue'
+import type { AccountWithStats } from '@/types/accounts.ts'
+import type { Instance } from '@/types/instances.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
+import { useInstancesStore } from '@/stores/instances.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import { systemApi } from '@/api/system.ts'
 import { useCookieGroups, type CookieGroup } from './useCookieGroups.ts'
 import CookieGroupBlock from './CookieGroupBlock.vue'
 import AccountRow from './AccountRow.vue'
-import type { ChannelOption } from './accountModes.ts'
+import { accountStatus } from '@/utils/accountStatus.ts'
+import { boundInstanceFor, runningInstancesForAccounts } from '@/utils/instances.ts'
 import {
   Cookie,
   Users,
@@ -18,61 +19,49 @@ import {
   Layers,
   Clock,
   Trash2,
-  Upload,
-  AlertCircle,
   RefreshCw,
+  Power,
+  PowerOff,
+  X,
 } from 'lucide-vue-next'
 
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   accounts: AccountWithStats[]
   activeId: string
-  loading?: boolean
-  error?: string | null
-  multiMode?: boolean
-  contexts?: SurfaceContext[]
-  activeContextAccountId?: string | null
-  channels?: ChannelOption[]
-  slots?: FeatureSlotRow[]
-  routingByAccount?: Record<string, AccountRouting>
-  refreshPendingIds?: Record<string, 'pending' | 'failed'>
-}>(), {
-  loading: false,
-  error: null,
-  multiMode: false,
-  contexts: () => [],
-  activeContextAccountId: null,
-  channels: () => [],
-  slots: () => [],
-  routingByAccount: () => ({}),
-  refreshPendingIds: () => ({}),
-})
+}>()
 
 const emit = defineEmits<{
   editName: [account: AccountWithStats]
-  import: []
-  dropFiles: [files: File[]]
-  retry: []
+  activateAccount: [account: AccountWithStats]
+  changeSlot: [account: AccountWithStats]
 }>()
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
+const instancesStore = useInstancesStore()
 const toast = useToastStore()
 
 // 搜索与状态过滤
 const searchKeyword = ref('')
-const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired'>('all')
+const statusFilter = ref<'all' | 'ready' | 'limited' | 'cooldown' | 'expired'>('all')
+
+function matchesStatusFilter(acc: AccountWithStats): boolean {
+  if (statusFilter.value === 'all') return true
+  const status = accountStatus(
+    acc,
+    instancesStore.instances,
+    accountsStore.activeId,
+  )
+  if (statusFilter.value === 'expired') return status.key === 'expired'
+  if (statusFilter.value === 'limited') return status.key === 'quota'
+  if (statusFilter.value === 'cooldown') return status.key === 'cooldown'
+  return status.key === 'ready'
+}
 
 const filteredAccounts = computed<AccountWithStats[]>(() => {
   const kw = searchKeyword.value.trim().toLowerCase()
   return props.accounts.filter((acc) => {
-    // 状态过滤
-    if (statusFilter.value === 'expired') {
-      if (!acc.session_expired) return false
-    } else if (statusFilter.value === 'limited') {
-      if (acc.session_expired || acc.is_available !== false) return false
-    } else if (statusFilter.value === 'ready') {
-      if (acc.session_expired || acc.is_available === false) return false
-    }
+    if (!matchesStatusFilter(acc)) return false
 
     // 关键词过滤
     if (!kw) return true
@@ -145,63 +134,146 @@ function toggleAllModels() {
   forceExpandAllModels.value = !forceExpandAllModels.value
 }
 
-// 拖拽批量导入：多个 JSON 拖到账号列表中央进入同一预览流程
-const dragActive = ref(false)
-const dragCount = ref(0)
-let dragDepth = 0
-
-function isFileDrag(event: DragEvent): boolean {
-  const types = event.dataTransfer?.types
-  return Boolean(types && Array.from(types).includes('Files'))
-}
-
-function updateDragCount(event: DragEvent) {
-  const items = event.dataTransfer?.items
-  const files = event.dataTransfer?.files
-  dragCount.value = items?.length || files?.length || 0
-}
-
-function handleDragEnter(event: DragEvent) {
-  if (!isFileDrag(event)) return
-  event.preventDefault()
-  dragDepth += 1
-  dragActive.value = true
-  updateDragCount(event)
-}
-
-function handleDragOver(event: DragEvent) {
-  if (!isFileDrag(event)) return
-  event.preventDefault()
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
-  updateDragCount(event)
-}
-
-function handleDragLeave(event: DragEvent) {
-  if (!isFileDrag(event)) return
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (dragDepth === 0) dragActive.value = false
-}
-
-function handleDrop(event: DragEvent) {
-  if (!isFileDrag(event)) return
-  event.preventDefault()
-  dragDepth = 0
-  dragActive.value = false
-  const files = Array.from(event.dataTransfer?.files || [])
-  if (files.length) emit('dropFiles', files)
-}
-
-// 美西午夜刷新倒计时计算
+// 美西午夜刷新倒计时计算 (自动适配 PST/PDT 夏令时)
 const hoursUntilPacificMidnight = computed(() => {
   const now = new Date()
-  // 计算基于 UTC-8（美西冬令时/夏令时标准区间）
-  const utcNow = now.getTime() + now.getTimezoneOffset() * 60000
-  const pacificOffsetHours = -8
-  const pacificNow = new Date(utcNow + 3600000 * pacificOffsetHours)
-  const hoursLeft = 23 - pacificNow.getHours()
-  const minutesLeft = 59 - pacificNow.getMinutes()
-  return `${hoursLeft} 小时 ${minutesLeft} 分`
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    }).formatToParts(now)
+    const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0) % 24
+    const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0)
+    return `${23 - h} 小时 ${59 - m} 分`
+  } catch {
+    const utcNow = now.getTime() + now.getTimezoneOffset() * 60000
+    const pacificNow = new Date(utcNow - 8 * 3600000)
+    return `${23 - pacificNow.getHours()} 小时 ${59 - pacificNow.getMinutes()} 分`
+  }
 })
+
+// 批量管理模式
+const batchMode = ref(false)
+const selectedIds = ref<Set<string>>(new Set())
+
+const selectedCount = computed(() => selectedIds.value.size)
+
+const batchRefreshing = computed(() =>
+  Array.from(selectedIds.value).some((id) => accountsStore.refreshingIds[id] === true),
+)
+
+const batchWorking = computed(() => accountsStore.batchBusy || batchRefreshing.value)
+
+const allFilteredSelected = computed(
+  () =>
+    filteredAccounts.value.length > 0 &&
+    filteredAccounts.value.every((acc) => selectedIds.value.has(acc.id)),
+)
+
+const someFilteredSelected = computed(
+  () => selectedCount.value > 0 && !allFilteredSelected.value,
+)
+
+watch(
+  () => props.accounts,
+  (accounts) => {
+    const live = new Set(accounts.map((acc) => acc.id))
+    let changed = false
+    const next = new Set<string>()
+    selectedIds.value.forEach((id) => {
+      if (live.has(id)) {
+        next.add(id)
+      } else {
+        changed = true
+      }
+    })
+    if (changed) {
+      selectedIds.value = next
+    }
+  },
+)
+
+function isSelected(id: string): boolean {
+  return selectedIds.value.has(id)
+}
+
+function toggleRow(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) {
+    next.delete(id)
+  } else {
+    next.add(id)
+  }
+  selectedIds.value = next
+}
+
+function toggleAllFiltered() {
+  const next = new Set(selectedIds.value)
+  if (allFilteredSelected.value) {
+    filteredAccounts.value.forEach((acc) => next.delete(acc.id))
+  } else {
+    filteredAccounts.value.forEach((acc) => next.add(acc.id))
+  }
+  selectedIds.value = next
+}
+
+/**
+ * Running instances whose bound account belongs to this cookie group.
+ * Derived from the instances store so every running slot (#1, #2, ...) is
+ * highlighted instead of the single legacy active account id.
+ */
+function activeInstancesFor(group: CookieGroup): Instance[] {
+  return runningInstancesForAccounts(
+    group.accounts.map((acc) => acc.id),
+    instancesStore.instances,
+  )
+}
+
+function groupSelectedCount(group: CookieGroup): number {
+  return group.accounts.filter((acc) => selectedIds.value.has(acc.id)).length
+}
+
+function toggleSelectGroup(group: CookieGroup) {
+  const ids = group.accounts.map((acc) => acc.id)
+  const allSelected = ids.length > 0 && ids.every((id) => selectedIds.value.has(id))
+  const next = new Set(selectedIds.value)
+  if (allSelected) {
+    ids.forEach((id) => next.delete(id))
+  } else {
+    ids.forEach((id) => next.add(id))
+  }
+  selectedIds.value = next
+}
+
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value
+  if (!batchMode.value) {
+    selectedIds.value = new Set()
+  }
+}
+
+async function handleBatchRefresh() {
+  if (selectedCount.value === 0 || batchRefreshing.value) return
+  await accountsStore.refreshAccounts(Array.from(selectedIds.value))
+}
+
+async function handleBatchToggle(enabled: boolean) {
+  if (selectedCount.value === 0) return
+  await accountsStore.batchToggle(Array.from(selectedIds.value), enabled)
+}
+
+async function handleBatchDelete() {
+  if (selectedCount.value === 0) return
+  if (confirm(`确定要删除选中的 ${selectedCount.value} 个账号吗？此操作不可逆。`)) {
+    const ok = await accountsStore.batchDelete(Array.from(selectedIds.value))
+    if (ok) {
+      selectedIds.value = new Set()
+      batchMode.value = false
+    }
+  }
+}
 
 // 清理幽灵残留状态
 const cleaningGhosts = ref(false)
@@ -237,10 +309,9 @@ async function handleDeleteCookieGroup(group: CookieGroup) {
   }
 }
 
-// 针对登录态失效或受阻账号执行重新验证（解除禁用并在浏览器中重放连接）
+// 针对登录态失效或受阻账号执行重新验证（刷新清除 expired 后清除 session_expired/冷却）
 async function handleReverifyAccount(acc: AccountWithStats) {
-  await systemStore.clearCooldown({ account_id: acc.id })
-  await accountsStore.activateAccount(acc.id)
+  await accountsStore.recoverAccount(acc.id)
 }
 
 async function handleClearAccountCooldown(accountId: string) {
@@ -255,13 +326,7 @@ async function handleClearModelCooldown(accountId: string, model: string) {
 </script>
 
 <template>
-  <div
-    class="relative bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden space-y-0"
-    @dragenter="handleDragEnter"
-    @dragover="handleDragOver"
-    @dragleave="handleDragLeave"
-    @drop="handleDrop"
-  >
+  <div class="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden space-y-0">
     <!-- Header Bar -->
     <div class="px-6 py-4 border-b border-gray-100 flex flex-col gap-3 bg-gray-50/40">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -299,6 +364,29 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             @click="collapseAll"
           >
             收起全部
+          </button>
+
+          <button
+            type="button"
+            class="px-2.5 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            title="刷新所有账号的等级、登录态与邮箱"
+            :disabled="accountsStore.refreshingAll"
+            @click="accountsStore.refreshAll()"
+          >
+            <RefreshCw
+              class="w-3.5 h-3.5"
+              :class="{ 'animate-spin': accountsStore.refreshingAll }"
+            />
+            <span>{{ accountsStore.refreshingAll ? '刷新中...' : '刷新全部' }}</span>
+          </button>
+
+          <button
+            type="button"
+            class="px-2.5 py-1 text-xs font-medium rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            :class="batchMode ? 'text-brand-700 bg-brand-50 hover:bg-brand-100' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'"
+            @click="toggleBatchMode"
+          >
+            <span>{{ batchMode ? '退出批量' : '批量管理' }}</span>
           </button>
 
           <button
@@ -357,6 +445,14 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             <button
               type="button"
               class="px-2.5 py-1 rounded-lg transition-all cursor-pointer"
+              :class="statusFilter === 'cooldown' ? 'bg-white text-orange-700 font-semibold shadow-2xs' : 'text-gray-500 hover:text-gray-900'"
+              @click="statusFilter = 'cooldown'"
+            >
+              鉴权冷却
+            </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded-lg transition-all cursor-pointer"
               :class="statusFilter === 'expired' ? 'bg-white text-rose-700 font-semibold shadow-2xs' : 'text-gray-500 hover:text-gray-900'"
               @click="statusFilter = 'expired'"
             >
@@ -371,78 +467,110 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <span>每日配额刷新 (00:00 PST): 还剩 {{ hoursUntilPacificMidnight }}</span>
         </div>
       </div>
-    </div>
 
-    <!-- Tree Body -->
-    <div
-      v-if="loading && !accounts.length"
-      class="p-4 space-y-3"
-      aria-busy="true"
-    >
+      <!-- Batch Action Bar -->
       <div
-        v-for="i in 2"
-        :key="i"
-        class="rounded-xl border border-gray-200/70 overflow-hidden"
+        v-if="batchMode"
+        class="flex flex-col md:flex-row md:items-center justify-between gap-2 pt-2 border-t border-gray-200/60"
       >
-        <div class="h-11 bg-gray-50 animate-pulse" />
-        <div class="p-3 space-y-2">
-          <div class="h-14 rounded-xl bg-gray-100 animate-pulse" />
-          <div class="h-14 rounded-xl bg-gray-100/80 animate-pulse" />
+        <div class="flex items-center gap-2 flex-wrap">
+          <label class="inline-flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input
+              type="checkbox"
+              class="w-3.5 h-3.5 accent-brand-600"
+              :checked="allFilteredSelected"
+              :indeterminate="someFilteredSelected"
+              @change="toggleAllFiltered"
+            >
+            <span>全选当前筛选</span>
+          </label>
+          <span class="text-xs font-mono text-gray-500">
+            已选 {{ selectedCount }} / {{ filteredAccounts.length }}
+          </span>
+        </div>
+
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchRefresh"
+          >
+            <RefreshCw
+              class="w-3 h-3"
+              :class="{ 'animate-spin': batchRefreshing }"
+            />
+            <span>{{ batchRefreshing ? '刷新中...' : '批量刷新' }}</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchToggle(true)"
+          >
+            <Power class="w-3 h-3" />
+            <span>批量启用</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchToggle(false)"
+          >
+            <PowerOff class="w-3 h-3" />
+            <span>批量停用</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedCount === 0 || batchWorking"
+            @click="handleBatchDelete"
+          >
+            <Trash2 class="w-3 h-3" />
+            <span>批量删除</span>
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
+            @click="toggleBatchMode"
+          >
+            <X class="w-3 h-3" />
+            <span>退出</span>
+          </button>
         </div>
       </div>
     </div>
 
-    <div
-      v-else-if="error && !accounts.length"
-      class="py-12 px-6 text-center space-y-3"
-    >
-      <AlertCircle class="w-9 h-9 text-rose-300 mx-auto" />
-      <div class="text-sm font-medium text-gray-700">
-        账号列表加载失败
-      </div>
-      <p class="text-xs text-rose-600 max-w-md mx-auto break-words">
-        {{ error }}
-      </p>
-      <button
-        type="button"
-        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 transition-colors cursor-pointer"
-        @click="emit('retry')"
-      >
-        <RefreshCw class="w-3.5 h-3.5" />
-        重试
-      </button>
-    </div>
-
-    <div
-      v-else
-      class="divide-y divide-gray-100"
-    >
+    <!-- Tree Body -->
+    <div class="divide-y divide-gray-100">
       <CookieGroupBlock
         v-for="group in cookieGroups"
         :key="group.id"
         :group="group"
         :collapsed="isGroupCollapsed(group.id)"
+        :batch-mode="batchMode"
+        :selected-count="groupSelectedCount(group)"
+        :total-count="group.accounts.length"
+        :active-instances="activeInstancesFor(group)"
         @toggle="toggleCookieGroup(group.id)"
         @delete-group="handleDeleteCookieGroup(group)"
+        @toggle-select-group="toggleSelectGroup(group)"
       >
         <AccountRow
           v-for="acc in group.accounts"
           :key="acc.id"
           :account="acc"
           :active="acc.id === activeId"
-          :activating="accountsStore.activatingId === acc.id"
           :force-expanded="forceExpandAllModels"
-          :multi-mode="multiMode"
-          :contexts="contexts"
-          :active-context-account-id="activeContextAccountId"
-          :channels="channels"
-          :slots="slots"
-          :routing="routingByAccount[acc.id] || null"
-          :refresh-state="refreshPendingIds[acc.id] || null"
-          @activate="accountsStore.activateAccount(acc.id)"
+          :bound-instance="boundInstanceFor(acc.id, instancesStore.instances)"
+          :batch-mode="batchMode"
+          :selected="isSelected(acc.id)"
+          @activate="emit('activateAccount', acc)"
+          @change-slot="emit('changeSlot', acc)"
           @delete="handleDeleteAccount(acc)"
           @edit-name="emit('editName', acc)"
-          @clear-cooldown="acc.session_expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
+          @toggle-select="toggleRow(acc.id)"
+          @clear-cooldown="acc.session_expired || acc.expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
           @clear-model="handleClearModelCooldown(acc.id, $event)"
         />
       </CookieGroupBlock>
@@ -450,54 +578,16 @@ async function handleClearModelCooldown(accountId: string, model: string) {
       <!-- Empty State -->
       <div
         v-if="!filteredAccounts.length"
-        class="py-16 px-6 text-center text-gray-400 space-y-3"
+        class="py-16 text-center text-gray-400 space-y-3"
       >
         <Cookie class="w-10 h-10 text-gray-300 mx-auto" />
         <div class="text-sm font-medium text-gray-600">
-          {{ searchKeyword || statusFilter !== 'all' ? '未找到匹配的账号' : '还没有凭据组' }}
+          {{ searchKeyword || statusFilter !== 'all' ? '未找到匹配的账号' : '未导入账号' }}
         </div>
         <p class="text-xs text-gray-400 max-w-sm mx-auto">
-          {{ searchKeyword || statusFilter !== 'all'
-            ? '请尝试更换搜索词或筛选条件。'
-            : '导入 Google 账号 auth JSON、账号数组或 bundle；支持一次多选，也可把多个 JSON 拖到列表中央。' }}
+          {{ searchKeyword || statusFilter !== 'all' ? '请尝试更换搜索词或筛选条件。' : '点击上方导入按钮添加凭据。' }}
         </p>
-        <button
-          v-if="!searchKeyword && statusFilter === 'all'"
-          type="button"
-          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-brand-500 hover:bg-brand-600 transition-colors cursor-pointer"
-          @click="emit('import')"
-        >
-          <Upload class="w-3.5 h-3.5" />
-          导入 Cookies / JSON
-        </button>
       </div>
     </div>
-
-    <!-- Drag & drop overlay -->
-    <Transition
-      enter-active-class="transition duration-150 ease-out"
-      enter-from-class="opacity-0"
-      enter-to-class="opacity-100"
-      leave-active-class="transition duration-150 ease-in"
-      leave-from-class="opacity-100"
-      leave-to-class="opacity-0"
-    >
-      <div
-        v-if="dragActive"
-        class="absolute inset-0 z-40 pointer-events-none bg-white/85 backdrop-blur-[1px] p-4 sm:p-6 flex items-center justify-center"
-      >
-        <div class="w-full h-full rounded-2xl border-2 border-dashed border-brand-400 bg-brand-50/50 flex flex-col items-center justify-center text-center px-4">
-          <div class="w-12 h-12 rounded-full bg-brand-100 text-brand-600 flex items-center justify-center">
-            <Upload class="w-6 h-6" />
-          </div>
-          <p class="mt-3 text-sm font-semibold text-gray-900">
-            松开导入 {{ dragCount || '多个' }} 个凭据
-          </p>
-          <p class="mt-1 text-xs text-gray-500">
-            支持多个 .json；先预览识别结果，确认后才会写入账号。
-          </p>
-        </div>
-      </div>
-    </Transition>
   </div>
 </template>

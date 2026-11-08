@@ -42,10 +42,6 @@ _AUTH_HEADER_RE = re.compile(
 )
 _SET_COOKIE_RE = re.compile(r"(?i)(\bset-cookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
 _COOKIE_HEADER_RE = re.compile(r"(?i)(\bcookie[\"']?\s*[:=]\s*[\"']?)([^\r\n\"']+)")
-_COOKIE_PAIR_RE = re.compile(r"([^=;\s]+)\s*=\s*([^;]*)")
-_SENSITIVE_COOKIE_NAME_RE = re.compile(
-    r"(?i)^(?:sapisid(?:hash)?|sid|hsid|ssid|apisid|__secure-.*|.*(?:auth|session|token).*)$"
-)
 _COOKIE_TOKEN_RE = re.compile(
     r"(?i)\b(sapisidhash|sapisid|hsid|ssid|apisid|sid)\s*=\s*([^;\s\"',]+)"
 )
@@ -53,9 +49,11 @@ _API_KEY_RE = re.compile(
     r"(?i)(\b(?:x-goog-api-key|api[_-]?key|access[_-]?token)\b[\"']?\s*[:=]\s*[\"']?)"
     r"([^\s,;\"'}]+)"
 )
+_API_KEY_PATH_RE = re.compile(r"(?i)(/api-keys/)([^\s?#\"']+)")
 _QUERY_KEY_RE = re.compile(r"(?i)([?&]key=)([^&\s]+)")
 _BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)([a-z0-9\-._~+/=]{8,})")
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
+_SK_TOKEN_RE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9][A-Za-z0-9_-]{4,}")
 
 _ARCHIVE_NAME_RE = re.compile(r"^aistudio-(\d{8})\.log$")
 
@@ -68,24 +66,16 @@ def sanitize_log_message(message: str) -> str:
         lambda match: f"{match.group(1)}{match.group(2) or ''}{_MASK}", text
     )
     text = _SET_COOKIE_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
-    text = _COOKIE_HEADER_RE.sub(
-        lambda match: match.group(1) + _mask_cookie_header(match.group(2)), text
-    )
+    # Cookie headers are masked wholesale: even non-auth cookie names can carry
+    # session material, so no cookie value may reach the ring or archive sink.
+    text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _COOKIE_TOKEN_RE.sub(lambda match: f"{match.group(1)}={_MASK}", text)
     text = _API_KEY_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
+    text = _API_KEY_PATH_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _QUERY_KEY_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
     text = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{_MASK}", text)
+    text = _SK_TOKEN_RE.sub(_MASK, text)
     return _GOOGLE_API_KEY_RE.sub(_MASK, text)
-
-
-def _mask_cookie_header(value: str) -> str:
-    def _mask_pair(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if _SENSITIVE_COOKIE_NAME_RE.match(name):
-            return f"{name}={_MASK}"
-        return match.group(0)
-
-    return _COOKIE_PAIR_RE.sub(_mask_pair, value)
 
 
 def level_number(level: str) -> int:
@@ -163,6 +153,12 @@ class LogBroadcaster:
             return self._entries[0].id if self._entries else None
 
     @property
+    def latest_id(self) -> int:
+        """Return the last allocated sequence number (0 when nothing is left)."""
+        with self._lock:
+            return self._next_id
+
+    @property
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subscribers)
@@ -236,6 +232,18 @@ class LogBroadcaster:
             subscription.active = False
             self._subscribers.pop(subscription.id, None)
 
+    def clear(self) -> int:
+        """Drop retained entries without resetting the sequence or subscribers.
+
+        The monotonic ``_next_id`` deliberately survives so replayed clients
+        never observe duplicate ids after a sandbox clear; live subscriber
+        queues and their connections are left untouched.
+        """
+        with self._lock:
+            cleared = len(self._entries)
+            self._entries.clear()
+            return cleared
+
     def replay(
         self,
         *,
@@ -251,7 +259,11 @@ class LogBroadcaster:
         oldest = entries[0].id if entries else None
         gap: dict[str, int] | None = None
         if last_id is not None and oldest is not None and last_id < oldest - 1:
-            gap = {"last_id": last_id, "oldest_id": oldest}
+            gap = {
+                "last_id": last_id,
+                "oldest_id": oldest,
+                "missed": oldest - last_id - 1,
+            }
 
         if last_id is not None:
             entries = [entry for entry in entries if entry.id > last_id]
@@ -391,6 +403,19 @@ class DailyLogFileHandler(logging.Handler):
     def close(self) -> None:
         self._close_stream()
         super().close()
+
+    def reopen(self) -> None:
+        """Close the active stream so the next record re-resolves the log dir.
+
+        ``ui_debug`` redirects ``AISTUDIO_LOG_DIR`` after this handler was
+        constructed; reopening guarantees injected records land in the sandbox
+        archive instead of a stream opened before the redirect.
+        """
+        self.acquire()
+        try:
+            self._close_stream()
+        finally:
+            self.release()
 
     def _open_for_day(self, day: date) -> None:
         self._close_stream()

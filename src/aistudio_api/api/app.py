@@ -4,23 +4,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.api.error_mapping import error_payload
+from aistudio_api.api.format_errors import ApiFormat, format_for_path
 from aistudio_api.application.instance_manager import InstanceError
-from aistudio_api.application.surface_orchestrator import SurfacePolicyError
-from aistudio_api.infrastructure.gateway.build_surface import BuildSurfaceError
+from aistudio_api.application.signature_cache import signature_cache
+from aistudio_api.config import resolve_data_dir, resolve_ui_debug
+from aistudio_api.domain.errors import AistudioError, RoutingError, TierRequiredError
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
+    validate_config,
 )
 from aistudio_api.infrastructure.utils.logger import (
     dump_request_exchange,
@@ -30,9 +37,10 @@ from aistudio_api.infrastructure.utils.logger import (
 )
 
 from .dependencies import require_api_key, require_web_auth
-from .format_errors import format_error_response, format_for_path
 from .routes_accounts import router as accounts_router
 from .routes_claude import router as claude_router
+from .routes_debug import router as debug_router
+from .routes_debug_dashboard import router as debug_dashboard_router
 from .routes_gemini import router as gemini_router
 from .routes_instances import router as instances_router
 from .routes_keepalive import router as keepalive_router
@@ -44,19 +52,350 @@ from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
 )
-from .state import runtime_state
+from .state import RuntimeState, runtime_state
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from aistudio_api.infrastructure.account.account_store import AccountStore
 
 _log_cfg = get_configured_logging_settings()
 setup_logging(str(_log_cfg.get("level", "INFO")))
 logger = get_logger("server")
 
 
+async def _call_lifecycle_method(target: object | None, method_name: str) -> None:
+    """调用可选组件的 stop/close，兼容同步与异步实现。"""
+    if target is None:
+        return
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        return
+    try:
+        result = method()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        logger.debug(
+            "生命周期方法 %s.%s 失败: %s", type(target).__name__, method_name, exc
+        )
+
+
+async def _warmup_control_session(client: AIStudioClient) -> None:
+    """Legacy pool-disabled warmup: opens the control Page and BotGuard once.
+
+    Pool-enabled startup must never call this: pooled sessions are the only
+    request instances, and a control Page would double the BotGuard probes.
+    """
+    for attempt in range(3):
+        try:
+            logger.debug("开始预热浏览器后端: attempt=%d", attempt + 1)
+            await client.warmup()
+            logger.debug("浏览器预热就绪: attempt=%d", attempt + 1)
+            return
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+                continue
+            logger.warning("浏览器预热失败: %s", exc)
+
+
+def _start_control_warmup(
+    client: AIStudioClient, *, pool_enabled: bool
+) -> asyncio.Task[object] | None:
+    """Return the legacy control warmup task, or None when the pool is enabled."""
+    if pool_enabled:
+        return None
+    return asyncio.create_task(_warmup_control_session(client))
+
+
+async def _startup_instances(
+    state: RuntimeState,
+    warmup_task: asyncio.Task[object] | None,
+) -> None:
+    """Start pooled request instances; legacy control warmup only when present."""
+    if warmup_task is not None:
+        try:
+            await warmup_task
+        except Exception as exc:
+            logger.debug("实例预启动前预热失败: %s", exc)
+    manager = state.instance_manager
+    if manager is None:
+        return
+    try:
+        await manager.startup()  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.warning("实例预启动失败: %s", exc)
+
+
+async def _refresh_model_catalog_once(state: RuntimeState) -> int:
+    """Refresh ListModels from READY pool sessions only (never the control Page)."""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    sessions = state.discovery_sessions()
+    models = await model_discovery.get_models(sessions=sessions, force_refresh=True)
+    return len(models)
+
+
+def _model_warmup_interval_seconds(
+    source: str,
+    settings: dict[str, int] | None = None,
+) -> int:
+    """Live page success refreshes daily; every other source retries sooner."""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_model_discovery_settings,
+    )
+
+    resolved = (
+        settings if settings is not None else get_configured_model_discovery_settings()
+    )
+    if source == "live_page":
+        return int(resolved.get("live_refresh_interval_sec", 86400))
+    return int(resolved.get("fallback_refresh_interval_sec", 600))
+
+
+async def _model_warmup_cycle(
+    state: RuntimeState,
+    *,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    settings: dict[str, int] | None = None,
+) -> int:
+    """Run one refresh and sleep for the interval matching its source."""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    failed = False
+    try:
+        await _refresh_model_catalog_once(state)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        failed = True
+        logger.warning("模型发现预热失败: %s", exc)
+    source = model_discovery.last_source
+    if failed or model_discovery.last_error is not None:
+        source = "fallback"
+    interval = _model_warmup_interval_seconds(source, settings)
+    await sleep(interval)
+    return interval
+
+
+TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
+
+
+def _checked_at_ts(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+async def _refresh_startup_account_metadata(
+    account_store: AccountStore,
+    *,
+    covered_ids: set[str] | None = None,
+) -> None:
+    """Probe startup tier/email, skipping keepalive-covered and fresh Free accounts.
+
+    ``covered_ids`` are accounts already handled by the keepalive startup
+    metadata refresh. A verified Free tier whose ``tier_checked_at`` is within
+    three days skips the benefit-tier HTTP probe; a missing email is still
+    refreshed.
+    """
+    import json
+
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        is_verified_free_tier_fresh,
+    )
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        probe_account_benefit_tier,
+        probe_account_email,
+    )
+
+    covered = covered_ids or set()
+    now_ts = time.time()
+    accounts_to_check = [
+        account
+        for account in account_store.list_accounts()
+        if account.id not in covered
+        and (
+            not account.email
+            or (checked := _checked_at_ts(account.tier_checked_at)) is None
+            or (now_ts - checked > TIER_PROBE_FRESHNESS_SECONDS)
+        )
+    ]
+    if not accounts_to_check:
+        logger.debug("启动探测：账号已被 keepalive 覆盖或最近已校验，跳过")
+        return
+
+    logger.info(
+        "开始自动校验账号订阅等级与邮箱 (共 %d 个账号待检测)...",
+        len(accounts_to_check),
+    )
+    upgraded_count = 0
+    checked_count = 0
+    skipped_tier_count = 0
+
+    for account in accounts_to_check:
+        auth_path = account_store.get_auth_path(account.id)
+        if auth_path is None or not auth_path.is_file():
+            continue
+        try:
+            auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
+            raw_cookies = auth_data.get("cookies") or []
+            cookie_dict = {
+                str(cookie.get("name") or ""): str(cookie.get("value") or "")
+                for cookie in raw_cookies
+                if isinstance(cookie, dict) and cookie.get("name")
+            }
+            if not cookie_dict:
+                continue
+            checked_count += 1
+            if not account.email:
+                email = await probe_account_email(
+                    cookie_dict, auth_user=account.auth_user or "0"
+                )
+                if email:
+                    account_store.update_account_email(account.id, email)
+            if is_verified_free_tier_fresh(account, now=now_ts):
+                skipped_tier_count += 1
+                logger.debug(
+                    "订阅等级 3 天内已校验且为 Free，跳过启动 tier 探测: id=%s",
+                    account.id,
+                )
+                continue
+            probed_tier = await probe_account_benefit_tier(
+                cookie_dict, auth_user=account.auth_user or "0"
+            )
+            if probed_tier is None:
+                logger.debug(
+                    "启动 tier 探测失败/不可解析，保留原等级: id=%s (u/%s, tier=%s)",
+                    account.id,
+                    account.auth_user,
+                    account.tier,
+                )
+                continue
+            account_store.update_account_tier(
+                account.id,
+                probed_tier,
+                checked_at=datetime.now(UTC).isoformat(),
+            )
+            if probed_tier != "Free" and account.tier == "Free":
+                upgraded_count += 1
+                logger.info(
+                    "账号订阅等级自动升级: id=%s (u/%s) -> %s",
+                    account.id,
+                    account.auth_user,
+                    probed_tier,
+                )
+        except Exception as exc:
+            logger.debug("账号 %s 订阅检测异常: %s", account.id, exc)
+
+    logger.info(
+        "账号订阅校验完成: 检测=%d 个, 跳过 tier=%d 个, 发现付费订阅=%d 个",
+        checked_count,
+        skipped_tier_count,
+        upgraded_count,
+    )
+
+
+async def _shutdown_runtime(
+    state: RuntimeState,
+    tasks: tuple[asyncio.Task[object] | None, ...] = (),
+) -> None:
+    """固定关闭顺序：取消后台任务 → keepalive → instance_manager → client。"""
+    cancelled: list[asyncio.Task[object]] = []
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+            cancelled.append(task)
+    if cancelled:
+        await asyncio.gather(*cancelled, return_exceptions=True)
+
+    await _call_lifecycle_method(state.keepalive, "stop")
+    await _call_lifecycle_method(state.instance_manager, "close")
+    await _call_lifecycle_method(state.client, "close")
+
+    state.keepalive = None
+    state.instance_manager = None
+    state.routing_pipeline = None
+    state.client = None
+    state.account_service = None
+    state.account_refresher = None
+    state.rotator = None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    from aistudio_api.application.account_keepalive import AccountKeepaliveService
+    ui_debug = resolve_ui_debug()
+    runtime_state.ui_debug = ui_debug
+    isolation = None
+    if ui_debug:
+        # Q1/Q2：在任何 config/log/API-key 路由或 validate_config 迁移写盘之前，
+        # 先把配置、数据、账号、统计、模型缓存、日志与 dump 路径全部重定向到临时
+        # 目录；关闭时恢复原始环境与 settings 并删除临时目录。
+        from .ui_sandbox import UiDebugIsolation
+
+        isolation = UiDebugIsolation().enter()
+    try:
+        validate_config()
+    except BaseException:
+        if isolation is not None:
+            isolation.close()
+        raise
+    if ui_debug:
+        # C2a：纯离线 UI 调试。绝不构造真实 client/browser、实例池、keepalive、
+        # 模型发现或账号元数据网络刷新；所有读写只落在临时 AccountStore 与内存沙箱。
+        from .ui_sandbox import create_ui_sandbox
+
+        try:
+            sandbox = create_ui_sandbox()
+        except BaseException:
+            if isolation is not None:
+                isolation.close()
+            raise
+        runtime_state.ui_sandbox = sandbox
+        runtime_state.client = None
+        runtime_state.account_service = sandbox.account_service
+        runtime_state.account_refresher = cast(Any, sandbox.refresher)
+        runtime_state.rotator = cast(Any, sandbox.rotator)
+        runtime_state.instance_manager = sandbox.manager
+        runtime_state.keepalive = sandbox.keepalive
+        runtime_state.routing_pipeline = None
+        signature_cache.configure_path(sandbox.root / "signature_cache.json")
+        logger.info(
+            "UI 调试沙箱已启用: scenario=%s, data_dir=%s（无浏览器/网络/真实磁盘）",
+            sandbox.scenario,
+            sandbox.root,
+        )
+        try:
+            yield
+        finally:
+            logger.info("UI 调试沙箱正在关闭")
+            sandbox.close()
+            runtime_state.keepalive = None
+            runtime_state.instance_manager = None
+            runtime_state.routing_pipeline = None
+            runtime_state.client = None
+            runtime_state.account_service = None
+            runtime_state.account_refresher = None
+            runtime_state.rotator = None
+            runtime_state.ui_sandbox = None
+            runtime_state.ui_debug = False
+            if isolation is not None:
+                isolation.close()
+        return
+
+    runtime_state.ui_sandbox = None
+    signature_cache.configure_path(resolve_data_dir() / "signature_cache.json")
+
+    from aistudio_api.application.account_keepalive import (
+        AccountKeepaliveService,
+        KeepaliveSettings,
+    )
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
-    from aistudio_api.config import settings
     from aistudio_api.infrastructure.account.account_info_refresher import (
         AccountInfoRefresher,
     )
@@ -76,270 +415,274 @@ async def lifespan(_app: FastAPI):
     account_store = AccountStore()
     account_service = AccountService(account_store)
     runtime_state.account_service = account_service
-
-    # WP5 v4：用户可见实例（一个同时登录账号会话）由独立 manager 管理。
-    from aistudio_api.application.instance_manager import InstanceManager
-
-    async def _switch_instance_account(account_id: str) -> bool:
-        # Instances use their own pooled sessions. Keep the active-account
-        # marker in sync, but do not perform a second blue-green browser switch.
-        current = account_store.get_active_account()
-        if current is not None and current.id == account_id:
-            return True
-        account_store.set_active_account(account_id)
-        return True
-
-    runtime_state.instance_manager = InstanceManager(
-        client.instance_pool,
-        account_store,
-        switch_account=_switch_instance_account,
-    )
+    # P1 接线刷新器；P6 由 keepalive metadata_refresh 统一调度 tier/email。
+    account_refresher = AccountInfoRefresher(account_store)
+    runtime_state.account_refresher = account_refresher
 
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
     runtime_state.rotator = rotator
 
-    account_refresher = AccountInfoRefresher(account_store)
-    runtime_state.account_refresher = account_refresher
-
+    for a in account_store.list_accounts():
+        st = rotator.get_account_stats(a.id)
+        if st is not None and not st.session_expired and st.auth_cooldown > 0:
+            st.auth_cooldown = 0.0
+    active_auth_path = account_store.get_active_auth_path()
+    if active_auth_path is not None and client.session is not None:
+        client.session._auth_file = str(active_auth_path)
     logger.info(
-        "Client initialized (port=%s, accounts=%d)",
+        "服务初始化完成: 监听浏览器调试端口=%d, 已加载账号数=%d",
         runtime_state.browser_port,
         len(account_store.list_accounts()),
     )
+    logger.debug(
+        "账号初始状态: %s",
+        [
+            f"{a.id}(u/{a.auth_user},tier={a.tier},enabled={a.enabled})"
+            for a in account_store.list_accounts()
+        ],
+    )
 
-    # 后台预热浏览器，避免首次请求延迟
-    warmup_task = None
+    # P3-D04：请求实例池由独立的 InstanceManager 管理；控制面不占池容量。
+    from aistudio_api.application.instance_manager import InstanceManager
+    from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_instance_specs,
+        get_configured_max_contexts,
+    )
 
-    async def _warmup():
-        for attempt in range(3):
-            try:
-                active = account_service.get_active_account()
-                if active is not None:
-                    await account_service.activate_account(
-                        active.id,
-                        client.session,
-                        client=client,
-                    )
-                else:
-                    await client.warmup()
-                return
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                logger.warning("浏览器预热失败: %s", e)
+    # 显式分流：多实例池启用时只允许 InstanceManager.startup() 预热池会话；
+    # 控制面 client.session 不得在启动时自动开页/跑 BotGuard。只有配置中
+    # 完全没有任何实例（真正的 pool-disabled legacy 模式）才允许控制面预热。
+    pool_specs = get_configured_instance_specs()
+    pool_enabled = bool(pool_specs)
+    if pool_enabled:
+        logger.info(
+            "实例池已启用 (%d 组配置)：跳过控制面预热，启动仅由 "
+            "InstanceManager.startup() 激活池会话",
+            len(pool_specs),
+        )
+    else:
+        logger.info("实例池未配置：使用 legacy 控制面预热（不创建池会话）")
+    warmup_task = _start_control_warmup(client, pool_enabled=pool_enabled)
 
-    warmup_task = asyncio.create_task(_warmup())
+    def _on_slot_retired(_realm_id: str) -> None:
+        client.clear_templates()
 
-    async def _startup_instances():
-        if warmup_task is not None:
-            try:
-                await warmup_task
-            except Exception as exc:
-                logger.debug("实例预启动前预热失败: %s", exc)
-        manager = runtime_state.instance_manager
-        if manager is None:
-            return
-        try:
-            await manager.startup()
-        except Exception as exc:
-            logger.warning("实例预启动失败: %s", exc)
+    instance_pool = InstancePool(
+        client.session.ensure_cdp_client,
+        specs_provider=get_configured_instance_specs,
+        max_contexts_provider=get_configured_max_contexts,
+        on_slot_retired=_on_slot_retired,
+    )
+    instance_manager = InstanceManager(
+        instance_pool,
+        account_store,
+    )
+    runtime_state.instance_manager = instance_manager
 
-    startup_task = asyncio.create_task(_startup_instances())
+    from aistudio_api.application.routing_pipeline import RoutingPipeline
 
-    async def _model_warmup():
-        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-        while True:
-            try:
-                await model_discovery.get_models(
-                    session=client.session, force_refresh=True
-                )
-            except Exception as e:
-                logger.warning("模型发现预热失败: %s", e)
-            await asyncio.sleep(model_discovery.cache_ttl)
-
-    model_warmup_task = asyncio.create_task(_model_warmup())
+    runtime_state.routing_pipeline = RoutingPipeline(
+        instance_manager=instance_manager,
+        account_store=account_store,
+        rotator=rotator,
+        stats_recorder=runtime_state.record,
+        client_recorder=runtime_state.record_client,
+        count_token_recorder=runtime_state.record_count_tokens,
+    )
 
     keepalive = AccountKeepaliveService(
         account_store,
-        account_service,
-        rotator,
         client,
         account_refresher,
+        instance_manager=instance_manager,
     )
     runtime_state.keepalive = keepalive
-    await keepalive.start()
+    # App owns the first metadata refresh below so the two startup probes can
+    # coordinate: keepalive reports covered accounts and app-side skips them.
+    await keepalive.start(startup_metadata_done=True)
 
-    idle_task = None
-    if settings.browser_idle_timeout > 0:
+    startup_task: asyncio.Task[object] | None = None
+    startup_task = asyncio.create_task(_startup_instances(runtime_state, warmup_task))
 
-        async def _idle_monitor():
-            while True:
-                await asyncio.sleep(10.0)
-                try:
-                    client = runtime_state.client
-                    session = getattr(client, "_session", None) if client else None
-                    if client is not None and session is not None:
-                        pool = getattr(client, "_instance_pool", None)
-                        if pool is not None and pool.has_active_work():
-                            # Instance load/switch already owns the browser; do
-                            # not recycle it while BotGuard/WS is warming up.
-                            session.touch_activity()
-                        else:
-                            await session.check_idle_timeout()
-                except Exception as e:
-                    logger.debug("空闲回收检查异常: %s", e)
+    # 启动订阅/邮箱自检：先跑 keepalive metadata refresh，再对未被覆盖的账号
+    # 做应用侧探测；3 天内已验证 Free 的账号跳过 benefit-tier 探测。
+    tier_task: asyncio.Task[object] | None = None
 
-        idle_task = asyncio.create_task(_idle_monitor())
-
-    tier_task = None
-
-    async def _auto_refresh_tiers():
-        import json
-
-        from aistudio_api.infrastructure.account.cookie_parser import (
-            probe_account_benefit_tier,
-            probe_account_email,
+    async def _startup_metadata_and_tiers() -> None:
+        covered_ids: set[str] = set()
+        settings = KeepaliveSettings.from_config()
+        if settings.metadata_refresh and settings.metadata_refresh_on_startup:
+            result = await keepalive.run_startup_metadata_refresh()
+            raw_accounts = result.get("accounts")
+            if result.get("reason") in ("checked", "no_due_accounts"):
+                if isinstance(raw_accounts, (list, tuple)):
+                    covered_ids = {str(account_id) for account_id in raw_accounts}
+            else:
+                logger.debug(
+                    "keepalive 启动 metadata 刷新未覆盖批次: reason=%s",
+                    result.get("reason"),
+                )
+        await _refresh_startup_account_metadata(
+            account_store, covered_ids=covered_ids
         )
 
-        for a in account_store.list_accounts():
-            if not a.email or not a.tier or a.tier == "Free":
-                apath = account_store.get_auth_path(a.id)
-                if apath and apath.is_file():
-                    try:
-                        adata = json.loads(apath.read_text(encoding="utf-8"))
-                        rcookies = adata.get("cookies") or []
-                        cdict = {
-                            str(c.get("name") or ""): str(c.get("value") or "")
-                            for c in rcookies
-                            if isinstance(c, dict) and c.get("name")
-                        }
-                        if cdict:
-                            if not a.email:
-                                em = await probe_account_email(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if em:
-                                    account_store.update_account_email(a.id, em)
-                            if a.tier == "Free":
-                                t = await probe_account_benefit_tier(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if t and t != "Free":
-                                    account_store.update_account_tier(a.id, t)
-                                    logger.info(
-                                        "启动自动校验并升级账号 %s (u/%s) 订阅等级: %s",
-                                        a.id,
-                                        a.auth_user,
-                                        t,
-                                    )
-                    except Exception:
-                        pass
+    tier_task = asyncio.create_task(_startup_metadata_and_tiers())
 
-    tier_task = asyncio.create_task(_auto_refresh_tiers())
+    # Model discovery warmup: wait until the instance pool has a READY session
+    # (preferring the Pro/paid lane), then refresh the live ListModels catalog
+    # and repeat on the cache TTL. Pool sessions only: never the control session
+    # and never a new Page/BotGuard path.
+    model_warmup_task: asyncio.Task[object] | None = None
 
-    yield
-    logger.info("服务正在关闭")
-    if warmup_task and not warmup_task.done():
-        warmup_task.cancel()
-    if startup_task and not startup_task.done():
-        startup_task.cancel()
-    if model_warmup_task and not model_warmup_task.done():
-        model_warmup_task.cancel()
-    if idle_task and not idle_task.done():
-        idle_task.cancel()
-    if tier_task and not tier_task.done():
-        tier_task.cancel()
-    if runtime_state.keepalive is not None:
-        await runtime_state.keepalive.stop()
-    if client:
-        try:
-            await client.close()
-        except Exception as e:
-            logger.debug("关闭客户端失败: %s", e)
-    runtime_state.instance_manager = None
-    runtime_state.client = None
-    runtime_state.account_service = None
-    runtime_state.rotator = None
-    runtime_state.account_refresher = None
-    runtime_state.keepalive = None
+    async def _model_warmup():
+        if startup_task is not None:
+            try:
+                await startup_task
+            except Exception as exc:
+                logger.debug("模型发现预热前实例启动失败: %s", exc)
+        while True:
+            await _model_warmup_cycle(runtime_state)
+
+    model_warmup_task = asyncio.create_task(_model_warmup())
+
+    try:
+        yield
+    finally:
+        logger.info("服务正在关闭")
+        await _shutdown_runtime(
+            runtime_state, (warmup_task, startup_task, tier_task, model_warmup_task)
+        )
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
-app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
-app.include_router(
-    keepalive_router,
-    prefix="/api",
-    dependencies=[Depends(require_web_auth)],
-)
+app.include_router(debug_router, prefix="/api")
+app.include_router(debug_dashboard_router, prefix="/api")
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
+app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     instances_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
-app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    keepalive_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
-app.include_router(models_router, dependencies=[Depends(require_api_key)])
-app.include_router(openai_router, dependencies=[Depends(require_api_key)])
-app.include_router(responses_router, dependencies=[Depends(require_api_key)])
-app.include_router(claude_router, dependencies=[Depends(require_api_key)])
+app.include_router(models_router)
+app.include_router(openai_router)
+app.include_router(claude_router)
+app.include_router(responses_router)
+app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 
 
-@app.exception_handler(InstanceError)
-async def instance_exception_handler(
-    _request: Request, exc: InstanceError
+def _protocol_for_request(request: Request) -> ApiFormat:
+    """Resolve the wire protocol face for one request path."""
+    return format_for_path(request.url.path)
+
+
+@app.exception_handler(TierRequiredError)
+@app.exception_handler(RoutingError)
+async def routing_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """D-04/D-06: tier 403 and routing 503 are rendered by the protocol adapter."""
+    status, body = error_payload(exc, _protocol_for_request(request))
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(AistudioError)
+async def aistudio_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    status, body = error_payload(exc, _protocol_for_request(request))
+    return JSONResponse(status_code=status, content=body)
+
+
+def _attach_exception_headers(
+    response: JSONResponse, exc: StarletteHTTPException
 ) -> JSONResponse:
+    """Carry official HTTP headers (405 ``Allow``, 401 ``WWW-Authenticate``)."""
+    headers = getattr(exc, "headers", None)
+    if headers:
+        for key, value in headers.items():
+            response.headers[key] = value
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Render router-level 404/405 for Claude/Responses; keep FastAPI defaults."""
+    protocol = _protocol_for_request(request)
+    if protocol in ("claude", "responses"):
+        from aistudio_api.api.format_errors import format_error_response
+
+        wrapped = HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=getattr(exc, "headers", None),
+        )
+        return _attach_exception_headers(
+            format_error_response(wrapped, protocol), exc
+        )
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": {"code": exc.code, "message": str(exc)}},
-    )
-
-
-@app.exception_handler(SurfacePolicyError)
-async def surface_policy_exception_handler(
-    _request: Request, exc: SurfacePolicyError
-) -> JSONResponse:
-    """Policy denials are client-visible 4xx, never generic 500."""
-    return JSONResponse(status_code=exc.http_status, content=exc.to_error_body())
-
-
-@app.exception_handler(BuildSurfaceError)
-async def build_surface_exception_handler(
-    _request: Request, exc: BuildSurfaceError
-) -> JSONResponse:
-    """Build not-ready/timeout is retryable 503; upstream failures are 502."""
-    retryable = {
-        "SURFACE_NOT_READY",
-        "PAGE_NOT_READY",
-        "SIGNER_NOT_READY",
-        "APP_NOT_CONNECTED",
-        "TIMEOUT",
-    }
-    status_code = 503 if exc.code in retryable else 502
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "code": status_code,
-                "message": f"[build_surface:{exc.stage}] {exc.code}: {exc.detail}",
-                "status": "UNAVAILABLE" if status_code == 503 else "BAD_GATEWAY",
-                "advice": exc.guidance,
-            }
-        },
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None),
     )
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    api_format = format_for_path(request.url.path)
-    if api_format != "gemini":
-        return format_error_response(exc, api_format)
-    code, msg, status_str = classify_gemini_error_payload(exc)
+    detail = exc.detail
+    if isinstance(detail, dict):
+        msg = str(detail.get("message") or detail)
+    else:
+        msg = str(detail)
+    code = exc.status_code
+    if code >= 500:
+        logger.error(
+            "HTTP 异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    elif code in (401, 403, 429):
+        logger.warning(
+            "HTTP 权限/限额异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    else:
+        logger.info(
+            "HTTP 业务异常: status=%d, message=%s, path=%s",
+            code,
+            msg,
+            request.url.path,
+        )
+    protocol = _protocol_for_request(request)
+    if protocol != "gemini":
+        from aistudio_api.api.format_errors import format_error_response
+
+        return _attach_exception_headers(format_error_response(exc, protocol), exc)
+    status_map = {
+        400: "INVALID_ARGUMENT",
+        401: "UNAUTHENTICATED",
+        403: "PERMISSION_DENIED",
+        404: "NOT_FOUND",
+        409: "ABORTED",
+        429: "RESOURCE_EXHAUSTED",
+        500: "INTERNAL",
+        502: "UNAVAILABLE",
+        503: "UNAVAILABLE",
+        504: "DEADLINE_EXCEEDED",
+    }
+    status_str = status_map.get(code, "INTERNAL" if code >= 500 else "UNKNOWN")
     return JSONResponse(
         status_code=code,
         content={
@@ -353,14 +696,40 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     )
 
 
+@app.exception_handler(InstanceError)
+async def instance_exception_handler(
+    _request: Request, exc: InstanceError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": {"code": exc.code, "message": str(exc)}},
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    api_format = format_for_path(request.url.path)
-    if api_format != "gemini":
-        return format_error_response(exc, api_format)
+    protocol = _protocol_for_request(request)
+    if protocol != "gemini":
+        from aistudio_api.api.format_errors import format_error_response
+
+        return format_error_response(exc, protocol)
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
+    # RequestValidationError.errors() does not support include_input here, so
+    # project only non-input fields to keep prompts/body fragments out of logs.
+    safe_errors = [
+        {
+            "loc": error.get("loc"),
+            "type": error.get("type"),
+            "msg": error.get("msg"),
+        }
+        for error in exc.errors()
+        if isinstance(error, dict)
+    ]
+    logger.warning(
+        "请求参数校验失败: path=%s, errors=%s", request.url.path, safe_errors
+    )
     return JSONResponse(
         status_code=code,
         content={
@@ -468,7 +837,11 @@ async def logging_and_dump_middleware(request, call_next):
             response_text=resp_text,
             is_stream=is_event_stream,
         )
-    elif not is_static:
+    elif not is_static and not (
+        path == "/health" and response.status_code == 200
+    ):
+        # Health probes are polled continuously; successful probes emit no
+        # access log record at all (no INFO, no DEBUG, no broadcast ring entry).
         logger.info(
             "HTTP %s %s -> %d (%.1fms)",
             request.method,
@@ -481,27 +854,14 @@ async def logging_and_dump_middleware(request, call_next):
 
 
 # 挂载前端静态资源与 SPA 路由支持
-class _NoCacheStaticFiles(StaticFiles):
-    """Revalidate unhashed frontend assets so rebuilds are picked up."""
-
-    async def get_response(self, path: str, scope):  # type: ignore[no-untyped-def]
-        response = await super().get_response(path, scope)
-        response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
-        return response
-
-
 static_dir = Path(__file__).resolve().parents[1] / "static"
 index_html_path = static_dir / "index.html"
 
 if static_dir.is_dir():
-    app.mount("/static", _NoCacheStaticFiles(directory=str(static_dir)), name="static")
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
-        app.mount(
-            "/assets",
-            _NoCacheStaticFiles(directory=str(assets_dir)),
-            name="assets",
-        )
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
 
 @app.get("/auth/check")
@@ -524,12 +884,12 @@ async def spa_navigation_middleware(request: Request, call_next):
     is_api = request.url.path.startswith(
         (
             "/api",
-            "/v1",
             "/v1beta",
             "/auth",
             "/assets",
             "/static",
             "/health",
+            "/stats",
             "/rotation",
             "/config",
             "/api-keys",
@@ -591,5 +951,5 @@ def main():
 
     import uvicorn
 
-    logger.info("正在启动服务，监听端口 %s", args.port)
+    logger.info("启动服务: 监听端口=%d, 浏览器调试端口=%d", args.port, runtime_state.browser_port)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")

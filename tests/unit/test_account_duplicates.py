@@ -58,6 +58,7 @@ def test_duplicate_flag_persists_across_reload(tmp_path):
     second = _save(store, "second", "persist@example.com", auth_user="1")
     store.refresh_duplicate_flags()
 
+    AccountStore._instances.pop(accounts_dir.resolve(), None)
     reloaded = AccountStore(accounts_dir=accounts_dir)
     assert _get(reloaded, first.id).duplicate_of is None
     assert _get(reloaded, second.id).duplicate_of == first.id

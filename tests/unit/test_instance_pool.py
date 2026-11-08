@@ -1,75 +1,55 @@
-"""Behavior contracts for the WP5 v3 unified request instance pool."""
+"""Instance pool contracts: one account + one Context + one Page + one surface."""
 
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from aistudio_api.infrastructure.gateway.instance_pool import (
+    InstanceBusyError,
     InstanceCapacityError,
     InstancePool,
-    InstanceSlot,
+    InstanceSpec,
+    InstanceTierError,
     SessionFactory,
     SlotState,
 )
 
 
 class FakePage:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
         self.closed = False
 
     def is_closed(self) -> bool:
         return self.closed
 
     async def close(self) -> None:
+        self.events.append("page.close")
         self.closed = True
 
 
-class FakeSessionContext:
-    def __init__(self) -> None:
-        self.page = FakePage()
-        self.auth_user = "0"
-        self.in_flight = 0
-
-
 class FakeSession:
-    def __init__(self) -> None:
-        self.active_context = FakeSessionContext()
-        self.in_flight_count = 0
-        self.closed = False
+    def __init__(self, events: list[str], auth_user: str) -> None:
+        self.events = events
+        self.active_context = SimpleNamespace(
+            page=FakePage(events), auth_user=auth_user
+        )
 
     @property
     def page(self) -> FakePage:
         return self.active_context.page
 
     async def close(self) -> None:
-        self.closed = True
-        self.active_context.page.closed = True
-
-
-class FakeBuildSurface:
-    def __init__(self, *, context_id: str, realm_id: str) -> None:
-        self.context_id = context_id
-        self.realm_id = realm_id
-        self.state = type(
-            "State",
-            (),
-            {
-                "page": FakePage(),
-                "ready": True,
-                "native_ready": True,
-                "signer_ready": False,
-            },
-        )()
-
-    async def ensure_ready(self, *_args, **_kwargs) -> None:
-        return None
+        await self.active_context.page.close()
 
 
 class FakeCDP:
     def __init__(self) -> None:
+        self.events: list[str] = []
         self.created: list[str] = []
         self.disposed: list[str] = []
         self._counter = 0
@@ -78,981 +58,363 @@ class FakeCDP:
         self._counter += 1
         context_id = f"ctx-{self._counter}"
         self.created.append(context_id)
+        self.events.append(f"context.create:{context_id}")
         return context_id
 
     async def dispose_browser_context(self, context_id: str) -> None:
         self.disposed.append(context_id)
+        self.events.append(f"context.dispose:{context_id}")
 
 
-def _features(max_contexts: int = 2) -> dict[str, object]:
-    return {
-        "routing": {"max_contexts": max_contexts, "global_max_pages": 4},
-        "channels": {
-            "chat": {"enabled": True, "max_pages": 2},
-            "build": {"enabled": True, "max_pages": 2},
-            "official": {"enabled": False, "max_pages": 0},
-        },
-    }
+def _factory(cdp: FakeCDP, *, fail_contexts: set[str] | None = None) -> SessionFactory:
+    async def factory(_cdp: Any, **kwargs: Any) -> FakeSession:
+        context_id = str(kwargs["context_id"])
+        cdp.events.append(f"session.create:{context_id}")
+        if fail_contexts and context_id in fail_contexts:
+            raise RuntimeError(f"bootstrap failed for {context_id}")
+        return FakeSession(cdp.events, str(kwargs.get("auth_user") or "0"))
+
+    return cast("SessionFactory", factory)
+
+
+async def _ready(value: FakeCDP) -> FakeCDP:
+    return value
 
 
 def _pool(
     cdp: FakeCDP,
     *,
+    specs: list[InstanceSpec] | None = None,
     max_contexts: int = 2,
-    features: dict[str, object] | None = None,
-    on_slot_retired=None,
+    on_slot_retired: Any = None,
+    fail_contexts: set[str] | None = None,
+    load_attempts: int = 3,
 ) -> InstancePool:
-    async def factory(_cdp, **kwargs):
-        session = FakeSession()
-        session.active_context.auth_user = str(kwargs.get("auth_user") or "0")
-        return session
-
-    configured = features or _features(max_contexts)
     return InstancePool(
-        lambda: _ready(cdp),
-        features_provider=lambda: configured,
-        session_factory=cast("SessionFactory", factory),
+        cast(Any, lambda: _ready(cdp)),
+        specs=specs
+        or [
+            InstanceSpec(count=1, surface="chat", min_tier="Free"),
+            InstanceSpec(count=1, surface="chat", min_tier="Pro"),
+        ],
+        max_contexts=max_contexts,
+        session_factory=_factory(cdp, fail_contexts=fail_contexts),
         on_slot_retired=on_slot_retired,
-        wait_timeout_s=0.0,
+        load_attempts=load_attempts,
     )
 
 
-async def _ready(value):
-    return value
-
-
-@pytest.mark.asyncio
-async def test_pool_reuses_same_account_and_caps_contexts() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-
-    first = await pool.acquire(account_id="a", auth_file="a.json", auth_user="1")
-    second = await pool.acquire(account_id="b", auth_file="b.json", auth_user="2")
-    assert pool.live_contexts == 2
-    assert len(cdp.created) == 2
-
-    again = await pool.acquire(account_id="a", auth_file="a.json", auth_user="1")
-    assert again.slot_id == first.slot_id
-    assert again.realm_id == first.realm_id
-    assert pool.live_contexts == 2
-    assert len(cdp.created) == 2
-
-    await pool.release(first)
-    await pool.release(second)
-    await pool.release(again)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_idle_slot_is_rebound_to_third_account() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    first = await pool.acquire(account_id="a", auth_file="a.json")
-    second = await pool.acquire(account_id="b", auth_file="b.json")
-    await pool.release(first)
-
-    third = await pool.acquire(account_id="c", auth_file="c.json")
-    assert third.slot_id == first.slot_id
-    assert third.adapter.current_account_id == "c"
-    assert third.adapter.generation == 2
-    assert pool.live_contexts == 2
-    assert len(cdp.created) == 3
-    assert len(cdp.disposed) == 1
-
-    await pool.release(second)
-    await pool.release(third)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_fifty_account_rotation_keeps_context_count_stable() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    for index in range(50):
-        lease = await pool.acquire(
-            account_id=f"account-{index}",
-            auth_file=f"account-{index}.json",
-            timeout_s=0.0,
-        )
-        assert pool.live_contexts <= 2
-        await pool.release(lease)
-    assert pool.live_contexts == 2
-    assert len(cdp.created) == 50
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_busy_pool_waits_and_raises_capacity_error() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    first = await pool.acquire(account_id="a", auth_file="a.json")
-    second = await pool.acquire(account_id="b", auth_file="b.json")
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(account_id="c", auth_file="c.json", timeout_s=0.0)
-
-    await pool.release(first)
-    third = await pool.acquire(account_id="c", auth_file="c.json", timeout_s=0.0)
-    assert third.slot_id == first.slot_id
-
-    await pool.release(second)
-    await pool.release(third)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_build_surface_reuses_same_slot_context(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-
-    async def fake_ensure(self: InstanceSlot, cdp_client):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-
-    chat = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    build = await pool.acquire(account_id="a", auth_file="a.json", channel="build")
-    assert build.slot_id == chat.slot_id
-    assert build.context_id == chat.context_id
-    assert build.adapter.build_ready() is True
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-
-    await pool.release(chat)
-    await pool.release(build)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_build_creation_counts_one_page(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fake_ensure(self: InstanceSlot, cdp_client):
-        if self.build_surface is None:
-            started.set()
-            await release.wait()
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-
-    chat = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    first_task = asyncio.create_task(
-        pool.acquire(account_id="a", auth_file="a.json", channel="build")
-    )
-    await started.wait()
-    second_task = asyncio.create_task(
-        pool.acquire(account_id="a", auth_file="a.json", channel="build")
-    )
-    await asyncio.sleep(0)
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-
-    release.set()
-    first, second = await asyncio.gather(first_task, second_task)
-    assert first.slot_id == second.slot_id == chat.slot_id
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-
-    await pool.release(chat)
-    await pool.release(first)
-    await pool.release(second)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_hidden_bootstrap_chat_page_obeys_chat_budget(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 2, "global_max_pages": 2},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1},
-                "build": {"enabled": True, "max_pages": 1},
-            },
-        },
-    )
-
-    async def fake_ensure(self: InstanceSlot, cdp_client):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-
-    chat = await pool.acquire(account_id="b", auth_file="b.json", channel="chat")
-    await pool.release(chat)
-    build = await pool.acquire(account_id="a", auth_file="a.json", channel="build")
-    await pool.release(build)
-
-    rebound = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    assert rebound.slot_id == chat.slot_id
-    assert rebound.slot_id != build.slot_id
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-
-    await pool.release(rebound)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_new_slot_is_closed_when_build_surface_creation_fails(
-    monkeypatch,
+async def _activate(
+    pool: InstancePool,
+    slot_id: str,
+    *,
+    account_id: str = "acc",
+    tier: str = "Free",
+    lane: str = "free",
+    surface: str = "chat",
+    force: bool = False,
 ) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-
-    async def fail_ensure(self: InstanceSlot, cdp_client):
-        raise RuntimeError("build surface failed")
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fail_ensure)
-
-    with pytest.raises(RuntimeError, match="build surface failed"):
-        await pool.acquire(account_id="a", auth_file="a.json", channel="build")
-
-    assert pool.slots() == ()
-    assert pool.live_contexts == 0
-    assert cdp.disposed == ["ctx-1"]
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_chat_waits_for_loading_slot() -> None:
-    cdp = FakeCDP()
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def factory(_cdp, **_kwargs):
-        started.set()
-        await release.wait()
-        return FakeSession()
-
-    pool = InstancePool(
-        lambda: _ready(cdp),
-        features_provider=lambda: _features(1),
-        session_factory=cast("SessionFactory", factory),
-        wait_timeout_s=5.0,
-    )
-    first_task = asyncio.create_task(
-        pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    )
-    await started.wait()
-    second_task = asyncio.create_task(
-        pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    )
-    await asyncio.sleep(0.05)
-    assert not second_task.done()
-
-    release.set()
-    first, second = await asyncio.gather(first_task, second_task)
-    assert first.slot_id == second.slot_id
-    assert pool.live_contexts == 1
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-
-    await pool.release(first)
-    await pool.release(second)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_slot_load_disposes_context_and_removes_slot() -> None:
-    cdp = FakeCDP()
-    started = asyncio.Event()
-    blocker = asyncio.Event()
-
-    async def factory(_cdp, **_kwargs):
-        started.set()
-        await blocker.wait()
-        return FakeSession()
-
-    pool = InstancePool(
-        lambda: _ready(cdp),
-        features_provider=lambda: _features(1),
-        session_factory=cast("SessionFactory", factory),
-        wait_timeout_s=0.0,
-    )
-    task = asyncio.create_task(pool.acquire(account_id="a", auth_file="a.json"))
-    await started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert pool.slots() == ()
-    assert pool.live_contexts == 0
-    assert cdp.disposed == ["ctx-1"]
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_ensure_channel_times_out_without_leaking_page(
-    monkeypatch,
-) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-
-    async def slow_ensure(self: InstanceSlot, cdp_client):
-        await asyncio.sleep(5)
-        return FakeBuildSurface(context_id=self.context_id, realm_id=self.realm_id)
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", slow_ensure)
-    monkeypatch.setattr(
-        "aistudio_api.infrastructure.gateway.instance_pool.BUILD_CHANNEL_READY_TIMEOUT_S",
-        0.01,
-    )
-    chat = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    await pool.release(chat)
-
-    with pytest.raises(InstanceCapacityError, match="渠道启动超时"):
-        await pool.ensure_channel(chat.slot_id, "build")
-
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_rebind_to_build_reserves_page_while_surface_loads(
-    monkeypatch,
-) -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 2, "global_max_pages": 2},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1, "max_instances": 2},
-                "build": {"enabled": True, "max_pages": 1, "max_instances": 2},
-            },
-        },
-    )
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fake_ensure(self: InstanceSlot, cdp_client):
-        if self.build_surface is None:
-            started.set()
-            await release.wait()
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    first = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    second = await pool.acquire(account_id="b", auth_file="b.json", channel="chat")
-    await pool.release(first)
-    await pool.release(second)
-
-    task = asyncio.create_task(
-        pool.rebind(
-            first.slot_id,
-            account_id="a",
-            auth_file="a.json",
-            auth_user="0",
-            channel="build",
-            group_name="g",
-            group_max_pages=1,
-        )
-    )
-    await started.wait()
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(
-            account_id="b",
-            auth_file="b.json",
-            channel="build",
-            group_name="g",
-            group_max_pages=1,
-            timeout_s=0.0,
-        )
-
-    release.set()
-    await task
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_rebind_to_build_creates_build_surface(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-
-    async def fake_ensure(self: InstanceSlot, cdp_client):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-
-    lease = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    await pool.release(lease)
-    await pool.rebind(
-        lease.slot_id,
-        account_id="b",
-        auth_file="b.json",
+    await pool.activate(
+        slot_id,
+        account_id=account_id,
+        auth_file=f"{account_id}.json",
         auth_user="0",
-        channel="build",
-        group_name="free",
-        group_max_pages=2,
+        tier=tier,
+        account_lane=lane,
+        surface=surface,
+        force=force,
     )
-    slot = pool.get(lease.slot_id)
-    assert slot is not None
-    assert slot.state is SlotState.READY
-    assert slot.channel_role == "build"
-    assert slot.build_ready() is True
-    assert pool.page_counts() == {"chat": 0, "build": 1}
-    await pool.close()
 
 
 @pytest.mark.asyncio
-async def test_idle_closed_page_releases_page_budget() -> None:
+async def test_free_and_paid_instances_are_isolated_and_bounded() -> None:
     cdp = FakeCDP()
     pool = _pool(cdp)
-    lease = await pool.acquire(account_id="a", auth_file="a.json", channel="chat")
-    slot = pool.get(lease.slot_id)
-    assert slot is not None
-    await pool.release(lease)
+    free = await pool.add_slot(pool.specs[0], lane="free")
+    paid = await pool.add_slot(pool.specs[1], lane="paid")
+
+    await _activate(pool, free.slot_id, account_id="free-acc", tier="Free")
+    await _activate(pool, paid.slot_id, account_id="pro-acc", tier="Pro", lane="paid")
+
+    assert pool.live_contexts == 2
+    assert free.context_id != paid.context_id
+    assert free.realm_id != paid.realm_id
+    assert [slot.slot_id for slot in pool.eligible_slots(paid=False)] == [free.slot_id]
+    assert [slot.slot_id for slot in pool.eligible_slots(paid=True)] == [paid.slot_id]
+
+    third = InstanceSpec(count=1, surface="chat", min_tier="Free")
+    with pytest.raises(InstanceCapacityError):
+        await pool.add_slot(third, lane="free")
+
+    with pytest.raises(InstanceTierError):
+        await _activate(pool, free.slot_id, account_id="pro", tier="Pro", lane="paid")
+
+
+@pytest.mark.asyncio
+async def test_one_page_per_instance_and_page_closes_before_context() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+
+    assert slot.page is not None
     assert slot.session is not None
-    cast("Any", slot.session).active_context.page.closed = True
-    assert pool.page_counts() == {"chat": 0, "build": 0}
-    await pool.close()
+    assert sum(1 for event in cdp.events if event.startswith("session.create")) == 1
+    assert pool.snapshot()[0]["pages"] == 1
 
+    old_realm = slot.realm_id
+    await pool.close_slot(slot.slot_id)
 
-def test_pending_build_page_is_counted_once() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    slot = InstanceSlot(
-        slot_id="slot-test",
-        build_counted=True,
-        pending_pages=1,
-        channel_role="build",
-    )
-    assert pool._slot_page_counts(slot) == {"chat": 0, "build": 1}
+    assert slot.context_id == ""
+    assert slot.session is None
+    assert cdp.disposed == ["ctx-1"]
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert retired == [old_realm]
+    assert pool.slots() == ()
 
 
 @pytest.mark.asyncio
-async def test_borrow_uses_idle_other_account_slot() -> None:
+async def test_active_requests_release_and_block_manual_close() -> None:
     cdp = FakeCDP()
-    pool = _pool(cdp)
-    first = await pool.acquire(account_id="a", auth_file="a.json")
-    await pool.release(first)
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
 
-    borrowed = await pool.acquire(
-        account_id="b",
-        auth_file="b.json",
-        borrow_accounts={"a"},
-        timeout_s=0.0,
-    )
-    assert borrowed.is_borrow is True
-    assert borrowed.slot_id == first.slot_id
-    assert borrowed.account_id == "a"
+    handle = await pool.begin_request(slot.slot_id)
+    assert slot.active_requests == 1
 
-    await pool.release(borrowed)
-    await pool.close()
+    slot.state = SlotState.RETIRING
+    with pytest.raises(InstanceCapacityError):
+        await pool.begin_request(slot.slot_id)
+    slot.state = SlotState.READY
+
+    with pytest.raises(InstanceCapacityError):
+        await pool.close_slot(slot.slot_id)
+
+    handle.release()
+    handle.release()
+    assert slot.active_requests == 0
+
+    await pool.close_slot(slot.slot_id)
+    assert pool.slots() == ()
 
 
 @pytest.mark.asyncio
-async def test_retire_idle_closes_context_and_reports_realm() -> None:
+async def test_activate_with_inflight_request_raises_busy() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id, account_id="a")
+    handle = await pool.begin_request(slot.slot_id)
+
+    with pytest.raises(InstanceBusyError):
+        await _activate(pool, slot.slot_id, account_id="b")
+
+    handle.release()
+
+
+@pytest.mark.asyncio
+async def test_retire_runtime_waits_once_then_force_closes() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+
+    handle = await pool.begin_request(slot.slot_id)
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.02)
+        handle.release()
+
+    task = asyncio.create_task(_release_soon())
+    timed_out = await pool.retire_runtime(slot.slot_id, timeout_s=1.0)
+    await task
+
+    assert timed_out is False
+    assert slot.state is SlotState.UNSTARTED
+    assert slot.context_id == ""
+    assert cdp.disposed == ["ctx-1"]
+
+    await _activate(pool, slot.slot_id)
+    assert slot.generation == 2
+
+    blocked = await pool.begin_request(slot.slot_id)
+    timed_out = await pool.retire_runtime(slot.slot_id, timeout_s=0.01)
+    blocked.release()
+
+    assert timed_out is True
+    assert slot.state is SlotState.UNSTARTED
+    assert cdp.disposed == ["ctx-1", "ctx-2"]
+
+
+@pytest.mark.asyncio
+async def test_sleep_releases_context_and_wake_creates_new_generation() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+    first_realm = slot.realm_id
+
+    await pool.sleep(slot.slot_id)
+    assert slot.state is SlotState.SLEEPING
+    assert slot.context_id == ""
+    assert slot in pool.slots()
+
+    await _activate(pool, slot.slot_id)
+    assert slot.state is SlotState.READY
+    assert slot.generation == 2
+    assert slot.realm_id != first_realm
+    assert pool.live_contexts == 1
+
+
+@pytest.mark.asyncio
+async def test_activate_same_account_ready_without_force_reuses_runtime() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+
+    await _activate(pool, slot.slot_id)
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 1
+    assert slot.context_id == first_context
+    assert slot.realm_id == first_realm
+    assert slot.session is first_session
+    assert cdp.created == ["ctx-1"]
+    assert cdp.disposed == []
+    assert retired == []
+
+
+@pytest.mark.asyncio
+async def test_activate_same_account_ready_with_force_rebuilds_runtime() -> None:
+    cdp = FakeCDP()
+    retired: list[str] = []
+    pool = _pool(cdp, on_slot_retired=retired.append, max_contexts=1)
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+    assert first_session is not None
+
+    await _activate(pool, slot.slot_id, force=True)
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 2
+    assert slot.realm_id == f"{slot.slot_id}-g2"
+    assert slot.realm_id != first_realm
+    assert slot.context_id == "ctx-2"
+    assert slot.context_id != first_context
+    assert slot.session is not first_session
+    assert "page.close" in cdp.events
+    assert cdp.created == ["ctx-1", "ctx-2"]
+    assert cdp.disposed == ["ctx-1"]
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert retired == [first_realm]
+    assert pool.live_contexts == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_retries_then_marks_invalid() -> None:
+    cdp = FakeCDP()
+    pool = _pool(cdp, max_contexts=1, fail_contexts={"ctx-1", "ctx-2"})
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
+
+    assert slot.state is SlotState.READY
+    assert len(cdp.created) == 3
+    assert cdp.disposed == ["ctx-1", "ctx-2"]
+
+    await pool.close_slot(slot.slot_id)
+
+    always_fail = _pool(
+        cdp,
+        max_contexts=1,
+        fail_contexts={"ctx-4", "ctx-5", "ctx-6"},
+    )
+    failed = await always_fail.add_slot(always_fail.specs[0], lane="free")
+    with pytest.raises(RuntimeError):
+        await _activate(always_fail, failed.slot_id)
+    assert failed.state is SlotState.INVALID
+    assert failed.context_id == ""
+
+
+def test_legacy_lease_and_pinned_surface_is_gone() -> None:
+    import aistudio_api.infrastructure.gateway.instance_pool as pool_module
+
+    assert not hasattr(pool_module, "InstanceLease")
+    assert "COOLDOWN" not in SlotState.__members__
+    for legacy in ("acquire", "release", "rebind", "retire_idle", "borrow"):
+        assert not hasattr(InstancePool, legacy)
+
+    slot = pool_module.InstanceSlot(
+        slot_id="slot-x", surface="chat", min_tier="Free", lane="free"
+    )
+    assert not hasattr(slot, "reservations")
+    assert not hasattr(slot, "pinned")
+    assert not hasattr(slot, "pending_pages")
+
+
+@pytest.mark.asyncio
+async def test_sync_account_tier_cross_lane_unbinds_free_slot_and_keeps_same_lane() -> None:
     cdp = FakeCDP()
     retired: list[str] = []
     pool = _pool(cdp, on_slot_retired=retired.append)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-    await pool.release(lease)
+    free = await pool.add_slot(pool.specs[0], lane="free")
+    paid = await pool.add_slot(pool.specs[1], lane="paid")
+    await _activate(pool, free.slot_id, account_id="restored", tier="Free")
+    await _activate(pool, paid.slot_id, account_id="paid-acc", tier="Pro", lane="paid")
+    free_context = free.context_id
+    paid_context = paid.context_id
 
-    assert await pool.retire_idle() == 1
-    assert pool.live_contexts == 0
-    assert retired == [lease.realm_id]
-    assert cdp.disposed == [lease.context_id]
-    await pool.close()
+    updated = await pool.sync_account_tier("restored", "Pro", drain_timeout_s=0.1)
 
+    assert updated == 1
+    assert free.state is SlotState.UNSTARTED
+    assert free.account_id == ""
+    assert free.session is None
+    assert free.context_id == ""
+    assert free_context in cdp.disposed
+    assert retired == [f"{free.slot_id}-g1"]
+    assert paid.state is SlotState.READY
+    assert paid.account_id == "paid-acc"
+    assert paid.context_id == paid_context
 
-@pytest.mark.asyncio
-async def test_snapshot_does_not_expose_credentials() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    lease = await pool.acquire(account_id="a", auth_file="secret.json")
-    snapshot = pool.snapshot()[0]
-    assert "auth_file" not in snapshot
-    assert "secret" not in str(snapshot)
-    assert snapshot["state"] == SlotState.BUSY.value
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_channel_page_budget_scales_with_instance_capacity() -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 2, "global_max_pages": 4},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1, "max_instances": 2},
-                "build": {"enabled": True, "max_pages": 1, "max_instances": 2},
-            },
-        },
-    )
-    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
-    second = await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
-    assert first.slot_id != second.slot_id
-    assert pool.live_contexts == 2
-    channel_budget = cast("dict[str, int]", pool.budget_snapshot()["channel_max_pages"])
-    assert channel_budget["chat"] == 2
-    await pool.release(first)
-    await pool.release(second)
-    await pool.close()
+    updated = await pool.sync_account_tier("paid-acc", "Ultra")
+    assert updated == 1
+    assert paid.tier == "Ultra"
+    assert paid.session is not None
+    assert paid.session.active_context.tier == "Ultra"
+    assert paid.context_id == paid_context
+    assert paid.account_id == "paid-acc"
 
 
 @pytest.mark.asyncio
-async def test_channel_instance_cap_blocks_second_page_for_429_acquire() -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 3, "global_max_pages": 3},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1, "max_instances": 1},
-                "build": {"enabled": True, "max_pages": 1, "max_instances": 1},
-            },
-        },
-    )
-    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
-    assert pool.page_counts().get("chat") == 1
-    await pool.release(first)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_full_page_budget_rebinds_idle_slot_instead_of_failing() -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 1, "global_max_pages": 1},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 1},
-                "build": {"enabled": True, "max_pages": 1},
-            },
-        },
-    )
-    first = await pool.acquire(account_id="a", auth_file="a.json", group_name="g")
-    await pool.release(first)
-
-    second = await pool.acquire(account_id="b", auth_file="b.json", group_name="g")
-    assert second.slot_id == first.slot_id
-    assert second.account_id == "b"
-    assert pool.live_contexts == 1
-    await pool.release(second)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_global_page_budget_is_at_least_instance_capacity() -> None:
-    cdp = FakeCDP()
-    pool = _pool(
-        cdp,
-        features={
-            "routing": {"max_contexts": 2, "global_max_pages": 1},
-            "channels": {
-                "chat": {"enabled": True, "max_pages": 2},
-                "build": {"enabled": True, "max_pages": 2},
-            },
-        },
-    )
-    assert pool.budget_snapshot()["global_max_pages"] == 2
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_group_page_budget_is_enforced() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    first = await pool.acquire(
-        account_id="a",
-        auth_file="a.json",
-        group_name="pro",
-        group_max_pages=1,
-    )
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(
-            account_id="b",
-            auth_file="b.json",
-            group_name="pro",
-            group_max_pages=1,
-        )
-    other = await pool.acquire(
-        account_id="c",
-        auth_file="c.json",
-        group_name="free",
-        group_max_pages=1,
-    )
-    await pool.release(first)
-    await pool.release(other)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_rebind_idle_slot_changes_account_without_new_context() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    lease = await pool.acquire(account_id="a", auth_file="a.json", group_name="pro")
-    await pool.release(lease)
-
-    await pool.rebind(
-        lease.slot_id,
-        account_id="b",
-        auth_file="b.json",
-        auth_user="0",
-        channel="chat",
-        group_name="free",
-    )
-    slot = pool.get(lease.slot_id)
-    assert slot is not None
-    assert slot.current_account_id == "b"
-    assert slot.group_name == "free"
-    assert slot.generation == 2
-    assert len(cdp.disposed) == 1
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_rebind_busy_slot_is_rejected() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-    with pytest.raises(InstanceCapacityError):
-        await pool.rebind(
-            lease.slot_id,
-            account_id="b",
-            auth_file="b.json",
-            auth_user="0",
-            channel="chat",
-        )
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_explicit_instance_is_pinned_and_not_rebound() -> None:
+async def test_snapshot_has_no_lease_or_page_budget_fields() -> None:
     cdp = FakeCDP()
     pool = _pool(cdp, max_contexts=1)
-    slot = await pool.create_instance(account_id="a", auth_file="a.json", auth_user="1")
-    assert slot.pinned is True
-    assert pool.live_contexts == 1
-    assert slot.state is SlotState.READY
+    slot = await pool.add_slot(pool.specs[0], lane="free")
+    await _activate(pool, slot.slot_id)
 
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(account_id="b", auth_file="b.json", timeout_s=0.0)
-
-    await pool.close_instance(slot.slot_id)
-    assert pool.live_contexts == 0
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_close_explicit_instance_refuses_in_flight() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=1)
-    slot = await pool.create_instance(account_id="a", auth_file="a.json")
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.close_instance(slot.slot_id)
-
-    await pool.release(lease)
-    await pool.close_instance(slot.slot_id)
-    assert pool.slots() == ()
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_reassign_explicit_instance_keeps_identity_and_pin() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=1)
-    slot = await pool.create_instance(account_id="a", auth_file="a.json")
-    await pool.reassign_instance(
-        slot.slot_id,
-        account_id="c",
-        auth_file="c.json",
-        auth_user="0",
-        channel="chat",
-    )
-    rebound = pool.get(slot.slot_id)
-    assert rebound is not None
-    assert rebound.current_account_id == "c"
-    assert rebound.pinned is True
-    assert rebound.state is SlotState.READY
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_explicit_instance_same_channel_reuses_slot() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-    first = await pool.create_instance(account_id="a", auth_file="a.json")
-    again = await pool.create_instance(account_id="a", auth_file="a.json")
-    assert again.slot_id == first.slot_id
-    assert len(pool.slots()) == 1
-    assert len(cdp.created) == 1
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_explicit_instance_second_channel_reuses_context(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-
-    async def fake_ensure(self, _cdp):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    chat = await pool.create_instance(account_id="a", auth_file="a.json")
-    build = await pool.create_instance(
-        account_id="a", auth_file="a.json", channel="build"
-    )
-    assert build.slot_id == chat.slot_id
-    assert build.context_id == chat.context_id
-    assert len(pool.slots()) == 1
-    assert len(cdp.created) == 1
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_close_channel_only_closes_one_page(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-
-    async def fake_ensure(self, _cdp):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    chat = await pool.create_instance(account_id="a", auth_file="a.json")
-    await pool.create_instance(account_id="a", auth_file="a.json", channel="build")
-    await pool.close_channel(chat.slot_id, "build")
-    assert chat.chat_ready() is True
-    assert chat.build_ready() is False
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    await pool.ensure_channel(chat.slot_id, "build")
-    assert chat.build_ready() is True
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_build_acquire_waits_until_surface_ready(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fake_ensure(self: InstanceSlot, _cdp):
-        started.set()
-        await release.wait()
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    task = asyncio.create_task(
-        pool.acquire(account_id="a", auth_file="a.json", channel="build")
-    )
-    await started.wait()
-    await asyncio.sleep(0.01)
-    assert task.done() is False
-
-    release.set()
-    lease = await task
-    assert lease.adapter.build_ready() is True
-
-
-@pytest.mark.asyncio
-async def test_build_only_slot_closes_bootstrap_chat_page(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-
-    async def fake_ensure(self, _cdp):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    slot = await pool.create_instance(
-        account_id="a", auth_file="a.json", channel="build"
-    )
-    assert slot.session is None
-    assert slot.chat_ready() is False
-    assert slot.build_ready() is True
-    assert pool.page_counts() == {"chat": 0, "build": 1}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_ensure_channel_reopens_chat_in_existing_context(monkeypatch) -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=2)
-
-    async def fake_ensure(self, _cdp):
-        if self.build_surface is None:
-            self.build_surface = FakeBuildSurface(
-                context_id=self.context_id, realm_id=self.realm_id
-            )
-        return self.build_surface
-
-    monkeypatch.setattr(InstanceSlot, "ensure_build_surface", fake_ensure)
-    slot = await pool.create_instance(
-        account_id="a", auth_file="a.json", channel="build"
-    )
-    await pool.ensure_channel(slot.slot_id, "chat")
-    assert slot.session is not None
-    assert slot.chat_ready() is True
-    assert slot.build_ready() is True
-    assert len(cdp.created) == 1
-    assert pool.page_counts() == {"chat": 1, "build": 1}
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_single_instance_cannot_open_second_page_in_parallel() -> None:
-    features = {
-        "routing": {"max_contexts": 1, "global_max_pages": 2},
-        "channels": {
-            "chat": {"enabled": True, "max_pages": 2},
-            "build": {"enabled": True, "max_pages": 2},
-        },
+    item = pool.snapshot()[0]
+    assert set(item) == {
+        "slot_id",
+        "realm_id",
+        "account_id",
+        "surface",
+        "min_tier",
+        "lane",
+        "state",
+        "generation",
+        "context_id",
+        "pages",
+        "active_requests",
+        "last_error",
     }
-    pool = _pool(FakeCDP(), max_contexts=1, features=features)
-
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-    assert pool.budget_snapshot()["global_max_pages"] == 1
-    assert pool.page_counts()["chat"] == 1
-    assert sum(pool.page_counts().values()) == 1
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(
-            account_id="a",
-            auth_file="a.json",
-            channel="build",
-            surface="build",
-        )
-
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_single_instance_ensure_channel_rejects_second_page() -> None:
-    pool = _pool(FakeCDP(), max_contexts=1)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.ensure_channel(lease.slot_id, "build")
-
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    assert len(pool.slots()) == 1
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_single_instance_check_create_budget_rejects_second_channel() -> None:
-    pool = _pool(FakeCDP(), max_contexts=1)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.check_create_budget("build", account_id="a")
-
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_single_instance_borrow_does_not_add_second_page() -> None:
-    pool = _pool(FakeCDP(), max_contexts=1)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-
-    with pytest.raises(InstanceCapacityError):
-        await pool.acquire(
-            account_id="b",
-            auth_file="b.json",
-            channel="build",
-            surface="build",
-            borrow_accounts={"a"},
-        )
-
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    assert len(pool.slots()) == 1
-    await pool.release(lease)
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_single_instance_rebind_replaces_page_sequentially() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=1)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-    slot_id = lease.slot_id
-    await pool.release(lease)
-
-    await pool.rebind(
-        slot_id,
-        account_id="b",
-        auth_file="b.json",
-        auth_user="2",
-        channel="chat",
-    )
-
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    assert len(pool.slots()) == 1
-    assert cdp.disposed == ["ctx-1"]
-    await pool.close()
-
-
-@pytest.mark.asyncio
-async def test_stale_pinned_slot_is_revived_for_same_account() -> None:
-    cdp = FakeCDP()
-    pool = _pool(cdp, max_contexts=1)
-    lease = await pool.acquire(account_id="a", auth_file="a.json")
-    slot = pool.slots()[0]
-    await pool.release(lease)
-
-    # Simulate the browser being recycled: the slot record survives, pages do not.
-    slot.pinned = True
-    slot.state = SlotState.READY
-    slot.session = None
-    slot.build_surface = None
-    slot.chat_counted = True
-    slot.build_counted = False
-
-    revived = await pool.acquire(account_id="a", auth_file="a.json")
-
-    assert revived.slot_id == slot.slot_id
-    assert slot.session is not None
-    assert slot.chat_ready() is True
-    assert pool.page_counts() == {"chat": 1, "build": 0}
-    assert len(pool.slots()) == 1
-    await pool.release(revived)
-    await pool.close()
+    assert item["active_requests"] == 0

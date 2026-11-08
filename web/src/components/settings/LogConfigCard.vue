@@ -1,174 +1,153 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import { systemApi } from '@/api/system.ts'
-import { useToastStore } from '@/stores/toast.ts'
-import type { SystemConfig } from '@/types/system.ts'
-import Button from '@/components/ui/Button.vue'
+import { computed } from 'vue'
 import ConfigSelect from '@/components/config/ConfigSelect.vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
 import ConfigInput from '@/components/config/ConfigInput.vue'
-import {
-  Activity,
-  Save,
-  Bug,
-  Info,
-  HardDrive,
-  Folder,
-} from 'lucide-vue-next'
+import FieldHelpTip from '@/components/config/FieldHelpTip.vue'
+import { asBool, asRecord, asString } from '@/components/config/configDraft.ts'
+import { Activity, Info } from 'lucide-vue-next'
 
 const props = defineProps<{
-  initialConfig: SystemConfig
+  modelValue: Record<string, unknown>
+  saving: boolean
 }>()
 
 const emit = defineEmits<{
-  saved: []
+  'update:modelValue': [value: Record<string, unknown>]
+  save: []
 }>()
 
-const toast = useToastStore()
+const logging = computed(() => asRecord(props.modelValue.logging))
+const diagnostics = computed(() => asRecord(props.modelValue.diagnostics))
 
-const logLevel = ref(props.initialConfig.log_level || 'INFO')
-const dumpRequests = ref(Boolean(props.initialConfig.dump_requests))
-const dumpToFile = ref(Boolean(props.initialConfig.dump_to_file))
-const dumpDir = ref(props.initialConfig.dump_dir || 'dumps')
-const debugEnvActive = ref(Boolean(props.initialConfig.debug_env_active))
-const saving = ref(false)
-
-watch(
-  () => props.initialConfig,
-  (cfg) => {
-    logLevel.value = cfg.log_level || 'INFO'
-    dumpRequests.value = Boolean(cfg.dump_requests)
-    dumpToFile.value = Boolean(cfg.dump_to_file)
-    dumpDir.value = cfg.dump_dir || 'dumps'
-    debugEnvActive.value = Boolean(cfg.debug_env_active)
-  },
-  { deep: true },
-)
+const logLevel = computed(() => asString(logging.value.level, 'INFO'))
+const dumpRequests = computed(() => asBool(logging.value.dump_requests, false))
+const dumpToFile = computed(() => asBool(logging.value.dump_to_file, false))
+const dumpDir = computed(() => asString(logging.value.dump_dir, 'dumps'))
+const uiDebug = computed(() => asBool(diagnostics.value.ui_debug, false))
 
 const logLevels = [
-  { value: 'DEBUG', label: '调试 (DEBUG)', description: '详细底层跟踪' },
-  { value: 'INFO', label: '信息 (INFO)', description: '标准运行信息' },
-  { value: 'WARNING', label: '警告 (WARNING)', description: '仅警告与错误' },
-  { value: 'ERROR', label: '错误 (ERROR)', description: '仅严重错误' },
+  { value: 'DEBUG', label: '调试 (DEBUG)', description: '输出详细的底层运行跟踪' },
+  { value: 'INFO', label: '信息 (INFO)', description: '输出标准运行信息（推荐）' },
+  { value: 'WARNING', label: '警告 (WARNING)', description: '仅输出警告与错误' },
+  { value: 'ERROR', label: '错误 (ERROR)', description: '仅输出严重错误' },
 ]
 
-async function handleSave() {
-  saving.value = true
-  try {
-    const res = await systemApi.updateLoggingConfig({
-      level: logLevel.value,
-      dump_requests: dumpRequests.value,
-      dump_to_file: dumpToFile.value,
-      dump_dir: dumpDir.value,
-    })
-    logLevel.value = res.log_level
-    dumpRequests.value = res.dump_requests
-    dumpToFile.value = res.dump_to_file
-    dumpDir.value = res.dump_dir
-    debugEnvActive.value = res.debug_env_active
-    emit('saved')
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '保存配置失败'
-    toast.error(msg)
-  } finally {
-    saving.value = false
-  }
+function patchLogging(key: string, value: unknown) {
+  emit('update:modelValue', {
+    ...props.modelValue,
+    logging: { ...logging.value, [key]: value },
+  })
+}
+
+function patchUiDebug(value: boolean) {
+  emit('update:modelValue', {
+    ...props.modelValue,
+    diagnostics: { ...diagnostics.value, ui_debug: value },
+  })
 }
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/80 rounded-2xl p-6 shadow-xs space-y-5">
+  <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-5">
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 pb-4">
       <div class="flex items-center gap-2.5">
-        <div class="p-2 rounded-xl bg-purple-50 text-purple-600 border border-purple-100">
-          <Activity class="w-5 h-5" />
-        </div>
-        <div>
-          <h3 class="font-semibold text-gray-900 text-sm flex items-center gap-2">
-            <span>日志与调试</span>
-            <span
-              v-if="debugEnvActive"
-              class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800"
-            >
-              <Bug class="w-3 h-3" /> DEBUG 环境变量生效中
-            </span>
-          </h3>
-        </div>
+        <Activity class="w-4 h-4 text-purple-600" />
+        <h3 class="font-bold text-gray-900 text-sm">
+          日志与调试
+        </h3>
       </div>
 
-      <div class="flex items-center gap-2">
-        <Button
-          variant="primary"
-          size="sm"
-          :loading="saving"
-          @click="handleSave"
-        >
-          <Save class="w-3.5 h-3.5" />
-          <span>保存日志配置</span>
-        </Button>
+      <button
+        type="button"
+        class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+        :disabled="saving"
+        @click="emit('save')"
+      >
+        💾 保存日志配置
+      </button>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="flex items-start gap-1.5">
+        <div class="flex-1 min-w-0">
+          <ConfigSelect
+            :model-value="logLevel"
+            label="日志输出级别"
+            :options="logLevels"
+            @update:model-value="patchLogging('level', String($event || 'INFO'))"
+          />
+        </div>
+        <FieldHelpTip
+          schema-key="logging.level"
+          class="mt-4 shrink-0"
+        />
+      </div>
+
+      <div class="flex items-start gap-1.5">
+        <div class="flex-1 min-w-0">
+          <ConfigSwitch
+            :model-value="dumpRequests"
+            label="请求报文输出到控制台"
+            description="打印请求与响应详情，仅包含脱敏后的安全字段"
+            @update:model-value="patchLogging('dump_requests', $event)"
+          />
+        </div>
+        <FieldHelpTip
+          schema-key="logging.dump_requests"
+          class="mt-2 shrink-0"
+        />
+      </div>
+
+      <div class="flex items-start gap-1.5">
+        <div class="flex-1 min-w-0">
+          <ConfigSwitch
+            :model-value="dumpToFile"
+            label="请求报文保存为文件"
+            description="写入下方目录中的独立文件"
+            @update:model-value="patchLogging('dump_to_file', $event)"
+          />
+        </div>
+        <FieldHelpTip
+          schema-key="logging.dump_to_file"
+          class="mt-2 shrink-0"
+        />
+      </div>
+
+      <div class="flex items-start gap-1.5">
+        <div class="flex-1 min-w-0">
+          <ConfigInput
+            :model-value="dumpDir"
+            label="报文文件保存目录"
+            placeholder="dumps"
+            @update:model-value="patchLogging('dump_dir', String($event || 'dumps'))"
+          />
+        </div>
+        <FieldHelpTip
+          schema-key="logging.dump_dir"
+          class="mt-4 shrink-0"
+        />
       </div>
     </div>
 
-    <!-- Env variable hint banner if DEBUG is active -->
-    <div
-      v-if="debugEnvActive"
-      class="p-3.5 bg-blue-50/80 border border-blue-200 rounded-xl flex items-start gap-2.5 text-xs text-blue-900 leading-relaxed"
-    >
-      <Info class="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-      <div>
-        <span class="font-bold">DEBUG 环境变量提示：</span>
-        系统已设置 <code>DEBUG=true</code> 环境变量，服务已激活请求报文转储。日志级别遵循下方独立设置。
+    <div class="flex items-start gap-1.5">
+      <div class="flex-1 min-w-0">
+        <ConfigSwitch
+          :model-value="uiDebug"
+          label="启用 UI Debug 沙盒"
+          description="开启后下次启动使用内存沙盒与临时配置，不启动真实浏览器、账号或网络"
+          @update:model-value="patchUiDebug"
+        />
       </div>
+      <FieldHelpTip
+        schema-key="diagnostics.ui_debug"
+        class="mt-2 shrink-0"
+      />
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-      <!-- 1. Log Level Configuration -->
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
-        <ConfigSelect
-          :model-value="logLevel"
-          label="日志输出级别"
-          :options="logLevels"
-          @update:model-value="logLevel = String($event || 'INFO')"
-        />
-      </div>
-
-      <!-- 2. Request Dump Toggle -->
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
-        <ConfigSwitch
-          :model-value="dumpRequests"
-          label="请求报文转储"
-          description="在标准输出中打印完整的请求与响应详情"
-          @update:model-value="dumpRequests = $event"
-        />
-      </div>
-
-      <!-- 3. Dump To File Switch -->
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
-        <div class="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
-          <HardDrive class="w-3.5 h-3.5 text-brand-600" />
-          <span>报文持久化落盘</span>
-        </div>
-        <ConfigSwitch
-          :model-value="dumpToFile"
-          label="将报文保存为文件"
-          description="将每次请求与响应报文写入磁盘独立文件"
-          @update:model-value="dumpToFile = $event"
-        />
-      </div>
-
-      <!-- 4. Dump Directory Input -->
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
-        <div class="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
-          <Folder class="w-3.5 h-3.5 text-brand-600" />
-          <span>转储文件存储目录</span>
-        </div>
-        <ConfigInput
-          :model-value="dumpDir"
-          label="保存路径"
-          placeholder="dumps"
-          @update:model-value="dumpDir = String($event || 'dumps')"
-        />
-      </div>
+    <div class="flex items-start gap-2 p-3 bg-gray-50/80 border border-gray-200/70 rounded-xl text-[11px] text-gray-500 leading-relaxed">
+      <Info class="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5" />
+      <span>UI Debug 开关只持久化到配置文件，下一次服务启动生效；当前运行状态不会热切换沙盒。</span>
     </div>
   </div>
 </template>

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -13,152 +13,188 @@ from pydantic import BaseModel
 from aistudio_api.api.dependencies import get_runtime_state
 from aistudio_api.api.response_models import (
     HealthResponse,
-    ModelStatsResponse,
-    StatsBucketResponse,
-    StatsRangeResponse,
     StatsResponse,
-    StatsTimeseriesPoint,
-    StatsTimeseriesResponse,
 )
-from aistudio_api.api.state import (
-    STATS_SCHEMA_VERSION,
-    STATS_TIMEZONE,
-    ModelStatsItem,
-    StatsCounters,
-    normalize_model_name,
-)
+from aistudio_api.config import resolve_default_config_template
 from aistudio_api.infrastructure.gateway.model_defaults import (
+    ConfigValidationError,
     _resolve_config_path,
-    get_features_config,
-    invalidate_config_cache,
-    update_configured_features,
+    get_configured_logging_settings,
+    merge_config_documents,
+    write_config_text,
 )
-from aistudio_api.infrastructure.system_resources import sample_process_resources
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    set_dump_dir,
+    set_dump_requests,
+    set_dump_to_file,
+    set_log_level,
+)
 
 logger = get_logger("routes.system")
 
 if TYPE_CHECKING:
     from aistudio_api.api.state import RuntimeState
-    from aistudio_api.infrastructure.gateway.session import BrowserSession
 
 public_router = APIRouter()
 protected_router = APIRouter()
 
 
+def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
+    sandbox = runtime_state.ui_sandbox
+    if runtime_state.ui_debug and sandbox is not None:
+        return str(getattr(sandbox, "scenario", "") or "") or None
+    return None
+
+
 def health_response() -> HealthResponse:
-    return HealthResponse(status="ok", busy=False)
-
-
-def _range_response(info: dict[str, object]) -> StatsRangeResponse:
-    def _str(key: str, default: str | None = None) -> str | None:
-        value = info.get(key)
-        return value if isinstance(value, str) else default
-
-    retention = info.get("retention_days")
-    return StatsRangeResponse(
-        key=_str("key", "all") or "all",
-        start=_str("start"),
-        end=_str("end"),
-        timezone=_str("timezone", "Asia/Shanghai") or "Asia/Shanghai",
-        data_start=_str("data_start"),
-        retention_days=retention if isinstance(retention, int) else 90,
-        partial=bool(info.get("partial")),
-    )
-
-
-def _bucket_response(counter: StatsCounters) -> StatsBucketResponse:
-    return StatsBucketResponse(
-        requests=counter.requests,
-        attempts=counter.attempts,
-        success=counter.success,
-        rate_limited=counter.rate_limited,
-        errors=counter.errors,
-        client_requests=counter.client_requests,
-        client_success=counter.client_success,
-        client_errors=counter.client_errors,
-        client_rate_limited=counter.client_rate_limited,
-        client_aborted=counter.client_aborted,
-        prompt_tokens=counter.prompt_tokens,
-        completion_tokens=counter.completion_tokens,
-        reasoning_tokens=counter.reasoning_tokens,
-        cache_read_tokens=counter.cache_read_tokens,
-        cache_write_tokens=counter.cache_write_tokens,
-        total_tokens=counter.total_tokens,
-        cache_hit_rate=counter.cache_hit_rate,
-        count_requests=counter.count_requests,
-        count_success=counter.count_success,
-        count_errors=counter.count_errors,
-        count_input_tokens=counter.count_input_tokens,
-        usage_missing=counter.usage_missing,
-        last_used=counter.last_used,
-    )
-
-
-def _model_response(
-    counter: StatsCounters, *, paid: bool | None = None
-) -> ModelStatsResponse:
-    if isinstance(counter, ModelStatsItem):
-        formats = {
-            name: _bucket_response(bucket) for name, bucket in counter.formats.items()
-        }
-        surfaces = {
-            name: _bucket_response(bucket) for name, bucket in counter.surfaces.items()
-        }
-    else:
-        formats = {}
-        surfaces = {}
-    return ModelStatsResponse(
-        **_bucket_response(counter).model_dump(),
-        paid=paid,
-        formats=formats,
-        surfaces=surfaces,
-    )
-
-
-async def _paid_map(session: BrowserSession | None = None) -> dict[str, bool]:
-    try:
-        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-        discovered = await model_discovery.get_models(session=session)
-    except Exception:
-        return {}
-    result: dict[str, bool] = {}
-    for item in discovered:
-        name = normalize_model_name(item.get("id") or item.get("name"))
-        value = item.get("paid")
-        if name and isinstance(value, bool):
-            result[name] = value
-    return result
-
-
-async def stats_response(
-    *,
-    range_key: str = "all",
-    start: str | None = None,
-    end: str | None = None,
-    session: BrowserSession | None = None,
-) -> StatsResponse:
     from aistudio_api.api.state import runtime_state
 
-    try:
-        models, range_info = runtime_state.stats_for_range(range_key, start, end)
-    except ValueError as exc:
-        raise HTTPException(400, detail=str(exc)) from exc
-    paid = await _paid_map(session)
-    totals = ModelStatsItem()
-    for item in models.values():
-        totals.add(item)
-    return StatsResponse(
-        schema_version=STATS_SCHEMA_VERSION,
-        generated_at=datetime.now(STATS_TIMEZONE).isoformat(timespec="seconds"),
-        range=_range_response(range_info),
-        models={
-            name: _model_response(item, paid=paid.get(name))
-            for name, item in models.items()
-        },
-        totals=_model_response(totals),
+    return HealthResponse(
+        status="ok",
+        busy=False,
+        ui_debug=bool(runtime_state.ui_debug),
+        ui_debug_scenario=_ui_debug_scenario(runtime_state),
     )
+
+
+def _format_flag(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "off", "no"}
+    return bool(value)
+
+
+def formats_status(runtime_state: RuntimeState) -> dict[str, bool]:
+    """Return the four format switches; Gemini is always enabled."""
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    getter = getattr(sandbox, "formats_payload", None)
+    if callable(getter):
+        payload = getter()
+        if isinstance(payload, dict):
+            return {str(key): bool(value) for key, value in payload.items()}
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_formats,
+    )
+
+    raw = get_configured_formats()
+    return {
+        "gemini": True,
+        "openai": _format_flag(raw.get("openai", True)),
+        "claude": _format_flag(raw.get("claude", True)),
+        "responses": _format_flag(raw.get("responses", True)),
+    }
+
+
+def default_text_model(runtime_state: RuntimeState) -> str:
+    getter = getattr(runtime_state.ui_sandbox, "default_text_model", None)
+    if runtime_state.ui_debug and callable(getter):
+        value = getter()
+        if value:
+            return str(value)
+    from aistudio_api.config import DEFAULT_TEXT_MODEL
+
+    return DEFAULT_TEXT_MODEL
+
+
+def stats_response(days: int | None = None) -> StatsResponse:
+    """Render ``GET /stats`` for the real runtime or the UI debug sandbox.
+
+    ``days`` is ``None`` for the legacy all-time summary plus the last 90 days
+    of daily points; ``7|30|90`` scopes the summary to that window while still
+    returning consecutive daily points (missing days are zero-filled here).
+    """
+    from aistudio_api.api.response_models import AccountBreakdownItem
+    from aistudio_api.api.state import (
+        CountTokensStats,
+        build_stats_payload,
+        runtime_state,
+    )
+    from aistudio_api.domain.model_access import is_paid_model
+    from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
+
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    source = getattr(sandbox, "model_stats", None)
+    is_sandbox = isinstance(source, dict)
+    raw_stats = source if is_sandbox else runtime_state.model_stats
+    daily_source = getattr(sandbox, "daily_stats", None) if is_sandbox else None
+    raw_daily = daily_source if isinstance(daily_source, dict) else runtime_state.daily_stats
+    count_source = getattr(sandbox, "count_tokens", None) if is_sandbox else None
+    count_stats = (
+        count_source
+        if isinstance(count_source, CountTokensStats)
+        else runtime_state.count_tokens
+    )
+    rotator = runtime_state.rotator
+    account_svc = runtime_state.account_service
+    accounts_list = account_svc.list_accounts() if account_svc else []
+
+    def _model_extra(name: str) -> dict[str, object]:
+        clean_m = name.removeprefix("models/").lower()
+        breakdown: list[AccountBreakdownItem] = []
+        if rotator:
+            from aistudio_api.application.account_rotator import (
+                get_pacific_date_key,
+                split_quota_key,
+            )
+
+            current_la = get_pacific_date_key()
+            for acc in accounts_list:
+                st = rotator.get_account_stats(acc.id)
+                if st:
+                    st._check_date_reset(current_la)
+                    for quota_key_name, m_daily in st.daily_models.items():
+                        surface, daily_model = split_quota_key(quota_key_name)
+                        if daily_model != clean_m:
+                            continue
+                        quota = resolve_tier_quota(acc.tier, daily_model)
+                        used_pct = round(
+                            (m_daily.requests / max(1, quota)) * 100, 1
+                        )
+                        cd_rem = (
+                            max(0, int(m_daily.cooldown_until - time.time()))
+                            if m_daily.cooldown_until > time.time()
+                            else 0
+                        )
+                        breakdown.append(
+                            AccountBreakdownItem(
+                                account_id=acc.id,
+                                name=acc.name,
+                                auth_user=acc.auth_user,
+                                email=acc.email,
+                                tier=acc.tier,
+                                group=acc.group,
+                                surface=surface,
+                                enabled=acc.enabled,
+                                today_requests=m_daily.requests,
+                                today_success=m_daily.success,
+                                today_rate_limited=m_daily.rate_limited,
+                                today_tokens=m_daily.total_tokens,
+                                today_reasoning_tokens=m_daily.reasoning_tokens,
+                                configured_quota=quota,
+                                quota_used_percent=used_pct,
+                                is_available=(
+                                    acc.enabled
+                                    and not acc.expired
+                                    and cd_rem == 0
+                                    and not st.session_expired
+                                ),
+                                cooldown_remaining=cd_rem,
+                            )
+                        )
+        return {
+            "paid": is_paid_model(name),
+            "account_breakdown": breakdown,
+        }
+
+    payload = build_stats_payload(
+        model_stats=raw_stats,
+        daily_stats=raw_daily,
+        count_tokens=count_stats,
+        days=days,
+        quota_scope=rotator.quota_scope if rotator else "account",
+        model_extra=_model_extra,
+    )
+    return StatsResponse.model_validate(payload)
 
 
 @public_router.get("/health", response_model=HealthResponse)
@@ -166,59 +202,40 @@ async def health():
     return health_response()
 
 
-@protected_router.get("/api/stats", response_model=StatsResponse)
-async def stats(
-    range_key: str = Query("all", alias="range"),
-    start: str | None = None,
-    end: str | None = None,
+@protected_router.get("/stats", response_model=StatsResponse)
+async def stats(days: int | None = Query(default=None, ge=1, le=90)):
+    return stats_response(days)
+
+
+@protected_router.get("/api/system/status")
+async def system_status(
     runtime_state: RuntimeState = Depends(get_runtime_state),
-) -> StatsResponse:
-    session = runtime_state.client._session if runtime_state.client else None
-    return await stats_response(
-        range_key=range_key, start=start, end=end, session=session
-    )
-
-
-@protected_router.get("/api/stats/timeseries", response_model=StatsTimeseriesResponse)
-async def stats_timeseries(
-    range_key: str = Query("7d", alias="range"),
-    start: str | None = None,
-    end: str | None = None,
-    bucket: str = "day",
-    runtime_state: RuntimeState = Depends(get_runtime_state),
-) -> StatsTimeseriesResponse:
-    if bucket != "day":
-        raise HTTPException(400, detail="only bucket=day is supported")
-    try:
-        _, range_info = runtime_state.stats_for_range(range_key, start, end)
-    except ValueError as exc:
-        raise HTTPException(400, detail=str(exc)) from exc
-
-    points: list[StatsTimeseriesPoint] = []
-    raw_start = range_info.get("start")
-    raw_end = range_info.get("end")
-    if isinstance(raw_start, str) and isinstance(raw_end, str):
-        cursor = date.fromisoformat(raw_start)
-        final = date.fromisoformat(raw_end)
-        while cursor <= final:
-            day_models = runtime_state.daily_stats.get(cursor.isoformat())
-            totals = ModelStatsItem()
-            if day_models:
-                for item in day_models.values():
-                    totals.add(item)
-            points.append(
-                StatsTimeseriesPoint(
-                    date=cursor.isoformat(),
-                    totals=_bucket_response(totals) if day_models else None,
-                )
-            )
-            cursor += timedelta(days=1)
-    return StatsTimeseriesResponse(
-        generated_at=datetime.now(STATS_TIMEZONE).isoformat(timespec="seconds"),
-        range=_range_response(range_info),
-        bucket="day",
-        points=points,
-    )
+) -> dict[str, object]:
+    """Read-only runtime status used by the web console/debug menu."""
+    account_service = runtime_state.account_service
+    manager = runtime_state.instance_manager
+    accounts = 0
+    if account_service is not None:
+        try:
+            accounts = len(account_service.list_accounts())
+        except Exception:
+            accounts = 0
+    instances = 0
+    if manager is not None:
+        try:
+            instances = len(getattr(manager, "records", lambda: ())())
+        except Exception:
+            instances = 0
+    return {
+        "status": "ok",
+        "busy": bool(getattr(runtime_state, "ui_sandbox", None) is not None),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
+        "accounts": accounts,
+        "instances": instances,
+        "formats": formats_status(runtime_state),
+        "default_text_model": default_text_model(runtime_state),
+    }
 
 
 # ========== 调度与配额管理 API ==========
@@ -227,7 +244,6 @@ async def stats_timeseries(
 class ClearCooldownRequest(BaseModel):
     account_id: str | None = None
     model: str | None = None
-    surface: str | None = None
 
 
 @protected_router.get("/rotation")
@@ -242,12 +258,17 @@ async def get_rotation_status(
             "mode": "sticky",
             "message": "调度器未初始化",
             "accounts": {},
+            "ui_debug": bool(runtime_state.ui_debug),
+            "ui_debug_scenario": _ui_debug_scenario(runtime_state),
         }
 
     return {
         "enabled": True,
         "mode": "sticky",
+        "quota_scope": rotator.quota_scope,
         "accounts": rotator.get_all_stats(),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
     }
 
 
@@ -262,18 +283,18 @@ async def clear_cooldown(
         raise HTTPException(503, detail="调度器未初始化")
 
     if req.account_id:
-        if req.surface:
-            rotator.clear_cooldown(req.account_id, model=req.model, surface=req.surface)
-        else:
-            rotator.clear_cooldown(req.account_id, model=req.model)
+        rotator.clear_cooldown(req.account_id, model=req.model)
+        service = runtime_state.account_service
+        store = getattr(service, "store", None)
+        if (
+            store is not None
+            and service is not None
+            and service.get_account(req.account_id) is not None
+        ):
+            store.update_account_refresh(req.account_id, expired=False)
     else:
         rotator.clear_all_cooldowns()
-    logger.info(
-        "已清除冷却锁定: 账号=%s, 模型=%s, 面=%s",
-        req.account_id,
-        req.model,
-        req.surface,
-    )
+    logger.info("已清除冷却状态: 账号=%s, 模型=%s", req.account_id or "全部", req.model or "全部")
 
     return {"ok": True, "accounts": rotator.get_all_stats()}
 
@@ -308,59 +329,30 @@ async def get_rotation_accounts(
     return rotator.get_all_stats()
 
 
-@protected_router.get("/system/resources")
-async def get_system_resources(
-    runtime_state: RuntimeState = Depends(get_runtime_state),
-) -> dict[str, float | bool | int | None]:
-    resources = sample_process_resources()
-    manager = runtime_state.instance_manager
-    instances = 0
-    if manager is not None:
-        result = await manager.list_instances()
-        instances = sum(1 for item in result.instances if item.state.value == "active")
-    resources["instances"] = instances
-    return resources
-
-
-@protected_router.get("/surface/instances")
-async def get_surface_instances(
-    runtime_state: RuntimeState = Depends(get_runtime_state),
-) -> dict[str, object]:
-    """页面/Context 实例挂载与预算快照（只读）。"""
-    client = runtime_state.client
-    if client is None:
-        raise HTTPException(503, detail="客户端未初始化")
-    snapshot = client.surface_instance_snapshot()
-    from aistudio_api.application.routing_pipeline import get_routing_pipeline
-
-    pipeline = get_routing_pipeline()
-    if pipeline is not None:
-        routing = pipeline.snapshot()
-        snapshot["routing"] = routing
-        raw_instances = routing.get("instances")
-        instances = raw_instances if isinstance(raw_instances, dict) else {}
-        snapshot["contexts"] = instances.get("contexts", [])
-        snapshot["budgets"] = instances.get("budgets", {})
-        snapshot["planned_instances"] = instances.get("planned_instances", 0)
-    return snapshot
-
-
-@protected_router.get("/routing/state")
-async def get_routing_state() -> dict[str, object]:
-    """路由熔断/预算/Context 只读快照。"""
-    from aistudio_api.application.routing_pipeline import get_routing_pipeline
-
-    pipeline = get_routing_pipeline()
-    if pipeline is None:
-        raise HTTPException(503, detail="路由管线未初始化")
-    return pipeline.snapshot()
-
-
 @protected_router.post("/rotation/next")
 async def force_next_account(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> dict[str, object]:
     """强制切换到下一个可用账号。"""
+    sandbox = runtime_state.ui_sandbox
+    if runtime_state.ui_debug and sandbox is not None:
+        next_account = getattr(sandbox, "next_account", None)
+        if not callable(next_account):
+            raise HTTPException(404, detail="没有可用的账号")
+        account = cast(Any, next_account)()
+        if account is None:
+            raise HTTPException(404, detail="没有可用的账号")
+        logger.info("UI 调试沙箱强制切换账号: id=%s", account.id)
+        return {
+            "ok": True,
+            "account": {
+                "id": account.id,
+                "name": account.name,
+                "email": account.email,
+            },
+            "ui_debug": True,
+        }
+
     rotator = runtime_state.rotator
     if rotator is None:
         raise HTTPException(503, detail="调度器未初始化")
@@ -375,15 +367,15 @@ async def force_next_account(
     if account_service is None or client is None or client._session is None:
         raise HTTPException(503, detail="服务未就绪")
 
-    from aistudio_api.application.account_orchestrator import switch_to_account
+    result = await account_service.activate_account(
+        next_account.id,
+        client._session,
+    )
 
-    if not await switch_to_account(next_account.id, require_idle=False):
-        raise HTTPException(500, detail="切换失败")
-    result = account_service.get_account(next_account.id)
     if result is None:
         raise HTTPException(500, detail="切换失败")
 
-    logger.info("已强制切换至下一可用账号: %s (%s)", result.id, result.name)
+    logger.info("强制切换到下一个账号: id=%s, name=%s", result.id, result.name)
     return {
         "ok": True,
         "account": {
@@ -401,12 +393,21 @@ class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
 
 
-class FeaturesUpdateRequest(BaseModel):
-    features: dict[str, object]
+def _apply_logging_runtime(parsed: object) -> None:
+    """Apply the persisted logging block to the live logger runtime."""
+    if not isinstance(parsed, dict) or "logging" not in parsed:
+        return
+    normalized_logging = get_configured_logging_settings()
+    set_log_level(str(normalized_logging.get("level", "INFO")))
+    set_dump_requests(bool(normalized_logging.get("dump_requests", False)))
+    set_dump_to_file(bool(normalized_logging.get("dump_to_file", False)))
+    set_dump_dir(str(normalized_logging.get("dump_dir", "dumps")))
 
 
 @protected_router.get("/config")
-async def get_system_config() -> dict[str, object]:
+async def get_system_config(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
     """获取系统运行配置与 config.yaml 内容。"""
     from aistudio_api.config import settings
     from aistudio_api.infrastructure.utils.logger import (
@@ -428,28 +429,15 @@ async def get_system_config() -> dict[str, object]:
         "browser_headless": settings.browser_headless,
         "proxy_configured": bool(settings.proxy_url),
         "auth_enabled": settings.auth_enabled,
-        "timeout_stream": settings.timeout_stream,
         "yaml_content": yaml_content,
         "log_level": get_log_level(),
         "dump_requests": is_dump_requests_enabled(),
         "debug_env_active": is_debug_env_active(),
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
-        "features": get_features_config(),
+        "ui_debug": bool(runtime_state.ui_debug),
+        "ui_debug_scenario": _ui_debug_scenario(runtime_state),
     }
-
-
-@protected_router.put("/config/features")
-async def update_features(req: FeaturesUpdateRequest) -> dict[str, object]:
-    """结构化更新 features（供 WP7 UI 使用），原子落盘并热重载。"""
-    try:
-        features = update_configured_features(req.features)
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(500, detail=f"写入 features 失败: {e}") from e
-    logger.info("features 已更新: %s", sorted(req.features))
-    return {"ok": True, "features": features}
 
 
 @protected_router.put("/config/yaml")
@@ -462,33 +450,140 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
-    config_yaml_path = _resolve_config_path(None)
     try:
-        config_yaml_path.write_text(req.yaml_content, encoding="utf-8")
-        invalidate_config_cache()
-
-        if isinstance(parsed, dict) and "logging" in parsed:
-            raw_logging = parsed["logging"]
-            if isinstance(raw_logging, dict):
-                from aistudio_api.infrastructure.utils.logger import (
-                    set_dump_dir,
-                    set_dump_requests,
-                    set_dump_to_file,
-                    set_log_level,
-                )
-
-                if "level" in raw_logging:
-                    set_log_level(str(raw_logging["level"]))
-                if "dump_requests" in raw_logging:
-                    set_dump_requests(bool(raw_logging["dump_requests"]))
-                if "dump_to_file" in raw_logging:
-                    set_dump_to_file(bool(raw_logging["dump_to_file"]))
-                if "dump_dir" in raw_logging:
-                    set_dump_dir(str(raw_logging["dump_dir"]))
-        logger.info("配置文件 config.yaml 已更新并重新加载")
-        return {"ok": True, "message": "配置已保存并重载"}
-    except Exception as e:
+        write_config_text(req.yaml_content)
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        _apply_logging_runtime(parsed)
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+    logger.info("配置文件 config.yaml 已更新并重新加载")
+    return {"ok": True, "message": "配置已保存并重载"}
+
+
+class ConfigPatchRequest(BaseModel):
+    updates: dict[str, object]
+
+
+@protected_router.patch("/config")
+async def patch_config(
+    req: ConfigPatchRequest,
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """按 section 局部更新 config.yaml，保留未提交键（含 D-09 诊断开关）。
+
+    前端按卡片提交局部对象，例如 ``{"updates": {"logging": {...}}}``；服务端读取
+    当前最新磁盘 YAML（ui_debug 下为沙盒临时路径）后递归合并，列表整体替换，
+    再走 ``validate_config_mapping`` 校验与原子写回。未提交的顶层/嵌套键原样保留。
+    """
+    config_path = _resolve_config_path(None)
+    try:
+        content = (
+            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        )
+    except OSError as e:
+        raise HTTPException(500, detail=f"读取配置文件失败: {e}") from e
+
+    try:
+        parsed = yaml.safe_load(content) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    if not isinstance(parsed, dict):
+        raise HTTPException(400, detail="YAML 顶层必须为字典结构")
+
+    merged = merge_config_documents(parsed, req.updates)
+    if not isinstance(merged, dict):
+        raise HTTPException(400, detail="配置合并结果必须为字典结构")
+
+    try:
+        write_config_text(
+            yaml.dump(merged, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        _apply_logging_runtime(merged)
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+
+    logger.info("配置已局部更新: %s", ", ".join(sorted(req.updates)))
+    payload = await get_system_config(runtime_state)
+    payload["ok"] = True
+    payload["message"] = "配置已保存并热重载"
+    return payload
+
+
+@protected_router.post("/config/reset")
+async def reset_config(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """用官方 defaults/config.yaml 覆盖当前配置，保留已创建的 API Key。
+
+    - 读取 ``defaults/config.yaml`` 模板（值语义，不继承用户改动）
+    - 保留当前磁盘配置中的 ``api_keys``（已创建的客户端密钥不丢）
+    - ui_debug 沙盒下强制 ``diagnostics.ui_debug: true``，且只写临时配置
+    - 校验 + 原子写回 + 刷新配置缓存，返回最新完整 SystemConfig
+    """
+    config_path = _resolve_config_path(None)
+    try:
+        template_path = resolve_default_config_template()
+        template_text = template_path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise HTTPException(500, detail=f"默认配置模板不存在: {e}") from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"读取默认配置模板失败: {e}") from e
+
+    try:
+        template = yaml.safe_load(template_text) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(500, detail=f"默认配置模板 YAML 解析失败: {e}") from e
+    if not isinstance(template, dict):
+        raise HTTPException(500, detail="默认配置模板顶层必须为字典结构")
+
+    preserved_keys: object = []
+    if config_path.exists():
+        try:
+            current = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            current = {}
+        if isinstance(current, dict) and isinstance(current.get("api_keys"), list):
+            preserved_keys = current["api_keys"]
+    template["api_keys"] = preserved_keys
+
+    if runtime_state.ui_debug:
+        diagnostics = template.get("diagnostics")
+        diagnostics_map = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+        diagnostics_map["ui_debug"] = True
+        template["diagnostics"] = diagnostics_map
+
+    try:
+        write_config_text(
+            yaml.dump(template, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+    try:
+        _apply_logging_runtime(template)
+    except Exception as e:
+        raise HTTPException(500, detail=f"应用日志配置失败: {e}") from e
+
+    logger.info("配置已重置为 defaults/config.yaml 默认值")
+    payload = await get_system_config(runtime_state)
+    payload["ok"] = True
+    payload["message"] = "已重置为官方默认配置并热重载"
+    return payload
 
 
 class LoggingConfigRequest(BaseModel):
@@ -625,16 +720,21 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     new_list.append({"name": name, "key": new_key, "created_at": created_at})
     parsed["api_keys"] = new_list
 
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("已创建新 API Key: 备注=%s, 密钥=%s", name, new_key[:8] + "...")
+    logger.info("创建 API Key: 备注=%s, 密钥=***", name)
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
 
 
-@protected_router.delete("/api-keys/{key_value}")
+@protected_router.delete("/api-keys/{key_value:path}")
 async def delete_api_key(key_value: str) -> dict[str, bool]:
     """在 config.yaml 中删除指定 API Key。"""
 
@@ -668,16 +768,21 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
         raise HTTPException(404, detail="未找到该 API Key")
 
     parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
-    logger.info("已删除 API Key: %s", key_value[:8] + "...")
+    logger.info("删除 API Key: 密钥=***")
     return {"ok": True}
 
 
-@protected_router.put("/api-keys/{key_value}", response_model=ApiKeyItemModel)
+@protected_router.put("/api-keys/{key_value:path}", response_model=ApiKeyItemModel)
 async def update_api_key_name(
     key_value: str, req: UpdateApiKeyRequest
 ) -> ApiKeyItemModel:
@@ -717,10 +822,15 @@ async def update_api_key_name(
         raise HTTPException(404, detail="未找到该 API Key")
 
     parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
-    logger.info("API Key 备注名已更新: %s -> %s", key_value[:8] + "...", new_name)
+    try:
+        write_config_text(
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            config_path=config_path,
+        )
+    except ConfigValidationError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+    logger.info("更新 API Key 备注: 密钥=***, 备注=%s", new_name)
 
     return updated_item

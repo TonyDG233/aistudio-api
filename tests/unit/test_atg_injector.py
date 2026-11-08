@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.application.atg.config import load_atg_config
 from aistudio_api.application.atg.injector import (
     Injector,
@@ -13,6 +12,7 @@ from aistudio_api.application.atg.injector import (
     _generate_tool_name,
     create_injector,
 )
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
 
 
 def _injector(**overrides: object) -> Injector:

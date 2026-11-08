@@ -1,0 +1,2335 @@
+"""C2a pure-offline UI debug sandbox.
+
+When ``diagnostics.ui_debug`` is enabled the lifespan must not construct a real
+``AIStudioClient``/browser, start pooled instances, warm up control sessions,
+run model discovery, keepalive or account metadata network refreshers.  The API
+routes keep their normal REST contract but read/write this in-memory sandbox
+backed by a throw-away ``AccountStore`` in a temp directory.
+
+Everything here is deterministic and performs no network or browser work.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import shutil
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from aistudio_api.api.state import (
+    SHANGHAI_TZ,
+    ClientStats,
+    CountTokensStats,
+    ModelStatsItem,
+    build_stats_payload,
+    daily_key,
+)
+from aistudio_api.application.account_rotator import (
+    AccountModelDailyStats,
+    AccountStats,
+    get_pacific_date_key,
+)
+from aistudio_api.application.account_service import AccountService
+from aistudio_api.config import resolve_default_config_template
+from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
+from aistudio_api.domain.model_access import (
+    instance_lane_for_tier,
+    normalize_tier,
+    resolve_tier_selector,
+    tier_matches_selector,
+)
+from aistudio_api.infrastructure.account.account_info_refresher import RefreshResult
+from aistudio_api.infrastructure.account.account_store import AccountMeta, AccountStore
+from aistudio_api.infrastructure.browser.fingerprint import get_account_fingerprint
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    get_configured_keepalive_settings,
+)
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+log = get_logger("ui-debug")
+
+SCENARIOS = ("all_states", "mass_accounts", "narrow_edge", "empty", "all_429")
+DASHBOARD_SCENARIOS = ("all_states", "mass_accounts", "all_429", "empty")
+DASHBOARD_ACTIONS = ("simulate_requests", "simulate_429", "toggle_formats")
+_SANDBOX_DRAIN_TIMEOUT_S = 0.05
+ACTIONS = (
+    "reset",
+    "instance_inflight",
+    "account_expired",
+    "instance_cooldown",
+    "keepalive_partial",
+    *DASHBOARD_ACTIONS,
+)
+_SANDBOX_MAX_CONTEXTS = 10
+
+# Built-in, deterministic model catalog for ui_debug.  It intentionally mirrors
+# the cold-start fallback shape (Free + Paid) but lives here so the model routes
+# never import ``model_discovery`` (which owns a real snapshot read) or construct
+# an ``AccountStore`` while ui_debug is on.
+_SANDBOX_MODEL_CATALOG: tuple[dict[str, object], ...] = (
+    {
+        "id": "gemini-3.7-flash",
+        "displayName": "Gemini 3.7 Flash",
+        "description": "Gemini 3.7 Flash default text model",
+        "category": "flash",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-3.8-flash",
+        "displayName": "Gemini 3.8 Flash",
+        "description": "Latest Gemini 3.8 Flash model",
+        "category": "flash",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-3.5-flash-lite",
+        "displayName": "Gemini 3.5 Flash Lite",
+        "description": "Ultra fast and lightweight model",
+        "category": "flash",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-3.1-pro-preview",
+        "displayName": "Gemini 3.1 Pro Preview",
+        "description": "Pro capabilities with complex reasoning",
+        "category": "flagship",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemma-4-31b-it",
+        "displayName": "Gemma 4 31B IT",
+        "description": "Open weights flagship text model",
+        "category": "gemma",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-pro-latest",
+        "displayName": "Gemini Pro Latest",
+        "description": "Latest stable Gemini Pro alias",
+        "category": "flagship",
+        "paid": False,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-4-argon",
+        "displayName": "Gemini 4 Argon",
+        "description": "Our most capable model",
+        "category": "flagship",
+        "paid": True,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-3.6-flash",
+        "displayName": "Gemini 3.6 Flash",
+        "description": "High throughput flash model",
+        "category": "flash",
+        "paid": True,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "gemini-3.1-flash-image",
+        "displayName": "Nano Banana 2",
+        "description": "Image generation and multimodal editing",
+        "category": "image",
+        "paid": True,
+        "is_image_model": True,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+    {
+        "id": "veo-3.1-generate-preview",
+        "displayName": "Veo 3.1",
+        "description": "Video generation preview model",
+        "category": "video",
+        "paid": True,
+        "is_video_model": True,
+        "supportedGenerationMethods": ["generateContent", "countTokens"],
+    },
+)
+
+
+def sandbox_model_catalog() -> list[dict[str, object]]:
+    """Return the built-in sandbox model list (Free + Paid), no disk/network."""
+    return [dict(item) for item in _SANDBOX_MODEL_CATALOG]
+
+
+def sandbox_model_by_id(model_id: str) -> dict[str, object] | None:
+    """Look up one sandbox model by bare or ``models/``-prefixed id."""
+    clean = model_id.removeprefix("models/").strip().lower()
+    for item in _SANDBOX_MODEL_CATALOG:
+        if str(item.get("id") or "").lower() == clean:
+            return dict(item)
+    return None
+
+
+class UiDebugIsolation:
+    """Redirect every persisted path touched by config/log/key routes to a temp dir.
+
+    ui_debug must be strictly offline and must never rewrite the operator's real
+    ``config.yaml``, accounts, stats, model cache or log archives.  The lifespan
+    enters this before ``validate_config()`` (which may migrate/write config) and
+    closes it after the sandbox, restoring the original environment and settings.
+    """
+
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="aistudio-ui-debug-paths-"))
+        self.config_file = self.root / "config.yaml"
+        self.data_dir = self.root / "data"
+        self.accounts_dir = self.data_dir / "accounts"
+        self.logs_dir = self.data_dir / "logs"
+        self.dumps_dir = self.data_dir / "dumps"
+        self._saved_env: dict[str, str | None] = {}
+        self._saved_settings: dict[str, object] = {}
+        self._entered = False
+
+    def enter(self) -> UiDebugIsolation:
+        try:
+            for directory in (
+                self.data_dir,
+                self.accounts_dir,
+                self.logs_dir,
+                self.dumps_dir,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+            self.config_file.write_text(
+                resolve_default_config_template().read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            overrides = {
+                "AISTUDIO_CONFIG_PATH": str(self.config_file),
+                "AISTUDIO_DATA_DIR": str(self.data_dir),
+                "AISTUDIO_ACCOUNTS_DIR": str(self.accounts_dir),
+                "AISTUDIO_STATS_FILE": str(self.data_dir / "stats.json"),
+                "AISTUDIO_ROTATOR_STATE_FILE": str(
+                    self.data_dir / "rotator_state.json"
+                ),
+                "AISTUDIO_MODEL_CACHE_FILE": str(
+                    self.data_dir / "models_cache.json"
+                ),
+                "AISTUDIO_LOG_DIR": str(self.logs_dir),
+                "AISTUDIO_DUMP_DIR": str(self.dumps_dir),
+                "AISTUDIO_DUMP_RAW_RESPONSE_DIR": str(self.dumps_dir / "raw"),
+            }
+            for key, value in overrides.items():
+                self._saved_env[key] = os.environ.get(key)
+                os.environ[key] = value
+
+            from aistudio_api.config import settings
+
+            for attr, value in (
+                ("config_file", str(self.config_file)),
+                ("data_dir", str(self.data_dir)),
+                ("accounts_dir", str(self.accounts_dir)),
+                ("stats_file", str(self.data_dir / "stats.json")),
+                ("rotator_state_file", str(self.data_dir / "rotator_state.json")),
+                ("model_cache_file", str(self.data_dir / "models_cache.json")),
+                ("dump_dir", str(self.dumps_dir)),
+                ("dump_raw_response_dir", str(self.dumps_dir / "raw")),
+            ):
+                self._saved_settings[attr] = getattr(settings, attr)
+                setattr(settings, attr, value)
+            self._entered = True
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        from aistudio_api.config import settings
+
+        for attr, value in self._saved_settings.items():
+            setattr(settings, attr, value)
+        self._saved_settings.clear()
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._saved_env.clear()
+        if self._entered:
+            self._entered = False
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+@dataclass
+class _AccountSeed:
+    id: str
+    name: str
+    email: str | None
+    tier: str = "Free"
+    enabled: bool = True
+    expired: bool = False
+    group: str = "default"
+    cookie_id: str | None = None
+    session_expired: bool = False
+    auth_cooldown: int = 0
+    quota_available: bool = True
+
+
+@dataclass
+class _InstanceSeed:
+    id: str
+    account_id: str
+    state: InstanceState
+    surface: str = "chat"
+    only_tier: str = ""
+    min_tier: str = ""
+    max_tier: str = ""
+    in_flight: int = 0
+
+
+@dataclass
+class _SandboxInstance:
+    id: str
+    number: int
+    account_id: str
+    state: InstanceState
+    surface: str
+    only_tier: str = ""
+    min_tier: str = ""
+    max_tier: str = ""
+    in_flight: int = 0
+    started_at: float = field(default_factory=time.time)
+
+    @property
+    def selector(self) -> Any:
+        if self.only_tier:
+            return resolve_tier_selector(only_tier=self.only_tier)
+        return resolve_tier_selector(
+            min_tier=self.min_tier or None,
+            max_tier=self.max_tier or None,
+        )
+
+    def accepts_tier(self, tier: object) -> bool:
+        return tier_matches_selector(tier, self.selector)
+
+
+def _sandbox_cookie_state() -> dict[str, object]:
+    return {
+        "cookies": [
+            {
+                "name": "SID",
+                "value": "ui-debug-sandbox",
+                "domain": ".google.com",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": True,
+                "secure": True,
+            }
+        ],
+        "origins": [],
+    }
+
+
+class SandboxInstanceManager:
+    """In-memory instance manager with the same public REST semantics."""
+
+    def __init__(self, account_store: AccountStore) -> None:
+        self._accounts = account_store
+        self._records: dict[str, _SandboxInstance] = {}
+        self._next_number = 1
+        self._latest_id: str | None = None
+        self._current_id: str | None = None
+        self._drain_timeout_s = _SANDBOX_DRAIN_TIMEOUT_S
+
+    @property
+    def max_instances(self) -> int:
+        return _SANDBOX_MAX_CONTEXTS
+
+    @property
+    def current_instance_id(self) -> str | None:
+        return self._current_id
+
+    def reset(self) -> None:
+        self._records.clear()
+        self._next_number = 1
+        self._latest_id = None
+        self._current_id = None
+
+    def seed(self, seeds: tuple[_InstanceSeed, ...]) -> None:
+        self.reset()
+        for seed in seeds:
+            number = self._next_number
+            self._next_number += 1
+            record = _SandboxInstance(
+                id=seed.id,
+                number=number,
+                account_id=seed.account_id,
+                state=seed.state,
+                surface=seed.surface,
+                only_tier=seed.only_tier,
+                min_tier=seed.min_tier,
+                max_tier=seed.max_tier,
+                in_flight=seed.in_flight,
+            )
+            self._records[record.id] = record
+            if record.state is InstanceState.ACTIVE:
+                self._latest_id = record.id
+                if self._current_id is None:
+                    self._current_id = record.id
+
+    async def startup(self) -> None:
+        return None
+
+    async def list_instances(self) -> InstanceList:
+        return InstanceList(
+            max_instances=self.max_instances,
+            latest_instance_id=self._latest_id,
+            current_instance_id=self._current_id,
+            instances=self.views(),
+        )
+
+    def views(self) -> tuple[Instance, ...]:
+        return tuple(
+            self._view(record)
+            for record in sorted(self._records.values(), key=lambda item: item.number)
+        )
+
+    async def create(
+        self,
+        account_id: str,
+        surface: str | None = None,
+        *,
+        only_tier: str | None = None,
+        min_tier: str | None = None,
+        max_tier: str | None = None,
+    ) -> Instance:
+        account = self._validate_account(account_id)
+        target_surface = self._normalize_surface(surface)
+        if self._has_record_for_account(account.id):
+            from aistudio_api.application.instance_manager import (
+                InstanceAlreadyExistsError,
+            )
+
+            raise InstanceAlreadyExistsError(
+                f"账号 {account_id} 已存在实例（同账号 chat/build 不并存）"
+            )
+        if len(self._records) >= self.max_instances:
+            from aistudio_api.application.instance_manager import (
+                InstanceCapacityExhaustedError,
+            )
+
+            raise InstanceCapacityExhaustedError("实例上限已满")
+        selector = self._resolve_selector(
+            account, only_tier=only_tier, min_tier=min_tier, max_tier=max_tier
+        )
+        if not tier_matches_selector(account.tier, selector):
+            from aistudio_api.application.instance_manager import (
+                InstanceInvalidAccountError,
+            )
+
+            raise InstanceInvalidAccountError(
+                f"账号 tier={account.tier} 不满足实例 tier 区间"
+            )
+        number = self._next_number
+        self._next_number += 1
+        record = _SandboxInstance(
+            id=f"inst-{number}",
+            number=number,
+            account_id=account.id,
+            state=InstanceState.ACTIVE,
+            surface=target_surface,
+            only_tier=selector.only_tier or "",
+            min_tier=selector.min_tier,
+            max_tier=selector.max_tier,
+        )
+        self._records[record.id] = record
+        self._latest_id = record.id
+        if self._current_id is None:
+            self._current_id = record.id
+        if self._accounts.get_active_account() is None:
+            self._accounts.set_active_account(account.id)
+        return self._view(record)
+
+    async def close(self, instance_id: str | None = None) -> Instance | None:
+        if instance_id is None:
+            self.reset()
+            return None
+        record = self._record(instance_id)
+        if record.in_flight > 0:
+            from aistudio_api.application.instance_manager import InstanceBusyError
+
+            raise InstanceBusyError("该实例仍有在途请求")
+        view = self._view(record, state=InstanceState.RECLAIMING)
+        self._records.pop(record.id, None)
+        self._repair_pointers()
+        return view
+
+    async def switch_to(self, instance_id: str, surface: str | None = None) -> Instance:
+        record = self._record(instance_id)
+        record.surface = self._normalize_surface(surface)
+        self._current_id = record.id
+        self._accounts.set_active_account(record.account_id)
+        return self._view(record)
+
+    async def restart(self, instance_id: str) -> Instance:
+        record = self._record(instance_id)
+        self._require_bound_account(record)
+        if record.in_flight > 0:
+            from aistudio_api.application.instance_manager import InstanceBusyError
+
+            raise InstanceBusyError("该实例仍有在途请求")
+        record.state = InstanceState.ACTIVE
+        self._latest_id = record.id
+        if self._current_id is None:
+            self._current_id = record.id
+        return self._view(record)
+
+    async def reassign(self, instance_id: str, account_id: str) -> Instance:
+        record = self._record(instance_id)
+        account = self._validate_account(account_id)
+        if record.account_id == account.id:
+            return self._view(record)
+        if instance_lane_for_tier(account.tier) != self._lane(record):
+            from aistudio_api.application.instance_manager import (
+                InstanceInvalidAccountError,
+            )
+
+            raise InstanceInvalidAccountError(
+                "Free/paid 实例池互相隔离，不能跨池改绑账号"
+            )
+        if not record.accepts_tier(account.tier):
+            from aistudio_api.application.instance_manager import (
+                InstanceInvalidAccountError,
+            )
+
+            raise InstanceInvalidAccountError(
+                f"账号 tier={account.tier} 不满足实例 tier 区间"
+            )
+        other = self._record_for_account(account.id, exclude_id=record.id)
+        if other is not None:
+            from aistudio_api.application.instance_manager import (
+                InstanceAlreadyExistsError,
+            )
+
+            raise InstanceAlreadyExistsError(
+                f"账号 {account_id} 已绑定实例 #{other.number}，"
+                f"请先在实例 #{other.number} 换绑其他账号或关闭该实例后"
+                "再绑定此槽位"
+            )
+        if record.in_flight > 0:
+            # Bounded safe drain: stop accepting new work, wait once, then
+            # force-close the simulated old runtime before switching accounts.
+            await self._drain(record)
+        record.account_id = account.id
+        record.state = InstanceState.ACTIVE
+        if self._current_id == record.id:
+            self._accounts.set_active_account(account.id)
+        return self._view(record)
+
+    async def wake(self, instance_id: str) -> Instance:
+        record = self._record(instance_id)
+        if record.state is InstanceState.ACTIVE:
+            return self._view(record)
+        if record.state not in (InstanceState.UNSTARTED, InstanceState.SLEEPING):
+            from aistudio_api.application.instance_manager import InstanceNotReadyError
+
+            raise InstanceNotReadyError("仅 UNSTARTED/SLEEPING 实例可唤醒")
+        self._require_bound_account(record)
+        record.state = InstanceState.ACTIVE
+        self._latest_id = record.id
+        return self._view(record)
+
+    async def rebind_account(
+        self,
+        target_account_id: str,
+        *,
+        previous_account_id: str | None = None,
+        reason: str = "d-05",
+    ) -> Instance:
+        target = self._validate_account(target_account_id)
+        target_lane = instance_lane_for_tier(target.tier)
+        previous_id = previous_account_id
+        if previous_id is None and self._current_id:
+            current = self._records.get(self._current_id)
+            if current is not None:
+                previous_id = current.account_id
+
+        affected = [
+            record
+            for record in self._records.values()
+            if record.account_id
+            and (
+                record.account_id == previous_id
+                or not self._is_runnable(record.account_id)
+            )
+        ]
+        target_record = self._find_target_record(target, target_lane)
+        if target_record is None:
+            from aistudio_api.application.instance_manager import InstanceNotReadyError
+
+            raise InstanceNotReadyError(
+                f"没有可用于账号 {target_account_id} 的 {target_lane} 实例"
+            )
+
+        for record in affected:
+            if record.id == target_record.id:
+                continue
+            self._retire(record)
+        if target_record in affected or target_record.account_id != target.id:
+            self._retire(target_record)
+
+        target_record.account_id = target.id
+        target_record.state = InstanceState.ACTIVE
+        target_record.in_flight = 0
+        self._current_id = target_record.id
+        self._latest_id = target_record.id
+        self._accounts.set_active_account(target.id)
+        log.info(
+            "[ui-debug] %s rebind complete %s -> %s",
+            reason,
+            previous_id,
+            target.id,
+        )
+        return self._view(target_record)
+
+    def ready_slot_for_account(self, account_id: str) -> object | None:
+        if not account_id:
+            return None
+        for record in self._records.values():
+            if record.account_id == account_id and record.state is InstanceState.ACTIVE:
+                self._current_id = record.id
+                return record
+        return None
+
+    def instance_account_ids(self) -> set[str]:
+        return {
+            record.account_id for record in self._records.values() if record.account_id
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "max_instances": self.max_instances,
+            "latest_instance_id": self._latest_id,
+            "current_instance_id": self._current_id,
+            "instances": [self.payload(record) for record in self._records.values()],
+        }
+
+    def payload(self, record: _SandboxInstance) -> dict[str, object]:
+        account = (
+            self._accounts.get_account(record.account_id) if record.account_id else None
+        )
+        return {
+            "id": record.id,
+            "number": record.number,
+            "account_id": record.account_id,
+            "state": record.state.value,
+            "surface": record.surface,
+            "only_tier": record.only_tier,
+            "min_tier": record.min_tier,
+            "max_tier": record.max_tier,
+            "tier_selector": {
+                "only_tier": record.only_tier,
+                "min_tier": record.min_tier or self._selector_min(record),
+                "max_tier": record.max_tier or self._selector_max(record),
+            },
+            "in_flight": record.in_flight,
+            "latest": record.id == self._latest_id,
+            "account_email": account.email if account is not None else None,
+            "account_name": account.name if account is not None else "",
+            "account_tier": account.tier if account is not None else "",
+            "tier": account.tier if account is not None else "",
+            "fingerprint": get_account_fingerprint(record.account_id),
+            "fingerprint_summary": get_account_fingerprint(record.account_id),
+            "last_used": record.started_at,
+        }
+
+    def records(self) -> tuple[_SandboxInstance, ...]:
+        return tuple(self._records.values())
+
+    def first_instance(self) -> _SandboxInstance | None:
+        return next(iter(self._records.values()), None)
+
+    def get_record(self, instance_id: str) -> _SandboxInstance | None:
+        return self._records.get(instance_id)
+
+    def _view(
+        self, record: _SandboxInstance, *, state: InstanceState | None = None
+    ) -> Instance:
+        account = (
+            self._accounts.get_account(record.account_id) if record.account_id else None
+        )
+        return Instance(
+            id=record.id,
+            number=record.number,
+            account_id=record.account_id,
+            state=state or record.state,
+            surface=record.surface,
+            min_tier=record.min_tier or self._selector_min(record),
+            only_tier=record.only_tier,
+            max_tier=record.max_tier or self._selector_max(record),
+            in_flight=record.in_flight,
+            latest=record.id == self._latest_id,
+            tier=account.tier if account is not None else "",
+            last_used=record.started_at,
+        )
+
+    def _selector_min(self, record: _SandboxInstance) -> str:
+        return record.selector.min_tier
+
+    def _selector_max(self, record: _SandboxInstance) -> str:
+        return record.selector.max_tier
+
+    def _lane(self, record: _SandboxInstance) -> str:
+        return record.selector.lane
+
+    def _retire(self, record: _SandboxInstance) -> None:
+        record.in_flight = 0
+        record.account_id = ""
+        record.state = InstanceState.SLEEPING
+
+    async def _drain(self, record: _SandboxInstance) -> bool:
+        """Bounded drain for the synthesized in-flight counter.
+
+        The sandbox has no real request handles, so a non-zero counter can only
+        drain by timeout. After the bound expires the simulated Page/Context is
+        considered force-closed and the slot becomes reusable.
+        """
+        if record.in_flight <= 0:
+            return False
+        await asyncio.sleep(self._drain_timeout_s)
+        timed_out = record.in_flight > 0
+        record.in_flight = 0
+        return timed_out
+
+    def _record_for_account(
+        self, account_id: str, *, exclude_id: str | None = None
+    ) -> _SandboxInstance | None:
+        for record in self._records.values():
+            if (
+                record.account_id == account_id
+                and record.id != exclude_id
+                and record.state
+                not in (
+                    InstanceState.RECLAIMING,
+                    InstanceState.RETIRING,
+                    InstanceState.INVALID,
+                )
+            ):
+                return record
+        return None
+
+    def _find_target_record(
+        self, target: AccountMeta, target_lane: str
+    ) -> _SandboxInstance | None:
+        for record in self._records.values():
+            if record.account_id == target.id and record.accepts_tier(target.tier):
+                return record
+        for record in self._records.values():
+            if (
+                record.selector.lane == target_lane
+                and not record.account_id
+                and record.accepts_tier(target.tier)
+            ):
+                return record
+        if len(self._records) < self.max_instances:
+            number = self._next_number
+            self._next_number += 1
+            selector = resolve_tier_selector(only_tier=normalize_tier(target.tier))
+            record = _SandboxInstance(
+                id=f"inst-{number}",
+                number=number,
+                account_id="",
+                state=InstanceState.UNSTARTED,
+                surface="chat",
+                only_tier=selector.only_tier or "",
+                min_tier=selector.min_tier,
+                max_tier=selector.max_tier,
+            )
+            self._records[record.id] = record
+            return record
+        return None
+
+    def _is_runnable(self, account_id: str) -> bool:
+        account = self._accounts.get_account(account_id)
+        return account is not None and account.enabled and not account.expired
+
+    def _require_bound_account(self, record: _SandboxInstance) -> AccountMeta:
+        from aistudio_api.application.instance_manager import (
+            InstanceInvalidAccountError,
+        )
+
+        if not record.account_id:
+            raise InstanceInvalidAccountError("实例账号不可用，请重新选择账号")
+        return self._validate_account(record.account_id)
+
+    def _validate_account(self, account_id: str) -> AccountMeta:
+        from aistudio_api.application.instance_manager import (
+            InstanceAccountNotFoundError,
+            InstanceInvalidAccountError,
+        )
+
+        account = self._accounts.get_account(account_id)
+        if account is None:
+            raise InstanceAccountNotFoundError("账号不存在")
+        if not account.enabled:
+            raise InstanceInvalidAccountError("账号已停用")
+        if account.expired:
+            raise InstanceInvalidAccountError("账号已失效，请重新登录")
+        if (
+            self._accounts.get_auth_path_optional(account.id, require_exists=True)
+            is None
+        ):
+            raise InstanceInvalidAccountError("账号凭据缺失，请重新登录")
+        return account
+
+    def _resolve_selector(
+        self,
+        account: AccountMeta,
+        *,
+        only_tier: str | None,
+        min_tier: str | None,
+        max_tier: str | None,
+    ) -> Any:
+        if any(value for value in (only_tier, min_tier, max_tier)):
+            return resolve_tier_selector(
+                only_tier=only_tier or None,
+                min_tier=min_tier or None,
+                max_tier=max_tier or None,
+            )
+        return resolve_tier_selector(only_tier=normalize_tier(account.tier))
+
+    def _record(self, instance_id: str) -> _SandboxInstance:
+        record = self._records.get(instance_id)
+        if record is None:
+            from aistudio_api.application.instance_manager import (
+                InstanceNotFoundError,
+            )
+
+            raise InstanceNotFoundError("实例不存在")
+        return record
+
+    def _has_record_for_account(
+        self, account_id: str, *, exclude_id: str | None = None
+    ) -> bool:
+        return self._record_for_account(account_id, exclude_id=exclude_id) is not None
+
+    def _repair_pointers(self) -> None:
+        if self._latest_id not in self._records:
+            candidates = [
+                record
+                for record in self._records.values()
+                if record.state is not InstanceState.RECLAIMING
+            ]
+            self._latest_id = (
+                max(candidates, key=lambda item: item.started_at).id
+                if candidates
+                else None
+            )
+        current = self._records.get(self._current_id or "")
+        if current is not None and current.state is InstanceState.ACTIVE:
+            return
+        active = [
+            record
+            for record in self._records.values()
+            if record.state is InstanceState.ACTIVE
+        ]
+        self._current_id = (
+            max(active, key=lambda item: item.started_at).id if active else None
+        )
+
+    @staticmethod
+    def _normalize_surface(surface: str | None) -> str:
+        if surface in (None, "", "chat"):
+            return "chat"
+        if surface == "build":
+            return "build"
+        from aistudio_api.application.instance_manager import InstanceNotReadyError
+
+        raise InstanceNotReadyError(f"未知 surface: {surface}")
+
+
+class SandboxRotator:
+    """In-memory rotator used by /rotation and /stats while ui_debug is on."""
+
+    quota_scope = "account"
+
+    def __init__(self, sandbox: UISandbox) -> None:
+        self._sandbox = sandbox
+        self._stats: dict[str, AccountStats] = {}
+
+    def get_account_stats(self, account_id: str) -> AccountStats | None:
+        if self._sandbox.account_service.get_account(account_id) is None:
+            return None
+        return self._stats_for(account_id)
+
+    def get_all_stats(self) -> dict[str, dict[str, object]]:
+        result: dict[str, dict[str, object]] = {}
+        for account in self._sandbox.account_service.list_accounts():
+            flags = self._sandbox.flags(account.id)
+            cooldown = int(flags["auth_cooldown"])
+            stats = self._stats_for(account.id)
+            result[account.id] = {
+                "name": account.name,
+                "email": account.email,
+                "auth_user": account.auth_user,
+                "tier": account.tier,
+                "quota_scope": self.quota_scope,
+                "enabled": account.enabled,
+                "group": account.group,
+                "requests": stats.total_requests,
+                "success": stats.total_success,
+                "rate_limited": stats.total_rate_limited,
+                "errors": stats.total_errors,
+                "today_total_requests": 0,
+                "today_total_tokens": 0,
+                "last_used": None,
+                "last_rate_limited": None,
+                "is_available": self._sandbox.is_available(account.id),
+                "session_expired": bool(flags["session_expired"]),
+                "auth_cooldown": cooldown,
+                "auth_errors": stats.auth_errors,
+                "cooldown_remaining": cooldown,
+                "model_cooldowns": {},
+                "today_models": {},
+                "model_requests": {},
+                "model_rate_limited": {},
+                "model_drip_mode": {},
+            }
+        return result
+
+    def clear_cooldown(
+        self, account_id: str | None = None, model: str | None = None
+    ) -> None:
+        del model
+        if account_id is None:
+            self.clear_all_cooldowns()
+            return
+        self._sandbox.clear_cooldown(account_id)
+
+    def clear_all_cooldowns(self) -> None:
+        for account in self._sandbox.account_service.list_accounts():
+            self._sandbox.clear_cooldown(account.id)
+
+    def cleanup_ghost_accounts(self) -> list[str]:
+        live = {account.id for account in self._sandbox.account_service.list_accounts()}
+        ghosts = [account_id for account_id in self._stats if account_id not in live]
+        for account_id in ghosts:
+            self._stats.pop(account_id, None)
+        return ghosts
+
+    def reset(self) -> None:
+        self._stats.clear()
+
+    def add_account(self, account_id: str) -> None:
+        self._stats_for(account_id)
+
+    def remove_account(self, account_id: str) -> None:
+        self._stats.pop(account_id, None)
+
+    async def get_next_account(self) -> AccountMeta | None:
+        for account in self._sandbox.account_service.list_accounts():
+            if self._sandbox.is_available(account.id):
+                return account
+        return None
+
+    def _stats_for(self, account_id: str) -> AccountStats:
+        stats = self._stats.get(account_id)
+        if stats is None:
+            stats = AccountStats(account_id=account_id, quota_scope=self.quota_scope)
+            self._stats[account_id] = stats
+        flags = self._sandbox.flags(account_id)
+        stats.session_expired = bool(flags["session_expired"])
+        stats.auth_cooldown = time.time() + int(flags["auth_cooldown"])
+        return stats
+
+
+class SandboxAccountRefresher:
+    """Offline account refresher: reports current sandbox state, no network."""
+
+    def __init__(self, sandbox: UISandbox) -> None:
+        self._sandbox = sandbox
+
+    async def refresh_accounts(
+        self, accounts: list[AccountMeta], *, refresh_email: bool = True
+    ) -> list[RefreshResult]:
+        results: list[RefreshResult] = []
+        checked_at = datetime.now(UTC).isoformat()
+        for account in accounts:
+            current = self._sandbox.account_service.get_account(account.id)
+            if current is None:
+                results.append(
+                    RefreshResult(
+                        account_id=account.id,
+                        ok=False,
+                        error="账号不存在",
+                        checked_at=checked_at,
+                    )
+                )
+                continue
+            if refresh_email and not current.email:
+                self._sandbox.account_service.update_account_email(
+                    current.id, f"ui-debug.{current.id}@example.com"
+                )
+                current = (
+                    self._sandbox.account_service.get_account(current.id) or current
+                )
+            self._sandbox.account_service.update_account_tier(
+                current.id,
+                normalize_tier(current.tier),
+                checked_at=checked_at,
+            )
+            self._sandbox._clear_recovery_state(current.id)
+            current = self._sandbox.account_service.get_account(current.id) or current
+            results.append(
+                RefreshResult(
+                    account_id=current.id,
+                    ok=True,
+                    tier=current.tier,
+                    expired=bool(current.expired),
+                    email=current.email,
+                    checked_at=checked_at,
+                )
+            )
+        return results
+
+
+def _setting_int(settings: dict[str, object], key: str, default: int) -> int:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return int(value)
+
+
+class SandboxKeepalive:
+    """Offline keepalive status/manual runner."""
+
+    def __init__(self, sandbox: UISandbox) -> None:
+        self._sandbox = sandbox
+        self._last_results: dict[str, dict[str, object]] = {}
+        self._last_error: str | None = None
+
+    async def start(self, startup_metadata_done: bool = False) -> None:
+        del startup_metadata_done
+
+    async def stop(self) -> None:
+        return None
+
+    def reset(self) -> None:
+        self._last_results.clear()
+        self._last_error = None
+
+    async def run_now(
+        self, task: str, *, trigger: str = "api", settings: object | None = None
+    ) -> dict[str, object]:
+        del settings
+        if task not in ("metadata_refresh", "auth_update", "active_activity"):
+            return {"ok": False, "task": task, "reason": "unknown_task"}
+        at = datetime.now(UTC).isoformat()
+        if self._sandbox.keepalive_partial:
+            result: dict[str, object] = {
+                "ok": False,
+                "task": task,
+                "reason": "sandbox_partial",
+                "error": "sandbox scenario: partial keepalive",
+                "at": at,
+                "trigger": trigger,
+            }
+        else:
+            result = {
+                "ok": True,
+                "task": task,
+                "reason": "sandbox",
+                "accounts": [
+                    account.id
+                    for account in self._sandbox.account_service.list_accounts()
+                ],
+                "at": at,
+                "trigger": trigger,
+            }
+        self._last_results[task] = result
+        return result
+
+    def status(self) -> dict[str, object]:
+        settings = get_configured_keepalive_settings()
+        in_flight = sum(record.in_flight for record in self._sandbox.manager.records())
+        return {
+            "settings": settings,
+            "tasks": ["metadata_refresh", "auth_update", "active_activity"],
+            "enabled": {
+                "auth_update": bool(settings.get("auth_update", True)),
+                "metadata_refresh": bool(settings.get("metadata_refresh", True)),
+                "active_activity": bool(settings.get("active_activity", False)),
+            },
+            "intervals": {
+                "auth_update_hours": _setting_int(settings, "auth_update_hours", 24),
+                "metadata_refresh_hours": _setting_int(
+                    settings, "metadata_refresh_hours", 24
+                ),
+                "active_activity_seconds": _setting_int(
+                    settings, "active_activity_seconds", 60
+                ),
+            },
+            "next_due": {},
+            "busy": False,
+            "running": None,
+            "last_run": {
+                task: entry.get("at") for task, entry in self._last_results.items()
+            },
+            "last_results": dict(self._last_results),
+            "last_error": self._last_error,
+            "in_flight": in_flight,
+            "pool_slots": len(self._sandbox.manager.records()),
+        }
+
+
+class UISandbox:
+    """Stateful offline runtime used by all UI-facing routes in ui_debug mode."""
+
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="aistudio-ui-debug-"))
+        try:
+            accounts_dir = self.root / "accounts"
+            accounts_dir.mkdir(parents=True, exist_ok=True)
+            (accounts_dir / "registry.json").write_text(
+                '{"accounts":{},"active_account_id":null}', encoding="utf-8"
+            )
+            self._store = AccountStore(accounts_dir)
+            self._store.refresh_duplicate_flags()
+            self.account_service = AccountService(self._store)
+            self.manager = SandboxInstanceManager(self._store)
+            self.rotator = SandboxRotator(self)
+            self.refresher = SandboxAccountRefresher(self)
+            self.keepalive = SandboxKeepalive(self)
+            self.scenario = "all_states"
+            self.keepalive_partial = False
+            self.model_stats: dict[str, ModelStatsItem] = {}
+            self.daily_stats: dict[str, dict[str, ModelStatsItem]] = {}
+            self.count_tokens = CountTokensStats()
+            self._formats_all_on: bool | None = None
+            self._flags: dict[str, dict[str, Any]] = {}
+            self._closed = False
+            self.reset("all_states")
+        except Exception:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
+
+    # ------------------------------------------------------------ lifecycle
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.manager.reset()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    # -------------------------------------------------------------- scenario
+    def _configured_formats_payload(self) -> dict[str, bool]:
+        """Effective config switches (Gemini is always on)."""
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_formats,
+        )
+
+        raw = get_configured_formats()
+        return {
+            "gemini": True,
+            "openai": _format_flag(raw.get("openai", True)),
+            "claude": _format_flag(raw.get("claude", True)),
+            "responses": _format_flag(raw.get("responses", True)),
+        }
+
+    def formats_payload(self) -> dict[str, bool]:
+        """Live format switches for the dashboard quick examples.
+
+        ``None`` means "follow config" (all four enabled by default), ``True``
+        forces every face on, and ``False`` is an explicit closed state so the
+        dashboard toggle never lands back on a fake default.
+        """
+        if self._formats_all_on is True:
+            return {
+                "gemini": True,
+                "openai": True,
+                "claude": True,
+                "responses": True,
+            }
+        if self._formats_all_on is False:
+            return {
+                "gemini": True,
+                "openai": False,
+                "claude": False,
+                "responses": False,
+            }
+        return self._configured_formats_payload()
+
+    def default_text_model(self) -> str:
+        from aistudio_api.config import DEFAULT_TEXT_MODEL
+
+        return DEFAULT_TEXT_MODEL
+
+    def stats_payload(self, days: int | None = None) -> dict[str, object]:
+        """Contract-shaped stats (all-time or ``days`` window) for ui_debug."""
+        from aistudio_api.domain.model_access import is_paid_model
+
+        return build_stats_payload(
+            model_stats=self.model_stats,
+            daily_stats=self.daily_stats,
+            count_tokens=self.count_tokens,
+            days=days,
+            quota_scope="account",
+            model_extra=lambda name: {"paid": is_paid_model(name)},
+        )
+
+    def reset(self, scenario: str) -> None:
+        if scenario not in SCENARIOS:
+            raise ValueError(f"unknown scenario: {scenario}")
+        for account in list(self._store.list_accounts()):
+            self._store.delete_account(account.id)
+        self._flags.clear()
+        self.scenario = scenario
+        self.keepalive_partial = False
+        self._formats_all_on = None
+        self.manager.reset()
+        self.rotator.reset()
+        self.keepalive.reset()
+        self.model_stats = {}
+        self.daily_stats = {}
+        self.count_tokens = CountTokensStats()
+        if scenario == "empty":
+            return
+        if scenario == "mass_accounts":
+            accounts, instances, active_id = _mass_scenario()
+        elif scenario == "narrow_edge":
+            accounts, instances, active_id = _narrow_edge_scenario()
+        else:
+            accounts, instances, active_id = _all_states_scenario()
+        self._seed(accounts, instances, active_id)
+        if scenario == "all_429":
+            self._apply_all_429()
+        self._seed_dashboard_stats(scenario)
+
+    def _apply_all_429(self) -> None:
+        until = time.time() + 600
+        for account in self.account_service.list_accounts():
+            flags = self.flags(account.id)
+            flags["_cooldown_until"] = until
+            flags["auth_cooldown"] = 600
+        for record in self.manager.records():
+            if record.account_id:
+                record.state = InstanceState.COOLDOWN
+
+    def _seed_dashboard_stats(self, scenario: str) -> None:
+        if scenario == "empty":
+            return
+        if scenario == "all_429":
+            stats = _all_429_model_stats()
+        elif scenario == "mass_accounts":
+            stats = _mass_model_stats()
+        elif scenario == "narrow_edge":
+            stats = _narrow_model_stats()
+        else:
+            stats = _all_states_model_stats()
+        self.model_stats = stats
+        for item in self.model_stats.values():
+            _normalize_stats_item(item)
+            item.client = _client_from_attempts(item)
+        self._seed_daily_stats(stats)
+        total_requests = sum(item.requests for item in stats.values())
+        self.count_tokens = _sandbox_count_tokens(total_requests, scenario)
+        self._seed_account_daily(stats)
+
+    def _seed_daily_stats(
+        self, stats: dict[str, ModelStatsItem], *, days: int = 21
+    ) -> None:
+        """Synthesize 21 consecutive Shanghai days with natural variation."""
+        keys = _recent_day_keys(days)
+        weights = _natural_weights(days)
+        self.daily_stats = {key: {} for key in keys}
+        for model_index, (model, item) in enumerate(stats.items()):
+            phase = model_index * 0.73
+            attempts = _distribute(item.requests, weights, phase=phase)
+            success = _allocate(item.success, attempts, weights, phase=phase + 0.4)
+            remaining = [
+                max(0, attempt - won)
+                for attempt, won in zip(attempts, success, strict=True)
+            ]
+            rate_limited = _allocate(
+                item.rate_limited, remaining, weights, phase=phase + 1.7
+            )
+            errors = [
+                max(0, left - limited)
+                for left, limited in zip(remaining, rate_limited, strict=True)
+            ]
+            prompt = _distribute(item.prompt_tokens, weights, phase=phase)
+            completion = _distribute(item.completion_tokens, weights, phase=phase)
+            cached = _allocate(
+                item.cached_tokens, prompt, weights, phase=phase + 2.1
+            )
+            reasoning = _allocate(
+                item.reasoning_tokens, completion, weights, phase=phase + 3.3
+            )
+            for index, key in enumerate(keys):
+                day_item = ModelStatsItem(
+                    requests=attempts[index],
+                    success=success[index],
+                    rate_limited=rate_limited[index],
+                    errors=errors[index],
+                    prompt_tokens=prompt[index],
+                    completion_tokens=completion[index],
+                    reasoning_tokens=reasoning[index],
+                    cached_tokens=cached[index],
+                    total_tokens=prompt[index] + completion[index],
+                    last_used=f"{key} 12:00:00",
+                )
+                if day_item.success:
+                    day_item.finish_reasons = {"STOP": day_item.success}
+                day_item.client = _client_from_attempts(day_item)
+                self.daily_stats[key][model] = day_item
+
+    def _seed_account_daily(
+        self, stats: dict[str, ModelStatsItem]
+    ) -> None:
+        accounts = [
+            account
+            for account in self.account_service.list_accounts()
+            if account.enabled and not account.expired
+        ]
+        if not accounts:
+            return
+        for model_index, (model, item) in enumerate(stats.items()):
+            buckets = (
+                (0.62, 0),
+                (0.23, 1),
+                (0.15, 2),
+            )
+            for share, offset in buckets:
+                account = accounts[(model_index + offset) % len(accounts)]
+                daily = self._account_daily(account.id, model)
+                success = int(item.success * share)
+                rate_limited = int(item.rate_limited * share)
+                errors = int(item.errors * share)
+                prompt = int(item.prompt_tokens * share)
+                completion = int(item.completion_tokens * share)
+                daily.requests += success + rate_limited + errors
+                daily.success += success
+                daily.rate_limited += rate_limited
+                daily.errors += errors
+                daily.prompt_tokens += prompt
+                daily.completion_tokens += completion
+                daily.reasoning_tokens += int(item.reasoning_tokens * share)
+                daily.cached_tokens += int(item.cached_tokens * share)
+                daily.total_tokens = daily.prompt_tokens + daily.completion_tokens
+                daily.last_used = time.time()
+                stats_for_account = self.rotator.get_account_stats(account.id)
+                if stats_for_account is not None:
+                    stats_for_account.total_requests += success + rate_limited + errors
+                    stats_for_account.total_success += success
+                    stats_for_account.total_rate_limited += rate_limited
+                    stats_for_account.total_errors += errors
+
+    def _account_daily(
+        self, account_id: str, model: str
+    ) -> AccountModelDailyStats:
+        stats = self.rotator.get_account_stats(account_id)
+        if stats is None:
+            return AccountModelDailyStats()
+        current_la = get_pacific_date_key()
+        stats._check_date_reset(current_la)
+        return stats.daily_models.setdefault(model, AccountModelDailyStats())
+
+    def _action_simulate_requests(self) -> None:
+        model = next(
+            (name for name in self.model_stats if "flash" in name),
+            next(iter(self.model_stats), "gemini-3.8-flash"),
+        )
+        item = self.model_stats.setdefault(model, ModelStatsItem())
+        item.requests += 10
+        item.success += 10
+        item.prompt_tokens += 32_000
+        item.completion_tokens += 18_000
+        item.reasoning_tokens += 5_000
+        item.cached_tokens += 2_000
+        item.total_tokens = item.prompt_tokens + item.completion_tokens
+        item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        for _ in range(10):
+            item.client.record("success")
+        daily_item = self._today_daily(model)
+        daily_item.requests += 10
+        daily_item.success += 10
+        daily_item.prompt_tokens += 32_000
+        daily_item.completion_tokens += 18_000
+        daily_item.reasoning_tokens += 5_000
+        daily_item.cached_tokens += 2_000
+        daily_item.total_tokens = (
+            daily_item.prompt_tokens + daily_item.completion_tokens
+        )
+        daily_item.last_used = item.last_used
+        for _ in range(10):
+            daily_item.client.record("success")
+        account = next(
+            (
+                account
+                for account in self.account_service.list_accounts()
+                if account.enabled and not account.expired
+            ),
+            None,
+        )
+        if account is not None:
+            daily = self._account_daily(account.id, model)
+            daily.requests += 10
+            daily.success += 10
+            daily.prompt_tokens += 32_000
+            daily.completion_tokens += 18_000
+            daily.reasoning_tokens += 5_000
+            daily.cached_tokens += 2_000
+            daily.total_tokens = daily.prompt_tokens + daily.completion_tokens
+            daily.last_used = time.time()
+
+    def _action_simulate_429(self) -> None:
+        model = next(
+            (name for name in self.model_stats if "argon" in name),
+            next(iter(self.model_stats), "gemini-4-argon"),
+        )
+        item = self.model_stats.setdefault(model, ModelStatsItem())
+        item.requests += 1
+        item.rate_limited += 1
+        item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        item.client.record("rate_limited")
+        daily_item = self._today_daily(model)
+        daily_item.requests += 1
+        daily_item.rate_limited += 1
+        daily_item.last_used = item.last_used
+        daily_item.client.record("rate_limited")
+        account = next(
+            (
+                account
+                for account in self.account_service.list_accounts()
+                if self.is_available(account.id)
+            ),
+            None,
+        )
+        if account is not None:
+            flags = self.flags(account.id)
+            flags["_cooldown_until"] = time.time() + 300
+            flags["auth_cooldown"] = 300
+            daily = self._account_daily(account.id, model)
+            daily.requests += 1
+            daily.rate_limited += 1
+            daily.last_used = time.time()
+            for record in self.manager.records():
+                if record.account_id == account.id:
+                    record.state = InstanceState.COOLDOWN
+
+    def _today_daily(self, model: str) -> ModelStatsItem:
+        bucket = self.daily_stats.setdefault(daily_key(), {})
+        return bucket.setdefault(model, ModelStatsItem())
+
+    def _action_toggle_formats(self) -> None:
+        if self._formats_all_on is None:
+            # Default is all-on; the first toggle must expose a real closed
+            # state instead of silently returning the same all-on payload.
+            current = self._configured_formats_payload()
+            self._formats_all_on = not all(current.values())
+            return
+        self._formats_all_on = not self._formats_all_on
+
+    def apply(
+        self,
+        *,
+        scenario: str | None = None,
+        action: str | None = None,
+        target_id: str | None = None,
+    ) -> dict[str, object]:
+        if scenario is not None:
+            self.reset(scenario)
+        if action is None:
+            return self.snapshot()
+        if action not in ACTIONS:
+            raise ValueError(f"unknown action: {action}")
+        if action == "reset":
+            self.reset(scenario or self.scenario)
+        elif action == "instance_inflight":
+            self._action_instance_inflight(target_id)
+        elif action == "account_expired":
+            self._action_account_expired(target_id)
+        elif action == "instance_cooldown":
+            self._action_instance_cooldown(target_id)
+        elif action == "keepalive_partial":
+            self.keepalive_partial = True
+            self.keepalive._last_error = "sandbox scenario: partial keepalive"
+        elif action == "simulate_requests":
+            self._action_simulate_requests()
+        elif action == "simulate_429":
+            self._action_simulate_429()
+        elif action == "toggle_formats":
+            self._action_toggle_formats()
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "ui_debug": True,
+            "ui_debug_scenario": self.scenario,
+            "enabled": True,
+            "scenario": self.scenario,
+            "scenarios": list(SCENARIOS),
+            "dashboard_scenarios": list(DASHBOARD_SCENARIOS),
+            "quick_actions": [action for action in ACTIONS if action != "reset"],
+            "dashboard_actions": list(DASHBOARD_ACTIONS),
+            "formats": self.formats_payload(),
+            "default_text_model": self.default_text_model(),
+            "stats": self.stats_payload(),
+            "accounts": [
+                self.account_payload(account)
+                for account in self.account_service.list_accounts()
+            ],
+            "instances": self.manager.snapshot(),
+            "rotation": self.rotator.get_all_stats(),
+            "keepalive": {"available": True, **self.keepalive.status()},
+        }
+
+    # --------------------------------------------------------------- account
+    def flags(self, account_id: str) -> dict[str, Any]:
+        flags = self._flags.get(account_id)
+        if flags is None:
+            flags = {
+                "session_expired": False,
+                "auth_cooldown": 0,
+                "quota_available": True,
+                "_cooldown_until": 0.0,
+            }
+            self._flags[account_id] = flags
+        remaining = int(flags.get("_cooldown_until", 0.0) - time.time())
+        flags["auth_cooldown"] = max(0, remaining)
+        return flags
+
+    def is_available(self, account_id: str) -> bool:
+        account = self.account_service.get_account(account_id)
+        if account is None:
+            return False
+        flags = self.flags(account_id)
+        return bool(
+            account.enabled
+            and not account.expired
+            and not flags["session_expired"]
+            and int(flags["auth_cooldown"]) == 0
+            and flags["quota_available"]
+        )
+
+    def quota_exhausted(self, account_id: str) -> bool:
+        """True only when quota is the sole blocker (cooldown/expiry is separate)."""
+        account = self.account_service.get_account(account_id)
+        if account is None:
+            return False
+        flags = self.flags(account_id)
+        return bool(
+            account.enabled
+            and not account.expired
+            and not flags["session_expired"]
+            and int(flags["auth_cooldown"]) == 0
+            and not flags["quota_available"]
+        )
+
+    def account_payload(self, account: AccountMeta) -> dict[str, object]:
+        flags = self.flags(account.id)
+        if account.cookie_id:
+            cookie_id = account.cookie_id
+        elif account.created_at:
+            cookie_id = f"cookie_{account.created_at[:16]}"
+        else:
+            cookie_id = f"cookie_{account.id}"
+        return {
+            "id": account.id,
+            "name": account.name,
+            "email": account.email,
+            "created_at": account.created_at,
+            "last_used": account.last_used,
+            "auth_user": account.auth_user,
+            "cookie_id": cookie_id,
+            "tier": account.tier,
+            "tier_checked_at": account.tier_checked_at,
+            "expired": bool(account.expired),
+            "duplicate_of": account.duplicate_of,
+            "enabled": account.enabled,
+            "group": account.group,
+            "session_expired": bool(flags["session_expired"]),
+            "auth_cooldown": int(flags["auth_cooldown"]),
+            "is_available": self.is_available(account.id),
+            "quota_exhausted": self.quota_exhausted(account.id),
+            "rebind_required": False,
+            "rebind_status": "not_required",
+            "previous_active_account_id": None,
+            "active_account_id": None,
+            "target_account": None,
+        }
+
+    def activate_account(self, account_id: str) -> AccountMeta | None:
+        account = self.account_service.get_account(account_id)
+        if account is None or not account.enabled or account.expired:
+            return None
+        self.account_service.set_active_account(account_id)
+        record = self.manager.ready_slot_for_account(account_id)
+        if record is None:
+            target = self.manager._find_target_record(
+                account, instance_lane_for_tier(account.tier)
+            )
+            if target is not None:
+                target.account_id = account_id
+                target.state = InstanceState.ACTIVE
+                self.manager._latest_id = target.id
+                self.manager._current_id = target.id
+        return account
+
+    def detect_email(self, account_id: str) -> AccountMeta | None:
+        account = self.account_service.get_account(account_id)
+        if account is None:
+            return None
+        if not account.email:
+            self.account_service.update_account_email(
+                account_id, f"detected.{account_id}@example.com"
+            )
+        self._clear_recovery_state(account_id)
+        return self.account_service.get_account(account_id)
+
+    def detect_tier(self, account_id: str) -> AccountMeta | None:
+        account = self.account_service.get_account(account_id)
+        if account is None:
+            return None
+        self.account_service.update_account_tier(
+            account_id,
+            normalize_tier(account.tier),
+            checked_at=datetime.now(UTC).isoformat(),
+        )
+        self._clear_recovery_state(account_id)
+        return self.account_service.get_account(account_id)
+
+    def clear_cooldown(self, account_id: str) -> None:
+        self._clear_recovery_state(account_id)
+        for record in self.manager.records():
+            if (
+                record.account_id == account_id
+                and record.state is InstanceState.COOLDOWN
+            ):
+                record.state = InstanceState.ACTIVE
+
+    def _clear_recovery_state(self, account_id: str) -> None:
+        """A successful recover/detect clears expired + session/cooldown locks."""
+        flags = self.flags(account_id)
+        flags["_cooldown_until"] = 0.0
+        flags["auth_cooldown"] = 0
+        flags["session_expired"] = False
+        self._store.update_account_refresh(account_id, expired=False)
+
+    def next_account(self) -> AccountMeta | None:
+        for account in self.account_service.list_accounts():
+            if self.is_available(account.id):
+                self.account_service.set_active_account(account.id)
+                return account
+        return None
+
+    def on_account_deleted(self, account_id: str) -> None:
+        """Unbind any sandbox slot that referenced a deleted account."""
+        self._flags.pop(account_id, None)
+        for record in self.manager.records():
+            if record.account_id != account_id:
+                continue
+            record.account_id = ""
+            record.in_flight = 0
+            record.state = InstanceState.UNSTARTED
+        self.manager._repair_pointers()
+
+    # ---------------------------------------------------------------- helpers
+    def _seed(
+        self,
+        accounts: tuple[_AccountSeed, ...],
+        instances: tuple[_InstanceSeed, ...],
+        active_id: str | None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        for seed in accounts:
+            account = self._store.save_account(
+                name=seed.name,
+                email=seed.email,
+                storage_state=_sandbox_cookie_state(),
+                account_id=seed.id,
+                auth_user="0",
+                cookie_id=seed.cookie_id,
+                tier=normalize_tier(seed.tier),
+                enabled=seed.enabled,
+                group=seed.group,
+            )
+            self._store.update_account_refresh(
+                account.id,
+                expired=seed.expired,
+                tier_checked_at=now,
+            )
+            self._flags[account.id] = {
+                "session_expired": seed.session_expired,
+                "auth_cooldown": seed.auth_cooldown,
+                "quota_available": seed.quota_available,
+                "_cooldown_until": (
+                    time.time() + seed.auth_cooldown if seed.auth_cooldown else 0.0
+                ),
+            }
+        if active_id is not None:
+            self._store.set_active_account(active_id)
+        self.manager.seed(
+            tuple(
+                seed
+                for seed in instances
+                if seed.account_id == "" or self._store.get_account(seed.account_id)
+            )
+        )
+
+    def _action_instance_inflight(self, target_id: str | None) -> None:
+        record = (
+            self.manager.get_record(target_id)
+            if target_id is not None
+            else self.manager.first_instance()
+        )
+        if record is None:
+            raise ValueError("no instance available for instance_inflight")
+        record.in_flight += 1
+
+    def _action_account_expired(self, target_id: str | None) -> None:
+        account_id = target_id
+        if account_id is None:
+            account = self.account_service.get_active_account()
+            account_id = account.id if account is not None else None
+        if account_id is None:
+            raise ValueError("no account available for account_expired")
+        if not self._store.update_account_refresh(account_id, expired=True):
+            account = self._store.get_account(account_id)
+            if account is None:
+                raise ValueError(f"unknown account: {account_id}")
+        self.flags(account_id)["session_expired"] = False
+
+    def _action_instance_cooldown(self, target_id: str | None) -> None:
+        record = (
+            self.manager.get_record(target_id)
+            if target_id is not None
+            else self.manager.first_instance()
+        )
+        if record is None:
+            raise ValueError("no instance available for instance_cooldown")
+        record.state = InstanceState.COOLDOWN
+        if record.account_id:
+            self.flags(record.account_id)["_cooldown_until"] = time.time() + 300
+            self.flags(record.account_id)["auth_cooldown"] = 300
+
+
+def _all_states_scenario() -> tuple[
+    tuple[_AccountSeed, ...], tuple[_InstanceSeed, ...], str | None
+]:
+    accounts = (
+        _AccountSeed(
+            "acc_free_ready",
+            "Free Ready",
+            "free.ready@example.com",
+            "Free",
+        ),
+        _AccountSeed("acc_free_nomail", "Free No Email", None, "Free"),
+        _AccountSeed(
+            "acc_plus_prod",
+            "Plus Production",
+            "plus.production.team+long-alias@example.com",
+            "Plus",
+            group="production",
+        ),
+        _AccountSeed(
+            "acc_pro_prod",
+            "Pro Production",
+            "pro.production@example.com",
+            "Pro",
+            group="production",
+        ),
+        _AccountSeed(
+            "acc_pro_expired",
+            "Pro Expired",
+            "pro.expired@example.com",
+            "Pro",
+            expired=True,
+            group="legacy",
+        ),
+        _AccountSeed(
+            "acc_pro_session",
+            "Pro Session Expired",
+            "pro.session@example.com",
+            "Pro",
+            group="legacy",
+            session_expired=True,
+        ),
+        _AccountSeed(
+            "acc_ultra_cooldown",
+            "Ultra Cooldown",
+            "ultra.cooldown@example.com",
+            "Ultra",
+            group="vip",
+            auth_cooldown=120,
+        ),
+        _AccountSeed(
+            "acc_ultra20x_disabled",
+            "Ultra 20X Disabled",
+            "ultra20x.disabled@example.com",
+            "Ultra_20X",
+            enabled=False,
+            group="vip",
+        ),
+        _AccountSeed(
+            "acc_free_quota",
+            "Free Quota Exhausted",
+            "free.quota@example.com",
+            "Free",
+            quota_available=False,
+        ),
+        _AccountSeed(
+            "acc_free_quota_idle",
+            "Free Quota Idle",
+            "free.quota.idle@example.com",
+            "Free",
+            quota_available=False,
+        ),
+        _AccountSeed(
+            "acc_cookie_shared_a",
+            "Shared Cookie A",
+            "cookie.shared.a@example.com",
+            "Free",
+            cookie_id="cookie_shared",
+        ),
+        _AccountSeed(
+            "acc_cookie_shared_b",
+            "Shared Cookie B",
+            "cookie.shared.b@example.com",
+            "Pro",
+            group="production",
+            cookie_id="cookie_shared",
+        ),
+    )
+    instances = (
+        _InstanceSeed(
+            "inst-1",
+            "acc_pro_prod",
+            InstanceState.ACTIVE,
+            min_tier="Pro",
+            max_tier="Ultra_20X",
+            in_flight=1,
+        ),
+        _InstanceSeed(
+            "inst-2",
+            "",
+            InstanceState.UNSTARTED,
+            only_tier="Free",
+            min_tier="Free",
+            max_tier="Free",
+        ),
+        _InstanceSeed(
+            "inst-3",
+            "acc_ultra_cooldown",
+            InstanceState.COOLDOWN,
+            only_tier="Ultra",
+            min_tier="Ultra",
+            max_tier="Ultra_20X",
+        ),
+        _InstanceSeed(
+            "inst-4",
+            "acc_pro_expired",
+            InstanceState.INVALID,
+            only_tier="Pro",
+        ),
+        _InstanceSeed(
+            "inst-5",
+            "acc_plus_prod",
+            InstanceState.STARTING,
+            only_tier="Plus",
+        ),
+        _InstanceSeed(
+            "inst-6",
+            "acc_free_ready",
+            InstanceState.RETIRING,
+            only_tier="Free",
+            in_flight=2,
+        ),
+        _InstanceSeed(
+            "inst-7",
+            "acc_free_quota",
+            InstanceState.SLEEPING,
+            only_tier="Free",
+        ),
+        _InstanceSeed(
+            "inst-8",
+            "acc_ultra20x_disabled",
+            InstanceState.RECLAIMING,
+            only_tier="Ultra_20X",
+        ),
+        _InstanceSeed(
+            "inst-9",
+            "",
+            InstanceState.UNSTARTED,
+            only_tier="Pro",
+            min_tier="Pro",
+            max_tier="Pro",
+        ),
+    )
+    return accounts, instances, "acc_pro_prod"
+
+
+def _narrow_edge_scenario() -> tuple[
+    tuple[_AccountSeed, ...], tuple[_InstanceSeed, ...], str | None
+]:
+    accounts = (
+        _AccountSeed(
+            "acc_edge_long",
+            "Extremely Long Narrow Edge Account Name That Should Ellipsize In Tables",
+            "a.very.long.email.address.for.narrow.viewports+edge-case@example.com",
+            "Free",
+            group="production",
+        ),
+        _AccountSeed(
+            "acc_edge_plus",
+            "Plus Edge",
+            "plus.edge@example.com",
+            "Plus",
+            group="vip",
+        ),
+        _AccountSeed(
+            "acc_edge_ultra20x",
+            "Ultra 20X Disabled Edge",
+            "ultra20x.edge@example.com",
+            "Ultra_20X",
+            enabled=False,
+            group="legacy",
+        ),
+    )
+    instances = (
+        _InstanceSeed(
+            "inst-1",
+            "acc_edge_long",
+            InstanceState.ACTIVE,
+            only_tier="Free",
+            in_flight=1,
+        ),
+        _InstanceSeed(
+            "inst-2",
+            "",
+            InstanceState.UNSTARTED,
+            min_tier="Pro",
+        ),
+    )
+    return accounts, instances, "acc_edge_long"
+
+
+def _mass_scenario() -> tuple[
+    tuple[_AccountSeed, ...], tuple[_InstanceSeed, ...], str | None
+]:
+    tiers = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
+    groups = ("default", "production", "vip", "legacy")
+    accounts: list[_AccountSeed] = []
+    for index in range(48):
+        tier = tiers[index % len(tiers)]
+        accounts.append(
+            _AccountSeed(
+                f"acc_mass_{index:03d}",
+                f"Mass Account {index:03d}",
+                None if index % 7 == 0 else f"mass.{index:03d}@example.com",
+                tier,
+                enabled=index % 19 != 0,
+                expired=index % 11 == 0,
+                group=groups[index % len(groups)],
+                session_expired=index % 13 == 0,
+                auth_cooldown=90 if index % 17 == 0 else 0,
+                quota_available=index % 23 != 0,
+            )
+        )
+    states = (
+        InstanceState.ACTIVE,
+        InstanceState.UNSTARTED,
+        InstanceState.COOLDOWN,
+        InstanceState.INVALID,
+        InstanceState.STARTING,
+        InstanceState.RETIRING,
+    )
+    active_seed = next(
+        account for account in accounts if account.enabled and not account.expired
+    )
+    instance_accounts = [
+        active_seed,
+        *[account for account in accounts if account is not active_seed][:5],
+    ]
+    instances = tuple(
+        _InstanceSeed(
+            f"inst-{index + 1}",
+            instance_accounts[index].id,
+            states[index],
+            only_tier=instance_accounts[index].tier,
+            in_flight=index % 4,
+        )
+        for index in range(6)
+    )
+    return tuple(accounts), instances, active_seed.id
+
+
+def _format_flag(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "off", "no"}
+    return bool(value)
+
+
+def _last_used_label(minutes_ago: int = 0) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _recent_day_keys(days: int) -> list[str]:
+    from aistudio_api.api.state import daily_keys
+
+    return daily_keys(days)
+
+
+def _natural_weights(days: int) -> list[float]:
+    """Weekend dips plus a gentle ramp so the trend looks organic."""
+    today = datetime.now(SHANGHAI_TZ).date()
+    weights: list[float] = []
+    span = max(1, days - 1)
+    for index, offset in enumerate(range(days - 1, -1, -1)):
+        moment = today - timedelta(days=offset)
+        weekend = 0.62 if moment.weekday() >= 5 else 1.0
+        ramp = 0.72 + 0.28 * (index / span)
+        weights.append(weekend * ramp)
+    return weights
+
+
+def _normalize_stats_item(item: ModelStatsItem) -> None:
+    """Enforce the stats ledger identities on a synthetic sandbox row.
+
+    ``attempts = success + rate_limited + errors``,
+    ``prompt_tokens = cached_tokens + uncached_prompt_tokens`` and
+    ``total_tokens = prompt_tokens + completion_tokens`` (completion already
+    includes reasoning).  Counters are clamped instead of silently drifting.
+    """
+    requests = max(0, item.requests)
+    success = min(max(0, item.success), requests)
+    rate_limited = min(max(0, item.rate_limited), requests - success)
+    prompt = max(0, item.prompt_tokens)
+    completion = max(0, item.completion_tokens)
+    item.requests = requests
+    item.success = success
+    item.rate_limited = rate_limited
+    item.errors = requests - success - rate_limited
+    item.prompt_tokens = prompt
+    item.completion_tokens = completion
+    item.cached_tokens = min(max(0, item.cached_tokens), prompt)
+    item.reasoning_tokens = min(max(0, item.reasoning_tokens), completion)
+    item.total_tokens = prompt + completion
+
+
+def _allocate(
+    total: int,
+    caps: list[int],
+    weights: list[float],
+    *,
+    phase: float = 0.0,
+) -> list[int]:
+    """Split ``total`` across at most ``caps[i]`` per bucket, exactly.
+
+    The result sums to ``min(total, sum(caps))`` and never exceeds a cap.  A
+    water-filling pass removes saturated buckets, then the final fractional
+    remainders are resolved deterministically by largest remainder.
+    """
+    count = len(caps)
+    if count == 0:
+        return []
+    target = max(0, min(int(total), sum(caps)))
+    values = [0] * count
+    if target == 0:
+        return values
+    adjusted = [
+        max(0.0, weight * (0.84 + 0.16 * math.sin(phase + index * 0.9)))
+        for index, weight in enumerate(weights)
+    ]
+    active = [index for index in range(count) if caps[index] > 0 and adjusted[index] > 0]
+    if not active:
+        adjusted = [1.0] * count
+        active = [index for index in range(count) if caps[index] > 0]
+    remaining = target
+    while remaining > 0 and active:
+        weight_sum = sum(adjusted[index] for index in active)
+        if weight_sum <= 0:
+            adjusted = [1.0] * count
+            weight_sum = float(len(active))
+        shares = {
+            index: remaining * adjusted[index] / weight_sum for index in active
+        }
+        overflow = [
+            index
+            for index in active
+            if values[index] + shares[index] > caps[index] + 1e-9
+        ]
+        if overflow:
+            overflow_set = set(overflow)
+            for index in overflow:
+                remaining -= caps[index] - values[index]
+                values[index] = caps[index]
+            active = [index for index in active if index not in overflow_set]
+            continue
+        floors = {index: int(shares[index]) for index in active}
+        assigned = sum(floors.values())
+        for index in active:
+            values[index] += floors[index]
+        leftover = remaining - assigned
+        order = sorted(
+            active,
+            key=lambda index: shares[index] - floors[index],
+            reverse=True,
+        )
+        for position in range(max(0, leftover)):
+            values[order[position % len(order)]] += 1
+        remaining = 0
+    return values
+
+
+def _distribute(
+    total: int,
+    weights: list[float],
+    *,
+    phase: float = 0.0,
+    cap: list[int] | None = None,
+) -> list[int]:
+    """Split ``total`` across days proportionally with deterministic jitter."""
+    count = len(weights)
+    if total <= 0 or count == 0:
+        return [0] * count
+    adjusted = [
+        weight * (0.84 + 0.16 * math.sin(phase + index * 0.9))
+        for index, weight in enumerate(weights)
+    ]
+    scale = sum(adjusted) or 1.0
+    raw = [total * weight / scale for weight in adjusted]
+    values = [int(value) for value in raw]
+    remainder = total - sum(values)
+    order = sorted(
+        range(count), key=lambda index: raw[index] - values[index], reverse=True
+    )
+    for index in range(remainder):
+        values[order[index % count]] += 1
+    if cap is not None:
+        values = [min(value, cap[index]) for index, value in enumerate(values)]
+    return values
+
+
+def _client_from_attempts(item: ModelStatsItem) -> ClientStats:
+    """Derive a plausible client terminal summary from attempt counters.
+
+    ``attempts = success + failures``; a rescued client consumed one failure
+    attempt plus its successful attempt, so client requests are fewer than
+    attempts whenever any request was rescued.
+    """
+    attempts = item.requests
+    success = min(item.success, attempts)
+    failures = max(0, item.rate_limited + item.errors)
+    rescued = min(success, failures // 2)
+    if failures and success and rescued == 0:
+        rescued = 1
+    client_failures = max(0, failures - rescued)
+    rate_limited = min(item.rate_limited, client_failures)
+    errors = min(item.errors, client_failures - rate_limited)
+    aborted = max(0, client_failures - rate_limited - errors)
+    return ClientStats(
+        requests=success + client_failures,
+        success=success,
+        errors=errors,
+        aborted=aborted,
+        rate_limited=rate_limited,
+        rescued_requests=rescued,
+    )
+
+
+def _sandbox_count_tokens(total_requests: int, scenario: str) -> CountTokensStats:
+    requests = max(24, total_requests // 9)
+    if scenario == "all_429":
+        success = max(0, requests // 4)
+        return CountTokensStats(
+            requests=requests,
+            success=success,
+            errors=requests - success,
+            input_tokens=success * 900,
+        )
+    errors = max(1, requests // 40)
+    success = max(0, requests - errors)
+    return CountTokensStats(
+        requests=requests,
+        success=success,
+        errors=errors,
+        input_tokens=success * 820,
+    )
+
+
+def _all_states_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=128,
+            success=121,
+            rate_limited=5,
+            errors=2,
+            prompt_tokens=1_845_000,
+            completion_tokens=926_000,
+            reasoning_tokens=412_000,
+            cached_tokens=328_000,
+            total_tokens=3_183_000,
+            finish_reasons={"STOP": 118, "MAX_TOKENS": 3},
+            last_used=_last_used_label(2),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=862,
+            success=854,
+            rate_limited=6,
+            errors=2,
+            prompt_tokens=4_120_000,
+            completion_tokens=1_980_000,
+            reasoning_tokens=610_000,
+            cached_tokens=1_240_000,
+            total_tokens=7_950_000,
+            finish_reasons={"STOP": 840, "MAX_TOKENS": 14},
+            last_used=_last_used_label(1),
+        ),
+        "gemini-3.7-flash": ModelStatsItem(
+            requests=1_240,
+            success=1_232,
+            rate_limited=7,
+            errors=1,
+            prompt_tokens=6_840_000,
+            completion_tokens=2_460_000,
+            reasoning_tokens=820_000,
+            cached_tokens=2_180_000,
+            total_tokens=12_300_000,
+            finish_reasons={"STOP": 1215, "MAX_TOKENS": 17},
+            last_used=_last_used_label(0),
+        ),
+        "gemma-4-31b-it": ModelStatsItem(
+            requests=96,
+            success=94,
+            rate_limited=2,
+            errors=0,
+            prompt_tokens=620_000,
+            completion_tokens=310_000,
+            reasoning_tokens=180_000,
+            cached_tokens=120_000,
+            total_tokens=1_230_000,
+            finish_reasons={"STOP": 94},
+            last_used=_last_used_label(8),
+        ),
+    }
+
+
+def _mass_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=3_420,
+            success=3_268,
+            rate_limited=112,
+            errors=40,
+            prompt_tokens=48_500_000,
+            completion_tokens=22_400_000,
+            reasoning_tokens=9_800_000,
+            cached_tokens=7_600_000,
+            total_tokens=88_300_000,
+            finish_reasons={"STOP": 3190, "MAX_TOKENS": 78},
+            last_used=_last_used_label(1),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=11_860,
+            success=11_720,
+            rate_limited=98,
+            errors=42,
+            prompt_tokens=72_300_000,
+            completion_tokens=31_900_000,
+            reasoning_tokens=11_200_000,
+            cached_tokens=18_400_000,
+            total_tokens=133_800_000,
+            finish_reasons={"STOP": 11640, "MAX_TOKENS": 80},
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.6-flash": ModelStatsItem(
+            requests=5_130,
+            success=5_076,
+            rate_limited=38,
+            errors=16,
+            prompt_tokens=31_700_000,
+            completion_tokens=12_800_000,
+            reasoning_tokens=4_900_000,
+            cached_tokens=6_200_000,
+            total_tokens=55_600_000,
+            finish_reasons={"STOP": 5060, "MAX_TOKENS": 16},
+            last_used=_last_used_label(3),
+        ),
+    }
+
+
+def _all_429_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-4-argon": ModelStatsItem(
+            requests=186,
+            success=0,
+            rate_limited=186,
+            errors=0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            reasoning_tokens=0,
+            cached_tokens=0,
+            total_tokens=0,
+            finish_reasons={},
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=542,
+            success=0,
+            rate_limited=542,
+            errors=0,
+            total_tokens=0,
+            last_used=_last_used_label(0),
+        ),
+        "gemini-3.7-flash": ModelStatsItem(
+            requests=318,
+            success=0,
+            rate_limited=318,
+            errors=0,
+            total_tokens=0,
+            last_used=_last_used_label(1),
+        ),
+    }
+
+
+def _narrow_model_stats() -> dict[str, ModelStatsItem]:
+    return {
+        "gemini-3.8-flash": ModelStatsItem(
+            requests=24,
+            success=24,
+            prompt_tokens=8_400,
+            completion_tokens=3_900,
+            reasoning_tokens=1_200,
+            cached_tokens=2_100,
+            total_tokens=15_600,
+            finish_reasons={"STOP": 24},
+            last_used=_last_used_label(0),
+        )
+    }
+
+
+def create_ui_sandbox() -> UISandbox:
+    return UISandbox()
+
+
+__all__ = [
+    "ACTIONS",
+    "DASHBOARD_ACTIONS",
+    "DASHBOARD_SCENARIOS",
+    "SCENARIOS",
+    "SandboxAccountRefresher",
+    "SandboxInstanceManager",
+    "SandboxKeepalive",
+    "SandboxRotator",
+    "UISandbox",
+    "UiDebugIsolation",
+    "create_ui_sandbox",
+    "sandbox_model_by_id",
+    "sandbox_model_catalog",
+]

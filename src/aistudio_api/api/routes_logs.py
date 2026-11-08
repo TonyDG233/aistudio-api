@@ -6,8 +6,8 @@ import asyncio
 import json
 import tempfile
 import zipfile
-from collections.abc import AsyncGenerator, Awaitable, Callable
-from datetime import date, datetime, timedelta
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -23,6 +23,7 @@ from aistudio_api.infrastructure.utils.log_broadcast import (
     get_broadcaster,
     level_number,
     resolve_log_dir,
+    sanitize_log_message,
 )
 
 protected_router = APIRouter()
@@ -163,14 +164,28 @@ def _parse_iso_datetime(value: str, field: str) -> datetime:
         raise HTTPException(400, detail=f"{field} 必须为 ISO8601 时间") from exc
 
 
+def _is_aware(value: datetime) -> bool:
+    return value.tzinfo is not None and value.utcoffset() is not None
+
+
+def _local_timezone() -> tzinfo:
+    return datetime.now().astimezone().tzinfo or UTC
+
+
 def resolve_export_range(
     *,
     start: str | None,
     end: str | None,
     days: int | None,
     today: date | None = None,
+    local_tz: tzinfo | None = None,
 ) -> list[date]:
-    """Resolve an export request into a chronological list of archive days."""
+    """Resolve an export request into a chronological list of archive days.
+
+    Archive files are bucketed by the server's local calendar day, so aware
+    timestamps are converted into the local timezone before their date is
+    taken. Naive timestamps are already local calendar values from the UI.
+    """
     current = today or date.today()
     earliest = current - timedelta(days=MAX_EXPORT_DAYS - 1)
 
@@ -187,11 +202,17 @@ def resolve_export_range(
 
     start_dt = _parse_iso_datetime(start, "start")
     end_dt = _parse_iso_datetime(end, "end")
-    if start_dt > end_dt:
+    if _is_aware(start_dt) != _is_aware(end_dt):
+        raise HTTPException(400, detail="start 与 end 的时区信息必须一致")
+
+    timezone = local_tz or _local_timezone()
+    start_local = start_dt.astimezone(timezone) if _is_aware(start_dt) else start_dt
+    end_local = end_dt.astimezone(timezone) if _is_aware(end_dt) else end_dt
+    if start_local > end_local:
         raise HTTPException(400, detail="start 不能晚于 end")
 
-    first = start_dt.date()
-    last = end_dt.date()
+    first = start_local.date()
+    last = end_local.date()
     if (last - first).days + 1 > MAX_EXPORT_DAYS:
         raise HTTPException(400, detail="单次导出最多 7 天")
     if first < earliest or last > current:
@@ -200,12 +221,18 @@ def resolve_export_range(
     return [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
 
 
+def _iter_sanitized_lines(path: Path) -> Iterator[str]:
+    """Yield archive lines with credentials masked before they leave the server."""
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for line in handle:
+            yield sanitize_log_message(line)
+
+
 async def _iter_file(path: Path) -> AsyncGenerator[bytes, None]:
     if not path.is_file():
         return
-    with path.open("rb") as handle:
-        while chunk := handle.read(64 * 1024):
-            yield chunk
+    for line in _iter_sanitized_lines(path):
+        yield line.encode("utf-8")
 
 
 async def _iter_zip(paths: list[Path]) -> AsyncGenerator[bytes, None]:
@@ -214,12 +241,9 @@ async def _iter_zip(paths: list[Path]) -> AsyncGenerator[bytes, None]:
             for path in paths:
                 if not path.is_file():
                     continue
-                with (
-                    archive.open(path.name, "w") as destination,
-                    path.open("rb") as source,
-                ):
-                    while chunk := source.read(64 * 1024):
-                        destination.write(chunk)
+                with archive.open(path.name, "w") as destination:
+                    for line in _iter_sanitized_lines(path):
+                        destination.write(line.encode("utf-8"))
         buffer.seek(0)
         while chunk := buffer.read(64 * 1024):
             yield chunk
@@ -242,6 +266,8 @@ async def export_logs(
     paths = [log_dir / archive_file_name(day) for day in selected_days]
 
     if len(selected_days) == 1:
+        if not paths[0].is_file():
+            raise HTTPException(404, detail="指定日期没有日志归档")
         filename = f"aistudio-logs-{timestamp}.log"
         return StreamingResponse(
             _iter_file(paths[0]),

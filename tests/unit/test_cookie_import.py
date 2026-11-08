@@ -1,10 +1,7 @@
-import json
-
 import pytest
 
 from aistudio_api.infrastructure.account.cookie_parser import (
     build_google_cookie_list,
-    cookies_for_google_rpc,
     parse_cookie_string,
 )
 from aistudio_api.infrastructure.account.cookie_refresher import (
@@ -76,91 +73,6 @@ def test_load_cookies_from_string_keeps_accounts_cookies_from_raw_string(monkeyp
     assert by_name["LSID"]["domain"] == ".google.com"
     assert by_name["ACCOUNT_CHOOSER"]["domain"] == ".google.com"
     assert "__Host-1PLSID" not in by_name
-
-
-def test_parse_cookie_string_preserves_cross_domain_google_cookies():
-    raw = json.dumps(
-        {
-            "cookies": [
-                {"name": "SID", "value": "sid_regional", "domain": ".google.com.sg"},
-                {"name": "SID", "value": "sid_canonical", "domain": ".google.com"},
-                {
-                    "name": "OSID",
-                    "value": "osid_studio",
-                    "domain": "aistudio.google.com",
-                },
-                {"name": "OSID", "value": "osid_regional", "domain": ".google.com"},
-                {
-                    "name": "LSID",
-                    "value": "lsid_accounts",
-                    "domain": "accounts.google.com",
-                },
-                {"name": "LSID", "value": "lsid_regional", "domain": ".google.com.mx"},
-            ]
-        }
-    )
-    state = parse_cookie_string(raw, discard_transient=False)
-    cookies = state.get("cookies")
-    assert isinstance(cookies, list)
-    entries = [cookie for cookie in cookies if isinstance(cookie, dict)]
-
-    assert {cookie["domain"] for cookie in entries} == {
-        ".google.com",
-        "aistudio.google.com",
-        "accounts.google.com",
-    }
-    osid = [cookie for cookie in entries if cookie["name"] == "OSID"]
-    assert {cookie["value"] for cookie in osid} == {"osid_studio", "osid_regional"}
-    assert {cookie["domain"] for cookie in osid} == {
-        "aistudio.google.com",
-        ".google.com",
-    }
-    lsid = [cookie for cookie in entries if cookie["name"] == "LSID"]
-    assert {cookie["domain"] for cookie in lsid} == {"accounts.google.com"}
-
-    rpc = cookies_for_google_rpc(state)
-    assert rpc["SID"] == "sid_canonical"
-    assert rpc["OSID"] == "osid_regional"
-    # accounts.google.com does not apply to clients6.google.com.
-    assert "LSID" not in rpc
-    assert "sid_regional" not in rpc.values()
-    assert "lsid_regional" not in rpc.values()
-
-
-def test_cookie_injection_preserves_storage_state_domains():
-    raw = json.dumps(
-        {
-            "cookies": [
-                {"name": "SID", "value": "sid", "domain": ".google.com", "path": "/"},
-                {
-                    "name": "OSID",
-                    "value": "osid_studio",
-                    "domain": "aistudio.google.com",
-                    "path": "/",
-                },
-                {
-                    "name": "OSID",
-                    "value": "osid_root",
-                    "domain": ".google.com",
-                    "path": "/",
-                },
-                {
-                    "name": "LSID",
-                    "value": "lsid",
-                    "domain": "accounts.google.com",
-                    "path": "/",
-                },
-            ]
-        }
-    )
-    cookies = load_cookies_from_string(raw)
-    assert {cookie["domain"] for cookie in cookies} == {
-        ".google.com",
-        "aistudio.google.com",
-        "accounts.google.com",
-    }
-    osid = [cookie for cookie in cookies if cookie["name"] == "OSID"]
-    assert {cookie["value"] for cookie in osid} == {"osid_studio", "osid_root"}
 
 
 def test_parse_raw_cookies_json_array_and_netscape():
@@ -247,12 +159,142 @@ def test_domain_overrides_scopes_osid_strictly_to_aistudio():
     assert ".google.com" not in _DOMAIN_OVERRIDES["__Secure-OSID"]
 
 
+def test_parse_storage_state_preserves_cross_domain_google_cookies():
+    raw = (
+        '[{"name":"LSID","value":"account","domain":"accounts.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"LSID","value":"root","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"OSID","value":"studio","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800}]'
+    )
+    state = parse_cookie_string(raw, discard_transient=False)
+    raw_state_cookies = state.get("cookies")
+    assert isinstance(raw_state_cookies, list)
+    values = {
+        (cookie["name"], cookie["domain"]): cookie["value"]
+        for cookie in raw_state_cookies
+        if isinstance(cookie, dict)
+    }
+    assert values[("LSID", "accounts.google.com")] == "account"
+    assert values[("LSID", ".google.com")] == "root"
+    assert values[("OSID", "aistudio.google.com")] == "studio"
+
+
+def test_parse_storage_state_external_import_discards_transient_cookies():
+    raw = (
+        '{"cookies":['
+        '{"name":"LSID","value":"account","domain":"accounts.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"LSID","value":"root","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"OSID","value":"studio","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"__Secure-OSID","value":"secure","domain":"aistudio.google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"SIDCC","value":"sidcc","domain":".google.com",'
+        '"path":"/","expires":4102444800},'
+        '{"name":"_ga","value":"ga","domain":".google.com",'
+        '"path":"/","expires":4102444800}],'
+        '"origins":[{"origin":"https://aistudio.google.com","items":[]}]}'
+    )
+    state = parse_cookie_string(raw, discard_transient=True)
+    raw_state_cookies = state.get("cookies")
+    assert isinstance(raw_state_cookies, list)
+    keys = {
+        (cookie["name"], cookie["domain"])
+        for cookie in raw_state_cookies
+        if isinstance(cookie, dict)
+    }
+    assert keys == {
+        ("LSID", "accounts.google.com"),
+        ("LSID", ".google.com"),
+    }
+    assert state["origins"] == [{"origin": "https://aistudio.google.com", "items": []}]
+
+
+def test_parse_raw_cookies_prefers_canonical_domain_over_regional():
+    from aistudio_api.infrastructure.account.cookie_parser import parse_raw_cookies
+
+    raw = [
+        {"name": "SID", "value": "regional", "domain": ".google.com.sg"},
+        {"name": "SID", "value": "canonical", "domain": ".google.com"},
+    ]
+    assert parse_raw_cookies(raw)["SID"] == "canonical"
+
+
+def test_load_cookies_from_string_preserves_storage_state_without_refresh(
+    monkeypatch,
+):
+    def _fail(_: dict[str, str]) -> dict[str, str]:
+        raise AssertionError("storage-state 导入不得走 curl_cffi 刷新")
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_refresher._refresh_session_cookies",
+        _fail,
+    )
+    raw = (
+        '[{"name":"LSID","value":"account","domain":"accounts.google.com"},'
+        '{"name":"LSID","value":"root","domain":".google.com"}]'
+    )
+    cookies = load_cookies_from_string(raw)
+    by_key = {(cookie["name"], cookie["domain"]): cookie["value"] for cookie in cookies}
+    assert by_key[("LSID", "accounts.google.com")] == "account"
+    assert by_key[("LSID", ".google.com")] == "root"
+
+
 @pytest.mark.asyncio
-async def test_import_bundle_flow(tmp_path):
+async def test_import_cookies_uses_monkeypatched_probes(tmp_path, monkeypatch):
+    """单份导入的 email/tier 探测必须可 monkeypatch，测试不访问真实网络。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.api import routes_accounts
+    from aistudio_api.api.routes_accounts import (
+        ImportCookiesRequest,
+        import_cookies,
+    )
+    from aistudio_api.api.state import RuntimeState
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    email_probe = AsyncMock(return_value="probed@example.com")
+    tier_probe = AsyncMock(return_value="Pro")
+    monkeypatch.setattr(routes_accounts, "probe_account_email", email_probe)
+    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", tier_probe)
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_import_probe")
+    svc = AccountService(store)
+    state = RuntimeState(account_service=svc, client=None, rotator=MagicMock())
+
+    response = await import_cookies(
+        ImportCookiesRequest(cookies="SID=sid; SAPISID=sapisid"),
+        account_service=svc,
+        runtime_state=state,
+    )
+    assert response.name
+    assert email_probe.await_count == 1
+    assert tier_probe.await_count == 1
+    assert store.get_account(response.account_id).tier == "Pro"  # type: ignore[union-attr]
+    assert store.get_account(response.account_id).email == "probed@example.com"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_flow(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.api import routes_accounts
     from aistudio_api.api.routes_accounts import ImportBundleRequest, import_bundle
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
 
+    monkeypatch.setattr(
+        routes_accounts, "probe_account_benefit_tier", AsyncMock(return_value="Free")
+    )
+    monkeypatch.setattr(
+        routes_accounts,
+        "probe_account_email",
+        AsyncMock(return_value="mock@example.com"),
+    )
     store = AccountStore(accounts_dir=tmp_path / "accounts")
     svc = AccountService(store)
 
@@ -288,41 +330,6 @@ async def test_import_bundle_flow(tmp_path):
     persisted = svc.list_accounts()
     assert len(persisted) == 2
     assert svc.get_active_account() is not None
-
-
-@pytest.mark.asyncio
-async def test_import_bundle_accepts_single_old_project_auth_json(tmp_path):
-    from aistudio_api.api.routes_accounts import ImportBundleRequest, import_bundle
-    from aistudio_api.application.account_service import AccountService
-    from aistudio_api.infrastructure.account.account_store import AccountStore
-
-    store = AccountStore(accounts_dir=tmp_path / "accounts")
-    svc = AccountService(store)
-    raw = json.dumps(
-        {
-            "accountName": "Old Profile",
-            "cookies": [
-                {"name": "SID", "value": "sid_regional", "domain": ".google.com.sg"},
-                {"name": "SID", "value": "sid_canonical", "domain": ".google.com"},
-                {"name": "SAPISID", "value": "sapisid_ok", "domain": ".google.com"},
-            ],
-            "origins": [],
-        }
-    )
-
-    res = await import_bundle(ImportBundleRequest(content=raw), account_service=svc)
-
-    assert res.imported_count == 1
-    assert res.accounts[0].name == "Old Profile"
-    auth_path = svc.get_account_auth_path(res.accounts[0].id)
-    assert auth_path is not None
-    stored = json.loads(auth_path.read_text(encoding="utf-8"))
-    by_name = {
-        cookie["name"]: cookie["value"]
-        for cookie in stored["cookies"]
-        if isinstance(cookie, dict)
-    }
-    assert by_name["SID"] == "sid_canonical"
 
 
 def test_mask_email():
@@ -361,9 +368,9 @@ def test_update_account_email(tmp_path):
 
 def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     """测试 GetAiStudioBenefitTier 响应解析、请求头映射及账号等级持久化。"""
+    from aistudio_api.domain.model_access import normalize_tier, tier_header_value
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.account.cookie_parser import (
-        get_tier_header_value,
         parse_benefit_tier_response,
     )
 
@@ -371,13 +378,42 @@ def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     assert parse_benefit_tier_response("[null]") == "Free"
     assert parse_benefit_tier_response("[0]") == "Free"
     assert parse_benefit_tier_response(")]}'\n[1]") == "Pro"
+    assert parse_benefit_tier_response("[,1]") == "Free"
     assert parse_benefit_tier_response([2]) == "Ultra"
     assert parse_benefit_tier_response([3]) == "Plus"
+    # Malformed / empty / non-list / unsupported element shapes all degrade to Free.
+    assert parse_benefit_tier_response("") == "Free"
+    assert parse_benefit_tier_response("not-json") == "Free"
+    assert parse_benefit_tier_response("null") == "Free"
+    assert parse_benefit_tier_response(True) == "Free"
+    assert parse_benefit_tier_response([True]) == "Free"
+    assert parse_benefit_tier_response(["1"]) == "Free"
+    assert parse_benefit_tier_response([9]) == "Free"
 
-    assert get_tier_header_value("Free") is None
-    assert get_tier_header_value("Pro") == "TIER1"
-    assert get_tier_header_value("Ultra") == "TIER2"
-    assert get_tier_header_value("Plus") == "TIER0"
+    from aistudio_api.infrastructure.account.benefit_tier import (
+        parse_benefit_tier_envelope,
+    )
+
+    envelope = parse_benefit_tier_envelope(')]}\'\n[9,"unexpected tier"]')
+    assert envelope.code == 9
+    assert envelope.tier is None
+    assert envelope.message == "unexpected tier"
+    assert envelope.display_tier() == "Free"
+    assert envelope.display_tier(include_unknown_code=True) == "unknown-9"
+    known = parse_benefit_tier_envelope("[2]")
+    assert known.code == 2
+    assert known.tier == "Ultra"
+    assert known.display_tier(include_unknown_code=True) == "Ultra"
+
+    assert tier_header_value("Free") is None
+    assert tier_header_value("Pro") == "TIER1"
+    assert tier_header_value("Ultra") == "TIER2"
+    assert tier_header_value("Ultra_20X") == "TIER2"
+    assert tier_header_value("ultra_20x") == "TIER2"
+    assert normalize_tier("ultra_20x") == "Ultra_20X"
+    assert tier_header_value("Plus") == "TIER0"
+    assert tier_header_value("Ultra_20X") == "TIER2"
+    assert tier_header_value("ultra_20x") == "TIER2"
 
     store = AccountStore(accounts_dir=tmp_path / "accounts_tier_test")
     acc = store.save_account(
@@ -385,13 +421,16 @@ def test_parse_benefit_tier_and_update_account_tier(tmp_path):
         email="tier@gmail.com",
         storage_state={"cookies": []},
     )
-    # 未探测档位保持为 None（未识别），不硬编码为 Free
-    assert acc.tier is None
+    assert acc.tier == "Free"
     assert store.update_account_tier(acc.id, "Pro") is True
     reloaded = store.get_account(acc.id)
     assert reloaded is not None
     assert reloaded.tier == "Pro"
     assert store.update_account_tier(acc.id, "Pro") is False
+    assert store.update_account_tier(acc.id, "Ultra_20X") is True
+    reloaded_u20 = store.get_account(acc.id)
+    assert reloaded_u20 is not None
+    assert reloaded_u20.tier == "Ultra_20X"
 
 
 def test_parse_emails_from_ogs_html_and_meta_reconciliation(tmp_path):
@@ -529,7 +568,6 @@ async def test_probe_import_activates_first_account_and_registers_in_rotator(
     account_service = MagicMock()
     account_service.get_active_account.return_value = None
     account_service.batch_import_accounts.return_value = [imported]
-    account_service.get_account.return_value = imported
     account_service.activate_account = AsyncMock(return_value=imported)
 
     browser_session = MagicMock()

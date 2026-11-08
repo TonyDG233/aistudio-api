@@ -11,9 +11,26 @@ from google import genai
 from google.genai import errors, types
 
 from aistudio_api.api.app import app
-from aistudio_api.api.dependencies import get_client
+from aistudio_api.api.dependencies import get_routing_pipeline
+from aistudio_api.config import settings
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput
+from tests.unit.routing_fakes import ScriptedPipeline, make_attempt, make_context
+
+
+def _install_pipeline(mock_client: MagicMock, count: int = 1) -> ScriptedPipeline:
+    pipeline = ScriptedPipeline(
+        [make_attempt(mock_client) for _ in range(count)],
+        context=make_context(),
+    )
+    app.dependency_overrides[get_routing_pipeline] = lambda: pipeline
+    return pipeline
+
+
+@pytest.fixture(autouse=True)
+def configured_test_api_key(monkeypatch):
+    """SDK 以 api_key='test-key' 发起请求；测试环境下配置同名 Key。"""
+    monkeypatch.setattr(settings, "api_keys", frozenset({"test-key"}))
 
 
 @pytest.fixture
@@ -35,7 +52,7 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
         )
     )
 
-    app.dependency_overrides[get_client] = lambda: mock_client
+    _install_pipeline(mock_client, count=2)
 
     try:
         sdk_client = genai.Client(
@@ -90,7 +107,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
         )
 
     mock_client.stream_generate_content = fake_stream
-    app.dependency_overrides[get_client] = lambda: mock_client
+    _install_pipeline(mock_client, count=2)
 
     try:
         sdk_client = genai.Client(
@@ -181,7 +198,7 @@ async def test_genai_sdk_function_calling_and_response_flow(
         )
 
     mock_client.generate_content = AsyncMock(side_effect=fake_generate)
-    app.dependency_overrides[get_client] = lambda: mock_client
+    _install_pipeline(mock_client, count=2)
 
     try:
         sdk_client = genai.Client(
@@ -252,7 +269,7 @@ async def test_genai_sdk_standard_api_error_parsing(mock_client: MagicMock) -> N
     mock_client.generate_content = AsyncMock(
         side_effect=UsageLimitExceeded("Daily quota exhausted for model")
     )
-    app.dependency_overrides[get_client] = lambda: mock_client
+    _install_pipeline(mock_client, count=2)
 
     try:
         sdk_client = genai.Client(
@@ -286,7 +303,7 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
             usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
         )
     )
-    app.dependency_overrides[get_client] = lambda: mock_client
+    _install_pipeline(mock_client, count=2)
 
     try:
         sdk_client = genai.Client(

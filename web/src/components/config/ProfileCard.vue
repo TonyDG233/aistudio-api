@@ -140,7 +140,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
                 :model-value="profile.name"
                 label="规则分组名称"
                 description="唯一标识"
-                placeholder="例如: image_models"
+                placeholder="例如：生图模型"
                 @update:model-value="updateField('name', String($event || ''))"
               />
             </div>
@@ -207,8 +207,9 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
           <FieldHelpTip schema-key="profile.default_tools" />
         </div>
         <ConfigTagList
+          :model-value="profile.default_tools || []"
           label="已启用的默认工具"
-          description="客户端未显式传 tools 时，默认自动挂载的工具"
+          description="客户端未显式传入工具参数时，默认自动挂载的工具"
           :suggestions="TOOL_SUGGESTIONS"
           @update:model-value="updateField('default_tools', $event as string[])"
         />
@@ -260,7 +261,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
                 :model-value="profile.generation_config_defaults?.media_resolution"
                 label="多模态输入分辨率"
                 :options="MEDIA_RESOLUTION_OPTIONS"
-                @update:model-value="updateGenerationConfig('media_resolution', $event as string | null)"
+                @update:model-value="updateGenerationConfig('media_resolution', $event as any)"
               />
             </div>
             <FieldHelpTip
@@ -307,7 +308,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
             <ConfigTagList
               :model-value="profile.clear_generation_config_indexes || []"
               label="清空特定字段下标"
-              description="发送前清除的 wire 数组索引 (如 7, 13, 17)"
+              description="发送前清除的报文字段下标（例如 7、13、17）"
               :is-number="true"
               placeholder="输入数字下标按回车"
               @update:model-value="updateField('clear_generation_config_indexes', $event as number[])"

@@ -102,7 +102,7 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
       <div>
         <h4 class="text-xs font-bold text-gray-900 flex items-center gap-2">
           <Layers class="w-4 h-4 text-brand-600" />
-          <span>单模型覆盖规则 (Model Overrides)</span>
+          <span>单模型覆盖规则</span>
         </h4>
       </div>
 
@@ -187,7 +187,7 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
             <div class="flex-1">
               <ConfigSwitch
                 :model-value="Boolean(override.is_image_model)"
-                label="作为生图模型 (is_image_model)"
+                label="作为生图模型"
                 description="将该模型设为生图模式，启用多模态图片编码与专用处理管线"
                 @update:model-value="updateModelField(String(modelKey), 'is_image_model', $event)"
               />
@@ -293,7 +293,7 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
                 <ConfigTagList
                   :model-value="override.clear_generation_config_indexes || []"
                   label="清空特定字段下标"
-                  description="针对该模型发送前清除的 wire 数组索引 (如 7, 13, 17)"
+                  description="针对该模型发送前清除的报文字段下标（例如 7、13、17）"
                   :is-number="true"
                   placeholder="输入数字下标按回车"
                   @update:model-value="updateModelField(String(modelKey), 'clear_generation_config_indexes', $event as number[])"
@@ -317,8 +317,8 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
             </div>
             <ConfigTagList
               :model-value="override.default_tools || []"
-              label="覆盖通用 profile 的工具列表"
-              description="客户端未显式传 tools 时挂载的专用工具"
+              label="覆盖通用分组规则的工具列表"
+              description="客户端未显式传入工具参数时挂载的专用工具"
               :suggestions="TOOL_SUGGESTIONS"
               @update:model-value="updateModelField(String(modelKey), 'default_tools', $event as string[])"
             />
@@ -339,7 +339,7 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
       v-else
       class="p-8 text-center text-gray-400 text-xs border border-dashed border-gray-200 rounded-2xl bg-gray-50/50"
     >
-      暂无单模型覆盖配置，全部模型遵循上方 Profiles 分组规则。
+      暂无单模型覆盖配置，全部模型遵循上方分组规则。
     </div>
   </div>
 </template>

@@ -1,0 +1,108 @@
+{
+  "generated_at": "2026-10-31T23:50:00+08:00",
+  "base": "http://127.0.0.1:8080",
+  "proxy": "127.0.0.1:10809",
+  "server_starts": 1,
+  "generation_requests": 5,
+  "generation_successes": 5,
+  "stage1": {
+    "health": 200,
+    "empty_key": 401,
+    "openai_models": 200,
+    "gemini_models": 200,
+    "model_count": 31,
+    "model_source": "live_page",
+    "instances": 2,
+    "instance_fields": ["only_tier", "min_tier", "max_tier"],
+    "instance_tiers": ["Free", "Pro"],
+    "in_flight": [0, 0],
+    "keepalive": 200,
+    "control_warmup_skipped": true
+  },
+  "tier_403": {
+    "model": "veo-3.1-generate-preview",
+    "openai_status": 403,
+    "openai_fields": ["tier", "model", "required_tier", "current_tier"],
+    "gemini_status": 403,
+    "gemini_fields": ["tier", "model", "required_tier", "current_tier"],
+    "required_tier": "Ultra",
+    "current_tier": "Pro"
+  },
+  "count_tokens": {
+    "status": 200,
+    "content_type": "application/json",
+    "total_tokens": 10
+  },
+  "generation": {
+    "free_openai_nonstream": {
+      "model": "gemini-3.8-flash",
+      "status": 200,
+      "content": "OK",
+      "response_id_present": true
+    },
+    "paid_openai_stream": {
+      "model": "gemini-3.6-flash",
+      "status": 200,
+      "events": 3,
+      "content": "OK",
+      "done": true
+    },
+    "native_gemini_stream": {
+      "model": "gemini-3.8-flash",
+      "status": 200,
+      "events": 2,
+      "content": "OK",
+      "finishReason": "STOP",
+      "usage": true
+    },
+    "native_tools": {
+      "model": "gemini-3.8-flash",
+      "status": 200,
+      "functionCall": "get_weather",
+      "finishReason": "STOP",
+      "signature_cache_entries_before": 0,
+      "signature_cache_entries_after": 1,
+      "toolshape_log_present": true
+    },
+    "pg08_atg_prefer_stream": {
+      "model": "gemini-3.8-flash",
+      "status": 200,
+      "events": 3,
+      "content": "OK",
+      "done": true,
+      "no_atg_tool_name_leak": true,
+      "no_fake_tool_name_leak": true
+    }
+  },
+  "logs": {
+    "spa_html": 200,
+    "sse": 200,
+    "export": 200,
+    "export_bytes": 6260304,
+    "export_bytes_note": "live-run measurement before offline sanitizer fix; not a new export",
+    "toolshape_present": true,
+    "pg08_present": true,
+    "export_sanitized": true,
+    "historical_test_api_key_prefix_present": false,
+    "cookie_header_secret_values_present": false,
+    "exact_current_temp_key_present": false,
+    "sanitizer_verification": "offline: archive export lines pass through sanitize_log_message; data/logs rewritten and re-verified idempotent"
+  },
+  "shutdown": {
+    "port_8080": "closed",
+    "port_9222": "closed",
+    "chrome_processes": 0
+  },
+  "security": {
+    "temp_key_cleared": true,
+    "atg_restored": "off",
+    "root_config_tracked": false,
+    "secrets_printed": false
+  },
+  "verdict": {
+    "functional_live": "PASS",
+    "b4_export_redaction": "PASS (offline-verified)",
+    "overall": "PASS"
+  },
+  "reason": "Functional live run passed all checks (one server start, 5/5 generations, both streams, native tools + signature_cache, PG-08/ATG prefer stream, four-field 403 on both surfaces, countTokens JSON). B4 export sanitizer and historical log cleanup PASS, verified offline; no new live export and no new live run was performed."
+}
