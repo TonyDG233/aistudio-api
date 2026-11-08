@@ -58,6 +58,17 @@ def test_build_chromium_args_contains_stealth_and_mobile_optimizations():
 
 
 def test_find_chromium_executable_strictly_requires_cloakbrowser(tmp_path):
+    project_root = Path(__file__).resolve().parents[2]
+    local_cloak_dir = project_root / ".cloakbrowser"
+    real_is_dir = Path.is_dir
+
+    def fake_opt_is_dir(self):
+        # Hide the developer's real project-local CloakBrowser so branch 4 is
+        # exercised against the patched /opt/cloakbrowser fixture.
+        if self == local_cloak_dir:
+            return False
+        return real_is_dir(self)
+
     # 1. When CloakBrowser is installed, successfully returns executable
     fake_home = tmp_path / "home"
     fake_cloak_dir = fake_home / ".cloakbrowser" / "chromium"
@@ -122,6 +133,7 @@ def test_find_chromium_executable_strictly_requires_cloakbrowser(tmp_path):
             "aistudio_api.infrastructure.browser.browser_engine._OPT_CLOAKBROWSER_DIR",
             fake_opt_dir,
         ),
+        patch.object(Path, "is_dir", fake_opt_is_dir),
         patch("pathlib.Path.home", return_value=tmp_path / "empty_home"),
         patch("aistudio_api.config.settings.browser_executable_path", None),
         patch(

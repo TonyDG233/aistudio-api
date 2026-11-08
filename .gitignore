@@ -16,6 +16,7 @@ build/
 stream_response.txt
 dumps/
 .vscode/
+/.kilo/
 !docs/BOTGUARD_VERIFICATION_CHAIN.md
 .env
 uv.toml
