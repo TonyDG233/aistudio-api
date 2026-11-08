@@ -1,6 +1,6 @@
 services:
   aistudio-api:
-    image: ghcr.io/deconstructedcube/aistudio-api:latest
+    image: ghcr.io/tonydg233/aistudio-api:2.0.0
     container_name: aistudio-api
     restart: unless-stopped
     ports:

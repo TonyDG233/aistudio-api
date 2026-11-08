@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aistudio-api"
-version = "0.1.0"
+version = "2.0.0"
 description = "Gemini-compatible API wrapper for Google AI Studio"
 readme = "README.md"
 requires-python = ">=3.11"

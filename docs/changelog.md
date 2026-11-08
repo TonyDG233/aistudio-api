@@ -3,10 +3,10 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
-## [2.0-rebuild] - 2026-10-31
+## [2.0.0] - 2026-11-08
 
-重建版本：在保留上游协议能力与前端界面的前提下，将运行时重构为“多实例池 + 请求期路由”架构，
-并补齐账号、保活、日志、模型发现与安全链路。
+2.0.0 重建基准：在保留上游协议能力与前端界面的前提下，将运行时重构为“多实例池 + 请求期路由”架构，
+补齐账号、保活、日志、模型发现与安全链路，并完成四协议接入、确定性浏览器指纹、SSE 首包保活与双口径统计台账。
 
 ### Added
 
@@ -15,9 +15,24 @@
 - **请求期路由**：`routing_pipeline.py` 解析 `chat/`、`build/` 模型前缀，按 tier 准入与负载均衡选择实例；
   排序依据为在途请求数、账号最低满足 tier、总/模型请求数、最近使用与实例编号。
 - **统一生成主链**：`generation_service.py` 统一负责路由获取、同账号空响应重试、账号/实例切换与 usage/finish 提取；
-  OpenAI Chat Completions、`/v1/models` 与 Gemini 原生 `generateContent`、`streamGenerateContent`、`countTokens` 共用该链路。
+  Gemini、OpenAI Chat Completions、Claude Messages 与 OpenAI Responses 共用该链路。
+- **四协议默认接入（C3）**：Gemini 核心协议常驻；`/v1/chat/completions`、`/v1/messages`、`/v1/messages/count_tokens`、
+  `/v1/responses`、`/v1/responses/input_tokens` 全部接入，`features.formats.openai/claude/responses` 默认 `true`，
+  可显式置 `false` 关闭。Claude 契约与转换位于 `application/contracts/claude.py`、
+  `application/format_converters/claude_{request,response}.py`；Responses 对应 `contracts/responses.py`、
+  `format_converters/responses_{request,response}.py`；路由分别位于 `api/routes_claude.py`、`api/routes_responses.py`。
+- **确定性桌面指纹（C1）**：`infrastructure/browser/fingerprint.py` 按账号标识（或 auth 文件目录+文件名）SHA-256
+  派生固定的 Windows 桌面指纹（NVIDIA/Intel/AMD ANGLE/D3D11 GPU、屏幕分辨率/DPR、CPU/内存、UA/平台/语言），
+  导航前通过 `fingerprint_spoof.js` 注入；脚本注册 fail-closed，屏幕指标覆盖 best-effort。
+- **Tier 单源与同步（C1b）**：`domain/model_access.py` 统一 `normalize_tier` / `tier_header_value` /
+  `resolve_tier_selector` / lane 判定；`InstanceManager.sync_account_tier` 与 `InstancePool.sync_account_tier`
+  在手动探测到 tier 变化时原位同步同 lane 槽位，跨 lane 时退役旧绑定并在新 lane 重新绑定。
+- **SSE 首包与保活（C1c）**：`api/sse_keepalive.py` 提供 `KeepaliveIterator`，四个流式协议共享
+  首事件预读窗口（默认 15 秒）与 `: keepalive\n\n` 心跳；首窗内失败保留真实 HTTP 4xx/5xx，慢首包切换为 200 + 心跳。
+- **快照加固（C1d）**：快照生成只把提示词末尾 256 个 Unicode 码点写入输入框；页面内先用占位 hash 预热
+  `dms[snapKey]`，并要求快照以 `!` 开头且长度 `>= 1520`，低质量时强制预热重试，仍不合格则显式失败。
 - **工具调用与 ATG**：签名缓存、流式截断 JSON 修复与 Struct 形状归一；ATG（Anti-Truncation Gateway）支持
-  `off/prefer/required`，默认关闭。
+  `off/prefer/required`，默认关闭，`mode_by_format` 可按四协议覆盖。
 - **账号体系**：Cookie 导入与跨域刷新、多子账号递归探测、账号预设与分组、上游原生 tier 与 Paid 识别；
   账号文件使用临时文件加原子替换写入。
 - **模型发现**：通过池化会话直接调用上游 ListModels，运行时解析 `access_tier` 与 `accessModes`，
@@ -26,50 +41,69 @@
   单全局锁串行执行，忙碌时跳过且不推进下次执行时间。
 - **日志子系统**：stderr、内存环形缓冲（SSE 实时推送）与按日归档三路 sink；日志页支持级别过滤、搜索、
   暂停与 1/3/7 天导出。
+- **日志沙盒注入（C2c）**：`ui_debug` 启动时 `UiDebugIsolation` 在配置/日志/API Key 路由初始化前把
+  `AISTUDIO_CONFIG_PATH`、`AISTUDIO_LOG_DIR`、数据目录、统计与 dump 路径重定向到临时目录，关闭时恢复并清理。
+- **双口径统计台账（C4）**：Client 口径每个客户端生成请求只记 1 次终态（429 同号重试或切号成功后仍为 1 次成功、
+  1 次救援），Attempt 口径每次真实上游尝试各记 1 次；`GET /stats` 返回全站汇总、`by_model` 分项与
+  最近 90 个 Asia/Shanghai 自然日的 `daily`（含每日 `by_model`），支持 `?days=7|30|90`。
+- **趋势可视化**：用量统计页内嵌 DeepSeek 风格双栏 SVG 趋势（请求次数渐变面积曲线 + Tokens 分项柱状图），
+  支持近 7/30/90 天、全模型汇总或单模型筛选与悬停详情。
+- **UI 调试沙盒（C2a）**：`diagnostics.ui_debug` / `AISTUDIO_UI_DEBUG` 启用纯离线内存沙盒，
+  不启动真实浏览器、账号、实例池、keepalive 或网络；提供确定性账号/实例/模型/统计种子与模拟操作。
 - **配置与鉴权**：`AISTUDIO_CONFIG_PATH` 指定配置路径，文件缺失时从 `defaults/config.yaml` 播种；
-  支持深合并、热重载与原子写回；对外 API 默认要求 API Key。
+  支持深合并、热重载与原子写回；对外 API 默认要求 API Key，且 `/v1/messages*`、`/v1/responses*`、`/v1/models*`
+  同时接受 `x-api-key`、`Authorization: Bearer` 与 `x-goog-api-key`。
 - **旧版配置自愈**：启动校验时自动移除废弃的 `groups`、`channel_registry`、`channels` 键，
   将 legacy `min_tier: Free` 归一为 `only_tier: Free`，并用默认模板深合并补齐新配置块；
   仅在内容实际变化时原子写回，不覆盖当前干净配置，也不改写受版本控制的默认模板。
 - **Web 控制台**：账号、实例、设置、日志与仪表盘页面；静态前端产物随仓库发布。
-- **容器与 CI**：Dockerfile 内置默认配置与静态前端；GHCR 镜像自动构建，支持 `rebuild-upstream`、`main`、`master`
-  分支与手动触发。
-- **应用层请求契约**：新增 `application/contracts/`（Gemini/OpenAI HTTP 请求 DTO）与
+- **容器与 CI**：Dockerfile 内置默认配置与静态前端；GHCR 镜像自动构建，支持 `master`/`main` 分支、版本标签、
+  每日定时与手动触发。
+- **应用层请求契约**：`application/contracts/` 提供 Gemini/OpenAI/Claude/Responses HTTP 请求 DTO 与
   `application/finish_reasons.py`，使应用层无需依赖 FastAPI 或 API 模块。
 
 ### Changed
 
 - 运行时从“控制面单页会话 + 后台自动切换”改为“请求实例池 + 请求期换绑”；控制面只承担管理操作，不占用请求实例容量。
+- 四协议默认全部启用；Gemini 核心协议面常驻，无独立开关。旧版“Claude/Responses 默认关闭”的口径作废。
 - 流式输出不再受请求级总超时限制，支持无限时长输出；仅保留工具调用的短空闲终止窗口。
 - 请求按上游 BotGuard 快照就绪状态启动，并按请求固定 `SessionContext`，避免跨请求串扰。
 - 路由候选顺序直接使用账号 tier 秩，实例选择结果可重复、可解释。
 - 配置以 `defaults/config.yaml` 为唯一受版本控制的默认值；根 `config.yaml` 仅作本地运行态，不纳入版本控制。
-  运行时默认配置直接读取该模板（含诊断开关、路由退避、完整模型画像与冷却参数），模板缺失时启动明确报错，
-  不再维护可能与模板漂移的内嵌默认副本。
-- Claude 与 Responses 协议保留配置开关但默认关闭；Build surface 在对应阶段前显式拒绝，而非静默切换 surface。
-- 吸收上游对内存占用、readiness watchdog、`Ultra_20X` tier 归一与 Web 配置编辑器的修复。
+  运行时默认配置直接读取该模板（含诊断开关、指纹开关、路由退避、完整模型画像与冷却参数），模板缺失时启动明确报错。
 - 收紧分层边界：Application 不再导入 API/FastAPI 或读取全局 `runtime_state`，请求统计改为构造注入回调；
-  Gemini 协议渲染与错误映射归位 API 层，Tier/Paid 共享规则归位 Domain，Infrastructure 不再反向依赖 Application。
+  Gemini/OpenAI/Claude/Responses 协议渲染与错误映射归位 API 层，Tier/Paid 共享规则归位 Domain，
+  Infrastructure 不再反向依赖 Application。
 - 兼容性：旧 `pg/` 前缀已移除；生成接口接受显式 `chat/` 前缀，但模型元数据目录不输出也不接受该前缀。
 - 配置启动迁移写回的是已应用非关键回退的有效配置（例如非法 `logging.level` 会持久化为 `INFO`），
-  `rotator.cooldowns.auth_error` 默认值调整为 `0`，403 认证失败不再产生固定冷却锁。
+  `rotator.cooldowns.auth_error` 默认值保持 `0`，403 认证失败不产生固定冷却锁。
 - `X-AIStudio-G1-Tier` 映射与 tier 归一集中到 `domain/model_access.py`（`tier_header_value`/`normalize_tier`），
-  Cookie 解析、transport、模型发现与账号刷新共用单一来源；Free 账号仍不发送该请求头。
+  Cookie 解析、transport、模型发现、账号刷新与 tier 同步共用单一来源；Free 账号仍不发送该请求头。
+- 429 同账号首次重试前默认退避 `2.0s`（`features.routing.retry_same_delay_sec`，可用
+  `AISTUDIO_RETRY_SAME_DELAY_SEC` 覆盖，范围 0..30）。
+- 403 同账号重试前强制 `refresh_page_auth_state` 重新读取 CDP Cookie；刷新后仍无 SAPISID 时不再重发过期凭据，直接进入切号/报错。
 
 ### Fixed
 
-- 修复 403 级联切号：首次同账号重新签名重试，第二次才切号；付费 tier 不足的 403 不触发切号。
-- 修复 429 处理：同账号重试一次后池内切号，预算耗尽返回 503。
+- 修复 403 级联切号：首次同账号刷新鉴权并重新签名重试，第二次才切号；付费 tier 不足的 403 不触发切号。
+- 修复 429 处理：同账号退避重试一次后池内切号，预算耗尽返回 503。
 - 修复流式截断与意外终止：补齐不完整 JSON 分块，finish-only 与工具流可正确收尾，`CONTINUING` 不再被当作终止码。
 - 修复工具调用参数与响应的 Struct 形状；缺少签名时从缓存取回或使用上游可接受的占位签名。
 - 修复实例池重复预热与双 BotGuard 探针；池化启用时跳过控制面预热。
 - 修复故障槽请求期换绑、路由均衡与实例 tier 选择器（`only_tier`/`min_tier`/`max_tier`）。
 - 修复日志导出与归档写入的脱敏缺口，历史日志不再原样泄漏密钥或 Cookie。
-- 修复只读配置目录下的启动失败：迁移写回失败时记录警告并继续以内存中已校验的配置启动，
-  同时清理可能残留的临时文件。
-- 容器 HEALTHCHECK 改为认证豁免的 `/health`，不再每 30 秒用未带 Key 的 `/v1beta/models` 探测。
-- 只读模型列表的缺 Key 401 按客户端 IP/path 在 5 分钟窗口内去重；WARN 附带截断到 80 字符的
-  `User-Agent` 与去除查询串/片段的 `Referer`，重复项降为 DEBUG，避免日志洪水与密钥泄漏。
+- 修复只读配置目录下的启动失败：迁移写回失败时记录警告并继续以内存中已校验的配置启动，同时清理残留临时文件。
+- 容器 HEALTHCHECK 改为认证豁免的 `/health`；成功探针不再产生 INFO/DEBUG 访问日志或环形缓冲记录。
+  只读模型列表的缺 Key 401 按客户端 IP/path 在 5 分钟窗口内去重；WARN 附带截断到 80 字符的 `User-Agent`
+  与去除查询串/片段的 `Referer`，重复项降为 DEBUG。
+- **C2d 实机反馈修复**：清除 `stats.json` 中 `finish_reasons` 等保留键产生的幽灵模型行；实例池只显示 `[最新]`，
+  运行中实例统一绿色激活边框与 `[🟢 实例 #X 运行中]` 徽章，不再重复蓝色 `[实例 #X]` 标签；恢复 CDP、日志级别与
+  Free/Plus/Pro/Ultra/Ultra_20X 等通用英文标识。
+- **C4b 设置页修复**：修正 `?` Tooltip 错误显示“推荐配置: false”的根因（`FieldHelpTip` 的 `recommended` 被
+  Boolean 默认值覆盖），新增推荐值格式化并与 `defaults/config.yaml` 75 个词条对齐；Tooltip 实现视口夹紧、
+  移动端最大宽度、上下翻转与箭头定位，1440/1024/768/375 视口均不出界。
+- **C4b 沙盒统计自洽**：`ui_debug` 种子强制 `prompt = cached + uncached`、`total = prompt + completion`、
+  `attempts = success + rate_limited + errors`，`simulate_requests` / `simulate_429` 同步维护该恒等式。
 
 ### Removed
 
@@ -78,10 +112,14 @@
 - 移除旧的全账号兜底切换路径，避免绕过实例池直接操作浏览器会话。
 - 移除仓库中的历史批次台账与失败草稿，仅保留归档记录。
 - 移除越层的 `application/api_service_gemini.py`、`api/schemas.py` 与 `api/schemas_openai.py`，由新契约与 API 模块取代。
+- 移除“Claude/Responses 适配器未启用”“四协议默认关闭”等过时描述与相关 feature-gate 拒绝路径。
 
 ### Security
 
 - 对外接口默认拒绝匿名访问；仅显式设置 `security.api_allow_anonymous: true` 时放开。
+- `/v1/messages*`、`/v1/responses*`、`/v1/models*` 与 Gemini 生成接口统一 API Key 守卫，支持 `x-api-key`、
+  `Authorization: Bearer` 与 `x-goog-api-key`。
+- 浏览器指纹脚本注册 fail-closed：注册失败即中止会话启动并把实例置为 invalid，避免暴露 SwiftShader 软件渲染器。
 - 日志在写入环形缓冲与归档文件前统一遮蔽 Authorization、Cookie、Set-Cookie、Google API Key、Bearer 与 `sk-*` 令牌；
   导出时对历史行再次脱敏，形成纵深防御。
 - 请求与响应 dump 只保留白名单字段，禁止明文记录请求头、Cookie、令牌与完整响应体。

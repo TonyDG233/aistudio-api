@@ -1,6 +1,8 @@
 # aistudio-api 系统架构设计
 
-本文档说明 `rebuild-upstream` 目标树的系统架构、实例模型、请求路由、单页生命周期、保活、日志与协议中立生成链。文档以当前 HEAD 代码为事实标准；出现分歧时以代码为准，并同步回本文档。所有实现引用均使用 `file:line`。
+本文档说明本仓库的系统架构、实例模型、请求路由、单页生命周期、保活、日志与协议中立生成链。文档以当前 HEAD 代码为事实标准；出现分歧时以代码为准，并同步回本文档。所有实现引用均使用 `file:line`。
+
+当前版本为 2.0.0：Gemini、OpenAI Chat Completions、Claude Messages 与 OpenAI Responses 四协议默认启用，共享同一条生成主链、SSE 首包/保活与双口径统计台账；浏览器侧按账号注入确定性 Windows 桌面指纹。
 
 ---
 
@@ -15,6 +17,8 @@
 - [7. B4 日志三 Sink 与脱敏](#7-b4-日志三-sink-与脱敏)
 - [8. 协议中立生成链与 ATG](#8-协议中立生成链与-atg)
 - [9. 跨平台支持与依赖隔离](#9-跨平台支持与依赖隔离)
+- [10. 四协议接入、SSE 首包与指纹](#10-四协议接入sse-首包与指纹)
+- [11. 双口径统计台账与 UI 调试沙盒](#11-双口径统计台账与-ui-调试沙盒)
 
 ---
 
@@ -29,6 +33,9 @@ flowchart TD
     subgraph API["1. API 接入层 (api/)"]
         RoutesGemini["routes_gemini.py"]
         RoutesOpenAI["routes_openai.py"]
+        RoutesClaude["routes_claude.py"]
+        RoutesResponses["routes_responses.py"]
+        SSE["sse_keepalive.py<br/>首包预读 / 心跳"]
         RoutesModels["routes_models.py"]
         RoutesInstances["routes_instances.py"]
         RoutesAccounts["routes_accounts.py"]
@@ -48,12 +55,14 @@ flowchart TD
         ChatSvc["chat_service.py<br/>请求规范化"]
         Signature["signature_cache.py<br/>PG-01 思维签名缓存"]
         ATG["atg/<br/>合成工具传输"]
-        Formats["format_converters/<br/>OpenAI 请求/响应"]
+        Contracts["contracts/<br/>Gemini/OpenAI/Claude/Responses DTO"]
+        Formats["format_converters/<br/>四协议请求/响应/媒体"]
     end
 
     subgraph DOMAIN["3. Domain 领域层 (domain/)"]
         DomainModels["models.py<br/>Candidate / ModelOutput / GeneratedImage"]
         DomainInstances["instances.py<br/>Instance / InstanceState"]
+        DomainAccess["model_access.py<br/>Tier / Paid / lane 单源"]
         DomainErrors["errors.py<br/>统一异常体系"]
     end
 
@@ -68,7 +77,7 @@ flowchart TD
         Streaming["gateway/streaming.py<br/>流式终态与分发"]
         Transport["gateway/transport.py<br/>CDP Binding 流传输"]
         Discovery["gateway/model_discovery.py<br/>ListModels / Paid 真值"]
-        Browser["browser/<br/>CDP / CloakBrowser / JS"]
+        Browser["browser/<br/>CDP / CloakBrowser / JS / fingerprint"]
         Account["account/<br/>Cookie / 账号存储"]
         Logs["utils/logger.py<br/>log_broadcast.py"]
     end
@@ -85,9 +94,9 @@ flowchart TD
 
 **依赖约束**：
 
-- API 层不直接访问浏览器、Cookie 或 Wire 数组；只通过依赖注入取得 `RoutingPipeline`、`AccountService`、`RuntimeState`（`api/dependencies.py:124-170`）。Gemini 协议渲染与错误映射留在 API 层（`api/gemini_service.py`、`api/error_mapping.py`）。
-- Application 层**不导入 `aistudio_api.api` 或 FastAPI**（`tests/unit/test_layer_boundaries.py` 静态校验）；HTTP 请求 DTO 由 `application/contracts/` 提供，finish reason 映射在无框架依赖的 `application/finish_reasons.py`，统计记录通过构造注入的 `stats_recorder` 回调完成，不反向读取 `api.state.runtime_state`。
-- Domain 不导入 FastAPI、CDP 或 JSPB；`Instance` 只暴露用户可见字段（`domain/instances.py:18-33`）；Tier/Paid 共享规则位于 `domain/model_access.py`。
+- API 层不直接访问浏览器、Cookie 或 Wire 数组；只通过依赖注入取得 `RoutingPipeline`、`AccountService`、`RuntimeState`（`api/dependencies.py:146-292` 的令牌解析/API Key 校验，`:295-336` 的运行时单例注入）。四协议渲染、SSE 首包与错误映射留在 API 层（`api/gemini_service.py`、`api/routes_{openai,claude,responses}.py`、`api/sse_keepalive.py`、`api/error_mapping.py`、`api/format_errors.py`）。
+- Application 层**不导入 `aistudio_api.api` 或 FastAPI**（`tests/unit/test_layer_boundaries.py` 静态校验）；HTTP 请求 DTO 由 `application/contracts/` 提供（`gemini.py`/`openai.py`/`claude.py`/`responses.py`），finish reason 映射在无框架依赖的 `application/finish_reasons.py`，统计记录通过构造注入的 `stats_recorder` / `client_recorder` / `count_token_recorder` 回调完成，不反向读取 `api.state.runtime_state`。
+- Domain 不导入 FastAPI、CDP 或 JSPB；`Instance` 只暴露用户可见字段（`domain/instances.py:18-33`）；Tier/Paid/lane 共享规则位于 `domain/model_access.py`（`normalize_tier` 115-117、`resolve_tier_selector` 163-233、`account_is_paid` 317-319、`instance_lane_for_tier` 327-330）。
 - Infrastructure 负责 CDP、Cookie、模板、Wire、流解析与日志；它依赖 Domain 的错误/模型，**不反向依赖 application**（`tests/unit/test_layer_boundaries.py` 静态校验）。
 - 历史 P0 债务（`application -> api` 的 6 文件反向依赖、`infrastructure -> application` 的 `model_access` 循环）已通过 B7-01/B7-02/B7-03 消除，并由 `tests/unit/test_layer_boundaries.py` 固化；不再保留临时豁免或 P0 断言。
 
@@ -99,15 +108,19 @@ flowchart TD
 | API | `gemini_service.py` | Gemini 协议渲染、SSE 事件与协议错误载荷 |
 | API | `error_mapping.py` | 四协议错误映射；Gemini 403/502/429 状态字符串与 JSPB 清理 |
 | API | `routes_openai.py` | `/v1/chat/completions`、OpenAI 流式/非流式响应 |
+| API | `routes_claude.py` | `/v1/messages`、`/v1/messages/count_tokens`（Claude Messages 协议） |
+| API | `routes_responses.py` | `/v1/responses`、`/v1/responses/input_tokens`（OpenAI Responses 协议） |
+| API | `sse_keepalive.py` | 四协议共享首事件预读窗口、`: keepalive` 心跳与 `KeepaliveIterator` |
+| API | `format_errors.py` | 四协议 feature gate 与协议错误体渲染 |
 | API | `routes_models.py` | OpenAI `/v1/models` 与 Gemini 模型发现 |
 | API | `routes_instances.py` | 实例列表、创建、关闭、重启、surface 切换、改绑 |
 | API | `routes_accounts.py` | Cookie 导入、多子账号探活、激活、预设 |
 | API | `routes_keepalive.py` | 手动触发/查询 `auth_update`、`metadata_refresh`、`active_activity` |
 | API | `routes_logs.py` | 日志 SSE、ring 查询、1/3/7 天导出 |
 | API | `dependencies.py` | Web 密码会话、API Key 鉴权、运行时单例注入 |
-| Application | `contracts/` | Gemini/OpenAI HTTP 请求 DTO（无 FastAPI 依赖） |
+| Application | `contracts/` | Gemini/OpenAI/Claude/Responses HTTP 请求 DTO（无 FastAPI 依赖） |
 | Application | `finish_reasons.py` | wire finish code → Gemini `finishReason` |
-| Application | `generation_service.py` | 路由获取、重试、ATG wrap/unwrap、usage/finish/response_id |
+| Application | `generation_service.py` | 路由获取、重试、ATG wrap/unwrap、usage/finish/response_id、Client 终态记录 |
 | Application | `routing_pipeline.py` | 模型准入、唤醒、候选排序、`active_requests` 句柄、失败槽改绑 |
 | Application | `routing_eligibility.py` | surface/lane/required tier 解析与 Paid 准入 |
 | Application | `routing_safety.py` | 单请求 `max_switches` 预算；无熔断/租约 |
@@ -115,12 +128,14 @@ flowchart TD
 | Application | `account_keepalive.py` | 24h Cookie 回写、tier/email 刷新、可选控制页活动 |
 | Application | `chat_service.py` | Gemini/OpenAI 请求归一、多模态、工具 Struct、`[toolshape]` |
 | Application | `signature_cache.py` | 按 `call_id` 持久化真实 `thoughtSignature`，TTL 30 天 |
-| Application | `format_converters/` | OpenAI 请求/响应/媒体转换 |
+| Application | `format_converters/` | Gemini/OpenAI/Claude/Responses 请求响应与媒体转换 |
 | Application | `atg/` | 合成工具包装、提取、修复、流式解包 |
-| Domain | `model_access.py` | Tier 排序与 Paid/tier 共享判定 |
-| Infrastructure | `instance_pool.py` | 单页实例、`active_requests`、有界 retire、Page→Context 关闭顺序 |
-| Infrastructure | `pooled_session.py` | 池化会话的 Page/Cookie/模板/快照/传输 |
+| Domain | `model_access.py` | Tier 排序、Paid 判定、lane 推导与 tier 选择器单源 |
+| Infrastructure | `instance_pool.py` | 单页实例、`active_requests`、有界 retire、Page→Context 关闭顺序、tier 同步 |
+| Infrastructure | `pooled_session.py` | 池化会话的 Page/Cookie/模板/快照/传输/鉴权刷新 |
 | Infrastructure | `session.py` | 控制面单页会话与有界 rebind（D-05/D-10/D-11） |
+| Infrastructure | `browser/fingerprint.py` | 按账号确定性 Windows 桌面指纹与注入脚本 |
+| Infrastructure | `gateway/transport.py` | `refresh_page_auth_state`：403 重签前强制刷新 CDP Cookie |
 | Infrastructure | `botguard_bootstrap.py` | WAA 握手、Temporary Chat、真实模板捕获、输入清理 |
 | Infrastructure | `model_discovery.py` | ListModels XHR/HTTP、字段解析、Paid 真值与快照 |
 | Infrastructure | `wire_*.py` | JSPB 请求/响应/Wire 类型与索引常量 |
@@ -141,18 +156,18 @@ flowchart TD
 - **1 个 Page**：实例同一时刻只允许一个 active Page；切换时先关闭旧 Page 再创建新 Page。
 - **1 个 surface**：`chat` 或 `build`；需要换面就显式关闭/切换，不静默换面。
 
-`InstanceSlot` 持有 `context_id`、`tier`、`state`、`generation`、`active_requests` 与 `lifecycle_lock`（`instance_pool.py:138-214`）。`realm_id = "<slot_id>-g<generation>"` 用于 capture/streaming 缓存隔离（`instance_pool.py:171-174`）。
+`InstanceSlot` 持有 `context_id`、`tier`、`state`、`generation`、`active_requests` 与 `lifecycle_lock`（`instance_pool.py:140-218`）。`realm_id = "<slot_id>-g<generation>"` 用于 capture/streaming 缓存隔离（`instance_pool.py:173-175`）。
 
 ### 2.2 Free / Paid lane 隔离
 
-- lane 由**账号 tier** 决定，不由模型名决定：`account_is_paid(tier)` 为真进入 paid lane，否则 Free lane（`domain/model_access.py:273-285`）。
+- lane 由**账号 tier** 决定，不由模型名决定：`account_is_paid(tier)` 为真进入 paid lane，否则 Free lane（`domain/model_access.py:317-330`）。
 - 同一账号的 chat/build 不并存；Free 实例与 paid 实例可同时在线，各自拥有独立 Context/Page/Cookie/模板/在途计数。
-- Free 模型只能命中 Free 实例；paid 模型必须命中 required tiers 允许的付费实例（最低 Pro；仅 `accessModes=4` 的模型要求 Ultra），且当前仅允许 `chat` surface（`domain/model_access.py:255-261`、`routing_eligibility.py:195-200`、`221-233`）。
-- `InstancePool.add_slot` 与 `InstanceManager._activate` 都校验 lane 一致；跨 lane 改绑直接拒绝（`instance_pool.py:327-363`、`instance_manager.py:389-425`）。
+- Free 模型只能命中 Free 实例；paid 模型必须命中 required tiers 允许的付费实例（最低 Pro；仅 `accessModes=4` 的模型要求 Ultra），且当前仅允许 `chat` surface（`domain/model_access.py:299-306`、`routing_eligibility.py:146-204`、`207-260`）。
+- `InstancePool.add_slot` 与 `InstanceManager._activate` 都校验 lane 一致；跨 lane 改绑直接拒绝（`instance_pool.py:409-446`、`instance_manager.py:424-478`）。
 
 ### 2.3 Tier 选择器：`only_tier` / `min_tier` / `max_tier`
 
-实例配置使用闭区间选择器，三者至少提供一个；旧 `min_tier` 仍兼容，但精确定位应使用 `only_tier`（`domain/model_access.py:119-188`、`model_defaults.py:261-392`）。
+实例配置使用闭区间选择器，三者至少提供一个；旧 `min_tier` 仍兼容，但精确定位应使用 `only_tier`（`domain/model_access.py:163-233`、`model_defaults.py:317-452`）。
 
 | 输入 | 归一化结果 | 说明 |
 |---|---|---|
@@ -167,19 +182,19 @@ flowchart TD
 
 **校验与 lane 规则**：
 
-1. `None`/空字符串视为未提供；显式提供的非空选择器必须是字符串且为已知 tier（Free/Plus/Pro/Ultra/Ultra_20X）；三者都未提供、非字符串（如数字/列表）或未知名称立即抛 `TierSelectorError`/`ConfigValidationError`，不静默忽略（`domain/model_access.py:96-116`、`model_defaults.py:300-332`）。
-2. `only_tier` 不能与不同的 `min_tier/max_tier` 同时配置；标准化形式允许 `only=Free,min=Free,max=Free` 这类同区间写法（`domain/model_access.py:140-155`）。
-3. Free 与 paid 不能混在同一区间；Free 实例只能是 `Free..Free`（`domain/model_access.py:172-188`）。
-4. Paid 实例的 `min_tier` 不能低于 Plus；`max_tier` 不能低于 Pro；确实需要 Plus 槽位时使用 `only_tier: Plus`（`domain/model_access.py:157-188`）。
-5. 账号 tier 必须先匹配 lane，再满足 `min_tier..max_tier` 闭区间（`domain/model_access.py:191-196`、`instance_pool.py:180-190`）。
-6. 配置合并键：Free 统一按键 `(surface, Free, Free, Free)`；paid `only_tier` 按 `(surface, only, "", "")`；`min/max` 仅在上界显式配置时把上界纳入键，从而合并重复 spec 的 count（`model_defaults.py:345-391`）。
+1. `None`/空字符串视为未提供；显式提供的非空选择器必须是字符串且为已知 tier（Free/Plus/Pro/Ultra/Ultra_20X）；三者都未提供、非字符串（如数字/列表）或未知名称立即抛 `TierSelectorError`/`ConfigValidationError`，不静默忽略（`domain/model_access.py:140-161`、`model_defaults.py:317-352`）。
+2. `only_tier` 不能与不同的 `min_tier/max_tier` 同时配置；标准化形式允许 `only=Free,min=Free,max=Free` 这类同区间写法（`domain/model_access.py:184-199`）。
+3. Free 与 paid 不能混在同一区间；Free 实例只能是 `Free..Free`（`domain/model_access.py:217-233`）。
+4. Paid 实例的 `min_tier` 不能低于 Plus；`max_tier` 不能低于 Pro；确实需要 Plus 槽位时使用 `only_tier: Plus`（`domain/model_access.py:201-233`）。
+5. 账号 tier 必须先匹配 lane，再满足 `min_tier..max_tier` 闭区间（`domain/model_access.py:235-241`、`instance_pool.py:182-192`）。
+6. 配置合并键：Free 统一按键 `(surface, Free, Free, Free)`；paid `only_tier` 按 `(surface, only, "", "")`；`min/max` 仅在上界显式配置时把上界纳入键，从而合并重复 spec 的 count（`model_defaults.py:388-452`）。
 
-实例视图同时返回三个字段，供后续 C2 UI 使用；当前 `.vue` 尚未改造（`instance_manager.py:1031-1047`）。
+实例视图同时返回三个字段，供 C2 UI 使用（`instance_manager.py:1241-1257`）。
 
 ### 2.4 池容量
 
-- 全局 `max_contexts` 限制实例/Context 总数，默认等于 `instances` 的 count 之和，硬上限 16（`model_defaults.py:395-417`、`1524-1531`）。
-- `InstancePool.add_slot` 在超过 `max_contexts` 时抛 `InstanceCapacityError`；启动时达到上限即停止继续创建（`instance_pool.py:344-349`、`instance_manager.py:186-191`）。
+- 全局 `max_contexts` 限制实例/Context 总数，默认等于 `instances` 的 count 之和，硬上限 16（`model_defaults.py:454-473`、`1645-1652`）。
+- `InstancePool.add_slot` 在超过 `max_contexts` 时抛 `InstanceCapacityError`；启动时达到上限即停止继续创建（`instance_pool.py:409-446`、`instance_manager.py:168-237`）。
 - 容量按实例数计算；没有 lease/reservation/pinned/defer 计数。
 
 ---
@@ -233,11 +248,11 @@ sequenceDiagram
 
 关键点：
 
-1. **协议入口只做渲染**：Gemini 与 OpenAI 路由都调用同一个 `generation_service.generate` / `stream_generation`（`api/gemini_service.py::handle_gemini_generate_content`、`::_build_gemini_streaming_response`、`api/routes_openai.py::chat_completions`）。
-2. **路由在生成前冻结**：`RoutingPipeline.begin` 解析 surface/lane/required tiers，唤醒合格休眠实例，过滤 tier 与 429/403 可用性，再排序候选（`routing_pipeline.py::RoutingPipeline.begin`）。
-3. **并发只靠 `active_requests`**：`begin_request` 返回幂等 `ActiveRequest`，`release()` 在 `finally` 调用（`instance_pool.py:116-135`、`routing_pipeline.py::RoutingPipeline.acquire`、`::RoutingPipeline.release`）。
-4. **快照按请求生成**：`PooledSession.generate_snapshot` 用 `build_snapshot_hash_parts` 拼接内容并 SHA-256，再调用页面内签名函数；快照不跨请求复用（`pooled_session.py:163-188`、`session.py:60-86`）。
-5. **流式解析**：`IncrementalJSONStreamParser` 去 XSSI 前缀、按括号深度切块；上层 `streaming.py` 统一处理 finish/usage/response_id 与截断修复（`stream_parser.py:151-273`、`streaming.py:99-249`）。
+1. **协议入口只做渲染**：Gemini、OpenAI、Claude、Responses 四个入口都调用同一个 `generation_service.generate` / `stream_generation`（`api/gemini_service.py:47-90`、`:222-309`、`api/routes_openai.py:99-221`、`api/routes_claude.py:175-216`、`api/routes_responses.py:96-201`）。
+2. **路由在生成前冻结**：`RoutingPipeline.begin` 解析 surface/lane/required tiers，唤醒合格休眠实例，过滤 tier 与 429/403 可用性，再排序候选（`routing_pipeline.py:379-470`）。
+3. **并发只靠 `active_requests`**：`begin_request` 返回幂等 `ActiveRequest`，`release()` 在 `finally` 调用（`instance_pool.py:118-138`、`:586-600`、`routing_pipeline.py:665-666`）。
+4. **快照按请求生成**：`PooledSession.generate_snapshot` 用 `build_snapshot_hash_parts` 拼接内容并 SHA-256，再调用页面内签名函数；快照不跨请求复用（`pooled_session.py:187-235`、`session.py:84-124`）。
+5. **流式解析**：`IncrementalJSONStreamParser` 去 XSSI 前缀、按括号深度切块；上层 `streaming.py` 统一处理 finish/usage/response_id 与截断修复（`stream_parser.py:151-274`、`streaming.py:102-232`）。四协议共用 `api/sse_keepalive.py:103-211` 的首包预读与心跳。
 
 ---
 
@@ -256,7 +271,7 @@ Live Free 真值优先：真实 `paid is False` 且无 Paid `accessModes` 的记
 
 ### 4.2 负载均衡顺序
 
-`RoutingPipeline._order` 的排序键（`routing_pipeline.py::RoutingPipeline._order`）：
+`RoutingPipeline._order` 的排序键（`routing_pipeline.py:466-506`）：
 
 ```text
 (
@@ -271,31 +286,31 @@ Live Free 真值优先：真实 `paid is False` 且无 Paid `accessModes` 的记
 )
 ```
 
-sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个槽垄断流量。候选包含 `UNSTARTED/SLEEPING/STARTING/ACTIVE`；请求到达会唤醒所有合格休眠实例（`instance_manager.py:249-267`、`465-505`）。
+sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个槽垄断流量。候选包含 `UNSTARTED/SLEEPING/STARTING/ACTIVE`；请求到达会唤醒所有合格休眠实例（`instance_manager.py:253-272`、`518-558`）。
 
 ### 4.3 错误恢复
 
 | 错误 | 策略 | 实现 |
 |---|---|---|
-| `UsageLimitExceeded` (429) | 同账号重试一次 → 池内切号 → 预算耗尽返回 503 | `routing_pipeline.py::RoutingPipeline.handle_error`、`::RoutingPipeline._switch_or_raise` |
-| `AuthError` (403) | 首次同账号重新签名重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py::RoutingPipeline.handle_error` |
-| `SessionExpiredError` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py::RoutingPipeline.handle_error` |
-| `session_hang` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py::RoutingPipeline.handle_error` |
-| `RequestError` 204/404 | 同账号重试一次；204 仍空 → `BrowserTransportError` | `routing_pipeline.py::RoutingPipeline.handle_error` |
-| 已出正文 | 不切号，直接抛出 | `has_yielded_data` 分支（`routing_pipeline.py::RoutingPipeline.handle_error`） |
+| `UsageLimitExceeded` (429) | 同账号退避（默认 2.0s）重试一次 → 池内切号 → 预算耗尽返回 503 | `routing_pipeline.py:754-910`、`:822-853`、`:1102-1150` |
+| `AuthError` (403) | 首次强制刷新页面鉴权（CDP Cookie）并同账号重签重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py:778-820`、`:912-954`、`transport.py:157-183` |
+| `SessionExpiredError` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:769-776` |
+| `session_hang` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:892-899` |
+| `RequestError` 204/404 | 同账号重试一次；204 仍空 → `BrowserTransportError` | `routing_pipeline.py:855-890` |
+| 已出正文 | 不切号，直接抛出 | `has_yielded_data` 分支（`routing_pipeline.py:772-776`、`:788-790`） |
 
 `RoutingBudget` 只记录连续切号次数，同账号重试不计入；默认 `max_switches=2`（`routing_safety.py:13-49`、`routing_pipeline.py::RoutingPipeline.begin`）。没有 lease、reservation、defer、pinned、circuit breaker 或后台 rebalance。
 
 ### 4.4 失败槽立即改绑（immediate failed-slot rebind）
 
-当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/session_expired/session_hang 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py::RoutingPipeline._try_rebind`）：
+当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/session_expired/session_hang 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py:956-1100`）：
 
 1. 释放当前 `ActiveRequest` 句柄（否则池拒绝激活）。
 2. 清空该实例的模板缓存。
 3. 若实例仍有在途请求，跳过改绑（`instance_active_requests > 0`）。
 4. 排除 `failed_accounts`、`attempted_accounts`、当前账号，以及已绑定到其他实例的账号。
 5. 调用 `AccountRotator.select_rebind_account`，按 lane、模型、surface、tier 区间/required tiers、可用性筛选，选择最小 tier → 总请求数 → 模型请求数 → LRU 的账号（`account_rotator.py:648-710`）。
-6. 调用 `InstanceManager.reassign` 原位关闭旧 Page/Context 并激活新账号；成功后更新候选、消耗一次切号预算、清模板缓存。
+6. 调用 `InstanceManager.reassign`（`instance_manager.py:424-478`）原位关闭旧 Page/Context 并激活新账号；成功后更新候选、消耗一次切号预算、清模板缓存。
 7. 没有其他候选时 `reuse=True`，请求重新取该槽；有其他候选时 `reuse=False`，当前请求继续走其他槽，失败槽已被修复供后续请求使用。
 
 没有“每槽只能 rebind 一次”的硬上限；循环保护来自 `attempted_accounts`/`failed_accounts` 与单请求 `max_switches` 预算。
@@ -307,17 +322,17 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 ### 5.1 控制面与请求实例分离
 
 - 控制面 `AIStudioClient.session` 只负责登录、Cookie 回写与按需保活，不是请求实例，不占池容量（`client.py`、`account_keepalive.py:380-407`）。
-- 请求实例由 `InstancePool`/`InstanceManager` 管理；池化实例启动时在独立 `BrowserContext` 内创建 Page 并完成 BotGuard/模板捕获（`instance_pool.py:462-496`、`pooled_session.py:64-114`）。
-- 配置了任意实例时，启动**跳过控制面预热**，避免控制面与池会话重复触发 BotGuard 探针；只有完全没有实例的 legacy 模式才预热控制面（`api/app.py:344-357`、`77-120`）。
+- 请求实例由 `InstancePool`/`InstanceManager` 管理；池化实例启动时在独立 `BrowserContext` 内创建 Page、注入账号指纹并完成 BotGuard/模板捕获（`instance_pool.py:448-548`、`pooled_session.py:80-140`）。
+- 配置了任意实例时，启动**跳过控制面预热**，避免控制面与池会话重复触发 BotGuard 探针；只有完全没有实例的 legacy 模式才预热控制面（`api/app.py:330-388`、`103-130`）。
 
 ### 5.2 D-05：控制面换绑
 
-禁用账号或应用预设触发 `InstanceManager.rebind_account`（`instance_manager.py:507-608`）：
+禁用账号或应用预设触发 `InstanceManager.rebind_account`（`instance_manager.py:560-661`）：
 
 1. 找到受影响记录与目标槽。
 2. 对旧记录执行 `_retire_record` → `InstancePool.retire_runtime`。
-3. `retire_runtime` 将槽置为 `RETIRING`，拒绝新请求；若 `active_requests > 0`，只等待一次 `active_zero`，超时默认 12 秒后强制关闭（`instance_pool.py:527-561`）。
-4. 关闭顺序固定：先 `session.close()`（Page），再 `dispose_browser_context`，最后触发旧 realm 的回收回调（`instance_pool.py:592-627`）。
+3. `retire_runtime` 将槽置为 `RETIRING`，拒绝新请求；若 `active_requests > 0`，只等待一次 `active_zero`，超时默认 12 秒后强制关闭（`instance_pool.py:615-658`）。
+4. 关闭顺序固定：先 `session.close()`（Page），再 `dispose_browser_context`，最后触发旧 realm 的回收回调（`instance_pool.py:688-732`）。
 5. drain 期间**不创建新 Page**；旧 Page/Context 关闭后才激活目标账号。
 6. 激活失败时尝试恢复旧账号；恢复失败把记录置 `INVALID` 并显式抛 `InstanceRebindError`，不留下不可见的不一致状态。
 7. 激活成功后才重写持久化 active account。
@@ -325,10 +340,10 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 ### 5.3 D-10/D-11：页面与 Context 清理
 
 - 同一账号最多 1 个 active Page；不允许“1 active + 1 drain”作为页预算例外（`AGENT.md` §4.5）。
-- `close_slot` 在有在途请求时拒绝；手动关闭/改绑在有 `active_requests` 时返回 busy（`instance_pool.py:563-575`、`instance_manager.py:340-353`）。
-- `_sync_records` 发现 READY 槽的 Page 已关闭时，把槽置 `INVALID`，不自动复活（`instance_manager.py:999-1015`）。
-- 失败/stale 只允许显式 `restart`；idle browser 自动回收默认关闭（`instance_manager.py:427-438`、`account_keepalive.py:63`）。
-- 控制面 `BrowserSession` 的 `transition_to_account` 同样先有界 drain 旧 Page，再创建新 Page；失败时关闭新 Page 并保留错误（`session.py:233-365`）。
+- `close_slot` 在有在途请求时拒绝；手动关闭/改绑在有 `active_requests` 时返回 busy（`instance_pool.py:659-672`、`instance_manager.py:354-389`）。
+- `_sync_records` 发现 READY 槽的 Page 已关闭时，把槽置 `INVALID`，不自动复活（`instance_manager.py:1209-1226`）。
+- 失败/stale 只允许显式 `restart`；idle browser 自动回收默认关闭（`instance_manager.py:480-492`、`account_keepalive.py:55-90`）。
+- 控制面 `BrowserSession` 的 `transition_to_account` 同样先有界 drain 旧 Page，再创建新 Page；失败时关闭新 Page 并保留错误（`session.py:271-385`）。
 
 ---
 
@@ -336,7 +351,7 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 
 ### 6.1 24h 保活
 
-`AccountKeepaliveService` 维护三个 job（`account_keepalive.py:33-40`、`54-96`）：
+`AccountKeepaliveService` 维护三个 job（`account_keepalive.py:33`、`55-97`）：
 
 | Job | 默认 | 作用 |
 |---|---|---|
@@ -349,22 +364,22 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 - 所有 job 共用一把全局串行锁；busy 时立即返回 `{"reason":"busy"}`，**不推进** `next_due`（`account_keepalive.py:225-251`）。
 - 失败按 job 短重试：无活动页 60s、刷新进行中 60s、普通失败 300s；成功才按 24h 间隔推进（`account_keepalive.py:212-223`）。
 - `auth_update` 按账号聚合每个 slot 的结果；只有该账号全部尝试成功才 `mark_auth_saved`，部分失败返回 `partial` 并记录失败 slot（`account_keepalive.py:409-503`）。
-- 启动时 keepalive metadata refresh 先跑，app 侧用 `covered_ids` 去重；已验证 Free 且 `tier_checked_at` 在 3 天内跳过 benefit-tier 探测（`api/app.py:150-245`、`397-415`）。
+- 启动时 keepalive metadata refresh 先跑，app 侧用 `covered_ids` 去重；已验证 Free 且 `tier_checked_at` 在 3 天内跳过 benefit-tier 探测（`api/app.py:194-301`、`509-537`）。
 - 429 冷却（60/300/600）与美西午夜跨天重置仍由 `AccountRotator` 负责（`account_rotator.py`）。
 
 ### 6.2 模型发现
 
-`ModelDiscoveryService` 的取数顺序（`model_discovery.py:386-527`）：
+`ModelDiscoveryService` 的取数顺序（`model_discovery.py:411-566`）：
 
-1. **池会话 XHR**：`get_models(sessions=...)` 优先使用 READY 池会话，paid lane 先、Free 后，lane 内空闲槽优先；每个会话用其 auth file 计算 SAPISIDHASH 并带 `X-Goog-AuthUser`/tier 头（`instance_manager.py:628-651`、`model_discovery.py:416-461`）。
-2. **HTTP 兜底**：若无可用池会话，使用账号 Cookie 直接 POST ListModels（`model_discovery.py:465-505`）。
-3. **本地 fallback**：仅冷启动、无快照且两种 live 都失败时使用 `_FALLBACK_MODELS`，并标记 `source=fallback`；已有快照时保留快照来源，不把 fallback 冒充 live（`model_discovery.py:507-527`）。
+1. **池会话 XHR**：`get_models(sessions=...)` 优先使用 READY 池会话，paid lane 先、Free 后，lane 内空闲槽优先；每个会话用其 auth file 计算 SAPISIDHASH 并带 `X-Goog-AuthUser`/tier 头（`instance_manager.py:681-705`、`model_discovery.py:724-796`）。
+2. **HTTP 兜底**：若无可用池会话，使用账号 Cookie 直接 POST ListModels（`model_discovery.py:797-837`）。
+3. **本地 fallback**：仅冷启动、无快照且两种 live 都失败时使用 `_FALLBACK_MODELS`，并标记 `source=fallback`；已有快照时保留快照来源，不把 fallback 冒充 live（`model_discovery.py:584-600`）。
 
-真值标记：`_discovery_source` ∈ `live_page/live_http/snapshot` 才算 truth；`fallback` 永远不是 truth（`model_discovery.py:270-320`）。
+真值标记：`_discovery_source` ∈ `live_page/live_http/snapshot` 才算 truth；`fallback` 永远不是 truth（`model_discovery.py:303-345`）。
 
 ### 6.3 动态 Paid
 
-ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-915`）：
+ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:838-980`）：
 
 | 数组下标 | protobuf 字段（1-based） | 语义 |
 |---|---|---|
@@ -375,9 +390,9 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 | `item[77]` | Field 78 | `access_tier`；`2` 表示 Paid（Pro-only） |
 | `item[82]` | Field 83 | `accessModes`；含 `3` 或 `4` 表示 Paid |
 
-`paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)`（`model_discovery.py:906`）。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新以真实记录覆盖，fallback 只在无快照冷启动时作为初始种子（`domain/model_access.py:221-239`、`model_discovery.py:507-541`）。不在传入列表中的模型保留旧状态，避免已知 Paid 因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
+`paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)`（`model_discovery.py:972`）。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新以真实记录覆盖，fallback 只在无快照冷启动时作为初始种子（`domain/model_access.py:265-283`、`model_discovery.py:584-600`）。不在传入列表中的模型保留旧状态，避免已知 Paid 因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
 
-路由的 required tiers 解析（`routing_eligibility.py:146-204`、`model_discovery.py:601-660`）：
+路由的 required tiers 解析（`routing_eligibility.py:146-204`、`model_discovery.py:601-723`）：
 
 1. 真实 live/snapshot 显式 Free → 返回空 required（authoritative Free）。
 2. `paid_model_rules` 命中 → 使用其 `required_tiers`。
@@ -389,18 +404,18 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 
 ## 7. B4 日志三 Sink 与脱敏
 
-`setup_logging` 挂载三个 sink（`logger.py:310-349`）：
+`setup_logging` 挂载三个 sink（`logger.py:310-350`）：
 
 1. **stderr `StreamHandler`**：按当前日志级别输出，TTY 下带颜色。
-2. **`BroadcastHandler`**：写入 5000 条 ring，供 `/api/logs` SSE 与历史查询；低级别日志在缓冲满时优先淘汰，保留 WARNING/ERROR/CRITICAL（`log_broadcast.py:126-201`）。
-3. **`DailyLogFileHandler`**：写入 `data/logs/aistudio-YYYYMMDD.log`，默认保留 7 天，跨天自动切换并清理（`log_broadcast.py:319-406`）。
+2. **`BroadcastHandler`**：写入 5000 条 ring，供 `/api/logs` SSE 与历史查询；低级别日志在缓冲满时优先淘汰，保留 WARNING/ERROR/CRITICAL（`log_broadcast.py:126-286`，淘汰在 `:166-207`）。
+3. **`DailyLogFileHandler`**：写入 `data/logs/aistudio-YYYYMMDD.log`，默认保留 7 天，跨天自动切换并清理（`log_broadcast.py:368-441`）。
 
 脱敏与噪音控制：
 
 - 所有写往 ring、archive、导出与 dump 的文本都经过 `sanitize_log_message`：掩码 Authorization、Set-Cookie/Cookie、SAPISID 系列、API Key、Bearer、`AIza...`、`sk-...` 等（`log_broadcast.py:61-78`）。
-- root/aistudio 固定 DEBUG，保证广播与归档完整；三方/传输噪音固定 WARNING，并在每个 handler 上挂 `NoisyLoggerFilter` 兜底（`logger.py:34-64`、`284-308`）。
-- 请求 dump 只落 `safe_headers`、`safe_query_params`、`safe_body`、`safe_response_*`；禁止明文 `headers/raw_body/response_body/cookie/token/API key`（`logger.py:445-565`）。
-- D-09 `hash_include_code` 是诊断开关，优先级为环境变量 > `diagnostics.hash_include_code` > 默认 true；不进入普通用户 UI（`config.py:257-277`、`session.py:60-86`）。
+- root/aistudio 固定 DEBUG，保证广播与归档完整；三方/传输噪音固定 WARNING，并在每个 handler 上挂 `NoisyLoggerFilter` 兜底（`logger.py:50-64`、`272-308`）。
+- 请求 dump 只落 `safe_headers`、`safe_query_params`、`safe_body`、`safe_response_*`；禁止明文 `headers/raw_body/response_body/cookie/token/API key`（`logger.py:460-580`，文件白名单字段在 `:523-543`）。
+- D-09 `hash_include_code` 是诊断开关，优先级为环境变量 > `diagnostics.hash_include_code` > 默认 true；不进入普通用户 UI（`aistudio_api/config.py:288-308`、`session.py:84-124`）。
 
 ---
 
@@ -408,29 +423,30 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 
 ### 8.1 单一生成主链
 
-`generation_service.py` 拥有协议中立核心（`generation_service.py:1-11`、`151-507`）：
+`generation_service.py` 拥有协议中立核心（`generation_service.py:1-12`、`229-372`、`382-611`）：
 
 - 通过 `RoutingPipeline` 获取/释放 `RouteAttempt`，遵守 `active_requests`。
 - 负责 ATG wrap/unwrap、同账号空响应重试、429/403/会话异常的 `handle_error` 分支。
 - 从 `ModelOutput` 或 `StreamEvent` 提取 `usage`、`finish_reason`、`response_id`、`thought_signature`。
-- 不渲染 Gemini/OpenAI/Claude 的具体 JSON/SSE；渲染在 API 层完成（`api/gemini_service.py:1-7`、`format_converters/`）。
+- 维护 Client 口径终态：每次客户端生成请求只记录一次 `success/rate_limited/errors/aborted` 与 `rescued`（`generation_service.py:161-227`、`:200-227`）。
+- 不渲染 Gemini/OpenAI/Claude/Responses 的具体 JSON/SSE；渲染在 API 层完成（`api/gemini_service.py:1-7`、`format_converters/`）。
 
 ### 8.2 PG-01..PG-04
 
 | 门槛 | 实现 |
 |---|---|
-| **PG-01** 历史 `functionCall` 缺 `thoughtSignature` | 先查 `signature_cache`（按 `call_id`，非消费式，TTL 30 天，max 4096，持久化 `data/signature_cache.json`）；未命中用 `DUMMY_THOUGHT_SIGNATURE = "context_engineering_is_the_way_to_go"`（`signature_cache.py:25-84`、`chat_service.py:730-734`） |
-| **PG-02** 首事件前真实 HTTP 状态 | `streaming.py` 先产出 `status` 事件，再分发 chunk；无数据即断流抛 `BrowserTransportError`（`streaming.py:138-140`、`232-238`） |
-| **PG-03** finish-only / 工具流终止 | 忽略 `0` 与 `WIRE_FINISH_REASON_CONTINUING=22`；已出 tool_calls 但无 finish 时合成 STOP；2s 工具空闲窗口只作用于该场景（`streaming.py:115-136`、`163-168`、`239-247`） |
-| **PG-04** functionCall/functionResponse 强制 Struct | `coerce_function_call_args` 把非 dict/JSON 对象包成 `{"content": ...}`；`coerce_function_response` 包成 `{"result": ...}`；`[toolshape]` 只记录脱敏形状摘要（`wire_types.py:336-372`、`chat_service.py:619-715`） |
+| **PG-01** 历史 `functionCall` 缺 `thoughtSignature` | 先查 `signature_cache`（按 `call_id`，非消费式，TTL 30 天，max 4096，持久化 `data/signature_cache.json`）；未命中用 `DUMMY_THOUGHT_SIGNATURE = "context_engineering_is_the_way_to_go"`（`signature_cache.py:32-160`、`chat_service.py:720-734`） |
+| **PG-02** 首事件前真实 HTTP 状态 | `streaming.py` 先产出 `status` 事件，再分发 chunk；无数据即断流抛 `BrowserTransportError`（`streaming.py:164-168`、`236-241`） |
+| **PG-03** finish-only / 工具流终止 | 忽略 `0` 与 `WIRE_FINISH_REASON_CONTINUING=22`；已出 tool_calls 但无 finish 时合成 STOP；2s 工具空闲窗口只作用于该场景（`streaming.py:118-136`、`164-168`、`242-248`） |
+| **PG-04** functionCall/functionResponse 强制 Struct | `coerce_function_call_args` 把非 dict/JSON 对象包成 `{"content": ...}`；`coerce_function_response` 包成 `{"result": ...}`；`[toolshape]` 只记录脱敏形状摘要（`wire_types.py:336-372`、`chat_service.py:619-704`） |
 
 ### 8.3 ATG（Anti-Truncation Gateway）
 
-- 默认 off，按协议/模型开启；`mode` 支持 `off/prefer/required`，`mode_by_format` 可按协议覆盖（`defaults/config.yaml`、`application/atg/config.py`）。
+- 默认 off，按协议/模型开启；`mode` 支持 `off/prefer/required`，`mode_by_format` 可按 gemini/openai/claude/responses 覆盖（`defaults/config.yaml:134-150`、`application/atg/config.py`）。
 - `prefer`：注入合成传输；上游未返回合成工具调用时回落纯文本。
 - `required`：必须出现合成调用，否则 `SyntheticRequiredError`。
-- 流式解包对 `body/thinking/tool_calls/images/reasoning_images` 事件调用 unwrapper；`usage/finish_reason/response_id/thought_signature` 等其他事件原样透传（`generation_service.py:42-44`、`385-423`）。
-- 客户端已自带合成传输时跳过本地 wrap，避免双重包装（`generation_service.py:107-115`）。
+- 流式解包对 `body/thinking/tool_calls/images/reasoning_images` 事件调用 unwrapper；`usage/finish_reason/response_id/thought_signature` 等其他事件原样透传（`generation_service.py:49-59`、`:382-611`）。
+- 客户端已自带合成传输时跳过本地 wrap，避免双重包装（`generation_service.py:94-132`）。
 
 ---
 
@@ -448,5 +464,84 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:772-9
 
 - 全局维持 **单个受控 Chromium 进程**，多个实例通过独立 `BrowserContext` 隔离；避免每个实例一个浏览器进程导致内存膨胀。
 - 启动限制参数保留 `--renderer-process-limit=1`、`--in-process-gpu`、128MB V8 限制、`--use-gl=angle --use-angle=swiftshader`、`--mute-audio` 等低内存/伪装参数（`AGENT.md` §4.7、`browser_engine.py`）。
-- 并发请求在各自 Page 内以轻量 `Fetch + ReadableStream` 执行，流结束后执行 `DOM_GC_CLEANUP_JS` 与 V8 GC 控制内存（`pooled_session.py:244-259`）。
+- 并发请求在各自 Page 内以轻量 `Fetch + ReadableStream` 执行，流结束后执行 `DOM_GC_CLEANUP_JS` 与 V8 GC 控制内存（`pooled_session.py:304-320`）。
+- 每个账号 Page 在首次导航前注入确定性 Windows 桌面指纹（GPU/屏幕/UA/CPU/内存/语言），避免暴露容器或 Termux 的 SwiftShader 软件渲染器（`browser/fingerprint.py:1-24`、`:443-497`）。
 - 依赖管理使用 `uv`；`uv.lock` 不纳入版本控制，桌面端直接使用 PyPI wheel，Termux 通过本地 `uv.toml` 使用 TUR 源，避免跨平台 wheel 源锁定冲突。
+
+---
+
+## 10. 四协议接入、SSE 首包与指纹
+
+### 10.1 四协议路由
+
+| 协议 | 入口 | 请求契约 | 转换器 | 响应器 | 默认 |
+|---|---|---|---|---|---|
+| Gemini | `routes_gemini.py:25-61` | `contracts/gemini.py` | 原生 `chat_service.py` | `gemini_service.py` | 常驻 |
+| OpenAI Chat | `routes_openai.py:99-221` | `contracts/openai.py` | `format_converters/openai_request.py` | `openai_response.py` | `features.formats.openai=true` |
+| Claude Messages | `routes_claude.py:175-252` | `contracts/claude.py` | `claude_request.py` | `claude_response.py` | `features.formats.claude=true` |
+| OpenAI Responses | `routes_responses.py:96-249` | `contracts/responses.py` | `responses_request.py` | `responses_response.py` | `features.formats.responses=true` |
+
+`features.formats.{openai,claude,responses}` 默认 `true`（`defaults/config.yaml:112-117`）；显式 `false` 时对应路由由
+`require_format_enabled` 返回 403 `feature_disabled`（`api/format_errors.py:114-126`）。四个协议都支持非流式、SSE 流式与
+对应的 token 计数端点（Gemini `:countTokens`、Claude `/v1/messages/count_tokens`、Responses `/v1/responses/input_tokens`）。
+
+### 10.2 SSE 首包与保活
+
+`api/sse_keepalive.py` 统一四个流式协议的首包与心跳：
+
+- `DEFAULT_KEEPALIVE_INTERVAL_SEC = 15.0`，`KEEPALIVE_FRAME = ": keepalive\n\n"`（`sse_keepalive.py:29-32`）。
+- `keepalive_interval_sec()` 读取 `AISTUDIO_SSE_KEEPALIVE_SEC`；非法、非有限、0 或负值回退 15 秒（`:54-76`）。
+- `preread_window_sec()` 读取 `AISTUDIO_SSE_PREREAD_WINDOW_SEC`；未设置/非法时跟随心跳间隔（`:79-90`）。
+- `KeepaliveIterator.next_event(timeout)` 在首窗超时后保留同一个 `__anext__` task，调用方可以先返回 200，再在 body 中继续等待并周期性 yield 心跳（`:103-175`）；`aclose()` 幂等且有界（`:177-211`）。
+- 首窗内失败（空流、`BrowserTransportError`、`AtgError` 等）仍返回真实 HTTP 4xx/5xx；首窗后失败只能以 SSE error 帧表达（`routes_claude.py:101-130`、`routes_responses.py:138-166`、`gemini_service.py:222-278`）。
+
+### 10.3 按账号确定性桌面指纹
+
+`infrastructure/browser/fingerprint.py`（P3-F）在 Page 首次导航前注入指纹：
+
+1. 账号键归一化：优先账号 id，其次 auth 文件“父目录+文件名”；同一账号恒定、不同账号不同（`fingerprint.py:230-253`）。
+2. SHA-256 派生种子，从固定池选择 GPU（NVIDIA/Intel/AMD ANGLE D3D11）、屏幕（1920x1080/2560x1440/1680x1050/1920x1200）、
+   Chrome 版本、CPU 核数、设备内存、平台版本与语言（`fingerprint.py:255-325`）。
+3. 禁止池中出现 `swiftshader/mesa/llvmpipe/software rasterizer/basic render driver`（`fingerprint.py:45-53`、`:327-349`）。
+4. `Page.addScriptToEvaluateOnNewDocument` 注册 `fingerprint_spoof.js` 为 fail-closed：注册失败抛错并中止启动；
+   `Emulation.setDeviceMetricsOverride` 为 best-effort（`fingerprint.py:443-497`）。
+5. 池化会话与控制面会话都在 Cookie 注入/导航前调用 `apply_fingerprint`（`pooled_session.py:95-102`、`session.py:324-330`、`:617-622`）。
+6. 实例/账号视图通过无浏览器的 `get_account_fingerprint` 返回摘要，用于 UI 展示（`fingerprint.py:420-433`、`routes_instances.py:82-99`）。
+
+---
+
+## 11. 双口径统计台账与 UI 调试沙盒
+
+### 11.1 Client / Attempt 双口径
+
+`api/state.py` 维护严格分离的两套计数：
+
+- **Attempt**：每次真实上游执行。`RuntimeState.record`（`state.py:844-854`）与 `RoutingPipeline.record_success` /
+  `_record_error` 写入；字段为 `attempts/success/rate_limited/errors`（`state.py:203-241`）。
+- **Client**：每个客户端生成请求只记一次终态。`generation_service._record_client_terminal`（`generation_service.py:161-227`）
+  通过 `RoutingPipeline.record_client`（`routing_pipeline.py:718-739`）写入；字段为
+  `requests/success/errors/aborted/rate_limited/rescued_requests`（`state.py:142-200`）。
+- 429 同号重试或切号成功后，Client 仍只记 1 次成功并计 1 次 `rescued`；Attempt 会记录失败尝试与最终成功两条。
+- `countTokens` 独立进入 `count_tokens` 台账（`state.py:243-269`、`:882-898`），不进入生成成功率分母，也不计入生成 Token 总量。
+- 统计持久化为 v2 envelope：`schema_version/models/daily/count_tokens`（`state.py:40-66`、`:725-750`）；
+  `load_stats` 只从 `models`/`daily` 读取，保留键（`finish_reasons` 等）不会被渲染为模型行（`state.py:626-709`）。
+
+### 11.2 90 天 daily 与 by_model
+
+- 自然日按 `Asia/Shanghai`（UTC+8）切分，保留 90 天并自动裁剪（`state.py:41-43`、`:404-439`）。
+- `GET /stats` 的 `days=None` 返回全时段汇总 + 最近 90 个 daily 点；`?days=7|30|90` 把
+  `totals/client/attempt` 限定到窗口并返回恰好 N 个连续日期（`routes_system.py:99-197`、`state.py:516-583`）。
+- 每日条目包含 `client`、`attempt`、`tokens` 与 `by_model`（每模型各自的 client/attempt/tokens）；Token 分项为
+  `prompt/cached/completion/reasoning/total`（`state.py:554-573`、`:474-513`）。
+- 前端「模型调用统计」卡片内嵌列表/趋势双模式：左栏请求次数渐变面积曲线，右栏 Tokens 分项柱状图，
+  支持 7/30/90 天与单模型筛选。
+
+### 11.3 UI 调试沙盒
+
+- `diagnostics.ui_debug`（或 `AISTUDIO_UI_DEBUG`）启用纯离线沙盒；启动时在任何配置/日志/API Key 路由和
+  `validate_config` 之前，`UiDebugIsolation` 把配置、数据、账号、统计、模型缓存、日志与 dump 路径重定向到临时目录，
+  关闭时恢复并清理（`app.py:330-388`、`ui_sandbox.py:175-219`）。
+- 沙盒不构造真实 client/browser、实例池、keepalive、模型发现或账号元数据网络刷新；提供确定性账号/实例/模型/统计种子
+  与 `simulate_requests` / `simulate_429` / `toggle_formats` 操作（`ui_sandbox.py:1086-1465`、`:2317-2318`）。
+- 沙盒统计保持 `prompt = cached + uncached`、`total = prompt + completion`、`attempts = success + rate_limited + errors`
+  恒等，并从 Attempt 计数反推合理的 Client 终态（`ui_sandbox.py:2001-2145`）。

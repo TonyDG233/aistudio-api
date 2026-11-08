@@ -1,6 +1,6 @@
 # 保活与日志技术规格
 
-- 状态：依据当前 `rebuild-upstream` 工作树源码整理，只读核对。
+- 状态：依据当前主仓源码整理，只读核对。
 - 范围：24h Cookie 保活（`slot.lifecycle_lock`、按槽位成功记账）、24h 元数据刷新与 `tier_checked_at` 3 天跳过、单一全局 job 锁、B4 三 sink（5000 环形缓冲 / 7 天归档 / SSE）、`safe_*` dump、写入/导出双重脱敏、历史清理与上限。
 - 非范围：实例池/路由调度、协议/工具调用。分别见 `INSTANCE_POOL_AND_ROUTING_SPEC.md` 与 `PROTOCOL_AND_TOOLCALL_SPEC.md`。
 - 文中 `file:line` 均指本仓库路径。
@@ -54,6 +54,8 @@
   - [7.5 历史数据生命周期](#75-历史数据生命周期)
 - [8. 残余限制](#8-残余限制)
 - [9. 证据索引](#9-证据索引)
+- [10. C1/C2c：/health 静默、401 去重与日志沙盒](#10-c1c2chealth-静默401-去重与日志沙盒)
+- [11. C4：Client/Attempt 双口径与 90 天 daily/by_model](#11-c4clientattempt-双口径与-90-天-dailyby_model)
 
 ---
 
@@ -66,16 +68,16 @@
 | `AccountKeepaliveService` | 单循环调度 metadata/auth/activity 三个 job；共用一把 job 锁 | `src/aistudio_api/application/account_keepalive.py:112-547` |
 | `AccountInfoRefresher` | 无浏览器直连探测 tier/登录态/邮箱；并发限流；进程内互斥 | `src/aistudio_api/infrastructure/account/account_info_refresher.py:191-398` |
 | `AccountStore` | 持久化 `auth_saved_at`、`last_refresh_attempt_at`、`last_refresh_error`、`tier_checked_at` | `src/aistudio_api/infrastructure/account/account_store.py:718-778` |
-| `PooledSession` | 提供 `save_current_cookies()` | `src/aistudio_api/infrastructure/gateway/pooled_session.py:261-262` |
-| `InstanceManager.pool_slots()` | 暴露池槽位给保活回写 | `src/aistudio_api/application/instance_manager.py:623-626` |
-| 日志三 sink | stderr、broadcast ring、daily archive | `src/aistudio_api/infrastructure/utils/logger.py:310-349` |
-| `LogBroadcaster` | 5000 条环形缓冲 + asyncio 订阅者 | `src/aistudio_api/infrastructure/utils/log_broadcast.py:126-267` |
-| `DailyLogFileHandler` | `data/logs/aistudio-YYYYMMDD.log`，7 天保留 | `log_broadcast.py:350-406` |
-| 日志路由 | SSE `/logs/stream` 与 `/logs/export` | `src/aistudio_api/api/routes_logs.py:113-286` |
+| `PooledSession` | 提供 `save_current_cookies()` | `src/aistudio_api/infrastructure/gateway/pooled_session.py:321-322` |
+| `InstanceManager.pool_slots()` | 暴露池槽位给保活回写 | `src/aistudio_api/application/instance_manager.py:676-680` |
+| 日志三 sink | stderr、broadcast ring、daily archive | `src/aistudio_api/infrastructure/utils/logger.py:310-350` |
+| `LogBroadcaster` | 5000 条环形缓冲 + asyncio 订阅者 | `src/aistudio_api/infrastructure/utils/log_broadcast.py:126-286` |
+| `DailyLogFileHandler` | `data/logs/aistudio-YYYYMMDD.log`，7 天保留 | `log_broadcast.py:368-441` |
+| 日志路由 | SSE `/logs/stream` 与 `/logs/export` | `src/aistudio_api/api/routes_logs.py:114-286` |
 
 ### 1.2 默认配置
 
-`defaults/config.yaml:47-55`：
+`defaults/config.yaml:91-100`：
 
 ```yaml
 features:
@@ -89,7 +91,7 @@ features:
     active_activity_seconds: 60
 ```
 
-`defaults/config.yaml:27-31`：
+`defaults/config.yaml:54-64`：
 
 ```yaml
 logging:
@@ -99,7 +101,7 @@ logging:
   dump_dir: dumps
 ```
 
-`get_configured_keepalive_settings` 在缺失/非法时回退 24h 默认值（`model_defaults.py:1450-1469`）。`KeepaliveSettings.from_mapping` 对 bool/float 做类型检查（`account_keepalive.py:54-88`）。
+`get_configured_keepalive_settings` 在缺失/非法时回退 24h 默认值（`model_defaults.py:1535-1555`）。`KeepaliveSettings.from_mapping` 对 bool/float 做类型检查（`account_keepalive.py:55-90`）。
 
 ---
 
@@ -138,10 +140,10 @@ stop_event.clear()
 task = create_task(_run(), name="account_keepalive")
 ```
 
-应用启动时传 `startup_metadata_done=True`（`api/app.py:386-388`），因此：
+应用启动时传 `startup_metadata_done=True`（`api/app.py:504-505`），因此：
 
 - 调度器不会在启动瞬间再次跑 metadata；
-- 应用层随后显式调用 `run_startup_metadata_refresh()`（`api/app.py:397-415`），确保启动元数据只跑一次并与后续 3 天跳过协调。
+- 应用层随后显式调用 `run_startup_metadata_refresh()`（`api/app.py:513-534`），确保启动元数据只跑一次并与后续 3 天跳过协调。
 
 `stop` 设置 stop event，取消并等待 task（`account_keepalive.py:188-196`）。
 
@@ -250,7 +252,7 @@ HTTP：
 
 `_pool_slots`（`:148-160`）通过 `instance_manager.pool_slots()` 获取槽位；异常时 warning 并返回空元组。
 
-`InstanceManager.pool_slots`（`instance_manager.py:623-626`）先 `_sync_records()`，再返回 `pool.slots()` 元组。
+`InstanceManager.pool_slots`（`instance_manager.py:676-680`）先 `_sync_records()`，再返回 `pool.slots()` 元组。
 
 ### 3.3 按槽位回写
 
@@ -279,7 +281,7 @@ return (account_id, slot_id, saved)
 - 没有 `lifecycle_lock` 时才直接保存（兼容测试替身）。
 - 保存失败不会抛出到 job 层，而是返回 `saved=False`，由上层记账。
 
-`PooledSession.save_current_cookies`（`pooled_session.py:261-262`）委托 `save_browser_cookies(page, auth_file)`。
+`PooledSession.save_current_cookies`（`pooled_session.py:321-322`）委托 `save_browser_cookies(page, auth_file)`。
 
 ### 3.4 控制会话回写
 
@@ -344,7 +346,7 @@ for account in saved_accounts:
 - `page.evaluate("() => { window.scrollBy(0, 2); return true; }")`。
 - 成功 -> `{ok:True, reason:"activity"}`。
 
-默认关闭（`defaults/config.yaml:54`）。没有 idle 回收/重建逻辑；它只是可选的控制页活动。
+默认关闭（`defaults/config.yaml:99`）。没有 idle 回收/重建逻辑；它只是可选的控制页活动。
 
 ### 3.7 时序图：auth_update
 
@@ -416,7 +418,7 @@ return {ok: failed==0, reason:"checked", count:len(results), failed, accounts:[.
 
 ### 4.2 3 天 tier 新鲜度
 
-`is_verified_free_tier_fresh`（`account_info_refresher.py:144-152`）：
+`is_verified_free_tier_fresh`（`account_info_refresher.py:149-158`）：
 
 ```text
 if account.tier != "Free": return False
@@ -425,9 +427,9 @@ if checked is None: return False
 return now - checked < TIER_PROBE_FRESHNESS_SECONDS
 ```
 
-`TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400`（`:126`）。
+`TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400`（`:131`）。
 
-`refresh_account` 的跳过分支（`:246-271`）：
+`refresh_account` 的跳过分支（`:252-277`）：
 
 - 读取 cookie；缺失 -> `ok=False`，错误提示重新导入。
 - 若 `skip_fresh_free_tier and is_verified_free_tier_fresh(account)`：
@@ -436,42 +438,42 @@ return now - checked < TIER_PROBE_FRESHNESS_SECONDS
   - 返回 `ok=True, tier=旧 tier, expired=False, checked_at=now`。
   - **不更新 `tier_checked_at`**；因此 3 天窗口从上次真实 tier 探测开始计算。
 
-正常 200 分支（`:277-320`）：
+正常 200 分支（`:280-336`）：
 
 - 解析 tier。
 - 需要时抓取邮箱。
 - `update_account_refresh(tier=..., tier_checked_at=checked_at, expired=False, email=...)`。
 - 返回 `ok=True`。
 
-401 分支（`:322-344`）：
+401 分支（`:338-374`）：
 
 - `update_account_refresh(expired=True)`。
 - 返回 `ok=False, expired=True`。
 
-其他非权威失败（`:346-356`）：
+其他非权威失败（`:374-378`）：
 
 - 不改账号状态，返回 `ok=False`。
 - `_metadata_refresh` 仍会 `mark_refresh_attempt` 记录错误。
 
 ### 4.3 启动时的两层协调
 
-应用启动（`api/app.py:397-415`）：
+应用启动（`api/app.py:513-534`）：
 
 1. 若 `metadata_refresh` 且 `metadata_refresh_on_startup`：
    - `keepalive.run_startup_metadata_refresh()`。
    - 若返回 `reason in ("checked","no_due_accounts")`，把 `accounts` 记为 `covered_ids`。
 2. `_refresh_startup_account_metadata(account_store, covered_ids=covered_ids)`。
 
-`_refresh_startup_account_metadata`（`api/app.py:150-249`）：
+`_refresh_startup_account_metadata`（`api/app.py:194-301`）：
 
-- 跳过已被 keepalive 覆盖的账号（`:174-183`）。
+- 跳过已被 keepalive 覆盖的账号（`:216-225`）。
 - 账号需要检查的条件：
   - 没有 email，或
   - `tier_checked_at` 缺失，或
   - `tier_checked_at` 超过 3 天。
 - 有 cookie 才继续；没有 email 先探 email。
-- 若 `is_verified_free_tier_fresh(account)` -> 跳过 tier 探测（`:217-223`）。
-- 否则调用 `probe_account_benefit_tier`，`update_account_tier(..., checked_at=now)`（`:224-232`）。
+- 若 `is_verified_free_tier_fresh(account)` -> 跳过 tier 探测（`:252-258`）。
+- 否则调用 `probe_account_benefit_tier`，`update_account_tier(..., checked_at=now)`（`:260-270`）。
 
 因此启动阶段最多两层：
 
@@ -510,7 +512,7 @@ Scheduler tick
 
 ### 5.1 三 sink 装配
 
-`setup_logging`（`logger.py:310-349`）：
+`setup_logging`（`logger.py:310-350`）：
 
 ```text
 formatter = UnifiedFormatter()
@@ -541,7 +543,7 @@ cleanup_old_logs()  # 启动清理超过 7 天
 
 ### 5.2 环形缓冲（5000）
 
-`LogBroadcaster`（`log_broadcast.py:126-267`）：
+`LogBroadcaster`（`log_broadcast.py:126-286`）：
 
 - `DEFAULT_CAPACITY = 5000`（`:23`）。
 - `DEFAULT_QUEUE_SIZE = 500`（`:24`）。
@@ -551,7 +553,7 @@ cleanup_old_logs()  # 启动清理超过 7 天
 - `publish`：
   - 校验 level 名称（`level_number`，未知抛 `ValueError`）（`:81-87`）。
   - 时间戳默认本地时区 ISO 秒（`:171`）。
-  - `sanitize_log_message` 清洗（`:172`）。
+  - `sanitize_log_message` 清洗（`:178`）。
   - 追加 entry；超过容量时优先删除最早的低级别（DEBUG/INFO）记录；若没有低级别则 `popleft()`（`:184-191`）。
   - 对每个订阅者 `loop.call_soon_threadsafe(_deliver, ...)`（`:192-201`）。
 - `subscribe`：
@@ -581,19 +583,19 @@ cleanup_old_logs()  # 启动清理超过 7 天
 - 只匹配 `^aistudio-(\d{8})\.log$`；早于 cutoff 的文件 `unlink`。
 - 返回删除的文件列表。
 
-`DailyLogFileHandler`（`:350-406`）：
+`DailyLogFileHandler`（`:368-441`）：
 
 - 每次 `emit` 取当天日期；跨天时 `_open_for_day`。
-- `_open_for_day` 先关闭旧流，调用 `cleanup_old_logs`，再以追加模式打开 `aistudio-YYYYMMDD.log`（`:389-398`）。
+- `_open_for_day` 先关闭旧流，调用 `cleanup_old_logs`，再以追加模式打开 `aistudio-YYYYMMDD.log`（`:420-441`）。
 - 写入格式：`YYYY-MM-DD HH:MM:SS LEVEL logger message`。
-- 写入前 `sanitize_log_message(record.getMessage())`（`:375`）。
+- 写入前 `sanitize_log_message(record.getMessage())`（`:393`）。
 - 每次写入后 `flush()`（`:381`）。
 
 启动时 `setup_logging` 也会调用一次 `cleanup_old_logs`（`logger.py:337-339`）。
 
 ### 5.4 SSE 流
 
-路由 `GET /logs/stream`（`routes_logs.py:113-154`）：
+路由 `GET /logs/stream`（`routes_logs.py:114-156`）：
 
 - 支持 query `level`（默认 `DEBUG`）与 `last_id`，也支持 `Last-Event-ID` header（`:120-125`）。
 - `prepare_stream` 先校验 level，再订阅，再 replay（`:35-47`）；这样不会丢失订阅与 replay 之间的日志。
@@ -641,7 +643,7 @@ data: {"dropped": N}
 
 ### 5.5 导出
 
-`GET /logs/export`（`routes_logs.py:256-286`）：
+`GET /logs/export`（`routes_logs.py:257-286`）：
 
 - 参数：`start`/`end` 或 `days`，二者不能混用（`:175-221`）。
 - `days` 必须 1..7；单次范围最多 7 天；必须在最近 7 天内（`:190-221`）。
@@ -653,8 +655,8 @@ data: {"dropped": N}
 
 第一层（写入）：
 
-- `publish` 对 message 调 `sanitize_log_message`（`log_broadcast.py:172`）。
-- `DailyLogFileHandler.emit` 对 message 再次调 `sanitize_log_message`（`:375`）。
+- `publish` 对 message 调 `sanitize_log_message`（`log_broadcast.py:178`）。
+- `DailyLogFileHandler.emit` 对 message 再次调 `sanitize_log_message`（`:393`）。
 - `sanitize_log_message` 覆盖：
   - Authorization header（Bearer 保留前缀，值打码）
   - Set-Cookie / Cookie header（整体打码）
@@ -665,11 +667,11 @@ data: {"dropped": N}
   - Bearer token
   - `sk-/rk-/pk-` token
   - `AIza...` Google API key
-  （`log_broadcast.py:40-78`）
+  （`log_broadcast.py:61-78`）
 
 第二层（导出）：
 
-- `_iter_sanitized_lines` 在读取归档时再次 `sanitize_log_message(line)`（`routes_logs.py:224-228`）。
+- `_iter_sanitized_lines` 在读取归档时再次 `sanitize_log_message(line)`（`routes_logs.py:224-229`）。
 - 因此即使归档文件是被旧版本/外部写入的未脱敏内容，导出也会再清洗一次。
 
 ### 5.7 时序图：日志写入与 SSE
@@ -712,7 +714,7 @@ Client GET /logs/stream
 
 ### 6.2 转储字段
 
-`safe_json_payload`（`:416-425`）：
+`safe_json_payload`（`:431-441`）：
 
 ```text
 safe_text = sanitize_log_message(text)
@@ -721,7 +723,7 @@ except: return safe_text
 return _sanitize_payload_value(parsed)
 ```
 
-`_sanitize_payload_value`（`:391-405`）：
+`_sanitize_payload_value`（`:406-429`）：
 
 - dict：敏感键（`_is_sensitive_key`）值替换为 `***`，其余递归。
 - list：逐项递归。
@@ -733,7 +735,7 @@ return _sanitize_payload_value(parsed)
 - 正则 `authorization|api[_-]?key|cookie|set-cookie|token|secret|password|auth|credential`。
 - 精确键 `key/api-key/apikey/x-goog-api-key`。
 
-`_safe_pretty_payload`（`:428-442`）：
+`_safe_pretty_payload`（`:443-458`）：
 
 - 尝试 JSON 解析；失败则 `sanitize_log_message(text)`。
 - 成功则 `json.dumps(_sanitize_payload_value(parsed), indent=2)`。
@@ -741,7 +743,7 @@ return _sanitize_payload_value(parsed)
 
 ### 6.3 文件 dump
 
-`dump_request_exchange`（`:445-565`）：
+`dump_request_exchange`（`:460-580`）：
 
 - `safe_url = sanitize_log_message(url)`。
 - `safe_headers = _mask_headers(headers)`。
@@ -766,7 +768,7 @@ record_data = {
 
 - 只写 `safe_*` 字段；不写 `headers` / `raw_body` / `response_body` 等原始键（`:507-528`）。
 - 文件路径：`get_dump_dir()/<clean_req_id>.json`，`req_id` 只保留 `\w-.`（`:500-502`）。
-- 同时覆盖 `latest_request.json`（`:532-533`）。
+- 同时覆盖 `latest_request.json`（`:547-548`）。
 - 异常只 warning，不影响请求（`:534-535`）。
 
 ### 6.4 仍会出现的字段
@@ -814,8 +816,8 @@ dump_request_exchange(...)
 | SSE 心跳 | 15 秒 | `routes_logs.py:31` |
 | 归档保留 | 7 天 | `log_broadcast.py:28` |
 | 单次导出范围 | 7 天 | `routes_logs.py:32`, `:190-221` |
-| dump 控制台正文 | 4000 字符截断 | `logger.py:428-442` |
-| dump 文件 | 每次请求一个 + `latest_request.json` | `logger.py:500-533` |
+| dump 控制台正文 | 4000 字符截断 | `logger.py:443-458` |
+| dump 文件 | 每次请求一个 + `latest_request.json` | `logger.py:512-548` |
 | 保留天数最小值 | 1 | `log_broadcast.py:326-327` |
 
 ### 7.2 环形缓冲淘汰
@@ -848,7 +850,7 @@ while len(entries) > capacity:
 
 ### 7.4 导出范围
 
-`resolve_export_range`（`routes_logs.py:175-221`）：
+`resolve_export_range`（`routes_logs.py:175-223`）：
 
 - `days` 与 `start/end` 互斥。
 - `days` 1..7。
@@ -893,11 +895,11 @@ while len(entries) > capacity:
 6. **归档清理只匹配标准文件名**：自定义命名或旧格式文件不会被自动清理（`log_broadcast.py:333-346`）。
 7. **保留天数固定 7**：`LOG_RETENTION_DAYS` 是常量，没有配置项；`cleanup_old_logs` 支持参数，但 `DailyLogFileHandler` 默认使用常量（`log_broadcast.py:28`, `:350-360`）。
 8. **归档按服务器本地日期分桶**：SSE 事件时间戳是本地时区 ISO；跨时区部署时“日期”语义依赖服务器本地时区（`log_broadcast.py:171`, `:372-376`）。
-9. **脱敏是正则启发式**：未覆盖的自定义凭据格式可能漏网；Cookie header 整体打码是最强保护，但非 header 形式的自定义 token 不一定命中（`log_broadcast.py:40-78`）。
-10. **dump 仍包含账号标识**：`account_id/auth_user/model/token_usage` 会落盘；共享 dump 前需自行评估（`logger.py:507-528`）。
-11. **dump 文件无自动清理**：只有归档日志有 7 天清理；`data/dumps` 由外部管理，代码不删除历史 dump（`logger.py:167-194`, `:500-533`）。
-12. **`latest_request.json` 覆盖写**：只保留最近一次请求（`logger.py:532-533`）。
-13. **dump 控制台截断**：超过 4000 字符只显示前 4000 + 总长度；文件 dump 不截断（`logger.py:428-442`）。
+9. **脱敏是正则启发式**：未覆盖的自定义凭据格式可能漏网；Cookie header 整体打码是最强保护，但非 header 形式的自定义 token 不一定命中（`log_broadcast.py:61-78`）。
+10. **dump 仍包含账号标识**：`account_id/auth_user/model/token_usage` 会落盘；共享 dump 前需自行评估（`logger.py:523-543`）。
+11. **dump 文件无自动清理**：只有归档日志有 7 天清理；`data/dumps` 由外部管理，代码不删除历史 dump（`logger.py:167-194`, `:512-548`）。
+12. **`latest_request.json` 覆盖写**：只保留最近一次请求（`logger.py:547-548`）。
+13. **dump 控制台截断**：超过 4000 字符只显示前 4000 + 总长度；文件 dump 不截断（`logger.py:443-458`）。
 14. **SSE 心跳是 15 秒固定值**：没有配置项（`routes_logs.py:31`）。
 15. **导出 ZIP 使用临时文件**：多日导出会先在 `TemporaryFile` 生成完整 ZIP 再分块发送（`routes_logs.py:238-249`）；极大归档会占用临时磁盘。
 16. **元数据刷新 24h 与 3 天跳过的双层语义**：Free 账号每 24h 仍会进入 due 并执行一次刷新过程，但 tier 探测被 3 天新鲜度跳过；这会产生“刷新尝试时间更新、tier_checked_at 不变”的现象（`account_keepalive.py:316-330`, `account_info_refresher.py:246-271`）。
@@ -912,16 +914,63 @@ while len(entries) > capacity:
 
 | 主题 | 主要证据 |
 |---|---|
-| 保活配置 | `defaults/config.yaml:47-55`; `model_defaults.py:1450-1469`; `account_keepalive.py:54-97` |
+| 保活配置 | `defaults/config.yaml:91-100`; `model_defaults.py:1535-1555`; `account_keepalive.py:55-90` |
 | 调度循环/锁 | `account_keepalive.py:112-139`, `:162-251`, `:253-296` |
-| auth_update | `account_keepalive.py:357-503`; `pooled_session.py:261-262`; `instance_manager.py:623-626` |
-| 成功记账 | `account_store.py:763-778` |
-| metadata_refresh | `account_keepalive.py:307-355`; `account_info_refresher.py:126-152`, `:227-356`, `:358-398` |
-| 启动协调 | `api/app.py:138-249`, `:379-415` |
-| 三 sink | `logger.py:272-349`; `log_broadcast.py:270-292`, `:350-406` |
-| 环形缓冲 | `log_broadcast.py:23-28`, `:126-267` |
-| 归档清理 | `log_broadcast.py:295-347`, `:389-398` |
-| SSE | `routes_logs.py:31-154`; `log_broadcast.py:229-267` |
+| auth_update | `account_keepalive.py:409-503`; `pooled_session.py:321-322`; `instance_manager.py:676-680` |
+| 成功记账 | `account_store.py:761-777` |
+| metadata_refresh | `account_keepalive.py:307-355`; `account_info_refresher.py:131-158`, `:232-380`, `:382-502` |
+| 启动协调 | `api/app.py:194-301`, `:504-534` |
+| 三 sink | `logger.py:310-350`; `log_broadcast.py:288-311`, `:368-441` |
+| 环形缓冲 | `log_broadcast.py:23-28`, `:126-286` |
+| 归档清理 | `log_broadcast.py:337-366`, `:420-441` |
+| SSE | `routes_logs.py:31-154`; `log_broadcast.py:209-274` |
 | 导出 | `routes_logs.py:175-286` |
-| 脱敏 | `log_broadcast.py:40-78`, `:172`, `:375`; `routes_logs.py:224-246` |
-| dump | `logger.py:121-265`, `:362-442`, `:445-565` |
+| 脱敏 | `log_broadcast.py:61-78`, `:178`, `:393`; `routes_logs.py:224-229` |
+| dump | `logger.py:121-265`, `:406-458`, `:460-580` |
+
+---
+
+## 10. C1/C2c：/health 静默、401 去重与日志沙盒
+
+### 10.1 `/health` 免密与静默
+
+- `/health` 注册在 `system_public_router`（无 Web 认证依赖），返回 `{status, busy, ui_debug, ui_debug_scenario}`（`routes_system.py:50-58`、`:200-203`、`app.py:560-561`）。
+- 访问日志中间件对 `path == "/health"` 且 `status_code == 200` 的成功探针完全不记录：不写 INFO、不写 DEBUG、不进入广播 ring（`app.py:840-851`）。
+- 因此容器 HEALTHCHECK 可以高频轮询，不会制造日志洪水；失败探针仍按普通 HTTP 日志记录。
+
+### 10.2 `/v1beta/models` 缺 Key 401 五分钟去重
+
+- `_MISSING_KEY_WARN_WINDOW_SECONDS = 300.0`，按 `(client_ip, path)` 去重；状态表有 1024 上限并按窗口清理（`dependencies.py:20-27`、`:76-104`）。
+- 首次缺 Key 401 打 WARNING，附带截断到 80 字符的 `User-Agent` 与去除 query/fragment 的 `Referer`，不记录密钥本身（`dependencies.py:112-143`）。
+- 窗口内重复项降为 DEBUG，并累计抑制次数（`dependencies.py:123-134`）。
+- 只读模型列表路由使用 `require_api_key_or_web_session` → `_validate_api_key(read_only=True)`；生成路由仍用严格 `require_api_key`（`dependencies.py:215-292`）。
+- `x-api-key`、`x-goog-api-key`、`key` 查询参数与 `Authorization: Bearer` 统一解析（`dependencies.py:146-176`）。
+
+### 10.3 C2c 日志沙盒注入
+
+- `ui_debug` 启动时，`UiDebugIsolation.enter()` 在 `validate_config()` 与任何 config/log/API Key 路由之前执行（`app.py:330-346`）。
+- 它把 `AISTUDIO_CONFIG_PATH`、`AISTUDIO_LOG_DIR`、数据目录、账号目录、统计文件、模型缓存、签名缓存与 dump 路径重定向到临时目录，并同步 `settings`（`ui_sandbox.py:175-219`）。
+- `DailyLogFileHandler`、`resolve_log_dir`、`resolve_data_dir` 都读取重定向后的路径，因此 UI 调试产生的日志只落临时目录，关闭时随沙盒清理，不污染真实 `data/logs`。
+- 关闭顺序为 `sandbox.close()` → 取消后台任务 → keepalive → instance_manager → client；随后 `isolation.close()` 恢复原始环境（`app.py:372-388`、`:303-328`）。
+
+---
+
+## 11. C4：Client/Attempt 双口径与 90 天 daily/by_model
+
+### 11.1 两套台账
+
+`api/state.py` 明确分离：
+
+- **Attempt**：每次真实上游执行。`RuntimeState.record`（`state.py:844-854`）由 `RoutingPipeline.record_success` / `_record_error` 调用；字段 `attempts/success/rate_limited/errors`（`state.py:203-241`）。
+- **Client**：每个客户端生成请求只记一次终态。`RuntimeState.record_client`（`state.py:856-880`）由 `RoutingPipeline.record_client`（`routing_pipeline.py:718-739`）调用；字段 `requests/success/errors/aborted/rate_limited/rescued_requests`（`state.py:142-200`）。
+- 429 同号重试或切号成功后，Client 只记 1 次成功且 `rescued_requests += 1`；Attempt 记录失败尝试和最终成功两条。
+- `countTokens` 独立进入 `count_tokens` 台账（`state.py:243-269`、`:882-898`），不进入生成成功率分母，也不计入生成 Token 总量。
+
+### 11.2 持久化与 90 天 daily
+
+- stats 文件为 v2 envelope：`{schema_version, models, daily, count_tokens}`（`state.py:40-66`、`:725-750`）。
+- `load_stats` 只从 `models`/`daily` 读取；`finish_reasons` 等保留键被跳过，不会生成幽灵模型行（`state.py:626-709`）。
+- 自然日按 `Asia/Shanghai`（UTC+8）切分，保留 90 天并自动裁剪（`state.py:41-43`、`:404-439`）。
+- `build_stats_payload` 对 `days=None` 返回全时段 `totals/client/attempt` + 最近 90 个 daily 点；`days=7|30|90` 把汇总限定到窗口并返回恰好 N 个连续日期（`state.py:516-583`）。
+- 每日条目包含 `client`、`attempt`、`tokens`、`by_model`；Token 分项为 `prompt/cached/completion/reasoning/total`（`state.py:474-513`、`:554-573`）。
+- `GET /stats` 支持 `?days=7|30|90`（`routes_system.py:205-208`）；`ui_debug` 沙盒使用同一渲染路径并保持统计恒等（`routes_system.py:99-197`、`ui_sandbox.py:2001-2145`）。

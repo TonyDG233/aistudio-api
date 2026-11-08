@@ -2,9 +2,9 @@
 
 本文档面向所有参与本项目的代码代理（Coding Agents）与开发者，明确核心架构共识、运行环境约束与代码规范。
 
-适用范围：目标施工区 `.kilo/worktrees/rebuild-upstream`（上游骨架 `99c38ba`）。行为权威是 `docs/dev/rebuild/06-decision-log.md` 全文与 `docs/dev/rebuild/08-09-decision-record.md` 的 D-01..D-14；两者冲突时以 `08-09` 为准。本文只固化工程口径，不新增决策。
+适用范围：本仓库主工作区。主工作区即唯一常态开发、审查与交付工作区，所有 Worker/Reviewer 直接在同一工作树内读写、测试与出报告。行为权威是 `docs/dev/rebuild/06-decision-log.md` 全文与 `docs/dev/rebuild/08-09-decision-record.md` 的 D-01..D-14；两者冲突时以 `08-09` 为准。本文只固化工程口径，不新增决策。
 
-主工作区 `rebuild`（约 5.5 万行旧 fork）只作只读参考与失败样本；严禁把旧分支整树 merge、checkout 或覆盖到目标树。
+历史 `docs/dev/rebuild/` 与旧 `rebuild` 分支只作决策依据与只读失败样本；严禁把旧分支整树 merge、checkout 或覆盖当前代码。
 
 ---
 
@@ -19,7 +19,7 @@
 - [7. 保活、日志与协议面](#7-保活日志与协议面)
 - [8. 配置口径](#8-配置口径)
 - [9. 代码结构索引](#9-代码结构索引)
-- [10. 智能体工作流与 B 阶段纪律](#10-智能体工作流与-b-阶段纪律)
+- [10. 智能体工作流与发布纪律](#10-智能体工作流与发布纪律)
 
 ---
 
@@ -27,7 +27,8 @@
 
 `aistudio-api` 是 Google AI Studio 反向代理网关。
 
-- **协议面**：原生 Gemini API（`/v1beta/...`）是第一协议面；最小可用闭环同时要求 OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）。所有协议请求归一到协议中立核心，响应在格式边界逆变换；核心生成管线不得散落协议判断。Claude 在 Build 之后，Responses 更后。
+- **分层边界（硬约束）**：`api` 只做协议校验、鉴权与响应渲染；`application` 编排用例，严禁 import `fastapi` 或 `aistudio_api.api`；`domain` 只放纯模型与错误契约；`infrastructure` 提供浏览器、CDP、存储等适配器，严禁反向 import `aistudio_api.application`。依赖方向固定为 `api → application → domain ← infrastructure`。
+- **协议面**：原生 Gemini API（`/v1beta/...`）、OpenAI Chat Completions（`/v1/chat/completions`、`/v1/models`）、Claude Messages（`/v1/messages`）与 OpenAI Responses（`/v1/responses`）四种协议面均已完成并默认启用；OpenAI/Claude/Responses 可通过 `features.formats` 关闭。所有协议请求归一到协议中立核心，响应在格式边界逆变换；核心生成管线不得散落协议判断。
 - **轻量 CDP 驱动**：使用纯 Python 异步 WebSocket 直连 Chrome DevTools Protocol（CDP），不依赖 Node.js、Playwright 或 Selenium。
 - **浏览器内 XHR Replay**：在 MakerSuite 页面上下文中执行携带 `withCredentials = true` 的异步 XHR 请求，天然复用完整的 Cookie 会话、BotGuard 快照与环境指纹。
 - **代码即事实标准（Code as Ground Truth）**：通过全量测试验证的代码是系统的事实标准。当技术规范文档与真实代码逻辑出现分歧时以代码为准，并在重构过程中同步更新文档；但不得用“代码如此”为违反 `06`/`08-09` 的旧实现辩护。
@@ -164,7 +165,7 @@ uv run python3 main.py server --port 8080
    - **严禁保留 `@deprecated` 向下兼容存根、无意义的历史 shim 别名包装或 `_unused_*` 废弃形参**；全库一次性完整迁移所有调用方和对应测试断言。
 10. **测试与契约纪律**：
     - 禁止为通过测试修改测试/配置/契约；测试失败必须区分“业务回归”与“本机平台差异”，并给出复现命令。
-    - 旧 fork 的蓝绿、lease、同账号双页等测试只作行为参考，按 `06-test-disposition.csv` 处置，不得作为新契约。
+    - 历史蓝绿、lease、同账号双页等测试只作行为参考，按 `06-test-disposition.csv` 处置，不得作为当前契约。
 
 ### 3.4 自动化检查命令与执行守则
 
@@ -204,16 +205,16 @@ uv run python3 main.py server --port 8080
 
 #### 4.1.1 实例 Tier 选择器（only_tier / min_tier / max_tier）
 
-实例 tier 选择器定义账号可落入的闭区间；实现事实在 `application/model_access.py` 与 `infrastructure/gateway/model_defaults.py`。
+实例 tier 选择器定义账号可落入的闭区间；实现事实在 `domain/model_access.py` 与 `infrastructure/gateway/model_defaults.py`。
 
-- **至少一个选择器**：`only_tier`/`min_tier`/`max_tier` 至少一个非空；`None`/空字符串视为未提供；显式提供的非空值必须是字符串，非字符串（如数字/列表）或未知 tier 名称一律 fail-fast（`model_access.py:96-116`、`model_defaults.py:300-332`）。未知/非字符串不得静默忽略，否则槽位会漂移到非预期 lane。
-- **`only_tier` 精确钉住**：`Free` 归一 `Free..Free`；`Ultra` 展开 `Ultra..Ultra_20X`；`Plus`/`Pro` 保持精确。`only_tier` 不得与不同的 `min_tier/max_tier` 同时配置；允许标准化后的同区间写法（如 `only=Free,min=Free,max=Free`）（`model_access.py:140-155`）。
-- **`min_tier` 单独**：`Free` → `Free..Free`；付费 tier → `min..Ultra_20X`（`model_access.py:167-170`）。
-- **`max_tier` 单独**：`Free` → `Free..Free`；付费上限下界默认 `Pro`，不能低于 Pro；确需 Plus 槽位时显式 `only_tier: Plus`（`model_access.py:157-165`）。
-- **`min_tier` + `max_tier`**：形成闭区间；要求 `rank(min) <= rank(max)`；Free 只能 `Free..Free`，不得与付费混合；付费区间 `min` 不能低于 Plus、`max` 不能低于 Pro（`model_access.py:172-188`）。
-- **Lane 规则**：Free 选择器只落 Free lane；任何付费选择器落 paid lane；账号 tier 必须先匹配 lane，再满足 `min..max`（`model_access.py:191-196`、`instance_pool.py:180-190`）。`InstancePool.add_slot` 与 `InstanceManager.reassign` 都拒绝跨 lane（`instance_pool.py:327-343`、`instance_manager.py:389-404`）。
-- **归一化与合并**：所有 Free 选择器归一为 `only=Free,min=Free,max=Free`，使 `only_tier: Free` 与旧 `min_tier: Free` 合并 count；paid `only_tier` 单独成键；`min/max` 仅在上界显式配置时把上界纳入合并键（`model_defaults.py:345-391`）。
-- **运行时契约**：`InstanceSpec.from_mapping` 归一 spec，`spec.selector` 生成闭区间，`accepts_tier` 校验账号（`instance_pool.py:71-114`）；实例 API 返回 `only_tier/min_tier/max_tier`，前端 `.vue` 暂不改，留待 C2（`domain/instances.py:18-33`、`instance_manager.py:1031-1047`）。
+- **至少一个选择器**：`only_tier`/`min_tier`/`max_tier` 至少一个非空；`None`/空字符串视为未提供；显式提供的非空值必须是字符串，非字符串（如数字/列表）或未知 tier 名称一律 fail-fast（`model_access.py:140-160,179-182`、`model_defaults.py:317-448`）。未知/非字符串不得静默忽略，否则槽位会漂移到非预期 lane。
+- **`only_tier` 精确钉住**：`Free` 归一 `Free..Free`；`Ultra` 展开 `Ultra..Ultra_20X`；`Plus`/`Pro` 保持精确。`only_tier` 不得与不同的 `min_tier/max_tier` 同时配置；允许标准化后的同区间写法（如 `only=Free,min=Free,max=Free`）（`model_access.py:184-199`）。
+- **`min_tier` 单独**：`Free` → `Free..Free`；付费 tier → `min..Ultra_20X`（`model_access.py:211-214`）。
+- **`max_tier` 单独**：`Free` → `Free..Free`；付费上限下界默认 `Pro`，不能低于 Pro；确需 Plus 槽位时显式 `only_tier: Plus`（`model_access.py:201-209`）。
+- **`min_tier` + `max_tier`**：形成闭区间；要求 `rank(min) <= rank(max)`；Free 只能 `Free..Free`，不得与付费混合；付费区间 `min` 不能低于 Plus、`max` 不能低于 Pro（`model_access.py:216-232`）。
+- **Lane 规则**：Free 选择器只落 Free lane；任何付费选择器落 paid lane；账号 tier 必须先匹配 lane，再满足 `min..max`（`model_access.py:235-240`、`instance_pool.py:109-114,182-191`）。`InstancePool.add_slot` 与 `InstanceManager.reassign` 都拒绝跨 lane（`instance_pool.py:409-446`、`instance_manager.py:424-478`）。
+- **归一化与合并**：所有 Free 选择器归一为 `only=Free,min=Free,max=Free`，使 `only_tier: Free` 与旧 `min_tier: Free` 合并 count；paid `only_tier` 单独成键；`min/max` 仅在上界显式配置时把上界纳入合并键（`model_defaults.py:401-431`）。
+- **运行时契约**：`InstanceSpec.from_mapping` 归一 spec，`spec.selector` 生成闭区间，`accepts_tier` 校验账号（`instance_pool.py:72-114`）；实例 API 返回 `only_tier/min_tier/max_tier`，前端类型与页面已使用这些字段（`domain/instances.py:20-35`、`instance_manager.py:1241-1253`）。
 
 ### 4.2 Free/Pro 多实例池（核心灵魂）
 
@@ -269,7 +270,7 @@ uv run python3 main.py server --port 8080
 ## 5. 路由、错误与重试
 
 - **Free/Pro 分流**：Free 模型走 Free 池；paid 模型必须 Pro 及以上，且先 chat；实例 tier 区间只决定账号能否落槽，不改变模型准入。
-- **Paid 模型 tier 不足**：领域错误 → API 层按 OpenAI/Gemini/Claude/Responses 映射 403；错误体含 `tier/model/required_tier/current_tier`；不切号、不自动降级到 free、不得用 503 表达 tier 不足。
+- **Paid 模型 tier 不足（D-04/D-06）**：领域错误 → API 层按 OpenAI/Gemini/Claude/Responses 映射 403；错误体含 `tier/model/required_tier/current_tier`；不切号、不自动降级到 free、不得用 503 表达 tier 不足。
 - **429**：先同账号重试 → 唤醒/切现有池内实例 → 保存消息后切换再重试 → 耗尽 503 + 等待/管理页提示；已出正文不切号。
 - **鉴权 403**：不加硬冷却锁（`auth_cooldown=0.0`）；首次 403 重新签名并原位重试，第二次 403 才切换到健康账号；`auth_errors` 只累加计数，调度准入不读取，不存在动态避让；Paid 模型 `TierRequiredError` 403 不切号。
 - 连续切号上限保留；丢弃全局回退与死熔断器；不请求期切号处理 403。
@@ -320,13 +321,13 @@ uv run python3 main.py server --port 8080
 - root DEBUG 保留，但必须按命名空间/三方库过滤 WARP/tunnel/CDP/websockets/httpx 噪音。
 - 统计后端单一事件账本：request/attempt/usage/error/latency/account/model/surface/paid；client 与 attempt 分区显示，绝不混算成功率；统计页后置。
 
-### 7.3 协议与生成（B5a/B5b）
+### 7.3 协议与生成
 
-- OpenAI Chat 是硬需求；Gemini + OpenAI 先行；Claude 在 Build 后；Responses 更后。
-- ATG 保留，默认 off，按协议/模型开启；tool_calls、thinking、images、usage、response_id、thought_signature 全部保留。
+- OpenAI Chat、Claude Messages、OpenAI Responses 与 Gemini 四协议已完成并默认启用；不再按阶段先后排序。
+- ATG 保留，默认 off，按协议通过 `mode_by_format` 开启；`text_model_pattern` / `non_text_model_pattern` 仅用于 text/non_text 过滤；tool_calls、thinking、images、usage、response_id、thought_signature 全部保留。
 - chat 继续 capture/replay + wire/JSPB，不改成直接 HTTP。
 - 账号切换、429 限流或 403 鉴权重试时清理模板缓存（`client.clear_templates()`），避免跨账号复用；快照签名按每次请求哈希实时生成，不跨请求共享；初次握手截获基线模板后，任意目标模型通过 `capture_template(model)` 纯内存适配。
-- **PG-01..PG-04 是 B5a 门槛**：functionCall 缺 thoughtSignature 兜底、首事件前真实 HTTP 4xx/5xx、finish-only/工具流终止兜底、functionResponse/functionCall 强制 Struct + 脱敏 `[toolshape]` 摘要。
+- **PG-01..PG-04 是工具调用硬门槛**：functionCall 缺 thoughtSignature 兜底、首事件前真实 HTTP 4xx/5xx、finish-only/工具流终止兜底、functionResponse/functionCall 强制 Struct + 脱敏 `[toolshape]` 摘要。
 - countTokens：默认把 system/tools/content 统一打包字符串计数；官方 key 仅用于精确 countTokens，不得生成/回显/进日志。
 - 流式首事件统一预读，尽量保留真实 HTTP 状态；已出正文不切号；非流式与同账号空响应重试保留。
 
@@ -334,7 +335,7 @@ uv run python3 main.py server --port 8080
 
 ## 8. 配置口径
 
-- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`defaults/config.schema.json` 覆盖 `defaults/config.yaml` 的顶层键；跨字段语义仍由 `application/model_access` 与 `model_defaults` 在运行期校验。
+- 单一 schema：YAML + env + 默认值；实例配置 `count/surface/(only_tier|min_tier|max_tier)`；至少一个 tier 选择器，Free/paid lane 不混合；全局只做总上限。`defaults/config.schema.json` 覆盖 `defaults/config.yaml` 的顶层键；跨字段语义仍由 `domain/model_access` 与 `model_defaults` 在运行期校验。
 - **D-07**：`_load_yaml_config` 不得浅替换 `rotator` 块；缺失键用默认值深合并；启动时校验类型/必填；请求路径不得抛 `KeyError`；非关键配置回退默认必须显式记录。
 - 删除 `channel_registry`，只保留 `surface=chat/build`；删除旧 groups/channel/打分配置；保留 upstream rotator 的账号状态与 429 冷却能力。
 - 保留热更新与原子写回；legacy 配置键一次性迁移后删除；关键配置 fail-fast，非关键配置回退默认。
@@ -346,7 +347,7 @@ uv run python3 main.py server --port 8080
 
 ## 9. 代码结构索引
 
-当前骨架来自上游 `99c38ba`：
+当前主仓结构：
 
 ```text
 aistudio-api/
@@ -356,35 +357,54 @@ aistudio-api/
 │   │   ├── types/                 # TypeScript 类型契约
 │   │   ├── stores/                # Pinia 状态管理
 │   │   ├── components/            # UI 与业务解耦组件
-│   │   ├── views/                 # 页面路由视图
+│   │   ├── views/                 # 控制面板 / 账号 / 系统与模型配置 / 日志
 │   │   └── router/                # Vue Router 路由与守卫
 │   └── vite.config.ts             # 构建配置 (输出至 src/aistudio_api/static)
 ├── android/                       # Android 伴侣端：多资料凭据提取器
 ├── src/aistudio_api/
-│   ├── api/                       # FastAPI 接口层
-│   │   ├── app.py                 # 应用生命周期与静态托管
-│   │   ├── dependencies.py        # API Key 与 Token 鉴权注入
-│   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent
-│   │   ├── routes_models.py       # /v1beta/models 模型发现
+│   ├── api/                       # FastAPI 接口层与协议适配
+│   │   ├── app.py                 # 应用生命周期、异常映射与静态托管
+│   │   ├── dependencies.py        # API Key / Web 会话鉴权注入
+│   │   ├── routes_gemini.py       # /v1beta 生成与 countTokens
+│   │   ├── routes_openai.py       # /v1/chat/completions 与 /v1/models
+│   │   ├── routes_claude.py       # /v1/messages 与 count_tokens
+│   │   ├── routes_responses.py    # /v1/responses 与 input_tokens
+│   │   ├── routes_models.py       # 模型发现
 │   │   ├── routes_accounts.py     # 账号管理与探活
-│   │   ├── routes_system.py       # 监控指标、日志配置与热重载
-│   │   ├── state.py               # 运行时全局单例容器
-│   │   ├── schemas.py             # API 请求与校验模型
-│   │   └── responses.py           # Gemini API 响应格式化辅助
+│   │   ├── routes_instances.py    # 实例槽位生命周期
+│   │   ├── routes_keepalive.py    # 保活状态与手动触发
+│   │   ├── routes_system.py       # 统计、配置、API Key 与热重载
+│   │   ├── routes_logs.py         # 日志 SSE 与导出
+│   │   ├── routes_debug*.py       # UI Debug 沙盒接口
+│   │   ├── sse_keepalive.py       # 首事件预读与 SSE 心跳
+│   │   ├── ui_sandbox.py          # 纯离线 UI 调试沙盒
+│   │   ├── format_errors.py       # 四协议错误渲染
+│   │   └── state.py               # 运行时全局单例容器
 │   ├── application/               # 业务应用层
-│   │   ├── account_rotator.py     # 黏性账号调度 (429 与太平洋午夜重置)
-│   │   ├── account_service.py     # 账号存储与激活上下文协调
-│   │   ├── api_service_gemini.py  # Gemini 请求生命周期与流式处理
-│   │   ├── account_orchestrator.py# 切号与故障转移编排
-│   │   └── chat_service.py        # 消息规范化与多模态数据处理
+│   │   ├── generation_service.py  # 协议中立生成主链
+│   │   ├── routing_pipeline.py    # 候选、重试、切号与 active_requests
+│   │   ├── routing_eligibility.py # surface / lane / tier 准入
+│   │   ├── routing_safety.py      # 单请求切号预算
+│   │   ├── instance_manager.py    # 实例生命周期与换绑
+│   │   ├── account_keepalive.py   # 24h Cookie / 元数据保活
+│   │   ├── account_rotator.py     # 账号统计、429 冷却与跨天重置
+│   │   ├── account_service.py     # 账号存储与激活协调
+│   │   ├── chat_service.py        # 请求规范化与多模态处理
+│   │   ├── signature_cache.py     # PG-01 思维签名缓存
+│   │   ├── token_counter.py       # countTokens 打包与上游调用
+│   │   ├── contracts/             # 四协议请求/响应 DTO
+│   │   ├── format_converters/     # OpenAI / Claude / Responses 转换
+│   │   └── atg/                   # 防截断合成工具网关
 │   ├── domain/                    # 纯净领域模型与异常体系
 │   │   ├── errors.py              # 业务异常定义
+│   │   ├── instances.py           # Instance / InstanceState
+│   │   ├── model_access.py        # tier 选择器与模型准入
 │   │   └── models.py              # 领域数据结构
 │   ├── infrastructure/            # 基础设施层
-│   │   ├── account/               # Cookie 解析、凭据持久化 (account_store, cookie_parser, cookie_refresher)
-│   │   ├── browser/               # CDP 客户端与 CloakBrowser 进程管理 (cdp_client, browser_engine, scripts)
-│   │   ├── gateway/               # 会话/鉴权/捕获/重放/传输/Wire (session, session_auth, capture, replay, transport, client, wire_*, streaming, model_*)
-│   │   └── utils/                 # 统一日志与通用工具 (logger, common)
+│   │   ├── account/               # Cookie 解析、凭据持久化与元数据刷新
+│   │   ├── browser/               # CDP 客户端、CloakBrowser 进程与指纹
+│   │   ├── gateway/               # 会话/池/捕获/重放/Wire/模型发现
+│   │   └── utils/                 # 统一日志、广播与通用工具
 ├── config.yaml                    # 本地运行时配置 (untracked + gitignored；不入库)
 ├── defaults/config.yaml           # 单一分发默认配置 (tracked)
 ├── main.py                        # 本地统一启动入口
@@ -394,26 +414,16 @@ aistudio-api/
     └── unit/                      # 按职责划分的单元测试模块
 ```
 
-B 阶段新增/改造落点（未落地前不得声称存在）：
-
-- **P9-pre**：`api/app.py`、`config.py`、`api/dependencies.py`、`defaults/config.yaml`
-- **P1**：`infrastructure/account/account_store.py`、`infrastructure/account/cookie_parser.py`、`infrastructure/account/cookie_refresher.py`、`infrastructure/gateway/session_auth.py`、`api/routes_accounts.py`、`application/account_rotator.py`
-- **P3-D03/D04**：`infrastructure/browser/browser_engine.py`、`infrastructure/browser/cdp_client.py`、`infrastructure/gateway/session.py`；新增 `infrastructure/gateway/instance_pool.py`、`infrastructure/gateway/pooled_session.py`
-- **P2**：`application/account_orchestrator.py`、`application/account_rotator.py`；新增路由/候选选择模块（按 B2-4 设计，不照搬旧 groups/channel）
-- **P6**：新增 `application/account_keepalive.py`、`api/routes_keepalive.py`
-- **P7**：`infrastructure/utils/logger.py`；新增 `infrastructure/utils/log_broadcast.py`、`api/routes_logs.py`、`web/src/views/LogsView.vue`
-- **B5a/B5b**：新增 `application/generation_service.py`、`api/routes_openai.py`、`application/format_converters/`、`application/atg/`
-
 ---
 
-## 10. 智能体工作流与 B 阶段纪律
+## 10. 智能体工作流与发布纪律
 
 ### 10.1 角色与报告
 
 - **主 agent = integrator**：唯一提交权；负责顺序、分派、回收报告、验收；不得把多个 domain 打包给少量 agent。
-- **worker**：每次只接一个 `Dxx-NNN` 或一个明确文件域；在 `.kilo/worktrees/rebuild-upstream` 修改并跑通 `uv run pytest`；不得改 `05/06/08-09`/架构文档；报告必须含改动文件、测试项、预期、实际、命令与结果。
-- **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `domains/Px/reviews/REV-<Step>.md`，同步主仓同路径；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
-- **前端 Review 截图归档（强制）**：凡涉及前端 UI 的审查步骤，Reviewer 必须在 `docs/dev/rebuild/domains/<Domain>/reviews/assets/` 保留 1~2 张最具代表性的完整页面实测截图（目标施工区与主工作区双仓同步留档、SHA256 一致），并在对应 `REV-*.md` 中引用，便于后续直观追溯 UI 样貌。
+- **worker**：每次只接一个 `Dxx-NNN` 或一个明确文件域；在主工作区直接修改并跑通 `uv run pytest`；不得改 `05/06/08-09`/架构文档；报告必须含改动文件、测试项、预期、实际、命令与结果。
+- **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `domains/Px/reviews/REV-<Step>.md`；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
+- **前端 Review 截图归档（强制）**：凡涉及前端 UI 的审查步骤，Reviewer 必须在 `docs/dev/rebuild/domains/<Domain>/reviews/assets/` 保留 1~2 张最具代表性的完整页面实测截图，并在对应 `REV-*.md` 中引用，便于后续直观追溯 UI 样貌。
 - **复杂任务并行拆分（强制）**：当单步任务涉及多个独立页面或跨模块改动时，主控 Integrator 必须按文件域拆分为多个独立的并行子 Agent（`task`）执行；每个子 Agent 只读取/修改自己职责范围内的少量文件，严禁单 Agent 同时加载全站导致上下文膨胀、质量下降。
 - worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改代码/文档，不自行派下一步。
 
@@ -424,13 +434,13 @@ B 阶段新增/改造落点（未落地前不得声称存在）：
 - 跑 `uv run pytest`；必要时跑 ruff/pyright；全量审查 `git diff`。
 - reviewer 独立审；报告落盘；用户审计确认后才 commit；单步问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。
 - **UI 前置设计确认（强制）**：凡涉及前端 UI 界面、设置卡片、按钮或交互变更的步骤，主 Agent 严禁仅给简短摘要就直接派 Worker 改代码。开工前必须先只读盘点并提交《UI 页面与交互设计清单》，至少包含：①所在页面与卡片位置；②控件类型、中文文案、选项与默认值；③点击后的 API 调用、loading/成功/错误反馈与确认弹窗逻辑；④拟清理的废弃组件/按钮。必须等用户审阅并明确确认后，才准派 Worker 修改 .vue 代码；每次 UI 修改完工必须执行 bun run build 更新 src/aistudio_api/static 产物。
-- **UI 验收闭环（强制）**：UI 步骤必须包含 `AISTUDIO_UI_DEBUG=1` 沙盒 + Playwright `1440x900`/`1024x900`/`768x900` 实测；Reviewer 必须双写 1~2 张完整页面截图并在 `REV-*.md` 引用；多页面或跨模块步骤按文件域并行拆分 Worker/Reviewer，禁止单 Agent 一锅炖。
+- **UI 验收闭环（强制）**：UI 步骤必须包含 `AISTUDIO_UI_DEBUG=1` 沙盒 + Playwright `1440x900`/`1024x900`/`768x900` 实测；Reviewer 必须归档 1~2 张完整页面截图并在 `REV-*.md` 引用；多页面或跨模块步骤按文件域并行拆分 Worker/Reviewer，禁止单 Agent 一锅炖。
 
-### 10.3 B 阶段固定顺序（不得改）
+### 10.3 施工阶段顺序（历史追溯）
 
-B0（目标树 `AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-D03）→ B2-3（P3-D04 多实例池）→ B2-4（P2/D05 路由）→ B3（P6/D08 保活）→ B4（P7/D09 日志）→ B5a（PG-01..04）→ B5b（P5 最小 OpenAI/Gemini/ATG 闭环）。
+B0（`AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-D03）→ B2-3（P3-D04 多实例池）→ B2-4（P2/D05 路由）→ B3（P6/D08 保活）→ B4（P7/D09 日志）→ B5a（PG-01..04）→ B5b（P5 最小 OpenAI/Gemini/ATG 闭环）。
 
-前一步用户确认 commit 后才进入下一步；B5a 未过不得进入 B5b。
+该顺序仅用于追溯已完成施工；当前日常工作按单工作区常态增量推进。尚未执行的 C5b 合并、打标与清理流程仍按既定发布口径执行，不因工作区常态化而删除或改写。
 
 ### 10.4 硬禁令
 

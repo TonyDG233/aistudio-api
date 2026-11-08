@@ -1,7 +1,7 @@
 # 协议适配与工具调用技术规格
 
-- 状态：依据当前 `rebuild-upstream` 工作树源码整理，只读核对。
-- 范围：`GenerationService` 的协议中立生成链、OpenAI Chat Completions 与原生 Gemini 的请求/响应转换、ATG（Anti-Truncation Gateway）五信号检测与状态机、PG-01..PG-04 门、PG-08 酒馆伪造工具历史兼容、`countTokens` 策略、`[toolshape]` 脱敏规则。
+- 状态：依据当前主仓源码整理，只读核对。
+- 范围：`GenerationService` 的协议中立生成链、Gemini / OpenAI Chat Completions / Claude Messages / OpenAI Responses 四协议请求/响应转换、C1c SSE 首包与 `KeepaliveIterator` 心跳、ATG（Anti-Truncation Gateway）五信号检测与状态机、PG-01..PG-04 门、PG-08 酒馆伪造工具历史兼容、E-04 seed 忽略、D-04/D-06 错误映射、`countTokens` 策略、`[toolshape]` 脱敏规则。
 - 非范围：实例池/路由调度、保活、日志归档。这些见 `INSTANCE_POOL_AND_ROUTING_SPEC.md` 与 `KEEPALIVE_AND_LOGGING_SPEC.md`。
 - 文中 `file:line` 均指本仓库路径。
 
@@ -66,6 +66,8 @@
   - [9.4 残余风险](#94-残余风险)
 - [10. 残余限制汇总](#10-残余限制汇总)
 - [11. 证据索引](#11-证据索引)
+- [12. C3：Claude Messages 与 OpenAI Responses](#12-c3claude-messages-与-openai-responses)
+- [13. C1c：SSE 首包与心跳、E-04 与 D-04/D-06](#13-c1csse-首包与心跳e-04-与-d-04d-06)
 
 ---
 
@@ -74,19 +76,23 @@
 协议面只负责“把某种客户端协议翻译成 Gemini 请求，再把中立输出渲染回该协议”；路由、重试、ATG、签名、空响应重试都在协议中立的 `generation_service` 中完成。
 
 ```text
-Gemini route  ─┐
-OpenAI route  ─┼─> GenerationService ─> RoutingPipeline ─> InstanceRequestClient ─> PooledSession/上游
-Claude/Responses（未启用）─┘        │
-                                     └─ ATG wrap/unwrap、空响应重试、签名记录
+Gemini route    ─┐
+OpenAI route    ─┼─> GenerationService ─> RoutingPipeline ─> InstanceRequestClient ─> PooledSession/上游
+Claude route    ─┤        │
+Responses route ─┘        └─ ATG wrap/unwrap、空响应重试、签名记录、Client 终态
 ```
+
+四个协议默认全部启用，共享协议中立生成链；协议层只做请求转换、SSE 渲染与错误体适配。
 
 证据：
 
-- `src/aistudio_api/application/generation_service.py:1-11`：模块职责与“无 lease/reservation”说明。
+- `src/aistudio_api/application/generation_service.py:1-12`：模块职责与“无 lease/reservation”说明。
 - `src/aistudio_api/api/gemini_service.py:1-7`：Gemini 只做 wire 渲染与错误翻译。
-- `src/aistudio_api/api/routes_gemini.py:21-61`：Gemini 入口。
-- `src/aistudio_api/api/routes_openai.py:79-158`：OpenAI 入口。
-- `defaults/config.yaml:57-64`：`formats.openai=true`，`claude/responses=false`。
+- `src/aistudio_api/api/routes_gemini.py:25-61`：Gemini 入口。
+- `src/aistudio_api/api/routes_openai.py:99-221`：OpenAI Chat Completions 入口。
+- `src/aistudio_api/api/routes_claude.py:175-252`：Claude Messages 入口。
+- `src/aistudio_api/api/routes_responses.py:96-249`：OpenAI Responses 入口。
+- `defaults/config.yaml:108-117`：`formats.openai/claude/responses` 默认 `true`，Gemini 常驻。
 
 ---
 
@@ -94,55 +100,55 @@ Claude/Responses（未启用）─┘        │
 
 ### 2.1 `generate`（非流式）
 
-`generation_service.generate`（`generation_service.py:151-285`）的步骤：
+`generation_service.generate`（`generation_service.py:229-372`）的步骤：
 
-1. `pipeline.begin(model_path=...)` 得到 `RouteContext`，取 `route.model` 与 `route.surface`（`:160-162`）。
-2. 根据 `api_format` 解析 ATG 模式并构造 `AtgProcessor`（`:164-167`, `:82-90`）。
-3. `_wrap_atg_request` 可能注入合成工具并返回 `tool_name`（`:165-167`, `:93-130`）。
-4. 循环 `acquire` -> `normalize_gemini_request` -> `client.generate_content`（`:174-217`）。
-5. 空响应重试：`max_empty = atg.cfg.empty_retries if tool_name else 1`，最多 `max_empty + 1` 次（`:187-232`）。
-6. 若 ATG 启用且有 `tool_name`，调用 `atg.unwrap_response` 把合成调用还原为正文/真实工具调用（`:235-242`）。
-7. `record_function_call_signatures` 记录真实签名（`:244`）。
-8. `_finish_reason` 映射为 Gemini finish 字符串（`:245`, `:133-139`）。
-9. `pipeline.record_success`，返回 `GenerationOutcome`（`:246-264`）。
-10. 异常统一交给 `pipeline.handle_error`；`retry_same` 继续同一 attempt，`switch` 释放并置空 attempt，其他上抛（`:265-276`）。
-11. `finally` 释放 attempt（`:277-279`）。
+1. `pipeline.begin(model_path=...)` 得到 `RouteContext`，取 `route.model` 与 `route.surface`（`:238-241`）。
+2. 根据 `api_format` 解析 ATG 模式并构造 `AtgProcessor`（`:242-246`, `:83-92`）。
+3. `_wrap_atg_request` 可能注入合成工具并返回 `tool_name`（`:243-246`, `:94-132`）。
+4. 循环 `acquire` -> `normalize_gemini_request` -> `client.generate_content`（`:252-335`）。
+5. 空响应重试：`max_empty = atg.cfg.empty_retries if tool_name else 1`，最多 `max_empty + 1` 次（`:265-310`、`:186-198`）。
+6. 若 ATG 启用且有 `tool_name`，调用 `atg.unwrap_response` 把合成调用还原为正文/真实工具调用（`:312-319`）。
+7. `record_function_call_signatures` 记录真实签名（`:321`）。
+8. `_finish_reason` 映射为 Gemini finish 字符串（`:322`, `:134-141`）。
+9. `pipeline.record_success`，返回 `GenerationOutcome`（`:323-341`）。
+10. 异常统一交给 `pipeline.handle_error`；`retry_same` 继续同一 attempt，`switch` 释放并置空 attempt，其他上抛（`:342-363`）。
+11. `finally` 释放 attempt（`:364-366`）。
 
-`GenerationOutcome` 字段：`output/model/finish_reason/response_id/surface`（`:59-66`）。
+`GenerationOutcome` 字段：`output/model/finish_reason/response_id/surface`（`:61-67`）。
 
 ### 2.2 `stream_generation`（流式）
 
-`generation_service.stream_generation`（`:298-506`）的步骤：
+`generation_service.stream_generation`（`:382-611`）的步骤：
 
-1. `pipeline.begin`、ATG 构造与 wrap 同非流式（`:310-317`）。
-2. 每次新 attempt 发送一个 `routing_wait` 事件（`:331-339`），OpenAI 渲染为 SSE 注释，Gemini 渲染为空（见 4.3/4.4）。
-3. `normalize_gemini_request` 每次 attempt 调用一次；`emit_toolshape` 只在第一次 normalize 时为 True（`:322-323`, `:346-353`）。
-4. 创建 per-stream ATG unwrapper（`:354-358`）。
-5. 迭代 `client.stream_generate_content`（`:366-384`）：
+1. `pipeline.begin`、ATG 构造与 wrap 同非流式（`:391-399`）。
+2. 每次新 attempt 发送一个 `routing_wait` 事件（`:413-422`），四个协议都将其渲染为进度注释或跳过。
+3. `normalize_gemini_request` 每次 attempt 调用一次；`emit_toolshape` 只在第一次 normalize 时为 True（`:404-405`, `:427-434`）。
+4. 创建 per-stream ATG unwrapper（`:435-439`）。
+5. 迭代 `client.stream_generate_content`（`:447-465`）：
    - `usage` -> `final_usage`
    - `finish_reason` -> `final_finish_reason`，若 ATG 合成调用且无真实工具调用则把 `TOOL_CALLS` 改为 `STOP`
    - `response_id` -> `latest_response_id`
    - `thought_signature` -> `buffered_thought_sig`
-   - 其他事件：`tool_calls` 记录签名；ATG unwrapper 处理；yield `StreamEvent`；非空 payload 置 `has_yielded_data=True`（`:385-423`）。
-6. 空流重试：`max_empty` 同非流式；`empty_attempt` 计数；仍空且 required -> `SyntheticRequiredError`（`:440-457`）。
-7. `unwrapper.finalize()` flush 缓冲/尾块（`:459-475`）。
-8. `record_success`，break（`:476-488`）。
-9. `finally` 释放 attempt（`:489-491`）。
-10. 循环结束后 yield 终止 `usage` 事件，携带 `finish_reason`/`response_id`（`:500-506`）。
+   - 其他事件：`tool_calls` 记录签名；ATG unwrapper 处理；yield `StreamEvent`；非空 payload 置 `has_yielded_data=True`（`:466-505`）。
+6. 空流重试：`max_empty` 同非流式；`empty_attempt` 计数；仍空且 required -> `SyntheticRequiredError`（`:521-538`）。
+7. `unwrapper.finalize()` flush 缓冲/尾块（`:540-556`）。
+8. `record_success`，break（`:557-569`）。
+9. `finally` 释放 attempt（`:570-572`）。
+10. 循环结束后 yield 终止 `usage` 事件，携带 `finish_reason`/`response_id`（`:581-587`）。
 
-`StreamEvent` 字段：`kind/payload/model/response_id/thought_signature/finish_reason`（`:47-57`）。
+`StreamEvent` 字段：`kind/payload/model/response_id/thought_signature/finish_reason`（`:49-59`）。
 
 ### 2.3 空响应判定
 
-`_output_is_empty`（`:68-79`）：没有 candidates，或第一个 candidate 的 `text/thinking/function_calls/images/reasoning_images` 全为空，即视为空。
+`_output_is_empty`（`:69-80`）：没有 candidates，或第一个 candidate 的 `text/thinking/function_calls/images/reasoning_images` 全为空，即视为空。
 
-注意：非流式在 `tool_name` 为空时 `max_empty=1`，最多尝试 2 次；若仍为空，代码会继续走 unwrap/成功路径并返回空输出（`:217-233`）。流式在同样情况下若 `produced_content=False` 且 required 未触发，会 flush/记录成功（`:440-457`）。这是“空响应不总是错误”的当前行为。
+注意：非流式在 `tool_name` 为空时 `max_empty=1`，最多尝试 2 次；若仍为空，代码会继续走 unwrap/成功路径并返回空输出（`:300-341`）。流式在同样情况下若 `produced_content=False` 且 required 未触发，会 flush/记录成功（`:521-538`）。这是“空响应不总是错误”的当前行为。
 
 ### 2.4 释放与取消
 
-- 非流式 `finally` 释放 attempt（`:277-279`）。
-- 流式 `finally` 释放 attempt（`:489-491`）。
-- `pipeline.release` 只调用 `handle.release()`（`routing_pipeline.py:586-587`），即 `ActiveRequest.release()`（`instance_pool.py:131-135`），保证 `active_requests` 归零。
+- 非流式 `finally` 释放 attempt（`:364-366`）。
+- 流式 `finally` 释放 attempt（`:570-572`）。
+- `pipeline.release` 只调用 `handle.release()`（`routing_pipeline.py:665-666`），即 `ActiveRequest.release()`（`instance_pool.py:132-138`），保证 `active_requests` 归零。
 
 ---
 
@@ -150,7 +156,7 @@ Claude/Responses（未启用）─┘        │
 
 ### 3.1 入口
 
-`routes_openai.chat_completions`（`routes_openai.py:79-158`）：
+`routes_openai.chat_completions`（`routes_openai.py:99-221`）：
 
 1. 解析 JSON -> `OpenAIChatRequest`（`:84-94`）。
 2. `MediaFetcher` + `convert_openai_request` -> Gemini body（`:96-99`）。
@@ -253,7 +259,7 @@ Claude/Responses（未启用）─┘        │
 - `decode_data_url` 拆出 mime/base64。
 - 输出 `{"inlineData":{"mimeType":..., "data":...}}`。
 
-`features.formats.media.allow_private_urls` 控制私有地址是否允许（`defaults/config.yaml:59-64`），由 `format_media_allow_private()` 读取（`routes_openai.py:97`）。
+`features.formats.media.allow_private_urls` 控制私有地址是否允许（`defaults/config.yaml:110-117`），由 `format_media_allow_private()` 读取（`routes_openai.py:97`）。
 
 ### 3.7 响应渲染（非流式）
 
@@ -346,7 +352,7 @@ normalize_gemini_request:
 
 ### 4.1 `normalize_gemini_request`
 
-`chat_service.normalize_gemini_request`（`application/chat_service.py:737-1061`）：
+`chat_service.normalize_gemini_request`（`application/chat_service.py:737-1062`）：
 
 - 必须有 `contents`（`:746-747`）。
 - 模型名统一为 `models/<clean>`（`:749-753`）。
@@ -420,8 +426,10 @@ OpenAI 路由采用同样的预读模式（`routes_openai.py:111-135`），窗�
 
 **首窗与保活环境变量**（`api/sse_keepalive.py`）：
 
-- `AISTUDIO_SSE_KEEPALIVE_SEC`：正文等待上游事件时发送 `: keepalive\n\n` 注释帧的间隔，默认 15 秒；非数字、`NaN`/`inf`、0 或负值回退 15 秒。它与“是否返回响应头”无关，只控制 200 之后的保活节奏。
-- `AISTUDIO_SSE_PREREAD_WINDOW_SEC`：返回 `StreamingResponse` 前的首事件预读窗口。未设置或非法时跟随 `AISTUDIO_SSE_KEEPALIVE_SEC`（默认 15 秒）；独立设置时以自身为准，且必须为有限正数。
+- `AISTUDIO_SSE_KEEPALIVE_SEC`：正文等待上游事件时发送 `: keepalive\n\n` 注释帧的间隔，默认 15 秒；非数字、`NaN`/`inf`、0 或负值回退 15 秒（`sse_keepalive.py:29-32`、`:68-76`）。它与“是否返回响应头”无关，只控制 200 之后的保活节奏。
+- `AISTUDIO_SSE_PREREAD_WINDOW_SEC`：返回 `StreamingResponse` 前的首事件预读窗口。未设置或非法时跟随 `AISTUDIO_SSE_KEEPALIVE_SEC`（默认 15 秒）；独立设置时以自身为准，且必须为有限正数（`sse_keepalive.py:79-90`）。
+- `KeepaliveIterator.next_event(timeout)` 在首窗超时后保留同一个 `__anext__` task，调用方可以先返回 200，再在 body 中继续等待并周期性 yield 心跳；`aclose()` 幂等且有界（`sse_keepalive.py:103-211`）。
+- 四个流式协议共享该实现：Gemini（`gemini_service.py:222-278`）、OpenAI（`routes_openai.py:99-221`）、Claude（`routes_claude.py:85-172`）、Responses（`routes_responses.py:128-199`）。
 - 本实现**没有整体生成/空闲总超时**：上游若永久挂起，200 后的 body 会持续发送 keepalive 而不是主动终止。连接释放依赖客户端断开/CDP WebSocket 断开，浏览器命令超时由命令层控制。不要把首窗或 keepalive 间隔理解成服务端总超时。
 
 ### 4.5 PG-03 finish-only 与工具流终止
@@ -469,7 +477,7 @@ finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`application/finish_reasons.py::W
 | `images` | inlineData parts |
 | `reasoning_images` | inlineData parts（thought 图） |
 
-`format_sse_usage`（`:239-269`）输出终止 chunk + `usageMetadata`。`format_sse_error`（`:272-286`）输出 `data: {"error": ...}`，`TierRequiredError`/`RoutingError` 会合并 `as_fields()`。
+`format_sse_usage`（`api/gemini_service.py:152-184`）输出终止 chunk + `usageMetadata`。`format_sse_error`（`api/gemini_service.py:185-200`）输出 `data: {"error": ...}`，`TierRequiredError`/`RoutingError` 会合并 `as_fields()`。
 
 ---
 
@@ -500,7 +508,7 @@ finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`application/finish_reasons.py::W
 | `max_response_bytes` | 16 MiB | 参数/响应上限 |
 | `model_filter` | 默认文本过滤器 | 非文本模型直通 |
 
-`resolve_atg_mode(api_format)`（`config.py:43-58`）：`features.atg.mode_by_format.<format>` 显式指定 `off/prefer/required` 时优先，否则继承 `features.atg.mode`。默认配置 `defaults/config.yaml:69-85` 为 `mode: off`，四个 format 均为 `inherit`。
+`resolve_atg_mode(api_format)`（`atg/config.py:43-58`）：`features.atg.mode_by_format.<format>` 显式指定 `off/prefer/required` 时优先，否则继承 `features.atg.mode`。默认配置 `defaults/config.yaml:134-150` 为 `mode: "off"`，四个 format（gemini/openai/claude/responses）均为 `inherit`。
 
 ### 5.2 wrap 流程
 
@@ -589,7 +597,7 @@ guard 命中（客户端已有合成通道）
 
 证据：
 
-- `AtgConfig.enabled`（`config.py:107-110`）。
+- `AtgConfig.enabled`（`atg/config.py:107-110`）。
 - `_wrap_atg_request` 的跳过分支（`generation_service.py:100-130`）。
 - 非流式 required 检查（`extractor.py:188-195`）。
 - 流式 required 检查（`stream_extractor.py:158-165`）。
@@ -683,7 +691,7 @@ guard 命中（客户端已有合成通道）
 
 **边界**：
 
-- 首事件之后的错误仍然是 `data: {"error": ...}`，HTTP 已是 200（`:344-354`）。这是 SSE 协议的固有限制。
+- 首事件之后的错误仍然是 `data: {"error": ...}`，HTTP 已是 200（`api/gemini_service.py:279-309`；Claude/Responses 对应 `routes_claude.py:101-164`、`routes_responses.py:138-191`）。这是 SSE 协议的固有限制。
 - 预读循环会跳过渲染为 `None` 的事件（例如 `routing_wait`），因此“首事件”指首个可渲染 chunk，而不是第一个内部事件。
 
 ### 6.3 PG-03：finish-only 与工具流终止
@@ -752,7 +760,7 @@ guard 命中（客户端已有合成通道）
 
 ### 7.4 残余限制
 
-- 宽松处理只覆盖 OpenAI 面；Claude/Responses 适配器当前未启用（`defaults/config.yaml:59-62`）。
+- OpenAI Chat 面由 `_lenient_arguments` / `_tool_response` 做完整 PG-08 兼容；Responses 面在 `responses_request.py:43-44`、`:144-198`、`:321-330` 采用同类宽松策略；Claude 面由 `claude_request.py:110-175` 处理 `tool_use`/`tool_result` 的缺失 id 与宽松 input。
 - 日志只记录原因/消息索引/字段，不记录参数值（`:52-61`）。
 - 工具名 hash 只用于 `[toolshape]`，不参与 PG-08 匹配。
 
@@ -762,7 +770,7 @@ guard 命中（客户端已有合成通道）
 
 ### 8.1 入口
 
-`routes_gemini.count_tokens_route`（`routes_gemini.py:48-61`）调用 `token_counter.count_tokens(api_format="gemini")`，返回 `{"totalTokens": outcome.total_tokens}`。
+`routes_gemini.count_tokens_route`（`routes_gemini.py:49-61`）调用 `token_counter.count_tokens(api_format="gemini")`，返回 `{"totalTokens": outcome.total_tokens}`。Claude 与 Responses 的计数端点分别在 `routes_claude.py:219-252`、`routes_responses.py:204-240`。
 
 ### 8.2 打包策略
 
@@ -781,16 +789,16 @@ guard 命中（客户端已有合成通道）
 
 ### 8.3 上游调用
 
-`count_tokens`（`:138-206`）：
+`count_tokens`（`:155-237`）：
 
-1. `pipeline.begin` -> `route.model/surface`。
-2. `build_count_body`。
-3. `pipeline.acquire` -> `InstanceRequestClient.count_tokens(packed_body=body)`。
-4. 成功 -> `pipeline.record_success`，返回 `TokenCountOutcome(model,total_tokens,surface)`。
-5. 异常 -> `pipeline.handle_error`，支持 `retry_same` / `switch`。
-6. `finally` 释放 attempt。
+1. `pipeline.begin` -> `route.model/surface`；`context.record_attempts = False`，计数请求不进入生成 Attempt/配额台账（`:172-177`）。
+2. `build_count_body`（`:177`）。
+3. `pipeline.acquire` -> `InstanceRequestClient.count_tokens(packed_body=body)`（`:181-203`）。
+4. 成功 -> `_record_count(..., "success", input_tokens=...)`，返回 `TokenCountOutcome(model,total_tokens,surface)`（`:204-220`）。
+5. 异常 -> `pipeline.handle_error`，支持 `retry_same` / `switch`；最终失败只记 `count_tokens.errors`（`:221-237`）。
+6. `finally` 释放 attempt（`:232-234`）。
 
-`InstanceRequestClient.count_tokens`（`instance_client.py:173-220`）：
+`InstanceRequestClient.count_tokens`（`instance_client.py:178-220`）：
 
 - 在 `session.request_scope()` 内执行，占用 `active_requests`。
 - 取 `SessionContext.base_template.url`；若含 `/GenerateContent`，替换为 `/CountTokens`；否则使用默认 CountTokens RPC URL（`:184-192`）。
@@ -800,7 +808,7 @@ guard 命中（客户端已有合成通道）
 
 ### 8.4 不触碰的路径
 
-模块说明明确：计数复用路由与 `active_requests`，但不修改生成模板、不捕获 snapshot、不应用 ATG（`token_counter.py:1-8`）。`instance_client.count_tokens` 也只使用 live page，不调用 `capture`（`:173-220`）。
+模块说明明确：计数复用路由与 `active_requests`，但不修改生成模板、不捕获 snapshot、不应用 ATG，也不写生成 Attempt 台账（`token_counter.py:1-8`、`:172-177`）。`instance_client.count_tokens` 也只使用 live page，不调用 `capture`（`:178-220`）。
 
 ### 8.5 数据流示例
 
@@ -926,7 +934,7 @@ upstream response [200, 1234] -> totalTokens=1234
 1. **PG-05 分片工具调用未聚合**：`StreamingGateway` 逐 chunk yield `tool_calls`（`streaming.py:173-175`），没有按 call_id 合并；`generation_service` 也没有聚合器。分片工具流可能产生多个部分调用。
 2. **PG-13 非 STOP finish 原样透传**：`application/finish_reasons.py` 有 10/12/13 的映射（`application/finish_reasons.py::WIRE_TO_GEMINI_FINISH_REASON`），但没有“有合法工具调用时把 MALFORMED/UNEXPECTED/TOO_MANY 视为可交付”的重写。ATG 的 `TOOL_CALLS -> STOP` 只比较字符串，真实 int finish 不触发（`extractor.py:131-132`, `:181-186`）。
 3. **PG-11 toolConfig 不写入上游**：`wire_codec.py:330-375` 只用 `tool_config` 做 NONE 清空和 allowedFunctionNames 声明过滤，没有写顶层 toolConfig；上游 ANY/required 可能被降级为 AUTO。这是上游 wire 限制。
-4. **PG-12 snapshot hash 对工具 part 视而不见**：`build_snapshot_hash_parts` 只收集 text/inline/file/code，functionCall/functionResponse 追加空串（`session.py:60-86`）。工具占比高的历史可能得到近似常量 hash，是否触发上游 403 未在本规格中验证。
+4. **PG-12 snapshot hash 对工具 part 视而不见**：`build_snapshot_hash_parts` 只收集 text/inline/file/code，functionCall/functionResponse 追加空串（`session.py:84-124`）。工具占比高的历史可能得到近似常量 hash，是否触发上游 403 未在本规格中验证。
 5. **ATG required 可能在已 yield 数据后失败**：流式 `finalize` 在部分内容已发送后才检查 required（`generation_service.py:459-475`, `stream_extractor.py:158-165`）。客户端可能看到半截内容 + 错误。
 6. **客户端合成守卫是启发式**：五个信号只扫描有限 parts/字符（`client_patterns.py:58-59`, `:201-221`），超长系统指令或非常规命名可能漏检；漏检会导致双重合成通道。
 7. **模型过滤器是 permissive default**：未知模型默认按文本处理（`model_filter.py:38-46`），可能对非文本模型做不必要的 wrap；可通过 `non_text_model_pattern` 覆盖（`:49-84`）。
@@ -942,14 +950,14 @@ upstream response [200, 1234] -> totalTokens=1234
 
 | 主题 | 主要证据 |
 |---|---|
-| 协议中立链 | `src/aistudio_api/application/generation_service.py:1-11`, `:47-79`, `:151-285`, `:298-506` |
+| 协议中立链 | `src/aistudio_api/application/generation_service.py:49-80`, `:229-372`, `:382-611` |
 | OpenAI 请求转换 | `src/aistudio_api/application/format_converters/openai_request.py:27-49`, `:64-128`, `:217-323`, `:441-532` |
 | OpenAI 响应渲染 | `src/aistudio_api/application/format_converters/openai_response.py:45-99`, `:102-221` |
 | 原生归一化 | `src/aistudio_api/application/chat_service.py:37-43`, `:567-704`, `:720-809`, `:1033-1040` |
 | Struct 强制 | `src/aistudio_api/infrastructure/gateway/wire_types.py:325-372` |
 | wire 下标 | `src/aistudio_api/infrastructure/gateway/wire_spec.py:28-43` |
 | 首事件预读 | `src/aistudio_api/api/gemini_service.py::_build_gemini_streaming_response`; `src/aistudio_api/api/routes_openai.py::chat_completions` |
-| 工具流终止 | `src/aistudio_api/infrastructure/gateway/streaming.py:34-37`, `:113-136`, `:239-249`; `wire_parser.py:437-541` |
+| 工具流终止 | `src/aistudio_api/infrastructure/gateway/streaming.py:34-37`, `:118-136`, `:242-248`; `wire_parser.py:437-541` |
 | ATG 配置/门面 | `src/aistudio_api/application/atg/__init__.py:38-90`; `atg/config.py:43-110` |
 | ATG 注入 | `src/aistudio_api/application/atg/injector.py:104-216` |
 | 五信号 | `src/aistudio_api/application/atg/client_patterns.py:9-18`, `:91-227` |
@@ -957,6 +965,100 @@ upstream response [200, 1234] -> totalTokens=1234
 | ATG 流式还原 | `src/aistudio_api/application/atg/stream_extractor.py:38-167`; `stream_decoder.py:136-375` |
 | ATG 参数修复 | `src/aistudio_api/application/atg/repair.py:17`, `:189-226` |
 | 签名缓存 | `src/aistudio_api/application/signature_cache.py:27-83`, `:161-180` |
-| countTokens | `src/aistudio_api/application/token_counter.py:1-8`, `:76-206`; `instance_client.py:173-220` |
-| 默认 ATG/格式配置 | `defaults/config.yaml:57-85` |
+| countTokens | `src/aistudio_api/application/token_counter.py:1-8`, `:76-237`; `instance_client.py:178-220` |
+| 默认 ATG/格式配置 | `defaults/config.yaml:108-150` |
 | `[toolshape]` | `src/aistudio_api/application/chat_service.py:567-704`, `:1033-1040` |
+
+---
+
+## 12. C3：Claude Messages 与 OpenAI Responses
+
+### 12.1 Claude Messages
+
+**入口**：`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（`routes_claude.py:175-252`），依赖 `require_claude` + `require_api_key`。
+`require_claude` 读取 `features.formats.claude`，默认 `true`（`routes_claude.py:58-59`、`format_errors.py:81-126`、`defaults/config.yaml:112-115`）。
+
+**请求契约**：`application/contracts/claude.py:13-40` 的 `ClaudeMessagesRequest` / `ClaudeCountTokensRequest`。
+
+**请求转换**：`convert_claude_request`（`claude_request.py:564-602`）：
+
+| Claude 输入 | Gemini 输出 | 证据 |
+|---|---|---|
+| `system` 字符串/块数组 | `systemInstruction.parts[0].text`，多条以 `\n` 连接 | `claude_request.py:55-77` |
+| `messages[].role=user/assistant` | `contents[].role=user/model` | `claude_request.py:251-257`、`:396-433` |
+| `text` / `image` blocks | `text` / `inlineData` | `claude_request.py:79-109`、`:344-395` |
+| `tool_use` | `functionCall`（`id` 缺失时合成） | `claude_request.py:259-297` |
+| `tool_result` | `functionResponse`（内容宽松包装） | `claude_request.py:130-175`、`:298-343` |
+| `tools[].input_schema` | `tools[].functionDeclarations[].parametersJsonSchema` | `claude_request.py:434-465` |
+| `tool_choice` | `toolConfig.functionCallingConfig` | `claude_request.py:466-501` |
+| `thinking.budget_tokens` | `thinkingConfig.thinkingLevel` | `claude_request.py:45-54`、`:502-518` |
+| `max_tokens/temperature/top_p/top_k/stop_sequences` | `generationConfig` | `claude_request.py:583-600` |
+| `response_format` / 输出约束 | `responseMimeType` + `responseSchema` | `claude_request.py:519-551` |
+
+`seed` 按 **E-04** 接受但忽略：`_log_ignored_seed` 记录告警，不写 `generationConfig.seed`（`claude_request.py:552-562`、`:568`）。
+
+**响应渲染**：`claude_response`（`claude_response.py:77-137`）输出 `type=message`、`content[]`（text/tool_use）、`stop_reason`、`usage`；
+流式 `ClaudeStreamRenderer`（`claude_response.py:138-326`）输出 `message_start` / `content_block_start|delta|stop` / `message_delta` / `message_stop`。
+
+**计数**：`count_message_tokens` 复用 `token_counter.count_tokens(api_format="claude")`，返回 `{"input_tokens": N}`（`routes_claude.py:219-252`、`token_counter.py:155-237`）。
+
+### 12.2 OpenAI Responses
+
+**入口**：`POST /v1/responses` 与 `POST /v1/responses/input_tokens`（`routes_responses.py:96-249`），默认启用（`features.formats.responses=true`，`defaults/config.yaml:115`）。
+
+**请求契约**：`contracts/responses.py:14-36` 的 `ResponsesRequest`。
+
+**请求转换**：`convert_responses_request`（`responses_request.py:434-557`）：
+
+| Responses 输入 | Gemini 输出 | 证据 |
+|---|---|---|
+| `instructions` | `systemInstruction` | `responses_request.py:464-467` |
+| `input` 字符串 | 单条 user text | `responses_request.py:478-480` |
+| `input[]` 的 `message` | `contents[]` user/model | `responses_request.py:484-500`、`:367-373` |
+| `input_text` / `input_image` | text / inlineData | `responses_request.py:79-130` |
+| `function_call` | `functionCall`（id 缺失时合成） | `responses_request.py:374-406` |
+| `function_call_output` | `functionResponse` | `responses_request.py:407-433` |
+| `tools[].function` / 内置工具 | `functionDeclarations` | `responses_request.py:200-259` |
+| `tool_choice` | `toolConfig.functionCallingConfig` | `responses_request.py:233-259` |
+| `text.format` | `responseMimeType` + `responseSchema` | `responses_request.py:260-288` |
+| `max_output_tokens/temperature/top_p/reasoning` | `generationConfig` | `responses_request.py:289-320` |
+| `previous_response_id` | 明确 `ConversionError`（无状态代理不支持） | `responses_request.py:438-444` |
+
+`store`、`parallel_tool_calls`、`truncation`、`include`、`metadata`、`user`、`service_tier` 被接受并记录 ignored；
+`seed` 按 **E-04** 接受但忽略（`responses_request.py:9-10`、`:315-318`、`:445-457`）。
+
+**响应渲染**：`responses_response`（`responses_response.py:188-220`）输出 `object=response`、`output[]`（reasoning/message/function_call）、
+`output_text`、`status`、`usage`；流式 `ResponsesStreamRenderer`（`responses_response.py:243-539`）输出
+`response.created`、`response.output_item.added/done`、`response.output_text.delta`、`response.completed/failed` 等事件。
+
+**计数**：`count_response_input_tokens` 返回 `{"object":"response.input_tokens","input_tokens":N}`（`routes_responses.py:204-240`）。
+
+---
+
+## 13. C1c：SSE 首包与心跳、E-04 与 D-04/D-06
+
+### 13.1 四协议共享首包/心跳
+
+`api/sse_keepalive.py` 的 `KeepaliveIterator` 是四协议唯一实现：
+
+- 心跳帧 `": keepalive\n\n"`，默认间隔 15 秒（`sse_keepalive.py:29-32`）。
+- 首事件预读窗口默认等于心跳间隔；`AISTUDIO_SSE_PREREAD_WINDOW_SEC` 可独立覆盖（`sse_keepalive.py:79-90`）。
+- 首窗超时后保留 pending `__anext__` task，先返回 `StreamingResponse`，body 继续等待并周期发送心跳（`sse_keepalive.py:103-175`）。
+- 首窗内空流/异常仍返回真实 HTTP 4xx/5xx；首窗后异常只能写 SSE error 帧（`routes_claude.py:101-164`、`routes_responses.py:138-191`、`gemini_service.py:222-278`）。
+- 该机制替代旧的“等待首事件再返回响应头”实现，避免 Cloudflare 524；它不是服务端总超时。
+
+### 13.2 E-04：非 Gemini 协议的 seed
+
+`seed` 仅对 Gemini 原生生效；OpenAI 无该字段；Claude 与 Responses 接受但忽略：
+
+- Claude：`_log_ignored_seed` 记录 `[E-04]` 告警，不写 `generationConfig.seed`（`claude_request.py:552-562`、`:568`）。
+- Responses：`_warn_ignored("seed")`，不写 `generationConfig.seed`（`responses_request.py:315-318`）。
+- Gemini：`chat_service.py:1009-1011` 写入 `generation_config_overrides["seed"]`，由 `wire_types.py:224-232` 写 generation config 下标 18。
+
+### 13.3 D-04/D-06：tier 403 与路由 503
+
+- `TierRequiredError` 是领域错误：`status_code=403`、`code=tier_required`、字段 `model/tier/required_tier/current_tier`（`domain/errors.py:24-62`）。
+- Application 层不构造 HTTP 响应；`RoutingPipeline.handle_error` 对 `TierRequiredError` 直接抛出，不重试/不切号（`routing_pipeline.py:763-764`）。
+- API 层 `error_mapping.error_payload` 按四协议渲染：Gemini `PERMISSION_DENIED`、Claude `permission_error`、OpenAI/Responses `tier_required`（`error_mapping.py:125-150`）。
+- `RoutingError`/`SurfaceCapacityError`/`SurfaceSwitchExhaustedError` 统一 503（`domain/errors.py:65-138`），绝不与 tier 403 混用；`format_errors.py:206-244` 对 `TierRequiredError`/`RoutingError` 直接委托 `error_payload`。
+- 四协议的流式错误帧分别由 `openai_sse_error` / `claude_sse_error` / `gemini_service.format_sse_error` / Responses `renderer.failed` 渲染，并保留 tier 字段（`format_errors.py:247-264`、`gemini_service.py:185-200`）。
