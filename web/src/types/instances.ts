@@ -37,6 +37,15 @@ export interface InstanceList {
   latest_instance_id: string | null
   current_instance_id: string | null
   instances: Instance[]
+  engine?: string
+  engine_phase?: string
+  engine_target?: string
+  rebuilt?: number
+  total?: number
+  transport_state?: string
+  worker_state?: string
+  proof_latency_ms?: number | null
+  fingerprint_profile?: string
 }
 
 export interface CreateInstanceRequest {

@@ -14,9 +14,12 @@ import {
   X,
 } from 'lucide-vue-next'
 import {
+  engineLabel,
+  enginePhaseLabel,
   fingerprintSummary,
   instanceStateLabel,
   instanceStateTone,
+  isEngineSwitching,
   slotSummary,
 } from '@/utils/instances.ts'
 
@@ -27,6 +30,11 @@ const emit = defineEmits<{
 
 const accountsStore = useAccountsStore()
 const instancesStore = useInstancesStore()
+
+const engineSwitching = computed(() => isEngineSwitching(instancesStore.enginePhase))
+const engineName = computed(() =>
+  engineLabel(instancesStore.engine || instancesStore.engineTarget || 'browser'),
+)
 
 const accountLabels = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {}
@@ -85,6 +93,24 @@ async function handleClose(instance: Instance) {
         </h3>
         <span class="text-xs font-mono text-gray-500 bg-white border border-gray-200 px-2.5 py-0.5 rounded-full">
           {{ instancesStore.usedCount }} / {{ instancesStore.maxInstances }}
+        </span>
+        <span
+          class="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
+          :class="instancesStore.engine === 'browserless'
+            ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+            : 'bg-sky-50 text-sky-700 border-sky-200'"
+        >
+          引擎: {{ engineName }}
+        </span>
+        <span
+          v-if="engineSwitching"
+          class="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200"
+          :title="`目标引擎: ${engineName}`"
+        >
+          切换中: {{ enginePhaseLabel(instancesStore.enginePhase) }}
+          <template v-if="instancesStore.engineTotal > 0">
+            ({{ instancesStore.engineRebuilt }}/{{ instancesStore.engineTotal }})
+          </template>
         </span>
         <span
           v-if="instancesStore.latestInstanceId"
@@ -153,6 +179,22 @@ async function handleClose(instance: Instance) {
               </span>
               <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-gray-100 text-gray-600 border border-gray-200">
                 {{ instance.surface || 'chat' }}
+              </span>
+              <span
+                v-if="engineSwitching"
+                class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200"
+                :title="`目标引擎: ${engineName}`"
+              >
+                {{ enginePhaseLabel(instancesStore.enginePhase) }}
+              </span>
+              <span
+                v-else
+                class="px-1.5 py-0.5 rounded text-[10px] font-mono border"
+                :class="instancesStore.engine === 'browserless'
+                  ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                  : 'bg-sky-50 text-sky-700 border-sky-200'"
+              >
+                {{ engineName }}
               </span>
               <span
                 v-if="instance.in_flight > 0"

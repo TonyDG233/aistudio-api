@@ -40,6 +40,10 @@ chromium-profile/
 # Botguard fork (not needed for main service)
 botguard-fork/
 
+# waa-signer local build artifacts (rebuilt inside the Docker build stage)
+waa-signer/.deps/
+waa-signer/bin/
+
 # Documentation
 docs/
 *.md

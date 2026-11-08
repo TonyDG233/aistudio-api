@@ -25,6 +25,7 @@
 - [Protocol Matrix](#protocol-matrix)
 - [Architecture](#architecture)
 - [Instance Pool and Account Scheduling](#instance-pool-and-account-scheduling)
+- [Engines (Browser / Browserless)](#engines-browser--browserless)
 - [Large-Context Tool Calling and SillyTavern](#large-context-tool-calling-and-sillytavern)
 - [Browser Fingerprint and Keepalive](#browser-fingerprint-and-keepalive)
 - [Quick Start](#quick-start)
@@ -48,6 +49,8 @@
 |---|---|
 | **Four protocol faces** | One protocol-neutral generation pipeline serves Gemini `/v1beta`, OpenAI `/v1/chat/completions`, Claude `/v1/messages`, and OpenAI Responses `/v1/responses`. Gemini is always on; OpenAI / Claude / Responses are enabled by default and can be disabled in `features.formats`. |
 | **Multi-instance account pool** | One instance = one account + one BrowserContext + one Page + one surface (chat or build). Instances are declared with `count`, `surface`, and tier selectors; Free and Paid lanes stay isolated. |
+| **Dual-engine hot switch** | `browser` (CloakBrowser/CDP) and `browserless` (built-in waa-signer, no Chromium) are global alternatives. Saving in the console runs Validate → Preflight → Drain → Destroy → Rebuild → Commit with automatic rollback; new requests receive 503 + `Retry-After` during the switch. |
+| **Built-in WAA signer** | In browserless mode, waa-signer executes the BotGuard challenge with SpiderMonkey 152 and sends protected RPC over uTLS/HTTP2/HTTP3. It supports an auto-started local subprocess or an explicit remote endpoint. |
 | **Tier admission** | `only_tier` / `min_tier` / `max_tier` form a closed interval. Free models only hit Free instances; paid models only hit instances whose account tier matches. Insufficient paid tier returns a local 403 without switching accounts or downgrading. |
 | **429 / 403 scheduling** | 429 retries the same account after a short backoff, then wakes or switches eligible pooled instances, bounded by a switch budget. 403 has no hard cooldown: the first failure re-signs and retries in place, the second switches to a healthy account. |
 | **Large-context tool calls** | PG-01 thought-signature cache, PG-04 Struct coercion, and PG-08 lenient tool history keep long sessions and tool chains valid against Gemini upstream. |
@@ -121,10 +124,14 @@ features:
 ┌──────────────────────────────▼───────────────────────────────┐
 │ InstancePool: 1 instance = account + Context + Page + surface │
 └──────────────────────────────┬───────────────────────────────┘
-                               │ CDP WebSocket
-┌──────────────────────────────▼───────────────────────────────┐
-│      Controlled CloakBrowser (Chromium) in-page XHR Replay    │
-└──────────────────────────────┬───────────────────────────────┘
+                               │ one global engine
+        ┌──────────────────────┴───────────────────────┐
+        │ browser (default)                             │ browserless
+┌───────▼──────────────────────────────┐  ┌────────────▼──────────────────────────────┐
+│ Controlled CloakBrowser (Chromium)   │  │ Built-in waa-signer (SpiderMonkey 152)    │
+│ in-page XHR Replay + CDP             │  │ proof minting + native uTLS/HTTP2/HTTP3   │
+└───────┬──────────────────────────────┘  └────────────┬──────────────────────────────┘
+        └──────────────────────┬───────────────────────┘
                                │ HTTPS / RPC
 ┌──────────────────────────────▼───────────────────────────────┐
 │                Google AI Studio (alkalimakersuite)            │
@@ -187,6 +194,66 @@ At least one of `only_tier` / `min_tier` / `max_tier` is required; semantics are
 - `account_surface`: chat and build are accounted separately.
 
 This only affects statistics keys, quota display, and 429 cooldown scope; it does not create new instances.
+
+---
+
+## Engines (Browser / Browserless)
+
+### Engine boundaries
+
+The engine is a global either/or choice set by `engine.mode`, defaulting to `browser`:
+
+- **browser**: one instance = one account + one BrowserContext + one Page + one surface, using controlled CloakBrowser (Chromium) with in-page XHR replay.
+- **browserless**: one instance = one account + one BrowserlessSession + one surface, with no Chromium. Each slot owns its own Cookies, deterministic fingerprint, proof minter, and transport; sessions and response headers are never shared across slots.
+
+Both engines share the same protocol faces, routing, accounts, statistics, keepalive, and logging. Switching engines does not change slot counts or tier selectors.
+
+### Hot switch from the console
+
+Saving `engine.mode` on the Settings page runs a transactional switch:
+
+1. **Validate**: validate the target engine settings and slot topology; invalid input returns 422.
+2. **Preflight**: establish one usable session with the new engine; failure returns 503 while the old engine keeps serving.
+3. **Drain**: wait for in-flight requests with a bounded timeout.
+4. **Destroy**: close old slots and the old engine (including CloakBrowser processes when leaving `browser`).
+5. **Rebuild**: rebuild the original slot topology and account bindings on the new engine.
+6. **Commit**: persist the new config and engine epoch; any failure rolls back the old engine and config.
+
+New requests during the switch receive 503 with `Retry-After`. `GET /api/system/status`, `GET /api/instances`, and `POST /api/engine/health-check` expose the engine, switch phase, and health result.
+
+### WAA signer: local and remote
+
+browserless mode delegates proof signing to waa-signer, which can be deployed in two ways:
+
+```yaml
+engine:
+  mode: browserless
+  browserless:
+    signer:
+      mode: local_subprocess      # local_subprocess | remote_http
+      endpoint: http://127.0.0.1:8081
+      binary_path: waa-signer/bin/waa-signer
+      auto_start: true
+      state_dir: data/waa/workers
+      max_workers: 8
+      idle_ttl_s: 900
+      locale: en-US
+      timezone: America/Los_Angeles
+```
+
+- `local_subprocess`: `binary_path` resolves relative to the repository root; with `auto_start: true` the main service spawns the process and waits for `/health`.
+- `remote_http`: point `endpoint` at a remote signer; the main service does not spawn a local process.
+- `state_dir` stores Worker fingerprints and interpreter caches and resolves relative to the process working directory (`/app/data/waa/workers` in Docker, persisted with the data volume).
+- `max_workers` must cover the number of instance slots; `locale` and `timezone` should match the declared account environment.
+
+### Single-image dual engines in Docker
+
+The official image bundles both CloakBrowser and waa-signer:
+
+- A multi-stage build produces a statically linked waa-signer at `/app/waa-signer/bin/waa-signer`, matching the default `engine.browserless.signer.binary_path`.
+- `local_subprocess` + `auto_start` is the default, so switching to browserless starts the signer automatically without an extra container or mount.
+- To run the signer separately, set `mode: remote_http` and point `endpoint` at it.
+- Both engines share the same image and data volume; no image rebuild is needed to switch engines.
 
 ---
 
@@ -330,7 +397,7 @@ Open `http://localhost:8080` after startup.
 
 ### Docker / Compose
 
-The image bundles the CloakBrowser runtime:
+The image bundles both CloakBrowser (browser engine) and waa-signer (browserless engine), so one container can hot-switch between them:
 
 ```bash
 docker run -d \
@@ -339,10 +406,10 @@ docker run -d \
   -p 8080:8080 \
   -v aistudio-api-data:/app/data \
   -e AISTUDIO_WEB_PASSWORD=your-console-password \
-  ghcr.io/tonydg233/aistudio-api:2.0.0
+  ghcr.io/tonydg233/aistudio-api:2.1.0
 ```
 
-GHCR provides both the pinned baseline `ghcr.io/tonydg233/aistudio-api:2.0.0` and the rolling `ghcr.io/tonydg233/aistudio-api:latest` tag. With `docker run`, the container initializes `/app/data/config.yaml` from `/app/defaults/config.yaml` on first start.
+GHCR provides both the pinned baseline `ghcr.io/tonydg233/aistudio-api:2.1.0` and the rolling `ghcr.io/tonydg233/aistudio-api:latest` tag. With `docker run`, the container initializes `/app/data/config.yaml` from `/app/defaults/config.yaml` on first start. waa-signer lives at `/app/waa-signer/bin/waa-signer` and is started automatically by the browserless engine, with no extra container or mount.
 
 Before using the repository's root `docker-compose.yml`, you must prepare `config.yaml` on the host; it is bind-mounted over `/app/config.yaml`. If the file does not exist, Docker creates a directory with that name and the entrypoint cannot materialize the template as the `/app/config.yaml` file:
 
@@ -372,6 +439,7 @@ docker compose up -d
 |---|---|
 | `api_keys` / `security` | Public API keys and anonymous access policy |
 | `instances` / `max_contexts` | Instance specs and global capacity |
+| `engine` | Request engine (browser / browserless), switch transaction, WAA signer and transport settings |
 | `rotator` | Retries, 429 cooldowns, quota scope |
 | `features.routing` | Consecutive switch budget and same-account 429 backoff |
 | `features.keepalive` | 24h auth and metadata refresh cadence |
@@ -430,7 +498,7 @@ Open `http://localhost:8080` (login is required after setting `AISTUDIO_WEB_PASS
 
 1. **Dashboard**: running instances, in-flight requests, account and quota overview, model usage statistics, 7 / 30 / 90-day request and token trend charts, and quick API examples. Statistics are archived by Asia/Shanghai natural day for the last 90 days and distinguish client-request from attempt denominators.
 2. **Accounts**: Cookie text and bundle import, sub-account probing, instance slot creation/rebinding/restart, account enablement and grouping, presets, quota and 429 state, and manual keepalive.
-3. **Settings**: API key management, security and browser, scheduling and retries, protocol switches and ATG, log configuration, model rules, and YAML source editing with hot reload on save.
+3. **Settings**: API key management, request engine (browser / browserless hot switch), security and browser, scheduling and retries, protocol switches and ATG, log configuration, model rules, and YAML source editing with hot reload on save. Engine changes use a transactional switch with rollback.
 4. **Logs**: live SSE log stream, level filtering, search, pause, and 1 / 3 / 7-day export.
 
 ### UI Debug sandbox
@@ -609,6 +677,7 @@ cd android
 - [System architecture](./docs/ARCHITECTURE.md): four layers, request lifecycle, instance pool, routing, logging.
 - [Wire protocol specification](./docs/WIRE_SPECIFICATION.md): Protobuf-JSON array mapping, field indices, multimodal parts, schema encoding.
 - [BotGuard verification chain](./docs/BOTGUARD_VERIFICATION_CHAIN.md): WAA challenge handshake, dynamic Wasm signing, content hashing.
+- [WAA Signer standalone service](./waa-signer/README.md): SpiderMonkey 152 runtime, HTTP API, manual builds, and Docker bundling.
 - [Instance pool and routing specification](./docs/INSTANCE_POOL_AND_ROUTING_SPEC.md): instances, tier selectors, 429 / 403, surface routing.
 - [Keepalive and logging specification](./docs/KEEPALIVE_AND_LOGGING_SPEC.md): 24h keepalive, three log sinks, redaction.
 - [Protocol and tool-call specification](./docs/PROTOCOL_AND_TOOLCALL_SPEC.md): four-protocol conversion, PG-01/04/08, ATG, countTokens.

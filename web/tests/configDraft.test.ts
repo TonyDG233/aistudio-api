@@ -3,15 +3,19 @@ import {
   applySection,
   asBool,
   asNumber,
+  asRecord,
   asString,
   deepClone,
   deepEqual,
   dirtySections,
   isYamlDirty,
   parseYamlDoc,
+  patchEngineSection,
   pickSection,
+  readEngineBlock,
   sectionsEqual,
   stringifyYamlDoc,
+  writeEngineSection,
   type ConfigDoc,
   type ConfigSectionKey,
 } from '../src/components/config/configDraft.ts'
@@ -184,5 +188,92 @@ describe('value coercion helpers', () => {
     expect(asNumber('nope', 7)).toBe(7)
     expect(asBool('true', false)).toBe(false)
     expect(asBool(true, false)).toBe(true)
+  })
+})
+
+describe('engine section model wiring', () => {
+  function engineDraft(): ConfigDoc {
+    return {
+      engine: {
+        mode: 'browser',
+        browserless: {
+          signer: {
+            mode: 'local_subprocess',
+            endpoint: 'http://127.0.0.1:8081',
+            auto_start: true,
+            max_workers: 8,
+          },
+          transport: { mode: 'signer_rpc' },
+        },
+      },
+      instances: [{ count: 1, surface: 'chat', only_tier: 'Free' }],
+      max_contexts: 2,
+    }
+  }
+
+  test('reads the inner engine block from a picked section model', () => {
+    const sectionModel = pickSection(engineDraft(), 'engine')
+
+    expect(asRecord(sectionModel.engine)).toBeDefined()
+    const engine = readEngineBlock(sectionModel)
+    expect(engine.mode).toBe('browser')
+    expect(asRecord(asRecord(engine.browserless).signer).max_workers).toBe(8)
+  })
+
+  test('switching mode writes draft.engine.mode and keeps nested fields', () => {
+    const saved = engineDraft()
+    const draft = deepClone(saved)
+    const emitted = {
+      ...readEngineBlock(pickSection(draft, 'engine')),
+      mode: 'browserless',
+    }
+
+    const next = applySection(draft, 'engine', writeEngineSection(emitted))
+    const engine = asRecord(next.engine)
+
+    expect(engine.mode).toBe('browserless')
+    expect(asRecord(asRecord(engine.browserless).signer).endpoint).toBe(
+      'http://127.0.0.1:8081',
+    )
+    expect(sectionsEqual(next, saved, 'engine')).toBe(false)
+    expect(dirtySections(next, saved)).toEqual(['engine'])
+    expect(next.instances).toEqual(saved.instances)
+    expect(next.max_contexts).toBe(2)
+  })
+
+  test('nested field patch round-trips through save', () => {
+    const saved = engineDraft()
+    const draft = deepClone(saved)
+    const sectionModel = pickSection(draft, 'engine')
+    const block = readEngineBlock(sectionModel)
+    const patch = patchEngineSection(sectionModel, {
+      browserless: {
+        ...asRecord(block.browserless),
+        signer: {
+          ...asRecord(asRecord(block.browserless).signer),
+          max_workers: 12,
+        },
+      },
+    })
+    const edited = applySection(draft, 'engine', patch)
+
+    expect(
+      asRecord(asRecord(asRecord(edited.engine).browserless).signer).max_workers,
+    ).toBe(12)
+
+    const server = applySection(saved, 'engine', pickSection(edited, 'engine'))
+    const nextDraft = applySection(edited, 'engine', pickSection(server, 'engine'))
+
+    expect(sectionsEqual(nextDraft, server, 'engine')).toBe(true)
+    expect(dirtySections(nextDraft, server)).toEqual([])
+  })
+
+  test('missing engine block stays empty and never leaks scheduler keys', () => {
+    const sectionModel = pickSection({ instances: [{ count: 1 }] }, 'engine')
+
+    expect(readEngineBlock(sectionModel)).toEqual({})
+    expect(Object.keys(patchEngineSection(sectionModel, { mode: 'browserless' }))).toEqual([
+      'engine',
+    ])
   })
 })

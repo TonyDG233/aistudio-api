@@ -1,3 +1,92 @@
+# syntax=docker/dockerfile:1
+
+# ============================================================================
+# Stage 1: waa-signer (browserless engine signing daemon)
+#
+# Builds the Go signer with the Go 1.27 toolchain required by waa-signer/go.mod
+# (toolchain go1.27.0) and links the static SpiderMonkey 152 library with Zig.
+# The resulting binary is statically linked, so no mozjs shared library is
+# needed in the runtime image. BuildKit caches the module download, Zig download
+# and SpiderMonkey download layers independently from the source copy.
+# ============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS waa-signer-build
+
+ARG TARGETARCH
+ARG ZIG_VERSION=0.14.1
+ARG SPIDERMONKEY_VERSION=v152.0.4-aistudio2api.1
+
+ENV GOTOOLCHAIN=local \
+    CGO_ENABLED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Zig for the build host architecture. Zig is used as the C/C++
+# cross-compiler so Go can cross-compile CGO for the target architecture.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) ZIG_ARCH="x86_64" ;; \
+        arm64) ZIG_ARCH="aarch64" ;; \
+        *) echo "Unsupported build architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fSL --retry 3 -o /tmp/zig.tar.xz \
+        "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm -f /tmp/zig.tar.xz; \
+    /opt/zig/zig version
+ENV PATH="/opt/zig:${PATH}"
+
+WORKDIR /src/waa-signer
+
+# Cache Go module downloads before copying the source tree.
+COPY waa-signer/go.mod waa-signer/go.sum ./
+RUN go mod download
+
+# Download the matching static SpiderMonkey library before copying the source
+# tree so source changes do not re-download it.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) SM_ARCH="linux-amd64" ;; \
+        arm64) SM_ARCH="linux-arm64" ;; \
+        *) echo "Unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    DEPS_DIR="/src/waa-signer/.deps/spidermonkey/${SM_ARCH}"; \
+    mkdir -p "${DEPS_DIR}"; \
+    TARBALL="spidermonkey-${SPIDERMONKEY_VERSION}-${SM_ARCH}.tar.gz"; \
+    curl -fSL --retry 3 -o "/tmp/${TARBALL}" \
+        "https://github.com/Mag1cFall/firefox/releases/download/${SPIDERMONKEY_VERSION}/${TARBALL}"; \
+    tar -xzf "/tmp/${TARBALL}" -C "${DEPS_DIR}"; \
+    rm -f "/tmp/${TARBALL}"; \
+    test -f "${DEPS_DIR}/lib/libjs_static.a"
+
+COPY waa-signer/ ./
+
+# Build a fully static Linux binary for the requested target architecture.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) GO_ARCH="amd64"; SM_ARCH="linux-amd64"; ZIG_TARGET="x86_64-linux-musl" ;; \
+        arm64) GO_ARCH="arm64"; SM_ARCH="linux-arm64"; ZIG_TARGET="aarch64-linux-musl" ;; \
+        *) echo "Unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    DEPS_DIR="/src/waa-signer/.deps/spidermonkey/${SM_ARCH}"; \
+    mkdir -p /out; \
+    CGO_ENABLED=1 GOOS=linux GOARCH="${GO_ARCH}" \
+        CC="zig cc -target ${ZIG_TARGET}" \
+        CXX="zig c++ -target ${ZIG_TARGET}" \
+        CGO_CXXFLAGS="-I${DEPS_DIR}/include" \
+        CGO_LDFLAGS="-L${DEPS_DIR}/lib" \
+        go build -trimpath -tags netgo,osusergo \
+            -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all'" \
+            -o /out/waa-signer ./cmd/waa-signer; \
+    chmod +x /out/waa-signer
+
+# ============================================================================
+# Stage 2: runtime image
+# ============================================================================
 # Use Debian 12 (bookworm) explicitly so package names stay stable.
 FROM python:3.11-slim-bookworm
 
@@ -11,7 +100,7 @@ ENV PYTHONUNBUFFERED=1 \
     AISTUDIO_BROWSER_EXECUTABLE=/opt/cloakbrowser/chrome
 
 # Install system dependencies and runtime libraries for CloakBrowser headless CDP automation
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     tar \
@@ -50,7 +139,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libexpat1 \
     libx11-xcb1 \
     libxcb-dri3-0 \
+    tzdata \
+    locales \
     && rm -rf /var/lib/apt/lists/*
+
+# The waa-signer binary embeds Go's time/tzdata and resolves its locale from
+# its own flags, so it does not depend on system locale files. Generate
+# en_US.UTF-8 anyway so Chromium and shell tooling can reuse it when a caller
+# explicitly sets LANG/LC_ALL; the default C.UTF-8 environment is unchanged.
+RUN sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen
 
 # Install CloakBrowser (stealth anti-detection Chromium) for x86_64 / aarch64
 ARG CLOAKBROWSER_VERSION=146.0.7680.177.4
@@ -93,11 +191,16 @@ COPY main.py .
 COPY defaults/config.yaml /app/defaults/config.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
+# Bundle the statically linked waa-signer for the browserless engine. The path
+# must stay identical to engine.browserless.signer.binary_path in
+# defaults/config.yaml and resolves relative to /app at runtime.
+COPY --from=waa-signer-build /out/waa-signer /app/waa-signer/bin/waa-signer
+
 # Create necessary directories
-RUN mkdir -p /app/data /tmp
+RUN mkdir -p /app/data /app/waa-signer/bin /tmp
 
 # Set permissions
-RUN chmod +x /app/main.py /app/docker-entrypoint.sh
+RUN chmod +x /app/main.py /app/docker-entrypoint.sh /app/waa-signer/bin/waa-signer
 
 # Expose ports
 # 8080: API server

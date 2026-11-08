@@ -64,14 +64,14 @@ build.bat
 脚本会自动完成依赖下载与编译，产出 `bin\waa-signer.exe`。
 > **Windows 编译小贴士**：推荐使用轻量免配置的 Zig 编译器（执行 `winget install zig.zig` 即可一键就绪）。
 
-#### Docker（当前状态）
-**主 Dockerfile 目前没有内置 `waa-signer` 的多阶段构建**，`docker build -t aistudio-api .` 不会产出或内置本服务。将 `waa-signer` 纳入主镜像的多阶段构建计划在 **2.1-B** 完成。
+#### Docker（单镜像内置）
+主 `Dockerfile` 现在包含独立的 `waa-signer` 多阶段构建，`docker build -t aistudio-api .` 会与 CloakBrowser 一起产出单镜像双引擎：
 
-在 2.1-B 落地前，请任选一种方式：
-1. 按上面的脚本自行编译 `bin/waa-signer`，在容器启动时通过 volume 挂载（或 COPY 到派生镜像）并单独拉起；
-2. 独立运行本服务（本机或远程节点），由 `aistudio-api` 通过 `waa.mode=remote` + 显式 endpoint 连接。
-
-> 不存在“主 Dockerfile 已自动构建并内置 waa-signer”的现成能力，请勿依赖不存在的自动化。
+- 构建阶段使用 `golang:1.27-bookworm` 与 `GOTOOLCHAIN=local`，满足 `go.mod` 的 `toolchain go1.27.0`；按目标架构获取对应的 SpiderMonkey 静态库，并用 Zig 交叉编译为静态二进制。
+- 产物写入最终镜像 `/app/waa-signer/bin/waa-signer`，与 `defaults/config.yaml` 的 `engine.browserless.signer.binary_path` 默认值一致。
+- 默认 `engine.browserless.signer.mode: local_subprocess` 且 `auto_start: true`，切换到 browserless 引擎时由主服务自动拉起，无需额外容器或 volume 挂载。
+- 仍支持独立部署：把 `mode` 改为 `remote_http` 并显式设置 `endpoint`，主服务不会拉起本地进程。
+- Docker 构建需要联网下载 Go 模块、Zig 与 SpiderMonkey 静态库；构建产物为 Linux 静态二进制。跨架构镜像以对应目标平台的构建结果为准，Windows 仍按上面的脚本手动构建。
 
 ---
 

@@ -3,6 +3,37 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.0] - 2026-11-08
+
+2.1.0 在 2.0.0 多实例池基础上引入 browser 与 browserless 双引擎，补齐 WAA 独立签名器、设置页事务热切换与 Docker 单镜像双引擎。
+
+### Added
+
+- **双引擎**：新增 `engine.mode` 全局二选一。`browser` 保持 CloakBrowser/CDP 单页实例；`browserless` 为每个槽位独立持有 BrowserlessSession（Cookie、确定性指纹、proof 铸造器与传输器），不启动 Chromium。
+- **WAA 签名器**：新增 Go + SpiderMonkey 152 独立签名服务，提供 `POST /v1/proof/mint`、`POST /v1/rpc/send`、`POST /v1/worker/release` 与 `GET /health`；支持 `local_subprocess` 与 `remote_http` 两种接入方式。
+- **引擎热切换**：设置页保存后按 Validate → Preflight → Drain → Destroy → Rebuild → Commit 事务切换，失败自动回滚；切换期间新请求返回 503 并带 `Retry-After`。
+- **引擎状态与探活**：`/api/system/status`、`/api/instances` 暴露引擎与切换阶段，新增 `/api/engine/health-check`（兼容 `/config/waa/health-check`）。
+- **Docker 单镜像双引擎**：主镜像新增 waa-signer 多阶段构建，静态二进制落在 `/app/waa-signer/bin/waa-signer`，与默认 `engine.browserless.signer.binary_path` 一致；镜像同时内置 CloakBrowser 与 waa-signer。
+- **测试**：补充双引擎切换生命周期、切换重入、池化会话回归与 waa-signer 单元测试。
+
+### Changed
+
+- `engine` 配置真实接线：`rollback_on_partial_failure`、`read_timeout_s`、`request_timeout_s` 接入引擎切换与签名传输；移除未实现的 `keep_control_plane`、`health_interval_s`、`http3` 等空配置项。
+- browserless 每个槽位独立持有会话状态，Cookie 回写通过 `/v1/rpc/send` 与 `/v1/proof/mint` 响应及 `X-WAA-Set-Cookies` 头回传，不再依赖全局 `last_headers`。
+- Mint/RPC 请求显式传递稳定 `accountKey`（优先账号 ID，缺失时回退 Cookie 哈希），Cookie 轮换前后 Worker 键保持稳定，并与 `/v1/worker/release` 对齐。
+- Docker 运行时补充时区与 locale 数据；waa-signer 使用 Go 内嵌 `time/tzdata`，无需外部时区库。
+
+### Fixed
+
+- 修复 Cookie 轮换导致 Worker 键漂移、proof 与 RPC 落到不同 Worker 的问题。
+- 修复引擎切换期间旧引擎未完全关闭，或新引擎失败后未回滚的问题。
+- 修复 `X-WAA-Set-Cookies` 在日志中可能泄漏 Cookie 的问题，统一掩码并记录截断告警。
+
+### Security
+
+- waa-signer `/v1/rpc/send` 限制请求体 32 MiB，仅允许 `https://` 且 host 命中 Google 官方域名白名单，拒绝 userinfo、非 443 端口、IP 字面量与第三方 URL（SSRF 防护）。
+- 签名器日志仅记录 Cookie 数量，不记录 Cookie、Authorization 或 API Key 内容；响应头 Cookie 摘要超限时截断并显式标记。
+
 ## [2.0.0] - 2026-11-08
 
 2.0.0 重建基准：在保留上游协议能力与前端界面的前提下，将运行时重构为“多实例池 + 请求期路由”架构，

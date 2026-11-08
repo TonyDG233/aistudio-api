@@ -230,7 +230,7 @@ async def system_status(
             instances = len(getattr(manager, "records", lambda: ())())
         except Exception:
             instances = 0
-    engine_status: dict[str, object] = {}
+    engine_status: dict[str, object] = _sandbox_status(runtime_state)
     switcher = runtime_state.engine_switcher
     getter: Any = getattr(switcher, "status", None)
     if callable(getter):
@@ -244,7 +244,9 @@ async def system_status(
                     str(key): value for key, value in raw_engine_status.items()
                 }
     if not engine_status:
-        settings_block = runtime_state.engine_settings or {}
+        settings_block = _sandbox_engine_settings(runtime_state) or (
+            runtime_state.engine_settings or {}
+        )
         engine_status = {
             "engine": str(settings_block.get("mode") or "browser"),
             "engine_phase": "idle",
@@ -269,6 +271,28 @@ async def engine_health_check(
 ) -> dict[str, object]:
     """Probe the active engine runtime (WAA signer health for browserless)."""
     started = time.perf_counter()
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    sandbox_probe: Any = getattr(sandbox, "engine_health", None)
+    if callable(sandbox_probe):
+        try:
+            sandbox_payload: Any = sandbox_probe()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "engine": "browserless",
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                "workers": 0,
+                "maxWorkers": 0,
+                "version": "",
+                "error": str(exc),
+            }
+        if isinstance(sandbox_payload, dict):
+            payload = {str(key): value for key, value in sandbox_payload.items()}
+            payload.setdefault(
+                "elapsed_ms", round((time.perf_counter() - started) * 1000, 2)
+            )
+            payload.setdefault("error", None)
+            return payload
     runtime = runtime_state.engine_runtime
     probe: Any = getattr(runtime, "health", None)
     if not callable(probe):
@@ -474,6 +498,84 @@ class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
 
 
+def _sandbox_status(runtime_state: RuntimeState) -> dict[str, object]:
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    getter = getattr(sandbox, "engine_status", None)
+    if not callable(getter):
+        return {}
+    try:
+        raw_status = getter()
+    except Exception as exc:
+        logger.debug("sandbox engine status unavailable: %s", exc)
+        return {}
+    if not isinstance(raw_status, dict):
+        return {}
+    return {str(key): value for key, value in raw_status.items()}
+
+
+def _sandbox_engine_settings(runtime_state: RuntimeState) -> dict[str, object] | None:
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    getter = getattr(sandbox, "engine_settings", None)
+    if not callable(getter):
+        return None
+    try:
+        raw_settings = getter()
+    except Exception as exc:
+        logger.debug("sandbox engine settings unavailable: %s", exc)
+        return None
+    return raw_settings if isinstance(raw_settings, dict) else None
+
+
+def _sync_sandbox_engine(
+    runtime_state: RuntimeState, target_engine: dict[str, object]
+) -> dict[str, object] | None:
+    """Apply the simulated switch after a successful sandbox config write."""
+    sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
+    setter = getattr(sandbox, "set_engine", None)
+    if not callable(setter):
+        return None
+    try:
+        result = setter(target_engine)
+    except Exception as exc:
+        logger.warning("sandbox engine switch simulation failed: %s", exc)
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _relax_sandbox_engine(config: dict[str, object]) -> bool:
+    """Offline sandbox must switch engines without a real signer binary.
+
+    Only the local subprocess signer requires ``binary_path`` to exist.  When
+    ui_debug is on and the binary is absent, disable auto-start in the sandbox
+    copy so validation and the simulated switch still succeed.  Nothing real is
+    ever launched.
+    """
+    engine = config.get("engine")
+    if not isinstance(engine, dict):
+        return False
+    browserless = engine.get("browserless")
+    if not isinstance(browserless, dict):
+        return False
+    signer = browserless.get("signer")
+    if not isinstance(signer, dict):
+        return False
+    if str(signer.get("mode") or "local_subprocess") != "local_subprocess":
+        return False
+    if signer.get("auto_start") is not True:
+        return False
+    from aistudio_api.infrastructure.waa.local_daemon import resolve_binary_path
+
+    raw_path = str(signer.get("binary_path") or "waa-signer/bin/waa-signer")
+    try:
+        binary = resolve_binary_path(raw_path)
+    except Exception:
+        binary = None
+    if binary is not None and binary.is_file():
+        return False
+    signer["auto_start"] = False
+    return True
+
+
 def _engine_settings_for_mapping(parsed: dict[str, object]) -> dict[str, object]:
     """Validate the engine block of a merged config document (422 on failure)."""
     raw_instances = parsed.get("instances")
@@ -574,7 +676,9 @@ async def get_system_config(
     if config_yaml_path.exists():
         with contextlib.suppress(Exception):
             yaml_content = config_yaml_path.read_text(encoding="utf-8")
-    engine_settings = runtime_state.engine_settings or {}
+    engine_settings = _sandbox_engine_settings(runtime_state) or (
+        runtime_state.engine_settings or {}
+    )
     return {
         "port": settings.port,
         "browser_port": settings.browser_port,
@@ -607,12 +711,19 @@ async def update_config_yaml(
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    config_text = req.yaml_content
     merged_for_engine_raw = merge_config_documents(_default_config(), parsed or {})
     merged_for_engine = (
         cast("dict[str, object]", merged_for_engine_raw)
         if isinstance(merged_for_engine_raw, dict)
         else {}
     )
+    if runtime_state.ui_debug and _relax_sandbox_engine(merged_for_engine):
+        relaxed = dict(parsed or {})
+        engine_block = merged_for_engine.get("engine")
+        if isinstance(engine_block, dict):
+            relaxed["engine"] = engine_block
+            config_text = yaml.dump(relaxed, allow_unicode=True, sort_keys=False)
     try:
         target_engine = _engine_settings_for_mapping(merged_for_engine)
     except ConfigValidationError as e:
@@ -632,15 +743,16 @@ async def update_config_yaml(
     switched = await _run_engine_switch(
         runtime_state,
         target_engine=target_engine,
-        target_config_text=req.yaml_content,
+        target_config_text=config_text,
     )
     if switched is None:
         try:
-            write_config_text(req.yaml_content)
+            write_config_text(config_text)
         except ConfigValidationError as e:
             raise HTTPException(400, detail=str(e)) from e
         except OSError as e:
             raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        _sync_sandbox_engine(runtime_state, target_engine)
 
     try:
         _apply_logging_runtime(parsed)
@@ -686,6 +798,8 @@ async def patch_config(
     merged = merge_config_documents(parsed, req.updates)
     if not isinstance(merged, dict):
         raise HTTPException(400, detail="配置合并结果必须为字典结构")
+    if runtime_state.ui_debug:
+        _relax_sandbox_engine(merged)
 
     target_text = yaml.dump(merged, allow_unicode=True, sort_keys=False)
     try:
@@ -717,6 +831,7 @@ async def patch_config(
             raise HTTPException(400, detail=str(e)) from e
         except OSError as e:
             raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        _sync_sandbox_engine(runtime_state, target_engine)
 
     try:
         _apply_logging_runtime(merged)
@@ -774,6 +889,7 @@ async def reset_config(
         diagnostics_map = dict(diagnostics) if isinstance(diagnostics, dict) else {}
         diagnostics_map["ui_debug"] = True
         template["diagnostics"] = diagnostics_map
+        _relax_sandbox_engine(template)
 
     target_text = yaml.dump(template, allow_unicode=True, sort_keys=False)
     try:
@@ -804,6 +920,7 @@ async def reset_config(
             raise HTTPException(400, detail=str(e)) from e
         except OSError as e:
             raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+        _sync_sandbox_engine(runtime_state, target_engine)
 
     try:
         _apply_logging_runtime(template)

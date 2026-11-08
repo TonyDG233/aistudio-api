@@ -10,10 +10,31 @@ export interface SystemConfig {
   debug_env_active?: boolean
   dump_to_file?: boolean
   dump_dir?: string
+  engine?: string
+  engine_settings?: Record<string, unknown>
   ui_debug?: boolean
   ui_debug_scenario?: string | null
   ok?: boolean
   message?: string
+  engine_switch?: EngineSwitchResult
+}
+
+export interface EngineHealthResponse {
+  ok: boolean
+  engine: string
+  elapsed_ms?: number
+  workers?: number
+  maxWorkers?: number
+  version?: string
+  error?: string | null
+}
+
+export interface EngineSwitchResult {
+  switched?: boolean
+  engine?: string
+  engine_epoch?: number
+  rebuilt?: number
+  total?: number
 }
 export interface UpdateLoggingConfigRequest {
   level?: string
@@ -49,6 +70,17 @@ export interface SystemStatusResponse {
   instances?: number
   formats?: SystemFormats
   default_text_model?: string
+  engine?: string
+  engine_phase?: string
+  engine_target?: string
+  engine_epoch?: number
+  rebuilt?: number
+  total?: number
+  transport_state?: string
+  worker_state?: string
+  proof_latency_ms?: number | null
+  fingerprint_profile?: string
+  engine_error?: string | null
 }
 export interface ApiKeyItem {
   name: string
