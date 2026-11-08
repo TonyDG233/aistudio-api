@@ -74,3 +74,16 @@ test('N-2 protocol card describes Claude and Responses as enabled by default', (
   expect(card).toContain("asBool(formats.value.claude, true)")
   expect(card).toContain("asBool(formats.value.responses, true)")
 })
+
+test('N-7 client tooltip separates 429 terminal failures, rescues, errors and aborts', () => {
+  const chart = source('../src/components/dashboard/UsageRequestChart.vue')
+
+  expect(chart).toContain('429 限流失败')
+  expect(chart).toContain('重试/切号救援成功')
+  expect(chart).toContain('最终失败')
+  expect(chart).toContain('中断')
+  expect(chart).toContain('tooltip.errors.toLocaleString()')
+  expect(chart).toContain('tooltip.aborted.toLocaleString()')
+  expect(chart).not.toContain('429 重试')
+  expect(chart).not.toContain('text-gray-300">救援</span>')
+})

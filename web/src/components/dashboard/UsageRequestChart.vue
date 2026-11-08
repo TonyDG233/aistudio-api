@@ -5,7 +5,6 @@ import { formatCompactNumber } from './dashboardMetrics.ts'
 import type { UsageMetricMode } from './modelUsage.ts'
 import {
   attemptSuccessRate,
-  clientFinalFailures,
   clientSuccessRate,
   formatSuccessRate,
   metricLabel,
@@ -124,7 +123,6 @@ const tooltip = computed(() => {
       success: point.client.success,
       rateLimited: point.client.rate_limited,
       rescued: point.client.rescued_requests,
-      failed: clientFinalFailures(point.client),
       errors: point.client.errors,
       aborted: point.client.aborted,
       rate: formatSuccessRate(clientSuccessRate(point.client)),
@@ -276,19 +274,20 @@ const tooltip = computed(() => {
             <span class="font-mono tabular-nums text-emerald-300">{{ tooltip.success.toLocaleString() }}</span>
           </div>
           <div class="flex items-center justify-between gap-4">
-            <span class="text-gray-300">429 重试</span>
+            <span class="text-gray-300">429 限流失败</span>
             <span class="font-mono tabular-nums text-amber-300">{{ tooltip.rateLimited.toLocaleString() }}</span>
           </div>
           <div class="flex items-center justify-between gap-4">
-            <span class="text-gray-300">救援</span>
+            <span class="text-gray-300">重试/切号救援成功</span>
             <span class="font-mono tabular-nums text-sky-300">{{ tooltip.rescued.toLocaleString() }}</span>
           </div>
-          <div
-            class="flex items-center justify-between gap-4"
-            :title="`错误 ${tooltip.errors.toLocaleString()} · 中断 ${tooltip.aborted.toLocaleString()}`"
-          >
+          <div class="flex items-center justify-between gap-4">
             <span class="text-gray-300">最终失败</span>
-            <span class="font-mono tabular-nums text-rose-300">{{ tooltip.failed.toLocaleString() }}</span>
+            <span class="font-mono tabular-nums text-rose-300">{{ tooltip.errors.toLocaleString() }}</span>
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <span class="text-gray-300">中断</span>
+            <span class="font-mono tabular-nums text-rose-300">{{ tooltip.aborted.toLocaleString() }}</span>
           </div>
           <div class="mt-1.5 flex items-center justify-between gap-4 border-t border-white/10 pt-1.5">
             <span class="text-gray-300">成功率</span>
