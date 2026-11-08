@@ -32,16 +32,16 @@ function handleInput(e: Event) {
 
 <template>
   <div class="space-y-1.5">
-    <div class="space-y-0.5">
+    <div class="flex items-center justify-between">
       <label class="block text-xs font-semibold text-gray-700">
         {{ label }}
       </label>
-      <p
+      <span
         v-if="description"
-        class="text-[11px] leading-snug text-gray-400"
+        class="text-[11px] text-gray-400"
       >
         {{ description }}
-      </p>
+      </span>
     </div>
 
     <input

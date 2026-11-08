@@ -1,0 +1,50 @@
+{
+  "feature_id": "D06-066",
+  "case": "F-01",
+  "description": "Gemini 原生历史 model-role functionCall 缺 thoughtSignature；normalize 后必须补占位签名。",
+  "request": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What is the weather in Paris? Use the tool."
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "get_weather",
+              "args": {
+                "city": "Paris"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "get_weather",
+              "response": {
+                "temperature_c": 21,
+                "condition": "sunny"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "wire_part_index": 10,
+    "thought_signature_index": 14,
+    "dummy_signature": "context_engineering_is_the_way_to_go",
+    "signature_scope": "functionCall-only"
+  }
+}

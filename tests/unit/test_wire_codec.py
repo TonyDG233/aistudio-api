@@ -113,14 +113,7 @@ def test_build_tools_from_names_allows_four_gemini_builtin_tools():
     ]
 
 
-def test_build_tools_from_names_restricts_unknown_model_to_safe_subset(
-    monkeypatch,
-):
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-    monkeypatch.setattr(
-        model_discovery, "get_cached_model_info", lambda _model_id: None
-    )
+def test_build_tools_from_names_restricts_unknown_model_to_safe_subset():
     try:
         build_tools_from_names(
             ["google_maps"], model="models/learnlm-1.5-pro-experimental"
@@ -351,9 +344,7 @@ def test_decode_image_request_maps_generation_config_fields_from_proto_indexes()
     assert request.generation_config.image_output_mode == [2, 1]
     assert request.generation_config.thinking_config == [1, None, None, 3]
     assert request.request_flag == 1
-    assert request.cached_content is not None and request.cached_content.startswith(
-        "v1_"
-    )
+    assert request.session_token is not None and request.session_token.startswith("v1_")
 
 
 def test_encode_preserves_newly_mapped_proto_fields():
@@ -368,7 +359,7 @@ def test_encode_preserves_newly_mapped_proto_fields():
     assert reparsed.generation_config.image_output_mode == [2, 1]
     assert reparsed.generation_config.thinking_config == [1, None, None, 3]
     assert reparsed.request_flag == 1
-    assert reparsed.cached_content == request.cached_content
+    assert reparsed.session_token == request.session_token
 
 
 def test_thinking_config_encodes_high_level_wire_shape():
@@ -398,6 +389,13 @@ def test_generation_config_accepts_media_resolution_enum():
     config.media_resolution = MediaResolution.MEDIUM
 
     assert config.media_resolution == 2
+
+
+def test_generation_config_seed_maps_to_index_18():
+    config = AistudioGenerationConfig([])
+    config.seed = 42
+    assert config.seed == 42
+    assert config.values[18] == 42
 
 
 def test_wire_codec_retains_schema_with_tools():

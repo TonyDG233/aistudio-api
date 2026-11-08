@@ -12,6 +12,7 @@ class GeminiUsageMetadata(BaseModel):
     candidatesTokenCount: int = 0
     thoughtsTokenCount: int = 0
     totalTokenCount: int = 0
+    cachedContentTokenCount: int | None = None
 
 
 class GeminiFunctionCallPayload(BaseModel):
@@ -61,68 +62,121 @@ class GeminiGenerateContentResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     busy: bool
+    ui_debug: bool = False
+    ui_debug_scenario: str | None = None
 
 
-class StatsBucketResponse(BaseModel):
+class AccountBreakdownItem(BaseModel):
+    account_id: str
+    name: str
+    auth_user: str = "0"
+    email: str | None = None
+    tier: str = "Free"
+    group: str = "default"
+    surface: str | None = None
+    enabled: bool = True
+    today_requests: int = 0
+    today_success: int = 0
+    today_rate_limited: int = 0
+    today_tokens: int = 0
+    today_reasoning_tokens: int = 0
+    configured_quota: int = 100
+    quota_used_percent: float = 0.0
+    is_available: bool = True
+    cooldown_remaining: int = 0
+
+
+class ClientStatsResponse(BaseModel):
+    """One terminal outcome per client generation request."""
+
     requests: int = 0
+    success: int = 0
+    errors: int = 0
+    aborted: int = 0
+    rate_limited: int = 0
+    rescued_requests: int = 0
+    success_rate: float | None = None
+
+
+class AttemptStatsResponse(BaseModel):
+    """Every real upstream execution attempt."""
+
     attempts: int = 0
     success: int = 0
     rate_limited: int = 0
     errors: int = 0
-    client_requests: int | None = None
-    client_success: int | None = None
-    client_errors: int | None = None
-    client_rate_limited: int | None = None
-    client_aborted: int | None = None
+    success_rate: float | None = None
+
+
+class TokenStatsResponse(BaseModel):
     prompt_tokens: int = 0
+    cached_tokens: int = 0
     completion_tokens: int = 0
-    reasoning_tokens: int | None = None
-    cache_read_tokens: int | None = None
-    cache_write_tokens: int | None = None
+    reasoning_tokens: int = 0
     total_tokens: int = 0
-    cache_hit_rate: float | None = None
-    count_requests: int | None = None
-    count_success: int | None = None
-    count_errors: int | None = None
-    count_input_tokens: int | None = None
-    usage_missing: int = 0
+
+
+class ModelBreakdownResponse(BaseModel):
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    tokens: TokenStatsResponse = Field(default_factory=TokenStatsResponse)
+
+
+class ModelStatsResponse(BaseModel):
+    requests: int
+    success: int
+    rate_limited: int
+    errors: int
+    prompt_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    total_tokens: int
+    finish_reasons: dict[str, int] = {}
     last_used: str | None = None
+    paid: bool = False
+    account_breakdown: list[AccountBreakdownItem] = []
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
 
 
-class ModelStatsResponse(StatsBucketResponse):
-    paid: bool | None = None
-    formats: dict[str, StatsBucketResponse] = Field(default_factory=dict)
-    surfaces: dict[str, StatsBucketResponse] = Field(default_factory=dict)
+class StatsTotalsResponse(BaseModel):
+    requests: int
+    success: int
+    rate_limited: int
+    errors: int
+    prompt_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    total_tokens: int
 
 
-class StatsRangeResponse(BaseModel):
-    key: str
-    start: str | None = None
-    end: str | None = None
-    timezone: str = "Asia/Shanghai"
-    data_start: str | None = None
-    retention_days: int = 90
-    partial: bool = False
+class DailyStatsResponse(BaseModel):
+    date: str
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    tokens: TokenStatsResponse = Field(default_factory=TokenStatsResponse)
+    by_model: dict[str, ModelBreakdownResponse] = Field(default_factory=dict)
+
+
+class CountTokensStatsResponse(BaseModel):
+    requests: int = 0
+    success: int = 0
+    errors: int = 0
+    input_tokens: int = 0
 
 
 class StatsResponse(BaseModel):
-    schema_version: int = 2
-    generated_at: str
-    range: StatsRangeResponse
     models: dict[str, ModelStatsResponse]
-    totals: ModelStatsResponse
-
-
-class StatsTimeseriesPoint(BaseModel):
-    date: str
-    totals: StatsBucketResponse | None = None
-
-
-class StatsTimeseriesResponse(BaseModel):
-    generated_at: str
-    range: StatsRangeResponse
-    bucket: str = "day"
-    points: list[StatsTimeseriesPoint]
+    totals: StatsTotalsResponse
+    quota_scope: str = "account"
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    daily: list[DailyStatsResponse] = Field(default_factory=list)
+    count_tokens: CountTokensStatsResponse = Field(
+        default_factory=CountTokensStatsResponse
+    )
 
 
 class GeminiModelResponse(BaseModel):

@@ -1,97 +1,116 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { HelpCircle, CheckCircle2 } from 'lucide-vue-next'
 import { CONFIG_SCHEMA } from './schema.ts'
-import { defaultValueFor, formatDefaultValue } from './defaults.ts'
+import { formatRecommendedValue } from './recommended.ts'
+import {
+  clampTooltipPosition,
+  type TooltipPosition,
+} from './tooltipPosition.ts'
 
 const props = defineProps<{
   schemaKey?: string
   title?: string
   content?: string
   explanation?: string
+  recommended?: unknown
 }>()
+
+const show = ref(false)
+const triggerRef = ref<HTMLElement | null>(null)
+const tooltipRef = ref<HTMLElement | null>(null)
+const positioned = ref(false)
+const position = ref<TooltipPosition>({
+  left: 0,
+  top: 0,
+  placement: 'top',
+  arrowLeft: 0,
+})
 
 const fieldDef = props.schemaKey ? CONFIG_SCHEMA[props.schemaKey] : null
 const displayTitle = props.title || fieldDef?.title || ''
 const displayContent = props.content || fieldDef?.description || ''
 const displayExplanation = props.explanation || fieldDef?.explanation || ''
-const schemaDefault = props.schemaKey ? defaultValueFor(props.schemaKey) : undefined
-const displayRecommended =
-  schemaDefault !== undefined ? schemaDefault : fieldDef?.recommendedValue
+const displayRecommended = computed(() =>
+  props.recommended !== undefined
+    ? props.recommended
+    : fieldDef?.recommendedValue,
+)
+const recommendedText = computed(() =>
+  formatRecommendedValue(displayRecommended.value),
+)
 
-// Teleport + fixed 定位：仅靠 z-index 无法逃出父级 stacking context / overflow 裁剪，
-// 会被相邻卡片的白底盖住（2026-10-18 用户实测）；改挂 body 并做视口边缘夹取。
-const show = ref(false)
-const anchorEl = ref<HTMLElement | null>(null)
-const tipEl = ref<HTMLElement | null>(null)
-const tipStyle = ref<Record<string, string>>({})
-const arrowStyle = ref<Record<string, string>>({})
-const placeBelow = ref(false)
-
-const GAP = 10
-const EDGE = 12
-const ARROW_INSET = 18
+let listening = false
 
 function updatePosition() {
-  const anchor = anchorEl.value
-  if (!anchor) return
-  const rect = anchor.getBoundingClientRect()
-  const width = Math.min(320, Math.max(240, window.innerWidth - EDGE * 2))
-  const height = tipEl.value?.offsetHeight || 200
-  const below =
-    rect.top < height + GAP + 8 &&
-    window.innerHeight - rect.bottom > height + GAP + 8
-  placeBelow.value = below
-  const cx = rect.left + rect.width / 2
-  const left = Math.max(
-    EDGE,
-    Math.min(cx - width / 2, window.innerWidth - width - EDGE),
-  )
-  const top = below
-    ? rect.bottom + GAP
-    : Math.max(8, rect.top - GAP - height)
-  tipStyle.value = {
-    position: 'fixed',
-    top: `${top}px`,
-    left: `${left}px`,
-    width: `${width}px`,
-    zIndex: '9999',
+  const trigger = triggerRef.value
+  const tooltip = tooltipRef.value
+  if (!trigger || !tooltip) return
+  const rect = trigger.getBoundingClientRect()
+  position.value = clampTooltipPosition({
+    trigger: {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    },
+    tooltip: { width: tooltip.offsetWidth, height: tooltip.offsetHeight },
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+  })
+  positioned.value = true
+}
+
+function stopListening() {
+  if (!listening) return
+  listening = false
+  window.removeEventListener('resize', updatePosition)
+  window.removeEventListener('scroll', updatePosition, true)
+}
+
+function startListening() {
+  if (listening) return
+  listening = true
+  window.addEventListener('resize', updatePosition)
+  window.addEventListener('scroll', updatePosition, true)
+}
+
+watch(show, async (open) => {
+  if (!open) {
+    stopListening()
+    return
   }
-  const arrowX = Math.max(ARROW_INSET, Math.min(cx - left, width - ARROW_INSET))
-  arrowStyle.value = { left: `${arrowX}px` }
+  positioned.value = false
+  await nextTick()
+  updatePosition()
+  startListening()
+})
+
+onBeforeUnmount(stopListening)
+
+function supportsHover(): boolean {
+  if (typeof window.matchMedia !== 'function') return true
+  return window.matchMedia('(hover: hover)').matches
 }
 
-function open() {
-  show.value = true
-  nextTick(updatePosition)
+function onTriggerEnter() {
+  if (supportsHover()) show.value = true
 }
 
-function close() {
-  show.value = false
+function onTriggerLeave() {
+  if (supportsHover()) show.value = false
 }
 
 function toggle() {
-  if (show.value) close()
-  else open()
+  show.value = !show.value
 }
-
-onMounted(() => {
-  window.addEventListener('resize', close)
-  window.addEventListener('scroll', close, true)
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('resize', close)
-  window.removeEventListener('scroll', close, true)
-})
 </script>
 
 <template>
   <div
-    ref="anchorEl"
+    ref="triggerRef"
     class="relative inline-flex items-center"
-    @mouseenter="open"
-    @mouseleave="close"
+    @mouseenter="onTriggerEnter"
+    @mouseleave="onTriggerLeave"
   >
     <button
       type="button"
@@ -102,21 +121,24 @@ onBeforeUnmount(() => {
       <HelpCircle class="w-3.5 h-3.5" />
     </button>
 
-    <!-- Floating Tooltip（独立挂载到 body，不受卡片 stacking context 影响） -->
     <Teleport to="body">
       <Transition
         enter-active-class="transition duration-150 ease-out"
-        enter-from-class="opacity-0 scale-95 translate-y-1"
-        enter-to-class="opacity-100 scale-100 translate-y-0"
+        enter-from-class="opacity-0 scale-95"
+        enter-to-class="opacity-100 scale-100"
         leave-active-class="transition duration-100 ease-in"
-        leave-from-class="opacity-100 scale-100 translate-y-0"
-        leave-to-class="opacity-0 scale-95 translate-y-1"
+        leave-from-class="opacity-100 scale-100"
+        leave-to-class="opacity-0 scale-95"
       >
         <div
           v-if="show"
-          ref="tipEl"
-          :style="tipStyle"
-          class="pointer-events-none bg-gray-900 text-gray-100 p-3.5 rounded-xl shadow-2xl border border-gray-700 text-xs space-y-2"
+          ref="tooltipRef"
+          class="fixed z-[100] w-72 max-w-[calc(100vw-16px)] sm:w-80 bg-gray-900 text-gray-100 p-3.5 rounded-xl shadow-2xl border border-gray-700 text-xs space-y-2 pointer-events-auto"
+          :style="{
+            left: `${position.left}px`,
+            top: `${position.top}px`,
+            visibility: positioned ? 'visible' : 'hidden',
+          }"
         >
           <div class="flex items-center justify-between border-b border-gray-800 pb-1.5 font-bold text-brand-300">
             <span>{{ displayTitle }}</span>
@@ -140,18 +162,17 @@ onBeforeUnmount(() => {
           </div>
 
           <div
-            v-if="displayRecommended !== undefined"
+            v-if="recommendedText !== null"
             class="flex items-center gap-1.5 text-[11px] text-emerald-400 font-semibold bg-emerald-950/60 px-2 py-1 rounded-lg border border-emerald-800/60"
           >
             <CheckCircle2 class="w-3.5 h-3.5 shrink-0 text-emerald-400" />
-            <span>默认值: {{ formatDefaultValue(displayRecommended) }}</span>
+            <span>推荐配置: {{ recommendedText }}</span>
           </div>
 
-          <!-- Little Arrow（随夹取后的实际位置对齐 anchor 中心） -->
           <div
-            :style="arrowStyle"
-            class="absolute -translate-x-1/2 border-4 border-transparent"
-            :class="placeBelow ? '-top-2 border-b-gray-900' : 'top-full border-t-gray-900'"
+            class="absolute border-4 border-transparent -translate-x-1/2"
+            :class="position.placement === 'top' ? 'top-full border-t-gray-900' : 'bottom-full border-b-gray-900'"
+            :style="{ left: `${position.arrowLeft}px` }"
           />
         </div>
       </Transition>

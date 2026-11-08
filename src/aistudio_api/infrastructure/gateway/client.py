@@ -3,28 +3,29 @@
 from __future__ import annotations
 
 import json
-from contextlib import suppress
+import os
+import time
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from aistudio_api.config import (
     DEFAULT_BROWSER_PORT,
     DEFAULT_IMAGE_MODEL,
     DEFAULT_TEXT_MODEL,
+    resolve_data_dir,
     settings,
 )
-from aistudio_api.domain.errors import RequestError, classify_error
-from aistudio_api.domain.models import Candidate, ModelOutput
-from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
+from aistudio_api.domain.errors import (
+    BrowserTransportError,
+    RequestError,
+    classify_error,
+)
+from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
     RequestCaptureService,
 )
-from aistudio_api.infrastructure.gateway.instance_pool import InstancePool
-from aistudio_api.infrastructure.gateway.model_defaults import (
-    get_features_config,
-    resolve_model_defaults,
-)
+from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
 from aistudio_api.infrastructure.gateway.replay import RequestReplayService
 from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
@@ -37,9 +38,28 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
     parse_text_output,
 )
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    safe_json_payload,
+    sanitize_log_message,
+)
 
 logger = get_logger("client")
+
+_SAFE_MODEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _sanitize_model_component(model: str) -> str:
+    """Return a filename-safe model token with no separators or traversal."""
+    sanitized = "".join(
+        char if char in _SAFE_MODEL_CHARS else "_" for char in model
+    )
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "._")
+    sanitized = sanitized.strip(".")
+    return sanitized or "model"
 
 
 class AIStudioClient:
@@ -65,361 +85,45 @@ class AIStudioClient:
 
     def __init__(self, port: int = DEFAULT_BROWSER_PORT):
         self.port = port
-        self._captured: CapturedRequest | None = None
         self._session = BrowserSession(port=port)
         self._capture_service = RequestCaptureService(self._session)
+        self._session.attach_capture_service(self._capture_service)
         self._replay_service = RequestReplayService(session=self._session)
 
         self._streaming_gateway = StreamingGateway(session=self._session)
-        self._build_surface: BuildSurface | None = None
-        self._realm_capture: dict[str, RequestCaptureService] = {}
-        self._realm_streaming: dict[str, StreamingGateway] = {}
-        self._realm_replay: dict[str, RequestReplayService] = {}
-        self._instance_pool = InstancePool(
-            self._ensure_browser_cdp_client,
-            features_provider=get_features_config,
-            on_slot_retired=self._forget_slot_services,
-        )
 
     @property
     def session(self) -> BrowserSession:
         """Expose active browser session facade."""
         return self._session
 
-    @property
-    def instance_pool(self) -> InstancePool:
-        """Unified request-context pool (v3); control session is not a slot."""
-        return self._instance_pool
-
-    async def _ensure_browser_cdp_client(self):
-        return await self._session.ensure_browser_cdp_client()
-
-    def _forget_slot_services(self, realm_id: str) -> None:
-        self._realm_capture.pop(realm_id, None)
-        self._realm_streaming.pop(realm_id, None)
-        self._realm_replay.pop(realm_id, None)
-
-    @property
-    def build_in_flight_count(self) -> int:
-        """Build 面在途任务数（无 build surface 时为 0）。"""
-        surface = self._build_surface
-        state = getattr(surface, "state", None)
-        try:
-            return int(getattr(state, "in_flight_count", 0) or 0)
-        except Exception:
-            return 0
-
-    @property
-    def in_flight_count(self) -> int:
-        """Control session + request pool aggregate in-flight count."""
-        realm_in_flight = 0
-        for capture in self._realm_capture.values():
-            session = getattr(capture, "_session", None)
-            try:
-                realm_in_flight += int(getattr(session, "in_flight_count", 0) or 0)
-            except Exception:
-                continue
-        pool_in_flight = sum(slot.in_flight for slot in self._instance_pool.slots())
-        realm_in_flight = max(realm_in_flight, pool_in_flight)
-        return (
-            self._session.in_flight_count + self.build_in_flight_count + realm_in_flight
-        )
-
-    def _ensure_realm_services(
-        self, lease
-    ) -> tuple[RequestCaptureService, StreamingGateway]:
-        adapter: Any = getattr(lease, "adapter", None)
-        session = getattr(adapter, "session", None)
-        if session is None:
-            return self._capture_service, self._streaming_gateway
-        realm_id = str(getattr(adapter, "realm_id", ""))
-        capture = self._realm_capture.get(realm_id)
-        if capture is None:
-            capture = RequestCaptureService(session)
-            self._realm_capture[realm_id] = capture
-        stream = self._realm_streaming.get(realm_id)
-        if stream is None:
-            stream = StreamingGateway(session=session)
-            self._realm_streaming[realm_id] = stream
-        return capture, stream
-
-    def _replay_for(self, lease) -> RequestReplayService:
-        adapter = getattr(lease, "adapter", None)
-        session = getattr(adapter, "session", None)
-        if session is None:
-            return self._replay_service
-        realm_id = str(getattr(adapter, "realm_id", ""))
-        service = self._realm_replay.get(realm_id)
-        if service is None:
-            service = RequestReplayService(session=session)
-            self._realm_replay[realm_id] = service
-        return service
-
-    async def _build_lease_auth(self, lease) -> tuple[str | None, str]:
-        """Resolve build auth from the lease, never from the global PG session."""
-        adapter = getattr(lease, "adapter", None) if lease is not None else None
-        auth_file = getattr(adapter, "auth_file", None)
-        auth_user = str(getattr(adapter, "auth_user", "0") or "0")
-        if auth_file:
-            return auth_file, auth_user
-        if lease is None:
-            ctx = self._session.active_context
-            if ctx is None:
-                ctx = await self._session.ensure_ready()
-            return ctx.auth_file, str(ctx.auth_user or "0")
-        raise RequestError(503, "build lease missing auth_file")
-
-    async def _ensure_lease_build_surface(self, lease) -> BuildSurface:
-        adapter = getattr(lease, "adapter", None)
-        if adapter is None:
-            return await self._ensure_build_surface()
-        cdp = await self._session.ensure_browser_cdp_client()
-        return await adapter.ensure_build_surface(cdp)
-
-    @property
-    def is_busy(self) -> bool:
-        return self.in_flight_count > 0
-
-    async def save_current_cookies(self) -> bool:
-        """把当前账号 cookies 回写 auth.json。"""
-        return await self._session.save_current_cookies()
-
-    async def save_pool_cookies(self) -> int:
-        """Write cookies for every live request slot to its account auth file."""
-        saved = 0
-        for slot in self._instance_pool.slots():
-            session = slot.session
-            if session is None or not slot.chat_ready():
-                continue
-            with suppress(Exception):
-                if await session.save_current_cookies():
-                    saved += 1
-        return saved
-
     async def warmup(self) -> None:
         """预热浏览器后端并加载 AI Studio 页面及捕获 BotGuard 服务。"""
         if self._session is not None:
             await self._session.ensure_botguard_service()
-            logger.info("浏览器预热完成")
+            logger.info("浏览器预热就绪")
 
     async def switch_auth(self, auth_file: str | None) -> None:
         """切换账号的 auth 文件并清空模板缓存。"""
-        with suppress(Exception):
-            await self._session.save_current_cookies()
         self.clear_templates()
-        await self._close_build_surface()
         if self._session is not None:
             await self._session.switch_auth(auth_file)
 
-    def clear_templates(self) -> None:
-        """清除捕获的请求模板。"""
-        if getattr(self, "_capture_service", None) is not None:
-            self._capture_service.clear_templates()
-
-    async def _ensure_build_surface(self) -> BuildSurface:
-        """Lazily create the Build surface bound to the current browser."""
-        if self._build_surface is None:
-            cdp = await self._session.ensure_browser_cdp_client()
-            self._build_surface = BuildSurface(cdp)
-        return self._build_surface
-
-    async def _close_build_surface(self) -> None:
-        """Close the Build surface page (best effort, never raises)."""
-        surface = self._build_surface
-        self._build_surface = None
-        if surface is None:
-            return
-        page = getattr(getattr(surface, "state", None), "page", None)
-        if page is not None and not page.is_closed():
-            with suppress(Exception):
-                await page.close()
-
-    def _build_surface_page_alive(self) -> bool:
-        """Whether the Build surface currently holds a live page (read-only)."""
-        surface = self._build_surface
-        if surface is None:
+    def clear_templates(self) -> bool:
+        """清除捕获的请求模板，返回是否真的清空了缓存。"""
+        service = getattr(self, "_capture_service", None)
+        if service is None:
             return False
-        page = getattr(getattr(surface, "state", None), "page", None)
-        if page is None:
+        return bool(service.clear_templates())
+
+    async def refresh_auth_state(self) -> bool:
+        """Invalidate the browser page's cached cookies and refetch them."""
+        if self._session is None:
             return False
-        try:
-            return not page.is_closed()
-        except Exception:
-            return False
-
-    def _count_live_page_instances(self) -> int:
-        """Current live page-instance count: chat page (1) + build page (1) (read-only)."""
-        count = 0
-        ctx = self._session.active_context
-        chat_page = ctx.page if ctx is not None else None
-        if chat_page is not None:
-            try:
-                if not chat_page.is_closed():
-                    count += 1
-            except Exception:
-                pass
-        if self._build_surface_page_alive():
-            count += 1
-        return count
-
-    def _active_account_identity(self) -> tuple[str | None, str | None]:
-        """Return the active account's (tier, email), or (None, None) if unknown."""
-        try:
-            from aistudio_api.infrastructure.account.account_store import AccountStore
-
-            account = AccountStore().get_active_account()
-        except Exception:
-            account = None
-        if account is None:
-            return None, None
-        return getattr(account, "tier", None), getattr(account, "email", None)
-
-    @staticmethod
-    def _features_config() -> dict[str, object]:
-        try:
-            from aistudio_api.infrastructure.gateway.model_defaults import (
-                get_features_config,
-            )
-
-            return dict(get_features_config())
-        except Exception:
-            return {}
-
-    @staticmethod
-    def _policy_to_request_error(exc: Exception) -> RequestError:
-        """Map a SurfacePolicyError into a request-level error carrying code/advice."""
-        status = (
-            getattr(exc, "http_status", None)
-            or getattr(exc, "status_code", None)
-            or getattr(exc, "status", None)
-            or 429
-        )
-        code = getattr(exc, "code", None)
-        message = getattr(exc, "message", None) or str(exc)
-        advice = getattr(exc, "advice", None)
-        detail = str(message)
-        if code:
-            detail = f"[{code}] {detail}"
-        if advice:
-            detail = f"{detail} | 处置建议: {advice}"
-        return RequestError(int(status), detail)
-
-    def _enforce_build_instance_quota(self) -> None:
-        """WP5: enforce the account group's page-instance quota before BuildSurface.ensure_ready.
-
-        Uses the ``application.surface_orchestrator`` policy module
-        (``match_group`` / ``check_instance_quota`` / ``SurfacePolicyError``):
-        the active account's tier/email + ``features.groups`` resolve the group,
-        and the live page-instance count (chat page + build page) decides whether a
-        new instance would exceed ``max_page_instances``. Over-quota is raised as a
-        request-level error carrying the policy ``code``/``message``/``advice`` —
-        never swallowed, never silently routed.
-        """
-        try:
-            from aistudio_api.application import surface_orchestrator as orchestrator
-        except Exception:
-            logger.warning("surface_orchestrator 尚未就绪，跳过 build 面实例配额检查")
-            return
-        match_group = getattr(orchestrator, "match_group", None)
-        check = getattr(orchestrator, "check_instance_quota", None)
-        policy_error = getattr(orchestrator, "SurfacePolicyError", None)
-        if match_group is None or check is None or policy_error is None:
-            logger.warning(
-                "surface_orchestrator 契约不完整(match_group/"
-                "check_instance_quota/SurfacePolicyError)，跳过 build 面配额检查"
-            )
-            return
-
-        tier, email = self._active_account_identity()
-        features = self._features_config()
-        groups = features.get("groups") or []
-        group = match_group(tier, email, groups)
-        if isinstance(group, dict):
-            group_name = str(group.get("name") or "unnamed")
-            max_instances = group.get("max_page_instances")
-        else:
-            group_name = f"default:{tier or 'unknown'}"
-            max_instances = None
-        live_instances = self._count_live_page_instances()
-        need_new = not self._build_surface_page_alive()
-        logger.info(
-            "[WP5] build 面配额检查: group=%s tier=%s max=%s live=%s need_new=%s",
-            group_name,
-            tier,
-            max_instances,
-            live_instances,
-            need_new,
-        )
-        try:
-            # check_instance_quota(group_name, max_instances, live_instances, surface, need_new)
-            check(group_name, max_instances, live_instances, "build", need_new)
-        except policy_error as exc:
-            raise self._policy_to_request_error(exc) from exc
-
-    def surface_instance_snapshot(self) -> dict[str, object]:
-        """WP5 v3 queue/instance snapshot (read-only, never raises)."""
-        snapshot: dict[str, object] = {
-            "active_account": None,
-            "contexts": [],
-            "pages": {"chat": 0, "build": 0},
-            "live_instances": 0,
-            "context_count": 0,
-            "planned_instances": 0,
-            "budgets": {},
-            "control_session": {"alive": False, "url": None},
-        }
-        try:
-            account = None
-            try:
-                from aistudio_api.infrastructure.account.account_store import (
-                    AccountStore,
-                )
-
-                account = AccountStore().get_active_account()
-            except Exception:
-                account = None
-            if account is not None:
-                snapshot["active_account"] = {
-                    "id": account.id,
-                    "name": getattr(account, "name", None),
-                    "tier": getattr(account, "tier", None),
-                    "email": getattr(account, "email", None),
-                }
-
-            session = self._session
-            ctx = session.active_context if session is not None else None
-            page = ctx.page if ctx is not None else None
-            if page is not None:
-                with suppress(Exception):
-                    snapshot["control_session"] = {
-                        "alive": not page.is_closed(),
-                        "url": page.url,
-                    }
-
-            pool = self._instance_pool
-            contexts = pool.snapshot()
-            pages = pool.page_counts()
-            snapshot["contexts"] = contexts
-            snapshot["pages"] = pages
-            snapshot["live_instances"] = sum(pages.values())
-            snapshot["context_count"] = pool.live_contexts
-            snapshot["budgets"] = pool.budget_snapshot()
-            features = self._features_config()
-            raw_slots = features.get("slots")
-            slots = raw_slots if isinstance(raw_slots, list) else []
-            snapshot["planned_instances"] = sum(
-                1
-                for slot in slots
-                if isinstance(slot, dict) and bool(slot.get("enabled", True))
-            )
-        except Exception:
-            pass
-        return snapshot
+        return await self._session.refresh_auth_state()
 
     async def close(self) -> None:
         """关闭浏览器后端。"""
-        await self._instance_pool.close()
-        await self._close_build_surface()
         if self._session is not None:
             await self._session.close()
 
@@ -435,20 +139,31 @@ class AIStudioClient:
         if not settings.dump_raw_response:
             return
 
-        out_dir = Path(settings.dump_raw_response_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe_model = model.replace("/", "_")
-        timestamp = __import__("time").strftime("%Y%m%d_%H%M%S")
-        payload = {
-            "kind": kind,
-            "model": model,
-            "capture_prompt": capture_prompt,
-            "modified_body": json.loads(modified_body),
-            "raw_response": raw_response,
-        }
-        path = out_dir / f"aistudio_{kind}_{safe_model}_{timestamp}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-        logger.info("已落盘原始请求/响应: %s", path)
+        try:
+            raw_dir = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR") or (
+                settings.dump_raw_response_dir
+            )
+            out_dir = Path(raw_dir).expanduser()
+            if not out_dir.is_absolute():
+                out_dir = resolve_data_dir() / out_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_model = _sanitize_model_component(model)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            payload = {
+                "kind": kind,
+                "model": model,
+                "safe_prompt": sanitize_log_message(capture_prompt),
+                "safe_request_body": safe_json_payload(modified_body),
+                "safe_response": sanitize_log_message(raw_response),
+            }
+            path = out_dir / f"aistudio_{kind}_{safe_model}_{timestamp}.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.debug("已将原始请求与响应数据安全保存到文件: %s", path)
+        except Exception as exc:
+            logger.debug("原始请求落盘失败: %s", exc)
 
     async def capture_request(
         self,
@@ -468,10 +183,8 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
         force_refresh: bool = False,
-        lease=None,
     ) -> CapturedRequest | None:
-        capture, _ = self._ensure_realm_services(lease)
-        return await capture.capture(
+        return await self._capture_service.capture(
             prompt=prompt,
             model=model,
             images=images,
@@ -489,70 +202,6 @@ class AIStudioClient:
             sanitize_plain_text=sanitize_plain_text,
             force_refresh=force_refresh,
         )
-
-    async def replay(self, body: str, timeout: int = 120) -> tuple[int, bytes]:
-        return await self._replay_service.replay(
-            self._captured, body=body, timeout=timeout
-        )
-
-    async def count_tokens(
-        self,
-        *,
-        packed_body: list[object],
-        lease=None,
-        timeout: int = 30,
-    ) -> int:
-        """Count prompt tokens through the real upstream ``CountTokens`` RPC.
-
-        The RPC only accepts ``[model, contents]``; system and tool
-        declarations are serialized into the packed contents by the caller.
-        The request reuses the pool slot's live chat page and never touches
-        the generation template, snapshot, or ATG path.
-        """
-        adapter = getattr(lease, "adapter", None)
-        session = getattr(adapter, "session", None) or self._session
-        ctx = session.active_context
-        if ctx is None:
-            ctx = await session.ensure_ready()
-
-        base_url = str(ctx.base_template.get("url") or "")
-        if "/GenerateContent" in base_url:
-            url = base_url.replace("/GenerateContent", "/CountTokens")
-        else:
-            url = (
-                "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
-                "google.internal.alkali.applications.makersuite.v1."
-                "MakerSuiteService/CountTokens"
-            )
-
-        raw_headers = ctx.base_template.get("headers")
-        headers = (
-            {str(k): str(v) for k, v in raw_headers.items()}
-            if isinstance(raw_headers, dict)
-            else {}
-        )
-        headers["Content-Type"] = "application/json+protobuf"
-
-        payload = json.dumps(packed_body, ensure_ascii=False, separators=(",", ":"))
-        status, raw = await session.send_hooked_request(
-            body=payload,
-            timeout_ms=timeout * 1000,
-            url=url,
-            headers=headers,
-        )
-        text = raw.decode("utf-8", errors="replace")
-        if status >= 400:
-            raise classify_error(status, text)
-        try:
-            data = json.loads(text)
-        except ValueError as exc:
-            raise RequestError(
-                502, "upstream CountTokens returned invalid JSON"
-            ) from exc
-        total = data[0] if isinstance(data, list) and data else None
-        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            raise RequestError(502, "upstream CountTokens response missing token total")
-        return total
 
     async def stream_generate_content(
         self,
@@ -572,35 +221,8 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
         force_refresh_capture: bool = False,
-        surface: str = "chat",
-        rest_body: str | None = None,
-        lease=None,
     ):
-        adapter = getattr(lease, "adapter", None)
-        session = getattr(adapter, "session", None) or self._session
-        if surface == "build":
-            if not rest_body:
-                raise RequestError(
-                    400, "build surface requires a REST body (rest_body)"
-                )
-            if lease is None:
-                self._enforce_build_instance_quota()
-            auth_file, auth_user = await self._build_lease_auth(lease)
-            async with self._session.request_scope():
-                build_surface = await self._ensure_lease_build_surface(lease)
-                await build_surface.ensure_ready(
-                    auth_file,
-                    auth_user,
-                    account_id=getattr(lease, "account_id", None),
-                )
-                async for event in build_surface.stream_generate(
-                    model=model, json_body=rest_body
-                ):
-                    yield event
-                return
-
-        _, stream_gateway = self._ensure_realm_services(lease)
-        async with session.request_scope():
+        async with self._session.request_scope():
             captured = await self.capture_request(
                 prompt=capture_prompt,
                 model=model,
@@ -617,53 +239,14 @@ class AIStudioClient:
                 generation_config_overrides=generation_config_overrides,
                 sanitize_plain_text=sanitize_plain_text,
                 force_refresh=force_refresh_capture,
-                lease=lease,
             )
             if not captured:
                 raise RequestError(0, "无法拦截请求")
-            async for event in stream_gateway.stream_chat(
+            async for event in self._streaming_gateway.stream_chat(
                 captured=captured,
                 model=model,
             ):
                 yield event
-
-    async def _collect_build_output(
-        self,
-        *,
-        model: str,
-        json_body: str,
-        build_surface: BuildSurface,
-    ) -> ModelOutput:
-        """Collect the build event stream into a non-streaming ModelOutput."""
-        candidate = Candidate()
-        output = ModelOutput(model=model)
-        async for event_type, payload in build_surface.stream_generate(
-            model=model, json_body=json_body
-        ):
-            if event_type == "status":
-                status = int(str(payload or 0))
-                if status >= 400:
-                    raise RequestError(status, f"build surface status {status}")
-            elif event_type == "body" and payload:
-                candidate.text += str(payload)
-            elif event_type == "thinking" and payload:
-                candidate.thinking += str(payload)
-            elif event_type == "tool_calls" and isinstance(payload, list):
-                candidate.function_calls.extend(payload)
-            elif event_type == "images" and isinstance(payload, list):
-                candidate.images.extend(payload)
-            elif event_type == "reasoning_images" and isinstance(payload, list):
-                candidate.reasoning_images.extend(payload)
-            elif event_type == "thought_signature" and payload:
-                candidate.thought_signature = str(payload)
-            elif event_type == "response_id" and payload:
-                output.response_id = str(payload)
-            elif event_type == "finish_reason" and isinstance(payload, int):
-                candidate.finish_reason = payload
-            elif event_type == "usage" and isinstance(payload, dict):
-                output.usage = payload
-        output.candidates = [candidate]
-        return output
 
     async def generate_content(
         self,
@@ -682,36 +265,9 @@ class AIStudioClient:
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
-        surface: str = "chat",
-        rest_body: str | None = None,
-        lease=None,
     ) -> ModelOutput:
-        adapter = getattr(lease, "adapter", None)
-        session = getattr(adapter, "session", None) or self._session
-        if surface == "build":
-            if not rest_body:
-                raise RequestError(
-                    400, "build surface requires a REST body (rest_body)"
-                )
-            if lease is None:
-                self._enforce_build_instance_quota()
-            auth_file, auth_user = await self._build_lease_auth(lease)
-            async with self._session.request_scope():
-                build_surface = await self._ensure_lease_build_surface(lease)
-                await build_surface.ensure_ready(
-                    auth_file,
-                    auth_user,
-                    account_id=getattr(lease, "account_id", None),
-                )
-                return await self._collect_build_output(
-                    model=model,
-                    json_body=rest_body,
-                    build_surface=build_surface,
-                )
-
-        replay = self._replay_for(lease)
-        async with session.request_scope():
-            logger.info("拦截请求: %r", f"{capture_prompt[:20]}...")
+        async with self._session.request_scope():
+            logger.debug("开始捕获请求: model=%s", model)
             captured = await self.capture_request(
                 prompt=capture_prompt,
                 model=model,
@@ -727,14 +283,15 @@ class AIStudioClient:
                 max_tokens=max_tokens,
                 generation_config_overrides=generation_config_overrides,
                 sanitize_plain_text=sanitize_plain_text,
-                lease=lease,
             )
             if not captured:
                 raise RequestError(0, "无法拦截请求")
 
             modified_body = captured.body
 
-            status, raw = await replay.replay(captured, body=modified_body)
+            status, raw = await self._replay_service.replay(
+                captured, body=modified_body
+            )
             raw_text = raw.decode("utf-8", errors="replace")
             self._dump_raw_exchange(
                 kind="generate_content",
@@ -745,6 +302,8 @@ class AIStudioClient:
             )
             if status != 200:
                 raise classify_error(status, raw_text)
+            if not raw_text.strip():
+                raise BrowserTransportError("empty 200 body (connection truncated)")
             output = parse_text_output(raw_text)
             output.model = model
             return output
@@ -768,8 +327,8 @@ class AIStudioClient:
     ) -> ModelOutput:
         async with self._session.request_scope():
             logger.info(
-                "生图请求: %r, images=%s",
-                f"{prompt[:20]}...",
+                "处理生图请求: model=%s, 图片数=%d",
+                model,
                 len(images) if images else 0,
             )
             request_contents = contents or [
@@ -811,7 +370,7 @@ class AIStudioClient:
 
             modified_body = captured.body
             status, raw = await self._replay_service.replay(
-                captured, body=modified_body, timeout=120
+                captured, body=modified_body
             )
             raw_text = raw.decode("utf-8", errors="replace")
             self._dump_raw_exchange(
@@ -823,6 +382,8 @@ class AIStudioClient:
             )
             if status != 200:
                 raise classify_error(status, raw_text)
+            if not raw_text.strip():
+                raise BrowserTransportError("empty 200 body (connection truncated)")
             output = parse_image_output(raw_text)
             output.model = model
 
@@ -835,7 +396,7 @@ class AIStudioClient:
                     else Path(f"{save_path}.{ext}")
                 )
                 path.write_bytes(img.data)
-                logger.info("图片已保存: %s (%s bytes)", path, img.size)
+                logger.info("生图文件已保存: 路径=%s, 大小=%d 字节", path, img.size)
 
             return output
 

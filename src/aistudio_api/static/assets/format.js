@@ -1,1 +1,0 @@
-function r(i,n={}){if(!i)return"-";const t=typeof i=="string"?new Date(i):i;return Number.isNaN(t.getTime())?typeof i=="string"?i:"-":t.toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",...n.withSeconds?{second:"2-digit"}:{}})}export{r as f};

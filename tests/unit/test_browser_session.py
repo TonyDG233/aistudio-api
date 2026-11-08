@@ -80,6 +80,63 @@ async def test_browser_session_generate_snapshot(mock_cdp_page):
 
 
 @pytest.mark.asyncio
+async def test_browser_session_generate_snapshot_retries_five_times_with_250ms(
+    mock_cdp_page,
+):
+    """Snapshot failures retry 5 times with a 250ms pause between attempts."""
+    session = BrowserSession(port=9222)
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="test_snapshot_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+    mock_cdp_page.evaluate = AsyncMock(side_effect=RuntimeError("snapshot not ready"))
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="retry")])]
+
+    with pytest.raises(RuntimeError, match="Snapshot generation failed"):
+        await session.generate_snapshot(contents)
+
+    assert mock_cdp_page.evaluate.await_count == 5
+    assert mock_cdp_page.wait_for_timeout.await_count == 4
+    assert [call.args for call in mock_cdp_page.wait_for_timeout.await_args_list] == [
+        (250,)
+    ] * 4
+
+
+@pytest.mark.asyncio
+async def test_browser_session_generate_snapshot_empty_result_also_retries(
+    mock_cdp_page,
+):
+    """Empty snapshots follow the same 5x250ms retry schedule as exceptions."""
+    session = BrowserSession(port=9222)
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="test_snapshot_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+    mock_cdp_page.evaluate = AsyncMock(return_value="")
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="retry")])]
+
+    with pytest.raises(RuntimeError, match="Snapshot generation failed"):
+        await session.generate_snapshot(contents)
+
+    assert mock_cdp_page.evaluate.await_count == 5
+    assert [call.args for call in mock_cdp_page.wait_for_timeout.await_args_list] == [
+        (250,)
+    ] * 4
+
+
+@pytest.mark.asyncio
 async def test_browser_session_send_hooked_request(mock_cdp_page):
     session = BrowserSession(port=9222)
     session.set_ready_context(
@@ -107,7 +164,6 @@ async def test_browser_session_send_hooked_request(mock_cdp_page):
         url="https://alkalimakersuite-pa.clients6.google.com/test",
         headers={"content-type": "application/json"},
         body='["test"]',
-        timeout_ms=5000,
     )
     assert status == 200
     assert body == b'["response_data"]'
@@ -162,44 +218,12 @@ async def test_browser_session_send_streaming_request(mock_cdp_page):
         url="https://alkalimakersuite-pa.clients6.google.com/stream",
         headers={"content-type": "application/json"},
         body='["stream"]',
-        timeout_ms=5000,
     ):
         collected.append((tag, data))
 
     assert ("status", 200) in collected
     assert ("chunk", b"data: hello ") in collected
     assert ("chunk", b"world\n\n") in collected
-
-
-@pytest.mark.asyncio
-async def test_browser_session_liveness_and_auto_reconnect():
-    """Test BrowserSession detects dead page and auto-reconnects."""
-    session = BrowserSession(port=9222)
-    mock_dead_page = MagicMock(spec=CDPPage)
-    mock_dead_page.is_closed = MagicMock(return_value=False)
-    mock_dead_page.is_alive = AsyncMock(return_value=False)
-
-    mock_alive_page = MagicMock(spec=CDPPage)
-    mock_alive_page.is_closed = MagicMock(return_value=False)
-    mock_alive_page.is_alive = AsyncMock(return_value=True)
-
-    session.set_ready_context(
-        SessionContext(
-            page=mock_dead_page,
-            snap_key="test_snapshot_fn",
-            auth_user="0",
-            auth_file=None,
-            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
-        )
-    )
-    session._close_internal = AsyncMock()
-    session._ensure_browser_cdp = AsyncMock(return_value=mock_alive_page)
-
-    # ensure_context should detect dead page, close it, and reconnect to new page
-    page = await session.ensure_context()
-    assert page == mock_alive_page
-    session._close_internal.assert_called_once()
-    session._ensure_browser_cdp.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -252,6 +276,8 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
                     function_call=("get_weather", {"city": "Tokyo"}, "call_123"),
                     thought=True,
                 ),
+                AistudioPart(executable_code=("PYTHON", "print(1)")),
+                AistudioPart(code_execution_result=("OUTCOME_OK", "1")),
             ],
         ),
         AistudioContent(
@@ -269,6 +295,8 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
         "What is the weather in Tokyo?",
         "iVBORw0KGgoAAAANSUhEUg==",
         "",  # function_call maps to ""
+        "print(1)",  # executable_code participates in the hash (D-09)
+        "1",  # code_execution_result participates in the hash (D-09)
         "",  # function_response maps to ""
         "files/sample_data_file",
     ]
@@ -276,7 +304,69 @@ async def test_generate_snapshot_hash_complex_tools_and_multimodal():
 
     snapshot = await session.generate_snapshot(contents)
     assert snapshot == "!snapshot_token_ok"
-    assert passed_args == [expected_hash]
+    assert passed_args[0]["hash"] == expected_hash
+
+
+@pytest.mark.asyncio
+async def test_generate_snapshot_hash_include_code_false_matches_upstream(
+    mock_cdp_page, monkeypatch
+):
+    """D-09: hash_include_code=false restores upstream behaviour (code parts -> "")."""
+    from aistudio_api.config import settings
+
+    monkeypatch.setattr(settings, "hash_include_code", False)
+
+    session = BrowserSession(port=9222)
+    passed_args: list[object] = []
+
+    async def fake_evaluate(expr, args=None, *a, **kw):
+        if (
+            "Promise.resolve(result)" in expr
+            or "snapQueue" in expr
+            or "service, hash" in expr
+        ):
+            passed_args.append(args)
+            return "!snapshot_token_ok"
+        return None
+
+    mock_cdp_page.evaluate.side_effect = fake_evaluate
+    session.set_ready_context(
+        SessionContext(
+            page=mock_cdp_page,
+            snap_key="snap_fn",
+            auth_user="0",
+            auth_file=None,
+            base_template=dict(DEFAULT_BOOTSTRAP_TEMPLATE),
+        )
+    )
+
+    contents = [
+        AistudioContent(
+            role="model",
+            parts=[
+                AistudioPart(executable_code=("PYTHON", "print(1)")),
+                AistudioPart(code_execution_result=("OUTCOME_OK", "1")),
+            ],
+        )
+    ]
+
+    assert await session.generate_snapshot(contents) == "!snapshot_token_ok"
+    # D-09 hash 口径不变：code 部分仍折叠为 ""；首次快照带 warmup 标记。
+    assert passed_args == [
+        {"prompt": " ", "hash": sha256(b" ").hexdigest(), "warmup": True}
+    ]
+
+
+def test_browser_session_single_page_surface_contract():
+    """D-03/D-10/D-11: no readiness gate or retiring-context bookkeeping remains."""
+    from aistudio_api.infrastructure.gateway import session_state
+
+    session = BrowserSession(port=9222)
+    assert not hasattr(session, "_gate")
+    assert not hasattr(session, "_retiring_contexts")
+    assert not hasattr(session, "_background_tasks")
+    assert not hasattr(session_state, "SessionReadinessGate")
+    assert not hasattr(session_state, "SessionState")
 
 
 @pytest.mark.asyncio
@@ -308,81 +398,6 @@ async def test_account_service_activate_account_warms_up_browser():
     assert result.id == "acc_1"
     mock_session.switch_auth.assert_called_once_with("/data/accounts/acc_1/auth.json")
     mock_session.ensure_botguard_service.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_account_service_activate_retries_when_wire_template_missing():
-    """BotGuard 模板缺失属偶发竞态：自动重试一次并成功。"""
-    mock_store = MagicMock(spec=AccountStore)
-    mock_store.get_account.return_value = AccountMeta(
-        id="acc_1",
-        name="Test Account",
-        email="test@example.com",
-        created_at="2026-09-01T00:00:00Z",
-        last_used="2026-09-01T00:00:00Z",
-        auth_user="0",
-    )
-    mock_store.get_auth_path_optional.return_value = "/data/accounts/acc_1/auth.json"
-    mock_store.get_active_account.return_value = None
-
-    mock_session = MagicMock(spec=BrowserSession)
-    mock_session.switch_auth = AsyncMock(
-        side_effect=[
-            RuntimeError("BotGuard service captured but wire template missing"),
-            None,
-        ]
-    )
-    mock_session.ensure_botguard_service = AsyncMock()
-
-    service = AccountService(mock_store)
-    result = await service.activate_account(
-        account_id="acc_1",
-        browser_session=mock_session,
-    )
-
-    assert result is not None
-    assert mock_session.switch_auth.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_account_service_activate_rolls_back_active_on_failure():
-    """切换最终失败时回滚此前持久化的活跃账号。"""
-    previous = AccountMeta(
-        id="acc_prev",
-        name="Previous",
-        email="prev@example.com",
-        created_at="2026-09-01T00:00:00Z",
-        last_used="2026-09-01T00:00:00Z",
-        auth_user="0",
-    )
-    target = AccountMeta(
-        id="acc_1",
-        name="Test Account",
-        email="test@example.com",
-        created_at="2026-09-01T00:00:00Z",
-        last_used="2026-09-01T00:00:00Z",
-        auth_user="0",
-    )
-    mock_store = MagicMock(spec=AccountStore)
-    mock_store.get_account.side_effect = lambda account_id: (
-        target if account_id == "acc_1" else previous
-    )
-    mock_store.get_auth_path_optional.return_value = "/data/accounts/acc_1/auth.json"
-    mock_store.get_active_account.return_value = previous
-
-    mock_session = MagicMock(spec=BrowserSession)
-    mock_session.switch_auth = AsyncMock(side_effect=RuntimeError("capture failed"))
-    mock_session.ensure_botguard_service = AsyncMock()
-
-    service = AccountService(mock_store)
-
-    with pytest.raises(RuntimeError, match="capture failed"):
-        await service.activate_account(
-            account_id="acc_1",
-            browser_session=mock_session,
-        )
-
-    assert mock_store.set_active_account.call_args_list[-1].args[0] == "acc_prev"
 
 
 @pytest.mark.asyncio
@@ -495,11 +510,11 @@ async def test_browser_session_generate_snapshot_concurrency(mock_cdp_page):
 
 def test_browser_session_temporary_chat_urls():
     """Verify AI Studio navigation URLs always enforce temporary=true to prevent history pollution."""
-    from aistudio_api.infrastructure.gateway.session_auth import (
+    from aistudio_api.infrastructure.gateway.public_web_constants import (
         AI_STUDIO_URL,
         AI_STUDIO_URL_FALLBACK,
-        get_aistudio_urls,
     )
+    from aistudio_api.infrastructure.gateway.session_auth import get_aistudio_urls
 
     assert "temporary=true" in AI_STUDIO_URL
     assert "temporary=true" in AI_STUDIO_URL_FALLBACK

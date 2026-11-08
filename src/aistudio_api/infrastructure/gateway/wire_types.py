@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -220,6 +221,17 @@ class AistudioGenerationConfig:
         self.values[idx] = value
 
     @property
+    def seed(self):
+        idx = GenerationConfigIndex.SEED
+        return self.values[idx] if len(self.values) > idx else None
+
+    @seed.setter
+    def seed(self, value):
+        idx = GenerationConfigIndex.SEED
+        self._ensure_len(idx + 1)
+        self.values[idx] = value
+
+    @property
     def output_resolution(self):
         idx = GenerationConfigIndex.OUTPUT_RESOLUTION
         return self.values[idx] if len(self.values) > idx else None
@@ -258,14 +270,16 @@ class AistudioPart:
 
     def to_wire(self) -> list[object]:
         wire = JspbArray()
+        if self.thought:
+            wire[PartIndex.THOUGHT_ALT_FLAG] = 1
+        if self.thought_signature:
+            wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
         if self.file_id:
             wire[PartIndex.FILE_DATA] = [self.file_id]
             return wire.compact()
         if self.inline_data:
             mime, b64 = self.inline_data
             wire[PartIndex.INLINE_DATA] = [mime, b64]
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
             return wire.compact()
         if self.function_call:
             name, args = self.function_call[0], self.function_call[1]
@@ -274,8 +288,6 @@ class AistudioPart:
             if call_id:
                 function_call.append(call_id)
             wire[PartIndex.FUNCTION_CALL_ALT] = function_call
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
             return wire.compact()
         if self.function_response:
             name, response = self.function_response[0], self.function_response[1]
@@ -286,15 +298,11 @@ class AistudioPart:
             if call_id:
                 function_response.append(call_id)
             wire[PartIndex.FUNCTION_RESPONSE_ALT] = function_response
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
             return wire.compact()
         if self.executable_code:
             lang, code = self.executable_code
             lang_code = 1 if str(lang).upper() in ("1", "PYTHON") else 0
             wire[PartIndex.EXECUTABLE_CODE] = [lang_code, code]
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
             return wire.compact()
         if self.code_execution_result:
             outcome, output = self.code_execution_result
@@ -309,22 +317,59 @@ class AistudioPart:
                 else int(outcome)
             )
             wire[PartIndex.CODE_RESULT] = [outcome_code, output]
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
-            return wire.compact()
-        # Text part — mark as thinking when thought=True (wire index 12 = 1).
-        if self.thought:
-            wire[PartIndex.TEXT] = self.text
-            wire[PartIndex.THOUGHT_ALT_FLAG] = 1
-            if self.thought_signature:
-                wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
-            return wire.compact()
-        if self.thought_signature:
-            wire[PartIndex.TEXT] = self.text
-            wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
             return wire.compact()
         wire[PartIndex.TEXT] = self.text
         return wire.compact()
+
+
+def _decode_json_object(text: str) -> dict[str, object] | None:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def coerce_function_call_args(value: object) -> dict[str, object]:
+    """Force ``functionCall.args`` into a legal Struct payload.
+
+    Dicts pass through.  Strings that decode to a JSON object become that
+    object; every other shape (plain string, list, scalar) is wrapped under
+    ``content`` so the wire encoder always sees a Struct.  ``None`` becomes an
+    empty Struct.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = _decode_json_object(value)
+        if parsed is not None:
+            return parsed
+        return {"content": value}
+    return {"content": value}
+
+
+def coerce_function_response(value: object) -> dict[str, object]:
+    """Force ``functionResponse.response`` into a legal Struct payload.
+
+    Dicts pass through.  Strings that decode to a JSON object become that
+    object; list/scalar/plain-string values are wrapped under ``result`` (the
+    OpenAI/Claude adapter convention).  ``None`` becomes an empty Struct.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = _decode_json_object(value)
+        if parsed is not None:
+            return parsed
+        return {"result": value}
+    return {"result": value}
 
 
 def _encode_wire_args(value):
@@ -409,6 +454,6 @@ class AistudioRequest:
     evergreen_model_uri: str | None = None
     tool_config: list | None = None
     request_flag: int | None = None
-    cached_content: str | None = None
+    session_token: str | None = None
     location: list | None = None
     raw_body: list = field(default_factory=list)

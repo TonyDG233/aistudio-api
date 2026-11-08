@@ -1,0 +1,28 @@
+2026-10-18 20:13:34 [INFO] [aistudio.server] 正在启动服务，监听端口 8080
+2026-10-18 20:13:35 [INFO] [aistudio.rotator] 已从 D:\LLM\self_programming\aistudio-api\data\rotator_state.json 恢复 2 个账号的运行与限额状态
+2026-10-18 20:13:35 [INFO] [aistudio.server] Client initialized (port=9222, accounts=2)
+2026-10-18 20:13:35 [INFO] [aistudio.browser] 正在启动 CloakBrowser 进程: D:\LLM\self_programming\aistudio-api\.cloakbrowser\chromium-146.0.7680.177.4\chrome.exe (调试端口 9222)
+2026-10-18 20:13:35 [INFO] [aistudio.routes.gemini] 收到 Gemini streamGenerateContent 流式请求: model=models/gemini-3.8-flash
+2026-10-18 20:13:35 [INFO] [aistudio.api.gemini] [build] 流式请求经 Build 面直连: model=models/gemini-3.8-flash, contents=1
+2026-10-18 20:13:35 [INFO] [aistudio.api.gemini] Gemini 流式请求: model=models/gemini-3.8-flash, 对话轮数=1
+2026-10-18 20:13:35 [INFO] [aistudio.server] HTTP POST /v1beta/models/gemini-3.8-flash:streamGenerateContent -> 200 (32.1ms)
+2026-10-18 20:13:35 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:13:35 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:13:35 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/list "HTTP/1.1 200 OK"
+2026-10-18 20:13:35 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:13:35 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/list "HTTP/1.1 200 OK"
+2026-10-18 20:13:35 [INFO] [aistudio.session.auth] 已向页面载入 7 个 Cookie (auth_file=C:\Users\ADMIN\AppData\Local\Temp\kilo\p3-build2\auth-1.json)
+2026-10-18 20:13:39 [INFO] [aistudio.session.auth] 已保存 9 个 Cookie 至 C:\Users\ADMIN\AppData\Local\Temp\kilo\p3-build2\auth-1.json
+2026-10-18 20:13:45 [INFO] [aistudio.session.botguard] BotGuard 握手成功并截获模板，耗时 1 秒 (累计 5.6 秒)
+2026-10-18 20:13:45 [INFO] [aistudio.session] 会话蓝绿平滑热切成功: auth_file=C:\Users\ADMIN\AppData\Local\Temp\kilo\p3-build2\auth-1.json, u/0 (活跃在途=0)
+2026-10-18 20:13:45 [INFO] [aistudio.client] 浏览器预热完成
+2026-10-18 20:13:45 [INFO] [websockets.server] server listening on 127.0.0.1:9998
+2026-10-18 20:13:45 [INFO] [aistudio.build_surface] Build 面 9998 WS 接收器已启动（app 内嵌客户端握手）
+2026-10-18 20:13:45 [INFO] [httpx] HTTP Request: GET http://127.0.0.1:9222/json/version "HTTP/1.1 200 OK"
+2026-10-18 20:13:45 [INFO] [httpx] HTTP Request: PUT http://127.0.0.1:9222/json/new "HTTP/1.1 200 OK"
+2026-10-18 20:13:45 [INFO] [aistudio.session.auth] 已向页面载入 7 个 Cookie (auth_file=C:\Users\ADMIN\AppData\Local\Temp\kilo\p3-build2\auth-1.json)
+2026-10-18 20:14:03 [INFO] [websockets.server] connection open
+2026-10-18 20:14:03 [INFO] [aistudio.build_surface] app 内嵌客户端已连接 9998（第 1 个）
+2026-10-18 20:14:04 [INFO] [aistudio.build_surface] 已向 app 内嵌客户端下发 warmup 规格（触发宿主 __warmup__ RPC，零上游流量）
+2026-10-18 20:14:05 [INFO] [aistudio.build_surface] [build] 签名器就绪: harvest 头=['authorization', 'content-type', 'x-goog-api-key', 'x-goog-authuser', 'x-goog-ext-519733851-bin', 'x-user-agent']
+2026-10-18 20:14:08 [INFO] [aistudio.api.gemini] Gemini 流式完成: model=models/gemini-3.8-flash, 输入Tokens=11, 输出Tokens=225

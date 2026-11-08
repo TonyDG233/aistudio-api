@@ -22,6 +22,10 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("browser")
 
+# System-level CloakBrowser installation (e.g. Docker containers). Kept as a
+# module-level constant so tests can exercise this branch on any platform.
+_OPT_CLOAKBROWSER_DIR = Path("/opt/cloakbrowser")
+
 
 def _derive_stable_fingerprint_seed(key: str) -> int:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -98,7 +102,7 @@ def find_chromium_executable() -> str:
                 ):
                     return _resolve_local_chrome(str(match))
     # 4. System-level CloakBrowser (/opt/cloakbrowser/**/chrome)
-    opt_cloak_dir = Path("/opt/cloakbrowser")
+    opt_cloak_dir = _OPT_CLOAKBROWSER_DIR
     if opt_cloak_dir.is_dir():
         for pat in (
             "chrome",
@@ -599,7 +603,7 @@ def cleanup_stale_chromium(
     killed_pids: list[int] = []
     if candidate_pids:
         log.info(
-            "发现 %d 个遗留或孤儿浏览器进程待清理: %s",
+            "发现 %d 个孤儿浏览器进程，开始清理: pids=%s",
             len(candidate_pids),
             sorted(candidate_pids),
         )
@@ -773,6 +777,9 @@ def _spawn_process_watchdog(
     When this Python parent process dies (even via SIGKILL or OOM), the kernel automatically
     closes the pipe write-end. The companion process unblocks on EOF and sends SIGKILL
     to the entire browser process group, leaving zero orphans.
+
+    D-02: this watchdog only reaps orphan Chromium processes. It must never be used
+    for account stale revival, automatic rebind, or restarting browser sessions.
     """
     if platform.system() == "Windows":
         return None, None
@@ -811,7 +818,9 @@ def _spawn_process_watchdog(
         watcher = subprocess.Popen(
             cmd,
             pass_fds=[pipe_r],
-            preexec_fn=_setup_child_pdeathsig,
+            # P-01: 绝不能给 watchdog 设置 PR_SET_PDEATHSIG。watchdog 必须在父进程
+            # 死亡后存活下来，读到 pipe EOF 再回收 Chromium 进程组；PDEATHSIG 会让
+            # 内核先杀掉 watchdog，孤儿 Chromium 将无人回收。
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -930,6 +939,7 @@ class ChromiumProcess:
 
     def terminate(self, timeout_s: float = 3.0) -> None:
         """Terminate the Chromium subprocess tree and companion watchdog safely."""
+        log.debug("正在终止 Chromium 进程: pid=%s, port=%d", getattr(self.process, "pid", None), self.port)
         _ACTIVE_CHROMIUM_PROCESSES.discard(self)
 
         # Close the write end of the pipe so the companion watchdog knows to exit cleanly
@@ -1037,7 +1047,7 @@ def launch_chromium_process(
         extra_args=extra_args,
     )
     cmd = [executable, *args]
-    log.info("正在启动 CloakBrowser 进程: %s (调试端口 %d)", executable, port)
+    log.info("启动浏览器进程: %s, 调试端口=%d", executable, port)
 
     preexec = _setup_child_pdeathsig if platform.system() != "Windows" else None
     proc = subprocess.Popen(

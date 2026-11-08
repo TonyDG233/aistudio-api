@@ -1,86 +1,91 @@
-"""Behavior contracts for WP5 v3 model-list projection."""
+"""Minimal ModelCatalog projection contracts (P1, no channel registry)."""
 
 from __future__ import annotations
 
+import pytest
+
 from aistudio_api.application.model_catalog import (
     catalog_prefix,
+    clean_model_id,
     project_model_ids,
     resolve_model_request,
     split_catalog_prefix,
 )
-
-
-def _features(*, chat: bool = True, build: bool = False) -> dict[str, object]:
-    return {
-        "channels": {
-            "chat": {"enabled": chat, "max_pages": 1},
-            "build": {"enabled": build, "max_pages": 1},
-            "official": {"enabled": False, "max_pages": 0},
-        }
-    }
+from aistudio_api.domain.model_access import clear_paid_models, set_paid_models
 
 
 def _models(*ids: str) -> list[dict[str, object]]:
     return [{"id": model_id} for model_id in ids]
 
 
-def test_single_channel_returns_bare_ids() -> None:
+def test_single_surface_returns_bare_ids() -> None:
     assert project_model_ids(
-        _models("models/gemini-3.8-flash", "models/gemini-2.5-pro"),
-        _features(),
+        _models("models/gemini-3.8-flash", "models/gemini-2.5-pro")
     ) == ["gemini-3.8-flash", "gemini-2.5-pro"]
 
 
-def test_multi_channel_lists_bare_and_prefixed_ids() -> None:
+def test_build_surface_lists_bare_and_build_prefixed_ids() -> None:
     projected = project_model_ids(
         _models("models/gemini-3.8-flash"),
-        _features(build=True),
+        enabled_surfaces=("chat", "build"),
     )
     assert projected == [
         "gemini-3.8-flash",
-        "pg/gemini-3.8-flash",
         "build/gemini-3.8-flash",
     ]
+    assert not any(model.startswith(("pg/", "chat/")) for model in projected)
 
 
-def test_chat_only_model_is_not_duplicated_into_build() -> None:
+def test_chat_only_model_is_not_projected_into_build() -> None:
+    clear_paid_models()
+    set_paid_models(
+        [
+            {"id": "gemini-4-argon", "paid": True},
+            {"id": "gemini-2.5-pro", "paid": False},
+        ]
+    )
     projected = project_model_ids(
         [
             {"id": "models/gemini-4-argon", "paid": True},
-            {"id": "models/gemini-2.5-pro", "paid": True},
+            {"id": "models/gemini-2.5-pro", "paid": False},
         ],
-        _features(build=True),
+        enabled_surfaces=("chat", "build"),
     )
     assert projected == [
         "gemini-4-argon",
         "gemini-2.5-pro",
-        "pg/gemini-4-argon",
-        "pg/gemini-2.5-pro",
+        "build/gemini-2.5-pro",
     ]
 
 
 def test_duplicate_discovery_entries_are_deduped() -> None:
     projected = project_model_ids(
         _models("models/flash", "flash", "models/flash"),
-        _features(build=True),
+        enabled_surfaces=("chat", "build"),
     )
-    assert projected == ["flash", "pg/flash", "build/flash"]
+    assert projected == ["flash", "build/flash"]
 
 
-def test_official_is_not_listed_before_wp9() -> None:
-    features = _features(build=True)
-    features["channels"]["official"]["enabled"] = True  # type: ignore[index]
-    assert all(
-        not item.startswith("official/")
-        for item in project_model_ids(_models("flash"), features)
-    )
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("gemini-x", ("gemini-x", None)),
+        ("models/gemini-x", ("gemini-x", None)),
+        ("chat/gemini-x", ("chat/gemini-x", None)),
+        ("build/gemini-x", ("gemini-x", "build")),
+        ("pg/gemini-x", ("pg/gemini-x", None)),
+        ("playground/gemini-x", ("playground/gemini-x", None)),
+        ("official/gemini-x", ("official/gemini-x", None)),
+    ],
+)
+def test_catalog_prefix_matrix(
+    model_id: str, expected: tuple[str, str | None]
+) -> None:
+    assert split_catalog_prefix(model_id) == expected
+    assert resolve_model_request(model_id) == expected
 
 
-def test_input_prefixes_are_parsed_not_listed() -> None:
-    assert split_catalog_prefix("pg/flash") == ("flash", "chat")
-    assert split_catalog_prefix("chat/flash") == ("flash", "chat")
-    assert split_catalog_prefix("playground/flash") == ("flash", "chat")
-    assert split_catalog_prefix("build/flash") == ("flash", "build")
-    assert split_catalog_prefix("models/flash") == ("flash", None)
-    assert catalog_prefix("chat") == "pg"
-    assert resolve_model_request("pg/flash") == ("flash", "chat")
+def test_catalog_prefix_helpers() -> None:
+    assert catalog_prefix("build") == "build"
+    assert clean_model_id("models/flash") == "flash"
+    assert clean_model_id("build/flash") == "build/flash"

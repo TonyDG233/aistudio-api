@@ -10,6 +10,8 @@ import pytest
 
 from aistudio_api.infrastructure.browser.cdp_client import (
     BLOCKED_URL_PATTERNS,
+    BUILD_SURFACE_BLOCKED_URL_PATTERNS,
+    EDITOR_LIBRARY_BLOCKED_URL_PATTERNS,
     CDPConnection,
     CDPError,
     CDPPage,
@@ -25,6 +27,41 @@ def test_blocked_url_patterns_coverage():
     assert "*play.google.com/log*" in BLOCKED_URL_PATTERNS
     assert "*SavePrompt*" in BLOCKED_URL_PATTERNS
     assert "*CreatePrompt*" in BLOCKED_URL_PATTERNS
+
+
+def test_build_surface_blocked_patterns_exclude_editor_libraries():
+    """D03-010: chat blocks editors, build lets monaco/codemirror/vs/mathjax/katex load."""
+    for pattern in EDITOR_LIBRARY_BLOCKED_URL_PATTERNS:
+        assert pattern in BLOCKED_URL_PATTERNS
+        assert pattern not in BUILD_SURFACE_BLOCKED_URL_PATTERNS
+    assert "*.png" in BUILD_SURFACE_BLOCKED_URL_PATTERNS
+
+
+@pytest.mark.asyncio
+async def test_cdp_connection_uses_websocket_ping_without_liveness_checker():
+    """D-03: keep WS ping, and never restore liveness checker / Runtime.evaluate polling."""
+    assert not hasattr(CDPConnection, "set_liveness_checker")
+    assert not hasattr(CDPPage, "set_liveness_checker")
+
+    fake_ws = AsyncMock()
+    fake_ws.recv = AsyncMock(side_effect=asyncio.CancelledError)
+    captured: dict[str, object] = {}
+
+    async def fake_connect(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_ws
+
+    conn = CDPConnection("ws://127.0.0.1:9222/devtools/page/test")
+    with patch(
+        "aistudio_api.infrastructure.browser.cdp_client.websockets.connect",
+        side_effect=fake_connect,
+    ):
+        await conn.connect()
+        await conn.close()
+
+    assert captured["ping_interval"] == 5
+    assert captured["ping_timeout"] == 5
+    assert not hasattr(conn, "_liveness_checker")
 
 
 @pytest.mark.asyncio
@@ -214,36 +251,34 @@ async def test_cdp_connection_fast_fail_on_target_crashed():
 
 
 @pytest.mark.asyncio
-async def test_cdp_connection_liveness_checker_fail_fast():
-    """Verify liveness_checker detects dead process and fails within milliseconds."""
-    conn = CDPConnection("ws://127.0.0.1:9222/devtools/page/test")
-    fake_ws = AsyncMock()
-    conn.ws = fake_ws
-    fake_ws.send = AsyncMock()
-
-    # Process is already dead
-    conn.set_liveness_checker(lambda: False)
-
-    start_t = asyncio.get_running_loop().time()
-    with pytest.raises(RuntimeError, match=r"Browser process has died"):
-        await conn.send("Runtime.evaluate", {"expression": "1+1"}, timeout_s=30.0)
-    elapsed = asyncio.get_running_loop().time() - start_t
-    assert elapsed < 0.5, f"Took too long to detect dead process: {elapsed}s"
-
-
-@pytest.mark.asyncio
 async def test_cdp_client_connect_page_success_and_prune():
     """Verify connect_page connects to main page and prunes extra spare pages."""
     from aistudio_api.infrastructure.browser.cdp_client import CDPClient
 
     client = CDPClient(port=9222)
     client.wait_until_ready = AsyncMock()
-
     fake_targets = [
-        {"id": "t1", "type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1"},
-        {"id": "t2", "type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p2"},
+        {
+            "id": "t1",
+            "type": "page",
+            "url": "https://aistudio.google.com/",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1",
+        },
+        {
+            "id": "t2",
+            "type": "page",
+            "url": "about:blank",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p2",
+        },
+        {
+            "id": "t3",
+            "type": "page",
+            "url": "https://aistudio.google.com/u/1/",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p3",
+        },
     ]
     client.get_targets = AsyncMock(return_value=fake_targets)
+    client.close_target = AsyncMock()
 
     with patch(
         "aistudio_api.infrastructure.browser.cdp_client.CDPConnection"
@@ -258,3 +293,8 @@ async def test_cdp_client_connect_page_success_and_prune():
         ):
             page = await client.connect_page(block_assets=True)
             assert page.target_id == "t1"
+            # D-11: every non-current target is closed, not just blank tabs.
+            assert [call.args[0] for call in client.close_target.await_args_list] == [
+                "t2",
+                "t3",
+            ]

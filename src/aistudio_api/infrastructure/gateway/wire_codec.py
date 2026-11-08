@@ -9,13 +9,7 @@ from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
 from .model_defaults import resolve_model_defaults
 from .wire_parser import (
     WIRE_PART_FILE_DATA_INDEX,
-    WIRE_PART_FUNCTION_CALL_ALT_INDEX,
-    WIRE_PART_FUNCTION_CALL_INDEX,
-    WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX,
-    WIRE_PART_FUNCTION_RESPONSE_INDEX,
-    WIRE_PART_INLINE_DATA_INDEX,
-    WIRE_PART_TEXT_INDEX,
-    WIRE_PART_THOUGHT_SIGNATURE_INDEX,
+    parse_response_part,
 )
 from .wire_spec import TopLevelIndex
 from .wire_types import (
@@ -157,17 +151,24 @@ class AistudioWireCodec:
     TOOLS_INDEX = TopLevelIndex.TOOLS
     EVERGREEN_MODEL_URI_INDEX = TopLevelIndex.EVERGREEN_MODEL_URI
     REQUEST_FLAG_INDEX = TopLevelIndex.REQUEST_FLAG
-    CACHED_CONTENT_INDEX = TopLevelIndex.CACHED_CONTENT
-    TIMEZONE_INDEX = TopLevelIndex.LOCATION
+    SESSION_TOKEN_INDEX = TopLevelIndex.SESSION_TOKEN
+    TIMEZONE_INDEX = TopLevelIndex.REQUEST_CONTEXT
 
     def decode(self, raw_body: str) -> AistudioRequest:
-        body = json.loads(raw_body)
+        parsed = json.loads(raw_body)
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"wire body must be a JSON array, got {type(parsed).__name__}"
+            )
+        body = list(parsed)
+        self._ensure_len(body, self.TIMEZONE_INDEX + 1)
+        raw_gc = body[self.GENERATION_CONFIG_INDEX]
         return AistudioRequest(
             model=body[self.MODEL_INDEX],
             contents=self._decode_contents(body[self.CONTENTS_INDEX]),
             safety_settings=body[self.SAFETY_INDEX],
             generation_config=AistudioGenerationConfig(
-                list(body[self.GENERATION_CONFIG_INDEX])
+                list(raw_gc) if isinstance(raw_gc, list) else []
             ),
             snapshot=body[self.SNAPSHOT_INDEX]
             if len(body) > self.SNAPSHOT_INDEX
@@ -185,8 +186,8 @@ class AistudioWireCodec:
             request_flag=body[self.REQUEST_FLAG_INDEX]
             if len(body) > self.REQUEST_FLAG_INDEX
             else None,
-            cached_content=body[self.CACHED_CONTENT_INDEX]
-            if len(body) > self.CACHED_CONTENT_INDEX
+            session_token=body[self.SESSION_TOKEN_INDEX]
+            if len(body) > self.SESSION_TOKEN_INDEX
             else None,
             location=body[self.TIMEZONE_INDEX]
             if len(body) > self.TIMEZONE_INDEX
@@ -214,7 +215,7 @@ class AistudioWireCodec:
         body[self.REQUEST_FLAG_INDEX] = (
             request.request_flag if request.request_flag is not None else 1
         )
-        body[self.CACHED_CONTENT_INDEX] = request.cached_content
+        body[self.SESSION_TOKEN_INDEX] = request.session_token
         body[self.TIMEZONE_INDEX] = request.location
 
         model_defaults = resolve_model_defaults(request.model)
@@ -237,7 +238,7 @@ class AistudioWireCodec:
                     1,
                 ]
             else:
-                while len(body) > self.CACHED_CONTENT_INDEX + 1 and body[-1] is None:
+                while len(body) > self.SESSION_TOKEN_INDEX + 1 and body[-1] is None:
                     body.pop()
         return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
@@ -302,17 +303,27 @@ class AistudioWireCodec:
         if top_k is not None:
             request.generation_config.top_k = top_k
         for attr, value in (generation_config_overrides or {}).items():
-            if value is None or not hasattr(request.generation_config, attr):
+            if not hasattr(request.generation_config, attr):
+                continue
+            if value is None and attr != "thinking_config":
                 continue
             setattr(request.generation_config, attr, value)
-        request.generation_config.enable_default_thinking()
+        explicit_thinking_null = (
+            "thinking_config" in defaults and defaults["thinking_config"] is None
+        ) or (
+            generation_config_overrides is not None
+            and "thinking_config" in generation_config_overrides
+            and generation_config_overrides["thinking_config"] is None
+        )
+        if not explicit_thinking_null:
+            request.generation_config.enable_default_thinking()
 
         # OpenAI chat compatibility should not inherit browser-side structured output
         # or explicit reasoning settings from a previously captured AI Studio request.
         if sanitize_plain_text and not model_defaults.is_image_model:
             request.generation_config.sanitize_for_plain_text()
-            request.generation_config.enable_default_thinking()
-
+            if not explicit_thinking_null:
+                request.generation_config.enable_default_thinking()
         if safety_off:
             request.safety_settings = [[None, None, cat, 5] for cat in [7, 8, 9, 10]]
 
@@ -380,87 +391,71 @@ class AistudioWireCodec:
         return contents
 
     def _decode_part(self, raw_part) -> AistudioPart:
+        parsed = parse_response_part(raw_part)
+        part = AistudioPart(
+            thought=parsed.thought,
+            thought_signature=parsed.thought_signature or None,
+        )
+        if not isinstance(raw_part, list):
+            return part
         if (
-            isinstance(raw_part, list)
-            and len(raw_part) > WIRE_PART_FILE_DATA_INDEX
+            len(raw_part) > WIRE_PART_FILE_DATA_INDEX
             and isinstance(raw_part[WIRE_PART_FILE_DATA_INDEX], list)
-            and len(raw_part[WIRE_PART_FILE_DATA_INDEX]) >= 1
+            and raw_part[WIRE_PART_FILE_DATA_INDEX]
             and isinstance(raw_part[WIRE_PART_FILE_DATA_INDEX][0], str)
         ):
-            return AistudioPart(file_id=raw_part[WIRE_PART_FILE_DATA_INDEX][0])
-        if (
-            isinstance(raw_part, list)
-            and len(raw_part) > WIRE_PART_INLINE_DATA_INDEX
-            and isinstance(raw_part[WIRE_PART_INLINE_DATA_INDEX], list)
-            and len(raw_part[WIRE_PART_INLINE_DATA_INDEX]) >= 2
+            part.file_id = raw_part[WIRE_PART_FILE_DATA_INDEX][0]
+        elif parsed.inline_data is not None:
+            part.inline_data = parsed.inline_data
+        elif parsed.function_call is not None:
+            raw = parsed.function_call.get("raw")
+            if isinstance(raw, list):
+                name = raw[0] if raw and isinstance(raw[0], str) else "unknown"
+                args = raw[1] if len(raw) > 1 else {}
+                part.function_call = (
+                    (name, args, raw[2])
+                    if len(raw) > 2 and isinstance(raw[2], str)
+                    else (name, args)
+                )
+        elif parsed.function_response is not None:
+            raw = parsed.function_response.get("raw")
+            if isinstance(raw, list):
+                name = raw[0] if raw and isinstance(raw[0], str) else "unknown"
+                response = raw[1] if len(raw) > 1 else {}
+                part.function_response = (
+                    (name, response, raw[2])
+                    if len(raw) > 2 and isinstance(raw[2], str)
+                    else (name, response)
+                )
+        elif (
+            isinstance(parsed.executable_code, list) and len(parsed.executable_code) > 1
         ):
-            return AistudioPart(
-                inline_data=(
-                    raw_part[WIRE_PART_INLINE_DATA_INDEX][0],
-                    raw_part[WIRE_PART_INLINE_DATA_INDEX][1],
-                )
+            part.executable_code = (
+                str(parsed.executable_code[0]),
+                str(parsed.executable_code[1]),
             )
-        if isinstance(raw_part, list):
-            raw_function_call = None
-            if len(raw_part) > WIRE_PART_FUNCTION_CALL_ALT_INDEX and isinstance(
-                raw_part[WIRE_PART_FUNCTION_CALL_ALT_INDEX], list
-            ):
-                raw_function_call = raw_part[WIRE_PART_FUNCTION_CALL_ALT_INDEX]
-            elif len(raw_part) > WIRE_PART_FUNCTION_CALL_INDEX and isinstance(
-                raw_part[WIRE_PART_FUNCTION_CALL_INDEX], list
-            ):
-                raw_function_call = raw_part[WIRE_PART_FUNCTION_CALL_INDEX]
-            if raw_function_call is not None:
-                name = (
-                    raw_function_call[0]
-                    if raw_function_call and isinstance(raw_function_call[0], str)
-                    else "unknown"
-                )
-                args = raw_function_call[1] if len(raw_function_call) > 1 else {}
-                call_id = (
-                    raw_function_call[2]
-                    if len(raw_function_call) > 2
-                    and isinstance(raw_function_call[2], str)
-                    else None
-                )
-                signature = (
-                    raw_part[WIRE_PART_THOUGHT_SIGNATURE_INDEX]
-                    if len(raw_part) > WIRE_PART_THOUGHT_SIGNATURE_INDEX
-                    and isinstance(raw_part[WIRE_PART_THOUGHT_SIGNATURE_INDEX], str)
-                    else None
-                )
-                function_call = (name, args, call_id) if call_id else (name, args)
-                return AistudioPart(
-                    function_call=function_call, thought_signature=signature
-                )
-        if isinstance(raw_part, list) and (
-            (
-                len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX], list)
-            )
-            or (
-                len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_INDEX], list)
-            )
+        elif (
+            isinstance(parsed.code_execution_result, list)
+            and len(parsed.code_execution_result) > 1
         ):
-            raw_function_response = (
-                raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX]
-                if len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX], list)
-                else raw_part[WIRE_PART_FUNCTION_RESPONSE_INDEX]
+            outcomes = {
+                1: "OUTCOME_OK",
+                2: "OUTCOME_FAILED",
+                3: "OUTCOME_DEADLINE_EXCEEDED",
+            }
+            raw_outcome = parsed.code_execution_result[0]
+            outcome_str = (
+                outcomes.get(raw_outcome, str(raw_outcome))
+                if isinstance(raw_outcome, int)
+                else str(raw_outcome)
             )
-            name = (
-                raw_function_response[0]
-                if raw_function_response and isinstance(raw_function_response[0], str)
-                else "unknown"
+            part.code_execution_result = (
+                outcome_str,
+                str(parsed.code_execution_result[1]),
             )
-            response = (
-                raw_function_response[1] if len(raw_function_response) > 1 else {}
-            )
-            return AistudioPart(function_response=(name, response))
-        if isinstance(raw_part, list) and len(raw_part) > WIRE_PART_TEXT_INDEX:
-            return AistudioPart(text=raw_part[WIRE_PART_TEXT_INDEX])
-        return AistudioPart()
+        else:
+            part.text = parsed.text
+        return part
 
     def _decode_system_instruction(self, raw_instruction) -> AistudioContent | None:
         if not raw_instruction or not isinstance(raw_instruction, list):

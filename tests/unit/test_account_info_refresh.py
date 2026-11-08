@@ -1,4 +1,4 @@
-"""WP3 账号信息刷新（tier/过期/邮箱 + 批量并行 + 调度排除）单元测试。
+"""账号信息刷新（tier/过期/邮箱 + 批量并行 + 调度排除）单元测试。
 
 所有 HTTP 交互经注入的 FakeTransport 离线完成，不发任何真实网络请求。
 """
@@ -113,12 +113,10 @@ def _make_store(tmp_path: Path) -> tuple[AccountStore, AccountMeta]:
     [
         ("[]", "Free"),
         ("[0]", "Free"),
+        ("[null]", "Free"),
         ("[1]", "Pro"),
         ("[2]", "Ultra"),
         ("[3]", "Plus"),
-        ("[9]", "unknown-9"),
-        ("null", "Free"),  # 非法/空 envelope 视作 free（对齐 Ark code=0）
-        ("not-json", "Free"),
     ],
 )
 def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
@@ -135,6 +133,81 @@ def test_tier_mapping(tmp_path: Path, body: str, expected: str) -> None:
     assert stored is not None
     assert stored.tier == expected
     assert stored.expired is False
+
+
+@pytest.mark.parametrize("existing_tier", ["Pro", "Ultra"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[9]",
+        "not-json",
+        "null",
+        '[null, "error message"]',
+    ],
+)
+def test_malformed_200_preserves_existing_tier_and_skips_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    existing_tier: str,
+) -> None:
+    store, account = _make_store(tmp_path)
+    store.update_account_refresh(
+        account.id,
+        tier=existing_tier,
+        tier_checked_at="2026-01-01T00:00:00Z",
+        expired=False,
+    )
+    current = store.get_account(account.id)
+    assert current is not None
+    update_mock = MagicMock(wraps=store.update_account_refresh)
+    monkeypatch.setattr(store, "update_account_refresh", update_mock)
+    transport = FakeTransport([TransportResponse(status=200, body=body)])
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    result = asyncio.run(refresher.refresh_account(current, refresh_email=False))
+
+    assert result.ok is False
+    assert result.tier is None
+    assert result.expired is None
+    update_mock.assert_not_called()
+    stored = store.get_account(account.id)
+    assert stored is not None
+    assert stored.tier == existing_tier
+    assert stored.tier_checked_at == "2026-01-01T00:00:00Z"
+    assert stored.expired is False
+
+
+def test_batch_continues_after_malformed_200(tmp_path: Path) -> None:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    pro = store.save_account(
+        name="Pro", email="pro@example.com", storage_state=_storage_state(), tier="Pro"
+    )
+    ultra = store.save_account(
+        name="Ultra",
+        email="ultra@example.com",
+        storage_state=_storage_state(),
+        tier="Ultra",
+    )
+    accounts = [pro, ultra]
+    transport = FakeTransport(
+        [
+            TransportResponse(status=200, body="not-json"),
+            TransportResponse(status=200, body="[9]"),
+        ]
+    )
+    refresher = AccountInfoRefresher(store, transport=transport, concurrency=2)
+
+    async def _run() -> list[RefreshResult]:
+        return await refresher.refresh_accounts(accounts, refresh_email=False)
+
+    results = asyncio.run(_run())
+
+    assert len(results) == 2
+    assert all(result.ok is False for result in results)
+    assert all(result.tier is None for result in results)
+    assert store.get_account(pro.id).tier == "Pro"  # type: ignore[union-attr]
+    assert store.get_account(ultra.id).tier == "Ultra"  # type: ignore[union-attr]
 
 
 # --------------------------------------------------------------------------- #
@@ -201,17 +274,16 @@ def test_401_marks_expired(tmp_path: Path) -> None:
     assert result.expired is True
     assert result.tier is None
     assert "401" in (result.error or "")
+    assert "Login required" in (result.error or "")
     stored = store.get_account(account.id)
     assert stored is not None
     assert stored.expired is True
-    # tier 徽章数据路径仍可读（tier 为空），与过期徽章并存表达
     resp = to_account_response(stored)
     assert resp.expired is True
-    assert resp.tier is None
 
 
 def test_401_cleared_after_recovery(tmp_path: Path) -> None:
-    """先标记过期，再刷新成功应清除 expired（否则账号永久出不了调度）。"""
+    """先标记过期，再刷新成功应清除 expired。"""
     store, account = _make_store(tmp_path)
     store.update_account_refresh(account.id, expired=True)
     transport = FakeTransport([TransportResponse(status=200, body="[1]")])
@@ -237,12 +309,12 @@ def test_server_error_does_not_change_state(tmp_path: Path) -> None:
     result = asyncio.run(refresher.refresh_account(account))
 
     assert result.ok is False
-    assert result.expired is None  # 非权威失败
+    assert result.expired is None
     assert "500" in (result.error or "")
     stored = store.get_account(account.id)
     assert stored is not None
     assert stored.expired is False
-    assert stored.tier == "Pro"  # 未被清空
+    assert stored.tier == "Pro"
     assert stored.tier_checked_at == "2026-01-01T00:00:00Z"
 
 
@@ -255,8 +327,8 @@ def test_403_key_blocked_recovers_and_retries_once(tmp_path: Path) -> None:
     transport = FakeTransport(
         [
             TransportResponse(status=403, body="API_KEY_SERVICE_BLOCKED"),
-            TransportResponse(status=200, body=html),  # apps 页回收 key
-            TransportResponse(status=200, body="[2]"),  # 重试成功
+            TransportResponse(status=200, body=html),
+            TransportResponse(status=200, body="[2]"),
         ]
     )
     refresher = AccountInfoRefresher(store, transport=transport, app_id="app-x")
@@ -267,7 +339,7 @@ def test_403_key_blocked_recovers_and_retries_once(tmp_path: Path) -> None:
     assert result.tier == "Ultra"
 
     rpc_calls = [r for r in transport.requests if r.method == "POST"]
-    assert len(rpc_calls) == 2, "一次原始 + 一次带回收 key 的重试"
+    assert len(rpc_calls) == 2
     assert rpc_calls[0].headers.get("x-goog-api-key") != NEW_KEY
     assert rpc_calls[1].headers.get("x-goog-api-key") == NEW_KEY
     page_calls = [r for r in transport.requests if r.method == "GET"]
@@ -287,7 +359,7 @@ def test_403_non_key_does_not_retry(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 邮箱回填（Ark 真实 HTML 特征 fixture）
+# 邮箱回填（真实 HTML 特征 fixture）
 # --------------------------------------------------------------------------- #
 ARK_APP_HTML = (
     "<!doctype html><html><head><script>"
@@ -405,7 +477,7 @@ def test_batch_mutual_exclusion_raises(tmp_path: Path) -> None:
         task = asyncio.create_task(
             refresher.refresh_accounts(accounts, refresh_email=False)
         )
-        await asyncio.sleep(0)  # 让首个 run 进入 active 状态
+        await asyncio.sleep(0)
         with pytest.raises(RefreshInProgressError):
             await refresher.refresh_accounts(accounts, refresh_email=False)
         await task
@@ -420,11 +492,12 @@ def test_account_meta_backward_compatible_defaults() -> None:
     meta = AccountMeta.from_dict(
         {"id": "a", "name": "n", "email": None, "created_at": "t"}
     )
-    assert meta.tier is None
+    assert meta.tier == "Free"
     assert meta.tier_checked_at is None
     assert meta.expired is False
+    assert meta.duplicate_of is None
     data = meta.to_dict()
-    assert data["tier"] is None
+    assert data["tier"] == "Free"
     assert data["tier_checked_at"] is None
     assert data["expired"] is False
 
@@ -438,6 +511,7 @@ def test_account_meta_roundtrip_with_refresh_fields() -> None:
         tier="Pro",
         tier_checked_at="2026-10-18T00:00:00Z",
         expired=True,
+        duplicate_of="keeper",
     )
     restored = AccountMeta.from_dict(json.loads(json.dumps(meta.to_dict())))
     assert restored == meta
@@ -451,7 +525,6 @@ def test_update_account_refresh_persists(tmp_path: Path) -> None:
         )
         is True
     )
-    # 幂等：相同值不再有改动
     assert (
         store.update_account_refresh(
             account.id, tier="Plus", tier_checked_at="ts", expired=True
@@ -462,7 +535,6 @@ def test_update_account_refresh_persists(tmp_path: Path) -> None:
     on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
     assert on_disk["tier"] == "Plus"
     assert on_disk["expired"] is True
-    # 未知账号
     assert store.update_account_refresh("missing", tier="Free") is False
 
 
@@ -525,7 +597,11 @@ class _FakeRefresher(AccountInfoRefresher):
         self.calls: list[tuple[list[str], bool]] = []
 
     async def refresh_accounts(
-        self, accounts: list[AccountMeta], *, refresh_email: bool = True
+        self,
+        accounts: list[AccountMeta],
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[RefreshResult]:
         if self._raises is not None:
             raise self._raises
@@ -596,7 +672,6 @@ def test_refresh_route_unknown_id_reports_error(fake_service) -> None:
     by_id = {r.id: r for r in resp.results}
     assert by_id["ghost"].ok is False
     assert by_id["ghost"].error == "账号不存在"
-    # 仅存在的账号进入刷新器
     assert refresher.calls[0][0] == ["acc_1"]
 
 

@@ -1,8 +1,8 @@
-"""Contract tests for the WP5 v4 instance API."""
+"""Contract tests for the single-instance/single-surface instance API."""
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import pytest
@@ -20,9 +20,20 @@ EXPECTED_KEYS = {
     "number",
     "account_id",
     "state",
-    "channel",
+    "surface",
+    "only_tier",
+    "min_tier",
+    "max_tier",
     "in_flight",
     "latest",
+    "account_email",
+    "account_name",
+    "account_tier",
+    "tier",
+    "fingerprint",
+    "fingerprint_summary",
+    "last_used",
+    "tier_selector",
 }
 
 
@@ -31,6 +42,7 @@ class FakeManager:
         self.created: list[tuple[str, str | None]] = []
         self.closed: list[str] = []
         self.reassigned: list[tuple[str, str]] = []
+        self.restarted: list[str] = []
         self.fail: Exception | None = None
 
     async def list_instances(self) -> InstanceList:
@@ -44,23 +56,27 @@ class FakeManager:
                     number=1,
                     account_id="a",
                     state=InstanceState.ACTIVE,
-                    channel="pg",
+                    surface="chat",
+                    only_tier="Free",
+                    min_tier="Free",
+                    max_tier="Free",
                     in_flight=1,
                     latest=True,
                 ),
             ),
         )
 
-    async def create(self, account_id: str, channel: str | None = None) -> Instance:
+    async def create(self, account_id: str, surface: str | None = None) -> Instance:
         if self.fail:
             raise self.fail
-        self.created.append((account_id, channel))
+        self.created.append((account_id, surface))
         return Instance(
             id="inst-2",
             number=2,
             account_id=account_id,
             state=InstanceState.STARTING,
-            channel="pg",
+            surface=surface or "chat",
+            min_tier="Free",
         )
 
     async def close(self, instance_id: str) -> Instance:
@@ -72,10 +88,11 @@ class FakeManager:
             number=2,
             account_id="b",
             state=InstanceState.RECLAIMING,
-            channel="pg",
+            surface="chat",
+            min_tier="Free",
         )
 
-    async def switch_to(self, instance_id: str, channel: str | None = None) -> Instance:
+    async def switch_to(self, instance_id: str, surface: str | None = None) -> Instance:
         if self.fail:
             raise self.fail
         return Instance(
@@ -83,7 +100,8 @@ class FakeManager:
             number=2,
             account_id="b",
             state=InstanceState.ACTIVE,
-            channel="pg",
+            surface=surface or "chat",
+            min_tier="Free",
         )
 
     async def reassign(self, instance_id: str, account_id: str) -> Instance:
@@ -95,7 +113,21 @@ class FakeManager:
             number=2,
             account_id=account_id,
             state=InstanceState.STARTING,
-            channel="pg",
+            surface="chat",
+            min_tier="Free",
+        )
+
+    async def restart(self, instance_id: str) -> Instance:
+        if self.fail:
+            raise self.fail
+        self.restarted.append(instance_id)
+        return Instance(
+            id=instance_id,
+            number=2,
+            account_id="b",
+            state=InstanceState.ACTIVE,
+            surface="chat",
+            min_tier="Free",
         )
 
 
@@ -103,7 +135,7 @@ class FakeManager:
 def manager() -> Any:
     fake = FakeManager()
     previous = runtime_state.instance_manager
-    runtime_state.instance_manager = cast("Any", fake)
+    runtime_state.instance_manager = fake
     try:
         yield fake
     finally:
@@ -117,7 +149,7 @@ def _client() -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
-async def test_list_instances_has_strict_user_fields(manager) -> None:
+async def test_list_instances_exposes_single_surface_fields(manager) -> None:
     async with _client() as client:
         resp = await client.get("/api/instances")
     assert resp.status_code == 200
@@ -127,6 +159,11 @@ async def test_list_instances_has_strict_user_fields(manager) -> None:
     assert payload["current_instance_id"] == "inst-1"
     item = payload["instances"][0]
     assert set(item) == EXPECTED_KEYS
+    assert item["surface"] == "chat"
+    assert item["only_tier"] == "Free"
+    assert item["min_tier"] == "Free"
+    assert item["max_tier"] == "Free"
+    assert "channel" not in item
     assert "context" not in str(payload).lower()
     assert "pages" not in str(payload).lower()
 
@@ -135,7 +172,7 @@ async def test_list_instances_has_strict_user_fields(manager) -> None:
 async def test_create_and_close_instance(manager) -> None:
     async with _client() as client:
         created = await client.post(
-            "/api/instances", json={"account_id": "a", "channel": "build"}
+            "/api/instances", json={"account_id": "a", "surface": "build"}
         )
         closed = await client.delete("/api/instances/inst-2")
     assert created.status_code == 201
@@ -147,12 +184,14 @@ async def test_create_and_close_instance(manager) -> None:
 
 
 @pytest.mark.asyncio
-async def test_switch_instance(manager) -> None:
+async def test_switch_instance_surface(manager) -> None:
     async with _client() as client:
-        resp = await client.post("/api/instances/inst-1/switch")
+        resp = await client.post(
+            "/api/instances/inst-1/switch", json={"surface": "build"}
+        )
     assert resp.status_code == 200
     assert resp.json()["id"] == "inst-1"
-    assert "current" not in resp.json()
+    assert resp.json()["surface"] == "build"
 
 
 @pytest.mark.asyncio
@@ -164,6 +203,15 @@ async def test_reassign_instance(manager) -> None:
     assert resp.status_code == 200
     assert resp.json()["account_id"] == "c"
     assert manager.reassigned == [("inst-2", "c")]
+
+
+@pytest.mark.asyncio
+async def test_restart_instance(manager) -> None:
+    async with _client() as client:
+        resp = await client.post("/api/instances/inst-1/restart")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "inst-1"
+    assert manager.restarted == ["inst-1"]
 
 
 @pytest.mark.asyncio

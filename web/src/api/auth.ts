@@ -7,7 +7,7 @@ export const authApi = {
   },
 
   verifyToken(token: string): Promise<StatsResponse> {
-    return request<StatsResponse>('/api/stats', {
+    return request<StatsResponse>('/stats', {
       headers: {
         Authorization: `Bearer ${token}`,
       },

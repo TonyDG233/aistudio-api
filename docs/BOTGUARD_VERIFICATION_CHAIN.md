@@ -14,6 +14,8 @@
 - [6. 阶段五：服务端校验与统一报错响应](#6-阶段五服务端校验与统一报错响应)
 - [7. 生命周期与会话约束](#7-生命周期与会话约束)
 - [8. 核心报文结构参考](#8-核心报文结构参考)
+- [9. 池化启动与快照加固（B6 实装）](#9-池化启动与快照加固b6-实装)
+- [10. C1 桌面指纹与 C1d 快照加固](#10-c1-桌面指纹与-c1d-快照加固)
 
 ---
 
@@ -201,37 +203,42 @@ _.l(requestProto, 5, t);             // 3. 将 Token 注入 Protobuf 字段 5 (W
    };
    ```
 
-2. **生成 BotGuard 快照 (`_.jp` / `_.Dp` / `snapKey`)**：
+2. **生成 BotGuard 快照 (`_.Pn` / `_.jp` / `_.Dp` / `snapKey`)**：
    前端调用被检测到的专属签名函数（在 `default_MakerSuite` 中动态匹配注册）：
    ```javascript
-   // 实测最新版本 (2026-09-28 live 验证):
-   _.jp = function(a, b) {
+   // 实测最新版本 (2026-10-27 live AST 验证 - live_m=_b.js):
+   _.Pn = function(a, b) {
        return _.y(function*() {
            yield a.H; // 等待 BotGuardService 初始化 Promise
            return a.A
-               ? (yield Vqb(a.A), a.A.snapshot({ Bcc: { content: b } }))
+               ? (yield Fxb(a.A), a.A.snapshot({ BFc: { content: b } }))
                : "";
+       });
+   };
+   _.gD = function(a) {
+       return _.y(function*() {
+           var b = _.Ck(a, _.au, 2).flatMap(c => c.Rg()).map(_.jn);
+           return _.VC(b.join(" "));
        });
    };
    // 历史版本混淆符号参考:
-   _.Dp = function(service, contentHash) {
-       return _.z(function*() {
-           yield service.H;
-           return service.A
-               ? (yield JUa(service.A), service.A.snapshot({ e9b: { content: contentHash } }))
-               : "";
-       });
-   };
+   // 2026-09-28: _.jp = (a, b) => a.A.snapshot({ Bcc: { content: b } })
+   // 更早版本:   _.Dp = (a, b) => a.A.snapshot({ e9b: { content: b } })
    ```
-   > **符号混淆与动态匹配**：Google 构建版本更新时会重置混淆名（如类名 `_.QC`、签名函数 `_.jp`、参数键 `Bcc` 等），因此系统通过源码特征（`.snapshot`、`content`、`yield`）动态定位函数，避免硬编码混淆符号。
+   > **关键事实说明（严格对齐网页源码 AST 分析）**：
+   > 1. `_.Ck(a, _.au, 2)` 仅访问请求 Protobuf 的字段 2（即 `contents` 消息体），**绝不包含**字段 6（`system_instruction`）。
+   > 2. `_.jn` 仅对文本 (tag 2)、内联数据 (tag 3)、文件 (tag 6) 提取字符串，其余非文本 Part（函数调用、执行结果等）**统一返回空字符串 `""`**。
+   > 3. 数组所有元素以单空格 `" "` 进行 `join`，**不作过滤**，随后计算 SHA-256 Hex 摘要。
+   >
+   > **符号混淆与动态匹配**：Google 构建版本更新时会重置混淆名（如类名 `_.QC`/`_.nC`、签名函数 `_.Pn`/`_.jp`、参数键 `BFc`/`Bcc` 等），因此系统通过源码特征（`.snapshot`、`content`、`yield`）动态定位函数，避免硬编码混淆符号。
    >
    > **生命周期与状态**：
    > - 快照 Token 与单次请求内容及时间戳绑定，不跨请求复用。
    > - 会话凭据与 Nonce 由服务端动态下发，账号切换时重新初始化。
 3. **虚拟机内部处理**：
-   - 采集浏览器指纹（屏幕分辨率、语言列表、时钟精度、WebGL 上下文特征等）；
+   - 采集浏览器指纹（屏幕分辨率、语言列表、时钟精度、WebGL 上下文特征等）；网关侧在导航前注入按账号确定性的 Windows 桌面 GPU/屏幕指纹，见 §10.1；
    - 使用握手会话秘钥对 `contentHash` 与环境特征进行加密并计算 HMAC 签名；
-   - 生成以 `!` 开头、长度约为 1500~1650 字符的 Base64 快照 Token（例如 `!dXaldhLNAAa1dSU5lXVCmOax...`）。
+   - 生成以 `!` 开头、长度约为 1500~1650 字符的 Base64 快照 Token（例如 `!dXaldhLNAAa1dSU5lXVCmOax...`）。网关质量门槛为 `>= 1520` 字符，见 §10.2。
 
 ## 5. 阶段四：Wire 协议组包与浏览器 Fetch/XHR 重放
 
@@ -272,8 +279,8 @@ _.l(requestProto, 5, t);             // 3. 将 Token 注入 Protobuf 字段 5 (W
 | **`6`** | `Field 7` | `tools` | 工具声明列表（Google 搜索、代码执行、Google Maps 等） |
 | **`7`** | `Field 8` | `evergreen_model_uri` | 动态常青模型 URI（如 `"models/gemini-..."`） |
 | **`10`** | `Field 11` | `request_flag` | 请求行为标记（固定值 `1`） |
-| **`11`** | `Field 12` | `cached_content` | 上下文缓存资源名称 |
-| **`13`** | `Field 14` | `location` | 用户位置与时区声明（如 `[[null, null, "Asia/Tokyo"]]`） |
+| **`11`** | `Field 12` | `session_token` | 会话续接令牌（如 `"v1_..."`） |
+| **`13`** | `Field 14` | `request_context` | 请求上下文与时区声明（如 `[[null, null, "Asia/Tokyo"]]`） |
 ### 浏览器内 Fetch/XHR 发送
 
 ```http
@@ -324,7 +331,7 @@ flowchart TD
 当 BotGuard 校验失败（快照缺失、快照过期、内容哈希不一致或身份冲突）时，服务端返回 **HTTP 403**，响应体为 JSON 数组 `[,[7,"The caller does not have permission"]]`（对应 gRPC 状态码 7 `PERMISSION_DENIED`）。
 
 网关针对该报错建立两级自愈机制：
-1. **多账号故障转移（Failover）**：网关自动对触发 403 的故障账号设置 300 秒短时隔离（`auth_cooldown`），优先调度下一个健康账号，避免在受限账号上无效重试。
+1. **403 两阶段自愈与多账号故障转移（Failover）**：首次 403 先清空模板缓存并在同一实例上重新生成签名重试；二次 403 才切换到健康账号。403 不加硬冷却锁（`auth_cooldown=0.0`），仅累加 `auth_errors` 计数；调度准入不读取 `auth_errors`，不存在 `auth_errors * 200.0` 动态避让。
 2. **单账号在位重建（In-Place Recovery）**：当无备用账号可用时，网关清空请求模板缓存，重载 Cookie 并通过 `ensure_botguard_service(force_refresh=True)` 重新执行页面导航与 WAA 挑战握手，恢复服务可用性。
 
 ---
@@ -348,6 +355,18 @@ Authorization: SAPISIDHASH <TS>_<HASH1> SAPISID1PHASH <TS>_<HASH2> SAPISID3PHASH
 HASH = SHA1(timestamp + " " + SAPISID_VALUE + " https://aistudio.google.com")
 ```
 
+网关实现 `calculate_sapisid_hash` 会同时生成三个哈希段（`src/aistudio_api/infrastructure/account/cookie_parser.py:248-266`）：
+
+```text
+SAPISIDHASH  <ts>_<sha1(ts SAPISID https://aistudio.google.com)>
+SAPISID1PHASH <ts>_<sha1(ts __Secure-1PAPISID https://aistudio.google.com)>
+SAPISID3PHASH <ts>_<sha1(ts __Secure-3PAPISID https://aistudio.google.com)>
+```
+
+- `SAPISID` 缺失时返回空字符串；1P/3P 缺失时回退到 `SAPISID`（`cookie_parser.py:252-256`）。
+- 时间戳取当前 UNIX 秒；`origin` 默认 `https://aistudio.google.com`（`cookie_parser.py:258-265`）。
+- 页面内 XHR 仍以 `withCredentials=true` 携带完整 Cookie；Authorization 头是补充而非唯一凭据。
+
 ### 8.2 快照签名 Token 特征
 
 | 属性 | 特征 |
@@ -356,3 +375,120 @@ HASH = SHA1(timestamp + " " + SAPISID_VALUE + " https://aistudio.google.com")
 | **编码** | URL-Safe Base64 |
 | **长度** | 约 1500 ~ 1650 字符 |
 | **内容** | 包含硬件与环境指纹、内容哈希 HMAC 与会话 Nonce |
+
+---
+
+## 9. 池化启动与快照加固（B6 实装）
+
+本章记录本仓库在 B6 收口阶段对 BotGuard 链路的工程化加固。原则是：**只允许池化实例启动时触发一次 BotGuard 探针；控制面不重复预热；模板必须来自真实上游请求；输入框与 Hook 必须清理。**
+
+### 9.1 池化启动防重复预热（anti-double-warmup）
+
+启动路径显式分流（`src/aistudio_api/api/app.py:103-130`、`330-388`）：
+
+1. `get_configured_instance_specs()` 非空时 `pool_enabled=True`。
+2. `_start_control_warmup(client, pool_enabled=True)` 直接返回 `None`，**不创建控制面预热任务**。
+3. `_startup_instances` 只有在拿到非空 `warmup_task` 时才等待控制面预热；随后调用 `InstanceManager.startup()`（`api/app.py:112-130`）。
+4. `InstanceManager.startup()` 为每个配置 spec 创建槽，并通过 `InstancePool.activate → PooledSession.bootstrap` 在独立 `BrowserContext` 内打开 Page、注入账号指纹与 Cookie、执行 BotGuard 握手（`instance_manager.py:168-237`、`pooled_session.py:80-140`）。
+5. 只有配置中完全没有任何实例（legacy pool-disabled 模式）才允许控制面预热；日志会明确打印“实例池已启用：跳过控制面预热”。
+
+模型发现预热也复用池会话，不新开 Page/BotGuard：`_model_warmup` 等待 `startup_task` 完成后调用 `_refresh_model_catalog_once`，后者只取 `runtime_state.discovery_sessions()`（paid lane 先、Free 后、空闲优先）（`api/app.py:539-570`、`instance_manager.py:681-705`）。
+
+效果：一次冷启动只产生池会话的 BotGuard 探针，避免控制面 + 池会话双重握手触发 Google 风控。
+
+### 9.2 池化会话 SAPISIDHASH 动态计算
+
+模型发现与 HTTP 兜底都按**当前会话账号的 auth file** 动态计算 SAPISIDHASH，不使用硬编码 Authorization：
+
+- 池会话遍历时从 `_session_auth_file` 读取 auth file，解析 `cookies`，调用 `calculate_sapisid_hash(cookies)`（`model_discovery.py:112-125`、`:473`）。
+- 页面 XHR 同时设置 `X-Goog-AuthUser`、`X-AIStudio-G1-Tier` 与动态 `Authorization`（`model_discovery.py:724-796`，头设置见 `:743-750`）。
+- HTTP 兜底同样按账号 Cookie 现算 `Authorization`，并带 `X-AIStudio-Visit-Id`、`Origin`、`Referer`（`model_discovery.py:797-837`）。
+- `calculate_sapisid_hash` 的实现与三段哈希格式见 §8.1（`cookie_parser.py:248-297`）。
+
+时间戳与 Cookie 每次都重新取值，因此账号切换或 Cookie 刷新后不会复用旧哈希。
+
+### 9.3 Temporary Chat 激活
+
+为避免 bootstrap 探针污染用户历史，`bootstrap_botguard_and_template` 在填充 `"say '1'"` 前调用 `enable_temporary_chat`（`botguard_bootstrap.py:253`）：
+
+- 先查找 `Temporary Chat`/`temporary mode`/`开启临时` 按钮并点击；排除 `data use policy` 干扰项（`botguard_bootstrap.py:40-71`）。
+- 找不到直接按钮时，打开 `View more actions` 菜单，再查找 `temporary`/`临时` 菜单项（`botguard_bootstrap.py:40-71`）。
+- 激活失败只记录 debug 并返回 `False`，不阻断 bootstrap（`botguard_bootstrap.py:73-77`）。
+
+### 9.4 真实模板捕获，拒绝假 fallback
+
+模板必须来自真实上游 `GenerateContent` 请求，禁止使用伪造 fallback 防止假阳性（`botguard_bootstrap.py:201-210`、`367-371`）：
+
+1. 安装页面 Hook 并取得 `snapKey`（`install_page_hooks`，`botguard_bootstrap.py:118-167`）。
+2. 订阅 `page.on_request`，只接受 URL 含 `GenerateContent`、不含 `Count`、且 body 非空的第一条请求，记录 URL/headers/body（`botguard_bootstrap.py:227-238`）。
+3. 打开 Playground、等待输入框、启用 Temporary Chat、填入探针 prompt、点击 Run 或 Ctrl+Enter（`botguard_bootstrap.py:239-260`）。
+4. 若网络事件未捕获，读取页面内 `window.__AISTUDIO__.capturedTemplate` 作为同源真实模板；仍为空则继续短轮询（`botguard_bootstrap.py:315-347`）。
+5. 停止生成、清理输入框、执行 DOM GC；若最终仍无真实模板，抛 `RuntimeError("...拒绝使用假 fallback...")`（`botguard_bootstrap.py:349-371`）。
+
+### 9.5 `finally` 输入清理与 Hook 复位
+
+`bootstrap_botguard_and_template` 的 `finally` 无条件执行（`botguard_bootstrap.py:381-388`）：
+
+1. `unsub()` 取消请求订阅，避免后续正常请求被误捕获。
+2. 将 `window.__AISTUDIO__.interceptBootstrap` 置回 `false`。
+3. 通过 `page.fill("textarea", original_text)` 恢复 bootstrap 前的输入框内容，清除 `"say '1'"` 探针文本。
+
+即使捕获超时或抛异常，输入框与 Hook 也不会残留。
+
+### 9.6 快照生成 5×250ms 重试与 C1d 质量门槛
+
+Python 侧池化会话与控制面会话都采用 **5 次尝试、每次间隔 250ms** 的外层重试：
+
+- 池化：`PooledSession.generate_snapshot` 在 `_snapshot_lock` 内最多 5 次调用 `SNAPSHOT_GENERATE_JS`；成功返回非空 snapshot，失败第 5 次后抛 `RuntimeError`（`pooled_session.py:187-235`）。
+- 控制面：`BrowserSession.generate_snapshot` 同样 5 次、每次 250ms（`session.py:460-513`）。
+- 快照按每次请求的内容哈希重新生成，不跨请求共享；锁保证同一会话不会并发调用签名函数。
+- 页面内 `snapshot_generate.js` 还负责 C1d 加固：只写入末尾 256 个 Unicode 码点、占位 hash 预热 `dms[snapKey]`、`>= 1520` 字符质量校验（见 §10.2）。
+
+### 9.7 D-09 `hash_include_code` 诊断开关
+
+Snapshot content hash 的默认口径包含 `executable_code` 与 `code_execution_result`（`session.py:84-124`）：
+
+- 优先级：`AISTUDIO_HASH_INCLUDE_CODE` 环境变量 > `diagnostics.hash_include_code` 配置 > 默认 `true`（`aistudio_api/config.py:288-308`）。
+- 关闭时，代码执行 Part 不再进入 hash，回退到上游行为；文本、内联图片、file_id 仍按原顺序参与。
+- 该开关仅用于诊断，不进入普通用户 UI；出现“同一输入被路由到错误模型/工具面”等严重异常时，优先怀疑该 hash 并临时回退（`AGENT.md` §4.5、`docs/WIRE_SPECIFICATION.md` §8.3）。
+
+### 9.8 403 自愈与 BotGuard 的关系
+
+BotGuard 校验失败统一返回 HTTP 403 `[,[7,"The caller does not have permission"]]`。网关自愈仍按 §6.1：
+
+- 首次 403：先 `refresh_page_auth_state` 强制刷新 CDP Cookie（清空页面 Cookie 缓存、重新 `Network.getCookies`，并确认仍含 SAPISID），再在同一实例重新签名重试；刷新失败则不重发过期凭据，直接进入切号/报错。403 不加硬冷却锁（`routing_pipeline.py:778-820`、`:912-954`、`transport.py:157-183`）。
+- 第二次 403：切换到健康账号；无备用账号时原位重建（重新导航 + WAA 握手）。
+- Paid `TierRequiredError` 403 不触发切号/重建，避免把权限不足误判为 BotGuard 失效。
+
+---
+
+## 10. C1 桌面指纹与 C1d 快照加固
+
+### 10.1 按账号确定性 Windows 桌面指纹（C1）
+
+BotGuard 与 WAA 会采集 WebGL/屏幕/UA/硬件指标。容器或 Termux 启动参数暴露 SwiftShader 软件渲染器，因此每个账号 Page 在首次导航前都必须拿到一致的桌面指纹：
+
+1. **账号键**：优先使用账号 id；没有 id 时使用 auth 文件的“父目录 + 文件名”。同一账号始终映射到同一指纹，不同账号不同（`fingerprint.py:230-253`）。
+2. **种子**：`SHA-256("aistudio-browser-fingerprint:v1:<account_key>")`，之后各维度用带标签的 SHA-256 摘要从固定池取值（`fingerprint.py:201-253`）。
+3. **GPU 池**：NVIDIA RTX 3060/4060、GTX 1660 SUPER、Intel UHD 630、Intel Iris Xe、AMD RX 6600 等真实 Windows ANGLE/D3D11 vendor+renderer 配对；厂商与渲染器始终同族（`fingerprint.py:71-109`）。
+4. **屏幕/硬件池**：1920x1080、2560x1440、1680x1050、1920x1200（含 1.5 DPR）、CPU 8/12/16/24、内存 8/16/32GB、Chrome 131-136、Windows 平台 15.0.0/10.0.0、语言 en-US/en-GB/en-CA（`fingerprint.py:111-127`、`:255-325`）。
+5. **禁用软件渲染器**：`FORBIDDEN_RENDERER_TOKENS = swiftshader/mesa/llvmpipe/software rasterizer/basic render driver`；生成后校验，命中即抛错（`fingerprint.py:45-53`、`:327-349`）。
+6. **注入时机**：`Page.addScriptToEvaluateOnNewDocument` 在 Cookie 注入/导航前注册 `fingerprint_spoof.js`；脚本注册 fail-closed（失败即中止启动），`Emulation.setDeviceMetricsOverride` best-effort（`fingerprint.py:443-497`、`pooled_session.py:95-102`、`session.py:324-330`）。
+7. **JS 覆盖面**：`navigator.hardwareConcurrency/deviceMemory`、`screen.width/height`、WebGL `UNMASKED_VENDOR_WEBGL`/`UNMASKED_RENDERER_WEBGL` 等（`fingerprint_spoof.js:61-62`、`:306-344`）。
+8. **只读摘要**：`get_account_fingerprint` 不启动浏览器即可返回 `id · gpu · WxH@dpr · c/GB`，用于实例/账号 UI（`fingerprint.py:420-433`、`routes_instances.py:82-99`）。
+
+配置开关为 `browser.fingerprint_spoof_enabled`（默认 `true`）或 `AISTUDIO_FINGERPRINT_SPOOF` 环境变量（`defaults/config.yaml:49-52`、`aistudio_api/config.py:337-388`）。
+
+### 10.2 C1d 快照写入、预热与质量校验
+
+`snapshot_generate.js` 在页面内执行以下加固（`snapshot_generate.js:1-113`）：
+
+1. **只写末尾 256 个 Unicode 码点**：`Array.from(prompt)` 按码点切分，`slice(-256).join('')` 写入输入框；避免把 200KB 全量 prompt 物化到 DOM，也避免把 astral 字符（emoji）拆成孤立 UTF-16 代理项（`snapshot_generate.js:20-27`）。
+2. **同源 `dms[snapKey]`**：从 `window.default_MakerSuite` 取当前签名函数，使用 `aistudio.service` 与 `aistudio.snapKey`；缺失即 `service_unavailable`（`snapshot_generate.js:2-8`）。
+3. **本地预热**：先用 `PLACEHOLDER_HASH = '0'.repeat(64)` 调用一次 `dms[snapKey]`，等待 40ms 后再用真实 content hash 生成；预热失败不影响真实尝试（`snapshot_generate.js:53`、`:73-90`）。
+4. **质量门槛**：`MIN_SNAPSHOT_LENGTH = 1520`，要求 `typeof value === 'string' && value.length >= 1520 && value.startsWith('!')`（按 JS `value.length` 计，不是 UTF-8 字节数）；不满足时强制预热并重试一次，仍不合格抛 `low_quality_snapshot`（`snapshot_generate.js:52-58`、`:92-101`）。
+5. **串行化**：`aistudio.snapQueue` 把同一页面的快照调用串行化，避免并发调用签名函数（`snapshot_generate.js:109-112`）。
+6. **超时**：单次 `dms[snapKey]` 调用 20 秒超时（`snapshot_generate.js:59-72`）；Python `page.evaluate` 侧 25 秒（`pooled_session.py:207-211`）。
+7. **输入框清理**：无论成功/失败，`finally` 都清空输入框（`snapshot_generate.js:104-106`）。
+
+Python 侧遇到 `low_quality_snapshot` 会直接抛错，不再盲目重试 5 次；只有其他瞬时失败才走 5×250ms 重试（`pooled_session.py:224-235`）。403 鉴权刷新会把 `_force_snapshot_warmup=True`，强制下一次快照先走本地预热（`pooled_session.py:237-248`、`session.py:515-527`）。

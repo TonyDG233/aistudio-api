@@ -10,32 +10,30 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aistudio_api.domain.errors import SessionExpiredError
+from aistudio_api.domain.model_access import normalize_tier
 from aistudio_api.infrastructure.account.account_store import write_storage_state
-from aistudio_api.infrastructure.account.cookie_parser import (
-    DEFAULT_API_KEY,
-    DEFAULT_EXT_BIN,
-    DEFAULT_USER_AGENT,
-    parse_benefit_tier_response,
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
 )
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     CHECK_IDENTITY_JS,
     EXTRACT_EMAIL_JS,
 )
-from aistudio_api.infrastructure.utils.common import mask_email
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_URL,
+    AI_STUDIO_URL_FALLBACK,
+    BENEFIT_TIER_URL,
+    EXT_BIN,
+    GOOGLE_LOGIN_BOOTSTRAP_URL,
+    GRPC_WEB_USER_AGENT,
+    WEB_API_KEY,
+    aistudio_new_chat_url,
+)
+from aistudio_api.infrastructure.utils.common import atomic_write_json, mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("session.auth")
-
-AI_STUDIO_URL = (
-    "https://aistudio.google.com/prompts/new_chat?model=gemini-3.7-flash&temporary=true"
-)
-AI_STUDIO_URL_FALLBACK = (
-    "https://aistudio.google.com/app/prompts/new_chat?temporary=true"
-)
-GOOGLE_LOGIN_BOOTSTRAP_URL = (
-    "https://accounts.google.com/ServiceLogin?continue=https://aistudio.google.com"
-)
 
 
 def is_login_page_url(url: str | None) -> bool:
@@ -98,9 +96,7 @@ def get_tier_from_meta(auth_file: str | None) -> str:
             meta_path = Path(auth_file).parent / "meta.json"
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                tier = str(meta.get("tier") or "Free").strip().capitalize()
-                if tier in ("Free", "Pro", "Ultra", "Plus"):
-                    return tier
+                return normalize_tier(str(meta.get("tier") or "Free"))
         except Exception:
             pass
     return "Free"
@@ -112,8 +108,8 @@ def get_aistudio_urls(
     """Build AI Studio navigation URLs for target auth_user."""
     if auth_user and auth_user != "0":
         return [
-            f"https://aistudio.google.com/u/{auth_user}/prompts/new_chat?model={model}&temporary=true",
-            f"https://aistudio.google.com/u/{auth_user}/app/prompts/new_chat?temporary=true",
+            aistudio_new_chat_url(auth_user=auth_user, model=model),
+            aistudio_new_chat_url(auth_user=auth_user, app=True),
         ]
     return [AI_STUDIO_URL, AI_STUDIO_URL_FALLBACK]
 
@@ -122,7 +118,7 @@ async def load_cookies_to_page(page: CDPPage, auth_file: str | None) -> bool:
     """Inject the account's full cookie set from auth_file into the target page.
 
     Generation authorization needs the account-scoped cookies (accounts.google.com
-    and OSID/__Secure-OSID).  Filtering them out leaves a page that looks logged in
+    and OSID/__Secure-OSID). Filtering them out leaves a page that looks logged in
     but gets ``The caller does not have permission`` from the upstream RPC.
     """
     if not auth_file or not Path(auth_file).is_file():
@@ -189,7 +185,7 @@ async def extract_account_tier(
     (args) => {
         return new Promise((resolve) => {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', 'https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier');
+            xhr.open('POST', args.url);
             xhr.setRequestHeader('Content-Type', 'application/json+protobuf');
             xhr.setRequestHeader('X-User-Agent', args.userAgent);
             xhr.setRequestHeader('X-Goog-Api-Key', args.apiKey);
@@ -218,15 +214,16 @@ async def extract_account_tier(
             script,
             {
                 "authUser": str(auth_user or "0"),
-                "apiKey": DEFAULT_API_KEY,
-                "userAgent": DEFAULT_USER_AGENT,
-                "extBin": DEFAULT_EXT_BIN,
+                "apiKey": WEB_API_KEY,
+                "userAgent": GRPC_WEB_USER_AGENT,
+                "extBin": EXT_BIN,
                 "authHeader": auth_header,
+                "url": BENEFIT_TIER_URL,
             },
             timeout_s=10.0,
         )
         if isinstance(res, dict) and res.get("ok"):
-            return parse_benefit_tier_response(res.get("text"))
+            return parse_benefit_tier_envelope(res.get("text")).strict_tier()
     except Exception as e:
         log.debug("从页面提取账号订阅等级失败: %s", e)
     return None
@@ -269,10 +266,7 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
             meta["email"] = discovered_email
             expected_email = discovered_email.strip().lower()
             with suppress(Exception):
-                meta_path.write_text(
-                    json.dumps(meta, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                atomic_write_json(meta_path, meta)
             with suppress(Exception):
                 from aistudio_api.infrastructure.account.account_store import (
                     AccountStore,
@@ -307,10 +301,7 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
         if discovered_tier:
             meta["tier"] = discovered_tier
             with suppress(Exception):
-                meta_path.write_text(
-                    json.dumps(meta, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                atomic_write_json(meta_path, meta)
             with suppress(Exception):
                 from aistudio_api.infrastructure.account.account_store import (
                     AccountStore,
@@ -384,7 +375,7 @@ def _merge_cookies(
     """Merge page cookies into the stored set instead of replacing it.
 
     ``page.get_cookies()`` can omit cookies that do not apply to the current page
-    (notably accounts.google.com and OSID).  Replacing the auth file with that
+    (notably accounts.google.com and OSID). Replacing the auth file with that
     reduced set permanently drops the cookies required for upstream authorization.
     Current page values win for the same identity; non-expired stored cookies are
     retained.
@@ -423,9 +414,7 @@ async def save_browser_cookies(
                 raw_cookies = stored.get("cookies")
                 if isinstance(raw_cookies, list):
                     existing_cookies = [
-                        cookie
-                        for cookie in raw_cookies
-                        if isinstance(cookie, dict)
+                        cookie for cookie in raw_cookies if isinstance(cookie, dict)
                     ]
         merged_cookies = _merge_cookies(existing_cookies, current_cookies)
         write_storage_state(auth_file, cookies=merged_cookies)

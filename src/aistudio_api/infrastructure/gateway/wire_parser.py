@@ -14,6 +14,8 @@ from aistudio_api.infrastructure.utils.common import (
     extract_outer_json,
 )
 
+_ROLE_NAMES = frozenset({"model", "user", "system", "assistant"})
+
 # ==============================================================================
 # Google Protobuf-over-JSON Wire Array Specifications (docs/WIRE_SPECIFICATION.md)
 # ==============================================================================
@@ -133,9 +135,17 @@ def parse_response_part(raw_part: object) -> ResponsePart:
     if len(raw_part) > 0 and isinstance(raw_part[0], list):
         return ResponsePart()
 
-    # Guard against role name in 2-element structure where index 1 is role
-    if len(raw_part) == 2 and raw_part[1] in ("model", "user", "system", "assistant"):
-        return ResponsePart()
+    # Guard against role name in 2-element structure where index 1 is role.
+    # Only treat as a content block when index 0 is a parts list or role name;
+    # `[None, "model"]` is a valid text part whose text happens to be "model".
+    if (
+        len(raw_part) == 2
+        and isinstance(raw_part[1], str)
+        and raw_part[1] in _ROLE_NAMES
+    ):
+        first = raw_part[0]
+        if isinstance(first, list) or (isinstance(first, str) and first in _ROLE_NAMES):
+            return ResponsePart()
 
     thought = False
     if len(raw_part) > WIRE_PART_THOUGHT_FLAG_INDEX and isinstance(
@@ -161,14 +171,14 @@ def parse_response_part(raw_part: object) -> ResponsePart:
         raw_inline = raw_part[WIRE_PART_INLINE_DATA_INDEX]
         inline_data = (str(raw_inline[0]), str(raw_inline[1]))
 
-    function_call = _coerce_wire_payload(
+    function_call = _coerce_structural_payload(
         raw_part[WIRE_PART_FUNCTION_CALL_INDEX]
         if len(raw_part) > WIRE_PART_FUNCTION_CALL_INDEX
         else None,
         "functionCall",
     )
     if function_call is None and len(raw_part) > WIRE_PART_FUNCTION_CALL_ALT_INDEX:
-        function_call = _coerce_wire_payload(
+        function_call = _coerce_structural_payload(
             raw_part[WIRE_PART_FUNCTION_CALL_ALT_INDEX], "functionCall"
         )
     thought_signature = (
@@ -184,7 +194,7 @@ def parse_response_part(raw_part: object) -> ResponsePart:
         if isinstance(raw, list) and len(raw) > 2 and isinstance(raw[2], str):
             function_call["call_id"] = raw[2]
 
-    function_response = _coerce_wire_payload(
+    function_response = _coerce_structural_payload(
         raw_part[WIRE_PART_FUNCTION_RESPONSE_INDEX]
         if len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_INDEX
         else None,
@@ -194,7 +204,7 @@ def parse_response_part(raw_part: object) -> ResponsePart:
         function_response is None
         and len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX
     ):
-        function_response = _coerce_wire_payload(
+        function_response = _coerce_structural_payload(
             raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX], "functionResponse"
         )
 
@@ -258,6 +268,19 @@ def _coerce_wire_payload(
             list_payload["call_id"] = raw_value[2]
         return list_payload
     return {"type": payload_type, "raw": raw_value}
+
+
+def _coerce_structural_payload(
+    raw_value: object, payload_type: str
+) -> dict[str, object] | None:
+    """Only accept structured (list/dict) payloads for functionCall/functionResponse.
+
+    Index 10 is shared with WIRE_PART_THOUGHT_FLAG_INDEX (boolean True); scalar flags
+    at index 10/11 must not be misinterpreted as function calls or responses.
+    """
+    if not isinstance(raw_value, (list, dict)):
+        return None
+    return _coerce_wire_payload(raw_value, payload_type)
 
 
 def _is_wire_value(val: object) -> bool:
@@ -378,6 +401,14 @@ def parse_usage_metadata(raw_usage: object) -> dict[str, object]:
         and isinstance(completion_tokens, int)
     ):
         total_tokens = prompt_tokens + completion_tokens
+    if (
+        prompt_tokens is None
+        and visible_completion_tokens is None
+        and total_tokens is None
+        and cached_tokens is None
+        and reasoning_tokens is None
+    ):
+        return {}
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -464,10 +495,11 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
                 reasoning_images.extend(decoded_images)
             else:
                 images.extend(decoded_images)
-        if part.executable_code:
-            code_outputs.append(str(part.executable_code))
-        if part.code_execution_result:
-            code_outputs.append(str(part.code_execution_result))
+        for code in (part.executable_code, part.code_execution_result):
+            if isinstance(code, list) and len(code) > 1 and isinstance(code[1], str):
+                code_outputs.append(code[1])
+            elif isinstance(code, str) and code:
+                code_outputs.append(code)
         if part.function_call:
             function_calls.append(part.function_call)
         if part.function_response:
@@ -523,6 +555,13 @@ def parse_text_output(raw: str) -> ModelOutput:
 
     merged = Candidate()
     for chunk in chunks:
+        usage = parse_chunk_usage(chunk)
+        if usage:
+            output.usage = usage
+        if len(chunk) > WIRE_RESPONSE_ID_INDEX:
+            raw_rid = chunk[WIRE_RESPONSE_ID_INDEX]
+            if isinstance(raw_rid, str) and raw_rid:
+                output.response_id = raw_rid
         parsed = parse_response_chunk(chunk)
         if parsed.text:
             merged.text += parsed.text
@@ -549,18 +588,6 @@ def parse_text_output(raw: str) -> ModelOutput:
         if parsed.safety_ratings:
             merged.safety_ratings = parsed.safety_ratings
 
-    last_chunk = chunks[-1]
-    output.usage = parse_usage_metadata(
-        last_chunk[WIRE_CHUNK_USAGE_INDEX]
-        if len(last_chunk) > WIRE_CHUNK_USAGE_INDEX
-        else None
-    )
-    raw_rid = (
-        last_chunk[WIRE_RESPONSE_ID_INDEX]
-        if len(last_chunk) > WIRE_RESPONSE_ID_INDEX
-        else None
-    )
-    output.response_id = str(raw_rid) if isinstance(raw_rid, str) else ""
     output.candidates = [merged]
     return output
 

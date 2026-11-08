@@ -1,65 +1,111 @@
-export type StatsRangeKey = 'today' | '7d' | '30d' | 'custom' | 'all'
+export interface AccountBreakdownItem {
+  account_id: string
+  name: string
+  auth_user: string
+  email: string | null
+  tier: string
+  group: string
+  enabled: boolean
+  today_requests: number
+  today_success: number
+  today_rate_limited: number
+  today_tokens: number
+  today_reasoning_tokens: number
+  configured_quota: number
+  quota_used_percent: number
+  is_available: boolean
+  cooldown_remaining: number
+}
 
-export interface StatsBucket {
+export interface ClientCounters {
   requests: number
+  success: number
+  errors: number
+  aborted: number
+  rate_limited: number
+  rescued_requests: number
+  success_rate: number | null
+}
+
+export interface AttemptCounters {
   attempts: number
   success: number
   rate_limited: number
   errors: number
-  client_requests: number | null
-  client_success: number | null
-  client_errors: number | null
-  client_rate_limited: number | null
-  client_aborted: number | null
+  success_rate: number | null
+}
+
+export interface TokenCounters {
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+}
+
+export interface UsageBucket {
+  client: ClientCounters
+  attempt: AttemptCounters
+  tokens: TokenCounters
+}
+
+export interface DailyUsagePoint extends UsageBucket {
+  date: string
+  by_model: Record<string, UsageBucket>
+}
+
+export interface CountTokensStats {
+  requests: number
+  success: number
+  errors: number
+  input_tokens: number
+}
+
+export interface StatsRangeInfo {
+  key?: string
+  start?: string | null
+  end?: string | null
+}
+
+export interface ModelStatItem {
+  requests: number
+  success: number
+  rate_limited: number
+  errors: number
   prompt_tokens: number
   completion_tokens: number
-  reasoning_tokens: number | null
-  cache_read_tokens: number | null
-  cache_write_tokens: number | null
+  reasoning_tokens?: number
+  cached_tokens?: number
   total_tokens: number
-  cache_hit_rate: number | null
-  count_requests: number | null
-  count_success: number | null
-  count_errors: number | null
-  count_input_tokens: number | null
-  usage_missing: number
-  last_used: string | null
+  finish_reasons?: Record<string, number>
+  last_used?: string | null
+  paid?: boolean
+  account_breakdown?: AccountBreakdownItem[]
+  client?: ClientCounters
+  attempt?: AttemptCounters
 }
 
-export interface ModelStatItem extends StatsBucket {
-  paid: boolean | null
-  formats: Record<string, StatsBucket>
-  surfaces: Record<string, StatsBucket>
+export interface StatsTotals {
+  requests: number
+  success: number
+  rate_limited: number
+  errors: number
+  prompt_tokens: number
+  completion_tokens: number
+  reasoning_tokens?: number
+  cached_tokens?: number
+  total_tokens: number
 }
 
-export type StatsTotals = ModelStatItem
-
-export interface StatsRange {
-  key: StatsRangeKey
-  start: string | null
-  end: string | null
-  timezone: string
-  data_start: string | null
-  retention_days: number
-  partial: boolean
-}
+export type StatsRangeDays = 7 | 30 | 90
 
 export interface StatsResponse {
-  schema_version: number
-  generated_at: string
-  range: StatsRange
   models: Record<string, ModelStatItem>
   totals: StatsTotals
-}
-
-export interface StatsTimeseriesPoint {
-  date: string
-  totals: StatsBucket | null
-}
-
-export interface StatsTimeseriesResponse {
-  generated_at: string
-  range: StatsRange
-  bucket: 'day'
-  points: StatsTimeseriesPoint[]
+  client?: ClientCounters
+  attempt?: AttemptCounters
+  daily?: DailyUsagePoint[]
+  count_tokens?: CountTokensStats
+  range?: StatsRangeInfo
+  quota_scope?: string
 }

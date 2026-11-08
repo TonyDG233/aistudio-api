@@ -13,14 +13,14 @@ from aistudio_api.application.format_converters.common import (
     sse_event,
     to_claude_usage,
 )
-from aistudio_api.application.format_converters.signature_cache import (
-    signature_cache,
-)
 from aistudio_api.application.generation_service import (
     GenerationOutcome,
     StreamEvent,
 )
+from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.domain.models import GeneratedImage
+
+_UNKNOWN_TOOL_NAME = "unknown"
 
 
 def _as_dict_list(value: object) -> list[dict[str, object]]:
@@ -62,14 +62,14 @@ def _tool_call_input(call: dict[str, object]) -> dict[str, object]:
     if raw is None:
         return {}
     if isinstance(raw, dict):
-        return raw
+        return cast("dict[str, object]", raw)
     if isinstance(raw, str):
         try:
             parsed: object = json.loads(raw)
         except json.JSONDecodeError:
             return {"value": raw}
         if isinstance(parsed, dict):
-            return parsed
+            return cast("dict[str, object]", parsed)
         return {"value": parsed}
     return {"value": raw}
 
@@ -113,7 +113,7 @@ def claude_response(*, model: str, outcome: GenerationOutcome) -> dict[str, obje
             {
                 "type": "tool_use",
                 "id": _tool_call_id(call),
-                "name": str(call.get("name") or "unknown"),
+                "name": str(call.get("name") or _UNKNOWN_TOOL_NAME),
                 "input": _tool_call_input(call),
             }
         )
@@ -138,9 +138,10 @@ def claude_response(*, model: str, outcome: GenerationOutcome) -> dict[str, obje
 class ClaudeStreamRenderer:
     """Render protocol-neutral stream events as Anthropic SSE events."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, *, input_tokens: int = 0) -> None:
         self._model = model
         self._message_id = new_id("msg_")
+        self._input_tokens = max(0, input_tokens)
         self._started = False
         self._closed = False
         self._next_index = 0
@@ -155,6 +156,9 @@ class ClaudeStreamRenderer:
         if self._started:
             return ""
         self._started = True
+        usage = to_claude_usage(None)
+        if self._input_tokens:
+            usage["input_tokens"] = self._input_tokens
         message = {
             "id": self._message_id,
             "type": "message",
@@ -163,7 +167,7 @@ class ClaudeStreamRenderer:
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": to_claude_usage(None),
+            "usage": usage,
         }
         return sse_event("ping", {}) + sse_event(
             "message_start", {"type": "message_start", "message": message}
@@ -320,7 +324,7 @@ class ClaudeStreamRenderer:
         chunks = [self._ensure_started(), self._close_open_block()]
         for call in calls:
             tool_id = _tool_call_id(call)
-            name = str(call.get("name") or "unknown")
+            name = str(call.get("name") or _UNKNOWN_TOOL_NAME)
             self._has_tool_use = True
             chunks.append(
                 self._start_block(
@@ -350,3 +354,6 @@ class ClaudeStreamRenderer:
             )
             chunks.append(self._close_open_block())
         return "".join(chunks)
+
+
+__all__ = ["ClaudeStreamRenderer", "claude_response"]

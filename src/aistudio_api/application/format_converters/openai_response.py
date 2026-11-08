@@ -14,13 +14,11 @@ from aistudio_api.application.format_converters.common import (
     sse_data,
     to_openai_usage,
 )
-from aistudio_api.application.format_converters.signature_cache import (
-    signature_cache,
-)
 from aistudio_api.application.generation_service import (
     GenerationOutcome,
     StreamEvent,
 )
+from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.domain.models import GeneratedImage
 
 
@@ -86,7 +84,7 @@ def openai_response(*, model: str, outcome: GenerationOutcome) -> dict[str, obje
         else map_finish_reason_openai(outcome.finish_reason)
     )
     return {
-        "id": new_id("chatcmpl-"),
+        "id": outcome.response_id or new_id("chatcmpl-"),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
@@ -158,6 +156,9 @@ class OpenAIStreamRenderer:
     def render(self, event: StreamEvent) -> str:
         if self._done:
             return ""
+
+        if event.response_id:
+            self.id = event.response_id
 
         if event.kind == "routing_wait":
             return ": resolving-instance\n\n"

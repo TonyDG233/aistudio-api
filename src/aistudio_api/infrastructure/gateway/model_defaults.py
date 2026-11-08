@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import os
+import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 import yaml
 
-from aistudio_api.config import resolve_config_file
-from aistudio_api.domain.account_tags import normalize_tags
+from aistudio_api.config import (
+    resolve_config_file,
+    resolve_default_config_template,
+)
+from aistudio_api.domain.model_access import (
+    TierSelectorError,
+    canonical_tier,
+    resolve_tier_selector,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
@@ -22,13 +33,713 @@ from .wire_types import (
 )
 
 _resolve_config_path = resolve_config_file
-_logger = get_logger("model_defaults")
+logger = get_logger("config")
+
 _SAFETY_CATEGORY_ORDER = (
     ("harassment", 7),
     ("hate", 8),
     ("sexually explicit", 9),
     ("dangerous content", 10),
 )
+
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_VALID_SURFACES = ("chat", "build")
+_VALID_MIN_TIERS = ("Free", "Plus", "Pro", "Ultra", "Ultra_20X")
+
+_RETRY_SAME_DELAY_DEFAULT_SEC = 2.0
+_RETRY_SAME_DELAY_MAX_SEC = 30.0
+_RETRY_SAME_DELAY_ENV = "AISTUDIO_RETRY_SAME_DELAY_SEC"
+
+_LEGACY_KEEPALIVE_KEYS = (
+    "auto_switch",
+    "auto_switch_interval_hours",
+    "keepalive_auth_update",
+    "keepalive_auth_update_hours",
+    "keepalive_metadata_refresh",
+    "keepalive_metadata_refresh_hours",
+    "keepalive_metadata_refresh_on_startup",
+    "keepalive_active_activity",
+    "keepalive_active_activity_seconds",
+)
+_KEEPALIVE_BOOL_KEYS = (
+    "auth_update",
+    "metadata_refresh",
+    "metadata_refresh_on_startup",
+    "active_activity",
+)
+_KEEPALIVE_FLOAT_KEYS = (
+    "auth_update_hours",
+    "metadata_refresh_hours",
+    "active_activity_seconds",
+)
+_KEEPALIVE_DEFAULT_BOOLS = {
+    "auth_update": True,
+    "metadata_refresh": True,
+    "metadata_refresh_on_startup": True,
+    "active_activity": False,
+}
+_KEEPALIVE_DEFAULT_FLOATS = {
+    "auth_update_hours": 24.0,
+    "metadata_refresh_hours": 24.0,
+    "active_activity_seconds": 60.0,
+}
+
+_MODEL_DISCOVERY_LIVE_REFRESH_DEFAULT_SEC = 86400
+_MODEL_DISCOVERY_FALLBACK_REFRESH_DEFAULT_SEC = 600
+_MODEL_DISCOVERY_DEFAULTS = {
+    "live_refresh_interval_sec": _MODEL_DISCOVERY_LIVE_REFRESH_DEFAULT_SEC,
+    "fallback_refresh_interval_sec": _MODEL_DISCOVERY_FALLBACK_REFRESH_DEFAULT_SEC,
+}
+
+
+class ConfigValidationError(ValueError):
+    """配置文件关键块类型或必填项非法。"""
+
+
+def _deep_merge(base: object, override: object) -> object:
+    """递归合并字典；列表与标量整体覆盖。"""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged: dict[str, object] = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return override
+
+
+def merge_config_documents(base: object, override: object) -> object:
+    """Public wrapper for partial config writes: dicts merge deeply, lists replace."""
+    return _deep_merge(base, override)
+
+
+def _describe_type(value: object) -> str:
+    return type(value).__name__
+
+
+def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]:
+    """非关键项非法时回退默认值并显式记录 warning。"""
+    defaults = _default_config()
+
+    raw_logging = config.get("logging")
+    if not isinstance(raw_logging, dict):
+        logger.warning(
+            "配置 logging 必须为字典（当前类型 %s），已回退默认 logging 块",
+            _describe_type(raw_logging),
+        )
+        default_logging = defaults.get("logging")
+        config["logging"] = (
+            dict(default_logging) if isinstance(default_logging, dict) else {}
+        )
+    else:
+        raw_level = raw_logging.get("level")
+        level = raw_level.strip().upper() if isinstance(raw_level, str) else ""
+        if level not in _VALID_LOG_LEVELS:
+            logger.warning(
+                "配置 logging.level 非法（%r），已回退默认值 INFO", raw_level
+            )
+            raw_logging["level"] = "INFO"
+        else:
+            raw_logging["level"] = level
+
+    raw_security = config.get("security")
+    if not isinstance(raw_security, dict):
+        logger.warning(
+            "配置 security 必须为字典（当前类型 %s），已回退默认 security 块",
+            _describe_type(raw_security),
+        )
+        default_security = defaults.get("security")
+        config["security"] = (
+            dict(default_security) if isinstance(default_security, dict) else {}
+        )
+    else:
+        allow_anonymous = raw_security.get("api_allow_anonymous", False)
+        if not isinstance(allow_anonymous, bool):
+            logger.warning(
+                "配置 security.api_allow_anonymous 非法（%r），已回退默认值 false",
+                allow_anonymous,
+            )
+            raw_security["api_allow_anonymous"] = False
+        else:
+            raw_security["api_allow_anonymous"] = allow_anonymous
+
+    raw_rotator = config.get("rotator")
+    if isinstance(raw_rotator, dict):
+        quota_scope = raw_rotator.get("quota_scope", "account")
+        if quota_scope not in ("account", "account_surface"):
+            logger.warning(
+                "配置 rotator.quota_scope 非法（%r），已回退默认值 account",
+                quota_scope,
+            )
+            raw_rotator["quota_scope"] = "account"
+
+    raw_features = config.get("features")
+    if not isinstance(raw_features, dict):
+        logger.warning(
+            "配置 features 必须为字典（当前类型 %s），已回退默认 features 块",
+            _describe_type(raw_features),
+        )
+        default_features = defaults.get("features")
+        config["features"] = (
+            dict(default_features) if isinstance(default_features, dict) else {}
+        )
+    else:
+        legacy_keys = [key for key in _LEGACY_KEEPALIVE_KEYS if key in raw_features]
+        if legacy_keys:
+            logger.warning(
+                "检测到旧版 keepalive 配置键（%s）；已忽略，请迁移到 "
+                "features.keepalive",
+                ", ".join(legacy_keys),
+            )
+            for key in legacy_keys:
+                raw_features.pop(key, None)
+
+        raw_routing = raw_features.get("routing")
+        if not isinstance(raw_routing, dict):
+            logger.warning(
+                "配置 features.routing 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_routing),
+            )
+            default_features = defaults.get("features")
+            default_routing = (
+                default_features.get("routing")
+                if isinstance(default_features, dict)
+                else None
+            )
+            raw_features["routing"] = (
+                dict(default_routing) if isinstance(default_routing, dict) else {}
+            )
+        else:
+            max_switches = raw_routing.get("max_switches", 2)
+            if (
+                isinstance(max_switches, bool)
+                or not isinstance(max_switches, int)
+                or max_switches < 0
+            ):
+                logger.warning(
+                    "配置 features.routing.max_switches 非法（%r），已回退默认值 2",
+                    max_switches,
+                )
+                raw_routing["max_switches"] = 2
+            raw_routing["retry_same_delay_sec"] = _normalize_retry_same_delay(
+                raw_routing
+            )
+
+        default_features = defaults.get("features")
+        default_keepalive = (
+            default_features.get("keepalive")
+            if isinstance(default_features, dict)
+            else None
+        )
+        fallback_keepalive = (
+            dict(default_keepalive) if isinstance(default_keepalive, dict) else {}
+        )
+        raw_keepalive = raw_features.get("keepalive")
+        if not isinstance(raw_keepalive, dict):
+            logger.warning(
+                "配置 features.keepalive 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_keepalive),
+            )
+            raw_features["keepalive"] = fallback_keepalive
+        else:
+            for key in _KEEPALIVE_BOOL_KEYS:
+                value = raw_keepalive.get(key, fallback_keepalive.get(key))
+                if not isinstance(value, bool):
+                    logger.warning(
+                        "配置 features.keepalive.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        _KEEPALIVE_DEFAULT_BOOLS[key],
+                    )
+                    value = _KEEPALIVE_DEFAULT_BOOLS[key]
+                raw_keepalive[key] = value
+            for key in _KEEPALIVE_FLOAT_KEYS:
+                value = raw_keepalive.get(key, fallback_keepalive.get(key))
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or float(value) <= 0
+                ):
+                    logger.warning(
+                        "配置 features.keepalive.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        _KEEPALIVE_DEFAULT_FLOATS[key],
+                    )
+                    value = _KEEPALIVE_DEFAULT_FLOATS[key]
+                raw_keepalive[key] = float(value)
+
+        default_model_discovery = (
+            default_features.get("model_discovery")
+            if isinstance(default_features, dict)
+            else None
+        )
+        fallback_model_discovery = (
+            dict(default_model_discovery)
+            if isinstance(default_model_discovery, dict)
+            else dict(_MODEL_DISCOVERY_DEFAULTS)
+        )
+        raw_model_discovery = raw_features.get("model_discovery")
+        if not isinstance(raw_model_discovery, dict):
+            logger.warning(
+                "配置 features.model_discovery 必须为字典（当前类型 %s），已回退默认值",
+                _describe_type(raw_model_discovery),
+            )
+            raw_features["model_discovery"] = fallback_model_discovery
+        else:
+            for key, default_value in _MODEL_DISCOVERY_DEFAULTS.items():
+                value = raw_model_discovery.get(
+                    key, fallback_model_discovery.get(key, default_value)
+                )
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    logger.warning(
+                        "配置 features.model_discovery.%s 非法（%r），已回退默认值 %r",
+                        key,
+                        value,
+                        default_value,
+                    )
+                    value = default_value
+                raw_model_discovery[key] = value
+
+    return config
+
+
+def _require_mapping(config: dict[str, object], key: str) -> dict[str, object]:
+    value = config.get(key)
+    if not isinstance(value, dict):
+        raise ConfigValidationError(
+            f"配置校验失败：{key} 必须为字典，当前类型为 {_describe_type(value)}"
+        )
+    return value
+
+
+def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
+    """Normalize ``instances`` tier selectors into closed interval specs.
+
+    ``only_tier`` / ``min_tier`` / ``max_tier`` must be strings naming a known
+    tier; at least one is required.  ``only_tier`` pins an exact tier,
+    ``min_tier`` alone opens ``min..Ultra_20X``, ``max_tier`` alone defaults its
+    lower bound to Pro (Free stays Free), and min+max form a closed interval.
+    Only a missing selector, a conflicting combination, an inverted interval or
+    a lane mix is rejected; non-string/unknown selectors are hard errors instead
+    of being silently dropped.  Free and paid lanes never mix.  Every Free
+    selector normalizes to the same ``only=Free,min=Free,max=Free`` merge key so
+    ``only_tier: Free`` and legacy ``min_tier: Free`` merge their counts.
+    """
+    if not isinstance(raw_instances, list):
+        raise ConfigValidationError(
+            "配置校验失败：instances 必须为列表，"
+            f"当前类型为 {_describe_type(raw_instances)}"
+        )
+
+    merged_counts: dict[tuple[str, str, str, str], int] = {}
+    order: list[tuple[str, str, str, str]] = []
+    normalized_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    for index, item in enumerate(raw_instances):
+        if not isinstance(item, dict):
+            logger.warning("忽略非法实例配置 #%d：必须为字典", index)
+            continue
+
+        count = item.get("count")
+        raw_surface = item.get("surface")
+
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            logger.warning("忽略非法实例配置 #%d：count 必须为正整数", index)
+            continue
+
+        surface = raw_surface.strip().lower() if isinstance(raw_surface, str) else ""
+        if surface not in _VALID_SURFACES:
+            logger.warning("忽略非法实例配置 #%d：surface 只允许 chat/build", index)
+            continue
+
+        raw_only = item.get("only_tier")
+        raw_min = item.get("min_tier")
+        raw_max = item.get("max_tier")
+        for name, value in (
+            ("only_tier", raw_only),
+            ("min_tier", raw_min),
+            ("max_tier", raw_max),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个实例配置 {name} 必须为字符串，"
+                    f"当前类型为 {_describe_type(value)}"
+                )
+            if value.strip() and canonical_tier(value) is None:
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个实例配置 {name}={value!r} 不是已知 tier"
+                    f"（{'/'.join(_VALID_MIN_TIERS)}）"
+                )
+        provided = [
+            value
+            for value in (raw_only, raw_min, raw_max)
+            if isinstance(value, str) and value.strip()
+        ]
+        if not provided:
+            raise ConfigValidationError(
+                "配置校验失败：第 "
+                f"{index + 1} 个实例配置缺少 tier 选择器"
+                "（only_tier/min_tier/max_tier 至少一个）"
+            )
+
+        try:
+            selector = resolve_tier_selector(
+                only_tier=raw_only,
+                min_tier=raw_min,
+                max_tier=raw_max,
+            )
+        except TierSelectorError as exc:
+            raise ConfigValidationError(
+                f"配置校验失败：第 {index + 1} 个实例配置非法：{exc}"
+            ) from exc
+
+        if selector.lane == "free":
+            normalized: dict[str, object] = {
+                "count": count,
+                "surface": surface,
+                "only_tier": "Free",
+                "min_tier": "Free",
+                "max_tier": "Free",
+            }
+            key = (surface, "Free", "Free", "Free")
+        elif selector.only_tier is not None:
+            normalized = {
+                "count": count,
+                "surface": surface,
+                "only_tier": selector.only_tier,
+            }
+            key = (surface, selector.only_tier, "", "")
+        else:
+            upper_explicit = isinstance(raw_max, str) and bool(raw_max.strip())
+            normalized = {
+                "count": count,
+                "surface": surface,
+                "min_tier": selector.min_tier,
+            }
+            if upper_explicit:
+                normalized["max_tier"] = selector.max_tier
+            key = (
+                surface,
+                "",
+                selector.min_tier,
+                selector.max_tier if upper_explicit else "",
+            )
+
+        if key in merged_counts:
+            merged_counts[key] += count
+        else:
+            merged_counts[key] = count
+            order.append(key)
+            normalized_by_key[key] = normalized
+
+    if not merged_counts:
+        raise ConfigValidationError("配置校验失败：instances 未包含任何有效实例配置")
+
+    normalized_specs: list[dict[str, object]] = []
+    for key in order:
+        entry = dict(normalized_by_key[key])
+        entry["count"] = merged_counts[key]
+        normalized_specs.append(entry)
+    return normalized_specs
+
+
+_MAX_CONTEXTS_LIMIT = 16
+
+
+def _normalize_max_contexts(
+    config: dict[str, object], specs: list[dict[str, object]]
+) -> int:
+    """Global instance/context upper bound; defaults to the configured spec sum."""
+    raw = config.get("max_contexts")
+    if raw is None:
+        return max(1, sum(int(str(item.get("count", 0))) for item in specs))
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ConfigValidationError(
+            f"配置校验失败：max_contexts 必须为正整数，当前值为 {raw!r}"
+        )
+    if raw > _MAX_CONTEXTS_LIMIT:
+        logger.warning(
+            "配置 max_contexts=%d 超出上限 %d，已回退上限",
+            raw,
+            _MAX_CONTEXTS_LIMIT,
+        )
+        return _MAX_CONTEXTS_LIMIT
+    return raw
+
+
+def validate_config_mapping(raw_dict: object) -> dict[str, object]:
+    """校验合并后的配置映射，返回应用了非关键回退的配置副本。"""
+    if raw_dict is None:
+        raw_dict = {}
+    if not isinstance(raw_dict, dict):
+        raise ConfigValidationError(
+            f"配置校验失败：配置顶层必须为字典，当前类型为 {_describe_type(raw_dict)}"
+        )
+
+    config = _deep_merge(_default_config(), raw_dict)
+    assert isinstance(config, dict)
+    _apply_noncritical_fallbacks(config)
+
+    diagnostics = _require_mapping(config, "diagnostics")
+    ui_debug = diagnostics.get("ui_debug")
+    if not isinstance(ui_debug, bool):
+        raise ConfigValidationError(
+            f"配置校验失败：diagnostics.ui_debug 必须为布尔值，当前值为 {ui_debug!r}"
+        )
+
+    rotator = _require_mapping(config, "rotator")
+    max_retries = rotator.get("max_retries")
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
+        raise ConfigValidationError(
+            "配置校验失败：rotator.max_retries 必须为非负整数，"
+            f"当前值为 {max_retries!r}"
+        )
+
+    cooldowns = rotator.get("cooldowns")
+    if not isinstance(cooldowns, dict):
+        raise ConfigValidationError(
+            "配置校验失败：rotator.cooldowns 必须为字典，"
+            f"当前类型为 {_describe_type(cooldowns)}"
+        )
+    for key in (
+        "rate_limited_short",
+        "rate_limited_drip",
+        "rate_limited_drip_extended",
+    ):
+        value = cooldowns.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigValidationError(
+                f"配置校验失败：rotator.cooldowns.{key} 必须为数值，当前值为 {value!r}"
+            )
+
+    # ``auth_error`` is a legacy/dead knob. Upstream configs omit it; keep it
+    # optional for compatibility while defaulting to 0 (403 has no hard lock).
+    if "auth_error" in cooldowns:
+        auth_error = cooldowns["auth_error"]
+        if isinstance(auth_error, bool) or not isinstance(auth_error, (int, float)):
+            raise ConfigValidationError(
+                "配置校验失败：rotator.cooldowns.auth_error 必须为数值，"
+                f"当前值为 {auth_error!r}"
+            )
+    else:
+        cooldowns["auth_error"] = 0
+
+    paid_rules = _require_mapping(config, "paid_model_rules")
+    for name, rule in paid_rules.items():
+        if not isinstance(rule, dict):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name} 必须为字典，"
+                f"当前类型为 {_describe_type(rule)}"
+            )
+        contains = rule.get("contains")
+        required_tiers = rule.get("required_tiers")
+        if not isinstance(contains, list):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name}.contains 必须为列表，"
+                f"当前类型为 {_describe_type(contains)}"
+            )
+        if not isinstance(required_tiers, list):
+            raise ConfigValidationError(
+                f"配置校验失败：paid_model_rules.{name}.required_tiers 必须为列表，"
+                f"当前类型为 {_describe_type(required_tiers)}"
+            )
+
+    _require_mapping(config, "tier_quotas")
+
+    presets = config.get("account_presets")
+    if not isinstance(presets, list):
+        raise ConfigValidationError(
+            "配置校验失败：account_presets 必须为字典列表，"
+            f"当前值为 {_describe_type(presets)}"
+        )
+    for index, preset in enumerate(presets):
+        if not isinstance(preset, dict):
+            raise ConfigValidationError(
+                f"配置校验失败：第 {index + 1} 个 preset 必须为字典，"
+                f"当前类型为 {_describe_type(preset)}"
+            )
+        for preset_field in ("id", "action"):
+            value = preset.get(preset_field)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigValidationError(
+                    "配置校验失败：第 "
+                    f"{index + 1} 个 preset 缺少非空字符串字段 {preset_field}"
+                )
+
+    model_defaults = _require_mapping(config, "model_defaults")
+    profiles = model_defaults.get("profiles")
+    if not isinstance(profiles, list):
+        raise ConfigValidationError(
+            "配置校验失败：model_defaults.profiles 必须为列表，"
+            f"当前类型为 {_describe_type(profiles)}"
+        )
+    models = model_defaults.get("models")
+    if not isinstance(models, dict):
+        raise ConfigValidationError(
+            "配置校验失败：model_defaults.models 必须为字典，"
+            f"当前类型为 {_describe_type(models)}"
+        )
+
+    specs = _normalize_instance_specs(config.get("instances"))
+    _normalize_max_contexts(config, specs)
+
+    api_keys = config.get("api_keys")
+    if not isinstance(api_keys, (list, str)):
+        raise ConfigValidationError(
+            "配置校验失败：api_keys 必须为列表或字符串，"
+            f"当前类型为 {_describe_type(api_keys)}"
+        )
+
+    return config
+
+
+_OBSOLETE_CONFIG_KEYS = ("groups", "channel_registry", "channels")
+_OBSOLETE_KEY_PARENTS = ("routing", "features", "model_defaults")
+
+
+def _strip_obsolete_config_keys(config: dict[str, object]) -> bool:
+    """Remove legacy strategy-group/channel keys without touching user blocks.
+
+    Top-level keys are always removed; the same obsolete names nested inside the
+    known routing/features/model_defaults blocks are removed too. Arbitrary
+    custom blocks (for example ``proxy``) are left byte-for-byte intact, and
+    valid ``target_groups`` fields are never touched.
+    """
+    changed = False
+    for key in _OBSOLETE_CONFIG_KEYS:
+        if key in config:
+            del config[key]
+            changed = True
+    for parent_name in _OBSOLETE_KEY_PARENTS:
+        parent = config.get(parent_name)
+        if isinstance(parent, dict) and _strip_obsolete_config_keys(parent):
+            changed = True
+    return changed
+
+
+def _migrate_legacy_instance(item: dict[str, object]) -> bool:
+    """Normalize a legacy Free ``min_tier``/``max_tier`` selector in place.
+
+    Only Free-only selectors are converted. A ``min_tier: Free`` combined with a
+    paid ``max_tier`` is a Free/Paid lane mix that must fail validation instead
+    of being silently rewritten. Paid ``min_tier`` intervals are untouched.
+    """
+    raw_only = item.get("only_tier")
+    raw_min = item.get("min_tier")
+    raw_max = item.get("max_tier")
+    only = canonical_tier(raw_only) if isinstance(raw_only, str) else None
+    lower = canonical_tier(raw_min) if isinstance(raw_min, str) else None
+    upper = canonical_tier(raw_max) if isinstance(raw_max, str) else None
+
+    if only == "Free":
+        changed = False
+        for key in ("min_tier", "max_tier"):
+            value = item.get(key)
+            if isinstance(value, str) and canonical_tier(value) == "Free":
+                del item[key]
+                changed = True
+        return changed
+
+    if only is not None or upper not in (None, "Free"):
+        return False
+    if lower not in (None, "Free"):
+        return False
+    if lower == "Free" or upper == "Free":
+        item.pop("min_tier", None)
+        item.pop("max_tier", None)
+        item["only_tier"] = "Free"
+        return True
+    return False
+
+
+def _migrate_legacy_config_mapping(
+    config: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    """Return a migrated copy of ``config`` and whether anything changed."""
+    migrated = copy.deepcopy(config)
+    changed = _strip_obsolete_config_keys(migrated)
+
+    raw_instances = migrated.get("instances")
+    if isinstance(raw_instances, list):
+        for item in raw_instances:
+            if isinstance(item, dict) and _migrate_legacy_instance(item):
+                changed = True
+    return migrated, changed
+
+
+def _read_config_file(config_path: Path) -> dict[str, object]:
+    """Read a runtime config file, raising ConfigValidationError on bad input."""
+    try:
+        content = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：无法读取配置文件 {config_path}：{exc}"
+        ) from exc
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(f"配置校验失败：YAML 语法错误：{exc}") from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ConfigValidationError(
+            "配置校验失败：配置顶层必须为字典，"
+            f"当前类型为 {_describe_type(loaded)}"
+        )
+    return cast("dict[str, object]", loaded)
+
+
+def _is_default_template_path(config_path: Path) -> bool:
+    """True when ``config_path`` points at the tracked defaults template."""
+    try:
+        return config_path.resolve() == resolve_default_config_template().resolve()
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def validate_config(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """启动时校验合并后的配置；关键块非法会立即抛出 ConfigValidationError。
+
+    校验通过后会迁移旧版运行配置（移除废弃策略组/渠道键、把 legacy
+    ``min_tier: Free`` 归一为 ``only_tier: Free``），并以默认模板深合并补齐所有
+    当前配置块。只有内容确实发生变化时才原子写回，且绝不改写受版本控制的
+    ``defaults/config.yaml`` 模板。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    exists = resolved_path.is_file()
+    raw = _read_config_file(resolved_path) if exists else {}
+    migrated, migration_changed = _migrate_legacy_config_mapping(raw)
+    validated = validate_config_mapping(migrated)
+
+    if (
+        exists
+        and not _is_default_template_path(resolved_path)
+        and (migration_changed or validated != raw)
+    ):
+        content = yaml.dump(validated, allow_unicode=True, sort_keys=False)
+        try:
+            _atomic_write_text(resolved_path, content)
+        except OSError as exc:
+            logger.warning(
+                "无法写回已迁移的配置文件 %s（%s）；继续使用内存中已校验的配置",
+                resolved_path,
+                exc,
+            )
+        else:
+            invalidate_config_cache()
+            logger.info("已迁移并写回旧版配置文件：%s", resolved_path)
+    return validated
 
 
 @dataclass(frozen=True)
@@ -129,8 +840,12 @@ class ModelProfile:
         )
 
 
-def _normalize_model_name(model: str) -> str:
-    return model.removeprefix("models/").lower()
+def normalize_model_name(model: str) -> str:
+    """Normalize model string (strip, lowercase, remove 'models/' prefix)."""
+    return model.strip().removeprefix("models/").lower()
+
+
+_normalize_model_name = normalize_model_name
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -271,52 +986,101 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
     )
 
 
-def _default_config() -> dict[str, object]:
+def _coerce_retry_same_delay(value: object) -> float | None:
+    """Parse a 429 same-account retry delay and clamp it to 0..30 seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return min(_RETRY_SAME_DELAY_MAX_SEC, max(0.0, parsed))
+
+
+def _routing_defaults() -> dict[str, object]:
     return {
-        "logging": {
-            "level": "INFO",
-            "dump_requests": False,
-        },
-        "model_defaults": {
-            "drop_unsupported_params": False,
-            "profiles": [
-                {
-                    "name": "image_models",
-                    "match": {"contains": ["image"]},
-                    "is_image_model": True,
-                    "generation_config_defaults": {
-                        "response_mime_type": None,
-                        "image_output_mode": "image_only",
-                        "thinking_config": {"level": "MINIMAL", "mode": 1},
-                    },
-                    "clear_generation_config_indexes": [7, 13, 17],
-                    "disable_safety_settings": True,
-                },
-                {
-                    "name": "gemma_models",
-                    "match": {"prefixes": ["gemma-"]},
-                    "default_tools": ["google_search"],
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                },
-                {
-                    "name": "gemini_models",
-                    "match": {"prefixes": ["gemini-"]},
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                },
-            ],
-            "models": {},
-        },
+        "max_switches": 2,
+        "retry_same_delay_sec": _RETRY_SAME_DELAY_DEFAULT_SEC,
     }
+
+
+def _normalize_retry_same_delay(raw_routing: dict[str, object]) -> float:
+    """Normalize the persisted config value without applying env overrides.
+
+    Runtime-only overrides must never dirty the config file during startup
+    migration; :func:`_resolve_retry_same_delay` layers the env value on top
+    when the routing settings are actually consumed.
+    """
+    raw_delay = raw_routing.get(
+        "retry_same_delay_sec", _RETRY_SAME_DELAY_DEFAULT_SEC
+    )
+    delay = _coerce_retry_same_delay(raw_delay)
+    if delay is None:
+        logger.warning(
+            "配置 features.routing.retry_same_delay_sec 非法（%r），回退默认 %s",
+            raw_delay,
+            _RETRY_SAME_DELAY_DEFAULT_SEC,
+        )
+        delay = _RETRY_SAME_DELAY_DEFAULT_SEC
+    return delay
+
+
+def _resolve_retry_same_delay(raw_routing: dict[str, object]) -> float:
+    """Resolve ``features.routing.retry_same_delay_sec`` with env override.
+
+    Invalid YAML/env values never raise: they fall back to the production
+    default so a typo cannot crash startup or silently disable the delay.
+    """
+    delay = _normalize_retry_same_delay(raw_routing)
+    env_value = os.getenv(_RETRY_SAME_DELAY_ENV)
+    if env_value:
+        env_delay = _coerce_retry_same_delay(env_value)
+        if env_delay is None:
+            logger.warning(
+                "环境变量 %s 非法（%r），忽略并使用配置值 %s",
+                _RETRY_SAME_DELAY_ENV,
+                env_value,
+                delay,
+            )
+        else:
+            delay = env_delay
+    return delay
+
+
+@lru_cache(maxsize=1)
+def _default_config_template() -> dict[str, object]:
+    """Load the tracked ``defaults/config.yaml`` template (single source of truth)."""
+    try:
+        template_path = resolve_default_config_template()
+    except FileNotFoundError as exc:
+        raise ConfigValidationError(f"配置校验失败：{exc}") from exc
+    try:
+        loaded = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：无法读取默认配置模板 {template_path}：{exc}"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(
+            f"配置校验失败：默认配置模板 {template_path} YAML 语法错误：{exc}"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise ConfigValidationError(
+            "配置校验失败：默认配置模板 "
+            f"{template_path} 顶层必须为字典，当前类型为 {_describe_type(loaded)}"
+        )
+    return cast("dict[str, object]", loaded)
+
+
+def _default_config() -> dict[str, object]:
+    """Return an independent deep copy of the tracked default configuration.
+
+    Every caller receives its own copy so mutation cannot leak into the cached
+    template or into another caller.
+    """
+    return copy.deepcopy(_default_config_template())
 
 
 _CONFIG_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
@@ -324,11 +1088,54 @@ _API_KEYS_CACHE: dict[str, tuple[float, frozenset[str], list[dict[str, str]]]] =
 
 
 def invalidate_config_cache() -> None:
-    """Clear in-memory configuration and API keys cache."""
+    """Clear in-memory configuration, template and API keys cache."""
     _CONFIG_CACHE.clear()
     _API_KEYS_CACHE.clear()
+    _default_config_template.cache_clear()
     _compiled_profiles.cache_clear()
     _compiled_model_overrides.cache_clear()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """同目录临时文件 + fsync + os.replace 原子写回。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)  # noqa: PTH105 - 原子写回要求使用 os.replace
+    except BaseException:
+        with contextlib.suppress(OSError):
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def write_config_text(
+    content: str,
+    config_path: str | os.PathLike[str] | None = None,
+) -> Path:
+    """校验合并配置后原子写回配置文件，并刷新缓存。"""
+    try:
+        parsed = yaml.safe_load(content) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigValidationError(f"配置校验失败：YAML 语法错误：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ConfigValidationError("配置校验失败：YAML 顶层必须为字典结构")
+    for block_name in ("logging", "security"):
+        if block_name in parsed and not isinstance(parsed[block_name], dict):
+            raise ConfigValidationError(
+                f"配置校验失败：{block_name} 必须为字典，"
+                f"当前类型为 {_describe_type(parsed[block_name])}"
+            )
+    validate_config_mapping(parsed)
+    resolved_path = _resolve_config_path(config_path)
+    _atomic_write_text(resolved_path, content)
+    invalidate_config_cache()
+    return resolved_path
 
 
 def _load_yaml_config(config_path: Path) -> dict[str, object]:
@@ -348,16 +1155,11 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(loaded, dict):
         loaded = {}
-    merged: dict[str, object] = _default_config()
-    merged.update(loaded)
-    raw_merged_defaults = merged.get("model_defaults")
-    raw_loaded_defaults = loaded.get("model_defaults")
-    if isinstance(raw_merged_defaults, dict) and isinstance(raw_loaded_defaults, dict):
-        def_config = _default_config()
-        def_md = def_config.get("model_defaults")
-        merged_model_defaults = dict(def_md if isinstance(def_md, dict) else {})
-        merged_model_defaults.update(raw_loaded_defaults)
-        merged["model_defaults"] = merged_model_defaults
+    else:
+        loaded, _ = _migrate_legacy_config_mapping(loaded)
+    merged = _deep_merge(_default_config(), loaded)
+    assert isinstance(merged, dict)
+    merged = _apply_noncritical_fallbacks(merged)
     _CONFIG_CACHE[path_key] = (mtime, merged)
     return merged
 
@@ -533,701 +1335,318 @@ def update_configured_logging_settings(
         logging_dict["dump_dir"] = dump_dir
 
     parsed["logging"] = logging_dict
-    resolved_path.write_text(
+    write_config_text(
         yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+        config_path=config_path,
     )
-    invalidate_config_cache()
-    return logging_dict
+    return get_configured_logging_settings(config_path)
 
 
-# ========== 功能开关框架（WP1）==========
-# config.yaml 顶层 `features:` 段的内置默认值。
-# 编排/fallback/活动类开关默认关闭；WP10 凭证与账号信息保活默认开启（对齐 Ark）。
-# 字段名对齐 Ark (.env) 语义，落 YAML 时统一 snake_case。
-_ATG_MODES = ("off", "prefer", "required")
-_ATG_CONTROL_POSITIONS = ("tail", "head")
-_ATG_RECOVERY_STRATEGIES = ("repair", "fail")
-_ATG_FORMAT_MODES = ("inherit", "off", "prefer", "required")
-_ATG_FORMATS = ("gemini", "openai", "claude", "responses")
-_DEFAULT_ATG_TOOL_PREFIX = "atg_emit_"
-_DEFAULT_ATG_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-_MAX_SIDE_BUFFER_BYTES = 16 * 1024 * 1024
-_MAX_ATG_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
-
-# WP5 分组编排：账号分组允许的面枚举与页面实例配额边界。
-_GROUP_SURFACE_CHOICES = ("chat", "build")
-_DEFAULT_GROUP_MAX_PAGE_INSTANCES = 2
-_DEFAULT_GROUP_MAX_PAGES = _DEFAULT_GROUP_MAX_PAGE_INSTANCES
-_MAX_GROUP_MAX_PAGE_INSTANCES = 16
-_DEFAULT_GROUP_WEIGHT = 1.0
-_MAX_GROUP_WEIGHT = 100.0
-_QUOTA_POOL_CHOICES = ("free", "pro", "official")
-
-# WP5 二期：渠道注册表、路由预算与槽位。
-_CHANNEL_CHOICES = ("chat", "build", "official")
-_CHANNEL_ALIASES = {
-    "chat": "chat",
-    "pg": "chat",
-    "playground": "chat",
-    "build": "build",
-    "official": "official",
-    "gemini_app": "official",
-}
-_DEFAULT_CHANNEL_MAX_INSTANCES = 2
-_MAX_CHANNEL_MAX_INSTANCES = 16
-_DEFAULT_CHANNEL_MAX_PAGES = {"chat": 2, "build": 2, "official": 0}
-_DEFAULT_GLOBAL_MAX_PAGES = 2
-_DEFAULT_MAX_CONTEXTS = 1
-
-_FEATURES_DEFAULTS: dict[str, object] = {
-    "build_surface": False,
-    "route_by_tier": False,
-    "groups_enabled": False,
-    "account_refresh_concurrency": 3,
-    "auto_switch": False,
-    "auto_switch_interval_hours": 3.0,
-    # WP10：自动刷新 Auth（凭证回写 auth.json）与账号信息刷新（meta）。
-    "keepalive_auth_update": True,
-    "keepalive_auth_update_hours": 24.0,
-    "keepalive_metadata_refresh": True,
-    "keepalive_metadata_refresh_hours": 24.0,
-    "keepalive_metadata_refresh_on_startup": True,
-    "keepalive_active_activity": False,
-    "keepalive_active_activity_seconds": 60.0,
-    # WP8：协议面开关。默认开启（对齐 Ark 的无条件端点注册）；
-    # 仍保留开关用于运维临时关闭。
-    "formats": {
-        "openai": True,
-        "claude": True,
-        "responses": True,
-        "media": {"allow_private_urls": False},
-    },
-    # WP5 二期：渠道注册表。chat=pg/playground；official 仅注册（WP9 前不实现）。
-    # build 的 enabled 在 YAML 未显式给出时继承 legacy build_surface。
-    "channels": {
-        "chat": {"enabled": True, "max_instances": 2, "max_pages": 1},
-        "build": {
-            "enabled": False,
-            "max_instances": 2,
-            "max_pages": 1,
-            "app_url": "",
-        },
-        "official": {"enabled": False, "max_instances": 0, "max_pages": 0},
-    },
-    # WP5 v3：页面数与 Context 数分开；旧 routing 键保留到 Phase 3 迁移完成。
-    "routing": {
-        "max_switches": 2,
-        "global_max_pages": 2,
-        "max_contexts": 1,
-        "borrow": False,
-        "prewarm": False,
-        "circuit_breaker": {
-            "window_seconds": 600,
-            "failure_threshold": 5,
-            "cooldown_seconds": 300,
-        },
-    },
-    # WP5 二期：槽位行（账号×渠道预留实例位）。
-    "slots": [],
-    # WP5：账号分组列表。空列表合法——未显式分组的账号由 orchestrator 按 tier
-    # 默认规则兜底（本模块只负责解析，不注入默认组）。
-    "groups": [],
-    "atg": {
-        "mode": "off",
-        "mode_by_format": {
-            "gemini": "inherit",
-            "openai": "inherit",
-            "claude": "inherit",
-            "responses": "inherit",
-        },
-        "tool_prefix": _DEFAULT_ATG_TOOL_PREFIX,
-        "control_position": "tail",
-        "strict": False,
-        "empty_retries": 2,
-        "recovery": "repair",
-        "side_buffer_bytes": 0,
-        "client_synthetic_guard": True,
-        "max_response_bytes": _DEFAULT_ATG_MAX_RESPONSE_BYTES,
-        "text_model_pattern": "",
-        "non_text_model_pattern": "",
-    },
-    "fallback": {
-        # 默认全 off：遵循「零自动回落」决策，任何改道必须显式开启且可 grep。
-        "on_quota": False,
-        "on_failure": False,
-        "cross_surface": False,
-    },
-}
-
-
-def _deep_merge(
-    base: dict[str, object], override: dict[str, object]
+# ─── 订阅层级每日软额度 (Tier Quotas) 与预设方案 (Presets) ───
+def get_configured_tier_quotas(
+    config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    merged = dict(base)
-    for key, value in override.items():
-        current = merged.get(key)
-        if isinstance(value, dict) and isinstance(current, dict):
-            merged[key] = _deep_merge(current, value)
-        else:
-            merged[key] = value
-    return merged
+    """获取 config.yaml 中配置的订阅层级软额度规则，若缺失则安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_quotas = config.get("tier_quotas")
+    if isinstance(raw_quotas, dict):
+        return raw_quotas
+    def_quotas = _default_config().get("tier_quotas")
+    if isinstance(def_quotas, dict):
+        return def_quotas
+    return {}
 
 
-def _coerce_feature_bool(value: object, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("1", "true", "yes", "on"):
-            return True
-        if text in ("0", "false", "no", "off"):
-            return False
-        return default
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return default
-
-
-def _coerce_feature_int(
-    value: object, default: int, *, minimum: int, maximum: int
+def resolve_tier_quota(
+    tier: str | None,
+    model: str | None,
+    config_path: str | os.PathLike[str] | None = None,
 ) -> int:
-    try:
-        parsed = int(str(value))
-    except (TypeError, ValueError):
-        return default
-    return min(maximum, max(minimum, parsed))
+    """计算指定账号层级在目标模型上的每日软额度限制（仅用于轮询打分权重，超额绝不禁用账号）。"""
+    normalized_model = _normalize_model_name(model) if model else ""
+    quotas = get_configured_tier_quotas(config_path)
 
+    # 1. 精确模型覆盖 overrides (优先级最高)
+    raw_overrides = quotas.get("overrides")
+    if isinstance(raw_overrides, dict):
+        for m_key, val in raw_overrides.items():
+            if _normalize_model_name(str(m_key)) == normalized_model:
+                try:
+                    return int(str(val))
+                except (ValueError, TypeError):
+                    pass
 
-def _coerce_feature_float(
-    value: object,
-    default: float,
-    *,
-    minimum: float,
-    maximum: float | None = None,
-) -> float:
-    try:
-        parsed = float(str(value))
-    except (TypeError, ValueError):
-        return default
-    parsed = max(minimum, parsed)
-    if maximum is not None:
-        parsed = min(maximum, parsed)
-    return parsed
-
-
-def _coerce_feature_choice(
-    value: object, default: str, choices: tuple[str, ...]
-) -> str:
-    normalized = str(value).strip().lower()
-    return normalized if normalized in choices else default
-
-
-def _coerce_feature_str(value: object, default: str) -> str:
-    if value is None:
-        return default
-    text = str(value).strip()
-    return text if text else default
-
-
-def _coerce_feature_str_list(value: object) -> list[str]:
-    """归一字符串列表：小写、去空白、去重；非列表输入返回空列表。"""
-    if not isinstance(value, (list, tuple)):
-        return []
-    items: list[str] = []
-    for item in value:
-        text = str(item).strip().lower()
-        if text and text not in items:
-            items.append(text)
-    return items
-
-
-def _coerce_feature_surfaces(value: object) -> list[str]:
-    """从 ("chat", "build") 中过滤出子集，保留输入顺序并去重。"""
-    if not isinstance(value, (list, tuple)):
-        return []
-    surfaces: list[str] = []
-    for item in value:
-        text = str(item).strip().lower()
-        if text in _GROUP_SURFACE_CHOICES and text not in surfaces:
-            surfaces.append(text)
-    return surfaces
-
-
-def _coerce_feature_optional_str(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _normalize_channel_key(value: object) -> str | None:
-    text = str(value or "").strip().lower()
-    return _CHANNEL_ALIASES.get(text)
-
-
-def _coerce_feature_quota_pool(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text or text == "any":
-        return None
-    return text if text in _QUOTA_POOL_CHOICES else None
-
-
-def _coerce_feature_quota_pools(value: object) -> list[str]:
-    if not isinstance(value, (list, tuple)):
-        return []
-    pools: list[str] = []
-    for item in value:
-        text = str(item).strip().lower()
-        if text in _QUOTA_POOL_CHOICES and text not in pools:
-            pools.append(text)
-    return pools
-
-
-def _normalize_channels(
-    raw: object,
-    *,
-    build_surface: bool,
-    build_explicit: bool,
-) -> dict[str, dict[str, object]]:
-    """归一 features.channels；build 未显式配置时继承 legacy build_surface。"""
-    data = raw if isinstance(raw, dict) else {}
-    by_channel: dict[str, dict[str, object]] = {}
-    for key, value in data.items():
-        channel = _normalize_channel_key(key)
-        if channel is None:
-            _logger.warning("features.channels 未知渠道 %r，已忽略", key)
-            continue
-        if isinstance(value, dict):
-            by_channel[channel] = value
+    # 2. 匹配对应层级规则
+    clean_tier = (tier or "Free").strip()
+    if clean_tier not in quotas:
+        matched_key = None
+        for k in quotas:
+            if k.lower() == clean_tier.lower():
+                matched_key = k
+                break
+        if matched_key:
+            clean_tier = matched_key
+        elif "Free" in quotas:
+            clean_tier = "Free"
         else:
-            _logger.warning("features.channels.%s 非映射结构，已忽略", channel)
+            clean_tier = next(iter(quotas), "Free")
 
-    build_enabled = (
-        _coerce_feature_bool(by_channel["build"].get("enabled"), build_surface)
-        if build_explicit and "build" in by_channel
-        else build_surface
-    )
-    chat_raw = by_channel.get("chat") or {}
-    build_raw = by_channel.get("build") or {}
-    chat_max_instances = _coerce_feature_int(
-        chat_raw.get("max_instances"),
-        _DEFAULT_CHANNEL_MAX_INSTANCES,
-        minimum=0,
-        maximum=_MAX_CHANNEL_MAX_INSTANCES,
-    )
-    build_max_instances = _coerce_feature_int(
-        build_raw.get("max_instances"),
-        _DEFAULT_CHANNEL_MAX_INSTANCES,
-        minimum=0,
-        maximum=_MAX_CHANNEL_MAX_INSTANCES,
-    )
-    chat_max_pages = chat_max_instances
-    build_max_pages = build_max_instances
-    chat_allowed_tags = normalize_tags(chat_raw.get("allowed_tags"))
-    build_allowed_tags = normalize_tags(build_raw.get("allowed_tags"))
-    legacy_chat_pool = _coerce_feature_quota_pool(chat_raw.get("quota_pool"))
-    legacy_build_pool = _coerce_feature_quota_pool(build_raw.get("quota_pool"))
-    if not chat_allowed_tags and legacy_chat_pool:
-        chat_allowed_tags = [legacy_chat_pool]
-    if not build_allowed_tags and legacy_build_pool:
-        build_allowed_tags = [legacy_build_pool]
-    return {
-        "chat": {
-            "enabled": _coerce_feature_bool(chat_raw.get("enabled"), True),
-            "max_instances": chat_max_instances,
-            "max_pages": chat_max_pages,
-            "allowed_tags": chat_allowed_tags,
-        },
-        "build": {
-            "enabled": build_enabled,
-            "max_instances": build_max_instances,
-            "max_pages": build_max_pages,
-            "allowed_tags": build_allowed_tags,
-            "app_url": str(build_raw.get("app_url") or "").strip(),
-        },
-        # WP9 前官网渠道只注册不实现：无论配置如何都保持关闭。
-        "official": {
-            "enabled": False,
-            "max_instances": 0,
-            "max_pages": 0,
-            "allowed_tags": [],
-        },
-    }
+    tier_rules = quotas.get(clean_tier)
+    if not isinstance(tier_rules, dict):
+        return 20
 
+    default_limit = int(str(tier_rules.get("default_limit", 20)))
+    if not normalized_model:
+        return default_limit
 
-def _normalize_routing(raw: object) -> dict[str, object]:
-    data = raw if isinstance(raw, dict) else {}
-    raw_breaker = data.get("circuit_breaker")
-    breaker = raw_breaker if isinstance(raw_breaker, dict) else {}
-    global_max_pages = _coerce_feature_int(
-        data.get("global_max_pages", data.get("global_max_instances")),
-        _DEFAULT_GLOBAL_MAX_PAGES,
-        minimum=1,
-        maximum=32,
-    )
-    max_contexts = _coerce_feature_int(
-        data.get("max_contexts", data.get("max_realms")),
-        _DEFAULT_MAX_CONTEXTS,
-        minimum=1,
-        maximum=16,
-    )
-    return {
-        "max_switches": _coerce_feature_int(
-            data.get("max_switches"), 2, minimum=0, maximum=10
-        ),
-        "global_max_pages": global_max_pages,
-        "max_contexts": max_contexts,
-        "borrow": _coerce_feature_bool(data.get("borrow"), False),
-        "prewarm": _coerce_feature_bool(data.get("prewarm"), False),
-        "circuit_breaker": {
-            "window_seconds": _coerce_feature_int(
-                breaker.get("window_seconds"), 600, minimum=60, maximum=3600
-            ),
-            "failure_threshold": _coerce_feature_int(
-                breaker.get("failure_threshold"), 5, minimum=1, maximum=100
-            ),
-            "cooldown_seconds": _coerce_feature_int(
-                breaker.get("cooldown_seconds"), 300, minimum=30, maximum=3600
-            ),
-        },
-    }
-
-
-def _normalize_slots(raw: object) -> list[dict[str, object]]:
-    """归一 features.slots；坏项丢弃，按 (account_id, channel) 去重。"""
-    if raw is None:
-        return []
-    if not isinstance(raw, (list, tuple)):
-        _logger.warning("features.slots 非列表结构，已按空列表处理: %r", raw)
-        return []
-    slots: list[dict[str, object]] = []
-    seen: set[tuple[str, str]] = set()
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            _logger.warning("features.slots[%d] 非映射结构，已丢弃", index)
+    for rule_key, rule_data in tier_rules.items():
+        if rule_key == "default_limit" or not isinstance(rule_data, dict):
             continue
-        account_id = str(item.get("account_id") or "").strip()
-        channel = _normalize_channel_key(item.get("channel"))
-        if not account_id or channel is None:
-            _logger.warning("features.slots[%d] 缺少 account_id/channel，已丢弃", index)
-            continue
-        key = (account_id, channel)
-        if key in seen:
-            _logger.warning("features.slots[%d] 重复槽位 %s，已丢弃", index, key)
-            continue
-        seen.add(key)
-        slots.append(
-            {
-                "account_id": account_id,
-                "channel": channel,
-                "enabled": _coerce_feature_bool(item.get("enabled"), True),
-                "note": str(item.get("note") or "").strip(),
-            }
-        )
-    return slots
-
-
-def _normalize_feature_group(raw: object, index: int) -> dict[str, object] | None:
-    """归一单个分组项；非映射结构视为坏项丢弃并告警，不抛异常。"""
-    if not isinstance(raw, dict):
-        _logger.warning("features.groups[%d] 非映射结构，已丢弃: %r", index, raw)
-        return None
-    max_pages = _coerce_feature_int(
-        raw.get("max_pages", raw.get("max_page_instances")),
-        _DEFAULT_GROUP_MAX_PAGES,
-        minimum=0,
-        maximum=_MAX_GROUP_MAX_PAGE_INSTANCES,
-    )
-    return {
-        "name": _coerce_feature_str(raw.get("name"), f"group-{index}"),
-        "enabled": _coerce_feature_bool(raw.get("enabled"), True),
-        "weight": _coerce_feature_float(
-            raw.get("weight"),
-            _DEFAULT_GROUP_WEIGHT,
-            minimum=0.1,
-            maximum=_MAX_GROUP_WEIGHT,
-        ),
-        "match_tier": _coerce_feature_str_list(raw.get("match_tier")),
-        "match_emails_regex": _coerce_feature_optional_str(
-            raw.get("match_emails_regex")
-        ),
-        "allowed_surfaces": _coerce_feature_surfaces(raw.get("allowed_surfaces")),
-        "allowed_quota_pools": _coerce_feature_quota_pools(
-            raw.get("allowed_quota_pools")
-        ),
-        "max_pages": max_pages,
-        # Phase 3 前兼容旧消费方。
-        "max_page_instances": max_pages,
-    }
-
-
-def _normalize_feature_groups(raw: object) -> list[dict[str, object]]:
-    """归一 features.groups 列表；逐项 coerce，坏项丢弃，缺省/空即空列表。"""
-    if raw is None:
-        return []
-    if not isinstance(raw, (list, tuple)):
-        _logger.warning("features.groups 非列表结构，已按空列表处理: %r", raw)
-        return []
-    groups: list[dict[str, object]] = []
-    for index, item in enumerate(raw):
-        normalized = _normalize_feature_group(item, index)
-        if normalized is not None:
-            groups.append(normalized)
-    return groups
-
-
-def _normalize_atg_mode_by_format(raw: object) -> dict[str, str]:
-    """归一 features.atg.mode_by_format；缺省/非法值回退 inherit。"""
-    data = raw if isinstance(raw, dict) else {}
-    result: dict[str, str] = {}
-    for api_format in _ATG_FORMATS:
-        raw_value = data.get(api_format, "inherit")
-        # PyYAML 1.1 parses unquoted ``off`` as boolean false; keep old YAML usable.
-        if raw_value is False:
-            result[api_format] = "off"
-            continue
-        value = str(raw_value).strip().lower()
-        result[api_format] = value if value in _ATG_FORMAT_MODES else "inherit"
-    return result
-
-
-def _env_feature_baseline() -> dict[str, object]:
-    """进程启动时的环境变量基线，作为 config.yaml features 段缺省项的兜底。"""
-    from aistudio_api.config import settings
-
-    return {
-        "build_surface": settings.build_surface,
-        "route_by_tier": settings.route_by_tier,
-        "account_refresh_concurrency": settings.account_refresh_concurrency,
-        "auto_switch": settings.auto_switch,
-        "auto_switch_interval_hours": settings.auto_switch_interval_hours,
-        "keepalive_auth_update": settings.keepalive_auth_update,
-        "keepalive_auth_update_hours": settings.keepalive_auth_update_hours,
-        "keepalive_metadata_refresh": settings.keepalive_metadata_refresh,
-        "keepalive_metadata_refresh_hours": settings.keepalive_metadata_refresh_hours,
-        "keepalive_metadata_refresh_on_startup": (
-            settings.keepalive_metadata_refresh_on_startup
-        ),
-        "keepalive_active_activity": settings.keepalive_active_activity,
-        "keepalive_active_activity_seconds": (
-            settings.keepalive_active_activity_seconds
-        ),
-        "atg": {"mode": settings.atg_mode},
-    }
-
-
-def _normalize_features(
-    raw: dict[str, object],
-    *,
-    channels_build_explicit: bool = False,
-) -> dict[str, object]:
-    raw_atg = raw.get("atg")
-    atg = raw_atg if isinstance(raw_atg, dict) else {}
-    raw_fallback = raw.get("fallback")
-    fallback = raw_fallback if isinstance(raw_fallback, dict) else {}
-    raw_formats = raw.get("formats")
-    formats = raw_formats if isinstance(raw_formats, dict) else {}
-    raw_media = formats.get("media")
-    media = raw_media if isinstance(raw_media, dict) else {}
-    legacy_build_surface = _coerce_feature_bool(raw.get("build_surface"), False)
-    channels = _normalize_channels(
-        raw.get("channels"),
-        build_surface=legacy_build_surface,
-        build_explicit=channels_build_explicit,
-    )
-    return {
-        "build_surface": bool(channels["build"]["enabled"]),
-        "route_by_tier": _coerce_feature_bool(raw.get("route_by_tier"), False),
-        "groups_enabled": _coerce_feature_bool(raw.get("groups_enabled"), False),
-        "account_refresh_concurrency": _coerce_feature_int(
-            raw.get("account_refresh_concurrency"), 3, minimum=1, maximum=16
-        ),
-        "auto_switch": _coerce_feature_bool(raw.get("auto_switch"), False),
-        "auto_switch_interval_hours": _coerce_feature_float(
-            raw.get("auto_switch_interval_hours"), 3.0, minimum=0.1
-        ),
-        "keepalive_auth_update": _coerce_feature_bool(
-            raw.get("keepalive_auth_update"), True
-        ),
-        "keepalive_auth_update_hours": _coerce_feature_float(
-            raw.get("keepalive_auth_update_hours"), 24.0, minimum=0.1
-        ),
-        "keepalive_metadata_refresh": _coerce_feature_bool(
-            raw.get("keepalive_metadata_refresh"), True
-        ),
-        "keepalive_metadata_refresh_hours": _coerce_feature_float(
-            raw.get("keepalive_metadata_refresh_hours"), 24.0, minimum=0.1
-        ),
-        "keepalive_metadata_refresh_on_startup": _coerce_feature_bool(
-            raw.get("keepalive_metadata_refresh_on_startup"), True
-        ),
-        "keepalive_active_activity": _coerce_feature_bool(
-            raw.get("keepalive_active_activity"), False
-        ),
-        "keepalive_active_activity_seconds": _coerce_feature_float(
-            raw.get("keepalive_active_activity_seconds"), 60.0, minimum=10.0
-        ),
-        "formats": {
-            "openai": _coerce_feature_bool(formats.get("openai"), False),
-            "claude": _coerce_feature_bool(formats.get("claude"), False),
-            "responses": _coerce_feature_bool(formats.get("responses"), False),
-            "media": {
-                "allow_private_urls": _coerce_feature_bool(
-                    media.get("allow_private_urls"), False
-                )
-            },
-        },
-        "channels": channels,
-        "routing": _normalize_routing(raw.get("routing")),
-        "slots": _normalize_slots(raw.get("slots")),
-        "groups": _normalize_feature_groups(raw.get("groups")),
-        "atg": {
-            "mode": _coerce_feature_choice(atg.get("mode"), "off", _ATG_MODES),
-            "mode_by_format": _normalize_atg_mode_by_format(atg.get("mode_by_format")),
-            "tool_prefix": _coerce_feature_str(
-                atg.get("tool_prefix"), _DEFAULT_ATG_TOOL_PREFIX
-            ),
-            "control_position": _coerce_feature_choice(
-                atg.get("control_position"), "tail", _ATG_CONTROL_POSITIONS
-            ),
-            "strict": _coerce_feature_bool(atg.get("strict"), False),
-            "empty_retries": _coerce_feature_int(
-                atg.get("empty_retries"), 2, minimum=0, maximum=5
-            ),
-            "recovery": _coerce_feature_choice(
-                atg.get("recovery"), "repair", _ATG_RECOVERY_STRATEGIES
-            ),
-            "side_buffer_bytes": _coerce_feature_int(
-                atg.get("side_buffer_bytes"),
-                0,
-                minimum=0,
-                maximum=_MAX_SIDE_BUFFER_BYTES,
-            ),
-            "client_synthetic_guard": _coerce_feature_bool(
-                atg.get("client_synthetic_guard"), True
-            ),
-            "max_response_bytes": _coerce_feature_int(
-                atg.get("max_response_bytes"),
-                _DEFAULT_ATG_MAX_RESPONSE_BYTES,
-                minimum=1024,
-                maximum=_MAX_ATG_MAX_RESPONSE_BYTES,
-            ),
-            "text_model_pattern": _coerce_feature_str(
-                atg.get("text_model_pattern"), ""
-            ),
-            "non_text_model_pattern": _coerce_feature_str(
-                atg.get("non_text_model_pattern"), ""
-            ),
-        },
-        "fallback": {
-            "on_quota": _coerce_feature_bool(fallback.get("on_quota"), False),
-            "on_failure": _coerce_feature_bool(fallback.get("on_failure"), False),
-            "cross_surface": _coerce_feature_bool(fallback.get("cross_surface"), False),
-        },
-    }
-
-
-def _migrate_legacy_feature_keys(features: dict[str, object]) -> dict[str, object]:
-    """Map v2 keys to v3 before deep-merging defaults.
-
-    Deep merge would otherwise hide whether the user wrote ``max_instances`` or
-    ``max_pages`` (the defaults already contain both). Migration is done on the
-    raw YAML object so explicit legacy values still take effect.
-    """
-    migrated = dict(features)
-    raw_channels = features.get("channels")
-    if isinstance(raw_channels, dict):
-        channels: dict[str, object] = {}
-        for key, value in raw_channels.items():
-            item = dict(value) if isinstance(value, dict) else value
-            channels[key] = item
-        migrated["channels"] = channels
-
-    raw_routing = features.get("routing")
-    if isinstance(raw_routing, dict):
-        routing = dict(raw_routing)
-        if "global_max_pages" not in routing and "global_max_instances" in routing:
-            routing["global_max_pages"] = routing["global_max_instances"]
-        if "max_contexts" not in routing and "max_realms" in routing:
-            routing["max_contexts"] = routing["max_realms"]
-        migrated["routing"] = routing
-
-    raw_groups = features.get("groups")
-    if isinstance(raw_groups, list):
-        groups: list[object] = []
-        for value in raw_groups:
-            group = dict(value) if isinstance(value, dict) else value
+        raw_match = rule_data.get("match")
+        if isinstance(raw_match, dict):
+            contains = [
+                str(c).lower()
+                for c in (raw_match.get("contains") or [])
+                if isinstance(c, str)
+            ]
+            prefixes = [
+                str(p).lower()
+                for p in (raw_match.get("prefixes") or [])
+                if isinstance(p, str)
+            ]
+            exact = [
+                _normalize_model_name(str(e))
+                for e in (raw_match.get("exact") or [])
+                if isinstance(e, str)
+            ]
             if (
-                isinstance(group, dict)
-                and "max_pages" not in group
-                and "max_page_instances" in group
+                (exact and normalized_model in exact)
+                or any(normalized_model.startswith(p) for p in prefixes)
+                or any(c in normalized_model for c in contains)
             ):
-                group["max_pages"] = group["max_page_instances"]
-            groups.append(group)
-        migrated["groups"] = groups
-    return migrated
+                return int(str(rule_data.get("daily_limit", default_limit)))
+
+    return default_limit
+
+
+def get_configured_presets(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, object]]:
+    """获取 config.yaml 中配置的预设方案列表。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_presets = config.get("account_presets")
+    if isinstance(raw_presets, list):
+        return [p for p in raw_presets if isinstance(p, dict)]
+    def_presets = _default_config().get("account_presets")
+    if isinstance(def_presets, list):
+        return [p for p in def_presets if isinstance(p, dict)]
+    return []
+
+
+def get_configured_rotator_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 rotator 重试与冷却时间，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rotator = config.get("rotator")
+    if isinstance(raw_rotator, dict):
+        return raw_rotator
+    def_rotator = _default_config().get("rotator")
+    if isinstance(def_rotator, dict):
+        return def_rotator
+    return {}
+
+
+def get_configured_paid_model_rules(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 paid_model_rules 付费模型判定与准入规则，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rules = config.get("paid_model_rules")
+    if isinstance(raw_rules, dict):
+        return raw_rules
+    def_rules = _default_config().get("paid_model_rules")
+    if isinstance(def_rules, dict):
+        return def_rules
+    return {}
 
 
 def get_features_config(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """解析 config.yaml 顶层 ``features`` 段并归一化返回。
+    """Return the merged ``features`` block (hot-reloadable via mtime cache)."""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    if isinstance(raw_features, dict):
+        return raw_features
+    defaults = _default_config().get("features")
+    return dict(defaults) if isinstance(defaults, dict) else {}
 
-    优先级：``config.yaml features.*`` > ``AISTUDIO_*`` 环境变量基线 > 内置默认值。
-    编码未知/非法取值时静默回退到安全默认，保证既有 YAML 消费方不因新键报错。
-    结果依赖 ``_load_yaml_config`` 的 mtime 缓存，PUT /config/yaml 触发的
-    ``invalidate_config_cache()`` 会让下一次读取立即反映热重载后的内容。
+
+def get_configured_formats(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    formats = get_features_config(config_path).get("formats")
+    return dict(formats) if isinstance(formats, dict) else {}
+
+
+def get_configured_routing_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """返回 features.routing 配置；缺失/非法时回退 max_switches=2。
+
+    ``retry_same_delay_sec`` 默认 2.0 秒，限制在 0..30；环境变量
+    ``AISTUDIO_RETRY_SAME_DELAY_SEC`` 可覆盖（非法值忽略，不抛异常）。
     """
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
     raw_features = config.get("features")
-    yaml_features = raw_features if isinstance(raw_features, dict) else {}
-    migrated_features = _migrate_legacy_feature_keys(yaml_features)
-    merged = _deep_merge(_FEATURES_DEFAULTS, _env_feature_baseline())
-    merged = _deep_merge(merged, migrated_features)
-    raw_channels = yaml_features.get("channels")
-    channels_build_explicit = (
-        isinstance(raw_channels, dict)
-        and isinstance(raw_channels.get("build"), dict)
-        and "enabled" in raw_channels["build"]
+    raw_routing = (
+        raw_features.get("routing") if isinstance(raw_features, dict) else None
     )
-    return _normalize_features(merged, channels_build_explicit=channels_build_explicit)
+    if not isinstance(raw_routing, dict):
+        logger.warning(
+            "配置 features.routing 非法（%r），回退默认 max_switches=2",
+            _describe_type(raw_routing),
+        )
+        return _routing_defaults()
+    raw_switches = raw_routing.get("max_switches", 2)
+    if (
+        isinstance(raw_switches, bool)
+        or not isinstance(raw_switches, int)
+        or raw_switches < 0
+    ):
+        logger.warning(
+            "配置 features.routing.max_switches 非法（%r），回退默认 2",
+            raw_switches,
+        )
+        raw_switches = 2
+    return {
+        "max_switches": raw_switches,
+        "retry_same_delay_sec": _resolve_retry_same_delay(raw_routing),
+    }
 
 
-def update_configured_features(
-    updates: dict[str, object],
+def get_configured_keepalive_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """结构化更新 features 并原子写回 config.yaml，返回归一化后的 features。"""
-    unknown = sorted(set(updates) - set(_FEATURES_DEFAULTS))
-    if unknown:
-        raise ValueError(f"unknown feature keys: {', '.join(unknown)}")
-
+    """返回 features.keepalive 配置；缺失/非法时回退 24h auth/metadata 默认值。"""
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    raw_keepalive = (
+        raw_features.get("keepalive") if isinstance(raw_features, dict) else None
     )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
-
-    raw_features = parsed.get("features")
-    features = dict(raw_features) if isinstance(raw_features, dict) else {}
-    features.update(updates)
-    parsed["features"] = features
-
-    tmp_path = resolved_path.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        tmp_path.write_text(
-            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
+    if not isinstance(raw_keepalive, dict):
+        logger.warning(
+            "配置 features.keepalive 非法（%r），回退默认值",
+            _describe_type(raw_keepalive),
         )
-        tmp_path.replace(resolved_path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-    invalidate_config_cache()
-    return get_features_config(config_path)
+        return {
+            **_KEEPALIVE_DEFAULT_BOOLS,
+            **_KEEPALIVE_DEFAULT_FLOATS,
+        }
+    return dict(raw_keepalive)
+
+
+def get_configured_model_discovery_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, int]:
+    """返回 features.model_discovery 刷新节奏；非法值回退 24h/10min 默认。
+
+    ``live_refresh_interval_sec`` 只用于 ``last_source == "live_page"`` 的成功
+    刷新；其他来源（fallback/snapshot/live_http）走较短的
+    ``fallback_refresh_interval_sec`` 重试。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_features = config.get("features")
+    raw_discovery = (
+        raw_features.get("model_discovery") if isinstance(raw_features, dict) else None
+    )
+    settings: dict[str, int] = {}
+    if not isinstance(raw_discovery, dict):
+        logger.warning(
+            "配置 features.model_discovery 非法（%r），回退默认刷新节奏",
+            _describe_type(raw_discovery),
+        )
+        raw_discovery = {}
+    for key, default_value in _MODEL_DISCOVERY_DEFAULTS.items():
+        value = raw_discovery.get(key, default_value)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            logger.warning(
+                "配置 features.model_discovery.%s 非法（%r），回退默认值 %r",
+                key,
+                value,
+                default_value,
+            )
+            value = default_value
+        settings[key] = value
+    return settings
+
+
+def resolve_quota_scope(
+    config_path: str | os.PathLike[str] | None = None,
+) -> str:
+    """D-01: ``account``（默认）或 ``account_surface``；非法值回退 account。"""
+    rotator = get_configured_rotator_settings(config_path)
+    raw_scope = rotator.get("quota_scope", "account")
+    if raw_scope in ("account", "account_surface"):
+        return str(raw_scope)
+    logger.warning(
+        "配置 rotator.quota_scope 非法（%r），回退默认 account", raw_scope
+    )
+    return "account"
+
+
+def get_configured_security_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> bool:
+    """获取 security.api_allow_anonymous；缺失或非法时返回 False。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_security = config.get("security")
+    if not isinstance(raw_security, dict):
+        logger.warning(
+            "配置 security 非法（%r），API 免密开关回退 false",
+            _describe_type(raw_security),
+        )
+        return False
+    allow_anonymous = raw_security.get("api_allow_anonymous", False)
+    if isinstance(allow_anonymous, bool):
+        return allow_anonymous
+    logger.warning(
+        "配置 security.api_allow_anonymous 非法（%r），回退 false", allow_anonymous
+    )
+    return False
+
+
+def get_configured_instance_specs(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, object]]:
+    """Normalize ``instances`` into merged closed tier-interval specs.
+
+    ``only_tier`` pins one exact tier; ``min_tier`` alone opens a paid
+    ``min..Ultra_20X`` interval; ``max_tier`` alone defaults the paid lower
+    bound to Pro (Free max stays Free); min+max form a closed interval.  Free
+    selectors always normalize to ``only=Free,min=Free,max=Free`` so duplicate
+    specs merge counts, and unknown/non-string selectors fail loudly.
+    """
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    return _normalize_instance_specs(config.get("instances"))
+
+
+def get_configured_max_contexts(
+    config_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """全局实例/Context 上限；缺省为 instances count 之和，上限 16。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    specs = _normalize_instance_specs(config.get("instances"))
+    return _normalize_max_contexts(config, specs)

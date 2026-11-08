@@ -1,17 +1,16 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { accountsApi } from '@/api/accounts.ts'
-import { ApiError } from '@/api/client.ts'
+import { systemApi } from '@/api/system.ts'
 import { useSystemStore } from './system.ts'
 import type {
   Account,
-  AccountRouting,
   AccountWithStats,
   AccountRotationStats,
   ImportCookiesRequest,
   ProbeAndImportRequest,
   ImportBundleRequest,
-  RefreshAccountsResponse,
+  AccountPreset,
 } from '@/types'
 import { useToastStore } from './toast.ts'
 
@@ -25,14 +24,12 @@ export const useAccountsStore = defineStore('accounts', () => {
   const loading = ref(false)
   const activatingId = ref<string | null>(null)
   const importing = ref(false)
+  const presets = ref<AccountPreset[]>([])
+  const groups = ref<string[]>([])
+  const applyingPresetId = ref<string | null>(null)
   const refreshingAll = ref(false)
   const refreshingIds = ref<Record<string, boolean>>({})
-  const listError = ref<string | null>(null)
-  const routingByAccount = ref<Record<string, AccountRouting>>({})
-  const routingLoadingIds = ref<Record<string, boolean>>({})
-  const routingErrors = ref<Record<string, string>>({})
-  const refreshPendingIds = ref<Record<string, 'pending' | 'failed'>>({})
-
+  const batchBusy = ref(false)
   const activeId = computed(() => activeAccount.value?.id || '')
 
   const accountRows = computed<AccountWithStats[]>(() => {
@@ -56,16 +53,8 @@ export const useAccountsStore = defineStore('accounts', () => {
 
       if (accsRes.status === 'fulfilled') {
         accounts.value = accsRes.value
-        listError.value = null
-        const liveIds = new Set(accounts.value.map((account) => account.id))
-        const nextRouting: Record<string, AccountRouting> = {}
-        for (const [id, routing] of Object.entries(routingByAccount.value)) {
-          if (liveIds.has(id)) nextRouting[id] = routing
-        }
-        routingByAccount.value = nextRouting
       } else {
         const reasonMsg = accsRes.reason instanceof Error ? accsRes.reason.message : String(accsRes.reason)
-        listError.value = reasonMsg
         console.warn('获取账号列表失败，保留当前展示数据:', accsRes.reason)
         useToastStore().error(`获取账号列表失败: ${reasonMsg}`)
       }
@@ -79,6 +68,96 @@ export const useAccountsStore = defineStore('accounts', () => {
       }
     } finally {
       loading.value = false
+    }
+  }
+
+  async function fetchPresets() {
+    try {
+      presets.value = await accountsApi.listPresets()
+    } catch {
+      // ignore
+    }
+  }
+
+  async function fetchGroups() {
+    try {
+      groups.value = await accountsApi.listGroups()
+    } catch {
+      // ignore
+    }
+  }
+
+  async function toggleAccountEnabled(id: string, enabled?: boolean) {
+    const toast = useToastStore()
+    try {
+      const updated = await accountsApi.toggle(id, enabled)
+      toast.success(`账号已${updated.enabled ? '启用' : '停用'}`)
+      await fetchAll()
+      return updated
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '切换状态失败'
+      toast.error(msg)
+      return null
+    }
+  }
+
+  async function updateAccountGroup(id: string, group: string) {
+    const toast = useToastStore()
+    try {
+      const updated = await accountsApi.updateGroup(id, group)
+      toast.success('分组已更新')
+      await fetchAll()
+      await fetchGroups()
+      return updated
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '更新分组失败'
+      toast.error(msg)
+      return null
+    }
+  }
+
+  async function applyPreset(presetId: string) {
+    const toast = useToastStore()
+    applyingPresetId.value = presetId
+    try {
+      const res = await accountsApi.applyPreset(presetId)
+      toast.success(`已应用「${res.preset_name}」: 启用 ${res.enabled_count} 个`)
+      await fetchAll()
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '应用方案失败'
+      toast.error(msg)
+      return false
+    } finally {
+      applyingPresetId.value = null
+    }
+  }
+
+  async function createSnapshotPreset(name: string, description = '') {
+    const toast = useToastStore()
+    try {
+      const created = await accountsApi.createSnapshotPreset({ name, description })
+      toast.success(`方案「${created.name}」已保存`)
+      await fetchPresets()
+      return created
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '保存方案失败'
+      toast.error(msg)
+      return null
+    }
+  }
+
+  async function deletePreset(presetId: string) {
+    const toast = useToastStore()
+    try {
+      await accountsApi.deletePreset(presetId)
+      toast.success('方案已删除')
+      await fetchPresets()
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '删除方案失败'
+      toast.error(msg)
+      return false
     }
   }
 
@@ -111,39 +190,6 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  async function deleteAccounts(ids: string[]) {
-    const toast = useToastStore()
-    if (!ids.length) return
-    try {
-      const res = await accountsApi.batchDelete(ids)
-      toast.success(`已删除 ${res.deleted} 个账号`)
-      await fetchAll()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '批量删除失败'
-      toast.error(msg)
-    }
-  }
-
-  async function refreshAccountsByIds(ids: string[]) {
-    const toast = useToastStore()
-    if (!ids.length) return
-    refreshingAll.value = true
-    try {
-      const res = await accountsApi.refreshAccounts({
-        account_ids: ids,
-        refresh_email: true,
-      })
-      toast.success(summarizeRefresh(res))
-      await fetchAll()
-      return res
-    } catch (err: unknown) {
-      reportRefreshError(err, '批量刷新账号信息失败')
-      return null
-    } finally {
-      refreshingAll.value = false
-    }
-  }
-
   async function deleteCookieGroup(cookieId: string) {
     const toast = useToastStore()
     try {
@@ -156,20 +202,16 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  async function updateAccountProfile(id: string, name: string, tags?: string[]) {
+  async function updateAccountName(id: string, name: string) {
     const toast = useToastStore()
     try {
-      await accountsApi.update(id, name, tags)
-      toast.success('账号信息已更新')
+      await accountsApi.update(id, name)
+      toast.success('账号名称已更新')
       await fetchAll()
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '更新失败'
       toast.error(msg)
     }
-  }
-
-  async function updateAccountName(id: string, name: string) {
-    await updateAccountProfile(id, name)
   }
 
   async function importCookies(payload: ImportCookiesRequest) {
@@ -242,190 +284,6 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  function summarizeRefresh(res: RefreshAccountsResponse): string {
-    const expired = res.expired_count
-    const ok = res.results.filter((r) => r.ok).length
-    return `刷新完成: 成功 ${ok}/${res.refreshed_count}${expired > 0 ? `，检出过期 ${expired} 个` : ''}`
-  }
-
-  function reportRefreshError(err: unknown, fallback: string) {
-    const toast = useToastStore()
-    if (err instanceof ApiError && err.status === 409) {
-      toast.warning('已有账号信息刷新正在进行中，请稍后再试')
-      return
-    }
-    const msg = err instanceof Error ? err.message : fallback
-    toast.error(msg)
-  }
-
-  async function refreshAllAccounts() {
-    refreshingAll.value = true
-    try {
-      const res = await accountsApi.refreshAccounts({ all: true, refresh_email: true })
-      useToastStore().success(summarizeRefresh(res))
-      await fetchAll()
-      return res
-    } catch (err: unknown) {
-      reportRefreshError(err, '批量刷新账号信息失败')
-      return null
-    } finally {
-      refreshingAll.value = false
-    }
-  }
-
-  async function refreshAccount(id: string) {
-    refreshingIds.value = { ...refreshingIds.value, [id]: true }
-    refreshPendingIds.value = { ...refreshPendingIds.value, [id]: 'pending' }
-    try {
-      const res = await accountsApi.refreshAccounts({
-        account_ids: [id],
-        refresh_email: true,
-      })
-      const result = res.results.find((r) => r.id === id)
-      const toast = useToastStore()
-      if (result && result.ok) {
-        toast.success(`刷新成功: tier=${result.tier ?? '未知'}`)
-        clearRefreshPending([id])
-      } else if (result && result.expired) {
-        toast.warning('凭据已过期 (401)，请重新导入 cookies')
-        clearRefreshPending([id])
-      } else {
-        toast.error(result?.error || '刷新失败')
-        markRefreshFailed([id])
-      }
-      await fetchAll()
-      return result ?? null
-    } catch (err: unknown) {
-      if (err instanceof ApiError && err.status === 409) {
-        markRefreshPending([id])
-      } else {
-        markRefreshFailed([id])
-      }
-      reportRefreshError(err, '刷新账号信息失败')
-      return null
-    } finally {
-      const next = { ...refreshingIds.value }
-      delete next[id]
-      refreshingIds.value = next
-    }
-  }
-
-  function clearRefreshPending(ids: string[]) {
-    const next = { ...refreshPendingIds.value }
-    for (const id of ids) delete next[id]
-    refreshPendingIds.value = next
-  }
-
-  function markRefreshPending(ids: string[]) {
-    const next = { ...refreshPendingIds.value }
-    for (const id of ids) next[id] = 'pending'
-    refreshPendingIds.value = next
-  }
-
-  function markRefreshFailed(ids: string[]) {
-    const next = { ...refreshPendingIds.value }
-    for (const id of ids) next[id] = 'failed'
-    refreshPendingIds.value = next
-  }
-
-  async function fetchRouting(id: string, force = false): Promise<AccountRouting | null> {
-    if (!force && routingByAccount.value[id]) return routingByAccount.value[id]
-    routingLoadingIds.value = { ...routingLoadingIds.value, [id]: true }
-    try {
-      const routing = await accountsApi.getRouting(id)
-      routingByAccount.value = { ...routingByAccount.value, [id]: routing }
-      const errors = { ...routingErrors.value }
-      delete errors[id]
-      routingErrors.value = errors
-      return routing
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '路由覆盖读取失败'
-      routingErrors.value = { ...routingErrors.value, [id]: msg }
-      return null
-    } finally {
-      const next = { ...routingLoadingIds.value }
-      delete next[id]
-      routingLoadingIds.value = next
-    }
-  }
-
-  async function ensureRouting(ids: string[]) {
-    await Promise.allSettled(ids.map((id) => fetchRouting(id)))
-  }
-
-  async function updateRoutingSurfaces(id: string, surfaces: string[]): Promise<AccountRouting> {
-    const current = routingByAccount.value[id] ?? (await accountsApi.getRouting(id))
-    const updated = await accountsApi.updateRouting(id, {
-      surfaces,
-      weight: current.weight ?? 1,
-      model_surfaces: current.model_surfaces ?? {},
-      quota_pools: current.quota_pools ?? [],
-    })
-    routingByAccount.value = { ...routingByAccount.value, [id]: updated }
-    const errors = { ...routingErrors.value }
-    delete errors[id]
-    routingErrors.value = errors
-    return updated
-  }
-
-  async function restoreDefaultRouting(id: string): Promise<void> {
-    await accountsApi.clearRouting(id)
-    routingByAccount.value = {
-      ...routingByAccount.value,
-      [id]: { surfaces: [], weight: 1, model_surfaces: {}, quota_pools: [] },
-    }
-  }
-
-  async function refreshImportedAccounts(ids: string[]) {
-    if (!ids.length) return
-    const toast = useToastStore()
-    markRefreshPending(ids)
-    try {
-      const res = await accountsApi.refreshAccounts({
-        account_ids: ids,
-        refresh_email: true,
-      })
-      let ok = 0
-      let expired = 0
-      let failed = 0
-      const doneIds: string[] = []
-      const failedIds: string[] = []
-      for (const result of res.results) {
-        if (result.ok) {
-          ok += 1
-          doneIds.push(result.id)
-        } else if (result.expired) {
-          expired += 1
-          doneIds.push(result.id)
-        } else {
-          failed += 1
-          failedIds.push(result.id)
-        }
-      }
-      clearRefreshPending(doneIds)
-      markRefreshFailed(failedIds)
-      if (!res.results.length) {
-        toast.warning(`已导入 ${ids.length} 个账号；tier 刷新未返回结果，当前显示待刷新`)
-      } else if (failed > 0) {
-        toast.warning(`已导入 ${ids.length} 个账号；${failed} 个 tier 待刷新，可在行内重试`)
-      } else if (expired > 0) {
-        toast.warning(`已导入 ${ids.length} 个账号；tier 刷新完成，检出 ${expired} 个过期账号`)
-      } else if (ok > 0) {
-        toast.success(`已导入 ${ids.length} 个账号；tier 刷新完成`)
-      }
-    } catch (err: unknown) {
-      if (err instanceof ApiError && err.status === 409) {
-        toast.warning('已导入账号；账号信息刷新进行中，当前显示待刷新，可稍后在行内重试')
-      } else {
-        markRefreshFailed(ids)
-        const msg = err instanceof Error ? err.message : '批量刷新账号信息失败'
-        toast.error(`已导入账号；tier 刷新失败: ${msg}`)
-      }
-    } finally {
-      await fetchAll()
-    }
-  }
-
   async function detectAccountTier(id: string) {
     const toast = useToastStore()
     try {
@@ -440,6 +298,155 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  async function refreshAll() {
+    const toast = useToastStore()
+    if (refreshingAll.value) return null
+    refreshingAll.value = true
+    try {
+      const res = await accountsApi.refresh({ all: true })
+      toast.success(
+        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
+      )
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '刷新全部账号失败'
+      toast.error(msg)
+      return null
+    } finally {
+      refreshingAll.value = false
+    }
+  }
+
+  async function refreshAccounts(ids: string[]) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return null
+    if (targets.some((id) => refreshingIds.value[id] === true)) return null
+    const next: Record<string, boolean> = { ...refreshingIds.value }
+    targets.forEach((id) => {
+      next[id] = true
+    })
+    refreshingIds.value = next
+    try {
+      const res = await accountsApi.refresh({ account_ids: targets })
+      toast.success(
+        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
+      )
+      await fetchAll()
+      return res
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '刷新账号失败'
+      toast.error(msg)
+      return null
+    } finally {
+      const cleared: Record<string, boolean> = { ...refreshingIds.value }
+      targets.forEach((id) => {
+        delete cleared[id]
+      })
+      refreshingIds.value = cleared
+    }
+  }
+
+  async function refreshAccount(id: string) {
+    return refreshAccounts([id])
+  }
+
+  async function batchDelete(ids: string[]) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return false
+    const requested = targets.length
+    batchBusy.value = true
+    try {
+      const res = await accountsApi.batchDelete(targets)
+      const deleted = Math.max(0, Number(res.deleted) || 0)
+      const failed = requested - deleted
+      await fetchAll()
+      if (deleted === 0) {
+        toast.error(`批量删除失败: 0/${requested} 个账号被删除`)
+        return false
+      }
+      if (failed > 0) {
+        toast.warning(`已删除 ${deleted}/${requested} 个账号，${failed} 个删除失败`)
+        return false
+      }
+      toast.success(`已删除 ${deleted} 个账号`)
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '批量删除失败'
+      toast.error(msg)
+      return false
+    } finally {
+      batchBusy.value = false
+    }
+  }
+
+  async function batchToggle(ids: string[], enabled: boolean) {
+    const toast = useToastStore()
+    const targets = Array.from(new Set(ids.filter((id) => Boolean(id))))
+    if (targets.length === 0) return false
+    const requested = targets.length
+    const action = enabled ? '启用' : '停用'
+    batchBusy.value = true
+    try {
+      const res = await accountsApi.batchToggle(targets, enabled)
+      const toggled = Math.max(0, Number(res.toggled_count) || 0)
+      const failed = Math.max(Number(res.error_count) || 0, requested - toggled)
+      await fetchAll()
+      if (toggled === 0) {
+        toast.error(`批量${action}失败: 0/${requested} 个账号成功`)
+        return false
+      }
+      if (failed > 0 || toggled < requested) {
+        toast.warning(`已${action} ${toggled}/${requested} 个账号，${failed} 个失败`)
+        return false
+      }
+      toast.success(`已${action} ${toggled} 个账号`)
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : `批量${action}失败`
+      toast.error(msg)
+      return false
+    } finally {
+      batchBusy.value = false
+    }
+  }
+
+  async function recoverAccount(id: string) {
+    const toast = useToastStore()
+    if (refreshingIds.value[id] === true) return false
+    refreshingIds.value = { ...refreshingIds.value, [id]: true }
+    try {
+      const res = await accountsApi.refresh({ account_ids: [id], refresh_email: true })
+      const result = res.results.find((item) => item.id === id)
+      if (result?.expired === true) {
+        toast.warning('登录态仍然失效，请重新导入 Cookies 后再恢复')
+        await fetchAll()
+        return false
+      }
+      if (!result || !result.ok) {
+        toast.error(result?.error || '刷新登录态失败，请重新导入 Cookies')
+        await fetchAll()
+        return false
+      }
+      // refresh 已清除持久化 expired；clearCooldown 清除 session_expired 与鉴权冷却。
+      await systemApi.clearCooldown({ account_id: id })
+      toast.success('账号登录态已恢复')
+      await fetchAll()
+      return true
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '恢复账号失败'
+      toast.error(msg)
+      await fetchAll()
+      return false
+    } finally {
+      const cleared: Record<string, boolean> = { ...refreshingIds.value }
+      delete cleared[id]
+      refreshingIds.value = cleared
+    }
+  }
+
   return {
     accounts,
     activeAccount,
@@ -449,32 +456,34 @@ export const useAccountsStore = defineStore('accounts', () => {
     loading,
     activatingId,
     importing,
-    refreshingAll,
-    refreshingIds,
-    listError,
-    routingByAccount,
-    routingLoadingIds,
-    routingErrors,
-    refreshPendingIds,
     fetchAll,
     activateAccount,
     deleteAccount,
-    deleteAccounts,
-    refreshAccountsByIds,
     deleteCookieGroup,
     updateAccountName,
-    updateAccountProfile,
     importCookies,
     probeAndImport,
     importBundle,
     detectAccountEmail,
-    refreshAllAccounts,
-    refreshAccount,
-    fetchRouting,
-    ensureRouting,
-    updateRoutingSurfaces,
-    restoreDefaultRouting,
-    refreshImportedAccounts,
     detectAccountTier,
+    presets,
+    groups,
+    applyingPresetId,
+    fetchPresets,
+    fetchGroups,
+    toggleAccountEnabled,
+    updateAccountGroup,
+    applyPreset,
+    createSnapshotPreset,
+    deletePreset,
+    refreshingAll,
+    refreshingIds,
+    batchBusy,
+    refreshAll,
+    refreshAccounts,
+    refreshAccount,
+    recoverAccount,
+    batchDelete,
+    batchToggle,
   }
 })

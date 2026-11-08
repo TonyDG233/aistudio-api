@@ -89,7 +89,13 @@ def _collect_declarations(body: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _declaration_shape(declaration: dict[str, object]) -> tuple[bool, bool, str, bool]:
-    params = declaration.get("parameters")
+    params = (
+        declaration.get("parameters")
+        or declaration.get("parametersJsonSchema")
+        or declaration.get("parameters_json_schema")
+        or declaration.get("input_schema")
+        or declaration.get("parameters_schema")
+    )
     properties: list[str] = []
     required: list[str] = []
     if isinstance(params, dict):

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from aistudio_api.infrastructure.gateway.stream_parser import (
+    IncrementalJSONStreamParser,
+)
 from aistudio_api.infrastructure.gateway.wire_parser import (
     _coerce_int,
     _decode_wire_struct,
@@ -60,7 +63,7 @@ def test_iter_response_chunks():
 def test_parse_usage_metadata():
     assert parse_usage_metadata(None) == {}
     assert parse_usage_metadata("invalid") == {}
-
+    assert parse_usage_metadata([None, None, None, None]) == {}
     raw = [10, 20, 30, 5, {"prompt": "details"}, None, None, None, None, 15]
     parsed = parse_usage_metadata(raw)
     assert parsed["prompt_tokens"] == 10
@@ -98,7 +101,7 @@ def test_parse_response_part():
     parsed = parse_response_part(part_with_thought)
     assert parsed.text == "thinking text"
     assert parsed.thought is True
-
+    assert parsed.function_call is None
     # Part with thought at index 12 (AI Studio variant)
     part_variant = [
         None,
@@ -141,10 +144,12 @@ def test_parse_response_part():
     parsed_cb = parse_response_part(content_block)
     assert parsed_cb.text == ""
 
-    # Guard against 2-element role tuple
+    # Guard against 2-element role tuple, while preserving valid text parts whose text is a role word
     role_part = [["nested"], "model"]
     assert parse_response_part(role_part).text == ""
     assert parse_response_part(["user", "user"]).text == ""
+    assert parse_response_part([None, "model"]).text == "model"
+    assert parse_response_part([None, "user"]).text == "user"
 
 
 def test_parse_response_chunk_empty():
@@ -372,3 +377,36 @@ def test_parse_response_chunk_with_ask_tool_payload():
             }
         ]
     }
+
+
+def test_pg03_finish_only_frame_preserves_finish_and_usage():
+    raw = (FIXTURES / "pg" / "f03_finish_only.bin").read_bytes().decode("utf-8")
+    parser = IncrementalJSONStreamParser()
+    chunks = list(parser.feed(raw))
+    assert len(chunks) == 1
+    chunk = chunks[0]
+
+    candidate = parse_response_chunk(chunk)
+
+    assert candidate.text == ""
+    assert candidate.function_calls == []
+    assert candidate.finish_reason == 1
+    usage = parse_chunk_usage(chunk)
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 8
+
+    output = parse_text_output(raw)
+    assert output.candidates[0].finish_reason == 1
+    assert output.usage["total_tokens"] == 8
+
+
+def test_pg03_continuing_finish_does_not_terminate_but_is_preserved():
+    chunk = [
+        [[[[[None, "first"]], "model"], 22]],
+        None,
+        [1, 1, 2],
+    ]
+    candidate = parse_response_chunk(chunk)
+    assert candidate.finish_reason == 22
+    assert candidate.text == "first"

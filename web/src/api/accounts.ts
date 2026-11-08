@@ -1,15 +1,20 @@
 import { request } from './client.ts'
 import type {
   Account,
-  AccountRouting,
   ImportCookiesRequest,
   ImportCookiesResponse,
   ProbeAndImportRequest,
   ProbeAndImportResponse,
   ImportBundleRequest,
   ImportBundleResponse,
+  AccountPreset,
+  CreatePresetRequest,
+  SnapshotPresetRequest,
+  ApplyPresetResponse,
   RefreshAccountsRequest,
   RefreshAccountsResponse,
+  BatchDeleteResponse,
+  BatchToggleResponse,
 } from '@/types'
 
 export const accountsApi = {
@@ -43,24 +48,11 @@ export const accountsApi = {
     })
   },
 
-  batchDelete(ids: string[]): Promise<{ deleted: number }> {
-    return request<{ deleted: number }>('/api/accounts/batch-delete', {
-      method: 'POST',
-      body: JSON.stringify({ ids }),
-    })
-  },
-
-  update(id: string, name: string, tags?: string[]): Promise<Account> {
-    const body: { name: string; tags?: string[] } = { name }
-    if (tags !== undefined) body.tags = tags
+  update(id: string, name: string): Promise<Account> {
     return request<Account>(`/api/accounts/${id}`, {
       method: 'PUT',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ name }),
     })
-  },
-
-  listTags(): Promise<string[]> {
-    return request<string[]>('/api/accounts/tags')
   },
 
   importCookies(req: ImportCookiesRequest): Promise<ImportCookiesResponse> {
@@ -88,27 +80,72 @@ export const accountsApi = {
     })
   },
 
-  refreshAccounts(req: RefreshAccountsRequest): Promise<RefreshAccountsResponse> {
+  toggle(id: string, enabled?: boolean): Promise<Account> {
+    return request<Account>(`/api/accounts/${id}/toggle`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  },
+
+  updateGroup(id: string, group: string): Promise<Account> {
+    return request<Account>(`/api/accounts/${id}/group`, {
+      method: 'PUT',
+      body: JSON.stringify({ group }),
+    })
+  },
+
+  listGroups(): Promise<string[]> {
+    return request<string[]>('/api/accounts/groups/list')
+  },
+
+  listPresets(): Promise<AccountPreset[]> {
+    return request<AccountPreset[]>('/api/accounts/presets/list')
+  },
+
+  createPreset(req: CreatePresetRequest): Promise<AccountPreset> {
+    return request<AccountPreset>('/api/accounts/presets', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
+
+  createSnapshotPreset(req: SnapshotPresetRequest): Promise<AccountPreset> {
+    return request<AccountPreset>('/api/accounts/presets/snapshot', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
+
+  deletePreset(id: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(`/api/accounts/presets/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    })
+  },
+
+  applyPreset(id: string): Promise<ApplyPresetResponse> {
+    return request<ApplyPresetResponse>(`/api/accounts/presets/${encodeURIComponent(id)}/apply`, {
+      method: 'POST',
+    })
+  },
+
+  refresh(req: RefreshAccountsRequest): Promise<RefreshAccountsResponse> {
     return request<RefreshAccountsResponse>('/api/accounts/refresh', {
       method: 'POST',
       body: JSON.stringify(req),
     })
   },
 
-  getRouting(id: string): Promise<AccountRouting> {
-    return request<AccountRouting>(`/api/accounts/${id}/routing`)
-  },
-
-  updateRouting(id: string, routing: AccountRouting): Promise<AccountRouting> {
-    return request<AccountRouting>(`/api/accounts/${id}/routing`, {
-      method: 'PUT',
-      body: JSON.stringify(routing),
+  batchDelete(ids: string[]): Promise<BatchDeleteResponse> {
+    return request<BatchDeleteResponse>('/api/accounts/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
     })
   },
 
-  clearRouting(id: string): Promise<{ ok: boolean }> {
-    return request<{ ok: boolean }>(`/api/accounts/${id}/routing`, {
-      method: 'DELETE',
+  batchToggle(ids: string[], enabled: boolean): Promise<BatchToggleResponse> {
+    return request<BatchToggleResponse>('/api/accounts/batch-toggle', {
+      method: 'POST',
+      body: JSON.stringify({ ids, enabled }),
     })
   },
 }

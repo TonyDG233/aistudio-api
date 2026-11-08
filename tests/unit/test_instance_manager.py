@@ -1,774 +1,1022 @@
-"""Behavior contracts for the WP5 v4 user-facing instance manager."""
+"""Instance manager contracts: lanes, wake, busy guard, D-05 bounded rebind."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import time
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from aistudio_api.application.instance_manager import (
     InstanceAlreadyExistsError,
     InstanceBusyError,
-    InstanceCapacityExhaustedError,
     InstanceInvalidAccountError,
     InstanceManager,
-    InstanceNotReadyError,
+    InstanceRebindError,
 )
-from aistudio_api.infrastructure.account.account_store import AccountMeta
+from aistudio_api.domain.instances import InstanceState
+from aistudio_api.infrastructure.account.account_store import AccountStore
 from aistudio_api.infrastructure.gateway.instance_pool import (
-    InstanceCapacityError,
+    InstancePool,
+    InstanceSpec,
+    SessionFactory,
     SlotState,
 )
 
 
-@dataclass
-class FakeSlot:
-    slot_id: str
-    current_account_id: str
-    state: SlotState = SlotState.READY
-    in_flight: int = 0
-    has_chat: bool = True
-    has_build: bool = False
-    chat_counted: bool = True
-    build_counted: bool = False
-    pinned: bool = False
-    last_used: float = 0.0
+class FakePage:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.closed = False
 
-    def chat_ready(self) -> bool:
-        return self.has_chat
+    def is_closed(self) -> bool:
+        return self.closed
 
-    def build_ready(self) -> bool:
-        return self.has_build
+    async def close(self) -> None:
+        self.events.append("page.close")
+        self.closed = True
 
 
-class FakePool:
-    def __init__(self, max_contexts: int = 2) -> None:
-        self.max_contexts = max_contexts
-        self._slots: dict[str, FakeSlot] = {}
-        self._counter = 0
+class FakeSession:
+    def __init__(self, events: list[str], auth_user: str) -> None:
+        self.events = events
+        self.active_context = SimpleNamespace(
+            page=FakePage(events), auth_user=auth_user
+        )
+
+    @property
+    def page(self) -> FakePage:
+        return self.active_context.page
+
+    async def close(self) -> None:
+        await self.active_context.page.close()
+
+
+class FakeCDP:
+    def __init__(self) -> None:
+        self.events: list[str] = []
         self.created: list[str] = []
-        self.closed: list[str] = []
-        self.fail_accounts: set[str] = set()
-        self.build_budget_full = False
-        self.channel_caps: dict[str, int] = {}
-        self.enabled_channels: set[str] = {"chat", "build"}
+        self.disposed: list[str] = []
+        self._counter = 0
 
-    def channel_max_instances(self, channel: str) -> int | None:
-        return self.channel_caps.get(channel)
-
-    def channel_enabled(self, channel: str) -> bool:
-        return channel in self.enabled_channels
-
-    def slots(self) -> tuple[FakeSlot, ...]:
-        return tuple(self._slots.values())
-
-    def get(self, slot_id: str) -> FakeSlot | None:
-        return self._slots.get(slot_id)
-
-    async def check_create_budget(
-        self,
-        channel: str,
-        *,
-        account_id: str | None = None,
-        group_name: str | None = None,
-        group_max_pages: int | None = None,
-    ) -> None:
-        existing = (
-            next(
-                (
-                    slot
-                    for slot in self._slots.values()
-                    if slot.current_account_id == account_id
-                ),
-                None,
-            )
-            if account_id
-            else None
-        )
-        if existing is None and len(self._slots) >= self.max_contexts:
-            raise InstanceCapacityError("capacity")
-        if channel == "build" and self.build_budget_full:
-            raise InstanceCapacityError("build page budget exhausted")
-
-    async def create_instance(self, **kwargs) -> FakeSlot:
-        account_id = str(kwargs["account_id"])
-        channel = str(kwargs.get("channel") or "chat")
-        if account_id in self.fail_accounts:
-            raise RuntimeError("startup failed")
-        existing = next(
-            (
-                slot
-                for slot in self._slots.values()
-                if slot.current_account_id == account_id
-            ),
-            None,
-        )
-        if existing is not None:
-            if channel == "build":
-                if self.build_budget_full:
-                    raise InstanceCapacityError("build page budget exhausted")
-                existing.has_build = True
-                existing.build_counted = True
-            else:
-                existing.has_chat = True
-                existing.chat_counted = True
-            return existing
-        if len(self._slots) >= self.max_contexts:
-            raise InstanceCapacityError("capacity")
-        if channel == "build" and self.build_budget_full:
-            raise InstanceCapacityError("build page budget exhausted")
+    async def create_browser_context(self) -> str:
         self._counter += 1
-        slot = FakeSlot(
-            slot_id=f"slot-{self._counter}",
-            current_account_id=account_id,
-            has_chat=True,
-            has_build=channel == "build",
-            chat_counted=channel == "chat",
-            build_counted=channel == "build",
-            pinned=True,
-        )
-        self._slots[slot.slot_id] = slot
-        self.created.append(slot.slot_id)
-        return slot
+        context_id = f"ctx-{self._counter}"
+        self.created.append(context_id)
+        self.events.append(f"context.create:{context_id}")
+        return context_id
 
-    async def close_instance(self, slot_id: str) -> None:
-        slot = self._slots.get(slot_id)
-        if slot is None:
-            return
-        if slot.in_flight > 0:
-            raise InstanceCapacityError("busy")
-        self._slots.pop(slot_id, None)
-        self.closed.append(slot_id)
-
-    async def ensure_channel(self, slot_id: str, channel: str) -> None:
-        slot = self._slots[slot_id]
-        if channel == "build":
-            if self.build_budget_full:
-                raise InstanceCapacityError("build page budget exhausted")
-            slot.has_build = True
-            slot.build_counted = True
-        else:
-            slot.has_chat = True
-            slot.chat_counted = True
-
-    async def close_channel(self, slot_id: str, channel: str) -> None:
-        slot = self._slots[slot_id]
-        if slot.in_flight > 0:
-            raise InstanceCapacityError("busy")
-        if channel == "build":
-            slot.has_build = False
-            slot.build_counted = False
-        else:
-            slot.has_chat = False
-            slot.chat_counted = False
-
-    async def reassign_instance(self, slot_id: str, **kwargs) -> FakeSlot:
-        slot = self._slots[slot_id]
-        slot.current_account_id = str(kwargs["account_id"])
-        return slot
+    async def dispose_browser_context(self, context_id: str) -> None:
+        self.disposed.append(context_id)
+        self.events.append(f"context.dispose:{context_id}")
 
 
-def _store(
-    *accounts: AccountMeta,
-    active_id: str | None = None,
-    missing_auth: set[str] | None = None,
-) -> object:
-    mapping = {account.id: account for account in accounts}
-    missing = missing_auth or set()
-
-    class Store:
-        def get_account(self, account_id: str) -> AccountMeta | None:
-            return mapping.get(account_id)
-
-        def get_auth_path_optional(
-            self, account_id: str, *, require_exists: bool = False
-        ) -> str | None:
-            if account_id not in mapping or (require_exists and account_id in missing):
-                return None
-            return f"{account_id}.json"
-
-        def list_accounts(self) -> list[AccountMeta]:
-            return list(mapping.values())
-
-        def get_active_account(self) -> AccountMeta | None:
-            if active_id is not None:
-                return mapping.get(active_id)
-            return next(iter(mapping.values()), None)
-
-    return Store()
+async def _ready(value: FakeCDP) -> FakeCDP:
+    return value
 
 
-def _account(
-    account_id: str,
-    *,
-    expired: bool = False,
-    tier: str | None = "Pro",
-    routing: dict[str, object] | None = None,
-) -> AccountMeta:
-    return AccountMeta(
-        id=account_id,
-        name=account_id,
-        email=f"{account_id}@gmail.com",
-        created_at="2026-10-20T00:00:00Z",
-        expired=expired,
-        tier=tier,
-        routing=routing or {},
-    )
+def _factory(cdp: FakeCDP, *, fail_contexts: set[str] | None = None) -> SessionFactory:
+    async def factory(_cdp: Any, **kwargs: Any) -> FakeSession:
+        context_id = str(kwargs["context_id"])
+        cdp.events.append(f"session.create:{context_id}")
+        if fail_contexts and context_id in fail_contexts:
+            raise RuntimeError(f"bootstrap failed for {context_id}")
+        return FakeSession(cdp.events, str(kwargs.get("auth_user") or "0"))
 
-
-TEST_FEATURES: dict[str, object] = {
-    "channels": {
-        "chat": {"enabled": True},
-        "build": {"enabled": True},
-    },
-    "groups": [],
-}
+    return cast("SessionFactory", factory)
 
 
 def _manager(
-    pool: FakePool | None = None,
+    store: AccountStore,
+    cdp: FakeCDP,
     *,
-    accounts: tuple[AccountMeta, ...] | None = None,
-    active_id: str | None = None,
-    missing_auth: set[str] | None = None,
-) -> tuple[InstanceManager, FakePool]:
-    fake_pool = pool or FakePool()
-    manager = InstanceManager(
-        fake_pool,  # type: ignore[arg-type]
-        _store(  # type: ignore[arg-type]
-            *(accounts or (_account("a"), _account("b"), _account("c"))),
-            active_id=active_id,
-            missing_auth=missing_auth,
-        ),
-        features_provider=lambda: TEST_FEATURES,
+    specs: list[InstanceSpec],
+    max_contexts: int,
+    fail_contexts: set[str] | None = None,
+    load_attempts: int = 1,
+    drain_timeout_s: float = 12.0,
+    retired: list[str] | None = None,
+) -> InstanceManager:
+    pool = InstancePool(
+        cast(Any, lambda: _ready(cdp)),
+        specs=specs,
+        max_contexts=max_contexts,
+        session_factory=_factory(cdp, fail_contexts=fail_contexts),
+        load_attempts=load_attempts,
+        on_slot_retired=(retired.append if retired is not None else None),
     )
-    return manager, fake_pool
+    return InstanceManager(pool, store, drain_timeout_s=drain_timeout_s)
 
 
-async def _settle(manager: InstanceManager) -> None:
+def _store_with_accounts(
+    tmp_path: Any,
+    *accounts: tuple[str, str, str],
+) -> tuple[AccountStore, dict[str, Any]]:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    by_name: dict[str, Any] = {}
+    for name, email, tier in accounts:
+        account = store.save_account(
+            name=name,
+            email=email,
+            storage_state={"cookies": []},
+            tier=tier,
+        )
+        by_name[name] = account
+    if by_name:
+        store.set_active_account(next(iter(by_name.values())).id)
+    return store, by_name
+
+
+def _free_spec(count: int = 1, surface: str = "chat") -> InstanceSpec:
+    return InstanceSpec(count=count, surface=surface, min_tier="Free")
+
+
+def _paid_spec(count: int = 1, surface: str = "chat") -> InstanceSpec:
+    return InstanceSpec(count=count, surface=surface, min_tier="Pro")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        InstanceSpec(count=1, surface="chat", only_tier="Pro"),
+        InstanceSpec(count=1, surface="chat", min_tier="Pro", max_tier="Pro"),
+    ],
+)
+async def test_paid_interval_excludes_ultra_at_startup(tmp_path, spec) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("ultra", "ultra@example.com", "Ultra")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[spec], max_contexts=1)
+
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+
+    assert record.state is InstanceState.UNSTARTED
+    assert record.account_id == ""
+    assert cdp.created == []
+
+
+def _by_account(items: tuple[Any, ...], account_id: str) -> Any:
+    return next(item for item in items if item.account_id == account_id)
+
+
+@pytest.mark.asyncio
+async def test_startup_runs_free_and_paid_lanes_isolated(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free", "free@example.com", "Free"),
+        ("pro", "pro@example.com", "Pro"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+
+    await manager.startup()
+    result = await manager.list_instances()
+
+    assert result.max_instances == 2
+    assert len(result.instances) == 2
+    assert all(item.state is InstanceState.ACTIVE for item in result.instances)
+    free_item = _by_account(result.instances, accounts["free"].id)
+    paid_item = _by_account(result.instances, accounts["pro"].id)
+    assert free_item.min_tier == "Free"
+    assert paid_item.min_tier == "Pro"
+    assert [item.id for item in manager.eligible_instances(paid=False)] == [
+        free_item.id
+    ]
+    assert [item.id for item in manager.eligible_instances(paid=True)] == [paid_item.id]
+
+
+@pytest.mark.asyncio
+async def test_free_account_never_occupies_paid_instance(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+
+    await manager.startup()
+    result = await manager.list_instances()
+
+    assert len(result.instances) == 2
+    assert (
+        _by_account(result.instances, accounts["free"].id).state is InstanceState.ACTIVE
+    )
+    paid = next(item for item in result.instances if item.min_tier == "Pro")
+    assert paid.state is InstanceState.UNSTARTED
+    assert paid.account_id == ""
+    assert len(cdp.created) == 1
+
+    store.save_account(
+        name="pro2", email="pro2@example.com", storage_state={"cookies": []}, tier="Pro"
+    )
+    awoken = await manager.wake_eligible(paid=True)
+    assert len(awoken) == 1
+    assert awoken[0].state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_same_account_does_not_get_a_second_instance(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+
+    await manager.startup()
+    result = await manager.list_instances()
+
+    assert len(result.instances) == 2
+    assert (
+        sum(1 for item in result.instances if item.state is InstanceState.ACTIVE) == 1
+    )
+    assert (
+        sum(1 for item in result.instances if item.state is InstanceState.UNSTARTED)
+        == 1
+    )
+    assert len(cdp.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_sleeping_instance_is_woken_on_message_arrival(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+
+    slept = await manager.sleep(record.id)
+    assert slept.state is InstanceState.SLEEPING
+    assert len(cdp.disposed) == 1
+
+    awoken = await manager.wake_eligible(paid=False)
+    assert len(awoken) == 1
+    assert awoken[0].state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_close_refuses_active_requests(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+
+    handle = await manager.begin_request(record.id)
+    with pytest.raises(InstanceBusyError):
+        await manager.close(record.id)
+
+    handle.release()
+    closed = await manager.close(record.id)
+    assert closed is not None
+    assert closed.state is InstanceState.RECLAIMING
+    assert (await manager.list_instances()).instances == ()
+
+
+@pytest.mark.asyncio
+async def test_d05_rebind_waits_for_active_request_then_switches(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec(count=2)], max_contexts=2, drain_timeout_s=1.0
+    )
+    await manager.startup()
+    first = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(first.id)
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.02)
+        handle.release()
+
+    task = asyncio.create_task(_release_soon())
+    switched = await manager.rebind_account(
+        free2.id, previous_account_id=accounts["free1"].id, reason="test"
+    )
+    await task
+
+    assert switched.account_id == free2.id
+    assert switched.state is InstanceState.ACTIVE
+    active = store.get_active_account()
+    assert active is not None
+    assert active.id == free2.id
+    assert first.id not in {
+        item.id
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["free1"].id
+        and item.state is InstanceState.ACTIVE
+    }
+
+    page_close = cdp.events.index("page.close")
+    old_dispose = cdp.events.index("context.dispose:ctx-1")
+    new_create = cdp.events.index("context.create:ctx-2")
+    assert page_close < old_dispose < new_create
+
+
+@pytest.mark.asyncio
+async def test_d05_rebind_timeout_force_closes_and_creates_page_after(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec(count=2)], max_contexts=2, drain_timeout_s=0.02
+    )
+    await manager.startup()
+    first = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(first.id)
+    started = time.monotonic()
+    switched = await manager.rebind_account(
+        free2.id, previous_account_id=accounts["free1"].id, reason="test"
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert switched.account_id == free2.id
+    active = store.get_active_account()
+    assert active is not None
+    assert active.id == free2.id
+    assert "context.dispose:ctx-1" in cdp.events
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert cdp.events.index("context.dispose:ctx-1") < cdp.events.index(
+        "context.create:ctx-2"
+    )
+    handle.release()
+
+
+@pytest.mark.asyncio
+async def test_d05_rebind_failure_is_explicit_and_restores_old_account(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store,
+        cdp,
+        specs=[_free_spec(count=2)],
+        max_contexts=2,
+        fail_contexts={"ctx-2"},
+        drain_timeout_s=0.5,
+    )
+    await manager.startup()
+    first = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    with pytest.raises(InstanceRebindError):
+        await manager.rebind_account(
+            free2.id, previous_account_id=accounts["free1"].id, reason="test"
+        )
+
+    active = store.get_active_account()
+    assert active is not None
+    assert active.id == accounts["free1"].id
+    restored = next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["free1"].id
+    )
+    assert restored.state is InstanceState.ACTIVE
+    target = next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.id == first.id
+    )
+    assert target.id == restored.id
+
+
+@pytest.mark.asyncio
+async def test_d05_rebind_failure_single_slot_keeps_restored_account(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store,
+        cdp,
+        specs=[_free_spec(count=1)],
+        max_contexts=1,
+        fail_contexts={"ctx-2"},
+        drain_timeout_s=0.5,
+    )
+    await manager.startup()
+    first = (await manager.list_instances()).instances[0]
+    store.toggle_account_enabled(accounts["free1"].id, False)
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    with pytest.raises(InstanceRebindError):
+        await manager.rebind_account(
+            free2.id, previous_account_id=accounts["free1"].id, reason="test"
+        )
+
+    active = store.get_active_account()
+    assert active is not None
+    assert active.id == accounts["free1"].id
+    records = (await manager.list_instances()).instances
+    assert len(records) == 1
+    assert records[0].id == first.id
+    assert records[0].account_id == accounts["free1"].id
+    assert records[0].state is InstanceState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_switch_surface_reuses_slot_and_rolls_back_on_failure(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    specs = [_free_spec(surface="chat"), _free_spec(surface="build")]
+    manager = _manager(
+        store,
+        cdp,
+        specs=specs,
+        max_contexts=2,
+        fail_contexts={"ctx-2"},
+        load_attempts=1,
+    )
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    assert record.surface == "chat"
+
+    from aistudio_api.application.instance_manager import InstanceNotReadyError
+
+    with pytest.raises(InstanceNotReadyError):
+        await manager.switch_to(record.id, "build")
+
+    after = (await manager.list_instances()).instances[0]
+    assert after.surface == "chat"
+    assert after.state is InstanceState.ACTIVE
+    assert len(manager._pool.slots()) == 2
+    assert "context.dispose:ctx-1" in cdp.events
+    assert "context.create:ctx-3" in cdp.events
+
+
+@pytest.mark.asyncio
+async def test_switch_surface_when_capacity_full_keeps_slot_count(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    specs = [_free_spec(surface="chat"), _free_spec(surface="build")]
+    manager = _manager(store, cdp, specs=specs, max_contexts=2)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+
+    switched = await manager.switch_to(record.id, "build")
+
+    assert switched.surface == "build"
+    assert len(manager._pool.slots()) == 2
+    assert sum(1 for item in manager._pool.slots() if item.context_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_instance_waits_for_manual_restart(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    slot = manager._pool.slots()[0]
+    assert slot is not None
+    assert slot.page is not None
+    slot.page.closed = True
+
+    listed = (await manager.list_instances()).instances[0]
+    assert listed.state is InstanceState.INVALID
+    assert len(cdp.created) == 1  # no automatic stale revival
+
+    restarted = await manager.restart(record.id)
+    assert restarted.state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_ready_same_account_forces_close_and_rebuild(
+    tmp_path, monkeypatch
+) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    slot = manager._pool.slots()[0]
+    assert slot.state is SlotState.READY
+    first_context = slot.context_id
+    first_realm = slot.realm_id
+    first_session = slot.session
+    assert first_session is not None
+
+    calls: list[dict[str, Any]] = []
+    original = manager._pool.activate
+
+    async def spy(slot_id: str, **kwargs: Any) -> Any:
+        calls.append({"slot_id": slot_id, **kwargs})
+        return await original(slot_id, **kwargs)
+
+    monkeypatch.setattr(manager._pool, "activate", spy)
+
+    restarted = await manager.restart(record.id)
+
+    assert calls
+    assert calls[-1]["slot_id"] == slot.slot_id
+    assert calls[-1]["force"] is True
+    assert restarted.state is InstanceState.ACTIVE
+    assert slot.state is SlotState.READY
+    assert slot.generation == 2
+    assert slot.realm_id != first_realm
+    assert slot.context_id != first_context
+    assert slot.session is not first_session
+    assert cdp.created == ["ctx-1", "ctx-2"]
+    assert cdp.disposed == [first_context]
+    assert "page.close" in cdp.events
+    assert cdp.events.index("page.close") < cdp.events.index(
+        f"context.dispose:{first_context}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_ready_same_account_with_inflight_request_stays_busy(
+    tmp_path,
+) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    slot = manager._pool.slots()[0]
+    handle = await manager._pool.begin_request(slot.slot_id)
+
+    try:
+        with pytest.raises(InstanceBusyError):
+            await manager.restart(record.id)
+    finally:
+        handle.release()
+
+    assert slot.state is SlotState.READY
+    assert slot.generation == 1
+    assert cdp.created == ["ctx-1"]
+    assert cdp.disposed == []
+
+
+@pytest.mark.asyncio
+async def test_reassign_drains_inflight_then_switches_same_slot(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec()], max_contexts=1, drain_timeout_s=1.0
+    )
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(record.id)
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.02)
+        handle.release()
+
+    task = asyncio.create_task(_release_soon())
+    updated = await manager.reassign(record.id, free2.id)
+    await task
+
+    assert updated.account_id == free2.id
+    assert updated.state is InstanceState.ACTIVE
+    assert updated.in_flight == 0
+    assert cdp.events.index("page.close") < cdp.events.index("context.dispose:ctx-1")
+    assert cdp.events.index("context.dispose:ctx-1") < cdp.events.index(
+        "context.create:ctx-2"
+    )
+    assert accounts["free1"].id != updated.account_id
+
+
+@pytest.mark.asyncio
+async def test_reassign_timeout_force_closes_and_switches_same_slot(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(
+        store, cdp, specs=[_free_spec()], max_contexts=1, drain_timeout_s=0.02
+    )
+    await manager.startup()
+    record = (await manager.list_instances()).instances[0]
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    handle = await manager.begin_request(record.id)
+    started = time.monotonic()
+    updated = await manager.reassign(record.id, free2.id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert updated.account_id == free2.id
+    assert updated.state is InstanceState.ACTIVE
+    assert updated.in_flight == 0
+    assert "context.dispose:ctx-1" in cdp.events
+    assert cdp.events.index("context.dispose:ctx-1") < cdp.events.index(
+        "context.create:ctx-2"
+    )
+    handle.release()
+
+
+@pytest.mark.asyncio
+async def test_reassign_unbound_slot_binds_account(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    unbound = next(
+        item for item in (await manager.list_instances()).instances if not item.account_id
+    )
+    assert unbound.state is InstanceState.UNSTARTED
+    free2 = store.save_account(
+        name="free2",
+        email="free2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+
+    bound = await manager.reassign(unbound.id, free2.id)
+
+    assert bound.account_id == free2.id
+    assert bound.state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_reassign_rejects_account_bound_to_other_instance(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free1", "free1@example.com", "Free"),
+        ("free2", "free2@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    first = next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["free1"].id
+    )
+
+    with pytest.raises(InstanceAlreadyExistsError, match="已绑定实例 #2"):
+        await manager.reassign(first.id, accounts["free2"].id)
+
+
+@pytest.mark.asyncio
+async def test_reassign_recovers_account_from_invalid_stale_slot(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free1", "free1@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(count=2)], max_contexts=2)
+    await manager.startup()
+    records = (await manager.list_instances()).instances
+    bound = next(item for item in records if item.account_id)
+    unbound = next(item for item in records if not item.account_id)
+    bound_slot = next(
+        slot
+        for slot in manager._pool.slots()
+        if slot.account_id == accounts["free1"].id
+    )
+    assert bound_slot.page is not None
+    bound_slot.page.closed = True
+
+    stale = (await manager.list_instances()).instances
+    stale_bound = next(item for item in stale if item.id == bound.id)
+    assert stale_bound.state is InstanceState.INVALID
+    assert stale_bound.account_id == accounts["free1"].id
+
+    rebound = await manager.reassign(unbound.id, accounts["free1"].id)
+
+    assert rebound.account_id == accounts["free1"].id
+    assert rebound.state is InstanceState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_create_is_async_starting_then_active(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+
+    created = await manager.create(accounts["free"].id)
+
+    assert created.state is InstanceState.STARTING
     await manager.wait_idle()
-
-
-class SlowPool(FakePool):
-    def __init__(self, max_contexts: int = 2) -> None:
-        super().__init__(max_contexts)
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def create_instance(self, **kwargs) -> FakeSlot:
-        self.started.set()
-        await self.release.wait()
-        return await super().create_instance(**kwargs)
+    listed = (await manager.list_instances()).instances
+    assert len(listed) == 1
+    assert listed[0].state is InstanceState.ACTIVE
+    assert listed[0].account_id == accounts["free"].id
 
 
 @pytest.mark.asyncio
-async def test_create_two_instances_and_latest() -> None:
-    manager, pool = _manager()
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-
-    listed = await manager.list_instances()
-    assert listed.max_instances == 2
-    assert [item.number for item in listed.instances] == [1, 2]
-    assert [item.account_id for item in listed.instances] == ["a", "b"]
-    assert listed.latest_instance_id == second.id
-    assert listed.current_instance_id == first.id
-    assert first.id != second.id
-    assert all(item.state.value == "active" for item in listed.instances)
-    assert listed.instances[0].channel == "pg"
-    assert all(slot.pinned for slot in pool.slots())
-
-
-@pytest.mark.asyncio
-async def test_create_with_build_channel_does_not_report_hidden_chat_page() -> None:
-    manager, pool = _manager()
-    item = await manager.create("a", "build")
-    await _settle(manager)
-
-    listed = await manager.list_instances()
-    assert listed.instances[0].channel == "build"
-    assert len(pool.slots()) == 1
-    assert pool.slots()[0].has_chat is True
-    assert pool.slots()[0].chat_counted is False
-    assert item.id == listed.instances[0].id
-
-
-@pytest.mark.asyncio
-async def test_startup_starts_max_contexts_accounts_active_first() -> None:
-    manager, pool = _manager(
-        FakePool(max_contexts=2),
-        accounts=(_account("a"), _account("b"), _account("c")),
-        active_id="b",
+async def test_create_accepts_explicit_tier_selector_without_configured_spec(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
     )
-    await manager.startup()
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[], max_contexts=2)
 
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 2
-    assert [item.account_id for item in listed.instances] == ["b", "a"]
-    assert listed.current_instance_id == listed.instances[0].id
-    assert listed.latest_instance_id == listed.instances[1].id
-    assert len(pool.slots()) == 2
+    created = await manager.create(accounts["free"].id, only_tier="Free")
+
+    assert created.state is InstanceState.STARTING
+    assert created.only_tier == "Free"
+    assert created.min_tier == "Free"
+    assert created.max_tier == "Free"
+    await manager.wait_idle()
+    listed = (await manager.list_instances()).instances
+    assert listed[0].state is InstanceState.ACTIVE
+    assert listed[0].account_id == accounts["free"].id
 
 
 @pytest.mark.asyncio
-async def test_startup_starts_fewer_when_accounts_are_unavailable() -> None:
-    manager, pool = _manager(
-        FakePool(max_contexts=3),
-        accounts=(
-            _account("a"),
-            _account("expired", expired=True),
-            _account("missing"),
-        ),
-        missing_auth={"missing"},
+async def test_create_rejects_account_already_bound_to_instance(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
     )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=2)
     await manager.startup()
-
-    listed = await manager.list_instances()
-    assert [item.account_id for item in listed.instances] == ["a", "a"]
-    assert sorted(item.channel for item in listed.instances) == ["build", "pg"]
-    assert len(pool.slots()) == 1
-
-
-@pytest.mark.asyncio
-async def test_startup_does_not_duplicate_accounts_and_isolates_failures() -> None:
-    pool = FakePool(max_contexts=2)
-    pool.fail_accounts.add("b")
-    manager, _ = _manager(
-        pool,
-        accounts=(_account("a"), _account("b"), _account("c")),
-        active_id="a",
-    )
-    await manager.startup()
-
-    listed = await manager.list_instances()
-    assert [item.account_id for item in listed.instances] == ["a", "c"]
-    assert listed.current_instance_id == listed.instances[0].id
-    assert listed.latest_instance_id == listed.instances[1].id
-
-
-@pytest.mark.asyncio
-async def test_capacity_and_duplicate_account_are_explicit() -> None:
-    manager, _ = _manager(FakePool(max_contexts=1))
-    await manager.create("a")
-    await _settle(manager)
 
     with pytest.raises(InstanceAlreadyExistsError):
-        await manager.create("a")
-    with pytest.raises(InstanceCapacityExhaustedError):
-        await manager.create("b")
+        await manager.create(accounts["free"].id)
 
 
 @pytest.mark.asyncio
-async def test_expired_account_is_rejected() -> None:
-    manager, _ = _manager(accounts=(_account("a", expired=True),))
-    with pytest.raises(InstanceInvalidAccountError):
-        await manager.create("a")
+async def test_unbound_restart_and_wake_raise_clear_account_error(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _free_spec()], max_contexts=2)
+    await manager.startup()
+
+    unbound = next(
+        item for item in (await manager.list_instances()).instances if not item.account_id
+    )
+    with pytest.raises(InstanceInvalidAccountError, match="账号"):
+        await manager.restart(unbound.id)
+    with pytest.raises(InstanceInvalidAccountError, match="账号"):
+        await manager.wake(unbound.id)
 
 
 @pytest.mark.asyncio
-async def test_build_budget_is_checked_before_creating_a_half_instance() -> None:
-    pool = FakePool()
-    pool.build_budget_full = True
-    manager, _ = _manager(pool)
+async def test_close_without_instance_id_closes_pool(tmp_path) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
 
-    with pytest.raises(InstanceCapacityExhaustedError):
-        await manager.create("a", "build")
+    result = await manager.close()
+
+    assert result is None
+    assert manager._pool.slots() == ()
     assert (await manager.list_instances()).instances == ()
-    assert pool.created == []
 
 
 @pytest.mark.asyncio
-async def test_close_refuses_in_flight_then_reclaims() -> None:
-    manager, pool = _manager()
-    item = await manager.create("a")
-    await _settle(manager)
-    slot = pool.slots()[0]
-    slot.in_flight = 1
-
-    with pytest.raises(InstanceBusyError):
-        await manager.close(item.id)
-
-    slot.in_flight = 0
-    closing = await manager.close(item.id)
-    assert closing.state.value == "reclaiming"
-    await _settle(manager)
-    assert (await manager.list_instances()).instances == ()
-    assert pool.closed == [slot.slot_id]
-
-
-@pytest.mark.asyncio
-async def test_reassign_preserves_number_and_does_not_change_latest() -> None:
-    manager, _pool = _manager()
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-
-    updated = await manager.reassign(first.id, "c")
-    await _settle(manager)
-    listed = await manager.list_instances()
-
-    assert updated.id == first.id
-    assert updated.number == first.number
-    changed = next(item for item in listed.instances if item.id == first.id)
-    assert changed.account_id == "c"
-    assert changed.number == first.number
-    assert listed.latest_instance_id == second.id
-    assert listed.current_instance_id == first.id
-
-
-@pytest.mark.asyncio
-async def test_latest_falls_back_when_latest_closes() -> None:
-    manager, _ = _manager()
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-
-    await manager.close(second.id)
-    await _settle(manager)
-    listed = await manager.list_instances()
-    assert listed.latest_instance_id == first.id
-    assert [item.latest for item in listed.instances] == [True]
-
-
-@pytest.mark.asyncio
-async def test_listing_while_starting_does_not_adopt_the_same_slot() -> None:
-    slow_pool = SlowPool()
-    manager, _ = _manager(slow_pool)
-    await manager.create("a")
-    await slow_pool.started.wait()
-
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 1
-    assert listed.instances[0].state.value == "starting"
-
-    slow_pool.release.set()
-    await _settle(manager)
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 1
-    assert listed.instances[0].state.value == "active"
-
-
-@pytest.mark.asyncio
-async def test_extra_pool_slot_for_same_account_is_not_adopted() -> None:
-    manager, pool = _manager()
-    await manager.create("a")
-    await _settle(manager)
-    pool._slots["slot-extra"] = FakeSlot(
-        slot_id="slot-extra", current_account_id="a", pinned=False
+async def test_sync_account_tier_moves_promoted_account_to_paid_and_refills_free(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("promoted", "promoted@example.com", "Free"),
+        ("spare", "spare@example.com", "Free"),
     )
-
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 1
-
-
-@pytest.mark.asyncio
-async def test_switch_active_instance_does_not_close_other_instances() -> None:
-    pool = FakePool()
-    calls: list[str] = []
-
-    async def switch_account(account_id: str) -> bool:
-        calls.append(account_id)
-        return True
-
-    manager = InstanceManager(
-        pool,  # type: ignore[arg-type]
-        _store(_account("a"), _account("b")),  # type: ignore[arg-type]
-        switch_account=switch_account,
-    )
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-
-    switched = await manager.switch_to(second.id)
-    listed = await manager.list_instances()
-
-    assert switched.id == second.id
-    assert listed.current_instance_id == second.id
-    assert calls == ["b"]
-    assert len(listed.instances) == 2
-    assert pool.closed == []
-    assert first.id != second.id
-
-
-@pytest.mark.asyncio
-async def test_failed_account_switch_keeps_current_unchanged() -> None:
-    pool = FakePool()
-
-    async def switch_account(_account_id: str) -> bool:
-        return False
-
-    manager = InstanceManager(
-        pool,  # type: ignore[arg-type]
-        _store(_account("a"), _account("b")),  # type: ignore[arg-type]
-        switch_account=switch_account,
-    )
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-    before = (await manager.list_instances()).current_instance_id
-
-    with pytest.raises(InstanceNotReadyError):
-        await manager.switch_to(second.id)
-
-    listed = await manager.list_instances()
-    assert listed.current_instance_id == before
-    assert listed.current_instance_id == first.id
-
-
-@pytest.mark.asyncio
-async def test_switch_active_target_can_start_another_channel_without_new_instance() -> (
-    None
-):
-    manager, pool = _manager()
-    item = await manager.create("a")
-    await _settle(manager)
-    await manager.switch_to(item.id, "build")
-    listed = await manager.list_instances()
-
-    assert len(listed.instances) == 2
-    assert {item.channel for item in listed.instances} == {"pg", "build"}
-    assert len(pool.slots()) == 1
-    assert pool.slots()[0].has_build is True
-
-
-@pytest.mark.asyncio
-async def test_switch_channel_budget_failure_returns_409_without_page() -> None:
-    pool = FakePool()
-    manager, _ = _manager(pool)
-    item = await manager.create("a")
-    await _settle(manager)
-    pool.build_budget_full = True
-
-    with pytest.raises(InstanceCapacityExhaustedError):
-        await manager.switch_to(item.id, "build")
-
-    listed = await manager.list_instances()
-    assert listed.instances[0].channel == "pg"
-    assert pool.slots()[0].has_build is False
-
-
-@pytest.mark.asyncio
-async def test_switch_inactive_target_restarts_without_closing_when_capacity_free() -> (
-    None
-):
-    manager, pool = _manager(FakePool(max_contexts=2))
-    await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-    slot_id = next(
-        item.runtime_ref for item in manager._records.values() if item.id == second.id
-    )
-    await pool.close_instance(slot_id)
-    listed = await manager.list_instances()
-    assert (
-        next(item for item in listed.instances if item.id == second.id).state.value
-        == "invalid"
-    )
-
-    switched = await manager.switch_to(second.id)
-    listed = await manager.list_instances()
-
-    assert switched.state.value == "active"
-    assert len(listed.instances) == 2
-    assert listed.current_instance_id == second.id
-
-
-@pytest.mark.asyncio
-async def test_switch_inactive_target_closes_current_when_capacity_full() -> None:
-    manager, pool = _manager(FakePool(max_contexts=2))
-    first = await manager.create("a")
-    await _settle(manager)
-    second = await manager.create("b")
-    await _settle(manager)
-    slot_id = next(
-        item.runtime_ref for item in manager._records.values() if item.id == second.id
-    )
-    await pool.close_instance(slot_id)
-    await manager.list_instances()
-    pool.max_contexts = 1
-
-    switched = await manager.switch_to(second.id)
-    listed = await manager.list_instances()
-
-    assert switched.state.value == "active"
-    assert [item.id for item in listed.instances] == [second.id]
-    assert listed.current_instance_id == second.id
-    assert first.id not in {item.id for item in listed.instances}
-
-async def test_startup_assigns_chat_to_paid_and_build_to_free() -> None:
-    manager, _ = _manager(
-        FakePool(max_contexts=2),
-        accounts=(
-            _account("free", tier="Free"),
-            _account("pro", tier="Pro"),
-        ),
-        active_id="free",
-    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
     await manager.startup()
 
-    listed = await manager.list_instances()
+    before = (await manager.list_instances()).instances
+    free_before = next(item for item in before if item.min_tier == "Free")
+    assert free_before.account_id == accounts["promoted"].id
+    assert next(item for item in before if item.min_tier == "Pro").account_id == ""
 
-    by_channel = {item.channel: item.account_id for item in listed.instances}
-    assert by_channel == {"pg": "pro", "build": "free"}
+    store.update_account_tier(accounts["promoted"].id, "Pro")
+    updated = await manager.sync_account_tier(accounts["promoted"].id, "Pro")
 
-
-async def test_startup_respects_channel_caps() -> None:
-    pool = FakePool(max_contexts=2)
-    pool.channel_caps = {"chat": 1, "build": 1}
-    manager, _ = _manager(
-        pool,
-        accounts=(_account("pro", tier="Pro"), _account("free", tier="Free")),
+    assert updated >= 1
+    after = (await manager.list_instances()).instances
+    promoted = next(
+        item for item in after if item.account_id == accounts["promoted"].id
     )
-    await manager.startup()
+    spare = next(item for item in after if item.account_id == accounts["spare"].id)
+    assert promoted.min_tier == "Pro"
+    assert promoted.state is InstanceState.ACTIVE
+    assert promoted.tier == "Pro"
+    assert spare.min_tier == "Free"
+    assert spare.state is InstanceState.ACTIVE
+    assert spare.tier == "Free"
+    assert sum(
+        1 for item in after if item.account_id == accounts["promoted"].id
+    ) == 1
 
-    listed = await manager.list_instances()
-
-    assert sorted((item.channel, item.account_id) for item in listed.instances) == [
-        ("build", "free"),
-        ("pg", "pro"),
-    ]
-
-
-async def test_startup_respects_account_channel_tags() -> None:
-    manager, _ = _manager(
-        FakePool(max_contexts=2),
-        accounts=(
-            _account("pro", tier="Pro", routing={"surfaces": ["build"]}),
-            _account("free", tier="Free", routing={"surfaces": ["build"]}),
-        ),
+    slots = manager._pool.slots()
+    promoted_slot = next(
+        slot for slot in slots if slot.account_id == accounts["promoted"].id
     )
-    await manager.startup()
-
-    listed = await manager.list_instances()
-
-    assert sorted((item.channel, item.account_id) for item in listed.instances) == [
-        ("build", "free"),
-    ]
-
-
-async def test_create_rejects_when_channel_cap_reached() -> None:
-    pool = FakePool(max_contexts=2)
-    pool.channel_caps = {"chat": 1}
-    manager, _ = _manager(pool, accounts=(_account("a"), _account("b")))
-
-    await manager.create("a", "chat")
-    with pytest.raises(InstanceCapacityExhaustedError):
-        await manager.create("b", "chat")
-
-@pytest.mark.asyncio
-async def test_single_instance_mode_starts_one_and_replaces_channel() -> None:
-    manager, pool = _manager(
-        FakePool(max_contexts=1),
-        accounts=(_account("a"),),
+    spare_slot = next(
+        slot for slot in slots if slot.account_id == accounts["spare"].id
     )
-    await manager.startup()
+    assert promoted_slot.lane == "paid"
+    assert promoted_slot.session is not None
+    assert promoted_slot.session.active_context.tier == "Pro"
+    assert spare_slot.lane == "free"
+    assert spare_slot.session is not None
+    assert spare_slot.session.active_context.tier == "Free"
 
-    listed = await manager.list_instances()
-    assert listed.max_instances == 1
-    assert len(listed.instances) == 1
-    assert listed.instances[0].channel == "pg"
-
-    with pytest.raises(InstanceCapacityExhaustedError):
-        await manager.create("a", "build")
-
-    switched = await manager.switch_to(listed.instances[0].id, "build")
-    await _settle(manager)
-
-    assert switched.channel == "build"
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 1
-    assert listed.instances[0].channel == "build"
-    assert len(pool.slots()) == 1
+    await manager.sync_account_tier(accounts["promoted"].id, "Pro")
+    account_ids = [slot.account_id for slot in manager._pool.slots() if slot.account_id]
+    assert len(account_ids) == len(set(account_ids))
+    assert next(
+        item
+        for item in (await manager.list_instances()).instances
+        if item.account_id == accounts["promoted"].id
+    ).min_tier == "Pro"
 
 
 @pytest.mark.asyncio
-async def test_single_instance_failed_channel_replace_restores_old_channel() -> None:
-    manager, pool = _manager(
-        FakePool(max_contexts=1),
-        accounts=(_account("a"),),
+async def test_sync_account_tier_without_free_replacement_unbinds_free_slot(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("promoted", "promoted@example.com", "Free")
     )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
     await manager.startup()
-    listed = await manager.list_instances()
-    target = listed.instances[0]
-    slot = pool.slots()[0]
 
-    pool.fail_accounts.add("a")
-    with pytest.raises(InstanceNotReadyError):
-        await manager.switch_to(target.id, "build")
+    store.update_account_tier(accounts["promoted"].id, "Pro")
+    await manager.sync_account_tier(accounts["promoted"].id, "Pro")
 
-    await _settle(manager)
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 1
-    assert listed.instances[0].id == target.id
-    assert listed.instances[0].channel == "pg"
-    assert listed.instances[0].state.value == "active"
-    assert len(pool.slots()) == 1
-    assert slot.has_chat is True
-    assert slot.has_build is False
+    after = (await manager.list_instances()).instances
+    promoted = next(
+        item for item in after if item.account_id == accounts["promoted"].id
+    )
+    free_item = next(item for item in after if item.min_tier == "Free")
+    assert promoted.min_tier == "Pro"
+    assert promoted.state is InstanceState.ACTIVE
+    assert free_item.account_id == ""
+    assert free_item.state is InstanceState.UNSTARTED
+
+    free_slot = next(slot for slot in manager._pool.slots() if slot.lane == "free")
+    assert free_slot.account_id == ""
+    assert free_slot.state is SlotState.UNSTARTED
+    assert free_slot.session is None
+
+    spare = store.save_account(
+        name="spare",
+        email="spare@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+    )
+    awoken = await manager.wake_eligible(paid=False)
+
+    assert len(awoken) == 1
+    assert awoken[0].account_id == spare.id
+    assert awoken[0].state is InstanceState.ACTIVE
+    assert free_slot.account_id == spare.id
 
 
 @pytest.mark.asyncio
-async def test_three_instance_limit_allows_2c3p() -> None:
-    manager, pool = _manager(
-        FakePool(max_contexts=3),
-        accounts=(_account("a"), _account("b")),
+async def test_sync_account_tier_binds_restored_pro_to_unstarted_paid_slot(
+    tmp_path,
+) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free", "free@example.com", "Free"),
+        ("dormant", "dormant@example.com", "Free"),
     )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec(), _paid_spec()], max_contexts=2)
+    await manager.startup()
 
-    await manager.create("a", "chat")
-    await _settle(manager)
-    await manager.create("a", "build")
-    await _settle(manager)
-    await manager.create("b", "chat")
-    await _settle(manager)
+    before = (await manager.list_instances()).instances
+    assert next(item for item in before if item.min_tier == "Pro").state is InstanceState.UNSTARTED
 
-    listed = await manager.list_instances()
-    assert len(listed.instances) == 3
-    assert len(pool.slots()) == 2
-    assert [(item.account_id, item.channel) for item in listed.instances] == [
-        ("a", "pg"),
-        ("a", "build"),
-        ("b", "pg"),
-    ]
+    store.update_account_tier(accounts["dormant"].id, "Pro")
+    await manager.sync_account_tier(accounts["dormant"].id, "Pro")
 
+    after = (await manager.list_instances()).instances
+    dormant = next(item for item in after if item.account_id == accounts["dormant"].id)
+    assert dormant.min_tier == "Pro"
+    assert dormant.state is InstanceState.ACTIVE
+    assert dormant.tier == "Pro"
+    paid_slot = next(slot for slot in manager._pool.slots() if slot.lane == "paid")
+    assert paid_slot.account_id == accounts["dormant"].id
+    assert paid_slot.state is SlotState.READY
+    assert paid_slot.session is not None
+    assert paid_slot.session.active_context.tier == "Pro"
 
 
 @pytest.mark.asyncio
-async def test_single_instance_replace_skips_account_switch_for_current_account() -> None:
-    pool = FakePool(max_contexts=1)
-    calls: list[str] = []
-
-    async def switch_account(account_id: str) -> bool:
-        calls.append(account_id)
-        return False
-
-    manager = InstanceManager(
-        pool,  # type: ignore[arg-type]
-        _store(_account("a")),  # type: ignore[arg-type]
-        switch_account=switch_account,
-        features_provider=lambda: TEST_FEATURES,
+async def test_sync_account_tier_same_lane_updates_without_restart(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("pro", "pro@example.com", "Pro")
     )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_paid_spec()], max_contexts=1)
     await manager.startup()
-    listed = await manager.list_instances()
-    target = listed.instances[0]
-    slot = pool.slots()[0]
 
-    switched = await manager.switch_to(target.id, "build")
+    slot = manager._pool.slots()[0]
+    context_id = slot.context_id
+    assert slot.account_id == accounts["pro"].id
+    assert slot.tier == "Pro"
 
-    await _settle(manager)
-    listed = await manager.list_instances()
-    assert switched.channel == "build"
-    assert calls == []
-    assert len(listed.instances) == 1
-    assert listed.instances[0].channel == "build"
-    assert listed.instances[0].state.value == "active"
-    assert len(pool.slots()) == 1
-    assert slot.has_chat is False
-    assert slot.has_build is True
+    store.update_account_tier(accounts["pro"].id, "Ultra")
+    updated = await manager.sync_account_tier(accounts["pro"].id, "Ultra")
+
+    assert updated == 1
+    assert slot.account_id == accounts["pro"].id
+    assert slot.context_id == context_id
+    assert slot.tier == "Ultra"
+    assert slot.session is not None
+    assert slot.session.active_context.tier == "Ultra"
+    assert len(cdp.created) == 1
+    listed = (await manager.list_instances()).instances
+    assert len(listed) == 1
+    assert listed[0].account_id == accounts["pro"].id
+    assert listed[0].tier == "Ultra"
+
+
+@pytest.mark.asyncio
+async def test_ready_slot_for_account_reuses_existing_page(tmp_path) -> None:
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[_free_spec()], max_contexts=1)
+    await manager.startup()
+    created_before = len(cdp.created)
+
+    slot = manager.ready_slot_for_account(accounts["free"].id)
+
+    assert slot is not None
+    assert slot.account_id == accounts["free"].id
+    assert slot.session is not None
+    # Lookup must not create another Context/Page or retire the slot.
+    assert len(cdp.created) == created_before
+    assert manager.ready_slot_for_account("missing-account") is None
+    assert len(cdp.created) == created_before

@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from aistudio_api.infrastructure.account.account_store import (
         AccountMeta,
+        AccountPreset,
         AccountStore,
+        PresetApplyResult,
     )
-    from aistudio_api.infrastructure.gateway.client import AIStudioClient
     from aistudio_api.infrastructure.gateway.session import BrowserSession
-from aistudio_api.domain.account_tags import account_tags
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("account")
@@ -53,10 +52,8 @@ class AccountService:
         self,
         account_id: str,
         browser_session: BrowserSession,
-        *,
-        client: AIStudioClient | None = None,
     ) -> AccountMeta | None:
-        """切换到指定账号（失败回滚活跃标记；模板缺失自动重试一次）。"""
+        """切换到指定账号。"""
         account = self._store.get_account(account_id)
         if account is None:
             return None
@@ -66,95 +63,30 @@ class AccountService:
             logger.error("账号 %s 的账号目录不存在", account_id)
             return None
 
-        previous = self._store.get_active_account()
-        previous_id = previous.id if previous is not None else None
-
-        saved_previous = False
-        with suppress(Exception):
-            if client is not None:
-                saved_previous = await client.save_current_cookies()
-            else:
-                saved_previous = await browser_session.save_current_cookies()
-        if previous_id and saved_previous:
-            self._store.mark_auth_saved(previous_id)
-
         self._store.set_active_account(account_id)
         logger.info("已切换活跃账号持久化状态: %s", account_id)
-        try:
-            await self._switch_with_template_retry(
-                browser_session, str(auth_path), client=client
-            )
-        except Exception:
-            if previous_id and self._store.get_account(previous_id) is not None:
-                self._store.set_active_account(previous_id)
-                logger.warning(
-                    "账号切换失败，已回滚活跃账号持久化状态为: %s", previous_id
-                )
-            raise
-        self._store.mark_auth_saved(account_id)
+        await browser_session.switch_auth(str(auth_path))
+        await browser_session.ensure_botguard_service()
         logger.info("已切换到账号: %s (%s)", account_id, account.name)
         return account
-
-    async def _switch_with_template_retry(
-        self,
-        browser_session: BrowserSession,
-        auth_path: str,
-        attempts: int = 2,
-        *,
-        client: AIStudioClient | None = None,
-    ) -> None:
-        """切换会话；BotGuard 模板缺失属偶发竞态，重试一次。"""
-        for attempt in range(attempts):
-            try:
-                if client is not None:
-                    await client.switch_auth(auth_path)
-                else:
-                    await browser_session.switch_auth(auth_path)
-                await browser_session.ensure_botguard_service()
-                return
-            except RuntimeError as exc:
-                retryable = "wire template missing" in str(exc).lower()
-                if not retryable or attempt >= attempts - 1:
-                    raise
-                logger.warning(
-                    "BotGuard 模板缺失，重试账号切换 (%d/%d): %s",
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
 
     def delete_account(self, account_id: str) -> bool:
         """删除账号。"""
         return self._store.delete_account(account_id)
 
-    def update_account(
-        self, account_id: str, name: str, tags: list[str] | None = None
-    ) -> AccountMeta | None:
-        """更新账号名称与自定义 tag；tags=None 表示保持不变。"""
-        if tags is None:
-            return self._store.update_account(account_id, name)
-        return self._store.update_account(account_id, name, tags)
-
-    def list_tags(self) -> list[str]:
-        """所有账号的 tag 目录：自定义 tag + tier 自动 tag。"""
-        tags: list[str] = []
-        seen: set[str] = set()
-        for account in self._store.list_accounts():
-            for tag in account_tags(account.tags, account.tier):
-                key = tag.casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                tags.append(tag)
-        return sorted(tags, key=str.casefold)
+    def update_account(self, account_id: str, name: str) -> AccountMeta | None:
+        """更新账号名称。"""
+        return self._store.update_account(account_id, name)
 
     def update_account_email(self, account_id: str, email: str) -> bool:
         """更新账号的登录邮箱。"""
         return self._store.update_account_email(account_id, email)
 
-    def update_account_tier(self, account_id: str, tier: str) -> bool:
+    def update_account_tier(
+        self, account_id: str, tier: str, checked_at: str | None = None
+    ) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
-        return self._store.update_account_tier(account_id, tier)
+        return self._store.update_account_tier(account_id, tier, checked_at=checked_at)
 
     def save_account_from_cookies(
         self,
@@ -166,6 +98,8 @@ class AccountService:
         auth_user: str = "0",
         cookie_id: str | None = None,
         tier: str = "Free",
+        enabled: bool = True,
+        group: str = "default",
     ) -> AccountMeta:
         """从 Cookie 存储状态保存新账号。"""
         return self._store.save_account(
@@ -176,6 +110,8 @@ class AccountService:
             auth_user=auth_user,
             cookie_id=cookie_id,
             tier=tier,
+            enabled=enabled,
+            group=group,
         )
 
     def batch_import_accounts(
@@ -213,3 +149,51 @@ class AccountService:
     def get_account_auth_path(self, account_id: str) -> Path | None:
         """获取指定账号的 auth.json 路径。"""
         return self._store.get_auth_path(account_id)
+
+    def toggle_account_enabled(
+        self, account_id: str, enabled: bool | None = None
+    ) -> AccountMeta | None:
+        """切换账号的启用/禁用状态。"""
+        return self._store.toggle_account_enabled(account_id, enabled)
+
+    def update_account_group(self, account_id: str, group: str) -> AccountMeta | None:
+        """更新账号所属分组。"""
+        return self._store.update_account_group(account_id, group)
+
+    def list_groups(self) -> list[str]:
+        """列出当前存在的所有分组。"""
+        return self._store.list_groups()
+
+    def select_active_candidate(
+        self, *, exclude: set[str] | None = None
+    ) -> AccountMeta | None:
+        """选择首个 enabled 且未过期的账号作为 rebind 目标（不改写 active）。"""
+        return self._store.select_active_candidate(exclude=exclude)
+
+    def refresh_duplicate_flags(self) -> int:
+        """重算同邮箱重复账号标记。"""
+        return self._store.refresh_duplicate_flags()
+
+    def list_presets(self) -> list[AccountPreset]:
+        """列出所有预设方案。"""
+        return self._store.list_presets()
+
+    def get_preset(self, preset_id: str) -> AccountPreset | None:
+        """获取单个预设方案。"""
+        return self._store.get_preset(preset_id)
+
+    def save_preset(self, preset: AccountPreset) -> AccountPreset:
+        """保存或更新预设方案。"""
+        return self._store.save_preset(preset)
+
+    def delete_preset(self, preset_id: str) -> bool:
+        """删除自定义预设。"""
+        return self._store.delete_preset(preset_id)
+
+    def create_snapshot_preset(self, name: str, description: str = "") -> AccountPreset:
+        """快照保存当前所有已启用账号。"""
+        return self._store.create_snapshot_preset(name, description)
+
+    def apply_preset(self, preset_id: str) -> PresetApplyResult:
+        """一键应用预设方案（返回 rebind 信号，不提前改写 active）。"""
+        return self._store.apply_preset(preset_id)

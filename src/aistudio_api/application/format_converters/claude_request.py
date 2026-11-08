@@ -1,8 +1,20 @@
-"""Claude Messages → Gemini request conversion (WP8 Claude format face)."""
+"""Claude Messages -> Gemini request conversion.
+
+The converter is deliberately lenient about replayed tool history (PG-08): a
+``tool_result`` that references an unknown ``tool_use_id`` must never become a
+client 400.  It resolves the name from context, then from an explicit ``name``
+field, and finally falls back to a deterministic ``unknown_tool`` label.  Every
+``functionCall.args`` / ``functionResponse.response`` payload is coerced to a
+JSON object so PG-04 always sees a Struct.
+"""
 
 from __future__ import annotations
 
-from aistudio_api.api.schemas_claude import (
+import json
+from dataclasses import dataclass, field
+from typing import cast
+
+from aistudio_api.application.contracts.claude import (
     ClaudeCountTokensRequest,
     ClaudeMessagesRequest,
 )
@@ -12,9 +24,7 @@ from aistudio_api.application.format_converters.common import (
     decode_data_url,
 )
 from aistudio_api.application.format_converters.media import MediaFetcher
-from aistudio_api.application.format_converters.signature_cache import (
-    signature_cache,
-)
+from aistudio_api.application.signature_cache import signature_cache
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("format.claude")
@@ -23,6 +33,7 @@ _SUPPORTED_BLOCK_TYPES = frozenset(
     {"text", "image", "tool_use", "tool_result", "thinking"}
 )
 _THINKING_TYPES = frozenset({"enabled", "adaptive", "between_tools"})
+_UNKNOWN_TOOL_NAME = "unknown_tool"
 
 
 def _require_str(value: object, *, field: str, what: str) -> str:
@@ -96,17 +107,47 @@ async def _image_part(
     )
 
 
-async def _tool_result_content(
-    content: object, media: MediaFetcher, *, field: str
-) -> tuple[str, list[dict[str, object]]]:
+def _tool_input(value: object) -> dict[str, object]:
+    """Coerce a Claude ``tool_use.input`` payload into a JSON object (PG-04)."""
+    if isinstance(value, dict):
+        return cast("dict[str, object]", value)
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed: object = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return {"content": value}
+        if isinstance(parsed, dict):
+            return cast("dict[str, object]", parsed)
+        return {"content": parsed}
+    return {"content": value}
+
+
+async def _tool_result_response(
+    content: object,
+    *,
+    is_error: bool,
+    media: MediaFetcher,
+    field: str,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Return a Struct response dict plus any image parts (PG-04)."""
     if content is None:
-        return "", []
+        return {}, []
+    if isinstance(content, dict):
+        return cast("dict[str, object]", content), []
     if isinstance(content, str):
-        return content, []
+        key = "error" if is_error else "result"
+        return {key: content}, []
     if not isinstance(content, list):
         raise ConversionError(
-            "tool_result content must be a string or a list of blocks", field=field
+            "tool_result content must be a string, object or a list of blocks",
+            field=field,
         )
+
     texts: list[str] = []
     parts: list[dict[str, object]] = []
     for index, block in enumerate(content):
@@ -127,7 +168,69 @@ async def _tool_result_content(
                 f"unsupported tool_result block type: {block_type!r}",
                 field=item_field,
             )
-    return "\n".join(texts), parts
+    key = "error" if is_error else "result"
+    return {key: "\n".join(texts)}, parts
+
+
+@dataclass
+class _ToolHistory:
+    """Lenient tool-use/tool-result reconciliation for replayed history."""
+
+    names: dict[str, str] = field(default_factory=dict)
+    pending: list[tuple[str, str]] = field(default_factory=list)
+    used_ids: set[str] = field(default_factory=set)
+    synthetic_seq: int = 0
+
+    def synthesize_id(self, message_index: int, call_index: int) -> str:
+        base = f"toolu_auto_{message_index}_{call_index}"
+        candidate = base
+        suffix = 0
+        while candidate in self.used_ids:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+        return candidate
+
+    def resolve_result_name(
+        self, tool_id: str | None, declared_name: str | None
+    ) -> str | None:
+        if tool_id is not None and tool_id in self.names:
+            name = self.names[tool_id]
+            self.pending = [item for item in self.pending if item[0] != tool_id]
+            return name
+        if declared_name:
+            for position, (_pending_id, pending_name) in enumerate(self.pending):
+                if pending_name == declared_name:
+                    self.pending.pop(position)
+                    return pending_name
+            return declared_name
+        if self.pending:
+            _pending_id, pending_name = self.pending.pop(0)
+            return pending_name
+        return None
+
+
+def _collect_tool_names(messages: list[dict[str, object]]) -> dict[str, str]:
+    """Pre-scan the whole history so replayed results can resolve any call id."""
+    names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            raw_id = block.get("id")
+            raw_name = block.get("name")
+            if (
+                isinstance(raw_id, str)
+                and raw_id.strip()
+                and isinstance(raw_name, str)
+                and raw_name.strip()
+            ):
+                names[raw_id.strip()] = raw_name.strip()
+    return names
 
 
 def _merge_content(
@@ -135,6 +238,8 @@ def _merge_content(
     role: str,
     parts: list[dict[str, object]],
 ) -> None:
+    if not parts:
+        return
     if contents and contents[-1].get("role") == role:
         existing = contents[-1].get("parts")
         if isinstance(existing, list):
@@ -151,12 +256,99 @@ def _claude_role_to_gemini(role: object, *, field: str) -> str:
     raise ConversionError(f"unsupported message role: {role!r}", field=field)
 
 
+def _tool_use_part(
+    block: dict[str, object],
+    *,
+    index: int,
+    call_index: int,
+    history: _ToolHistory,
+) -> dict[str, object]:
+    raw_id = block.get("id")
+    tool_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    if not tool_id or tool_id in history.used_ids:
+        tool_id = history.synthesize_id(index, call_index)
+        logger.warning(
+            "[pg08] lenient tool history reason=tool-use-id-%s message=%d call=%d",
+            "duplicate" if raw_id else "missing",
+            index,
+            call_index,
+        )
+    raw_name = block.get("name")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    if not name:
+        name = _UNKNOWN_TOOL_NAME
+        logger.warning(
+            "[pg08] lenient tool history reason=tool-use-name-missing message=%d",
+            index,
+        )
+    history.used_ids.add(tool_id)
+    history.names[tool_id] = name
+    history.pending.append((tool_id, name))
+    signature = signature_cache.get(tool_id)
+    return {
+        "functionCall": {
+            "id": tool_id,
+            "name": name,
+            "args": _tool_input(block.get("input")),
+        },
+        "thoughtSignature": signature or DUMMY_THOUGHT_SIGNATURE,
+    }
+
+
+async def _tool_result_part(
+    block: dict[str, object],
+    *,
+    index: int,
+    field: str,
+    history: _ToolHistory,
+    media: MediaFetcher,
+) -> dict[str, object]:
+    raw_id = block.get("tool_use_id")
+    tool_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else None
+    raw_name = block.get("name")
+    declared_name = (
+        raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+    )
+    name = history.resolve_result_name(tool_id, declared_name)
+    if name is None:
+        name = _UNKNOWN_TOOL_NAME
+        logger.warning(
+            "[pg08] lenient tool history reason=unknown-tool-use-id message=%d "
+            "tool_use_id=%s",
+            index,
+            tool_id or "(missing)",
+        )
+    if tool_id is None:
+        history.synthetic_seq += 1
+        tool_id = f"toolu_output_{index}_{history.synthetic_seq}"
+        logger.warning(
+            "[pg08] lenient tool history reason=missing-tool-use-id message=%d",
+            index,
+        )
+    response, parts = await _tool_result_response(
+        block.get("content"),
+        is_error=bool(block.get("is_error")),
+        media=media,
+        field=field,
+    )
+    function_response: dict[str, object] = {
+        "id": tool_id,
+        "name": name,
+        "response": response,
+    }
+    if parts:
+        function_response["parts"] = parts
+    return {"functionResponse": function_response}
+
+
 async def _convert_block(
     block: object,
     media: MediaFetcher,
     *,
+    index: int,
+    block_index: int,
     field: str,
-    tool_names: dict[str, str],
+    history: _ToolHistory,
 ) -> dict[str, object] | None:
     if not isinstance(block, dict):
         raise ConversionError("content block must be an object", field=field)
@@ -185,55 +377,27 @@ async def _convert_block(
         }
 
     if block_type == "tool_use":
-        tool_id = _require_str(block.get("id"), field=f"{field}.id", what="tool_use id")
-        name = _require_str(block.get("name"), field=f"{field}.name", what="tool name")
-        raw_input = block.get("input")
-        if raw_input is None:
-            tool_input: dict[str, object] = {}
-        elif isinstance(raw_input, dict):
-            tool_input = raw_input
-        else:
-            raise ConversionError(
-                "tool_use input must be an object", field=f"{field}.input"
-            )
-        tool_names[tool_id] = name
-        signature = signature_cache.get(tool_id)
-        return {
-            "functionCall": {"id": tool_id, "name": name, "args": tool_input},
-            "thoughtSignature": signature or DUMMY_THOUGHT_SIGNATURE,
-        }
-
-    # tool_result
-    tool_use_id = _require_str(
-        block.get("tool_use_id"),
-        field=f"{field}.tool_use_id",
-        what="tool_use_id",
-    )
-    name = tool_names.get(tool_use_id)
-    if name is None:
-        raise ConversionError(
-            f"tool_result references unknown tool_use_id: {tool_use_id}",
-            field=f"{field}.tool_use_id",
+        return _tool_use_part(
+            block,
+            index=index,
+            call_index=block_index,
+            history=history,
         )
-    text, parts = await _tool_result_content(block.get("content"), media, field=field)
-    response: dict[str, object] = (
-        {"error": text} if block.get("is_error") else {"result": text}
+
+    return await _tool_result_part(
+        block,
+        index=index,
+        field=field,
+        history=history,
+        media=media,
     )
-    function_response: dict[str, object] = {
-        "id": tool_use_id,
-        "name": name,
-        "response": response,
-    }
-    if parts:
-        function_response["parts"] = parts
-    return {"functionResponse": function_response}
 
 
 async def _convert_messages(
     messages: list[dict[str, object]], media: MediaFetcher
 ) -> list[dict[str, object]]:
     contents: list[dict[str, object]] = []
-    tool_names: dict[str, str] = {}
+    history = _ToolHistory(names=_collect_tool_names(messages))
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ConversionError(
@@ -251,8 +415,10 @@ async def _convert_messages(
                 converted = await _convert_block(
                     block,
                     media,
+                    index=index,
+                    block_index=block_index,
                     field=f"messages[{index}].content[{block_index}]",
-                    tool_names=tool_names,
+                    history=history,
                 )
                 if converted is not None:
                     parts.append(converted)
@@ -376,10 +542,22 @@ def _output_constraints(
                 "json_schema output requires an object schema",
                 field="output_format.schema",
             )
-        return "application/json", schema
+        return "application/json", cast("dict[str, object]", schema)
     raise ConversionError(
         f"unsupported output format type: {format_type!r}",
         field="output_format.type",
+    )
+
+
+def _log_ignored_seed(req: ClaudeMessagesRequest) -> None:
+    """E-04: accept ``seed`` but do not forward it to Gemini."""
+    seed = getattr(req, "seed", None)
+    if seed is None:
+        return
+    logger.warning(
+        "[E-04] Claude seed=%r accepted but ignored; "
+        "Gemini generationConfig.seed is not set",
+        seed,
     )
 
 
@@ -387,6 +565,7 @@ async def convert_claude_request(
     req: ClaudeMessagesRequest, media: MediaFetcher
 ) -> dict[str, object]:
     """Convert a Claude Messages payload into a Gemini request dictionary."""
+    _log_ignored_seed(req)
     body: dict[str, object] = {"contents": await _convert_messages(req.messages, media)}
 
     system_instruction = _system_instruction(req.system)
@@ -444,3 +623,6 @@ async def convert_claude_count_request(
     body.pop("generationConfig", None)
     body.pop("toolConfig", None)
     return body
+
+
+__all__ = ["convert_claude_count_request", "convert_claude_request"]

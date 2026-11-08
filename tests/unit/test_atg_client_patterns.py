@@ -133,3 +133,29 @@ def test_history_loop_requires_name_hit():
     det = detect_client_synthetic_transport(body, "atg_emit_")
     assert det is not None
     assert det.hit is False
+
+
+def test_signal_3_reads_parameters_json_schema_pg07():
+    body = {
+        "tools": [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "emit_answer",
+                        "parametersJsonSchema": {
+                            "type": "object",
+                            "properties": {"content": {"type": "string"}},
+                            "required": ["content"],
+                        },
+                    }
+                ]
+            }
+        ],
+        "toolConfig": {
+            "functionCallingConfig": {"allowedFunctionNames": ["emit_answer"]}
+        },
+    }
+    det = detect_client_synthetic_transport(body, "atg_emit_")
+    assert det is not None
+    assert det.hit is True
+    assert det.reason == "forced-content-tool"

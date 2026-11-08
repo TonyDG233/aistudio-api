@@ -1,13 +1,13 @@
 """账号信息刷新：无浏览器直连探测 AI Studio 档位（tier）与登录态，并回填邮箱。
 
-逐字对齐 Ark_AIStudioToAPI ``src/core/AccountInfoRefresher.js``（513 行）的传输与判定：
-- 探测 RPC：``POST .../MakerSuiteService/GetAiStudioBenefitTier``，body ``"[]"``，
+传输与判定对齐上游：
+- 探测 RPC：``POST .../MakerSuite service/GetAiStudioBenefitTier``，body ``"[]"``，
   ``content-type: application/json+protobuf``，携带账号 Cookie、SAPISIDHASH
-  Authorization（复用本仓 :func:`calculate_sapisid_hash`）与 AI Studio web API key。
+  Authorization 与 AI Studio web API key。
 - 档位映射：``[]``/``0`` -> Free；``1`` -> Pro；``2`` -> Ultra；``3`` -> Plus；
-  其他 -> ``unknown-N``。
-- ``200`` -> 凭据有效；``401`` -> 标记过期；``403`` 且疑为 key 被拒 -> 回收 key
-  重试一次；``5xx``/网络故障 -> 非权威失败，不改状态。
+  未知 code 或不可解析的 ``200`` 响应不产生权威档位，``tier`` 保持原值。
+- ``200`` -> 凭据有效且档位权威才写入；``401`` -> 标记过期；``403`` 且疑为 key
+  被拒 -> 回收 key 重试一次；``5xx``/网络故障 -> 非权威失败，不改状态。
 - 邮箱回填：apps 页 HTML 的 ``WIZ_global_data`` ``"oPEP7c"`` 正则 + 噪音域排除回退。
 """
 
@@ -26,9 +26,23 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 
 from aistudio_api.config import settings
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
-    DEFAULT_EXT_BIN,
     calculate_sapisid_hash,
+)
+from aistudio_api.infrastructure.gateway.public_web_constants import (
+    AI_STUDIO_HOME_URL,
+    AI_STUDIO_ORIGIN,
+    BENEFIT_TIER_URL,
+    DEFAULT_APP_ID,
+    EXT_BIN,
+    GRPC_WEB_USER_AGENT,
+    WEB_API_KEY,
+    WEB_API_KEY_PREFIX,
+    WEB_API_KEY_RE,
+    aistudio_app_url,
 )
 from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -41,19 +55,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("account_refresher")
 
-RPC_HOST = "alkalimakersuite-pa.clients6.google.com"
-RPC_BASE = "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
-RPC_URL = f"https://{RPC_HOST}{RPC_BASE}GetAiStudioBenefitTier"
-PAGE_HOST = "aistudio.google.com"
-ORIGIN = "https://aistudio.google.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
-TIER_BY_CODE: dict[int, str] = {1: "Pro", 2: "Ultra", 3: "Plus"}
-# 与 Ark 同款的公网 AI Studio web API key（可用 MAKERSUITE_WEB_API_KEY 覆盖）。
-DEFAULT_WEB_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
-# Ark ConfigLoader 默认 app id，用于 apps 页取 HTML（邮箱回填 / key 回收）。
-DEFAULT_APP_ID = "3b85b4ed-f945-422c-ba25-395d1feef528"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -66,7 +70,6 @@ _NOISE_EMAIL_DOMAIN_RE = re.compile(
     r"|googleusercontent\.com)$",
     re.IGNORECASE,
 )
-_WEB_API_KEY_RE = re.compile(r"AIzaSy[A-Za-z0-9_-]{25,45}")
 
 
 class RefreshInProgressError(RuntimeError):
@@ -125,8 +128,33 @@ class _CookieJar:
     jar: dict[str, str]
 
 
+TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _parse_checked_at(value: object) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def is_verified_free_tier_fresh(account: object, *, now: float | None = None) -> bool:
+    """True when a verified Free tier was checked within the last three days."""
+    if str(getattr(account, "tier", "") or "") != "Free":
+        return False
+    checked = _parse_checked_at(getattr(account, "tier_checked_at", None))
+    if checked is None:
+        return False
+    current = time.time() if now is None else now
+    return current - checked < TIER_PROBE_FRESHNESS_SECONDS
 
 
 def resolve_app_id() -> str:
@@ -140,11 +168,7 @@ def resolve_app_id() -> str:
 
 
 class HttpxTransport:
-    """默认 HTTP 传输实现（httpx，尊重 ``settings.proxy_url``）。
-
-    每次请求临时建立客户端连接，避免长生命周期客户端的关闭问题；刷新为低频操作，
-    连接复用收益有限。测试通过注入替身传输完全绕过网络。
-    """
+    """默认 HTTP 传输实现（httpx，尊重 ``settings.proxy_url``）。"""
 
     def __init__(self, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
         self._timeout = timeout
@@ -170,7 +194,7 @@ class HttpxTransport:
 
 
 class AccountInfoRefresher:
-    """账号信息刷新器（tier / 过期 / 邮箱），对齐 Ark AccountInfoRefresher 行为。"""
+    """账号信息刷新器（tier / 过期 / 邮箱）。"""
 
     def __init__(
         self,
@@ -187,7 +211,7 @@ class AccountInfoRefresher:
         self._web_api_key = (
             override
             or (os.getenv("MAKERSUITE_WEB_API_KEY") or "").strip()
-            or DEFAULT_WEB_API_KEY
+            or WEB_API_KEY
         )
         if concurrency is None:
             concurrency = int(
@@ -206,9 +230,13 @@ class AccountInfoRefresher:
         return self._concurrency
 
     async def refresh_account(
-        self, account: AccountMeta, *, refresh_email: bool = True
+        self,
+        account: AccountMeta,
+        *,
+        refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> RefreshResult:
-        """刷新单账号：凭据有效性 + 档位（可选邮箱回填），并对齐 Ark 的落库语义。"""
+        """刷新单账号：凭据有效性 + 档位（可选邮箱回填）。"""
         cookies = self._load_cookies(account)
         if cookies is None:
             return RefreshResult(
@@ -221,12 +249,57 @@ class AccountInfoRefresher:
             )
 
         checked_at = _now_iso()
+        if skip_fresh_free_tier and is_verified_free_tier_fresh(account):
+            email: str | None = None
+            email_error: str | None = None
+            if refresh_email or not account.email:
+                try:
+                    email = await self._fetch_account_email(
+                        cookies, account.email, auth_user=account.auth_user
+                    )
+                except Exception as e:
+                    email_error = str(e)
+            if email:
+                self._store.update_account_refresh(account.id, email=email)
+            logger.info(
+                "[Refresh] %s verified Free within 3 days; tier probe skipped",
+                account.id,
+            )
+            return RefreshResult(
+                account_id=account.id,
+                ok=True,
+                tier=str(account.tier or "Free"),
+                expired=False,
+                email=email or account.email,
+                error=email_error,
+                checked_at=checked_at,
+            )
+
         response = await self._post_tier_request(cookies, auth_user=account.auth_user)
-        envelope = self._parse_envelope(response.body)
-        message = self._envelope_message(envelope)
+        envelope = parse_benefit_tier_envelope(response.body)
+        message = envelope.message
 
         if response.status == 200:
-            tier = self._tier_name(self._tier_code_from_envelope(envelope))
+            tier = envelope.strict_tier()
+            if tier is None:
+                logger.warning(
+                    "[Refresh] %s returned HTTP 200 without an authoritative "
+                    "tier (account tier unchanged): code=%r message=%r",
+                    account.id,
+                    envelope.code,
+                    message,
+                )
+                return RefreshResult(
+                    account_id=account.id,
+                    ok=False,
+                    tier=None,
+                    expired=None,
+                    error=(
+                        "probe returned HTTP 200 but no parseable canonical "
+                        "tier; account tier unchanged"
+                    ),
+                    checked_at=checked_at,
+                )
             email: str | None = None
             email_error: str | None = None
             wants_email = refresh_email or not account.email
@@ -311,6 +384,7 @@ class AccountInfoRefresher:
         accounts: list[AccountMeta],
         *,
         refresh_email: bool = True,
+        skip_fresh_free_tier: bool = False,
     ) -> list[RefreshResult]:
         """并发刷新一批账号（``Semaphore`` 限流，结果顺序与输入一致）。
 
@@ -329,7 +403,11 @@ class AccountInfoRefresher:
 
         async def _run(account: AccountMeta) -> RefreshResult:
             async with semaphore:
-                return await self.refresh_account(account, refresh_email=refresh_email)
+                return await self.refresh_account(
+                    account,
+                    refresh_email=refresh_email,
+                    skip_fresh_free_tier=skip_fresh_free_tier,
+                )
 
         try:
             results = await asyncio.gather(*(_run(account) for account in accounts))
@@ -356,11 +434,29 @@ class AccountInfoRefresher:
 
         checked_at = _now_iso()
         response = await self._post_tier_request(cookies, auth_user=account.auth_user)
-        envelope = self._parse_envelope(response.body)
-        message = self._envelope_message(envelope)
+        envelope = parse_benefit_tier_envelope(response.body)
+        message = envelope.message
 
         if response.status == 200:
-            tier = self._tier_name(self._tier_code_from_envelope(envelope))
+            tier = envelope.strict_tier()
+            if tier is None:
+                logger.warning(
+                    "[Refresh] %s probe returned HTTP 200 without an "
+                    "authoritative tier (account tier unchanged): "
+                    "code=%r message=%r",
+                    account.id,
+                    envelope.code,
+                    message,
+                )
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": (
+                        "probe returned HTTP 200 but no parseable canonical "
+                        "tier; account tier unchanged"
+                    ),
+                    "checked_at": checked_at,
+                }
             self._store.update_account_refresh(
                 account.id, tier=tier, tier_checked_at=checked_at, expired=False
             )
@@ -440,7 +536,7 @@ class AccountInfoRefresher:
         return _CookieJar(header="; ".join(header_parts), jar=jar)
 
     def _build_authorization(self, jar: dict[str, str]) -> str:
-        return calculate_sapisid_hash(jar, origin=ORIGIN)
+        return calculate_sapisid_hash(jar, origin=AI_STUDIO_ORIGIN)
 
     def _rpc_headers(
         self, cookies: _CookieJar, *, auth_user: str = "0"
@@ -448,14 +544,14 @@ class AccountInfoRefresher:
         headers: dict[str, str] = {
             "accept": "*/*",
             "content-type": "application/json+protobuf",
-            "origin": ORIGIN,
-            "referer": f"{ORIGIN}/",
+            "origin": AI_STUDIO_ORIGIN,
+            "referer": AI_STUDIO_HOME_URL,
             "user-agent": USER_AGENT,
             "x-goog-api-key": self._web_api_key,
             "x-goog-authuser": str(auth_user or "0"),
-            "x-goog-ext-519733851-bin": DEFAULT_EXT_BIN,
+            "x-goog-ext-519733851-bin": EXT_BIN,
             "x-ai-studio-visit-id": f"v1_{uuid.uuid4()}",
-            "x-user-agent": "grpc-web-javascript/0.1",
+            "x-user-agent": GRPC_WEB_USER_AGENT,
         }
         if cookies.header:
             headers["cookie"] = cookies.header
@@ -469,7 +565,7 @@ class AccountInfoRefresher:
     ) -> TransportResponse:
         headers = self._rpc_headers(cookies, auth_user=auth_user)
         response = await self._transport.request(
-            "POST", RPC_URL, headers=headers, content="[]"
+            "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
         )
         if response.status == 403 and self._is_key_problem(response.body):
             rotated = await self._recover_web_api_key(cookies, auth_user=auth_user)
@@ -481,7 +577,7 @@ class AccountInfoRefresher:
                     "re-extracted key."
                 )
                 response = await self._transport.request(
-                    "POST", RPC_URL, headers=headers, content="[]"
+                    "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
                 )
         return response
 
@@ -493,22 +589,17 @@ class AccountInfoRefresher:
     async def _recover_web_api_key(
         self, cookies: _CookieJar, *, auth_user: str = "0"
     ) -> str | None:
-        """从 apps 页 HTML 回收 web API key（只返回，不在此处改写当前 key）。
-
-        注意：Ark 原实现会在回收时立即写入 ``this.webApiKey``，导致其
-        ``rotatedKey !== this.webApiKey`` 判定恒为假、重试分支成为死代码。此处按
-        WP3 规格修正为「回收的 key 与当前 key 不同才重试一次」，由调用方写回。
-        """
+        """从 apps 页 HTML 回收 web API key（只返回，不在此处改写当前 key）。"""
         try:
             html = await self._fetch_app_html(cookies, auth_user=auth_user)
         except Exception as e:
             logger.warning("[Refresh] Unable to re-extract the web API key: %s", e)
             return None
-        keys = list(dict.fromkeys(_WEB_API_KEY_RE.findall(html)))
+        keys = list(dict.fromkeys(WEB_API_KEY_RE.findall(html)))
         if not keys:
             return None
         return next(
-            (candidate for candidate in keys if candidate.startswith("AIzaSyDdP8")),
+            (candidate for candidate in keys if candidate.startswith(WEB_API_KEY_PREFIX)),
             keys[0],
         )
 
@@ -524,7 +615,7 @@ class AccountInfoRefresher:
         }
         if cookies.header:
             headers["cookie"] = cookies.header
-        url = f"https://{PAGE_HOST}/apps/{self._app_id}?authuser={auth_user or '0'}"
+        url = aistudio_app_url(self._app_id, auth_user=auth_user)
         response = await self._transport.request("GET", url, headers=headers)
         if response.status != 200:
             raise RuntimeError(f"page fetch HTTP {response.status}")
@@ -553,33 +644,9 @@ class AccountInfoRefresher:
                 return exact
         return found[0]
 
-    @staticmethod
-    def _parse_envelope(body: str) -> list[object] | None:
-        try:
-            parsed = json.loads(str(body or "").strip())
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, list) else None
-
-    @staticmethod
-    def _tier_code_from_envelope(envelope: list[object] | None) -> int:
-        if not envelope:
-            return 0
-        first = envelope[0]
-        return first if isinstance(first, int) else 0
-
-    @staticmethod
-    def _tier_name(code: int) -> str:
-        return TIER_BY_CODE.get(code) or ("Free" if code == 0 else f"unknown-{code}")
-
-    @staticmethod
-    def _envelope_message(envelope: list[object] | None) -> str:
-        if envelope and len(envelope) >= 2 and isinstance(envelope[1], str):
-            return envelope[1][:300]
-        return ""
-
 
 __all__ = [
+    "TIER_PROBE_FRESHNESS_SECONDS",
     "AccountInfoRefresher",
     "HttpTransport",
     "HttpxTransport",

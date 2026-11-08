@@ -1,33 +1,44 @@
-"""OpenAI Responses compatible routes (WP11.1)."""
+"""OpenAI Responses compatible routes (``POST /v1/responses``).
+
+The two endpoints are registered on the app and share the existing auth,
+keepalive and four-protocol error adapters; defaults ship enabled and can be
+turned off explicitly via ``features.formats.responses``.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
-from aistudio_api.api.dependencies import get_client
+from aistudio_api.api.dependencies import get_routing_pipeline, require_api_key
 from aistudio_api.api.format_errors import (
     format_error_response,
     format_media_allow_private,
     require_format_enabled,
 )
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
-from aistudio_api.api.schemas_openai_responses import ResponsesRequest
-from aistudio_api.application.format_converters.common import (
-    ConversionError,
-    strip_models_prefix,
+from aistudio_api.api.sse_keepalive import (
+    KEEPALIVE_FRAME,
+    KEEPALIVE_SENTINEL,
+    KeepaliveIterator,
+    KeepaliveTimeout,
+    keepalive_interval_sec,
+    preread_window_sec,
 )
+from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
+from aistudio_api.application.contracts.responses import ResponsesRequest
+from aistudio_api.application.format_converters.common import ConversionError
 from aistudio_api.application.format_converters.media import MediaFetcher
 from aistudio_api.application.format_converters.responses_request import (
     convert_responses_request,
 )
 from aistudio_api.application.format_converters.responses_response import (
     ResponsesStreamRenderer,
-    response_failed_event,
     responses_response,
 )
 from aistudio_api.application.generation_service import (
@@ -35,17 +46,27 @@ from aistudio_api.application.generation_service import (
     generate,
     stream_generation,
 )
-from aistudio_api.application.token_counter import count_tokens as count_prompt_tokens
-from aistudio_api.infrastructure.gateway.client import AIStudioClient
-
-if TYPE_CHECKING:
-    pass
+from aistudio_api.application.routing_pipeline import RoutingPipeline
+from aistudio_api.application.token_counter import count_tokens
+from aistudio_api.domain.errors import RequestError
 
 router = APIRouter()
 
 
 def require_responses() -> None:
     require_format_enabled("responses")
+
+
+def strip_responses_model_prefix(model: str) -> str:
+    """Strip only ``models/`` / ``chat/`` prefixes; never invent aliases."""
+    value = model.strip()
+    while True:
+        for prefix in ("models/", "chat/"):
+            if value.startswith(prefix):
+                value = value[len(prefix) :]
+                break
+        else:
+            return value
 
 
 def _validation_error(exc: ValidationError) -> ConversionError:
@@ -59,36 +80,158 @@ def _validation_error(exc: ValidationError) -> ConversionError:
     return ConversionError(text, field=location or None)
 
 
-@router.post("/v1/responses/input_tokens", dependencies=[Depends(require_responses)])
-async def count_response_input_tokens(
+def _request_error(message: str) -> RequestError:
+    return RequestError(502, message)
+
+
+async def _build_gemini_request(
+    payload: ResponsesRequest,
+) -> tuple[str, GeminiGenerateContentRequest]:
+    media = MediaFetcher(allow_private=format_media_allow_private())
+    body = await convert_responses_request(payload, media)
+    request = GeminiGenerateContentRequest.model_validate(body)
+    return strip_responses_model_prefix(payload.model), request
+
+
+@router.post(
+    "/v1/responses",
+    dependencies=[Depends(require_responses), Depends(require_api_key)],
+)
+async def create_response(
     request: Request,
-    client: AIStudioClient = Depends(get_client),
+    pipeline: RoutingPipeline = Depends(get_routing_pipeline),
 ) -> Response:
     try:
         raw: object = await request.json()
     except Exception:
         return format_error_response(
-            ConversionError("request body is not valid JSON"), "openai"
+            ConversionError("request body is not valid JSON"), "responses"
         )
 
     try:
         payload = ResponsesRequest.model_validate(raw)
     except ValidationError as exc:
-        return format_error_response(_validation_error(exc), "openai")
+        return format_error_response(_validation_error(exc), "responses")
 
     try:
-        media = MediaFetcher(allow_private=format_media_allow_private())
-        body = await convert_responses_request(payload, media)
-        gemini_request = GeminiGenerateContentRequest.model_validate(body)
-        model_path = strip_models_prefix(payload.model)
-        outcome = await count_prompt_tokens(
+        model_path, gemini_request = await _build_gemini_request(payload)
+
+        if not payload.stream:
+            outcome = await generate(
+                model_path=model_path,
+                req=gemini_request,
+                pipeline=pipeline,
+                api_format="responses",
+            )
+            return JSONResponse(responses_response(model=model_path, outcome=outcome))
+
+        events: KeepaliveIterator[StreamEvent] = KeepaliveIterator(
+            stream_generation(
+                model_path=model_path,
+                req=gemini_request,
+                pipeline=pipeline,
+                api_format="responses",
+            ),
+            interval=keepalive_interval_sec(),
+        )
+
+        # Phase A: bounded wait for the first real event.  Errors and an
+        # exhausted stream before the deadline keep a real HTTP status; a slow
+        # upstream switches to HTTP 200 plus ``: keepalive`` comments.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + preread_window_sec()
+        first_event: StreamEvent | None = None
+        try:
+            while first_event is None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                event = await events.next_event(remaining)
+                if isinstance(event, KeepaliveTimeout):
+                    break
+                candidate = cast("StreamEvent", event)
+                if candidate.kind == "routing_wait":
+                    continue
+                first_event = candidate
+        except StopAsyncIteration:
+            with contextlib.suppress(Exception):
+                await events.aclose()
+            return format_error_response(
+                _request_error("generation produced no stream events"),
+                "responses",
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await events.aclose()
+            return format_error_response(exc, "responses")
+
+        renderer = ResponsesStreamRenderer(model_path)
+
+        async def event_stream() -> AsyncIterator[str]:
+            try:
+                yield renderer.start()
+                if first_event is not None:
+                    chunk = renderer.render(first_event)
+                    if chunk:
+                        yield chunk
+                else:
+                    yield KEEPALIVE_FRAME
+                async for item in events:
+                    if item is KEEPALIVE_SENTINEL:
+                        yield KEEPALIVE_FRAME
+                        continue
+                    rendered = renderer.render(cast("StreamEvent", item))
+                    if rendered:
+                        yield rendered
+                if not renderer.done:
+                    tail = renderer.close()
+                    if tail:
+                        yield tail
+            except Exception as exc:
+                yield renderer.failed(exc)
+            finally:
+                await events.aclose()
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    except Exception as exc:
+        return format_error_response(exc, "responses")
+
+
+@router.post(
+    "/v1/responses/input_tokens",
+    dependencies=[Depends(require_responses), Depends(require_api_key)],
+)
+async def count_response_input_tokens(
+    request: Request,
+    pipeline: RoutingPipeline = Depends(get_routing_pipeline),
+) -> Response:
+    try:
+        raw: object = await request.json()
+    except Exception:
+        return format_error_response(
+            ConversionError("request body is not valid JSON"), "responses"
+        )
+
+    try:
+        payload = ResponsesRequest.model_validate(raw)
+    except ValidationError as exc:
+        return format_error_response(_validation_error(exc), "responses")
+
+    try:
+        model_path, gemini_request = await _build_gemini_request(payload)
+        outcome = await count_tokens(
             model_path=model_path,
             req=gemini_request,
-            client=client,
+            pipeline=pipeline,
             api_format="responses",
         )
     except Exception as exc:
-        return format_error_response(exc, "openai")
+        return format_error_response(exc, "responses")
+
     return JSONResponse(
         {
             "object": "response.input_tokens",
@@ -97,82 +240,10 @@ async def count_response_input_tokens(
     )
 
 
-@router.post("/v1/responses", dependencies=[Depends(require_responses)])
-async def create_response(
-    request: Request,
-    client: AIStudioClient = Depends(get_client),
-) -> Response:
-    try:
-        raw: object = await request.json()
-    except Exception:
-        return format_error_response(
-            ConversionError("request body is not valid JSON"), "openai"
-        )
-
-    try:
-        payload = ResponsesRequest.model_validate(raw)
-    except ValidationError as exc:
-        return format_error_response(_validation_error(exc), "openai")
-
-    try:
-        media = MediaFetcher(allow_private=format_media_allow_private())
-        body = await convert_responses_request(payload, media)
-        gemini_request = GeminiGenerateContentRequest.model_validate(body)
-        model_path = strip_models_prefix(payload.model)
-
-        if not payload.stream:
-            outcome = await generate(
-                model_path=model_path,
-                req=gemini_request,
-                client=client,
-                api_format="responses",
-            )
-            return JSONResponse(responses_response(model=model_path, outcome=outcome))
-
-        iterator: AsyncIterator[StreamEvent] = stream_generation(
-            model_path=model_path,
-            req=gemini_request,
-            client=client,
-            api_format="responses",
-        )
-        try:
-            first_event = await iterator.__anext__()
-        except StopAsyncIteration:
-            return format_error_response(
-                HTTPException(
-                    500,
-                    detail={
-                        "message": "generation produced no stream events",
-                        "type": "server_error",
-                    },
-                ),
-                "openai",
-            )
-        except Exception as exc:
-            return format_error_response(exc, "openai")
-
-        renderer = ResponsesStreamRenderer(model_path)
-
-        async def event_stream() -> AsyncIterator[str]:
-            try:
-                yield renderer.start()
-                chunk = renderer.render(first_event)
-                if chunk:
-                    yield chunk
-                async for event in iterator:
-                    rendered = renderer.render(event)
-                    if rendered:
-                        yield rendered
-                tail = renderer.close()
-                if tail:
-                    yield tail
-            except Exception as exc:
-                yield response_failed_event(exc)
-
-        return StreamingResponse(
-            event_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-    except Exception as exc:
-        return format_error_response(exc, "openai")
+__all__ = [
+    "count_response_input_tokens",
+    "create_response",
+    "require_responses",
+    "router",
+    "strip_responses_model_prefix",
+]

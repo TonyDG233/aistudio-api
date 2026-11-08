@@ -56,7 +56,7 @@ def test_replay_level_filter_last_id_and_gap():
     _publish(broadcaster, 6)
     entries, gap = broadcaster.replay(last_id=1)
     assert [entry.id for entry in entries] == [4, 5, 6]
-    assert gap == {"last_id": 1, "oldest_id": 4}
+    assert gap == {"last_id": 1, "oldest_id": 4, "missed": 2}
 
 
 def test_replay_limit_keeps_most_recent_entries():
@@ -134,8 +134,25 @@ def test_sanitize_authorization_bearer_cookie_sapisid_and_api_key():
     assert "AIzaSyVerySecretValue" not in sanitized
     assert "json-secret" not in sanitized
     assert "eyJhbGciOiJIUzI1NiJ9.payload.signature" not in sanitized
-    assert "theme=dark" in sanitized
+    assert "theme=dark" not in sanitized
+    assert "Cookie: ***" in sanitized
     assert "keep me" in sanitized
+
+
+def test_sanitize_masks_cookie_api_key_path_and_standalone_sk_token():
+    sanitized = sanitize_log_message(
+        "Cookie: SID=session-value; theme=dark\n"
+        "HTTP DELETE /api-keys/plain-key-value -> 200\n"
+        "已删除 API Key: sk-b6-deadbeefcafebabe\n"
+        "[toolshape] preserved\n"
+    )
+
+    assert "session-value" not in sanitized
+    assert "theme=dark" not in sanitized
+    assert "plain-key-value" not in sanitized
+    assert "/api-keys/***" in sanitized
+    assert "sk-b6-deadbeefcafebabe" not in sanitized
+    assert "[toolshape] preserved" in sanitized
 
 
 def test_broadcast_handler_publishes_sanitized_record_without_lines():
@@ -158,3 +175,25 @@ def test_broadcast_handler_publishes_sanitized_record_without_lines():
     assert entries[0].level == "WARNING"
     assert entries[0].logger == "aistudio.test"
     assert "secret-value" not in entries[0].message
+
+
+def test_ring_buffer_masks_cookie_authorization_and_api_key_values():
+    broadcaster = LogBroadcaster(capacity=10)
+    broadcaster.publish(
+        "INFO",
+        "aistudio.test",
+        "Authorization: Bearer ring-secret\n"
+        "Cookie: SAPISID=ring-cookie; theme=dark\n"
+        "Set-Cookie: token=ring-set-cookie\n"
+        "x-goog-api-key: ring-api-key-value",
+    )
+
+    entries, _ = broadcaster.replay()
+    message = entries[0].message
+    assert "ring-secret" not in message
+    assert "ring-cookie" not in message
+    assert "ring-set-cookie" not in message
+    assert "ring-api-key-value" not in message
+    assert "theme=dark" not in message
+    assert "Authorization: Bearer ***" in message
+    assert "Cookie: ***" in message

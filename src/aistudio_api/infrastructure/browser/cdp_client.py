@@ -102,11 +102,6 @@ class CDPConnection:
         self._recv_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._closed = False
-        self._liveness_checker: Callable[[], bool] | None = None
-
-    def set_liveness_checker(self, checker: Callable[[], bool] | None) -> None:
-        """Register a callback that returns False if the underlying browser process is dead."""
-        self._liveness_checker = checker
 
     def fail_pending_futures(self, exc: Exception) -> None:
         """Immediately fail all pending command futures with the given exception."""
@@ -122,6 +117,7 @@ class CDPConnection:
             websockets.connect(
                 self.ws_url,
                 max_size=None,
+                # D-03：只保留 WebSocket ping 作为半开连接探测；不做 liveness 轮询。
                 ping_interval=5,
                 ping_timeout=5,
             ),
@@ -176,7 +172,7 @@ class CDPConnection:
                         log.debug("CDP 目标正常关闭: %s", reason)
                     else:
                         log.warning(
-                            "CDP 目标崩溃或断开: %s (参数=%s)",
+                            "CDP 目标异常退出: method=%s, params=%s",
                             method,
                             msg.get("params"),
                         )
@@ -217,15 +213,11 @@ class CDPConnection:
         self,
         method: str,
         params: dict[str, object] | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = 30.0,
     ) -> dict[str, object]:
         """Send a JSON-RPC command over CDP and await result."""
         if not self.ws or self._closed:
             raise RuntimeError("CDP connection is not open")
-
-        if self._liveness_checker and not self._liveness_checker():
-            self.fail_pending_futures(RuntimeError("Browser process has died"))
-            raise RuntimeError("Browser process has died before CDP command dispatch")
 
         req_id = self._next_id
         self._next_id += 1
@@ -247,30 +239,9 @@ class CDPConnection:
             raise RuntimeError(f"CDP connection closed: {e}") from e
 
         try:
-            if self._liveness_checker is None:
-                return await asyncio.wait_for(fut, timeout=timeout_s)
-
-            deadline = loop.time() + timeout_s
-            while True:
-                if not self._liveness_checker():
-                    self.fail_pending_futures(RuntimeError("Browser process has died"))
-                    raise RuntimeError(
-                        f"Browser process died while awaiting CDP command {method}"
-                    )
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    self._futures.pop(req_id, None)
-                    raise TimeoutError(
-                        f"CDP command {method} timed out after {timeout_s}s"
-                    )
-                step_timeout = min(remaining, 0.2)
-                try:
-                    return await asyncio.wait_for(
-                        asyncio.shield(fut), timeout=step_timeout
-                    )
-                except TimeoutError:
-                    if fut.done():
-                        return fut.result()
+            if timeout_s is None or timeout_s <= 0:
+                return await fut
+            return await asyncio.wait_for(fut, timeout=timeout_s)
         except Exception:
             self._futures.pop(req_id, None)
             raise
@@ -298,6 +269,11 @@ class CDPConnection:
     async def close(self) -> None:
         """Close WebSocket connection cleanly."""
         self._closed = True
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        self._background_tasks.clear()
+        self._listeners.clear()
         if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -317,6 +293,10 @@ class CDPPage:
         self._unsubscribers: list[Callable[[], None]] = []
         self.has_stream_binding: bool = False
         self._cached_cookies: dict[str, str] | None = None
+        self.account_auth_file: str | None = None
+        self.has_net_trace: bool = False
+        self.rpc_net_requests: dict[str, dict[str, object]] = {}
+        self.rpc_net_failures: list[dict[str, object]] = []
 
     def _track_listener(self, unsub: Callable[[], None]) -> Callable[[], None]:
         self._unsubscribers.append(unsub)
@@ -349,10 +329,6 @@ class CDPPage:
         except Exception:
             return False
 
-    def set_liveness_checker(self, checker: Callable[[], bool] | None) -> None:
-        """Bind underlying browser process liveness checker to CDP connection."""
-        self.cdp.set_liveness_checker(checker)
-
     async def init_domains(self, block_assets: bool = True) -> None:
         """Enable required CDP domains and install kernel-level asset filters."""
         await self.cdp.send("Page.enable")
@@ -374,7 +350,7 @@ class CDPPage:
 
         # Listen for renderer crash and inspector detached events to fail fast
         def on_crashed(params: dict[str, object]) -> None:
-            log.warning("CDP 页面渲染器崩溃: %s", params)
+            log.warning("页面渲染进程崩溃: params=%s", params)
             self._is_closed = True
             self.cdp.fail_pending_futures(
                 RuntimeError("Page target crashed (renderer terminated)")
@@ -385,7 +361,7 @@ class CDPPage:
             if reason == "target_closed":
                 log.debug("CDP 页面检查器已分离 (目标关闭)")
             else:
-                log.warning("CDP 页面检查器已分离: %s", reason)
+                log.warning("页面检查器断开连接: reason=%s", reason)
             self._is_closed = True
             self.cdp.fail_pending_futures(
                 RuntimeError(f"Page inspector detached: {reason}")
@@ -428,7 +404,7 @@ class CDPPage:
         args: object = None,
         await_promise: bool = True,
         return_by_value: bool = True,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = 30.0,
     ) -> object:
         """Evaluate a JS expression or function in the page's main world."""
         expr = expression.strip()
@@ -719,9 +695,9 @@ class CDPPage:
 
         try:
             await self.cdp.send("Network.setCookies", {"cookies": formatted})
-            log.debug("已通过 CDP 成功注入 %d 个 Cookie", len(formatted))
+            log.debug("已通过 CDP 注入 Cookie: 数量=%d", len(formatted))
         except Exception as e:
-            log.warning("批量通过 CDP 注入 Cookie 失败 (%s)，正在尝试逐条重试", e)
+            log.warning("批量注入 Cookie 失败，改为逐条重试: 错误=%s", e)
             for item in formatted:
                 try:
                     await self.cdp.send("Network.setCookies", {"cookies": [item]})
@@ -780,6 +756,12 @@ class CDPPage:
 
         return self._track_listener(self.cdp.on("Network.responseReceived", listener))
 
+    def on_loading_failed(
+        self, callback: Callable[[dict[str, object]], object]
+    ) -> Callable[[], None]:
+        """Listen to Network.loadingFailed (net-level request failures)."""
+        return self._track_listener(self.cdp.on("Network.loadingFailed", callback))
+
     async def get_response_body(self, request_id: str) -> str:
         """Get response body for a completed request."""
         try:
@@ -828,6 +810,7 @@ class CDPClient:
         self.base_url = f"http://{host}:{port}"
         self.page: CDPPage | None = None
         self._browser_conn: CDPConnection | None = None
+        # Target.createBrowserContext 是浏览器级命令，进程内串行化避免并发建/删竞态。
         self._context_lock = asyncio.Lock()
 
     async def get_version(self) -> dict[str, object]:
@@ -883,15 +866,12 @@ class CDPClient:
                 page_target = None
                 if page_targets:
                     page_target = page_targets[0]
-                    # Prune any spare about:blank or crashed tabs to save ~50MB RAM each
+                    # D-11：关闭所有非当前 target（含空白页），不允许 Page 泄露。
+                    # drain 只发生在显式 rebind 的旧 Page 上，由会话层有界处理。
                     for spare in page_targets[1:]:
                         spare_id = str(spare.get("id") or "")
                         if spare_id:
-                            with contextlib.suppress(Exception):
-                                async with httpx.AsyncClient(timeout=2.0) as client:
-                                    await client.put(
-                                        f"{self.base_url}/json/close/{spare_id}"
-                                    )
+                            await self.close_target(spare_id)
                 if not page_target:
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         resp = await client.put(f"{self.base_url}/json/new")
@@ -907,10 +887,11 @@ class CDPClient:
                 page = CDPPage(conn, target_id)
                 await page.init_domains(block_assets=block_assets)
                 self.page = page
+                log.info("已连接至浏览器页面: target_id=%s", page.target_id)
                 return page
             except Exception as e:
                 last_exc = e
-                log.debug("连接页面第 %d 次尝试失败: %s", attempt + 1, e)
+                log.debug("连接页面失败: 尝试=%d, 错误=%s", attempt + 1, e)
                 if attempt < 2:
                     await asyncio.sleep(0.3)
         raise RuntimeError(
@@ -932,6 +913,7 @@ class CDPClient:
             await conn.connect()
             page = CDPPage(conn, target_id)
             await page.init_domains(block_assets=block_assets)
+            log.info("已创建新浏览器页面: target_id=%s", page.target_id)
             return page
         except Exception:
             await conn.close()
@@ -968,7 +950,7 @@ class CDPClient:
             return context_id
 
     async def dispose_browser_context(self, context_id: str) -> None:
-        """Dispose one BrowserContext; missing contexts are ignored."""
+        """Dispose one BrowserContext; missing or already-disposed contexts are ignored."""
         if not context_id:
             return
         with contextlib.suppress(Exception):
@@ -1020,6 +1002,10 @@ class CDPClient:
 
         ws_url = str(target.get("webSocketDebuggerUrl") or "")
         if not ws_url:
+            with contextlib.suppress(Exception):
+                await conn.send(
+                    "Target.closeTarget", {"targetId": target_id}, timeout_s=5.0
+                )
             raise RuntimeError(f"Target {target_id} has no webSocketDebuggerUrl")
         page_conn = CDPConnection(ws_url)
         try:

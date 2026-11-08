@@ -1,13 +1,13 @@
-"""Unified Context instance pool (WP5 v3).
+"""Request instance pool.
 
-All request instances live here. There is no privileged "default" instance and
-no account-to-context hard binding: a slot is a BrowserContext that may be
-reused while it is bound to the same account, or rebound to another eligible
-account after its current pages are idle.
+D-05/D-10/D-11: one instance is exactly one account + one BrowserContext + one
+Page + one surface. The pool owns request runtimes only; the control session is
+not an instance and never occupies pool capacity.
 
-The pool owns *request* contexts only. ``BrowserSession`` remains the browser
-process/control-plane object (login, cookie import, model discovery); it never
-serves a generation request.
+There is no lease/reservation/borrow/defer/pinned/rebalance machinery here.
+``active_requests`` is the only concurrency primitive. Closing or retiring a
+slot rejects new requests, waits once (bounded) for active requests to drain,
+and always closes the Page before disposing the BrowserContext.
 """
 
 from __future__ import annotations
@@ -15,200 +15,263 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
 
+from aistudio_api.domain.model_access import (
+    TierSelector,
+    canonical_tier,
+    instance_lane_for_tier,
+    resolve_tier_selector,
+    tier_matches_selector,
+)
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
 from aistudio_api.infrastructure.utils.logger import get_logger
 
-BUILD_CHANNEL_READY_TIMEOUT_S = 60.0
-
-if TYPE_CHECKING:
-    from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
-
 log = get_logger("instance-pool")
+
+_VALID_SURFACES = ("chat", "build")
 
 
 class SlotState(StrEnum):
-    EMPTY = "empty"
-    LOADING = "loading"
+    """Runtime lifecycle of one configured instance slot."""
+
+    UNSTARTED = "unstarted"
+    STARTING = "starting"
     READY = "ready"
-    BUSY = "busy"
-    COOLDOWN = "cooldown"
+    SLEEPING = "sleeping"
     RETIRING = "retiring"
+    INVALID = "invalid"
 
 
 class InstanceCapacityError(RuntimeError):
-    """No request slot is available within the wait budget."""
+    """No instance/Context capacity is available."""
+
+
+class InstanceTierError(RuntimeError):
+    """An account tier does not belong to the instance's Free/paid lane."""
+
+
+class InstanceBusyError(RuntimeError):
+    """A slot still has in-flight requests and would be overwritten."""
+
+
+@dataclass(frozen=True)
+class InstanceSpec:
+    """One normalized ``instances`` entry (count/surface/tier selector)."""
+
+    count: int
+    surface: str
+    min_tier: str = ""
+    only_tier: str = ""
+    max_tier: str = ""
+
+    @classmethod
+    def from_mapping(cls, item: dict[str, object]) -> InstanceSpec:
+        try:
+            count = int(str(item.get("count", 1)))
+        except (TypeError, ValueError):
+            count = 1
+        surface = str(item.get("surface") or "chat").lower()
+        raw_max = item.get("max_tier")
+        selector = resolve_tier_selector(
+            only_tier=item.get("only_tier"),
+            min_tier=item.get("min_tier"),
+            max_tier=raw_max,
+        )
+        if selector.only_tier is not None:
+            return cls(
+                count=count,
+                surface=surface,
+                only_tier=selector.only_tier,
+                min_tier=selector.min_tier,
+                max_tier=selector.max_tier,
+            )
+        return cls(
+            count=count,
+            surface=surface,
+            min_tier=selector.min_tier,
+            max_tier=canonical_tier(raw_max) or "",
+        )
+
+    @property
+    def selector(self) -> TierSelector:
+        if self.only_tier:
+            return resolve_tier_selector(only_tier=self.only_tier)
+        return resolve_tier_selector(
+            min_tier=self.min_tier or None,
+            max_tier=self.max_tier or None,
+        )
+
+    @property
+    def lane(self) -> str:
+        return self.selector.lane
+
+    def accepts_tier(self, tier: object) -> bool:
+        return tier_matches_selector(tier, self.selector)
+
+
+@dataclass
+class ActiveRequest:
+    """One in-flight request handle; release is idempotent and must be in finally."""
+
+    slot: InstanceSlot
+    _released: bool = False
+
+    @property
+    def slot_id(self) -> str:
+        return self.slot.slot_id
+
+    @property
+    def realm_id(self) -> str:
+        return self.slot.realm_id
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self.slot.release_request()
 
 
 @dataclass
 class InstanceSlot:
-    """One BrowserContext in the unified request pool."""
+    """One configured request instance."""
 
     slot_id: str
+    surface: str
+    min_tier: str
+    lane: str
+    only_tier: str = ""
+    max_tier: str = ""
     context_id: str = ""
-    state: SlotState = SlotState.EMPTY
-    current_account_id: str = ""
+    account_id: str = ""
     auth_file: str | None = None
     auth_user: str = "0"
+    tier: str = "Free"
     session: PooledSession | None = None
+    cdp: CDPClient | None = field(default=None, repr=False, compare=False)
+    state: SlotState = SlotState.UNSTARTED
     generation: int = 0
-    reservations: int = 0
-    pending_pages: int = 0
-    pending_channel: str = ""
-    chat_counted: bool = False
-    build_counted: bool = False
-    build_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock, repr=False, compare=False
-    )
-    chat_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock, repr=False, compare=False
-    )
-    group_name: str = ""
-    channel_role: str = ""
+    active_requests: int = 0
+    last_error: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
-    pinned: bool = False
-    build_surface: Any = None
-    assigned_slot_rows: tuple[dict[str, object], ...] = ()
+    lifecycle_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+    active_zero: asyncio.Event = field(
+        default_factory=asyncio.Event, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        self.active_zero.set()
 
     @property
     def realm_id(self) -> str:
-        """Compatibility identity used by capture/stream service caches."""
+        """Realm identity consumed by capture/stream caches."""
         return f"{self.slot_id}-g{self.generation}"
 
     @property
     def in_flight(self) -> int:
-        session_in_flight = 0
-        if self.session is not None:
-            with suppress(Exception):
-                session_in_flight = int(self.session.in_flight_count)
-        return max(self.reservations, session_in_flight)
+        return self.active_requests
 
     @property
-    def chat_page(self) -> CDPPage | None:
+    def selector(self) -> TierSelector:
+        if self.only_tier:
+            return resolve_tier_selector(only_tier=self.only_tier)
+        return resolve_tier_selector(
+            min_tier=self.min_tier or None,
+            max_tier=self.max_tier or None,
+        )
+
+    def accepts_tier(self, tier: object) -> bool:
+        return tier_matches_selector(tier, self.selector)
+
+    @property
+    def page(self) -> CDPPage | None:
         return self.session.page if self.session is not None else None
 
-    @property
-    def build_page(self) -> CDPPage | None:
-        surface = self.build_surface
-        state = getattr(surface, "state", None)
-        return getattr(state, "page", None)
-
-    def chat_ready(self) -> bool:
-        page = self.chat_page
+    def page_closed(self) -> bool:
+        page = self.page
+        if page is None:
+            return True
         try:
-            return page is not None and not page.is_closed()
+            return page.is_closed()
         except Exception:
-            return False
+            return True
 
-    def build_ready(self) -> bool:
-        page = self.build_page
-        state = getattr(self.build_surface, "state", None)
-        try:
-            return bool(
-                page is not None
-                and not page.is_closed()
-                and getattr(state, "ready", False)
-                and (
-                    getattr(state, "native_ready", False)
-                    or getattr(state, "signer_ready", False)
-                )
-            )
-        except Exception:
-            return False
+    def acquire_request(self) -> None:
+        self.active_requests += 1
+        self.active_zero.clear()
+        self.last_used = time.monotonic()
 
-    async def ensure_build_surface(self, cdp: CDPClient) -> BuildSurface:
-        from aistudio_api.infrastructure.gateway.build_surface import BuildSurface
-
-        async with self.build_lock:
-            if self.build_surface is None:
-                self.build_surface = BuildSurface(
-                    cdp,
-                    context_id=self.context_id,
-                    realm_id=self.realm_id,
-                )
-            surface = self.build_surface
-            await surface.ensure_ready(
-                self.auth_file, self.auth_user, account_id=self.current_account_id
-            )
-            return surface
-
-    async def close_pages(self) -> None:
-        self.chat_counted = False
-        self.build_counted = False
-        surface = self.build_surface
-        self.build_surface = None
-        if surface is not None:
-            page = getattr(getattr(surface, "state", None), "page", None)
-            if page is not None:
-                with suppress(Exception):
-                    await page.close()
-        if self.session is not None:
-            with suppress(Exception):
-                await self.session.close()
-            self.session = None
-
-
-@dataclass
-class InstanceLease:
-    """One reserved slot for a request attempt."""
-
-    account_id: str
-    channel: str
-    surface: str
-    slot_id: str
-    realm_id: str
-    context_id: str
-    adapter: InstanceSlot
-    is_borrow: bool = False
-    slot_index: int | None = None
-    released: bool = False
+    def release_request(self) -> None:
+        self.active_requests = max(0, self.active_requests - 1)
+        self.last_used = time.monotonic()
+        if self.active_requests == 0:
+            self.active_zero.set()
 
 
 SessionFactory = Callable[..., Awaitable[PooledSession]]
 
 
 class InstancePool:
-    """Pool of equal BrowserContext slots with rebinding and idle retirement."""
+    """Pool of isolated, single-page request instances."""
 
     def __init__(
         self,
         cdp_provider: Callable[[], Awaitable[CDPClient]],
         *,
-        features_provider: Callable[[], dict[str, object]] | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        specs: Sequence[InstanceSpec | dict[str, object]] | None = None,
+        max_contexts: int = 1,
+        specs_provider: Callable[[], Sequence[InstanceSpec | dict[str, object]]]
+        | None = None,
+        max_contexts_provider: Callable[[], int] | None = None,
         session_factory: SessionFactory | None = None,
         on_slot_retired: Callable[[str], None] | None = None,
-        wait_timeout_s: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+        load_attempts: int = 3,
+        retry_delay_s: float = 0.0,
     ) -> None:
         self._cdp_provider = cdp_provider
-        self._features_provider = features_provider
-        self._clock = clock or time.monotonic
+        self._static_specs = list(specs or [])
+        self._specs_provider = specs_provider
+        self._max_contexts = max(1, int(max_contexts))
+        self._max_contexts_provider = max_contexts_provider
         self._session_factory = session_factory or PooledSession.bootstrap
         self._on_slot_retired = on_slot_retired
-        self._wait_timeout_s = max(0.0, wait_timeout_s)
+        self._clock = clock or time.monotonic
+        self._load_attempts = max(1, int(load_attempts))
+        self._retry_delay_s = max(0.0, retry_delay_s)
         self._slots: dict[str, InstanceSlot] = {}
         self._counter = itertools.count(1)
-        self._condition = asyncio.Condition()
+        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ config
 
-    def _max_contexts(self) -> int:
-        if self._features_provider is None:
-            return 1
-        try:
-            features = self._features_provider()
-            routing = features.get("routing")
-            raw = routing if isinstance(routing, dict) else {}
-            return max(1, int(raw.get("max_contexts", 1)))
-        except (TypeError, ValueError, AttributeError):
-            return 1
+    @staticmethod
+    def _coerce_spec(item: InstanceSpec | dict[str, object]) -> InstanceSpec:
+        if isinstance(item, InstanceSpec):
+            return item
+        return InstanceSpec.from_mapping(dict(item))
+
+    @property
+    def specs(self) -> tuple[InstanceSpec, ...]:
+        raw: Sequence[InstanceSpec | dict[str, object]]
+        if self._specs_provider is not None:
+            raw = self._specs_provider()
+        else:
+            raw = self._static_specs
+        return tuple(self._coerce_spec(item) for item in raw)
+
+    @property
+    def max_contexts(self) -> int:
+        if self._max_contexts_provider is not None:
+            return max(1, int(self._max_contexts_provider()))
+        return self._max_contexts
 
     # --------------------------------------------------------------- inspection
 
@@ -216,1037 +279,458 @@ class InstancePool:
     def live_contexts(self) -> int:
         return sum(1 for slot in self._slots.values() if slot.context_id)
 
-    @property
-    def max_contexts(self) -> int:
-        return self._max_contexts()
-
     def get(self, slot_id: str) -> InstanceSlot | None:
         return self._slots.get(slot_id)
 
     def slots(self) -> tuple[InstanceSlot, ...]:
         return tuple(self._slots.values())
 
-    def page_counts(self) -> dict[str, int]:
-        return self._page_counts_locked()
-
-    def _slot_page_counts(self, slot: InstanceSlot) -> dict[str, int]:
-        # Count acquired surface pages, not the bootstrap chat page that a
-        # build-only context creates for BotGuard. ``pending_pages`` is the
-        # reservation for a surface currently being created; it must not be
-        # added to an already-counted page (that would double-count a build
-        # page during ensure_build_surface).
-        if (
-            slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
-            and slot.in_flight == 0
-            and slot.pending_pages == 0
-        ):
-            if slot.chat_counted and not slot.chat_ready():
-                slot.chat_counted = False
-            if slot.build_counted and not slot.build_ready():
-                slot.build_counted = False
-        chat = 1 if slot.chat_counted else 0
-        build = 1 if slot.build_counted else 0
-        if slot.pending_pages:
-            pending_channel = slot.pending_channel or slot.channel_role
-            if pending_channel == "chat":
-                chat = max(chat, 1)
-            elif pending_channel == "build":
-                build = max(build, 1)
-        return {"chat": chat, "build": build}
-
-    def _page_counts_locked(
-        self, *, exclude_slot_id: str | None = None
-    ) -> dict[str, int]:
-        counts = {"chat": 0, "build": 0}
-        for slot in self._slots.values():
-            if exclude_slot_id and slot.slot_id == exclude_slot_id:
-                continue
-            slot_counts = self._slot_page_counts(slot)
-            counts["chat"] += slot_counts["chat"]
-            counts["build"] += slot_counts["build"]
-        return counts
-
-    def _group_page_count_locked(
-        self, group_name: str, *, exclude_slot_id: str | None = None
-    ) -> int:
-        total = 0
-        for slot in self._slots.values():
-            if exclude_slot_id and slot.slot_id == exclude_slot_id:
-                continue
-            if slot.group_name == group_name:
-                total += sum(self._slot_page_counts(slot).values())
-        return total
-
-    def _features(self) -> dict[str, object]:
-        if self._features_provider is None:
-            return {}
-        try:
-            return dict(self._features_provider())
-        except Exception:
-            return {}
-
-    def channel_max_instances(self, channel: str) -> int | None:
-        """该渠道允许并存的实例数；未配置返回 None（只受全局实例上限约束）。"""
-        features = self._features()
-        raw_channels = features.get("channels")
-        channels = raw_channels if isinstance(raw_channels, dict) else {}
-        key = "chat" if channel in ("chat", "pg") else channel
-        raw = channels.get(key)
-        spec = raw if isinstance(raw, dict) else {}
-        if "max_instances" not in spec:
-            return None
-        try:
-            return max(0, int(spec.get("max_instances", 0)))
-        except (TypeError, ValueError):
-            return None
-
-    def channel_enabled(self, channel: str) -> bool:
-        features = self._features()
-        raw_channels = features.get("channels")
-        channels = raw_channels if isinstance(raw_channels, dict) else {}
-        key = "chat" if channel in ("chat", "pg") else channel
-        raw = channels.get(key)
-        spec = raw if isinstance(raw, dict) else {}
-        if key == "build":
-            return bool(spec.get("enabled", features.get("build_surface", False)))
-        return bool(spec.get("enabled", True))
-
-    def _channel_max_pages(self, channel: str) -> int:
-        features = self._features()
-        raw_channels = features.get("channels")
-        channels = raw_channels if isinstance(raw_channels, dict) else {}
-        raw = channels.get(channel)
-        spec = raw if isinstance(raw, dict) else {}
-        try:
-            configured = max(0, int(spec.get("max_pages", 2)))
-        except (TypeError, ValueError):
-            configured = 2
-        if channel in ("chat", "build"):
-            # Page count is not an independent user budget: one channel page is
-            # one instance. Deriving it from max_instances keeps every path
-            # (startup, manual create, switch_to, 429 request acquire) bounded
-            # by the same channel cap.
-            instance_cap = self.channel_max_instances(channel)
-            return configured if instance_cap is None else max(0, instance_cap)
-        return configured
-
-    def _global_max_pages(self) -> int:
-        # Total page budget equals the user-visible instance limit.
-        return max(1, self._max_contexts())
-
-    def _check_page_budget_locked(
+    async def sync_account_tier(
         self,
+        account_id: str,
+        tier: str,
         *,
-        channel: str,
-        group_name: str | None,
-        group_max_pages: int | None,
-        adding: int = 1,
-        exclude_slot_id: str | None = None,
-    ) -> None:
-        counts = self._page_counts_locked(exclude_slot_id=exclude_slot_id)
-        if sum(counts.values()) + adding > self._global_max_pages():
-            raise InstanceCapacityError(
-                f"page budget exhausted: global>{self._global_max_pages()}"
-            )
-        if counts.get(channel, 0) + adding > self._channel_max_pages(channel):
-            raise InstanceCapacityError(
-                f"page budget exhausted: {channel}>{self._channel_max_pages(channel)}"
-            )
-        if group_name and group_max_pages is not None:
-            group_count = self._group_page_count_locked(
-                group_name, exclude_slot_id=exclude_slot_id
-            )
-            if group_count + adding > group_max_pages:
-                raise InstanceCapacityError(
-                    f"page budget exhausted: group {group_name}>{group_max_pages}"
+        drain_timeout_s: float = 12.0,
+    ) -> int:
+        """Synchronize a manually detected tier into every bound slot.
+
+        Same-lane changes update ``slot.tier`` and ``session.active_context.tier``
+        in place. A cross-lane change (e.g. Free -> Pro) must never leave the old
+        account serving from a slot whose configured lane no longer accepts it:
+        the slot is retired, unbound and left UNSTARTED so the manager can refill
+        it with an account that still belongs to that lane.
+
+        Slot state/binding mutations happen under the pool lock; runtime close
+        happens under the slot lifecycle lock with the caller's bounded drain
+        timeout. Returns the number of affected slots.
+        """
+        if not account_id:
+            return 0
+        canonical = canonical_tier(tier) or str(tier or "")
+        target_lane = instance_lane_for_tier(canonical)
+        evict: list[InstanceSlot] = []
+        affected = 0
+        async with self._lock:
+            for slot in self._slots.values():
+                if slot.account_id != account_id:
+                    continue
+                affected += 1
+                if slot.lane == target_lane:
+                    slot.tier = canonical
+                    session = slot.session
+                    context = (
+                        getattr(session, "active_context", None)
+                        if session is not None
+                        else None
+                    )
+                    if context is not None:
+                        context.tier = canonical
+                    continue
+                slot.state = SlotState.RETIRING
+                evict.append(slot)
+
+        for slot in evict:
+            try:
+                await self.retire_runtime(
+                    slot.slot_id, timeout_s=max(0.0, float(drain_timeout_s))
                 )
+            except Exception as exc:
+                log.warning(
+                    "[pool] cross-lane retire failed slot=%s account=%s: %s",
+                    slot.slot_id,
+                    account_id,
+                    exc,
+                )
+            finally:
+                async with self._lock:
+                    if slot.account_id == account_id:
+                        slot.account_id = ""
+                        slot.auth_file = None
+                        slot.auth_user = "0"
+                        slot.tier = "Free"
+                        slot.last_error = None
+                        if slot.context_id or slot.session is not None:
+                            slot.state = SlotState.INVALID
+                        else:
+                            slot.state = SlotState.UNSTARTED
+            slot.last_used = self._clock()
+            log.info(
+                "[pool] cross-lane tier change unbound slot=%s account=%s "
+                "from_lane=%s to_lane=%s tier=%s state=%s",
+                slot.slot_id,
+                account_id,
+                "paid" if slot.lane == "paid" else "free",
+                target_lane,
+                canonical,
+                slot.state.value,
+            )
+        return affected
 
-    def has_active_work(self) -> bool:
-        """True while a slot is loading, reserved, or serving a request."""
-        return any(
-            slot.state is SlotState.LOADING
-            or slot.in_flight > 0
-            or slot.pending_pages > 0
-            for slot in self._slots.values()
+    def eligible_slots(
+        self, *, paid: bool, surface: str | None = None
+    ) -> tuple[InstanceSlot, ...]:
+        """Configured candidates in one lane (includes sleeping/unstarted)."""
+        lane = "paid" if paid else "free"
+        wanted = (
+            SlotState.UNSTARTED,
+            SlotState.STARTING,
+            SlotState.READY,
+            SlotState.SLEEPING,
         )
-
-    def budget_snapshot(self) -> dict[str, object]:
-        channel_limits: dict[str, int] = {}
-        for channel in ("chat", "build", "official"):
-            channel_limits[channel] = self._channel_max_pages(channel)
-        return {
-            "global_max_pages": self._global_max_pages(),
-            "channel_max_pages": channel_limits,
-            "max_contexts": self.max_contexts,
-            "pages": self.page_counts(),
-            "contexts": self.live_contexts,
-        }
+        return tuple(
+            slot
+            for slot in self._slots.values()
+            if slot.lane == lane
+            and slot.state in wanted
+            and (surface is None or slot.surface == surface)
+        )
 
     def snapshot(self) -> list[dict[str, object]]:
         return [
             {
                 "slot_id": slot.slot_id,
                 "realm_id": slot.realm_id,
-                "account_id": slot.current_account_id or None,
-                "context_id": slot.context_id,
+                "account_id": slot.account_id or None,
+                "surface": slot.surface,
+                "min_tier": slot.min_tier,
+                "lane": slot.lane,
                 "state": slot.state.value,
-                "in_flight": slot.in_flight,
-                "reservations": slot.reservations,
-                "chat_ready": slot.chat_ready(),
-                "build_ready": slot.build_ready(),
-                "chat_counted": slot.chat_counted,
-                "build_counted": slot.build_counted,
-                "pending_pages": slot.pending_pages,
-                "pages": self._slot_page_counts(slot),
-                "last_used": slot.last_used,
-                "created_at": slot.created_at,
-                "pinned": slot.pinned,
-                "slot_rows": list(slot.assigned_slot_rows),
+                "generation": slot.generation,
+                "context_id": slot.context_id,
+                "pages": 1 if slot.session is not None else 0,
+                "active_requests": slot.active_requests,
+                "last_error": slot.last_error,
             }
             for slot in sorted(self._slots.values(), key=lambda item: item.slot_id)
         ]
 
-    # ---------------------------------------------------------------- acquiring
+    # ------------------------------------------------------------------ slots
 
-    async def acquire(
+    async def add_slot(
         self,
+        spec: InstanceSpec | dict[str, object],
         *,
-        account_id: str,
-        auth_file: str | None,
-        auth_user: str | None = None,
-        channel: str = "chat",
-        surface: str | None = None,
-        timeout_s: float | None = None,
-        borrow_accounts: set[str] | None = None,
-        group_name: str | None = None,
-        group_max_pages: int | None = None,
-    ) -> InstanceLease:
-        """Reserve a ready slot for the account/channel.
-
-        Reuses an existing same-account slot first. If the pool has spare
-        Context capacity, creates a new slot. Otherwise rebinds the least
-        recently used idle slot. When nothing is rebindable, waits up to
-        ``timeout_s`` for a release and raises ``InstanceCapacityError``.
-        """
-        surface = surface or channel
-        deadline = self._clock() + (
-            self._wait_timeout_s if timeout_s is None else max(0.0, timeout_s)
-        )
-        needs_surface = False
-        lease: InstanceLease | None = None
-        slot: InstanceSlot | None = None
-        async with self._condition:
-            while True:
-                lease = self._lease_existing_locked(
-                    account_id,
-                    auth_file,
-                    auth_user or "0",
-                    channel,
-                    surface,
-                    group_name,
-                    group_max_pages,
-                )
-                if lease is not None:
-                    if self._page_ready(lease.adapter, surface):
-                        self._touch_locked(lease.adapter)
-                        return lease
-                    needs_surface = True
-                    break
-
-                # A browser can be recycled while its slot record remains. Revive
-                # that same-account slot instead of treating it as capacity.
-                slot = self._reserve_stale_slot_locked(
-                    account_id,
-                    auth_file=auth_file,
-                    auth_user=auth_user or "0",
-                    channel=channel,
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                )
-                if slot is not None:
-                    break
-
-                if borrow_accounts:
-                    lease = self._lease_borrow_locked(
-                        borrow_accounts,
-                        channel,
-                        surface,
-                        group_name,
-                        group_max_pages,
-                    )
-                    if lease is not None:
-                        self._touch_locked(lease.adapter)
-                        return lease
-
-                slot = self._reserve_slot_locked(
-                    account_id,
-                    channel=channel,
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                )
-                if slot is not None:
-                    break
-
-                remaining = deadline - self._clock()
-                if remaining <= 0:
-                    raise InstanceCapacityError(
-                        "instance capacity exhausted: "
-                        f"live={len(self._slots)} limit={self._max_contexts()}"
-                    )
-                try:
-                    await asyncio.wait_for(self._condition.wait(), remaining)
-                except TimeoutError as exc:
-                    raise InstanceCapacityError(
-                        "instance capacity exhausted: "
-                        f"live={len(self._slots)} limit={self._max_contexts()}"
-                    ) from exc
-
-        # Bootstrap outside the condition lock; the slot stays reserved/loading.
-        try:
-            if needs_surface and lease is not None:
-                await self._ensure_surface(lease.adapter, surface)
-                return lease
-            if slot is None:
-                raise InstanceCapacityError("instance slot reservation lost")
-            await self._load_slot(
-                slot,
-                account_id=account_id,
-                auth_file=auth_file,
-                auth_user=auth_user,
+        lane: str,
+        slot_id: str | None = None,
+    ) -> InstanceSlot:
+        """Allocate one configured instance record (no Context yet)."""
+        normalized = self._coerce_spec(spec)
+        if normalized.surface not in _VALID_SURFACES:
+            raise ValueError(f"unknown surface: {normalized.surface}")
+        if lane not in ("free", "paid"):
+            raise ValueError(f"unknown instance lane: {lane}")
+        if normalized.lane != lane:
+            raise ValueError(
+                f"instance tier selector lane {normalized.lane} cannot use {lane} slot"
             )
-            if not self._page_ready(slot, surface):
-                await self._ensure_surface(slot, surface)
-        except BaseException:
-            if lease is None:
-                if slot is not None:
-                    await self._discard_slot(slot)
-            else:
-                await self.release(lease)
-            raise
+        async with self._lock:
+            if len(self._slots) >= self.max_contexts:
+                raise InstanceCapacityError(
+                    f"instance capacity exhausted: live={len(self._slots)} "
+                    f"limit={self.max_contexts}"
+                )
+            resolved_id = slot_id or f"slot-{next(self._counter)}"
+            if resolved_id in self._slots:
+                raise ValueError(f"duplicate slot id: {resolved_id}")
+            slot = InstanceSlot(
+                slot_id=resolved_id,
+                surface=normalized.surface,
+                min_tier=normalized.min_tier,
+                lane=lane,
+                only_tier=normalized.only_tier,
+                max_tier=normalized.max_tier,
+                last_used=self._clock(),
+                created_at=self._clock(),
+            )
+            self._slots[resolved_id] = slot
+            return slot
 
-        async with self._condition:
-            slot.reservations = max(1, slot.reservations)
-            self._touch_locked(slot)
-            self._condition.notify_all()
-            return self._lease_for_slot(slot, channel, surface, is_borrow=False)
-
-    async def create_instance(
+    async def activate(
         self,
+        slot_id: str,
         *,
         account_id: str,
         auth_file: str | None,
         auth_user: str = "0",
-        channel: str = "chat",
+        tier: str = "Free",
+        account_lane: str | None = None,
+        surface: str | None = None,
+        timeout_s: float = 90.0,
+        force: bool = False,
     ) -> InstanceSlot:
-        """Activate one explicit instance (account + channel) and pin it.
+        """Start (or restart) exactly one Context and one Page for a slot.
 
-        A second channel for the same account reuses that account's context and
-        only adds its channel page; it never creates a second context.
+        A READY slot already bound to the same account/surface/auth file is
+        normally reused without touching its runtime. ``force=True`` bypasses
+        that no-op so a manual restart always closes the old Page/Context and
+        bootstraps a new generation/realm. Any previous runtime is closed first:
+        Page close happens before ``dispose_browser_context``. The retire
+        callback is fired for the old realm.
         """
-        async with self._condition:
-            existing = next(
-                (
-                    slot
-                    for slot in self._slots.values()
-                    if slot.current_account_id == account_id
-                    and slot.state is not SlotState.RETIRING
-                ),
-                None,
-            )
-            if existing is not None:
-                existing.pinned = True
-                slot = existing
-                created = False
-            else:
-                if len(self._slots) >= self._max_contexts():
-                    raise InstanceCapacityError(
-                        f"instance capacity exhausted: live={len(self._slots)} "
-                        f"limit={self._max_contexts()}"
-                    )
-                self._check_page_budget_locked(
-                    channel=channel,
-                    group_name=None,
-                    group_max_pages=None,
-                )
-                slot = InstanceSlot(
-                    slot_id=f"slot-{next(self._counter)}",
-                    state=SlotState.LOADING,
-                    current_account_id=account_id,
-                    auth_file=auth_file,
-                    auth_user=auth_user or "0",
-                    channel_role=channel,
-                    pending_pages=1,
-                    pending_channel=channel,
-                    pinned=True,
-                    last_used=self._clock(),
-                )
-                self._slots[slot.slot_id] = slot
-                created = True
-                self._condition.notify_all()
-        if not created:
-            await self.ensure_channel(slot.slot_id, channel)
-            return slot
-        try:
-            await self._load_slot(
-                slot,
-                account_id=account_id,
-                auth_file=auth_file,
-                auth_user=auth_user,
-            )
-            if channel == "build":
-                await self._ensure_surface(slot, "build")
-        except BaseException:
-            await self._discard_slot(slot)
-            raise
-        async with self._condition:
-            slot.state = SlotState.READY
-            slot.reservations = 0
-            slot.pending_pages = 0
-            self._condition.notify_all()
-        return slot
-
-    async def check_create_budget(
-        self,
-        channel: str,
-        *,
-        account_id: str | None = None,
-        group_name: str | None = None,
-        group_max_pages: int | None = None,
-    ) -> None:
-        """Preflight an explicit instance creation without allocating anything."""
-        async with self._condition:
-            existing = (
-                next(
-                    (
-                        slot
-                        for slot in self._slots.values()
-                        if slot.current_account_id == account_id
-                        and slot.state is not SlotState.RETIRING
-                    ),
-                    None,
-                )
-                if account_id
-                else None
-            )
-            if existing is None and len(self._slots) >= self._max_contexts():
-                raise InstanceCapacityError(
-                    f"instance capacity exhausted: live={len(self._slots)} "
-                    f"limit={self._max_contexts()}"
-                )
-            self._check_page_budget_locked(
-                channel=channel,
-                group_name=group_name,
-                group_max_pages=group_max_pages,
-            )
-
-    async def ensure_channel(self, slot_id: str, channel: str) -> None:
-        """Activate one channel page on an existing explicit instance."""
-        surface = "build" if channel == "build" else "chat"
-        async with self._condition:
-            slot = self._slots.get(slot_id)
-            if slot is None:
-                raise InstanceCapacityError(f"slot missing: {slot_id}")
-            if slot.state is SlotState.RETIRING:
-                raise InstanceCapacityError(f"slot retiring: {slot_id}")
-            if self._page_ready(slot, surface):
-                return
-            self._check_page_budget_locked(
-                channel=surface,
-                group_name=slot.group_name or None,
-                group_max_pages=None,
-            )
-            slot.pending_pages = max(1, slot.pending_pages + 1)
-            slot.pending_channel = surface
-        try:
-            if surface == "build":
-                await asyncio.wait_for(
-                    self._ensure_surface(slot, "build"),
-                    timeout=BUILD_CHANNEL_READY_TIMEOUT_S,
-                )
-            else:
-                await asyncio.wait_for(
-                    self._ensure_chat_surface(slot),
-                    timeout=BUILD_CHANNEL_READY_TIMEOUT_S,
-                )
-        except TimeoutError as exc:
-            async with self._condition:
-                slot.pending_pages = max(0, slot.pending_pages - 1)
-                slot.pending_channel = ""
-            raise InstanceCapacityError(
-                f"渠道启动超时（{BUILD_CHANNEL_READY_TIMEOUT_S:.0f}s）"
-            ) from exc
-        except BaseException:
-            async with self._condition:
-                slot.pending_pages = max(0, slot.pending_pages - 1)
-                slot.pending_channel = ""
-            raise
-        async with self._condition:
-            slot.pending_pages = max(0, slot.pending_pages - 1)
-            slot.pending_channel = ""
-            slot.channel_role = surface
-            self._condition.notify_all()
-
-    async def close_channel(self, slot_id: str, channel: str) -> None:
-        """Close one channel page while keeping the account context alive."""
-        surface = "build" if channel == "build" else "chat"
-        session = None
-        build_surface = None
-        async with self._condition:
-            slot = self._slots.get(slot_id)
-            if slot is None:
-                return
-            if slot.in_flight > 0:
-                raise InstanceCapacityError(f"slot busy: {slot_id}")
-            if surface == "chat":
-                session = slot.session
-                slot.session = None
-                slot.chat_counted = False
-            else:
-                build_surface = slot.build_surface
-                slot.build_surface = None
-                slot.build_counted = False
-            slot.channel_role = (
-                "build" if slot.build_counted else ("chat" if slot.chat_counted else "")
-            )
-            self._condition.notify_all()
-        if session is not None:
-            with suppress(Exception):
-                await session.close()
-        if build_surface is not None:
-            page = getattr(getattr(build_surface, "state", None), "page", None)
-            if page is not None:
-                with suppress(Exception):
-                    await page.close()
-
-    async def _ensure_chat_surface(self, slot: InstanceSlot) -> None:
-        async with slot.chat_lock:
-            if slot.chat_ready():
-                slot.chat_counted = True
-                return
-            if not slot.context_id:
-                raise InstanceCapacityError(f"slot has no context: {slot.slot_id}")
-            cdp = await self._cdp_provider()
-            session = await self._session_factory(
-                cdp,
-                context_id=slot.context_id,
-                auth_file=slot.auth_file,
-                auth_user=slot.auth_user,
-                realm_id=slot.realm_id,
-            )
-            slot.session = session
-            slot.chat_counted = True
-
-    async def close_instance(self, slot_id: str) -> None:
-        """Close one explicit instance; refuse while it still has requests."""
-        async with self._condition:
-            slot = self._slots.get(slot_id)
-            if slot is None:
-                return
-            if slot.in_flight > 0:
-                raise InstanceCapacityError(f"slot busy: {slot_id}")
-            slot.state = SlotState.RETIRING
-            self._slots.pop(slot_id, None)
-            self._condition.notify_all()
-        await self._close_slots([slot])
-
-    async def reassign_instance(
-        self,
-        slot_id: str,
-        *,
-        account_id: str,
-        auth_file: str | None,
-        auth_user: str | None,
-        channel: str = "chat",
-    ) -> None:
-        """Rebind an explicit instance to another account, keeping its identity."""
-        await self.rebind(
-            slot_id,
-            account_id=account_id,
-            auth_file=auth_file,
-            auth_user=auth_user,
-            channel=channel,
-        )
         slot = self._slots.get(slot_id)
-        if slot is not None:
-            slot.pinned = True
+        if slot is None:
+            raise InstanceCapacityError(f"unknown instance: {slot_id}")
+        target_surface = (surface or slot.surface).lower()
+        if target_surface not in _VALID_SURFACES:
+            raise ValueError(f"unknown surface: {target_surface}")
+        if account_lane is not None and account_lane != slot.lane:
+            raise InstanceTierError(
+                f"account lane {account_lane} cannot use {slot.lane} instance"
+            )
+        if not slot.accepts_tier(tier):
+            raise InstanceTierError(
+                f"account tier {tier} outside instance tier spec "
+                f"only={slot.only_tier or '-'} min={slot.min_tier or '-'} "
+                f"max={slot.max_tier or '-'}"
+            )
 
-    async def rebind(
-        self,
-        slot_id: str,
-        *,
-        account_id: str,
-        auth_file: str | None,
-        auth_user: str | None,
-        channel: str,
-        group_name: str = "",
-        group_max_pages: int | None = None,
-    ) -> None:
-        """Rebind an idle slot to another account (background switch)."""
-        async with self._condition:
-            slot = self._slots.get(slot_id)
-            if slot is None:
-                raise InstanceCapacityError(f"unknown slot: {slot_id}")
-            if slot.in_flight > 0:
-                raise InstanceCapacityError(f"slot busy: {slot_id}")
-            if slot.state not in (
-                SlotState.READY,
-                SlotState.COOLDOWN,
-                SlotState.EMPTY,
+        async with slot.lifecycle_lock:
+            if slot.state is SlotState.RETIRING:
+                raise InstanceCapacityError(f"instance retiring: {slot_id}")
+            if (
+                not force
+                and slot.state is SlotState.READY
+                and slot.account_id == account_id
+                and slot.surface == target_surface
+                and slot.auth_file == auth_file
+                and not slot.page_closed()
             ):
-                raise InstanceCapacityError(
-                    f"slot not idle: {slot_id} state={slot.state.value}"
-                )
-            self._check_page_budget_locked(
-                channel=channel,
-                group_name=group_name or None,
-                group_max_pages=group_max_pages,
-                exclude_slot_id=slot.slot_id,
-            )
-            slot.state = SlotState.LOADING
-            slot.current_account_id = account_id
-            slot.group_name = group_name
-            slot.channel_role = channel
-            slot.chat_counted = False
-            slot.build_counted = False
-            slot.pending_pages = 1
-            slot.reservations = 0
-        try:
-            await self._load_slot(
-                slot,
-                account_id=account_id,
-                auth_file=auth_file,
-                auth_user=auth_user,
-            )
-            if channel == "build":
-                async with self._condition:
-                    slot.state = SlotState.LOADING
-                await self._ensure_surface(slot, "build")
-        except BaseException:
-            await self._discard_slot(slot)
-            raise
-        async with self._condition:
-            slot.reservations = 0
-            slot.state = SlotState.READY
-            self._condition.notify_all()
-
-    async def release(self, lease: InstanceLease) -> None:
-        if lease.released:
-            return
-        async with self._condition:
-            slot = self._slots.get(lease.slot_id)
-            if slot is not None:
-                slot.reservations = max(0, slot.reservations - 1)
                 slot.last_used = self._clock()
-                if slot.reservations == 0:
-                    slot.pending_pages = 0
-                    slot.pending_channel = ""
-                    if not slot.chat_ready():
-                        slot.chat_counted = False
-                    if not slot.build_ready():
-                        slot.build_counted = False
-                    if slot.state is SlotState.BUSY:
-                        slot.state = SlotState.READY
-            lease.released = True
-            self._condition.notify_all()
-
-    # -------------------------------------------------------------- slot loading
-
-    def _reserve_slot_locked(
-        self,
-        account_id: str,
-        *,
-        channel: str,
-        group_name: str | None,
-        group_max_pages: int | None,
-    ) -> InstanceSlot | None:
-        idle = [
-            slot
-            for slot in self._slots.values()
-            if slot.in_flight == 0
-            and not slot.pinned
-            and slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
-        ]
-
-        if len(self._slots) < self._max_contexts():
-            try:
-                self._check_page_budget_locked(
-                    channel=channel,
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                )
-            except InstanceCapacityError:
-                # Page budget is full. Wait for an existing slot to become idle or
-                # ready; an in-flight same-page request may satisfy this one.
-                if not idle:
-                    return None
-            else:
-                slot = InstanceSlot(
-                    slot_id=f"slot-{next(self._counter)}",
-                    state=SlotState.LOADING,
-                    current_account_id=account_id,
-                    reservations=1,
-                    pending_pages=1,
-                    group_name=group_name or "",
-                    channel_role=channel,
-                    last_used=self._clock(),
-                )
-                self._slots[slot.slot_id] = slot
                 return slot
 
-        if not idle:
-            return None
-        for slot in sorted(idle, key=lambda item: item.last_used):
-            try:
-                self._check_page_budget_locked(
-                    channel=channel,
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                    exclude_slot_id=slot.slot_id,
+            if slot.active_requests > 0:
+                raise InstanceBusyError(
+                    f"instance busy: {slot_id} ({slot.active_requests} in-flight)"
                 )
-            except InstanceCapacityError:
-                continue
-            slot.state = SlotState.LOADING
-            slot.current_account_id = account_id
-            slot.reservations = 1
-            slot.chat_counted = False
-            slot.build_counted = False
-            slot.pending_pages = 1
-            slot.group_name = group_name or ""
-            slot.channel_role = channel
-            return slot
-        return None
 
-    def _reserve_stale_slot_locked(
-        self,
-        account_id: str,
-        *,
-        auth_file: str | None,
-        auth_user: str,
-        channel: str,
-        group_name: str | None,
-        group_max_pages: int | None,
-    ) -> InstanceSlot | None:
-        """Reuse a same-account slot whose pages/context died with the browser."""
-        for slot in self._slots.values():
-            if slot.current_account_id != account_id:
-                continue
-            if slot.in_flight > 0 or slot.state in (
-                SlotState.LOADING,
-                SlotState.RETIRING,
-            ):
-                continue
-            if slot.chat_ready() or slot.build_ready():
-                continue
+            await self._close_runtime(slot)
+            slot.state = SlotState.STARTING
+            slot.account_id = account_id
+            slot.auth_file = auth_file
+            slot.auth_user = auth_user or "0"
+            slot.tier = tier or "Free"
+            slot.surface = target_surface
+            slot.last_error = None
             try:
-                self._check_page_budget_locked(
-                    channel=channel,
-                    group_name=group_name,
-                    group_max_pages=group_max_pages,
-                    exclude_slot_id=slot.slot_id,
+                await asyncio.wait_for(
+                    self._bootstrap_runtime(slot, timeout_s=timeout_s),
+                    timeout=timeout_s,
                 )
-            except InstanceCapacityError:
-                continue
-            slot.state = SlotState.LOADING
-            slot.current_account_id = account_id
-            slot.auth_file = auth_file or slot.auth_file
-            slot.auth_user = auth_user or slot.auth_user
-            slot.group_name = group_name or ""
-            slot.channel_role = channel
-            slot.pending_pages = 1
-            slot.pending_channel = channel
-            slot.chat_counted = False
-            slot.build_counted = False
-            slot.reservations = 0
+            except asyncio.CancelledError:
+                await self._close_runtime(slot)
+                slot.state = SlotState.UNSTARTED
+                raise
+            except BaseException as exc:
+                await self._close_runtime(slot)
+                slot.state = SlotState.INVALID
+                slot.last_error = str(exc)
+                log.warning(
+                    "[pool] activate failed slot=%s account=%s error=%s",
+                    slot.slot_id,
+                    account_id,
+                    exc,
+                )
+                raise
+            slot.state = SlotState.READY
+            slot.last_used = self._clock()
+            log.info(
+                "[pool] instance ready: slot=%s account=%s surface=%s context=%s "
+                "realm=%s live=%d/%d",
+                slot.slot_id,
+                account_id,
+                slot.surface,
+                slot.context_id,
+                slot.realm_id,
+                self.live_contexts,
+                self.max_contexts,
+            )
             return slot
-        return None
 
-    async def _load_slot(
-        self,
-        slot: InstanceSlot,
-        *,
-        account_id: str,
-        auth_file: str | None,
-        auth_user: str | None,
-    ) -> None:
+    async def _bootstrap_runtime(self, slot: InstanceSlot, *, timeout_s: float) -> None:
+        del timeout_s
         cdp = await self._cdp_provider()
-        old_context_id = slot.context_id
-        old_realm_id = slot.realm_id
-        slot.chat_counted = False
-        slot.build_counted = False
-        if old_context_id:
-            await slot.close_pages()
-            with suppress(Exception):
-                await cdp.dispose_browser_context(old_context_id)
-            slot.context_id = ""
-            slot.session = None
-            if self._on_slot_retired is not None:
-                with suppress(Exception):
-                    self._on_slot_retired(old_realm_id)
-
-        realm_id = f"{slot.slot_id}-g{slot.generation + 1}"
-        context_id = ""
-        session = None
-        last_error: Exception | None = None
-        # Cold-start BotGuard capture occasionally misses the wire template on a
-        # fresh context. Recreate the context once before failing the request.
-        for attempt in range(3):
+        slot.cdp = cdp
+        next_generation = slot.generation + 1
+        realm_id = f"{slot.slot_id}-g{next_generation}"
+        last_error: BaseException | None = None
+        for attempt in range(self._load_attempts):
             context_id = await cdp.create_browser_context()
-            slot.context_id = context_id
             try:
                 session = await self._session_factory(
                     cdp,
                     context_id=context_id,
-                    auth_file=auth_file,
-                    auth_user=auth_user,
+                    auth_file=slot.auth_file,
+                    auth_user=slot.auth_user,
                     realm_id=realm_id,
+                    account_id=slot.account_id,
                 )
-                break
-            except Exception as exc:
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await cdp.dispose_browser_context(context_id)
+                raise
+            except BaseException as exc:
                 last_error = exc
                 with suppress(Exception):
                     await cdp.dispose_browser_context(context_id)
-                slot.context_id = ""
-                if attempt < 2:
-                    await asyncio.sleep(2.0)
-            except BaseException:
-                with suppress(Exception):
-                    await cdp.dispose_browser_context(context_id)
-                slot.context_id = ""
-                raise
-        if session is None:
-            raise last_error or RuntimeError("pooled session bootstrap failed")
-
-        slot.context_id = context_id
-        slot.session = session
-        slot.auth_file = auth_file
-        slot.auth_user = session.active_context.auth_user
-        slot.generation += 1
-        slot.current_account_id = account_id
-        slot.state = SlotState.READY
-        slot.pending_pages = 0
-        slot.pending_channel = ""
-        if slot.channel_role == "build":
-            # The chat page is only a BotGuard bootstrap page for a build-only
-            # context. Keep the context/cookies, but close the hidden page so it
-            # neither counts as an instance page nor costs a renderer.
-            with suppress(Exception):
-                await session.close()
-            slot.session = None
-            slot.chat_counted = False
-            slot.build_counted = True
-        elif slot.channel_role == "chat":
-            slot.chat_counted = True
-        slot.last_used = self._clock()
-        log.info(
-            "[pool] slot loaded: slot=%s account=%s context=%s live=%d/%d",
-            slot.slot_id,
-            account_id,
-            context_id,
-            len(self._slots),
-            self._max_contexts(),
-        )
-
-    # --------------------------------------------------------------- lease types
-
-    def _lease_existing_locked(
-        self,
-        account_id: str,
-        auth_file: str | None,
-        auth_user: str,
-        channel: str,
-        surface: str,
-        group_name: str | None = None,
-        group_max_pages: int | None = None,
-    ) -> InstanceLease | None:
-        for slot in self._slots.values():
-            if slot.current_account_id != account_id:
+                if attempt + 1 < self._load_attempts and self._retry_delay_s:
+                    await asyncio.sleep(self._retry_delay_s)
                 continue
-            if slot.state not in (SlotState.READY, SlotState.BUSY):
-                continue
-            if surface == "chat" and not slot.chat_ready():
-                continue
-            counted = slot.chat_counted if surface == "chat" else slot.build_counted
-            pending = slot.pending_pages > 0 and slot.channel_role == surface
-            needs_accounting = not counted and not pending
-            if needs_accounting:
-                try:
-                    self._check_page_budget_locked(
-                        channel=surface,
-                        group_name=group_name,
-                        group_max_pages=group_max_pages,
-                    )
-                except InstanceCapacityError:
-                    continue
-            if slot.state is SlotState.READY:
-                slot.state = SlotState.BUSY
-            slot.auth_file = auth_file or slot.auth_file
-            slot.auth_user = auth_user or slot.auth_user
-            slot.group_name = group_name or slot.group_name
-            slot.channel_role = surface
-            if surface == "chat":
-                slot.chat_counted = True
-            else:
-                slot.build_counted = True
-                if needs_accounting and not slot.build_ready():
-                    slot.pending_pages += 1
-            slot.reservations += 1
-            return self._lease_for_slot(slot, channel, surface, is_borrow=False)
-        return None
 
-    def _lease_borrow_locked(
-        self,
-        borrow_accounts: set[str],
-        channel: str,
-        surface: str,
-        group_name: str | None = None,
-        group_max_pages: int | None = None,
-    ) -> InstanceLease | None:
-        for slot in sorted(self._slots.values(), key=lambda item: item.last_used):
-            if slot.current_account_id not in borrow_accounts:
-                continue
-            if slot.in_flight > 0 or slot.state not in (
-                SlotState.READY,
-                SlotState.BUSY,
-            ):
-                continue
-            if not self._page_ready(slot, surface):
-                continue
-            counted = slot.chat_counted if surface == "chat" else slot.build_counted
-            if not counted:
-                try:
-                    self._check_page_budget_locked(
-                        channel=surface,
-                        group_name=group_name,
-                        group_max_pages=group_max_pages,
-                    )
-                except InstanceCapacityError:
-                    continue
-                if surface == "chat":
-                    slot.chat_counted = True
-                else:
-                    slot.build_counted = True
-            slot.state = SlotState.BUSY
-            slot.reservations += 1
-            return self._lease_for_slot(slot, channel, surface, is_borrow=True)
-        return None
-
-    def _lease_for_slot(
-        self,
-        slot: InstanceSlot,
-        channel: str,
-        surface: str,
-        *,
-        is_borrow: bool,
-    ) -> InstanceLease:
-        return InstanceLease(
-            account_id=slot.current_account_id,
-            channel=channel,
-            surface=surface,
-            slot_id=slot.slot_id,
-            realm_id=slot.realm_id,
-            context_id=slot.context_id,
-            adapter=slot,
-            is_borrow=is_borrow,
-            slot_index=int(slot.slot_id.rsplit("-", 1)[-1])
-            if slot.slot_id.rsplit("-", 1)[-1].isdigit()
-            else None,
-        )
-
-    @staticmethod
-    def _page_ready(slot: InstanceSlot, surface: str) -> bool:
-        if surface == "build":
-            return slot.build_ready()
-        return slot.chat_ready()
-
-    async def _ensure_surface(self, slot: InstanceSlot, surface: str) -> None:
-        if surface == "chat":
-            await self._ensure_chat_surface(slot)
+            slot.context_id = context_id
+            slot.session = session
+            slot.generation = next_generation
+            session.active_context.tier = slot.tier
             return
-        if surface != "build":
+        raise last_error or RuntimeError("session bootstrap failed")
+
+    async def begin_request(self, slot_id: str) -> ActiveRequest:
+        """Acquire the single active-request handle for a ready instance."""
+        slot = self._slots.get(slot_id)
+        if slot is None:
+            raise InstanceCapacityError(f"unknown instance: {slot_id}")
+        if slot.state is not SlotState.READY:
+            raise InstanceCapacityError(
+                f"instance not ready: {slot_id} state={slot.state.value}"
+            )
+        if slot.page_closed():
+            slot.state = SlotState.INVALID
+            slot.last_error = "instance page closed"
+            raise InstanceCapacityError(f"instance page closed: {slot_id}")
+        slot.acquire_request()
+        return ActiveRequest(slot=slot)
+
+    async def sleep(self, slot_id: str) -> InstanceSlot:
+        """Release the runtime but keep the configured SLEEPING instance."""
+        slot = self._slots.get(slot_id)
+        if slot is None:
+            raise InstanceCapacityError(f"unknown instance: {slot_id}")
+        async with slot.lifecycle_lock:
+            if slot.active_requests > 0:
+                raise InstanceCapacityError(f"instance busy: {slot_id}")
+            await self._close_runtime(slot)
+            slot.state = SlotState.SLEEPING
+            slot.last_error = None
+            return slot
+
+    async def retire_runtime(self, slot_id: str, *, timeout_s: float) -> bool:
+        """D-05 bounded retire: stop new work, drain once, then force-close.
+
+        Returns True when the bounded wait timed out and the old Page/Context had
+        to be force-closed. The slot is kept (UNSTARTED) so a rebind can reuse it
+        only after the old Page/Context is gone. The caller must not create a new
+        page until this coroutine returns.
+        """
+        slot = self._slots.get(slot_id)
+        if slot is None:
+            raise InstanceCapacityError(f"unknown instance: {slot_id}")
+        timed_out = False
+        async with slot.lifecycle_lock:
+            if slot.context_id == "" and slot.session is None:
+                if slot.active_requests > 0:
+                    slot.active_requests = 0
+                    slot.active_zero.set()
+                slot.state = SlotState.UNSTARTED
+                return False
+            slot.state = SlotState.RETIRING
+            if slot.active_requests > 0:
+                try:
+                    await asyncio.wait_for(
+                        slot.active_zero.wait(), timeout=max(0.0, timeout_s)
+                    )
+                except TimeoutError:
+                    timed_out = True
+                    log.warning(
+                        "[pool] retire drain timeout %.2fs slot=%s active=%d; "
+                        "force-closing old Page/Context",
+                        timeout_s,
+                        slot.slot_id,
+                        slot.active_requests,
+                    )
+            await self._close_runtime(slot)
+            if timed_out:
+                # The old Page/Context is gone and the remaining handles are
+                # aborted; the slot must be reusable for the new binding.
+                slot.active_requests = 0
+                slot.active_zero.set()
+            slot.state = SlotState.UNSTARTED
+            slot.last_error = None
+            return timed_out
+
+    async def close_slot(self, slot_id: str) -> None:
+        """Manually close one instance; refuse while requests are active."""
+        slot = self._slots.get(slot_id)
+        if slot is None:
             return
-        cdp = await self._cdp_provider()
-        await slot.ensure_build_surface(cdp)
-        slot.pending_pages = 0
-        slot.pending_channel = ""
-        slot.build_counted = True
-
-    def _touch_locked(self, slot: InstanceSlot) -> None:
-        slot.last_used = self._clock()
-        if slot.state is SlotState.READY and slot.reservations > 0:
-            slot.state = SlotState.BUSY
-
-    # -------------------------------------------------------------- retirement
-
-    async def retire_idle(self, *, max_idle_seconds: float | None = None) -> int:
-        """Reserve and close idle slots, oldest first."""
-        async with self._condition:
-            now = self._clock()
-            candidates = [
-                slot
-                for slot in self._slots.values()
-                if slot.in_flight == 0
-                and not slot.pinned
-                and slot.state in (SlotState.READY, SlotState.COOLDOWN, SlotState.EMPTY)
-                and (
-                    max_idle_seconds is None or now - slot.last_used >= max_idle_seconds
-                )
-            ]
-            for slot in candidates:
-                slot.state = SlotState.RETIRING
-        if not candidates:
-            return 0
-        try:
-            await self._close_slots(candidates)
-        finally:
-            async with self._condition:
-                for slot in candidates:
-                    self._slots.pop(slot.slot_id, None)
-                self._condition.notify_all()
-        return len(candidates)
+        async with slot.lifecycle_lock:
+            if slot.active_requests > 0:
+                raise InstanceCapacityError(f"instance busy: {slot_id}")
+            slot.state = SlotState.RETIRING
+            await self._close_runtime(slot)
+        async with self._lock:
+            self._slots.pop(slot_id, None)
+        log.info("[pool] instance closed: slot=%s", slot_id)
 
     async def close(self) -> None:
-        async with self._condition:
+        async with self._lock:
             slots = list(self._slots.values())
             self._slots.clear()
-            self._condition.notify_all()
-        await self._close_slots(slots)
-
-    async def _close_slots(self, slots: list[InstanceSlot]) -> None:
-        cdp = None
-        with suppress(Exception):
-            cdp = await self._cdp_provider()
         for slot in slots:
-            realm_id = slot.realm_id
-            await slot.close_pages()
-            if cdp is not None and slot.context_id:
-                with suppress(Exception):
-                    await cdp.dispose_browser_context(slot.context_id)
-            if self._on_slot_retired is not None:
-                with suppress(Exception):
-                    self._on_slot_retired(realm_id)
-            log.info(
-                "[pool] slot retired: slot=%s account=%s",
-                slot.slot_id,
-                slot.current_account_id,
-            )
+            slot.state = SlotState.RETIRING
+            with suppress(Exception):
+                await slot.lifecycle_lock.acquire()
+                try:
+                    await self._close_runtime(slot)
+                finally:
+                    slot.lifecycle_lock.release()
 
-    async def _discard_slot(self, slot: InstanceSlot) -> None:
-        if slot.context_id:
-            await self._close_slots([slot])
-        else:
-            await slot.close_pages()
-        async with self._condition:
-            self._slots.pop(slot.slot_id, None)
-            self._condition.notify_all()
+    # ---------------------------------------------------------------- runtime
 
-    def _drop_slot_locked(self, slot: InstanceSlot) -> None:
-        self._slots.pop(slot.slot_id, None)
+    async def _close_runtime(self, slot: InstanceSlot) -> None:
+        """Close Page first, then dispose BrowserContext, then retire caches."""
+        had_runtime = bool(slot.context_id or slot.session)
+        old_realm = slot.realm_id
+        session = slot.session
+        context_id = slot.context_id
+        cdp = slot.cdp
+        slot.session = None
+        slot.context_id = ""
+        if session is not None:
+            try:
+                await session.close()
+            except Exception as exc:
+                log.warning(
+                    "[pool] close session failed slot=%s: %s", slot.slot_id, exc
+                )
+        if context_id and cdp is not None:
+            try:
+                await cdp.dispose_browser_context(context_id)
+            except Exception as exc:
+                log.warning(
+                    "[pool] dispose context failed slot=%s context=%s: %s",
+                    slot.slot_id,
+                    context_id,
+                    exc,
+                )
+        if had_runtime and self._on_slot_retired is not None:
+            try:
+                self._on_slot_retired(old_realm)
+            except Exception as exc:
+                log.warning(
+                    "[pool] retire callback failed slot=%s realm=%s: %s",
+                    slot.slot_id,
+                    old_realm,
+                    exc,
+                )
 
 
 __all__ = [
+    "ActiveRequest",
+    "InstanceBusyError",
     "InstanceCapacityError",
-    "InstanceLease",
     "InstancePool",
     "InstanceSlot",
+    "InstanceSpec",
+    "InstanceTierError",
+    "SessionFactory",
     "SlotState",
 ]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aistudio_api.application.format_converters.signature_cache import (
+from aistudio_api.application.signature_cache import (
     ThoughtSignatureCache,
 )
 
