@@ -327,6 +327,9 @@ class ScriptedPipeline:
         )
     )
     successes: list[tuple[str, dict[str, object] | None]] = field(default_factory=list)
+    client_terminals: list[tuple[str, str, bool]] = field(default_factory=list)
+    count_terminals: list[tuple[str, str, int]] = field(default_factory=list)
+    empty_retries: int = 0
 
     async def begin(
         self, *, model_path: str, requested_surface: str | None = None
@@ -372,6 +375,27 @@ class ScriptedPipeline:
     ) -> None:
         del context, finish_reason
         self.successes.append((attempt.instance_id, usage))
+
+    def record_client(
+        self,
+        model: str,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None:
+        del usage, finish_reason
+        self.client_terminals.append((model, result, rescued))
+
+    def record_count(
+        self, model: str, result: str, *, input_tokens: int = 0
+    ) -> None:
+        self.count_terminals.append((model, result, input_tokens))
+
+    def record_empty_retry(self, context: RouteContext, attempt: RouteAttempt) -> None:
+        del context, attempt
+        self.empty_retries += 1
 
 
 def make_attempt(

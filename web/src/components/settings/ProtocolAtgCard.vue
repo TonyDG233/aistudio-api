@@ -26,8 +26,8 @@ const atg = computed(() => asRecord(features.value.atg))
 const modeByFormat = computed(() => asRecord(atg.value.mode_by_format))
 
 const openai = computed(() => asBool(formats.value.openai, true))
-const claude = computed(() => asBool(formats.value.claude, false))
-const responses = computed(() => asBool(formats.value.responses, false))
+const claude = computed(() => asBool(formats.value.claude, true))
+const responses = computed(() => asBool(formats.value.responses, true))
 const allowPrivateUrls = computed(() => asBool(media.value.allow_private_urls, false))
 
 const ATG_MODES = [
@@ -158,7 +158,7 @@ function formatLabel(key: string): string {
             <ConfigSwitch
               :model-value="claude"
               label="Claude 兼容协议"
-              description="兼容 Claude 消息协议，默认关闭"
+              description="兼容 Claude 消息协议，默认开启"
               @update:model-value="updateFormat('claude', $event)"
             />
           </div>
@@ -173,7 +173,7 @@ function formatLabel(key: string): string {
             <ConfigSwitch
               :model-value="responses"
               label="Responses 协议"
-              description="启用 OpenAI Responses 协议，默认关闭"
+              description="启用 OpenAI Responses 协议，默认开启"
               @update:model-value="updateFormat('responses', $event)"
             />
           </div>

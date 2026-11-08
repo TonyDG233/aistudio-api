@@ -1015,19 +1015,21 @@ def _http_request(path: str) -> Request:
     )
 
 
-def test_is_openai_path_uses_shared_format_classifier(monkeypatch):
+def test_protocol_for_request_uses_shared_format_classifier(monkeypatch):
     from aistudio_api.api import app as app_module
 
     monkeypatch.setattr(app_module, "format_for_path", lambda _path: "openai")
     assert (
-        app_module._is_openai_path(_http_request("/v1beta/x:generateContent"))
-        is True
+        app_module._protocol_for_request(_http_request("/v1beta/x:generateContent"))
+        == "openai"
     )
 
     monkeypatch.setattr(app_module, "format_for_path", lambda _path: "gemini")
     assert (
-        app_module._is_openai_path(_http_request("/v1/chat/completions")) is False
+        app_module._protocol_for_request(_http_request("/v1/chat/completions"))
+        == "gemini"
     )
+    assert not hasattr(app_module, "_is_openai_path")
 
 
 def test_format_enabled_treats_string_false_and_zero_as_disabled(monkeypatch):

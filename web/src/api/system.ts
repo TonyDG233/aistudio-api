@@ -1,5 +1,6 @@
 import { request } from './client.ts'
 import type {
+  StatsRangeDays,
   StatsResponse,
   RotationStatusResponse,
   ClearCooldownRequest,
@@ -23,8 +24,9 @@ export const systemApi = {
     return request<SystemStatusResponse>('/api/system/status')
   },
 
-  getStats(): Promise<StatsResponse> {
-    return request<StatsResponse>('/stats')
+  getStats(days?: StatsRangeDays): Promise<StatsResponse> {
+    const query = days ? `?days=${days}` : ''
+    return request<StatsResponse>(`/stats${query}`)
   },
 
   getRotation(): Promise<RotationStatusResponse> {

@@ -4,6 +4,7 @@ import type { ModelStatItem } from '@/types/stats.ts'
 import Badge from '@/components/ui/Badge.vue'
 import { formatDate } from '@/utils/format.ts'
 import { normalizeModelStats } from './modelStats.ts'
+import ModelUsageChart from './ModelUsageChart.vue'
 import {
   Layers,
   ChevronDown,
@@ -17,6 +18,7 @@ const props = defineProps<{
   stats: Record<string, ModelStatItem>
 }>()
 
+const viewMode = ref<'table' | 'chart'>('table')
 const expandedModels = ref<Record<string, boolean>>({})
 
 function toggleExpand(key: string) {
@@ -28,19 +30,44 @@ const statList = computed(() => normalizeModelStats(props.stats))
 
 <template>
   <div class="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden">
-    <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <Layers class="w-4 h-4 text-brand-600" />
+    <div class="px-4 sm:px-6 py-4 border-b border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div class="flex items-center gap-2 min-w-0">
+        <Layers class="w-4 h-4 text-brand-600 shrink-0" />
         <h3 class="font-semibold text-gray-900 text-sm">
           模型调用统计
         </h3>
       </div>
-      <span class="text-xs text-gray-400 font-mono">
-        {{ statList.length }} 个模型记录
-      </span>
+      <div class="flex items-center gap-3 shrink-0">
+        <span class="text-xs text-gray-400 font-mono">
+          {{ statList.length }} 个模型记录
+        </span>
+        <div class="inline-flex rounded-lg bg-gray-100 p-0.5 text-xs">
+          <button
+            type="button"
+            class="rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
+            :class="viewMode === 'table' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-800'"
+            :aria-pressed="viewMode === 'table'"
+            @click="viewMode = 'table'"
+          >
+            📋 列表明细
+          </button>
+          <button
+            type="button"
+            class="rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
+            :class="viewMode === 'chart' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-800'"
+            :aria-pressed="viewMode === 'chart'"
+            @click="viewMode = 'chart'"
+          >
+            📈 趋势图表
+          </button>
+        </div>
+      </div>
     </div>
 
-    <div class="overflow-x-auto">
+    <div
+      v-if="viewMode === 'table'"
+      class="overflow-x-auto"
+    >
       <table class="w-full min-w-[760px] text-left border-collapse text-sm">
         <thead>
           <tr class="bg-gray-50/70 border-b border-gray-100 text-xs font-semibold text-gray-500 uppercase tracking-wider">
@@ -324,5 +351,6 @@ const statList = computed(() => normalizeModelStats(props.stats))
         </tbody>
       </table>
     </div>
+    <ModelUsageChart v-else />
   </div>
 </template>

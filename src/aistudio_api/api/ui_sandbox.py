@@ -12,16 +12,24 @@ Everything here is deterministic and performs no network or browser work.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from aistudio_api.api.state import ModelStatsItem, is_reserved_stats_key
+from aistudio_api.api.state import (
+    SHANGHAI_TZ,
+    ClientStats,
+    CountTokensStats,
+    ModelStatsItem,
+    build_stats_payload,
+    daily_key,
+)
 from aistudio_api.application.account_rotator import (
     AccountModelDailyStats,
     AccountStats,
@@ -1096,6 +1104,8 @@ class UISandbox:
             self.scenario = "all_states"
             self.keepalive_partial = False
             self.model_stats: dict[str, ModelStatsItem] = {}
+            self.daily_stats: dict[str, dict[str, ModelStatsItem]] = {}
+            self.count_tokens = CountTokensStats()
             self._formats_all_on: bool | None = None
             self._flags: dict[str, dict[str, Any]] = {}
             self._closed = False
@@ -1155,28 +1165,18 @@ class UISandbox:
 
         return DEFAULT_TEXT_MODEL
 
-    def stats_payload(self) -> dict[str, object]:
-        """All-time model stats used by /stats while the sandbox is active."""
-        models = {
-            name: asdict(item)
-            for name, item in self.model_stats.items()
-            if name and not is_reserved_stats_key(name)
-        }
-        totals = {
-            key: sum(int(getattr(item, key, 0)) for item in self.model_stats.values())
-            for key in (
-                "requests",
-                "success",
-                "rate_limited",
-                "errors",
-                "prompt_tokens",
-                "completion_tokens",
-                "reasoning_tokens",
-                "cached_tokens",
-                "total_tokens",
-            )
-        }
-        return {"models": models, "totals": totals}
+    def stats_payload(self, days: int | None = None) -> dict[str, object]:
+        """Contract-shaped stats (all-time or ``days`` window) for ui_debug."""
+        from aistudio_api.domain.model_access import is_paid_model
+
+        return build_stats_payload(
+            model_stats=self.model_stats,
+            daily_stats=self.daily_stats,
+            count_tokens=self.count_tokens,
+            days=days,
+            quota_scope="account",
+            model_extra=lambda name: {"paid": is_paid_model(name)},
+        )
 
     def reset(self, scenario: str) -> None:
         if scenario not in SCENARIOS:
@@ -1191,6 +1191,8 @@ class UISandbox:
         self.rotator.reset()
         self.keepalive.reset()
         self.model_stats = {}
+        self.daily_stats = {}
+        self.count_tokens = CountTokensStats()
         if scenario == "empty":
             return
         if scenario == "mass_accounts":
@@ -1226,7 +1228,50 @@ class UISandbox:
         else:
             stats = _all_states_model_stats()
         self.model_stats = stats
+        for item in self.model_stats.values():
+            item.client = _client_from_attempts(item)
+        self._seed_daily_stats(stats)
+        total_requests = sum(item.requests for item in stats.values())
+        self.count_tokens = _sandbox_count_tokens(total_requests, scenario)
         self._seed_account_daily(stats)
+
+    def _seed_daily_stats(
+        self, stats: dict[str, ModelStatsItem], *, days: int = 21
+    ) -> None:
+        """Synthesize 21 consecutive Shanghai days with natural variation."""
+        keys = _recent_day_keys(days)
+        weights = _natural_weights(days)
+        self.daily_stats = {key: {} for key in keys}
+        for model_index, (model, item) in enumerate(stats.items()):
+            phase = model_index * 0.73
+            attempts = _distribute(item.requests, weights, phase=phase)
+            success = _distribute(item.success, weights, phase=phase, cap=attempts)
+            rate_limited = _distribute(
+                item.rate_limited, weights, phase=phase
+            )
+            errors = _distribute(item.errors, weights, phase=phase)
+            prompt = _distribute(item.prompt_tokens, weights, phase=phase)
+            completion = _distribute(item.completion_tokens, weights, phase=phase)
+            reasoning = _distribute(item.reasoning_tokens, weights, phase=phase)
+            cached = _distribute(item.cached_tokens, weights, phase=phase)
+            total = _distribute(item.total_tokens, weights, phase=phase)
+            for index, key in enumerate(keys):
+                day_item = ModelStatsItem(
+                    requests=attempts[index],
+                    success=success[index],
+                    rate_limited=rate_limited[index],
+                    errors=errors[index],
+                    prompt_tokens=prompt[index],
+                    completion_tokens=completion[index],
+                    reasoning_tokens=reasoning[index],
+                    cached_tokens=cached[index],
+                    total_tokens=total[index],
+                    last_used=f"{key} 12:00:00",
+                )
+                if day_item.success:
+                    day_item.finish_reasons = {"STOP": day_item.success}
+                day_item.client = _client_from_attempts(day_item)
+                self.daily_stats[key][model] = day_item
 
     def _seed_account_daily(
         self, stats: dict[str, ModelStatsItem]
@@ -1290,6 +1335,19 @@ class UISandbox:
         item.cached_tokens += 2_000
         item.total_tokens += 50_000
         item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        for _ in range(10):
+            item.client.record("success")
+        daily_item = self._today_daily(model)
+        daily_item.requests += 10
+        daily_item.success += 10
+        daily_item.prompt_tokens += 32_000
+        daily_item.completion_tokens += 12_000
+        daily_item.reasoning_tokens += 4_000
+        daily_item.cached_tokens += 2_000
+        daily_item.total_tokens += 50_000
+        daily_item.last_used = item.last_used
+        for _ in range(10):
+            daily_item.client.record("success")
         account = next(
             (
                 account
@@ -1318,6 +1376,12 @@ class UISandbox:
         item.requests += 1
         item.rate_limited += 1
         item.last_used = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        item.client.record("rate_limited")
+        daily_item = self._today_daily(model)
+        daily_item.requests += 1
+        daily_item.rate_limited += 1
+        daily_item.last_used = item.last_used
+        daily_item.client.record("rate_limited")
         account = next(
             (
                 account
@@ -1337,6 +1401,10 @@ class UISandbox:
             for record in self.manager.records():
                 if record.account_id == account.id:
                     record.state = InstanceState.COOLDOWN
+
+    def _today_daily(self, model: str) -> ModelStatsItem:
+        bucket = self.daily_stats.setdefault(daily_key(), {})
+        return bucket.setdefault(model, ModelStatsItem())
 
     def _action_toggle_formats(self) -> None:
         if self._formats_all_on is None:
@@ -1892,6 +1960,101 @@ def _last_used_label(minutes_ago: int = 0) -> str:
 
     return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
         "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _recent_day_keys(days: int) -> list[str]:
+    from aistudio_api.api.state import daily_keys
+
+    return daily_keys(days)
+
+
+def _natural_weights(days: int) -> list[float]:
+    """Weekend dips plus a gentle ramp so the trend looks organic."""
+    today = datetime.now(SHANGHAI_TZ).date()
+    weights: list[float] = []
+    span = max(1, days - 1)
+    for index, offset in enumerate(range(days - 1, -1, -1)):
+        moment = today - timedelta(days=offset)
+        weekend = 0.62 if moment.weekday() >= 5 else 1.0
+        ramp = 0.72 + 0.28 * (index / span)
+        weights.append(weekend * ramp)
+    return weights
+
+
+def _distribute(
+    total: int,
+    weights: list[float],
+    *,
+    phase: float = 0.0,
+    cap: list[int] | None = None,
+) -> list[int]:
+    """Split ``total`` across days proportionally with deterministic jitter."""
+    count = len(weights)
+    if total <= 0 or count == 0:
+        return [0] * count
+    adjusted = [
+        weight * (0.84 + 0.16 * math.sin(phase + index * 0.9))
+        for index, weight in enumerate(weights)
+    ]
+    scale = sum(adjusted) or 1.0
+    raw = [total * weight / scale for weight in adjusted]
+    values = [int(value) for value in raw]
+    remainder = total - sum(values)
+    order = sorted(
+        range(count), key=lambda index: raw[index] - values[index], reverse=True
+    )
+    for index in range(remainder):
+        values[order[index % count]] += 1
+    if cap is not None:
+        values = [min(value, cap[index]) for index, value in enumerate(values)]
+    return values
+
+
+def _client_from_attempts(item: ModelStatsItem) -> ClientStats:
+    """Derive a plausible client terminal summary from attempt counters.
+
+    ``attempts = success + failures``; a rescued client consumed one failure
+    attempt plus its successful attempt, so client requests are fewer than
+    attempts whenever any request was rescued.
+    """
+    attempts = item.requests
+    success = min(item.success, attempts)
+    failures = max(0, item.rate_limited + item.errors)
+    rescued = min(success, failures // 2)
+    if failures and success and rescued == 0:
+        rescued = 1
+    client_failures = max(0, failures - rescued)
+    rate_limited = min(item.rate_limited, client_failures)
+    errors = min(item.errors, client_failures - rate_limited)
+    aborted = max(0, client_failures - rate_limited - errors)
+    return ClientStats(
+        requests=success + client_failures,
+        success=success,
+        errors=errors,
+        aborted=aborted,
+        rate_limited=rate_limited,
+        rescued_requests=rescued,
+    )
+
+
+def _sandbox_count_tokens(total_requests: int, scenario: str) -> CountTokensStats:
+    requests = max(24, total_requests // 9)
+    if scenario == "all_429":
+        success = max(0, requests // 4)
+        return CountTokensStats(
+            requests=requests,
+            success=success,
+            errors=requests - success,
+            input_tokens=success * 900,
+        )
+    errors = max(1, requests // 40)
+    success = max(0, requests - errors)
+    return CountTokensStats(
+        requests=requests,
+        success=success,
+        errors=errors,
+        input_tokens=success * 820,
     )
 
 

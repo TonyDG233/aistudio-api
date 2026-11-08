@@ -7,15 +7,13 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import get_runtime_state
 from aistudio_api.api.response_models import (
     HealthResponse,
-    ModelStatsResponse,
     StatsResponse,
-    StatsTotalsResponse,
 )
 from aistudio_api.config import resolve_default_config_template
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -98,11 +96,17 @@ def default_text_model(runtime_state: RuntimeState) -> str:
     return DEFAULT_TEXT_MODEL
 
 
-def stats_response() -> StatsResponse:
+def stats_response(days: int | None = None) -> StatsResponse:
+    """Render ``GET /stats`` for the real runtime or the UI debug sandbox.
+
+    ``days`` is ``None`` for the legacy all-time summary plus the last 90 days
+    of daily points; ``7|30|90`` scopes the summary to that window while still
+    returning consecutive daily points (missing days are zero-filled here).
+    """
     from aistudio_api.api.response_models import AccountBreakdownItem
     from aistudio_api.api.state import (
-        is_reserved_stats_key,
-        normalize_model_name,
+        CountTokensStats,
+        build_stats_payload,
         runtime_state,
     )
     from aistudio_api.domain.model_access import is_paid_model
@@ -110,35 +114,23 @@ def stats_response() -> StatsResponse:
 
     sandbox = runtime_state.ui_sandbox if runtime_state.ui_debug else None
     source = getattr(sandbox, "model_stats", None)
-    raw_stats = source if isinstance(source, dict) else runtime_state.model_stats
-    stats = {
-        name: item
-        for name, item in raw_stats.items()
-        if name
-        and not is_reserved_stats_key(name)
-        and not is_reserved_stats_key(normalize_model_name(name))
-    }
+    is_sandbox = isinstance(source, dict)
+    raw_stats = source if is_sandbox else runtime_state.model_stats
+    daily_source = getattr(sandbox, "daily_stats", None) if is_sandbox else None
+    raw_daily = daily_source if isinstance(daily_source, dict) else runtime_state.daily_stats
+    count_source = getattr(sandbox, "count_tokens", None) if is_sandbox else None
+    count_stats = (
+        count_source
+        if isinstance(count_source, CountTokensStats)
+        else runtime_state.count_tokens
+    )
     rotator = runtime_state.rotator
     account_svc = runtime_state.account_service
     accounts_list = account_svc.list_accounts() if account_svc else []
 
-    totals = StatsTotalsResponse(
-        requests=sum(s.requests for s in stats.values()),
-        success=sum(s.success for s in stats.values()),
-        rate_limited=sum(s.rate_limited for s in stats.values()),
-        errors=sum(s.errors for s in stats.values()),
-        prompt_tokens=sum(s.prompt_tokens for s in stats.values()),
-        completion_tokens=sum(s.completion_tokens for s in stats.values()),
-        reasoning_tokens=sum(s.reasoning_tokens for s in stats.values()),
-        cached_tokens=sum(s.cached_tokens for s in stats.values()),
-        total_tokens=sum(s.total_tokens for s in stats.values()),
-    )
-
-    models = {}
-    for name, s in stats.items():
+    def _model_extra(name: str) -> dict[str, object]:
         clean_m = name.removeprefix("models/").lower()
         breakdown: list[AccountBreakdownItem] = []
-
         if rotator:
             from aistudio_api.application.account_rotator import (
                 get_pacific_date_key,
@@ -189,27 +181,20 @@ def stats_response() -> StatsResponse:
                                 cooldown_remaining=cd_rem,
                             )
                         )
+        return {
+            "paid": is_paid_model(name),
+            "account_breakdown": breakdown,
+        }
 
-        models[name] = ModelStatsResponse(
-            requests=s.requests,
-            success=s.success,
-            rate_limited=s.rate_limited,
-            errors=s.errors,
-            prompt_tokens=s.prompt_tokens,
-            completion_tokens=s.completion_tokens,
-            reasoning_tokens=s.reasoning_tokens,
-            cached_tokens=s.cached_tokens,
-            total_tokens=s.total_tokens,
-            finish_reasons=dict(s.finish_reasons),
-            last_used=s.last_used,
-            paid=is_paid_model(name),
-            account_breakdown=breakdown,
-        )
-    return StatsResponse(
-        models=models,
-        totals=totals,
+    payload = build_stats_payload(
+        model_stats=raw_stats,
+        daily_stats=raw_daily,
+        count_tokens=count_stats,
+        days=days,
         quota_scope=rotator.quota_scope if rotator else "account",
+        model_extra=_model_extra,
     )
+    return StatsResponse.model_validate(payload)
 
 
 @public_router.get("/health", response_model=HealthResponse)
@@ -218,8 +203,8 @@ async def health():
 
 
 @protected_router.get("/stats", response_model=StatsResponse)
-async def stats():
-    return stats_response()
+async def stats(days: int | None = Query(default=None, ge=1, le=90)):
+    return stats_response(days)
 
 
 @protected_router.get("/api/system/status")
