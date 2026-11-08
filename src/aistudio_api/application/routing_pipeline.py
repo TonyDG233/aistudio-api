@@ -33,6 +33,7 @@ from aistudio_api.domain.errors import (
     AistudioError,
     AuthError,
     BrowserTransportError,
+    EngineSwitchingError,
     RequestError,
     RoutingError,
     SessionExpiredError,
@@ -96,7 +97,6 @@ class InstanceManagerProtocol(Protocol):
     async def wake(self, instance_id: str) -> object: ...
 
     async def begin_request(self, instance_id: str) -> RequestHandle: ...
-
 
 
 class GenerationClient(Protocol):
@@ -380,6 +380,10 @@ class RoutingPipeline:
         self, *, model_path: str, requested_surface: str | None = None
     ) -> RouteContext:
         manager = self._manager
+        if not bool(getattr(manager, "requests_open", True)):
+            raise EngineSwitchingError(
+                "engine switch in progress; request rejected with 503"
+            )
         await self._ensure_started()
         surfaces = getattr(manager, "configured_surfaces", frozenset()) or frozenset(
             {"chat"}
@@ -402,13 +406,11 @@ class RoutingPipeline:
         if not lane_candidates:
             if route.paid:
                 lane_all = list(manager.lane_instances(paid=True))
-                all_candidates = list(
-                    manager.eligible_instances(paid=True)
-                ) + list(manager.eligible_instances(paid=False))
+                all_candidates = list(manager.eligible_instances(paid=True)) + list(
+                    manager.eligible_instances(paid=False)
+                )
                 current = self._current_tier(lane_all + all_candidates)
-                if not tier_satisfies_required(
-                    current, route.required_tiers
-                ):
+                if not tier_satisfies_required(current, route.required_tiers):
                     raise self._tier_error(route, current)
             raise SurfaceCapacityError(surface=route.surface)
 
@@ -545,9 +547,7 @@ class RoutingPipeline:
         if not callable(checker):
             return True
         try:
-            return bool(
-                checker(account_id, model=route.model, surface=route.surface)
-            )
+            return bool(checker(account_id, model=route.model, surface=route.surface))
         except TypeError:
             return bool(checker(account_id, model=route.model))
 
@@ -643,9 +643,7 @@ class RoutingPipeline:
                     candidate.account_id,
                     context.total_attempts,
                 )
-                return RouteAttempt(
-                    candidate=candidate, handle=handle, client=client
-                )
+                return RouteAttempt(candidate=candidate, handle=handle, client=client)
             except (RoutingError, TierRequiredError):
                 raise
             except Exception as exc:
@@ -696,9 +694,7 @@ class RoutingPipeline:
             except Exception as exc:
                 logger.debug("[routing] 统计记录失败: %s", exc)
 
-    def record_empty_retry(
-        self, context: RouteContext, attempt: RouteAttempt
-    ) -> None:
+    def record_empty_retry(self, context: RouteContext, attempt: RouteAttempt) -> None:
         """Record one independent attempt for an empty-response retry."""
         if not context.record_attempts:
             return
@@ -738,16 +734,12 @@ class RoutingPipeline:
         except Exception as exc:
             logger.debug("[routing] client 终态记录失败: %s", exc)
 
-    def record_count(
-        self, model: str, result: str, *, input_tokens: int = 0
-    ) -> None:
+    def record_count(self, model: str, result: str, *, input_tokens: int = 0) -> None:
         """Record one isolated countTokens terminal (no attempt/quota)."""
         if self._count_token_recorder is None:
             return
         try:
-            self._count_token_recorder(
-                model, result, input_tokens=input_tokens
-            )
+            self._count_token_recorder(model, result, input_tokens=input_tokens)
         except Exception as exc:
             logger.debug("[routing] countTokens 统计记录失败: %s", exc)
 
@@ -781,14 +773,15 @@ class RoutingPipeline:
                 # tier that cannot satisfy the route: count it as an attempt
                 # before surfacing the tier error.
                 self._record_error("auth_error", context, attempt, exc=exc)
-                raise self._tier_error(
-                    context.route, attempt.candidate.tier
-                ) from exc
+                raise self._tier_error(context.route, attempt.candidate.tier) from exc
             self._record_error("auth_error", context, attempt, exc=exc)
             if has_yielded_data:
                 attempt.client.clear_templates()
                 raise exc
-            if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
+            if (
+                attempt.same_retries == 0
+                and context.total_attempts < context.max_retries
+            ):
                 # 403 常见根因是页面缓存的 SAPISID/__Secure-1PSIDTS 已过期；
                 # 先用仍然有效的浏览器会话重新取 cookie，再重新签名重试。
                 if await self._refresh_auth_state(context, attempt, reason_summary):
@@ -823,7 +816,10 @@ class RoutingPipeline:
             self._record_error("rate_limited", context, attempt, exc=exc)
             if has_yielded_data:
                 raise exc
-            if attempt.same_retries == 0 and context.total_attempts < context.max_retries:
+            if (
+                attempt.same_retries == 0
+                and context.total_attempts < context.max_retries
+            ):
                 attempt.same_retries += 1
                 context.retry_same = True
                 context.budget.record_retry("429")
@@ -853,10 +849,7 @@ class RoutingPipeline:
             )
 
         if isinstance(exc, RequestError) and exc.status in (204, 404):
-            if (
-                exc.status == 404
-                and not is_transient_rpc_error(exc)
-            ):
+            if exc.status == 404 and not is_transient_rpc_error(exc):
                 self._record_error("error", context, attempt, exc=exc)
                 raise exc
             if (
@@ -873,8 +866,7 @@ class RoutingPipeline:
                 context.budget.record_retry(f"retry_{exc.status}")
                 attempt.client.clear_templates()
                 logger.warning(
-                    "[routing] %s 同账号重试 model=%s instance=%s account=%s "
-                    "reason=%s",
+                    "[routing] %s 同账号重试 model=%s instance=%s account=%s reason=%s",
                     exc.status,
                     context.route.model,
                     attempt.instance_id,
@@ -924,8 +916,7 @@ class RoutingPipeline:
         refresher = getattr(attempt.client, "refresh_auth_state", None)
         if not callable(refresher):
             logger.warning(
-                "[routing] 客户端不支持 403 鉴权刷新 instance=%s account=%s "
-                "reason=%s",
+                "[routing] 客户端不支持 403 鉴权刷新 instance=%s account=%s reason=%s",
                 attempt.instance_id,
                 attempt.account_id,
                 reason_summary,
@@ -1112,8 +1103,7 @@ class RoutingPipeline:
             raise exc
         context.failed_accounts.add(attempt.account_id)
         can_continue = (
-            context.total_attempts < context.max_retries
-            and context.budget.can_switch()
+            context.total_attempts < context.max_retries and context.budget.can_switch()
         )
         if can_continue:
             # Heal the failed slot immediately (429-dead slots must not stay in

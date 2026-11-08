@@ -366,6 +366,116 @@ def test_update_account_email(tmp_path):
     assert store.update_account_email(acc.id, "real_user@gmail.com") is False
 
 
+def test_filter_minimal_cookies_keeps_auth_and_does_not_mutate_source():
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        filter_minimal_cookies,
+    )
+
+    jar = {
+        "SAPISID": "sapisid",
+        "SID": "sid",
+        "__Secure-1PSIDTS": "ts",
+        "LSID": "account-only",
+        "__Host-GAPS": "host-only",
+        "_ga": "telemetry",
+        "OSID": "studio",
+        "EMPTY": "",
+    }
+    minimal = filter_minimal_cookies(jar)
+
+    assert minimal == {
+        "SAPISID": "sapisid",
+        "SID": "sid",
+        "__Secure-1PSIDTS": "ts",
+    }
+    # Browser session jars must keep every cookie for DOM/storage-state flows.
+    assert jar["LSID"] == "account-only"
+    assert jar["__Host-GAPS"] == "host-only"
+    assert jar["_ga"] == "telemetry"
+    assert jar["OSID"] == "studio"
+
+
+@pytest.mark.asyncio
+async def test_import_cookies_detects_tampermonkey_auth_user_and_tier(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.api import routes_accounts
+    from aistudio_api.api.routes_accounts import (
+        ImportCookiesRequest,
+        import_cookies,
+    )
+    from aistudio_api.api.state import RuntimeState
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    email_probe = AsyncMock(return_value="tm@example.com")
+    tier_probe = AsyncMock(return_value="Ultra")
+    monkeypatch.setattr(routes_accounts, "probe_account_email", email_probe)
+    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", tier_probe)
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_tm")
+    svc = AccountService(store)
+    state = RuntimeState(account_service=svc, client=None, rotator=MagicMock())
+
+    payload = (
+        '{"cookies": "SID=sid; SAPISID=sapisid", "authUser": 2, "g1Tier": "TIER1"}'
+    )
+    response = await import_cookies(
+        ImportCookiesRequest(cookies=payload),
+        account_service=svc,
+        runtime_state=state,
+    )
+
+    assert response.auth_user == "2"
+    assert response.tier == "Pro"
+    assert tier_probe.await_count == 0
+    saved = store.get_account(response.account_id)
+    assert saved is not None
+    assert saved.auth_user == "2"
+    assert saved.tier == "Pro"
+
+
+@pytest.mark.asyncio
+async def test_import_cookies_explicit_auth_user_wins_over_tampermonkey(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.api import routes_accounts
+    from aistudio_api.api.routes_accounts import (
+        ImportCookiesRequest,
+        import_cookies,
+    )
+    from aistudio_api.api.state import RuntimeState
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    monkeypatch.setattr(
+        routes_accounts, "probe_account_email", AsyncMock(return_value="tm@example.com")
+    )
+    monkeypatch.setattr(
+        routes_accounts, "probe_account_benefit_tier", AsyncMock(return_value="Free")
+    )
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts_tm_explicit")
+    svc = AccountService(store)
+    state = RuntimeState(account_service=svc, client=None, rotator=MagicMock())
+
+    payload = (
+        '{"cookies": "SID=sid; SAPISID=sapisid", "authUser": 2, "g1Tier": "TIER2"}'
+    )
+    response = await import_cookies(
+        ImportCookiesRequest(cookies=payload, auth_user="1"),
+        account_service=svc,
+        runtime_state=state,
+    )
+
+    assert response.auth_user == "1"
+    assert response.tier == "Ultra"
+
+
 def test_parse_benefit_tier_and_update_account_tier(tmp_path):
     """测试 GetAiStudioBenefitTier 响应解析、请求头映射及账号等级持久化。"""
     from aistudio_api.domain.model_access import normalize_tier, tier_header_value

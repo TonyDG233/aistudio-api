@@ -55,6 +55,15 @@ class InstanceListResponse(BaseModel):
     latest_instance_id: str | None
     current_instance_id: str | None
     instances: list[InstanceResponse]
+    engine: str = ""
+    engine_phase: str = ""
+    engine_target: str = ""
+    rebuilt: int = 0
+    total: int = 0
+    transport_state: str = ""
+    worker_state: str = ""
+    proof_latency_ms: float | None = None
+    fingerprint_profile: str = ""
 
 
 class CreateInstanceRequest(BaseModel):
@@ -128,6 +137,18 @@ async def list_instances(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> InstanceListResponse:
     result: InstanceList = await manager.list_instances()
+    engine_status: dict[str, object] = {}
+    switcher = runtime_state.engine_switcher
+    getter = getattr(switcher, "status", None)
+    if callable(getter):
+        try:
+            raw_engine_status = getter()
+        except Exception:
+            raw_engine_status = {}
+        if isinstance(raw_engine_status, dict):
+            engine_status = {
+                str(key): value for key, value in raw_engine_status.items()
+            }
     return InstanceListResponse(
         max_instances=result.max_instances,
         latest_instance_id=result.latest_instance_id,
@@ -138,7 +159,28 @@ async def list_instances(
             )
             for item in result.instances
         ],
+        engine=str(engine_status.get("engine") or ""),
+        engine_phase=str(engine_status.get("engine_phase") or ""),
+        engine_target=str(engine_status.get("engine_target") or ""),
+        rebuilt=_engine_int(engine_status.get("rebuilt")),
+        total=_engine_int(engine_status.get("total")),
+        transport_state=str(engine_status.get("transport_state") or ""),
+        worker_state=str(engine_status.get("worker_state") or ""),
+        proof_latency_ms=_engine_float(engine_status.get("proof_latency_ms")),
+        fingerprint_profile=str(engine_status.get("fingerprint_profile") or ""),
     )
+
+
+def _engine_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
+def _engine_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 @router.post("", response_model=InstanceResponse, status_code=201)

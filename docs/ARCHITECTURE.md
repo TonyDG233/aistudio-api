@@ -147,9 +147,14 @@ flowchart TD
 
 ## 2. 实例模型、Tier 选择器与池容量
 
-### 2.1 1 实例 = 1 账号 + 1 Context + 1 Page + 1 surface
+### 2.1 实例定义：双引擎 1 实例边界
 
-实例是不可再拆的调度与用量单位（`domain/instances.py:18-33`、`instance_pool.py:1-11`）：
+实例是不可再拆的调度与用量单位。全局引擎二选一（`browser` 默认、`browserless` 可选），两模式共用同一套实例槽位、Tier 选择器、容量上限与 `active_requests` 并发原语，仅底层执行载体不同：
+
+- **`browser` 模式**：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface（`domain/instances.py:18-33`、`instance_pool.py:1-11`）。
+- **`browserless` 模式**：1 实例 = 1 账号 + 1 BrowserlessSession（无 Chromium Context/Page）+ 1 surface；每个槽位独立持有 Cookie、确定性指纹、proof 铸造器与传输器。
+
+`browser` 模式下的实例边界（`domain/instances.py:18-33`、`instance_pool.py:1-11`）：
 
 - **1 个账号**：实例绑定一个 `AccountMeta`，同一账号的 chat/build 不并存。
 - **1 个 BrowserContext**：实例在独立 `BrowserContext` 内运行，互不共享 Cookie/缓存/模板。

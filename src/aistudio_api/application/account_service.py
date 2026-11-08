@@ -65,6 +65,15 @@ class AccountService:
 
         self._store.set_active_account(account_id)
         logger.info("已切换活跃账号持久化状态: %s", account_id)
+        if getattr(browser_session, "engine", "browser") == "browserless":
+            # Browserless mode has no control page: switching the persisted
+            # active account must never launch CloakBrowser/BotGuard.
+            logger.info(
+                "已切换活跃账号（browserless 无浏览器控制面）: %s (%s)",
+                account_id,
+                account.name,
+            )
+            return account
         await browser_session.switch_auth(str(auth_path))
         await browser_session.ensure_botguard_service()
         logger.info("已切换到账号: %s (%s)", account_id, account.name)

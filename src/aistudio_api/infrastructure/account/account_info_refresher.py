@@ -31,6 +31,7 @@ from aistudio_api.infrastructure.account.benefit_tier import (
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
+    filter_minimal_cookies,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
@@ -139,9 +140,7 @@ def _parse_checked_at(value: object) -> float | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(
-            str(value).replace("Z", "+00:00")
-        ).timestamp()
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return None
 
@@ -536,7 +535,9 @@ class AccountInfoRefresher:
         return _CookieJar(header="; ".join(header_parts), jar=jar)
 
     def _build_authorization(self, jar: dict[str, str]) -> str:
-        return calculate_sapisid_hash(jar, origin=AI_STUDIO_ORIGIN)
+        return calculate_sapisid_hash(
+            filter_minimal_cookies(jar), origin=AI_STUDIO_ORIGIN
+        )
 
     def _rpc_headers(
         self, cookies: _CookieJar, *, auth_user: str = "0"
@@ -599,7 +600,11 @@ class AccountInfoRefresher:
         if not keys:
             return None
         return next(
-            (candidate for candidate in keys if candidate.startswith(WEB_API_KEY_PREFIX)),
+            (
+                candidate
+                for candidate in keys
+                if candidate.startswith(WEB_API_KEY_PREFIX)
+            ),
             keys[0],
         )
 

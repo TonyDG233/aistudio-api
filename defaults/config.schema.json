@@ -32,6 +32,127 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "engine": {
+      "type": "object",
+      "description": "Stage 2.1 双引擎二选一。mode=browser 使用 CloakBrowser/CDP；mode=browserless 使用 waa-signer（不启动 Chromium）。切换为事务式热切换，期间新请求 503。",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["browser", "browserless"],
+          "default": "browser"
+        },
+        "switch": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drain_timeout_s": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 120,
+              "default": 12
+            },
+            "startup_concurrency": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16,
+              "default": 2
+            },
+            "switch_timeout_s": {
+              "type": "number",
+              "minimum": 1,
+              "default": 120
+            },
+            "rollback_on_partial_failure": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "browserless": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "signer": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": ["local_subprocess", "remote_http"],
+                  "default": "local_subprocess"
+                },
+                "endpoint": {
+                  "type": "string",
+                  "default": "http://127.0.0.1:8081"
+                },
+                "binary_path": {
+                  "type": "string",
+                  "default": "waa-signer/bin/waa-signer"
+                },
+                "auto_start": { "type": "boolean", "default": true },
+                "startup_timeout_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 30
+                },
+                "request_timeout_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 90
+                },
+                "state_dir": {
+                  "type": "string",
+                  "default": "data/waa/workers"
+                },
+                "max_workers": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64,
+                  "default": 8
+                },
+                "idle_ttl_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 900
+                },
+                "locale": { "type": "string", "default": "en-US" },
+                "timezone": {
+                  "type": "string",
+                  "default": "America/Los_Angeles"
+                }
+              }
+            },
+            "transport": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": ["signer_rpc", "direct_http"],
+                  "default": "signer_rpc"
+                },
+                "http2": { "type": "boolean", "default": true },
+                "max_connections": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64,
+                  "default": 6
+                },
+                "connect_timeout_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 15
+                },
+                "read_timeout_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 120
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "instances": {
       "type": "array",
       "description": "实例级配置：1 账号 + 1 Context + 1 Page + 1 surface；同账号 chat/build 不得并存。tier 选择器至少一个：only_tier 精确钉住（Ultra 展开 Ultra..Ultra_20X），min_tier 单独开 min..Ultra_20X，max_tier 单独默认下界 Pro，min+max 为闭区间；Free 只能是 Free..Free，Free 与付费 lane 不得混合。",

@@ -16,7 +16,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aistudio_api.config import resolve_fingerprint_spoof_enabled, settings
 from aistudio_api.infrastructure.browser.browser_engine import (
@@ -149,14 +149,17 @@ class BrowserSession:
         self._transport = XHRStreamTransport()
         self._in_flight: int = 0
         self._stream_cleanup_count: int = 0
+        # Set by the app in browserless mode so control-plane helpers never
+        # open a CloakBrowser page/BotGuard probe.
+        self.engine = "browser"
 
     @property
     def is_ready(self) -> bool:
         return self._active_context is not None and self._active_context.is_usable()
 
     @property
-    def active_context(self) -> SessionContext | None:
-        return self._active_context
+    def active_context(self) -> SessionContext:
+        return cast("SessionContext", self._active_context)
 
     @property
     def page(self) -> CDPPage | None:
@@ -385,9 +388,10 @@ class BrowserSession:
 
     async def _drain_and_close_context(self, context: SessionContext) -> None:
         """Wait once (bounded) for the old page, then force-close it."""
-        if context.in_flight > 0 and not context.page.is_closed():
+        page = context.require_page()
+        if context.in_flight > 0 and not page.is_closed():
             deadline = asyncio.get_running_loop().time() + self._drain_timeout_s
-            while context.in_flight > 0 and not context.page.is_closed():
+            while context.in_flight > 0 and not page.is_closed():
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     log.warning(
@@ -406,13 +410,13 @@ class BrowserSession:
 
         # D03-026: 关闭前回写当前账号 cookie，避免最后一次会话状态丢失。
         with suppress(Exception):
-            await save_browser_cookies(context.page, auth_file=context.auth_file)
+            await save_browser_cookies(page, auth_file=context.auth_file)
         with suppress(Exception):
-            if not context.page.is_closed():
-                await context.page.close()
-        if self._cdp_client is not None and context.page.target_id:
+            if not page.is_closed():
+                await page.close()
+        if self._cdp_client is not None and page.target_id:
             with suppress(Exception):
-                await self._cdp_client.close_target(context.page.target_id)
+                await self._cdp_client.close_target(page.target_id)
 
     async def ensure_botguard_service(self, force_refresh: bool = False) -> CDPPage:
         page = self.page
@@ -425,7 +429,7 @@ class BrowserSession:
             await self.transition_to_account(
                 self._auth_file, force_refresh=force_refresh
             )
-        return (await self.ensure_ready()).page
+        return (await self.ensure_ready()).require_page()
 
     async def capture_template(self, model: str) -> dict[str, object]:
         if self._proc is not None and not self._proc.is_alive():
@@ -480,7 +484,7 @@ class BrowserSession:
 
             for attempt in range(5):
                 try:
-                    raw_res = await ctx.page.evaluate(
+                    raw_res = await ctx.require_page().evaluate(
                         SNAPSHOT_GENERATE_JS, args=args, timeout_s=25.0
                     )
                     snapshot = ""
@@ -506,7 +510,7 @@ class BrowserSession:
                         ) from e
                     log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
                 if attempt < 4:
-                    await ctx.page.wait_for_timeout(250)
+                    await ctx.require_page().wait_for_timeout(250)
 
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
@@ -541,7 +545,7 @@ class BrowserSession:
             else {}
         )
         return await self._transport.send_hooked_request(
-            ctx.page,
+            ctx.require_page(),
             url=captured_url,
             headers=captured_headers,
             body=body,
@@ -567,7 +571,7 @@ class BrowserSession:
         ctx.incr_in_flight()
         try:
             async for event in self._transport.send_streaming_request(
-                ctx.page,
+                ctx.require_page(),
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
@@ -577,7 +581,7 @@ class BrowserSession:
                 yield event
         finally:
             ctx.decr_in_flight()
-            await self.cleanup_stream_page(ctx.page)
+            await self.cleanup_stream_page(ctx.require_page())
 
     async def cleanup_stream_page(self, page: CDPPage | None = None) -> None:
         self._stream_cleanup_count += 1
@@ -713,8 +717,9 @@ class BrowserSession:
         self._ready_event.clear()
         if active_ctx is not None:
             with suppress(Exception):
-                if not active_ctx.page.is_closed():
-                    await active_ctx.page.close()
+                page = active_ctx.require_page()
+                if not page.is_closed():
+                    await page.close()
         await self._stop_browser()
 
     async def _stop_browser(self) -> None:

@@ -342,6 +342,26 @@ async def test_auth_update_writes_all_pool_slots_including_build_only(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_browserless_auth_update_uses_slot_cookies_without_control_page(
+    tmp_path,
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    control = FakeControlSession(page_open=False)
+    slot_session = FakeSlotSession(saved=True)
+    manager = FakeManager([FakeSlot("slot-a", "acc_a", session=slot_session)])
+    service = _service(store, client=FakeClient(control), manager=manager)
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["ok"] is True
+    assert result["accounts"] == ["acc_a"]
+    assert slot_session.calls == 1
+    # Browserless has no control page; only per-slot signer cookies are written.
+    assert control.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_auth_update_marks_only_accounts_whose_slots_all_saved(tmp_path):
     store = AccountStore(tmp_path)
     _account(store, "acc_a", "a@example.com")
@@ -639,9 +659,7 @@ async def test_metadata_refresh_skips_benefit_tier_for_fresh_free(tmp_path):
     store.update_account_refresh(account.id, tier="Free", tier_checked_at=checked)
     transport = CountingTransport()
     refresher = AccountInfoRefresher(store, transport=transport)
-    service = _service(
-        store, refresher=refresher, clock=FakeClock(now.timestamp())
-    )
+    service = _service(store, refresher=refresher, clock=FakeClock(now.timestamp()))
 
     result = await service.run_now("metadata_refresh", settings=_settings())
 
@@ -662,9 +680,7 @@ async def test_metadata_refresh_probes_free_tier_older_than_three_days(tmp_path)
     store.update_account_refresh(account.id, tier="Free", tier_checked_at=checked)
     transport = CountingTransport()
     refresher = AccountInfoRefresher(store, transport=transport)
-    service = _service(
-        store, refresher=refresher, clock=FakeClock(now.timestamp())
-    )
+    service = _service(store, refresher=refresher, clock=FakeClock(now.timestamp()))
 
     result = await service.run_now("metadata_refresh", settings=_settings())
 
@@ -673,3 +689,49 @@ async def test_metadata_refresh_probes_free_tier_older_than_three_days(tmp_path)
     after = store.get_account(account.id)
     assert after is not None
     assert after.tier_checked_at != checked
+
+
+@pytest.mark.asyncio
+async def test_pause_race_rechecked_after_job_lock(tmp_path) -> None:
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    service = _service(store)
+    executed: list[str] = []
+
+    async def _execute(task: str, settings: object, trigger: str) -> dict[str, object]:
+        del settings, trigger
+        executed.append(task)
+        return {"ok": True, "task": task}
+
+    service._execute = _execute  # type: ignore[method-assign]
+
+    class _RecheckLock:
+        def __init__(self) -> None:
+            self.inner = asyncio.Lock()
+
+        def locked(self) -> bool:
+            return False
+
+        async def __aenter__(self) -> _RecheckLock:
+            await self.inner.acquire()
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+            self.inner.release()
+
+    fake_lock = _RecheckLock()
+    await fake_lock.inner.acquire()
+    service._job_lock = fake_lock  # type: ignore[assignment]
+
+    task = asyncio.create_task(
+        service.run_now("metadata_refresh", settings=_settings())
+    )
+    await asyncio.sleep(0)
+    service._paused = True
+    fake_lock.inner.release()
+    result = await task
+
+    assert result["reason"] == "paused"
+    assert executed == []
+    assert service._job_lock is fake_lock

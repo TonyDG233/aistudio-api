@@ -142,12 +142,20 @@ class PooledSession:
         return self._context
 
     @property
-    def page(self) -> CDPPage:
+    def engine(self) -> str:
+        return "browser"
+
+    @property
+    def page(self) -> CDPPage | None:
         return self._context.page
 
     @property
     def in_flight_count(self) -> int:
         return self._in_flight
+
+    def is_alive(self) -> bool:
+        page = self._context.page
+        return page is not None and not page.is_closed()
 
     @asynccontextmanager
     async def request_scope(self):
@@ -161,7 +169,7 @@ class PooledSession:
 
     async def ensure_ready(self, timeout_s: float = 120.0) -> SessionContext:
         del timeout_s
-        if self._context.page.is_closed():
+        if self._context.require_page().is_closed():
             raise RuntimeError(f"PooledSession {self._realm_id} page is closed")
         return self._context
 
@@ -204,7 +212,7 @@ class PooledSession:
             )
             for attempt in range(5):
                 try:
-                    raw_res = await self._context.page.evaluate(
+                    raw_res = await self._context.require_page().evaluate(
                         SNAPSHOT_GENERATE_JS,
                         args=args,
                         timeout_s=25.0,
@@ -229,7 +237,7 @@ class PooledSession:
                         ) from exc
                     log.debug("PooledSession 快照第 %d 次失败: %s", attempt + 1, exc)
                 if attempt < 4:
-                    await self._context.page.wait_for_timeout(250)
+                    await self._context.require_page().wait_for_timeout(250)
         raise RuntimeError(
             f"PooledSession snapshot generation failed for {content_hash[:8]}"
         )
@@ -241,7 +249,7 @@ class PooledSession:
         warmup so the WAA challenge sees fresh cookie state.
         """
         self._force_snapshot_warmup = True
-        page = self._context.page
+        page = self._context.require_page()
         if page.is_closed():
             log.warning("刷新鉴权态失败: realm=%s 页面已关闭", self._realm_id)
             return False
@@ -263,7 +271,7 @@ class PooledSession:
             else {}
         )
         return await self._transport.send_hooked_request(
-            ctx.page,
+            ctx.require_page(),
             url=captured_url,
             headers=captured_headers,
             body=body,
@@ -289,7 +297,7 @@ class PooledSession:
         ctx.incr_in_flight()
         try:
             async for event in self._transport.send_streaming_request(
-                ctx.page,
+                ctx.require_page(),
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
@@ -299,11 +307,11 @@ class PooledSession:
                 yield event
         finally:
             ctx.decr_in_flight()
-            await self.cleanup_stream_page(ctx.page)
+            await self.cleanup_stream_page(ctx.require_page())
 
     async def cleanup_stream_page(self, page: CDPPage | None = None) -> None:
         self._stream_cleanup_count += 1
-        target_page = page or self._context.page
+        target_page = page or self._context.require_page()
         if (
             target_page is not None
             and not target_page.is_closed()
@@ -319,9 +327,11 @@ class PooledSession:
                 gc.collect()
 
     async def save_current_cookies(self) -> bool:
-        return await save_browser_cookies(self._context.page, self._context.auth_file)
+        return await save_browser_cookies(
+            self._context.require_page(), self._context.auth_file
+        )
 
     async def close(self) -> None:
         self._capture_service.clear_templates(invalidate_base=True)
         with suppress(Exception):
-            await self._context.page.close()
+            await self._context.require_page().close()

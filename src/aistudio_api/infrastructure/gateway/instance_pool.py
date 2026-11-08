@@ -19,7 +19,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
+from aistudio_api.domain.errors import EngineSwitchingError
 from aistudio_api.domain.model_access import (
     TierSelector,
     canonical_tier,
@@ -28,7 +30,10 @@ from aistudio_api.domain.model_access import (
     tier_matches_selector,
 )
 from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
-from aistudio_api.infrastructure.gateway.pooled_session import PooledSession
+from aistudio_api.infrastructure.gateway.browser_engine_session import (
+    BrowserEngineSession,
+)
+from aistudio_api.infrastructure.gateway.session_protocol import EngineSession
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("instance-pool")
@@ -119,6 +124,8 @@ class ActiveRequest:
     """One in-flight request handle; release is idempotent and must be in finally."""
 
     slot: InstanceSlot
+    epoch: int = 0
+    generation: int = 0
     _released: bool = False
 
     @property
@@ -133,6 +140,21 @@ class ActiveRequest:
         if self._released:
             return
         self._released = True
+        if self.slot.generation != self.generation:
+            log.warning(
+                "[pool] stale request release ignored slot=%s gen=%d current=%d",
+                self.slot_id,
+                self.generation,
+                self.slot.generation,
+            )
+            return
+        if self.slot.engine_epoch != self.epoch:
+            log.warning(
+                "[pool] cross-epoch release slot=%s epoch=%d current=%d",
+                self.slot_id,
+                self.epoch,
+                self.slot.engine_epoch,
+            )
         self.slot.release_request()
 
 
@@ -151,10 +173,11 @@ class InstanceSlot:
     auth_file: str | None = None
     auth_user: str = "0"
     tier: str = "Free"
-    session: PooledSession | None = None
+    session: EngineSession | None = None
     cdp: CDPClient | None = field(default=None, repr=False, compare=False)
     state: SlotState = SlotState.UNSTARTED
     generation: int = 0
+    engine_epoch: int = 0
     active_requests: int = 0
     last_error: str | None = None
     last_used: float = field(default_factory=time.monotonic)
@@ -191,17 +214,36 @@ class InstanceSlot:
         return tier_matches_selector(tier, self.selector)
 
     @property
-    def page(self) -> CDPPage | None:
-        return self.session.page if self.session is not None else None
+    def engine(self) -> str:
+        return str(getattr(self.session, "engine", "browser") or "browser")
 
-    def page_closed(self) -> bool:
+    @property
+    def page(self) -> CDPPage | None:
+        if self.session is None:
+            return None
+        return getattr(self.session, "page", None)
+
+    def session_alive(self) -> bool:
+        """True while a request runtime exists (Page optional for browserless)."""
+        if self.session is None:
+            return False
+        checker = getattr(self.session, "is_alive", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
         page = self.page
         if page is None:
             return True
         try:
-            return page.is_closed()
+            return not page.is_closed()
         except Exception:
-            return True
+            return False
+
+    def page_closed(self) -> bool:
+        """Compatibility predicate: no live runtime counts as closed."""
+        return not self.session_alive()
 
     def acquire_request(self) -> None:
         self.active_requests += 1
@@ -215,7 +257,7 @@ class InstanceSlot:
             self.active_zero.set()
 
 
-SessionFactory = Callable[..., Awaitable[PooledSession]]
+SessionFactory = Callable[..., Awaitable[EngineSession]]
 
 
 class InstancePool:
@@ -231,6 +273,8 @@ class InstancePool:
         | None = None,
         max_contexts_provider: Callable[[], int] | None = None,
         session_factory: SessionFactory | None = None,
+        engine_runtime: Any | None = None,
+        engine: str = "browser",
         on_slot_retired: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         load_attempts: int = 3,
@@ -241,7 +285,9 @@ class InstancePool:
         self._specs_provider = specs_provider
         self._max_contexts = max(1, int(max_contexts))
         self._max_contexts_provider = max_contexts_provider
-        self._session_factory = session_factory or PooledSession.bootstrap
+        self._session_factory = session_factory or BrowserEngineSession.bootstrap
+        self._engine_runtime = engine_runtime
+        self._engine = str(engine or "browser")
         self._on_slot_retired = on_slot_retired
         self._clock = clock or time.monotonic
         self._load_attempts = max(1, int(load_attempts))
@@ -249,6 +295,11 @@ class InstancePool:
         self._slots: dict[str, InstanceSlot] = {}
         self._counter = itertools.count(1)
         self._lock = asyncio.Lock()
+        # Engine epoch/generation and the request gate used by hot switching.
+        self._epoch = 1
+        self._requests_open = True
+        self._engine_phase = "idle"
+        self._gate_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ config
 
@@ -277,7 +328,51 @@ class InstancePool:
 
     @property
     def live_contexts(self) -> int:
+        """Live BrowserContext count (unchanged for the traditional engine)."""
         return sum(1 for slot in self._slots.values() if slot.context_id)
+
+    @property
+    def live_runtimes(self) -> int:
+        """Live request runtimes across either engine (Page optional)."""
+        return sum(1 for slot in self._slots.values() if slot.session is not None)
+
+    @property
+    def engine(self) -> str:
+        return self._engine
+
+    @property
+    def engine_phase(self) -> str:
+        return self._engine_phase
+
+    @property
+    def engine_epoch(self) -> int:
+        return self._epoch
+
+    @property
+    def requests_open(self) -> bool:
+        return self._requests_open
+
+    def set_engine_phase(self, phase: str) -> None:
+        self._engine_phase = str(phase)
+
+    def set_engine_runtime(self, runtime: Any | None, *, engine: str) -> None:
+        self._engine_runtime = runtime
+        self._engine = str(engine or "browser")
+
+    def pause_requests(self) -> None:
+        self._requests_open = False
+
+    def resume_requests(self) -> None:
+        self._requests_open = True
+
+    def commit_epoch(self) -> int:
+        self._epoch += 1
+        self._requests_open = True
+        self._engine_phase = "idle"
+        return self._epoch
+
+    def total_active_requests(self) -> int:
+        return sum(int(slot.active_requests) for slot in self._slots.values())
 
     def get(self, slot_id: str) -> InstanceSlot | None:
         return self._slots.get(slot_id)
@@ -548,11 +643,42 @@ class InstancePool:
 
     async def _bootstrap_runtime(self, slot: InstanceSlot, *, timeout_s: float) -> None:
         del timeout_s
-        cdp = await self._cdp_provider()
-        slot.cdp = cdp
         next_generation = slot.generation + 1
         realm_id = f"{slot.slot_id}-g{next_generation}"
         last_error: BaseException | None = None
+
+        if self._engine_runtime is not None:
+            # Engine-neutral path: the runtime owns CDP/Context creation for the
+            # browser engine and cookie/proof/transport plumbing for browserless.
+            for attempt in range(self._load_attempts):
+                try:
+                    build = await self._engine_runtime.create_session(
+                        slot_id=slot.slot_id,
+                        auth_file=slot.auth_file,
+                        auth_user=slot.auth_user,
+                        tier=slot.tier,
+                        account_id=slot.account_id,
+                        realm_id=realm_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    last_error = exc
+                    if attempt + 1 < self._load_attempts and self._retry_delay_s:
+                        await asyncio.sleep(self._retry_delay_s)
+                    continue
+                slot.cdp = getattr(build, "cdp", None)
+                slot.context_id = str(getattr(build, "context_id", "") or "")
+                slot.session = build.session
+                slot.generation = next_generation
+                context = build.session.active_context
+                if context is not None:
+                    context.tier = slot.tier
+                return
+            raise last_error or RuntimeError("session bootstrap failed")
+
+        cdp = await self._cdp_provider()
+        slot.cdp = cdp
         for attempt in range(self._load_attempts):
             context_id = await cdp.create_browser_context()
             try:
@@ -579,25 +705,39 @@ class InstancePool:
             slot.context_id = context_id
             slot.session = session
             slot.generation = next_generation
-            session.active_context.tier = slot.tier
+            context = session.active_context
+            if context is not None:
+                context.tier = slot.tier
             return
         raise last_error or RuntimeError("session bootstrap failed")
 
     async def begin_request(self, slot_id: str) -> ActiveRequest:
-        """Acquire the single active-request handle for a ready instance."""
-        slot = self._slots.get(slot_id)
-        if slot is None:
-            raise InstanceCapacityError(f"unknown instance: {slot_id}")
-        if slot.state is not SlotState.READY:
-            raise InstanceCapacityError(
-                f"instance not ready: {slot_id} state={slot.state.value}"
+        """Acquire the single active-request handle for a ready instance.
+
+        The gate lock makes the pause/acquire barrier explicit: once
+        ``pause_requests`` flips the gate, no new request can pass this check.
+        """
+        async with self._gate_lock:
+            if not self._requests_open:
+                raise EngineSwitchingError(
+                    "engine switch in progress; request rejected before routing"
+                )
+            slot = self._slots.get(slot_id)
+            if slot is None:
+                raise InstanceCapacityError(f"unknown instance: {slot_id}")
+            if slot.state is not SlotState.READY:
+                raise InstanceCapacityError(
+                    f"instance not ready: {slot_id} state={slot.state.value}"
+                )
+            if not slot.session_alive():
+                slot.state = SlotState.INVALID
+                slot.last_error = "instance runtime closed"
+                raise InstanceCapacityError(f"instance runtime closed: {slot_id}")
+            slot.engine_epoch = self._epoch
+            slot.acquire_request()
+            return ActiveRequest(
+                slot=slot, epoch=self._epoch, generation=slot.generation
             )
-        if slot.page_closed():
-            slot.state = SlotState.INVALID
-            slot.last_error = "instance page closed"
-            raise InstanceCapacityError(f"instance page closed: {slot_id}")
-        slot.acquire_request()
-        return ActiveRequest(slot=slot)
 
     async def sleep(self, slot_id: str) -> InstanceSlot:
         """Release the runtime but keep the configured SLEEPING instance."""

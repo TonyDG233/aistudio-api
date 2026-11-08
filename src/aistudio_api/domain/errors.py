@@ -91,6 +91,21 @@ class RoutingError(AistudioError):
         return fields
 
 
+class EngineSwitchingError(RoutingError):
+    """A transactional engine hot-switch is in progress; retry later.
+
+    ``retry_after`` is surfaced as the HTTP ``Retry-After`` header so clients
+    and the web console back off instead of spinning against the drain window.
+    """
+
+    status_code = 503
+    code = "engine_switching"
+
+    def __init__(self, message: str, *, retry_after: int = 1) -> None:
+        self.retry_after = max(1, int(retry_after))
+        super().__init__(message, code=self.code)
+
+
 class SurfaceCapacityError(RoutingError):
     """No instance capacity in the model's lane/surface."""
 

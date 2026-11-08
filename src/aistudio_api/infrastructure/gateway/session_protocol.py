@@ -1,4 +1,11 @@
-"""Structural session surface shared by control and pooled request sessions."""
+"""Engine-neutral session surface shared by every request engine.
+
+``EngineSession`` is implemented by the traditional browser engine
+(``BrowserEngineSession`` wrapping ``PooledSession``) and the browserless WAA
+engine (``BrowserlessSession``).  Method names are intentionally unchanged from
+the original ``RequestSession`` protocol so capture/replay/streaming code does
+not have to care which engine produced the session.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +16,19 @@ from typing import Protocol
 from aistudio_api.infrastructure.gateway.session_state import SessionContext
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 
+ENGINE_BROWSER = "browser"
+ENGINE_BROWSERLESS = "browserless"
+VALID_ENGINES = frozenset({ENGINE_BROWSER, ENGINE_BROWSERLESS})
 
-class RequestSession(Protocol):
-    """The subset of BrowserSession/PooledSession used by capture/replay."""
+
+class EngineSession(Protocol):
+    """The subset of a request engine used by capture/replay/streaming."""
+
+    @property
+    def engine(self) -> str: ...
+
+    @property
+    def active_context(self) -> SessionContext: ...
 
     def request_scope(self) -> AbstractAsyncContextManager[object]: ...
 
@@ -43,5 +60,19 @@ class RequestSession(Protocol):
         headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]: ...
 
+    async def save_current_cookies(self) -> bool: ...
 
-__all__ = ["RequestSession"]
+    async def close(self) -> None: ...
+
+
+# Backwards-compatible alias: existing imports keep working unchanged.
+RequestSession = EngineSession
+
+
+__all__ = [
+    "ENGINE_BROWSER",
+    "ENGINE_BROWSERLESS",
+    "VALID_ENGINES",
+    "EngineSession",
+    "RequestSession",
+]

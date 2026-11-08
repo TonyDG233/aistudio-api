@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
@@ -67,6 +68,24 @@ def get_ui_sandbox(runtime_state: RuntimeState) -> UISandbox | None:
     return None
 
 
+def _browserless_engine(runtime_state: RuntimeState) -> bool:
+    """True when the active engine has no browser control page.
+
+    Browserless mode must never touch the control-plane BrowserSession: cookies
+    are already persisted by AccountService, so import/delete/toggle paths only
+    update registry/rotator/pool state.
+    """
+    settings_block = getattr(runtime_state, "engine_settings", None)
+    if (
+        isinstance(settings_block, dict)
+        and str(settings_block.get("mode") or "") == "browserless"
+    ):
+        return True
+    client = getattr(runtime_state, "client", None)
+    session = getattr(client, "_session", None) if client is not None else None
+    return str(getattr(session, "engine", "browser")) == "browserless"
+
+
 def _account_status(
     runtime_state: RuntimeState, account_id: str
 ) -> dict[str, object] | None:
@@ -93,7 +112,10 @@ def _account_status(
     )
     session_expired = bool(stats.session_expired)
     is_available = bool(
-        account.enabled and not account.expired and not session_expired and cooldown == 0
+        account.enabled
+        and not account.expired
+        and not session_expired
+        and cooldown == 0
     )
     return {
         "session_expired": session_expired,
@@ -171,9 +193,7 @@ async def _run_control_rebind(
     return False, "applied"
 
 
-def _clear_account_failure_state(
-    runtime_state: RuntimeState, account_id: str
-) -> None:
+def _clear_account_failure_state(runtime_state: RuntimeState, account_id: str) -> None:
     """Clear persisted expiry and rotator session/cooldown locks after success."""
     service = runtime_state.account_service
     store = getattr(service, "store", None)
@@ -347,6 +367,41 @@ class ImportCookiesResponse(BaseModel):
     tier: str = "Free"
 
 
+_TAMPERMONKEY_TIER_MAP = {
+    "TIER0": "Free",
+    "TIER1": "Pro",
+    "TIER2": "Ultra",
+}
+
+
+def _apply_tampermonkey_import_metadata(req: ImportCookiesRequest) -> None:
+    """Detect authUser / g1Tier from a Tampermonkey grabber JSON export.
+
+    Only fills values the caller left at their defaults: an explicit auth_user
+    other than ``"0"`` and an explicit tier are never overwritten. Malformed
+    JSON is ignored so the normal cookie parsers still get a chance to handle
+    the payload.
+    """
+    raw_text = req.cookies.strip()
+    if not (raw_text.startswith("{") and raw_text.endswith("}")):
+        return
+    with contextlib.suppress(Exception):
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict):
+            return
+        raw_auth_user = parsed.get("authUser", parsed.get("auth_user"))
+        if (
+            raw_auth_user is not None
+            and (not req.auth_user or req.auth_user == "0")
+            and str(raw_auth_user).strip()
+        ):
+            req.auth_user = str(raw_auth_user).strip()
+        if not req.tier:
+            raw_tier = parsed.get("g1Tier", parsed.get("g1_tier"))
+            if isinstance(raw_tier, str):
+                req.tier = _TAMPERMONKEY_TIER_MAP.get(raw_tier.strip().upper())
+
+
 class ProbeAndImportRequest(BaseModel):
     cookies: str
     name_prefix: str | None = None
@@ -505,7 +560,11 @@ async def activate_account(
         if runtime_state.rotator:
             runtime_state.rotator.add_account(account.id)
             runtime_state.rotator.clear_cooldown(account.id)
-        log.info("手动激活账号（复用已就绪实例页，未切控制面）: %s (%s)", account.id, account.name)
+        log.info(
+            "手动激活账号（复用已就绪实例页，未切控制面）: %s (%s)",
+            account.id,
+            account.name,
+        )
         return to_account_response(account)
 
     browser_session = runtime_state.client._session if runtime_state.client else None
@@ -793,13 +852,13 @@ async def delete_account(
         )
         if new_active is not None:
             account_service.set_active_account(new_active.id)
-            if browser_session is not None:
+            if browser_session is not None and not _browserless_engine(runtime_state):
                 new_auth_path = account_service.get_account_auth_path(new_active.id)
                 await browser_session.switch_auth(
                     str(new_auth_path) if new_auth_path else None
                 )
         else:
-            if browser_session is not None:
+            if browser_session is not None and not _browserless_engine(runtime_state):
                 await browser_session.switch_auth(None)
 
     log.info("已删除账号: id=%s", account_id)
@@ -831,12 +890,12 @@ async def batch_delete_accounts(
         )
         if new_active is not None:
             account_service.set_active_account(new_active.id)
-            if browser_session is not None:
+            if browser_session is not None and not _browserless_engine(runtime_state):
                 new_auth_path = account_service.get_account_auth_path(new_active.id)
                 await browser_session.switch_auth(
                     str(new_auth_path) if new_auth_path else None
                 )
-        elif browser_session is not None:
+        elif browser_session is not None and not _browserless_engine(runtime_state):
             await browser_session.switch_auth(None)
     log.info("批量删除账号完成: %d 个", len(deleted_ids))
     return BatchDeleteResponse(deleted=len(deleted_ids))
@@ -877,13 +936,13 @@ async def delete_cookie_group(
         )
         if new_active is not None:
             account_service.set_active_account(new_active.id)
-            if browser_session is not None:
+            if browser_session is not None and not _browserless_engine(runtime_state):
                 new_auth_path = account_service.get_account_auth_path(new_active.id)
                 await browser_session.switch_auth(
                     str(new_auth_path) if new_auth_path else None
                 )
         else:
-            if browser_session is not None:
+            if browser_session is not None and not _browserless_engine(runtime_state):
                 await browser_session.switch_auth(None)
 
     return {"deleted": deleted_count}
@@ -1171,7 +1230,8 @@ async def import_cookies(
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ImportCookiesResponse:
-    """从 cookie 导入账号（支持 JSON 数组、Netscape 或 KV）。"""
+    """从 cookie 导入账号（支持 JSON 数组、Netscape、KV 或油猴导出的 JSON 对象）。"""
+    _apply_tampermonkey_import_metadata(req)
     storage_state = parse_cookie_string(req.cookies)
     raw_cookies = storage_state.get("cookies")
     cookie_list: list[dict[str, object]] = (
@@ -1234,7 +1294,7 @@ async def import_cookies(
         browser_session = (
             runtime_state.client._session if runtime_state.client else None
         )
-        if browser_session:
+        if browser_session and not _browserless_engine(runtime_state):
             auth_path = account_service.get_account_auth_path(account.id)
             count = await browser_session.import_cookies(
                 req.cookies,

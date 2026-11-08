@@ -135,6 +135,13 @@ class StreamingGateway:
                     )
                     break
 
+                if event_type == "error":
+                    err_msg = (
+                        str(payload).strip()
+                        if payload
+                        else "unknown streaming transport error"
+                    )
+                    raise BrowserTransportError(f"Streaming request failed: {err_msg}")
                 if event_type == "status" and payload and not status_code:
                     status_code = int(str(payload))
                 elif event_type == "chunk" and payload:
@@ -194,10 +201,9 @@ class StreamingGateway:
             if usage:
                 latest_usage = usage
             candidate = parse_response_chunk(parsed_chunk)
-            if (
-                candidate.finish_reason is not None
-                and candidate.finish_reason
-                not in (0, WIRE_FINISH_REASON_CONTINUING)
+            if candidate.finish_reason is not None and candidate.finish_reason not in (
+                0,
+                WIRE_FINISH_REASON_CONTINUING,
             ):
                 latest_finish_reason = candidate.finish_reason
             if candidate.thinking:
@@ -213,6 +219,10 @@ class StreamingGateway:
             if candidate.thought_signature:
                 yield ("thought_signature", candidate.thought_signature)
         raw_response = "".join(raw_parts)
+        if status_code == 0:
+            raise BrowserTransportError(
+                "stream ended before HTTP response status arrived (connection failed)"
+            )
         _dump_stream_exchange(
             model=model,
             url=captured.url,

@@ -14,8 +14,11 @@ the old Page/Context when the timeout expires, and only then switches account.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import time
+from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -106,6 +109,13 @@ class InstanceStore(Protocol):
 
 
 @dataclass
+class _LifecycleTxn:
+    """Shared reentrancy token inherited by shielded/child tasks."""
+
+    depth: int = 0
+
+
+@dataclass
 class _Record:
     id: str
     number: int
@@ -155,15 +165,64 @@ class InstanceManager:
         self._records: dict[str, _Record] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_txn: ContextVar[_LifecycleTxn | None] = ContextVar(
+            f"instance-lifecycle-{id(self)}", default=None
+        )
+        self._lifecycle_depth = 0
         self._next_number = 1
         self._latest_id: str | None = None
         self._current_id: str | None = None
+
+    @contextlib.asynccontextmanager
+    async def lifecycle_scope(self) -> AsyncIterator[None]:
+        """Hold the whole lifecycle transaction, re-entrant per transaction.
+
+        Reentrancy is tracked with a ``ContextVar`` transaction token rather
+        than ``asyncio.current_task()``: a shielded rollback runs in a *new*
+        task but inherits the context of the switch task, so it must be able to
+        reuse the scope instead of deadlocking on ``_lifecycle_lock``.
+
+        Tasks created outside the scope (normal request/rebind tasks) do not
+        carry the token and still block on the lock until the transaction ends.
+        """
+        txn = self._lifecycle_txn.get()
+        if txn is not None:
+            txn.depth += 1
+            self._lifecycle_depth = txn.depth
+            try:
+                yield
+            finally:
+                txn.depth -= 1
+                self._lifecycle_depth = txn.depth
+            return
+
+        txn = _LifecycleTxn()
+        await self._lifecycle_lock.acquire()
+        token = self._lifecycle_txn.set(txn)
+        txn.depth = 1
+        self._lifecycle_depth = 1
+        try:
+            yield
+        finally:
+            txn.depth = 0
+            self._lifecycle_depth = 0
+            self._lifecycle_txn.reset(token)
+            self._lifecycle_lock.release()
 
     # ------------------------------------------------------------- public API
 
     @property
     def max_instances(self) -> int:
         return max(1, int(self._pool.max_contexts))
+
+    @property
+    def requests_open(self) -> bool:
+        """False while a transactional engine switch is draining old slots."""
+        return bool(getattr(self._pool, "requests_open", True))
+
+    @property
+    def engine_phase(self) -> str:
+        return str(getattr(self._pool, "engine_phase", "idle"))
 
     async def startup(self) -> None:
         """Create one record per configured spec and start eligible accounts."""
@@ -727,10 +786,7 @@ class InstanceManager:
         if found is None:
             return None
         for record in self._records.values():
-            if (
-                record.account_id == account_id
-                and record.state is InstanceState.ACTIVE
-            ):
+            if record.account_id == account_id and record.state is InstanceState.ACTIVE:
                 self._current_id = record.id
                 break
         return found
@@ -788,8 +844,7 @@ class InstanceManager:
 
             account = self._accounts.get_account(account_id)
             already_bound = any(
-                record.account_id == account_id
-                for record in self._records.values()
+                record.account_id == account_id for record in self._records.values()
             )
             if (
                 not already_bound
@@ -851,8 +906,7 @@ class InstanceManager:
             self._repair_latest()
             self._repair_current()
             log.info(
-                "[instances] tier sync account=%s tier=%s lane=%s slots=%d "
-                "evicted=%d",
+                "[instances] tier sync account=%s tier=%s lane=%s slots=%d evicted=%d",
                 account_id,
                 canonical,
                 target_lane,
@@ -865,6 +919,115 @@ class InstanceManager:
         """Return the preferred READY pool session for discovery."""
         sessions = self.discovery_sessions()
         return sessions[0] if sessions else None
+
+    def records(self) -> tuple[Any, ...]:
+        """Read-only record view for status endpoints."""
+        return tuple(sorted(self._records.values(), key=lambda item: item.number))
+
+    async def destroy_runtimes(self) -> int:
+        """Close every slot runtime after an engine drain; keep slot topology."""
+        async with self.lifecycle_scope():
+            return await self._destroy_runtimes_locked()
+
+    async def _destroy_runtimes_locked(self) -> int:
+        self._sync_records()
+        closed = 0
+        for record in list(self._records.values()):
+            slot = self._pool.get(record.slot_id)
+            if slot is None:
+                continue
+            try:
+                await self._pool.retire_runtime(record.slot_id, timeout_s=0.0)
+                closed += 1
+            except Exception as exc:
+                log.warning(
+                    "[instances] destroy runtime failed slot=%s: %s",
+                    record.slot_id,
+                    exc,
+                )
+            record.state = InstanceState.UNSTARTED
+            record.last_error = None
+        return closed
+
+    async def rebuild_runtimes(
+        self, *, concurrency: int = 2, timeout_s: float = 120.0
+    ) -> tuple[int, int]:
+        """Rebuild every slot runtime under the lifecycle lock.
+
+        Account binding is preserved; a disabled/deleted bound account leaves
+        the slot UNSTARTED instead of silently rebinding another account (Q-05).
+        """
+        async with self.lifecycle_scope():
+            return await self._rebuild_runtimes_locked(
+                concurrency=concurrency, timeout_s=timeout_s
+            )
+
+    async def _rebuild_runtimes_locked(
+        self, *, concurrency: int = 2, timeout_s: float = 120.0
+    ) -> tuple[int, int]:
+        self._sync_records()
+        records = sorted(self._records.values(), key=lambda item: item.number)
+        total = len(records)
+        if not records:
+            return 0, 0
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+        rebuilt = 0
+        errors: list[str] = []
+        used: set[str] = {record.account_id for record in records if record.account_id}
+
+        async def _rebuild(record: _Record) -> None:
+            nonlocal rebuilt
+            async with semaphore:
+                bound_account_id = record.account_id
+                if bound_account_id:
+                    # Preserve the binding. A disabled/deleted account leaves
+                    # the slot UNSTARTED; never silently pick another account.
+                    account = self._account_for_record(
+                        record, allow_disabled=False, raise_if_missing=False
+                    )
+                    if account is None or (
+                        self._accounts.get_auth_path_optional(
+                            account.id, require_exists=True
+                        )
+                        is None
+                    ):
+                        record.state = InstanceState.UNSTARTED
+                        record.last_error = (
+                            f"bound account unavailable: {bound_account_id}"
+                        )
+                        return
+                else:
+                    account = self._pick_account(
+                        record.spec,
+                        self._ordered_accounts(self._accounts.get_active_account()),
+                        used,
+                    )
+                    if account is None:
+                        record.state = InstanceState.UNSTARTED
+                        record.last_error = None
+                        return
+                used.add(account.id)
+                try:
+                    await asyncio.wait_for(
+                        self._activate(record, account, force=True),
+                        timeout=max(1.0, float(timeout_s)),
+                    )
+                except Exception as exc:
+                    record.account_id = account.id
+                    record.state = InstanceState.INVALID
+                    record.last_error = str(exc)
+                    errors.append(f"{record.id}: {exc}")
+                    return
+                rebuilt += 1
+
+        await asyncio.gather(*(_rebuild(record) for record in records))
+        self._repair_latest()
+        self._repair_current()
+        if errors:
+            raise InstanceRebindError(
+                "engine rebuild partially failed: " + "; ".join(errors[:3])
+            )
+        return rebuilt, total
 
     def active_account_ids(self) -> set[str]:
         return {
@@ -881,9 +1044,7 @@ class InstanceManager:
         pick the same account twice.
         """
         return {
-            record.account_id
-            for record in self._records.values()
-            if record.account_id
+            record.account_id for record in self._records.values() if record.account_id
         }
 
     def instance_active_requests(self, instance_id: str) -> int:
@@ -1096,9 +1257,7 @@ class InstanceManager:
         record.last_error = None
         return timed_out
 
-    def _find_bindable_record(
-        self, lane: str, tier: object
-    ) -> _Record | None:
+    def _find_bindable_record(self, lane: str, tier: object) -> _Record | None:
         """Return an unbound idle record in ``lane`` that accepts ``tier``."""
         for record in sorted(self._records.values(), key=lambda item: item.number):
             if record.lane != lane or record.account_id:

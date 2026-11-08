@@ -75,7 +75,7 @@ async def test_generate_image_tools_selection():
     )
     assert captured_tools[-1] is None
 
-    # use_default_tools=True -> default tools loaded
+    # use_default_tools=True -> shipped defaults no longer inject a search tool
     await client.generate_image(
         prompt="draw a cat",
         model="models/gemini-3.1-flash-image-preview",
@@ -83,7 +83,7 @@ async def test_generate_image_tools_selection():
         image_search=False,
         use_default_tools=True,
     )
-    assert captured_tools[-1] == [[None, None, None, [None, [[], []]]]]
+    assert captured_tools[-1] is None
 
 
 def test_chat_service_does_not_guess_thought_for_multi_parts():

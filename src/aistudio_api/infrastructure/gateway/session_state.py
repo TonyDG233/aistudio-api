@@ -43,9 +43,14 @@ def should_warm_snapshot(
 
 @dataclass
 class SessionContext:
-    """Encapsulates a fully-bootstrapped, verified AI Studio page context."""
+    """Encapsulates a fully-bootstrapped, verified AI Studio session context.
 
-    page: CDPPage
+    ``page`` is optional: the browser engine always provides a live CDP page,
+    while the browserless WAA engine has no page at all and only carries the
+    cookie/template/auth material.
+    """
+
+    page: CDPPage | None
     snap_key: str
     auth_user: str
     auth_file: str | None
@@ -67,5 +72,13 @@ class SessionContext:
         if self.in_flight == 0:
             self.drain_event.set()
 
+    def require_page(self) -> CDPPage:
+        """Return the live CDP page or fail loudly for browser-only callers."""
+        if self.page is None:
+            raise RuntimeError("session context has no browser page")
+        return self.page
+
     def is_usable(self) -> bool:
-        return not self.page.is_closed() and bool(self.snap_key)
+        if not self.snap_key:
+            return False
+        return self.page is None or not self.page.is_closed()

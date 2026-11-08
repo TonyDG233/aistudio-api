@@ -218,14 +218,28 @@ def _domain_payload(
     return None
 
 
+def _retry_after_headers(exc: Exception) -> dict[str, str] | None:
+    if not isinstance(exc, RoutingError):
+        return None
+    if classify_gemini_error_payload(exc)[0] != 503:
+        return None
+    retry_after = getattr(exc, "retry_after", None)
+    try:
+        value = int(retry_after) if retry_after is not None else 1
+    except (TypeError, ValueError):
+        value = 1
+    return {"Retry-After": str(max(1, value))}
+
+
 def format_error_response(
     exc: Exception,
     api_format: ApiFormat,
 ) -> JSONResponse:
+    headers = _retry_after_headers(exc)
     domain = _domain_payload(exc, api_format)
     if domain is not None:
         status, body = domain
-        return JSONResponse(status_code=status, content=body)
+        return JSONResponse(status_code=status, content=body, headers=headers)
     status, error_type, message, param = classify_format_error(exc, api_format)
     if api_format in {"openai", "responses"}:
         body = openai_error_body(status, message, error_type=error_type, param=param)
@@ -241,7 +255,7 @@ def format_error_response(
                 ),
             }
         }
-    return JSONResponse(status_code=status, content=body)
+    return JSONResponse(status_code=status, content=body, headers=headers)
 
 
 def openai_sse_error(exc: Exception) -> str:

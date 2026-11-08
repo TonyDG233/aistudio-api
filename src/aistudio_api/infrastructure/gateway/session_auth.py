@@ -166,6 +166,7 @@ async def extract_account_tier(
         return None
     from aistudio_api.infrastructure.account.cookie_parser import (
         calculate_sapisid_hash,
+        filter_minimal_cookies,
     )
 
     auth_header = ""
@@ -179,7 +180,7 @@ async def extract_account_tier(
                 if isinstance(c, dict) and c.get("name")
             }
         if cookie_dict:
-            auth_header = calculate_sapisid_hash(cookie_dict)
+            auth_header = calculate_sapisid_hash(filter_minimal_cookies(cookie_dict))
 
     script = """
     (args) => {
