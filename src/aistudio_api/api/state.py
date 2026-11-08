@@ -29,14 +29,32 @@ STATS_SCHEMA_VERSION = 2
 # Top-level v2 envelope keys and legacy ghost counters that must never be
 # rendered as model rows.
 STATS_RESERVED_KEYS = frozenset(
-    {"models", "daily", "schema_version", "totals", "version"}
+    {
+        "models",
+        "daily",
+        "schema_version",
+        "totals",
+        "version",
+        "finish_reasons",
+        "count_tokens",
+        "client",
+        "attempt",
+        "range",
+        "events",
+        "quota_scope",
+        "updated_at",
+        "account_breakdown",
+    }
 )
 _CHANNEL_PREFIXES = {"pg", "chat", "playground", "build", "official"}
 
 
 def is_reserved_stats_key(value: object) -> bool:
     """True for v2 envelope / legacy aggregate keys masquerading as models."""
-    return str(value or "").strip().lower() in STATS_RESERVED_KEYS
+    text = str(value or "").strip()
+    if text.startswith("models/"):
+        text = text[len("models/") :]
+    return text.strip().lower() in STATS_RESERVED_KEYS
 
 
 def normalize_model_name(value: object) -> str:
@@ -232,15 +250,20 @@ class RuntimeState:
             needs_migration = False
             raw_models = data.get("models")
             raw_daily = data.get("daily")
-            is_v2 = isinstance(raw_models, dict) and (
-                data.get("schema_version") == STATS_SCHEMA_VERSION
-                or "daily" in data
+            # A v2 envelope is identified by any envelope key.  Its payload
+            # lives strictly under ``models``/``daily``; the top level must
+            # never be iterated as model rows (that produced ghost rows such
+            # as ``finish_reasons`` with zero requests).
+            is_v2 = any(
+                key in data for key in ("schema_version", "models", "daily")
             )
             if is_v2:
                 models_map = raw_models if isinstance(raw_models, dict) else {}
                 models_ghosts = any(
                     is_reserved_stats_key(name) for name in models_map
                 )
+                if "models" in data and not isinstance(raw_models, dict):
+                    needs_migration = True
                 for name, raw in models_map.items():
                     if is_reserved_stats_key(name):
                         continue
@@ -257,6 +280,7 @@ class RuntimeState:
                         bucket: dict[str, ModelStatsItem] = {}
                         for name, raw in day_models.items():
                             if is_reserved_stats_key(name):
+                                needs_migration = True
                                 continue
                             item = _load_item(raw)
                             if item is not None:

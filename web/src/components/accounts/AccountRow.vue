@@ -21,7 +21,7 @@ import {
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
 import { accountStatus } from '@/utils/accountStatus.ts'
-import { instanceStateLabel, instanceStateTone, tierLabel } from '@/utils/instances.ts'
+import { instanceStateLabel, instanceStateTone, tierShortLabel } from '@/utils/instances.ts'
 
 const props = defineProps<{
   account: AccountWithStats
@@ -93,7 +93,7 @@ const isExpired = computed(() => {
 
 const primaryLabel = computed(() => {
   if (props.account.email) return props.account.email
-  return `编号：${props.account.id}`
+  return `ID: ${props.account.id}`
 })
 
 const secondaryLabel = computed(() => {
@@ -102,11 +102,13 @@ const secondaryLabel = computed(() => {
   if (props.account.name && props.account.name !== props.account.email) {
     parts.push(props.account.name)
   }
-  parts.push(`编号：${props.account.id}`)
+  parts.push(`ID: ${props.account.id}`)
   return parts.join(' · ')
 })
 
 const boundNumber = computed(() => props.boundInstance?.number ?? null)
+
+const isRunningInstance = computed(() => props.boundInstance?.state === 'active')
 
 async function handleToggleEnabled() {
   togglingEnabled.value = true
@@ -154,11 +156,13 @@ async function handleRefresh() {
         ? 'border-gray-200 bg-gray-50/60 opacity-60'
         : isExpired
           ? 'border-rose-300 bg-rose-50/30'
-          : batchMode && selected
-            ? 'border-brand-300 bg-brand-50/30 ring-1 ring-brand-300/30'
-            : active
-              ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
-              : 'border-gray-200/80 hover:border-gray-300',
+          : isRunningInstance
+            ? 'border-emerald-300 bg-emerald-50/40 ring-1 ring-emerald-400/20'
+            : batchMode && selected
+              ? 'border-brand-300 bg-brand-50/30 ring-1 ring-brand-300/30'
+              : active
+                ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
+                : 'border-gray-200/80 hover:border-gray-300',
     ]"
   >
     <!-- Sub-Account Header Bar -->
@@ -225,7 +229,7 @@ async function handleRefresh() {
           title="点击重新探测此子账号的会员等级"
           @click="handleDetectTier"
         >
-          {{ detectingTier ? '...' : tierLabel(accountTier) }}
+          {{ detectingTier ? '...' : tierShortLabel(accountTier) }}
         </button>
 
         <!-- Group Tag / Inline Editor -->
@@ -238,7 +242,7 @@ async function handleRefresh() {
               v-model="groupInput"
               type="text"
               class="px-1.5 py-0.5 text-[11px] font-mono border rounded focus:outline-none focus:ring-1 focus:ring-brand-500 w-20"
-              placeholder="默认分组"
+              placeholder="default"
               @keydown.enter="saveGroup"
               @blur="saveGroup"
             >
@@ -258,7 +262,7 @@ async function handleRefresh() {
             @click="startEditGroup"
           >
             <Tag class="w-2.5 h-2.5 text-gray-400 shrink-0" />
-            <span class="truncate">{{ account.group && account.group !== 'default' ? account.group : '默认分组' }}</span>
+            <span class="truncate">{{ account.group || 'default' }}</span>
           </button>
         </div>
 
@@ -301,14 +305,6 @@ async function handleRefresh() {
             429: {{ account.rate_limited || 0 }}
           </Badge>
         </div>
-
-        <span
-          v-if="boundNumber !== null"
-          class="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200"
-          title="该账号已绑定实例"
-        >
-          实例 #{{ boundNumber }}
-        </span>
 
         <!-- Status Pill (shared accountStatus precedence) -->
         <div

@@ -6,6 +6,15 @@ export const RESERVED_STATS_KEYS = new Set([
   'schema_version',
   'totals',
   'version',
+  'finish_reasons',
+  'count_tokens',
+  'client',
+  'attempt',
+  'range',
+  'events',
+  'quota_scope',
+  'updated_at',
+  'account_breakdown',
 ])
 
 const CHANNEL_PREFIXES = new Set(['pg', 'chat', 'playground', 'build', 'official'])
@@ -17,7 +26,9 @@ export interface NormalizedModelStat extends ModelStatItem {
 }
 
 export function isReservedStatsKey(value: string): boolean {
-  return RESERVED_STATS_KEYS.has(value.trim().toLowerCase())
+  return RESERVED_STATS_KEYS.has(
+    value.trim().replace(/^models\//, '').toLowerCase(),
+  )
 }
 
 export function normalizeModelName(value: string): string {
