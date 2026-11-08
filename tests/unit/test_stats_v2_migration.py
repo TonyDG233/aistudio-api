@@ -105,11 +105,14 @@ def test_v2_top_level_ghost_counters_never_become_models(monkeypatch, tmp_path):
 
     assert set(state.model_stats) == {"gemini-3.8-flash"}
     assert state.model_stats["gemini-3.8-flash"].requests == 4
+    # count_tokens is now a real envelope key, not a model/ghost counter.
+    assert state.count_tokens.requests == 8
     backup = stats_file.with_name("stats.json.bak")
     assert json.loads(backup.read_text(encoding="utf-8")) == original
     rewritten = json.loads(stats_file.read_text(encoding="utf-8"))
     assert set(rewritten["models"]) == {"gemini-3.8-flash"}
-    for ghost in ("finish_reasons", "count_tokens", "client", "quota_scope"):
+    assert rewritten["count_tokens"]["requests"] == 8
+    for ghost in ("finish_reasons", "client", "quota_scope"):
         assert ghost not in rewritten
 
 

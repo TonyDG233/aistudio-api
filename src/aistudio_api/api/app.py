@@ -488,6 +488,8 @@ async def lifespan(_app: FastAPI):
         account_store=account_store,
         rotator=rotator,
         stats_recorder=runtime_state.record,
+        client_recorder=runtime_state.record_client,
+        count_token_recorder=runtime_state.record_count_tokens,
     )
 
     keepalive = AccountKeepaliveService(
@@ -578,10 +580,6 @@ app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth
 app.include_router(
     logs_protected_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
-
-
-def _is_openai_path(request: Request) -> bool:
-    return format_for_path(request.url.path) == "openai"
 
 
 def _protocol_for_request(request: Request) -> ApiFormat:

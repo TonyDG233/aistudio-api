@@ -202,6 +202,9 @@ class RouteContext:
     retry_same: bool = False
     retry_same_delay_sec: float = 0.0
     last_reason: str = "initial"
+    # countTokens reuses the route but must never touch the generation attempt
+    # ledger or consume account generation quota.
+    record_attempts: bool = True
 
     def next_candidate(self) -> RouteCandidate | None:
         for candidate in self.candidates:
@@ -280,6 +283,24 @@ class RoutingPipelineProtocol(Protocol):
         finish_reason: str | None = None,
     ) -> None: ...
 
+    def record_client(
+        self,
+        model: str,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None: ...
+
+    def record_empty_retry(
+        self, context: RouteContext, attempt: RouteAttempt
+    ) -> None: ...
+
+    def record_count(
+        self, model: str, result: str, *, input_tokens: int = 0
+    ) -> None: ...
+
 
 def _as_int(value: object, default: int) -> int:
     if isinstance(value, bool):
@@ -337,6 +358,8 @@ class RoutingPipeline:
         rotator: AccountRotator | None = None,
         routing_settings_provider: RoutingSettingsProvider | None = None,
         stats_recorder: Callable[..., None] | None = None,
+        client_recorder: Callable[..., None] | None = None,
+        count_token_recorder: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._manager = instance_manager
@@ -344,6 +367,8 @@ class RoutingPipeline:
         self._rotator = rotator
         self._routing_settings_provider = routing_settings_provider
         self._stats_recorder = stats_recorder
+        self._client_recorder = client_recorder
+        self._count_token_recorder = count_token_recorder
         self._clock = clock
 
     def _rotator_or_none(self) -> AccountRotator | None:
@@ -650,6 +675,8 @@ class RoutingPipeline:
     ) -> None:
         context.retry_same = False
         context.last_reason = "success"
+        if not context.record_attempts:
+            return
         record_rotator_event(
             "success",
             account_id=attempt.account_id,
@@ -668,6 +695,61 @@ class RoutingPipeline:
                 )
             except Exception as exc:
                 logger.debug("[routing] 统计记录失败: %s", exc)
+
+    def record_empty_retry(
+        self, context: RouteContext, attempt: RouteAttempt
+    ) -> None:
+        """Record one independent attempt for an empty-response retry."""
+        if not context.record_attempts:
+            return
+        record_rotator_event(
+            "error",
+            account_id=attempt.account_id,
+            model=context.route.model,
+            surface=context.route.surface,
+            rotator=self._rotator_or_none(),
+        )
+        if self._stats_recorder is not None:
+            try:
+                self._stats_recorder(context.route.model, "errors")
+            except Exception as exc:
+                logger.debug("[routing] 空响应重试统计记录失败: %s", exc)
+
+    def record_client(
+        self,
+        model: str,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None:
+        """Record one client-request terminal outcome (never per attempt)."""
+        if self._client_recorder is None:
+            return
+        try:
+            self._client_recorder(
+                model,
+                result,
+                usage=usage,
+                finish_reason=finish_reason,
+                rescued=rescued,
+            )
+        except Exception as exc:
+            logger.debug("[routing] client 终态记录失败: %s", exc)
+
+    def record_count(
+        self, model: str, result: str, *, input_tokens: int = 0
+    ) -> None:
+        """Record one isolated countTokens terminal (no attempt/quota)."""
+        if self._count_token_recorder is None:
+            return
+        try:
+            self._count_token_recorder(
+                model, result, input_tokens=input_tokens
+            )
+        except Exception as exc:
+            logger.debug("[routing] countTokens 统计记录失败: %s", exc)
 
     async def handle_error(
         self,
@@ -695,6 +777,10 @@ class RoutingPipeline:
 
         if isinstance(exc, AuthError):
             if not tier_allows(attempt.candidate.tier, context.route):
+                # The upstream call really happened and returned 403 on a
+                # tier that cannot satisfy the route: count it as an attempt
+                # before surfacing the tier error.
+                self._record_error("auth_error", context, attempt, exc=exc)
                 raise self._tier_error(
                     context.route, attempt.candidate.tier
                 ) from exc
@@ -778,6 +864,10 @@ class RoutingPipeline:
                 and attempt.same_retries == 0
                 and context.total_attempts < context.max_retries
             ):
+                # Record the failed upstream execution before retrying the
+                # same instance; the retry (and any later success) adds its
+                # own independent attempt.
+                self._record_error("error", context, attempt, exc=exc)
                 attempt.same_retries += 1
                 context.retry_same = True
                 context.budget.record_retry(f"retry_{exc.status}")
@@ -1068,6 +1158,8 @@ class RoutingPipeline:
         exc: Exception | None = None,
         summary: str | None = None,
     ) -> None:
+        if not context.record_attempts:
+            return
         record_rotator_event(
             event,
             account_id=attempt.account_id,

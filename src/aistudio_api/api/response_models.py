@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class GeminiUsageMetadata(BaseModel):
@@ -86,6 +86,42 @@ class AccountBreakdownItem(BaseModel):
     cooldown_remaining: int = 0
 
 
+class ClientStatsResponse(BaseModel):
+    """One terminal outcome per client generation request."""
+
+    requests: int = 0
+    success: int = 0
+    errors: int = 0
+    aborted: int = 0
+    rate_limited: int = 0
+    rescued_requests: int = 0
+    success_rate: float | None = None
+
+
+class AttemptStatsResponse(BaseModel):
+    """Every real upstream execution attempt."""
+
+    attempts: int = 0
+    success: int = 0
+    rate_limited: int = 0
+    errors: int = 0
+    success_rate: float | None = None
+
+
+class TokenStatsResponse(BaseModel):
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
+
+
+class ModelBreakdownResponse(BaseModel):
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    tokens: TokenStatsResponse = Field(default_factory=TokenStatsResponse)
+
+
 class ModelStatsResponse(BaseModel):
     requests: int
     success: int
@@ -100,6 +136,8 @@ class ModelStatsResponse(BaseModel):
     last_used: str | None = None
     paid: bool = False
     account_breakdown: list[AccountBreakdownItem] = []
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
 
 
 class StatsTotalsResponse(BaseModel):
@@ -114,11 +152,31 @@ class StatsTotalsResponse(BaseModel):
     total_tokens: int
 
 
+class DailyStatsResponse(BaseModel):
+    date: str
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    tokens: TokenStatsResponse = Field(default_factory=TokenStatsResponse)
+    by_model: dict[str, ModelBreakdownResponse] = Field(default_factory=dict)
+
+
+class CountTokensStatsResponse(BaseModel):
+    requests: int = 0
+    success: int = 0
+    errors: int = 0
+    input_tokens: int = 0
+
+
 class StatsResponse(BaseModel):
     models: dict[str, ModelStatsResponse]
     totals: StatsTotalsResponse
     quota_scope: str = "account"
-
+    client: ClientStatsResponse = Field(default_factory=ClientStatsResponse)
+    attempt: AttemptStatsResponse = Field(default_factory=AttemptStatsResponse)
+    daily: list[DailyStatsResponse] = Field(default_factory=list)
+    count_tokens: CountTokensStatsResponse = Field(
+        default_factory=CountTokensStatsResponse
+    )
 
 
 class GeminiModelResponse(BaseModel):

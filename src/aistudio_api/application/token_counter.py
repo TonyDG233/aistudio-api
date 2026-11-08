@@ -135,6 +135,23 @@ def build_count_body(req: GeminiGenerateContentRequest, model: str) -> list[obje
     return _packed_body(req, model)
 
 
+def _record_count(
+    pipeline: RoutingPipelineProtocol,
+    model: str,
+    result: str,
+    *,
+    input_tokens: int = 0,
+) -> None:
+    """Record one isolated countTokens terminal (never a generation attempt)."""
+    recorder = getattr(pipeline, "record_count", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(model, result, input_tokens=input_tokens)
+    except Exception as exc:
+        logger.debug("[token_counter] countTokens 统计记录失败: %s", exc)
+
+
 async def count_tokens(
     *,
     model_path: str,
@@ -142,68 +159,82 @@ async def count_tokens(
     pipeline: RoutingPipelineProtocol,
     api_format: str = "gemini",
 ) -> TokenCountOutcome:
-    """Count tokens through the real upstream total, with account failover."""
-    context = await pipeline.begin(model_path=model_path)
-    effective_model_path = context.route.model
-    surface = context.route.surface
-    body = build_count_body(req, effective_model_path)
+    """Count tokens through the real upstream total, with account failover.
+
+    The request reuses routing for transport only: it explicitly disables the
+    generation attempt ledger and rotator quota events, then records a single
+    ``count_tokens`` terminal in its own ledger.
+    """
+    count_model = model_path
     attempt: RouteAttempt | None = None
-    last_error: Exception | None = None
 
     try:
-        while True:
-            if attempt is None:
-                attempt = await pipeline.acquire(context)
-                if attempt is None:
-                    raise SurfaceSwitchExhaustedError(surface=surface)
-            try:
-                logger.info(
-                    "count request: format=%s model=%s contents=%d instance=%s",
-                    api_format,
-                    effective_model_path,
-                    len(req.contents),
-                    attempt.instance_id,
-                )
-                if forced_429(
-                    account_id=attempt.account_id,
-                    model=effective_model_path,
-                    surface=surface,
-                ):
-                    raise UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
-                total_tokens = await attempt.client.count_tokens(packed_body=body)
-                pipeline.record_success(context, attempt)
-                logger.info(
-                    "count complete: format=%s model=%s totalTokens=%s",
-                    api_format,
-                    effective_model_path,
-                    total_tokens,
-                )
-                return TokenCountOutcome(
-                    model=effective_model_path,
-                    total_tokens=total_tokens,
-                    surface=surface,
-                )
-            except Exception as exc:
-                last_error = exc
-                action = await pipeline.handle_error(
-                    context, attempt, exc, has_yielded_data=False
-                )
-                if action == "retry_same":
-                    continue
-                if action == "switch":
-                    await pipeline.release(attempt)
-                    attempt = None
-                    continue
-                raise
-    finally:
-        if attempt is not None:
-            await pipeline.release(attempt)
+        context = await pipeline.begin(model_path=model_path)
+        context.record_attempts = False
+        effective_model_path = context.route.model
+        count_model = effective_model_path
+        surface = context.route.surface
+        body = build_count_body(req, effective_model_path)
 
-    if isinstance(last_error, UsageLimitExceeded):
-        raise SurfaceSwitchExhaustedError(surface=surface) from last_error
-    if last_error is not None:
-        raise last_error
-    raise SurfaceSwitchExhaustedError(surface=surface)
+        try:
+            while True:
+                if attempt is None:
+                    attempt = await pipeline.acquire(context)
+                    if attempt is None:
+                        raise SurfaceSwitchExhaustedError(surface=surface)
+                try:
+                    logger.info(
+                        "count request: format=%s model=%s contents=%d instance=%s",
+                        api_format,
+                        effective_model_path,
+                        len(req.contents),
+                        attempt.instance_id,
+                    )
+                    if forced_429(
+                        account_id=attempt.account_id,
+                        model=effective_model_path,
+                        surface=surface,
+                    ):
+                        raise UsageLimitExceeded(
+                            "forced 429 (AISTUDIO_TEST_HOOKS)"
+                        )
+                    total_tokens = await attempt.client.count_tokens(
+                        packed_body=body
+                    )
+                    _record_count(
+                        pipeline,
+                        effective_model_path,
+                        "success",
+                        input_tokens=total_tokens,
+                    )
+                    logger.info(
+                        "count complete: format=%s model=%s totalTokens=%s",
+                        api_format,
+                        effective_model_path,
+                        total_tokens,
+                    )
+                    return TokenCountOutcome(
+                        model=effective_model_path,
+                        total_tokens=total_tokens,
+                        surface=surface,
+                    )
+                except Exception as exc:
+                    action = await pipeline.handle_error(
+                        context, attempt, exc, has_yielded_data=False
+                    )
+                    if action == "retry_same":
+                        continue
+                    if action == "switch":
+                        await pipeline.release(attempt)
+                        attempt = None
+                        continue
+                    raise
+        finally:
+            if attempt is not None:
+                await pipeline.release(attempt)
+    except Exception:
+        _record_count(pipeline, count_model, "errors")
+        raise
 
 
 __all__ = ["TokenCountOutcome", "build_count_body", "count_tokens"]

@@ -271,3 +271,10 @@ async def test_model_discovery_extended_fields_and_aliases():
     assert resp_model.temperature == 0.7
     assert resp_model.topP == 0.9
     assert resp_model.topK == 40
+
+    # topK is integer in the public contract: JSON must be 40, not 40.0.
+    dumped = resp_model.model_dump(mode="json")
+    assert dumped["topK"] == 40
+    assert isinstance(dumped["topK"], int)
+    assert not isinstance(dumped["topK"], bool)
+    assert '"topK":40' in resp_model.model_dump_json()

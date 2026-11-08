@@ -12,6 +12,7 @@ No lease/reservation/pinned/defer machinery is used: routing exposes only
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
@@ -148,6 +149,83 @@ async def _acquire(
     return attempt
 
 
+def _terminal_result(exc: BaseException) -> str:
+    """Map the final client-visible error to its client terminal bucket."""
+    if isinstance(exc, (SurfaceSwitchExhaustedError, UsageLimitExceeded)):
+        return "rate_limited"
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return "aborted"
+    return "errors"
+
+
+def _record_client_terminal(
+    pipeline: RoutingPipelineProtocol,
+    model: str,
+    result: str,
+    *,
+    usage: dict[str, object] | None = None,
+    finish_reason: str | None = None,
+    rescued: bool = False,
+) -> None:
+    """Record exactly one terminal outcome for the client request."""
+    recorder = getattr(pipeline, "record_client", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(
+            model,
+            result,
+            usage=usage,
+            finish_reason=finish_reason,
+            rescued=rescued,
+        )
+    except Exception as exc:
+        logger.debug("[generation] client 缁堟€佽褰曞け璐? %s", exc)
+
+
+def _record_empty_retry(
+    pipeline: RoutingPipelineProtocol,
+    context: RouteContext,
+    attempt: RouteAttempt,
+) -> None:
+    recorder = getattr(pipeline, "record_empty_retry", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(context, attempt)
+    except Exception as exc:
+        logger.debug("[generation] 绌哄搷搴?attempt 璁板綍澶辫触: %s", exc)
+
+
+class _ClientTerminal:
+    """Idempotent client-request terminal recorder (exactly one per request)."""
+
+    def __init__(self, pipeline: RoutingPipelineProtocol, model: str) -> None:
+        self._pipeline = pipeline
+        self.model = model
+        self._done = False
+
+    def record(
+        self,
+        result: str,
+        *,
+        usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
+        rescued: bool = False,
+    ) -> None:
+        if self._done:
+            return
+        self._done = True
+        _record_client_terminal(
+            self._pipeline,
+            self.model,
+            result,
+            usage=usage,
+            finish_reason=finish_reason,
+            rescued=rescued,
+        )
+
+
 async def generate(
     *,
     model_path: str,
@@ -157,21 +235,23 @@ async def generate(
     atg_factory: Callable[[], AtgProcessor] | None = None,
 ) -> GenerationOutcome:
     """Run one non-streaming generation through the routing pipeline."""
-    context = await pipeline.begin(model_path=model_path)
-    effective_model_path = context.route.model
-    surface = context.route.surface
-
-    atg = _create_atg(api_format, atg_factory)
-    effective_req, tool_name = _wrap_atg_request(
-        atg, req, effective_model_path, api_format
-    )
-
     attempt: RouteAttempt | None = None
     normalized: NormalizedGeminiRequest | None = None
     toolshape_emitted = False
-    last_error: Exception | None = None
+    rescued = False
+    client_terminal = _ClientTerminal(pipeline, model_path)
 
     try:
+        context = await pipeline.begin(model_path=model_path)
+        effective_model_path = context.route.model
+        client_terminal.model = effective_model_path
+        surface = context.route.surface
+
+        atg = _create_atg(api_format, atg_factory)
+        effective_req, tool_name = _wrap_atg_request(
+            atg, req, effective_model_path, api_format
+        )
+
         while True:
             if attempt is None:
                 attempt = await _acquire(pipeline, context)
@@ -217,6 +297,8 @@ async def generate(
                     if not _output_is_empty(output):
                         break
                     if empty_index < max_empty:
+                        rescued = True
+                        _record_empty_retry(pipeline, context, attempt)
                         logger.warning(
                             "[generation] empty response, retrying same account "
                             "(%d/%d): model=%s",
@@ -249,6 +331,12 @@ async def generate(
                     usage=output.usage,
                     finish_reason=finish_reason,
                 )
+                client_terminal.record(
+                    "success",
+                    usage=output.usage,
+                    finish_reason=finish_reason,
+                    rescued=rescued,
+                )
                 logger.info(
                     "generation complete: format=%s model=%s instance=%s",
                     api_format,
@@ -263,26 +351,24 @@ async def generate(
                     surface=surface,
                 )
             except Exception as exc:
-                last_error = exc
                 action = await pipeline.handle_error(
                     context, attempt, exc, has_yielded_data=False
                 )
                 if action == "retry_same":
+                    rescued = True
                     continue
                 if action == "switch":
+                    rescued = True
                     await pipeline.release(attempt)
                     attempt = None
                     continue
                 raise
+    except BaseException as exc:
+        client_terminal.record(_terminal_result(exc))
+        raise
     finally:
         if attempt is not None:
             await pipeline.release(attempt)
-
-    if isinstance(last_error, UsageLimitExceeded):
-        raise SurfaceSwitchExhaustedError(surface=surface) from last_error
-    if last_error is not None:
-        raise last_error
-    raise SurfaceSwitchExhaustedError(surface=surface)
 
 
 def _stream_finish(value: object) -> str:
@@ -304,196 +390,210 @@ async def stream_generation(
     """Run one streaming generation, yielding protocol-neutral events.
 
     The terminal ``usage`` event carries ``finish_reason`` and ``response_id``.
+    Exactly one client terminal is recorded: success once the upstream stream
+    is fully consumed, ``aborted`` on cancellation/disconnect, or
+    ``rate_limited``/``errors`` for the final failure.
     """
-    context = await pipeline.begin(model_path=model_path)
-    effective_model_path = context.route.model
-    surface = context.route.surface
-
-    atg = _create_atg(api_format, atg_factory)
-    effective_req, tool_name = _wrap_atg_request(
-        atg, req, effective_model_path, api_format
-    )
-
     attempt: RouteAttempt | None = None
     normalized: NormalizedGeminiRequest | None = None
     unwrapper = None
     toolshape_emitted = False
     empty_attempt = 0
-    last_error: Exception | None = None
     final_usage: dict[str, object] | None = None
     final_finish_reason = "STOP"
     latest_response_id: str | None = None
     buffered_thought_sig: str | None = None
+    rescued = False
+    client_terminal = _ClientTerminal(pipeline, model_path)
 
     try:
-        while True:
-            if attempt is None:
-                attempt = await _acquire(pipeline, context)
-                empty_attempt = 0
-                yield StreamEvent(
-                    kind="routing_wait",
-                    payload="resolving-instance",
-                    model=effective_model_path,
-                )
-            final_usage = None
-            final_finish_reason = "STOP"
-            latest_response_id = None
-            buffered_thought_sig = None
-            has_yielded_data = False
-            try:
-                normalized = normalize_gemini_request(
-                    effective_req,  # type: ignore[arg-type]
-                    effective_model_path,
-                    api_format=api_format,
-                    surface=surface,
-                    emit_toolshape=not toolshape_emitted,
-                )
-                toolshape_emitted = True
-                unwrapper = (
-                    atg.create_stream_unwrapper(tool_name)
-                    if atg.enabled and tool_name
-                    else None
-                )
-                produced_content = False
-                if forced_429(
-                    account_id=attempt.account_id,
-                    model=normalized.model,
-                    surface=surface,
-                ):
-                    raise UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
-                async for event_type, text in attempt.client.stream_generate_content(
-                    model=normalized.model,
-                    capture_prompt=normalized.capture_prompt,
-                    capture_images=normalized.capture_images,
-                    contents=normalized.contents,
-                    system_instruction_content=normalized.system_instruction,
-                    tools=normalized.tools,
-                    tool_config=normalized.tool_config,
-                    safety_settings=normalized.safety_settings,
-                    temperature=normalized.temperature,
-                    top_p=normalized.top_p,
-                    top_k=normalized.top_k,
-                    max_tokens=normalized.max_tokens,
-                    generation_config_overrides=normalized.generation_config_overrides,
-                    sanitize_plain_text=False,
-                    force_refresh_capture=(
-                        attempt.same_retries > 0 or empty_attempt > 0
-                    ),
-                ):
-                    if event_type == "usage":
-                        final_usage = text if isinstance(text, dict) else None
-                    elif event_type == "finish_reason":
-                        final_finish_reason = _stream_finish(text)
-                        if (
-                            unwrapper is not None
-                            and final_finish_reason == "TOOL_CALLS"
-                            and unwrapper.should_remap_finish_reason()
-                        ):
-                            final_finish_reason = "STOP"
-                    elif event_type == "response_id":
-                        latest_response_id = str(text)
-                    elif event_type == "thought_signature":
-                        buffered_thought_sig = str(text)
-                    else:
-                        if event_type == "tool_calls":
-                            record_function_call_signatures(text)
-                        if text:
-                            produced_content = True
-                        if (
-                            unwrapper is not None
-                            and event_type in _ATG_STREAM_EVENT_TYPES
-                        ):
-                            out_events = unwrapper.process_event(event_type, text)
+        context = await pipeline.begin(model_path=model_path)
+        effective_model_path = context.route.model
+        client_terminal.model = effective_model_path
+        surface = context.route.surface
+
+        atg = _create_atg(api_format, atg_factory)
+        effective_req, tool_name = _wrap_atg_request(
+            atg, req, effective_model_path, api_format
+        )
+
+        try:
+            while True:
+                if attempt is None:
+                    attempt = await _acquire(pipeline, context)
+                    empty_attempt = 0
+                    yield StreamEvent(
+                        kind="routing_wait",
+                        payload="resolving-instance",
+                        model=effective_model_path,
+                    )
+                final_usage = None
+                final_finish_reason = "STOP"
+                latest_response_id = None
+                buffered_thought_sig = None
+                has_yielded_data = False
+                try:
+                    normalized = normalize_gemini_request(
+                        effective_req,  # type: ignore[arg-type]
+                        effective_model_path,
+                        api_format=api_format,
+                        surface=surface,
+                        emit_toolshape=not toolshape_emitted,
+                    )
+                    toolshape_emitted = True
+                    unwrapper = (
+                        atg.create_stream_unwrapper(tool_name)
+                        if atg.enabled and tool_name
+                        else None
+                    )
+                    produced_content = False
+                    if forced_429(
+                        account_id=attempt.account_id,
+                        model=normalized.model,
+                        surface=surface,
+                    ):
+                        raise UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
+                    async for event_type, text in attempt.client.stream_generate_content(
+                        model=normalized.model,
+                        capture_prompt=normalized.capture_prompt,
+                        capture_images=normalized.capture_images,
+                        contents=normalized.contents,
+                        system_instruction_content=normalized.system_instruction,
+                        tools=normalized.tools,
+                        tool_config=normalized.tool_config,
+                        safety_settings=normalized.safety_settings,
+                        temperature=normalized.temperature,
+                        top_p=normalized.top_p,
+                        top_k=normalized.top_k,
+                        max_tokens=normalized.max_tokens,
+                        generation_config_overrides=normalized.generation_config_overrides,
+                        sanitize_plain_text=False,
+                        force_refresh_capture=(
+                            attempt.same_retries > 0 or empty_attempt > 0
+                        ),
+                    ):
+                        if event_type == "usage":
+                            final_usage = text if isinstance(text, dict) else None
+                        elif event_type == "finish_reason":
+                            final_finish_reason = _stream_finish(text)
+                            if (
+                                unwrapper is not None
+                                and final_finish_reason == "TOOL_CALLS"
+                                and unwrapper.should_remap_finish_reason()
+                            ):
+                                final_finish_reason = "STOP"
+                        elif event_type == "response_id":
+                            latest_response_id = str(text)
+                        elif event_type == "thought_signature":
+                            buffered_thought_sig = str(text)
                         else:
-                            out_events = [(event_type, text)]
-                        for index, (out_type, out_text) in enumerate(out_events):
-                            if out_text:
-                                has_yielded_data = True
-                            yield StreamEvent(
-                                kind=out_type,
-                                payload=out_text,
-                                model=normalized.model,
-                                response_id=latest_response_id,
-                                thought_signature=(
-                                    buffered_thought_sig if index == 0 else None
-                                ),
-                            )
+                            if event_type == "tool_calls":
+                                record_function_call_signatures(text)
+                            if text:
+                                produced_content = True
+                            if (
+                                unwrapper is not None
+                                and event_type in _ATG_STREAM_EVENT_TYPES
+                            ):
+                                out_events = unwrapper.process_event(event_type, text)
+                            else:
+                                out_events = [(event_type, text)]
+                            for index, (out_type, out_text) in enumerate(out_events):
+                                if out_text:
+                                    has_yielded_data = True
+                                yield StreamEvent(
+                                    kind=out_type,
+                                    payload=out_text,
+                                    model=normalized.model,
+                                    response_id=latest_response_id,
+                                    thought_signature=(
+                                        buffered_thought_sig if index == 0 else None
+                                    ),
+                                )
+                            buffered_thought_sig = None
+                except Exception as exc:
+                    action = await pipeline.handle_error(
+                        context,
+                        attempt,
+                        exc,
+                        has_yielded_data=has_yielded_data,
+                    )
+                    if action == "retry_same":
+                        rescued = True
+                        continue
+                    if action == "switch":
+                        rescued = True
+                        await pipeline.release(attempt)
+                        attempt = None
+                        continue
+                    raise
+
+                max_empty = atg.cfg.empty_retries if tool_name else 1
+                if not produced_content and empty_attempt < max_empty:
+                    empty_attempt += 1
+                    rescued = True
+                    _record_empty_retry(pipeline, context, attempt)
+                    logger.warning(
+                        "[generation] empty stream, retrying same account (%d/%d): "
+                        "model=%s",
+                        empty_attempt,
+                        max_empty,
+                        effective_model_path,
+                    )
+                    continue
+                if not produced_content and atg.enabled and tool_name and (
+                    atg.cfg.mode == "required"
+                ):
+                    raise SyntheticRequiredError(
+                        "synthetic tool call required but not present in upstream "
+                        "response"
+                    )
+
+                if unwrapper is not None:
+                    for out_type, out_text in unwrapper.finalize():
+                        if out_text:
+                            has_yielded_data = True
+                        yield StreamEvent(
+                            kind=out_type,
+                            payload=out_text,
+                            model=normalized.model,
+                            response_id=latest_response_id,
+                            thought_signature=buffered_thought_sig,
+                        )
                         buffered_thought_sig = None
-            except Exception as exc:
-                last_error = exc
-                action = await pipeline.handle_error(
+                    logger.info(
+                        "[ATG] stream unwrap: tool=%s stats=%s",
+                        tool_name,
+                        json.dumps(unwrapper.stats.to_dict(), ensure_ascii=False),
+                    )
+                pipeline.record_success(
                     context,
                     attempt,
-                    exc,
-                    has_yielded_data=has_yielded_data,
+                    usage=final_usage,
+                    finish_reason=final_finish_reason,
                 )
-                if action == "retry_same":
-                    continue
-                if action == "switch":
-                    await pipeline.release(attempt)
-                    attempt = None
-                    continue
-                raise
-
-            max_empty = atg.cfg.empty_retries if tool_name else 1
-            if not produced_content and empty_attempt < max_empty:
-                empty_attempt += 1
-                logger.warning(
-                    "[generation] empty stream, retrying same account (%d/%d): "
-                    "model=%s",
-                    empty_attempt,
-                    max_empty,
-                    effective_model_path,
+                client_terminal.record(
+                    "success",
+                    usage=final_usage,
+                    finish_reason=final_finish_reason,
+                    rescued=rescued,
                 )
-                continue
-            if not produced_content and atg.enabled and tool_name and (
-                atg.cfg.mode == "required"
-            ):
-                raise SyntheticRequiredError(
-                    "synthetic tool call required but not present in upstream "
-                    "response"
-                )
-
-            if unwrapper is not None:
-                for out_type, out_text in unwrapper.finalize():
-                    if out_text:
-                        has_yielded_data = True
-                    yield StreamEvent(
-                        kind=out_type,
-                        payload=out_text,
-                        model=normalized.model,
-                        response_id=latest_response_id,
-                        thought_signature=buffered_thought_sig,
-                    )
-                    buffered_thought_sig = None
                 logger.info(
-                    "[ATG] stream unwrap: tool=%s stats=%s",
-                    tool_name,
-                    json.dumps(unwrapper.stats.to_dict(), ensure_ascii=False),
+                    "stream complete: format=%s model=%s instance=%s",
+                    api_format,
+                    normalized.model,
+                    attempt.instance_id,
                 )
-            pipeline.record_success(
-                context,
-                attempt,
-                usage=final_usage,
-                finish_reason=final_finish_reason,
-            )
-            logger.info(
-                "stream complete: format=%s model=%s instance=%s",
-                api_format,
-                normalized.model,
-                attempt.instance_id,
-            )
-            break
-    finally:
-        if attempt is not None:
-            await pipeline.release(attempt)
+                break
+        finally:
+            if attempt is not None:
+                await pipeline.release(attempt)
+    except BaseException as exc:
+        client_terminal.record(_terminal_result(exc))
+        raise
 
     if normalized is None:
-        if isinstance(last_error, UsageLimitExceeded):
-            raise SurfaceSwitchExhaustedError(surface=surface) from last_error
-        if last_error is not None:
-            raise last_error
-        raise SurfaceSwitchExhaustedError(surface=surface)
+        raise SurfaceSwitchExhaustedError(surface=client_terminal.model)
 
     yield StreamEvent(
         kind="usage",
