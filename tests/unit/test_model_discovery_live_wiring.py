@@ -226,7 +226,7 @@ async def test_fallback_is_marked_fallback_and_never_live():
 
     models = await service.get_models(force_refresh=True)
 
-    assert len(models) == len(_FALLBACK_MODELS) == 16
+    assert len(models) == len(_FALLBACK_MODELS) >= 30
     assert service.last_source == "fallback"
     assert service.last_error is not None
     assert {m["id"] for m in models} == {m["id"] for m in _FALLBACK_MODELS}

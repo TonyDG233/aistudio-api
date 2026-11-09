@@ -102,9 +102,7 @@ def test_max_tier_only_defaults_paid_lower_bound_to_pro() -> None:
 
 
 def test_normalized_free_spec_is_consistent_with_only_tier() -> None:
-    selector = resolve_tier_selector(
-        only_tier="Free", min_tier="Free", max_tier="Free"
-    )
+    selector = resolve_tier_selector(only_tier="Free", min_tier="Free", max_tier="Free")
     assert selector.lane == "free"
     assert selector.only_tier == "Free"
     assert (selector.min_tier, selector.max_tier) == ("Free", "Free")
@@ -165,6 +163,9 @@ def test_snapshot_restores_status_and_applies_downgrade(tmp_path, monkeypatch) -
         [
             {"id": "models/gemini-4-argon", "paid": False},
             {"id": "models/new-paid-model", "paid": True},
+            {"id": "models/gemini-3.8-flash", "paid": False},
+            {"id": "models/gemini-3.1-pro-preview", "paid": False},
+            {"id": "models/gemma-4-31b-it", "paid": False},
         ]
     )
 

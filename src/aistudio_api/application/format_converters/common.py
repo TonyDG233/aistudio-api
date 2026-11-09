@@ -168,6 +168,97 @@ def parse_arguments(value: object, *, field: str) -> dict[str, object]:
     return parsed
 
 
+_SCHEMA_OBJECT_KEYS = ("properties", "patternProperties", "dependentSchemas")
+_SCHEMA_LIST_KEYS = ("anyOf", "any_of", "oneOf", "one_of", "allOf", "all_of")
+_SCHEMA_SINGLE_KEYS = (
+    "items",
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "propertyNames",
+    "not",
+    "not_",
+    "if",
+    "then",
+    "else",
+)
+_ARRAY_ITEM_FALLBACK = {"type": "string"}
+_ARRAY_ITEM_FALLBACK_UPPER = {"type": "STRING"}
+
+
+def _schema_type_label(schema: dict[str, object]) -> str:
+    raw_type = schema.get("type")
+    if isinstance(raw_type, str):
+        return raw_type
+    if isinstance(raw_type, list):
+        for item in raw_type:
+            if isinstance(item, str) and item.strip().lower() != "null":
+                return item
+    return ""
+
+
+def _has_schema_items(items: object) -> bool:
+    if isinstance(items, dict):
+        return bool(items)
+    if isinstance(items, list):
+        return bool(items) and isinstance(items[0], dict) and bool(items[0])
+    return items is True
+
+
+def _array_item_fallback(type_label: str) -> dict[str, object]:
+    if not any(char.islower() for char in type_label):
+        return dict(_ARRAY_ITEM_FALLBACK_UPPER)
+    return dict(_ARRAY_ITEM_FALLBACK)
+
+
+def _normalize_schema_node(node: object) -> object:
+    if isinstance(node, list):
+        return [_normalize_schema_node(item) for item in node]
+    if isinstance(node, dict):
+        return _normalize_schema_dict(node)
+    return node
+
+
+def _normalize_schema_dict(schema: dict[str, object]) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_OBJECT_KEYS and isinstance(value, dict):
+            normalized[key] = {
+                name: _normalize_schema_node(sub) for name, sub in value.items()
+            }
+        elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
+            normalized[key] = [_normalize_schema_node(sub) for sub in value]
+        elif key in _SCHEMA_SINGLE_KEYS and isinstance(value, dict):
+            normalized[key] = _normalize_schema_node(value)
+        else:
+            normalized[key] = value
+
+    type_label = _schema_type_label(normalized)
+    if "array" in type_label.lower():
+        items = normalized.get("items")
+        if isinstance(items, (dict, list)):
+            items = _normalize_schema_node(items)
+        if isinstance(items, list):
+            normalized["items"] = (
+                items if _has_schema_items(items) else _array_item_fallback(type_label)
+            )
+        elif not _has_schema_items(items):
+            normalized["items"] = _array_item_fallback(type_label)
+        else:
+            normalized["items"] = items
+    return normalized
+
+
+def normalize_tool_schema(schema: dict[str, object]) -> dict[str, object]:
+    """Recursively give every array schema a non-empty ``items`` node.
+
+    Gemini function declarations reject arrays whose ``items`` is missing or
+    empty.  The normalization is idempotent and only touches schema keywords;
+    unrelated JSON values (for example ``default``) are left alone.
+    """
+    return _normalize_schema_dict(schema)
+
+
 def decode_data_url(url: str, *, field: str) -> tuple[str, str]:
     """Validate a base64 data URL and return (mime_type, base64 payload)."""
     if not url.startswith("data:"):

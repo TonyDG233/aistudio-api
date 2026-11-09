@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from aistudio_api.application.contracts.gemini import (
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         GeminiTool,
     )
 
+from aistudio_api.application.format_converters.common import normalize_tool_schema
 from aistudio_api.application.signature_cache import (
     DUMMY_THOUGHT_SIGNATURE,
     signature_cache,
@@ -195,6 +196,14 @@ def _encode_schema_combiners(
         )
 
 
+def _has_array_items(items: object) -> bool:
+    if isinstance(items, dict):
+        return bool(items)
+    if isinstance(items, list):
+        return bool(items) and isinstance(items[0], dict) and bool(items[0])
+    return items is True
+
+
 def encode_schema_to_wire(
     schema: dict[str, object], *, include_required: bool = True
 ) -> list[object]:
@@ -221,11 +230,13 @@ def encode_schema_to_wire(
     if isinstance(enum_vals, (list, tuple)) and enum_vals:
         wire[SchemaIndex.ENUM] = [str(x) for x in enum_vals]
 
-    items = schema.get("items")
+    items: object = schema.get("items")
+    if schema_type == "array" and not _has_array_items(items):
+        items = {"type": "string"}
     if schema_type == "array" or items is not None:
         if isinstance(items, dict):
             wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
-                items,
+                cast("dict[str, object]", items),
                 include_required=include_required,
             )
         elif isinstance(items, list) and items and isinstance(items[0], dict):
@@ -318,7 +329,9 @@ def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[
         or declaration.get("parameters_schema")
     )
     if isinstance(parameters, dict):
-        wire[2] = encode_schema_to_wire(parameters, include_required=True)
+        wire[2] = encode_schema_to_wire(
+            normalize_tool_schema(parameters), include_required=True
+        )
     elif isinstance(parameters, list):
         wire[2] = parameters
 
