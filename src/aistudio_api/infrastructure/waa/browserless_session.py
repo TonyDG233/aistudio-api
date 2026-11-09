@@ -21,7 +21,11 @@ from typing import Any
 import httpx
 
 from aistudio_api.config import settings
-from aistudio_api.domain.errors import BrowserTransportError
+from aistudio_api.domain.errors import (
+    AuthError,
+    BrowserTransportError,
+    SessionExpiredError,
+)
 from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.account.account_store import write_storage_state
 from aistudio_api.infrastructure.account.cookie_parser import (
@@ -45,6 +49,7 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.waa.signer_client import (
     MintProofResult,
+    SignerAuthError,
     SignerClient,
     SignerError,
 )
@@ -63,6 +68,23 @@ _BASE_HEADERS: dict[str, str] = {
 
 _COOKIE_DROP_HEADERS = frozenset({"host", "content-length", "cookie", "authorization"})
 _ACCOUNT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _map_signer_auth_error(exc: SignerAuthError) -> AuthError:
+    """Translate a signer login-state denial into a routing-visible error.
+
+    The original signer status and bounded server reason are preserved in the
+    message so routing logs/rotator events stay actionable. 401 is a definite
+    expired session; a 403/WAA denial keeps the first-attempt same-account
+    re-sign path.
+    """
+    reason = exc.reason or str(exc)
+    message = (
+        f"browserless 登录态失效 (status={exc.status_code or 'unknown'}): {reason}"
+    )
+    if exc.status_code == 401:
+        return SessionExpiredError(message)
+    return AuthError(message)
 
 
 def _base_template(model: str = DEFAULT_CHAT_MODEL) -> dict[str, object]:
@@ -427,6 +449,8 @@ class BrowserlessSession:
                     proxy=self._proxy,
                     account_key=self.stable_account_key,
                 )
+            except SignerAuthError as exc:
+                raise _map_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise RuntimeError(f"browserless proof mint failed: {exc}") from exc
             if not result.proof:
@@ -511,6 +535,8 @@ class BrowserlessSession:
                     proxy=self._proxy,
                     account_key=self.stable_account_key,
                 )
+            except SignerAuthError as exc:
+                raise _map_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise BrowserTransportError(f"browserless rpc failed: {exc}") from exc
             self._apply_rpc_metadata(
@@ -547,6 +573,8 @@ class BrowserlessSession:
                     on_metadata=self._apply_rpc_metadata,
                 ):
                     yield event
+            except SignerAuthError as exc:
+                raise _map_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise BrowserTransportError(
                     f"browserless rpc stream failed: {exc}"

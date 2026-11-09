@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from aistudio_api.domain.model_access import (
     is_paid_model as _is_paid_model,
     set_paid_models,
     tier_header_value,
+    tier_rank,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
@@ -180,6 +182,118 @@ def _cookies_from_auth_file(auth_file: str | None) -> dict[str, str]:
     }
 
 
+def _session_engine(session: object | None) -> str:
+    return str(getattr(session, "engine", "") or "")
+
+
+def _session_page(session: object | None) -> CDPPage | None:
+    if session is None:
+        return None
+    return getattr(session, "page", None) or getattr(session, "_page", None)
+
+
+def _session_is_browserless(session: object | None) -> bool:
+    """Browserless sessions have no Page; they must use the HTTP path."""
+    return (
+        _session_engine(session) == "browserless"
+        or type(session).__name__ == "BrowserlessSession"
+    )
+
+
+def _session_is_alive(session: object | None) -> bool:
+    checker = getattr(session, "is_alive", None)
+    if not callable(checker):
+        return True
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _session_cookies(session: object | None) -> dict[str, str]:
+    """Prefer the live in-memory cookie jar, falling back to auth.json."""
+    raw = getattr(session, "_cookies", None) if session is not None else None
+    if isinstance(raw, list):
+        cookies = {
+            str(item.get("name")): str(item.get("value") or "")
+            for item in raw
+            if isinstance(item, Mapping) and item.get("name")
+        }
+        if cookies:
+            return cookies
+    return _cookies_from_auth_file(_session_auth_file(session))
+
+
+@dataclass(frozen=True)
+class _HttpCandidate:
+    cookies: dict[str, str]
+    auth_user: str
+    tier: str
+    label: str
+    auth_file: str | None = None
+
+
+def _http_candidate_key(candidate: _HttpCandidate) -> str:
+    if candidate.auth_file:
+        try:
+            return str(Path(candidate.auth_file).resolve())
+        except OSError:
+            return candidate.auth_file
+    minimal = filter_minimal_cookies(candidate.cookies)
+    return "cookies:" + "|".join(
+        f"{name}={value}" for name, value in sorted(minimal.items())
+    )
+
+
+def _account_http_candidates() -> list[_HttpCandidate]:
+    """Return healthy enabled accounts ordered paid-first for ListModels HTTP."""
+    try:
+        from aistudio_api.infrastructure.account.account_store import AccountStore
+
+        store = AccountStore()
+        accounts = list(store.list_accounts())
+    except Exception as exc:
+        logger.debug("读取账号列表用于模型发现失败: %s", exc)
+        return []
+
+    healthy = [
+        account
+        for account in accounts
+        if getattr(account, "enabled", True) and not getattr(account, "expired", False)
+    ]
+    healthy.sort(
+        key=lambda account: (
+            -tier_rank(getattr(account, "tier", "Free")),
+            str(getattr(account, "id", "") or ""),
+        )
+    )
+
+    candidates: list[_HttpCandidate] = []
+    for account in healthy:
+        account_id = str(getattr(account, "id", "") or "")
+        if not account_id:
+            continue
+        try:
+            auth_path = store.get_auth_path_optional(account_id, require_exists=True)
+        except Exception:
+            continue
+        if auth_path is None:
+            continue
+        cookies = _cookies_from_auth_file(str(auth_path))
+        if not cookies:
+            continue
+        candidates.append(
+            _HttpCandidate(
+                cookies=cookies,
+                auth_user=str(getattr(account, "auth_user", "0") or "0"),
+                tier=str(getattr(account, "tier", "Free") or "Free"),
+                label=f"account {account_id}",
+                auth_file=str(auth_path),
+            )
+        )
+    return candidates
+
+
 def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
     """Stable, log-safe identity used to decide whether a refresh changed."""
     return [
@@ -191,8 +305,8 @@ def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
     ]
 
 
-# 本地保底默认模型列表（仅冷启动/网络未就绪时使用；live 数据永远优先）。
-# 与主分支 16 条保底条目及 paid 标记保持一致，禁止把 fallback 冒充 live。
+# 本地保底默认模型列表（仅冷启动/脏快照回退时使用；live 数据永远优先）。
+# 覆盖当前实测 30+ 真实模型及 paid 标记，禁止把 fallback 冒充 live。
 _FALLBACK_MODELS = [
     {
         "id": "gemini-3.8-flash",
@@ -290,7 +404,150 @@ _FALLBACK_MODELS = [
         "description": "Latest stable Gemini Flash Lite alias",
         "paid": False,
     },
+    {
+        "id": "antigravity-preview-09-2026",
+        "displayName": "Antigravity Preview",
+        "description": "Paid preview model",
+        "paid": True,
+    },
+    {
+        "id": "deep-research-preview-04-2026",
+        "displayName": "Deep Research Preview",
+        "description": "Paid deep research model",
+        "paid": True,
+    },
+    {
+        "id": "deep-research-max-preview-04-2026",
+        "displayName": "Deep Research Max Preview",
+        "description": "Paid deep research max model",
+        "paid": True,
+    },
+    {
+        "id": "gemini-3.8-flash-tts",
+        "displayName": "Gemini 3.8 Flash TTS",
+        "description": "Text to speech model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-3.1-flash-lite",
+        "displayName": "Gemini 3.1 Flash Lite",
+        "description": "Lightweight flash model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-nano-banana-2.1",
+        "displayName": "Nano Banana 2.1",
+        "description": "Image generation and editing model",
+        "paid": True,
+    },
+    {
+        "id": "gemini-3.1-flash-lite-image",
+        "displayName": "Gemini 3.1 Flash Lite Image",
+        "description": "Lightweight image generation model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-3.5-transcribe",
+        "displayName": "Gemini 3.5 Transcribe",
+        "description": "Transcription model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-2.5-flash-image",
+        "displayName": "Gemini 2.5 Flash Image",
+        "description": "Image generation model",
+        "paid": True,
+    },
+    {
+        "id": "gemini-robotics-er-2-preview",
+        "displayName": "Gemini Robotics ER 2 Preview",
+        "description": "Robotics preview model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-3.8-flash-lite-tts",
+        "displayName": "Gemini 3.8 Flash-Lite TTS",
+        "description": "Text to speech lite model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-3.1-flash-tts-preview",
+        "displayName": "Gemini 3.1 Flash TTS Preview",
+        "description": "Text to speech preview model",
+        "paid": False,
+    },
+    {
+        "id": "lyria-3.5",
+        "displayName": "Lyria 3.5",
+        "description": "Music generation model",
+        "paid": True,
+    },
+    {
+        "id": "lyria-3-pro-preview",
+        "displayName": "Lyria 3 Pro Preview",
+        "description": "Music generation pro preview model",
+        "paid": True,
+    },
+    {
+        "id": "lyria-3-clip-preview",
+        "displayName": "Lyria 3 Clip Preview",
+        "description": "Music generation clip preview model",
+        "paid": True,
+    },
+    {
+        "id": "gemini-2.5-pro-preview-tts",
+        "displayName": "Gemini 2.5 Pro TTS Preview",
+        "description": "Text to speech pro preview model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-2.5-flash-preview-tts",
+        "displayName": "Gemini 2.5 Flash TTS Preview",
+        "description": "Text to speech flash preview model",
+        "paid": False,
+    },
+    {
+        "id": "gemini-omni-1.1-flash",
+        "displayName": "Gemini Omni 1.1 Flash",
+        "description": "Omni flash model",
+        "paid": True,
+    },
 ]
+
+_MIN_VALID_SNAPSHOT_MODELS = 5
+_FAKE_MODEL_ID_PREFIXES = ("dynamic-", "test-", "fake-")
+_FAKE_MODEL_ID_SUFFIXES = ("-test", "-fake")
+
+
+def _clean_model_id(entry: object) -> str:
+    if not isinstance(entry, Mapping):
+        return ""
+    return (
+        str(entry.get("id") or entry.get("name") or "")
+        .removeprefix("models/")
+        .strip()
+        .lower()
+    )
+
+
+def _is_fake_model_id(model_id: str) -> bool:
+    clean = model_id.removeprefix("models/").strip().lower()
+    if not clean:
+        return False
+    return (
+        clean == "dynamic-gemini-test"
+        or clean.startswith(_FAKE_MODEL_ID_PREFIXES)
+        or clean.endswith(_FAKE_MODEL_ID_SUFFIXES)
+    )
+
+
+def _snapshot_is_dirty(models: list[dict[str, object]]) -> bool:
+    """Reject fixture/test snapshots and truncated lists (<5 real models)."""
+    valid_ids = [model_id for entry in models if (model_id := _clean_model_id(entry))]
+    if len(valid_ids) < _MIN_VALID_SNAPSHOT_MODELS:
+        return True
+    return any(_is_fake_model_id(model_id) for model_id in valid_ids)
+
 
 LIVE_SOURCES = frozenset({"live_page", "live_http"})
 
@@ -379,6 +636,21 @@ class ModelDiscoveryService:
             if not isinstance(models, list):
                 return
             loaded = [dict(item) for item in models if isinstance(item, dict)]
+            if _snapshot_is_dirty(loaded):
+                logger.warning(
+                    "忽略脏模型快照 (%d 条，含测试假名或有效模型不足 %d 条)，"
+                    "回退内置模型表",
+                    len(loaded),
+                    _MIN_VALID_SNAPSHOT_MODELS,
+                )
+                self._cached_models = mark_discovery_source(
+                    [dict(model) for model in _FALLBACK_MODELS], "fallback"
+                )
+                self._last_fetched_at = time.time()
+                self.last_source = "fallback"
+                self.last_error = None
+                set_paid_models(self._cached_models)
+                return
             fetched_at = (
                 payload.get("fetched_at") if isinstance(payload, dict) else None
             )
@@ -444,7 +716,8 @@ class ModelDiscoveryService:
             self.last_error = None
             cached_before = list(self._cached_models)
 
-            # 1. 优先通过 READY 池会话（paid 先、Free 后）发 XHR 拉 ListModels
+            # 1. 汇总 HTTP 候选：调用方 Cookies → READY 池会话（paid 先）→
+            #    所有 enabled/未过期账号（paid 先、Free 后），按账号去重。
             candidates: list[Any] = []
             if sessions is not None:
                 try:
@@ -454,24 +727,53 @@ class ModelDiscoveryService:
             elif session is not None:
                 candidates.append(session)
 
-            session_cookies: dict[str, str] = {}
-            for candidate in candidates:
-                try:
-                    auth_file = _session_auth_file(candidate)
-                    candidate_cookies = _cookies_from_auth_file(auth_file)
-                    if not session_cookies:
-                        session_cookies = candidate_cookies
-                    if getattr(candidate, "engine", "browser") == "browserless":
-                        # Browserless has no page and must use the HTTP/signer
-                        # path below; never a hidden Chromium fallback.
-                        raise RuntimeError("browserless session has no page")
-                    page = getattr(candidate, "page", None) or getattr(
-                        candidate, "_page", None
+            http_candidates: list[_HttpCandidate] = []
+            seen_candidate_keys: set[str] = set()
+
+            def _add_http_candidate(candidate: _HttpCandidate) -> None:
+                if not candidate.cookies:
+                    return
+                key = _http_candidate_key(candidate)
+                if key in seen_candidate_keys:
+                    return
+                seen_candidate_keys.add(key)
+                http_candidates.append(candidate)
+
+            if cookies:
+                _add_http_candidate(
+                    _HttpCandidate(
+                        cookies=dict(cookies),
+                        auth_user=auth_user or "0",
+                        tier="Free",
+                        label="request cookies",
                     )
-                    if page is None:
-                        raise RuntimeError("session has no page")
-                    if page.is_closed():
-                        raise RuntimeError("session page is closed")
+                )
+
+            # 2. 浏览器页 XHR：browserless / 无 page 会话静默跳过（无 Page 不是错误）。
+            for candidate in candidates:
+                _add_http_candidate(
+                    _HttpCandidate(
+                        cookies=_session_cookies(candidate),
+                        auth_user=_session_auth_user(candidate),
+                        tier=_session_tier(candidate),
+                        label=f"{type(candidate).__name__} session",
+                        auth_file=_session_auth_file(candidate),
+                    )
+                )
+                if _session_is_browserless(candidate):
+                    continue
+                page = _session_page(candidate)
+                if page is None:
+                    continue
+                if not _session_is_alive(candidate) or page.is_closed():
+                    self.last_error = "live_page: session page is closed"
+                    logger.warning(
+                        "通过页面 XHR 拉取模型列表失败 (session=%s): page is closed",
+                        type(candidate).__name__,
+                    )
+                    continue
+                try:
+                    candidate_cookies = _session_cookies(candidate)
                     auth_header = (
                         calculate_sapisid_hash(
                             filter_minimal_cookies(candidate_cookies)
@@ -494,52 +796,38 @@ class ModelDiscoveryService:
                         type(candidate).__name__,
                         e,
                     )
-            if not candidates:
-                self.last_error = "no discovery session available"
 
-            # 2. 次选通过直接 HTTP 协议拉取（使用池会话对应账号的 Cookie）
-            effective_cookies = cookies or session_cookies
-            effective_auth_user = auth_user
-            effective_tier = "Free"
-            auth_source = session or (candidates[0] if candidates else None)
-            auth_file = _session_auth_file(auth_source)
-            if auth_source is not None:
-                effective_auth_user = _session_auth_user(auth_source)
-                effective_tier = _session_tier(auth_source)
-            if not auth_file:
-                try:
-                    from aistudio_api.infrastructure.account.account_store import (
-                        AccountStore,
-                    )
+            for account_candidate in _account_http_candidates():
+                _add_http_candidate(account_candidate)
 
-                    store = AccountStore()
-                    active = store.get_active_account()
-                    if active:
-                        auth_path = store.get_auth_path_optional(
-                            active.id, require_exists=True
-                        )
-                        auth_file = str(auth_path) if auth_path else None
-                        effective_auth_user = active.auth_user or "0"
-                        effective_tier = getattr(active, "tier", "Free") or "Free"
-                except Exception:
-                    pass
-            if not effective_cookies:
-                effective_cookies = _cookies_from_auth_file(auth_file)
+            if not http_candidates:
+                self.last_error = (
+                    self.last_error or "no discovery credentials available"
+                )
 
-            if effective_cookies:
+            # 3. HTTP 协议拉取：逐个候选尝试，401/403/登录态失效只跳过当前账号。
+            for candidate in http_candidates:
                 try:
                     models = await self._fetch_via_http(
-                        effective_cookies,
-                        effective_auth_user,
-                        tier=effective_tier,
+                        candidate.cookies,
+                        candidate.auth_user,
+                        tier=candidate.tier,
                     )
                     self._accept_live(models, source="live_http")
                     return models
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     self.last_error = f"live_http: {e}"
-                    logger.warning("通过 HTTP 协议拉取模型列表失败: %s", e)
+                    logger.debug("HTTP 模型发现候选失败 (%s): %s", candidate.label, e)
+            if http_candidates:
+                logger.warning(
+                    "所有 HTTP 模型发现候选均失败 (%d 个): %s",
+                    len(http_candidates),
+                    self.last_error or "unknown",
+                )
 
-            # 3. 保底返回本地默认模型列表（仅冷启动；已有快照则保留快照来源）
+            # 4. 保底返回本地默认模型列表（仅冷启动；已有快照则保留快照来源）
             if not self._cached_models:
                 self._cached_models = mark_discovery_source(
                     [dict(m) for m in _FALLBACK_MODELS], "fallback"

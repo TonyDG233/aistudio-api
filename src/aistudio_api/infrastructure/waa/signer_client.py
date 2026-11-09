@@ -50,6 +50,25 @@ class SignerProtocolError(SignerError):
     """The signer returned an unusable/invalid response."""
 
 
+class SignerAuthError(SignerError):
+    """The signer rejected the account login state (401/403/WAA denial).
+
+    ``status_code`` keeps the signer's HTTP status and ``reason`` keeps the
+    bounded server-provided error text, so callers can map this to the domain
+    ``AuthError``/``SessionExpiredError`` instead of a generic transport error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        reason: str = "",
+    ) -> None:
+        self.reason = reason[:300]
+        super().__init__(message, status_code=status_code)
+
+
 @dataclass(frozen=True)
 class SignerHealth:
     ok: bool
@@ -92,6 +111,7 @@ class RpcResult:
     body: bytes
     content_type: str = ""
     account_key: str = ""
+    upstream_status: int | None = None
     set_cookies: list[dict[str, object]] = field(default_factory=list)
     deleted_cookies: list[dict[str, object]] = field(default_factory=list)
     truncated: bool = False
@@ -155,6 +175,51 @@ def _error_text(payload: object, fallback: str) -> str:
     return fallback[:300]
 
 
+_AUTH_FAILURE_MARKERS = (
+    "invalid authentication",
+    "authentication required",
+    "credential expired",
+    "credentials expired",
+    "waa denied",
+    "unauthorized",
+    "隔离登录态失效",
+    "登录态失效",
+    "缺少登录 cookie",
+    "需要重新登录",
+    "请重新登录",
+)
+
+
+def _looks_like_auth_failure(status: int | None, text: str) -> bool:
+    """True when a signer/local 401/403 or login-state error body is auth.
+
+    A real upstream 4xx that the signer proxies always carries
+    ``X-Upstream-Status``; callers must check that header first so this helper
+    never rewrites a genuine upstream business error.
+    """
+    if status in (401, 403):
+        return True
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
+
+
+def _optional_int_header(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _response_error_text(resp: httpx.Response) -> str:
+    try:
+        text = resp.text
+    except Exception:
+        return ""
+    return " ".join(text.split())[:300]
+
+
 class SignerClient:
     """Strict, timeout-bounded client for one signer endpoint."""
 
@@ -197,6 +262,17 @@ class SignerClient:
         if isinstance(exc, httpx.HTTPError):
             return SignerError("waa-signer 传输失败")
         return SignerError("waa-signer 调用异常")
+
+    @staticmethod
+    def _raise_if_signer_auth_failure(operation: str, resp: httpx.Response) -> None:
+        reason = _response_error_text(resp)
+        if not _looks_like_auth_failure(resp.status_code, reason):
+            return
+        raise SignerAuthError(
+            f"waa-signer {operation} 登录态失效 (status={resp.status_code})",
+            status_code=resp.status_code,
+            reason=reason,
+        )
 
     async def health(self) -> SignerHealth:
         try:
@@ -264,6 +340,13 @@ class SignerClient:
             raise self._map_exception(exc) from exc
         latency_ms = (_monotonic() - started) * 1000.0
         if resp.status_code != 200:
+            reason = _response_error_text(resp)
+            if _looks_like_auth_failure(resp.status_code, reason):
+                raise SignerAuthError(
+                    f"waa-signer mint 登录态失效 (status={resp.status_code})",
+                    status_code=resp.status_code,
+                    reason=reason,
+                )
             raise SignerError(
                 f"waa-signer mint 失败 (status={resp.status_code})",
                 status_code=resp.status_code,
@@ -326,11 +409,15 @@ class SignerClient:
             resp = await self._client.post(self._url(RPC_PATH), json=payload)
         except Exception as exc:
             raise self._map_exception(exc) from exc
+        upstream_status = _optional_int_header(resp.headers.get("x-upstream-status"))
+        if upstream_status is None and resp.status_code >= 400:
+            self._raise_if_signer_auth_failure("rpc", resp)
         return RpcResult(
             status=resp.status_code,
             body=resp.content,
             content_type=resp.headers.get("content-type", ""),
             account_key=resp.headers.get("x-waa-account-key", ""),
+            upstream_status=upstream_status,
             set_cookies=_decode_set_cookies(resp.headers.get("x-waa-set-cookies")),
             deleted_cookies=_decode_set_cookies(
                 resp.headers.get("x-waa-deleted-cookies")
@@ -375,16 +462,33 @@ class SignerClient:
             async with self._client.stream(
                 "POST", self._url(RPC_PATH), json=payload
             ) as resp:
+                status = int(resp.status_code)
+                upstream_status = _optional_int_header(
+                    resp.headers.get("x-upstream-status")
+                )
                 if on_metadata is not None:
                     on_metadata(
                         resp.headers.get("x-waa-account-key", ""),
                         _decode_set_cookies(resp.headers.get("x-waa-set-cookies")),
                         _truthy_header(resp.headers.get("x-waa-set-cookies-truncated")),
                     )
-                yield ("status", int(resp.status_code))
+                if upstream_status is None and status >= 400:
+                    # A signer-local error body is small; buffer it so an auth
+                    # denial is raised as a routing-visible error instead of a
+                    # generic transport failure. Proxied upstream responses keep
+                    # their streamed body/status untouched.
+                    error_body = await resp.aread()
+                    self._raise_if_signer_auth_failure("rpc stream", resp)
+                    yield ("status", status)
+                    if error_body:
+                        yield ("chunk", error_body)
+                    return
+                yield ("status", status)
                 async for chunk in resp.aiter_bytes():
                     if chunk:
                         yield ("chunk", chunk)
+        except SignerError:
+            raise
         except Exception as exc:
             raise self._map_exception(exc) from exc
 
@@ -460,6 +564,7 @@ __all__ = [
     "HEALTH_PATH",
     "MintProofResult",
     "RpcResult",
+    "SignerAuthError",
     "SignerClient",
     "SignerError",
     "SignerHealth",

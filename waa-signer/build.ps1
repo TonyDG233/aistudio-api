@@ -1,4 +1,4 @@
-# Requires -Version 5.1
+﻿# Requires -Version 5.1
 <#
 .SYNOPSIS
     一键编译 WAA Signer (Windows x64)
@@ -62,9 +62,25 @@ Write-Host ">>> 检测到 Go: $goVersionStr" -ForegroundColor Cyan
 $CC = ""
 $CXX = ""
 $ExtLdFlags = ""
+# 标记是否使用 Zig 工具链（决定是否启用 libjsrust.a 的 Zig 兼容后处理）
+$UseZig = $false
 
 # 2.1 探测系统中是否已有 Zig (优先检测 PATH，其次深度扫描 WinGet、Scoop、ProgramFiles 目录)
 $zigCmd = Get-Command "zig" -ErrorAction SilentlyContinue
+if (-not $zigCmd) {
+    # 2.1.1 优先使用 .deps 内置的 Zig 0.13.0（已验证可链接 SpiderMonkey 预编译静态库）
+    foreach ($pinnedZig in @(
+        "$ScriptDir\.deps\zig\zig-windows-x86_64-0.13.0\zig.exe",
+        "$ScriptDir\.deps\zig\zig-x86_64-windows-0.13.0\zig.exe"
+    )) {
+        if (Test-Path $pinnedZig) {
+            $env:PATH = "$(Split-Path $pinnedZig -Parent);$env:PATH"
+            $zigCmd = Get-Command "zig" -ErrorAction SilentlyContinue
+            Write-Host ">>> 使用内置 Zig 0.13.0: $pinnedZig" -ForegroundColor Green
+            break
+        }
+    }
+}
 if (-not $zigCmd) {
     $searchPaths = @(
         "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
@@ -88,6 +104,7 @@ if (-not $zigCmd) {
 
 if ($zigCmd) {
     Write-Host ">>> 检测到 Zig 编译器，启用高性能免配置 CGO 静态交叉编译" -ForegroundColor Green
+    $UseZig = $true
     $CC = "zig cc -target x86_64-windows-gnu"
     $CXX = "zig c++ -target x86_64-windows-gnu"
     $ExtLdFlags = "-Wl,--strip-all"
@@ -127,6 +144,7 @@ if ($zigCmd) {
                     $zigDir = $foundZig.DirectoryName
                     $env:PATH = "$zigDir;$env:PATH"
                     Write-Host ">>> Zig 编译器已就绪: $($foundZig.FullName)" -ForegroundColor Green
+                    $UseZig = $true
                     $CC = "zig cc -target x86_64-windows-gnu"
                     $CXX = "zig c++ -target x86_64-windows-gnu"
                     $ExtLdFlags = "-Wl,--strip-all"
@@ -312,6 +330,86 @@ if ($ForceDownload -or -not (Test-Path $LibStatic)) {
     Write-Host ">>> SpiderMonkey 静态库解压就绪!" -ForegroundColor Green
 }
 
+# 3.5 Zig 静态库兼容后处理（幂等，每次构建都会校验）
+# Zig 0.13.0 链接 SpiderMonkey 预编译静态库时存在两类冲突:
+#   1) libjsrust.a 内的 compiler_builtins cgu.150 重复提供 ___chkstk_ms，与 Zig 的 compiler-rt 冲突;
+#   2) Rust 侧引用的 fstat64i32 在 Zig 的 MinGW CRT 中缺失。
+# 此处自动移除冲突成员并注入 fstat64i32 shim；重复运行不会产生重复成员。
+if ($UseZig -and (Test-Path $LibStatic)) {
+    $LibRust = "$DepsDir\lib\libjsrust.a"
+    $LibRustOrig = "$LibRust.orig"
+    if (-not (Test-Path $LibRust)) {
+        Write-Host "错误: 未找到 SpiderMonkey Rust 静态库: $LibRust" -ForegroundColor Red
+        exit 1
+    }
+
+    $ZigExe = ""
+    $resolvedZig = Get-Command "zig" -ErrorAction SilentlyContinue
+    if ($resolvedZig) {
+        $ZigExe = $resolvedZig.Source
+    }
+    if ([string]::IsNullOrWhiteSpace($ZigExe) -or -not (Test-Path $ZigExe)) {
+        Write-Host "错误: 未找到 Zig 可执行文件，无法执行静态库兼容后处理。" -ForegroundColor Red
+        exit 1
+    }
+
+    if (-not (Test-Path $LibRustOrig)) {
+        Copy-Item $LibRust $LibRustOrig -Force
+        Write-Host ">>> 已备份原始 libjsrust.a -> $LibRustOrig" -ForegroundColor Gray
+    }
+
+    $rustMembers = @(& $ZigExe ar t $LibRust)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "错误: 读取 libjsrust.a 成员列表失败。" -ForegroundColor Red
+        exit 1
+    }
+    $conflictMembers = @($rustMembers | Where-Object { $_ -match '^compiler_builtins-.*cgu\.150\.rcgu\.o$' })
+    if ($conflictMembers.Count -gt 0) {
+        foreach ($member in $conflictMembers) {
+            Write-Host ">>> 移除与 Zig compiler-rt 冲突的成员: $member" -ForegroundColor Yellow
+            & $ZigExe ar d $LibRust $member
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "错误: 移除冲突成员失败: $member" -ForegroundColor Red
+                exit 1
+            }
+        }
+    } else {
+        Write-Host ">>> libjsrust.a 未发现重复 ___chkstk_ms 成员，跳过移除。" -ForegroundColor Gray
+    }
+
+    $ShimSrc = "$ScriptDir\tools\fstat64i32_shim.c"
+    $ShimObj = "$ScriptDir\.deps\fstat_shim.o"
+    if (-not (Test-Path $ShimSrc)) {
+        Write-Host "错误: 缺少 fstat64i32 shim 源码: $ShimSrc" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ">>> 编译并注入 fstat64i32 CRT shim..." -ForegroundColor Cyan
+    & $ZigExe cc -target x86_64-windows-gnu -O2 -c $ShimSrc -o $ShimObj
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ShimObj)) {
+        Write-Host "错误: 编译 fstat64i32 shim 失败。" -ForegroundColor Red
+        exit 1
+    }
+    $rustMembers = @(& $ZigExe ar t $LibRust)
+    if ($rustMembers -contains "fstat_shim.o") {
+        & $ZigExe ar d $LibRust "fstat_shim.o"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "错误: 移除旧 fstat_shim.o 成员失败。" -ForegroundColor Red
+            exit 1
+        }
+    }
+    & $ZigExe ar r $LibRust $ShimObj
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "错误: 注入 fstat_shim.o 失败。" -ForegroundColor Red
+        exit 1
+    }
+    $rustMembers = @(& $ZigExe ar t $LibRust)
+    if (-not ($rustMembers -contains "fstat_shim.o")) {
+        Write-Host "错误: 注入后未在 libjsrust.a 中找到 fstat_shim.o。" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ">>> libjsrust.a Zig 兼容后处理完成。" -ForegroundColor Green
+}
+
 # 4. 创建产物目录
 if (-not (Test-Path $BinDir)) {
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
@@ -335,7 +433,27 @@ if (-not [string]::IsNullOrWhiteSpace($ExtLdFlags)) {
     $ldflags += " -extldflags `"$ExtLdFlags`""
 }
 
-go build -trimpath -tags "netgo,osusergo" -ldflags "$ldflags" -o $OutExe ./cmd/waa-signer
+# 5.1 生成构建专用临时 modfile
+# 仓库 go.mod 的 go 指令为 1.23（Q-08 基线），而 uquic/utls 已声明 go 1.27，
+# Go 1.27 工具链会以 "updates to go.mod needed" 拒绝直接构建。此处复制一份临时
+# modfile，并按 go.mod 中已有的 toolchain 指令提升 go 版本，避免修改受版本控制的 go.mod。
+$GoModFile = "$ScriptDir\go.mod"
+$GoSumFile = "$ScriptDir\go.sum"
+$BuildModFile = "$ScriptDir\.deps\waa-signer.mod"
+$BuildSumFile = "$ScriptDir\.deps\waa-signer.sum"
+$goModText = [System.IO.File]::ReadAllText($GoModFile)
+$toolchainMatch = [regex]::Match($goModText, '(?m)^toolchain\s+go(\d+\.\d+)')
+$buildArgs = @()
+if ($toolchainMatch.Success) {
+    $goLangVersion = $toolchainMatch.Groups[1].Value
+    $patchedGoMod = $goModText -replace '(?m)^go\s+\d+\.\d+\s*$', ('go ' + $goLangVersion)
+    [System.IO.File]::WriteAllText($BuildModFile, $patchedGoMod, (New-Object System.Text.UTF8Encoding($false)))
+    Copy-Item $GoSumFile $BuildSumFile -Force
+    $buildArgs = @("-modfile", $BuildModFile)
+    Write-Host ">>> 使用临时 modfile (go $goLangVersion，不修改仓库 go.mod): $BuildModFile" -ForegroundColor Gray
+}
+
+go build @buildArgs -trimpath -tags "netgo,osusergo" -ldflags "$ldflags" -o $OutExe ./cmd/waa-signer
 if ($LASTEXITCODE -ne 0) {
     Write-Host "错误: 编译 waa-signer 失败！" -ForegroundColor Red
     exit $LASTEXITCODE
