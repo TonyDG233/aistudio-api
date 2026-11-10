@@ -146,15 +146,15 @@ async def chat_completions(
         try:
             while first_event is None:
                 remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                event = await events.next_event(remaining)
+                event = await events.next_event(max(0.0, remaining))
                 if isinstance(event, KeepaliveTimeout):
                     break
                 candidate = cast("StreamEvent", event)
                 if candidate.kind == "routing_wait":
                     # ``routing_wait`` is only a resolving progress comment,
                     # never a model content frame for the first window.
+                    if remaining <= 0:
+                        break
                     continue
                 first_event = candidate
         except StopAsyncIteration:

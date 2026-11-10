@@ -106,15 +106,15 @@ async def _streaming_response(
     try:
         while first_event is None:
             remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            event = await events.next_event(remaining)
+            event = await events.next_event(max(0.0, remaining))
             if isinstance(event, KeepaliveTimeout):
                 break
             candidate = cast("StreamEvent", event)
             if candidate.kind in {"routing_wait", "usage"}:
                 # ``routing_wait`` is progress and ``usage`` is the terminal
                 # marker: neither starts a Claude content stream.
+                if remaining <= 0:
+                    break
                 continue
             first_event = candidate
     except StopAsyncIteration:

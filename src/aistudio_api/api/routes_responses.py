@@ -144,13 +144,13 @@ async def create_response(
         try:
             while first_event is None:
                 remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                event = await events.next_event(remaining)
+                event = await events.next_event(max(0.0, remaining))
                 if isinstance(event, KeepaliveTimeout):
                     break
                 candidate = cast("StreamEvent", event)
                 if candidate.kind == "routing_wait":
+                    if remaining <= 0:
+                        break
                     continue
                 first_event = candidate
         except StopAsyncIteration:
