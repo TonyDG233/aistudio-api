@@ -87,12 +87,19 @@ RUN set -eux; \
         done; \
     fi; \
     mkdir -p /out; \
+    # go.mod keeps a go 1.23 language baseline for Q-08 while upstream
+    # transport modules declare go 1.27. Use a temporary modfile so the
+    # tracked file stays unchanged and Go 1.27 can resolve dependencies.
+    BUILD_MODFILE="/src/waa-signer/.deps/waa-signer.mod"; \
+    cp go.mod "$BUILD_MODFILE"; \
+    cp go.sum "${BUILD_MODFILE%.mod}.sum"; \
+    sed -i 's/^go 1[.]23$/go 1.27/' "$BUILD_MODFILE"; \
     CGO_ENABLED=1 GOOS=linux GOARCH="${GO_ARCH}" \
         CC="zig cc -target ${ZIG_TARGET}" \
         CXX="zig c++ -target ${ZIG_TARGET}" \
         CGO_CXXFLAGS="-I${DEPS_DIR}/include" \
         CGO_LDFLAGS="-L${DEPS_DIR}/lib" \
-        go build -trimpath -tags netgo,osusergo \
+        go build -modfile "$BUILD_MODFILE" -trimpath -tags netgo,osusergo \
             -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all'" \
             -o /out/waa-signer ./cmd/waa-signer; \
     chmod +x /out/waa-signer
