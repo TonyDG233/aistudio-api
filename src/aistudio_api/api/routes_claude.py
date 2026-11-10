@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
@@ -22,8 +21,8 @@ from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
     KEEPALIVE_SENTINEL,
     KeepaliveIterator,
-    KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_first_rendered,
     preread_window_sec,
 )
 from aistudio_api.application.contracts.claude import (
@@ -100,28 +99,12 @@ async def _streaming_response(
 
     # Phase A: bounded wait for the first renderable event.  Errors before this
     # point keep a real HTTP status; a slow upstream switches to 200 + keepalive.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + preread_window_sec()
-    first_event: StreamEvent | None = None
-    saw_routing_wait = False
     try:
-        while first_event is None:
-            remaining = deadline - loop.time()
-            if remaining <= 0 and not saw_routing_wait:
-                break
-            saw_routing_wait = False
-            event = await events.next_event(max(0.0, remaining))
-            if isinstance(event, KeepaliveTimeout):
-                break
-            candidate = cast("StreamEvent", event)
-            if candidate.kind in {"routing_wait", "usage"}:
-                # ``routing_wait`` is progress and ``usage`` is the terminal
-                # marker: neither starts a Claude content stream.
-                if remaining <= 0:
-                    break
-                saw_routing_wait = True
-                continue
-            first_event = candidate
+        first_event = await preread_first_rendered(
+            events,
+            lambda item: None if item.kind in {"routing_wait", "usage"} else item,
+            window=preread_window_sec(),
+        )
     except StopAsyncIteration:
         with contextlib.suppress(Exception):
             await events.aclose()
