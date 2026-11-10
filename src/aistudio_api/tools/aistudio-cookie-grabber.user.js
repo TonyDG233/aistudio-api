@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google AI Studio 多账号一键抓取与同步工具
 // @namespace    https://github.com/DeconstructedCube/aistudio-api
-// @version      2.1.0
+// @version      2.1.1
 // @description  在 Google AI Studio 网页上一键自动抓取浏览器登录的全部账号 Cookie、authUser 索引与权益等级，并支持一键直接同步到本地 aistudio-api 网关服务或下载凭据包。
 // @author       omp & Lianues
 // @match        https://aistudio.google.com/*
@@ -274,7 +274,8 @@
     });
 
     const title = document.createElement('div');
-    title.innerHTML = '⚡ <b>AI Studio 多账号同步助手</b>';
+    title.textContent = '⚡ AI Studio 多账号同步助手';
+    title.style.fontWeight = '700';
     title.style.color = '#1f2937';
     title.style.marginBottom = '4px';
 
@@ -284,7 +285,7 @@
     statusText.textContent = '就绪：支持一键自动抓取并同步全部子账号';
 
     const btnSyncAll = document.createElement('button');
-    btnSyncAll.innerHTML = '🚀 <b>一键自动同步全部账号到本地</b>';
+    btnSyncAll.textContent = '🚀 一键自动同步全部账号到本地';
     Object.assign(btnSyncAll.style, {
       background: '#2563eb',
       color: '#fff',
@@ -296,7 +297,7 @@
     });
 
     const btnCopyBundle = document.createElement('button');
-    btnCopyBundle.innerHTML = '📋 复制全部账号 Bundle JSON';
+    btnCopyBundle.textContent = '📋 复制全部账号 Bundle JSON';
     Object.assign(btnCopyBundle.style, {
       background: '#f3f4f6',
       color: '#374151',
@@ -307,7 +308,7 @@
     });
 
     const btnDownloadBundle = document.createElement('button');
-    btnDownloadBundle.innerHTML = '💾 下载凭据包 (.json)';
+    btnDownloadBundle.textContent = '💾 下载凭据包 (.json)';
     Object.assign(btnDownloadBundle.style, {
       background: '#f3f4f6',
       color: '#374151',
@@ -319,23 +320,23 @@
 
     btnSyncAll.onclick = async () => {
       btnSyncAll.disabled = true;
-      btnSyncAll.innerHTML = '⏳ 正在发现全部子账号并探测权益...';
+      btnSyncAll.textContent = '⏳ 正在发现全部子账号并探测权益...';
       try {
         const bundle = await discoverAllAccounts();
-        btnSyncAll.innerHTML = `⏳ 发现 ${bundle.total} 个账号，正在推送到本地网关...`;
+        btnSyncAll.textContent = `⏳ 发现 ${bundle.total} 个账号，正在推送到本地网关...`;
         const res = await postToLocalGateway(bundle);
         btnSyncAll.style.background = '#16a34a';
-        btnSyncAll.innerHTML = `🎉 成功同步 ${res.count || bundle.total} 个账号！`;
+        btnSyncAll.textContent = `🎉 成功同步 ${res.count || bundle.total} 个账号！`;
         statusText.textContent = `全部子账号已自动入驻，耗时 ${(res.count || bundle.total)} 项！`;
       } catch (err) {
         btnSyncAll.style.background = '#dc2626';
-        btnSyncAll.innerHTML = '❌ 同步失败，点击重试';
+        btnSyncAll.textContent = '❌ 同步失败，点击重试';
         statusText.textContent = err.message;
       } finally {
         setTimeout(() => {
           btnSyncAll.disabled = false;
           btnSyncAll.style.background = '#2563eb';
-          btnSyncAll.innerHTML = '🚀 <b>一键自动同步全部账号到本地</b>';
+          btnSyncAll.textContent = '🚀 一键自动同步全部账号到本地';
         }, 5000);
       }
     };
