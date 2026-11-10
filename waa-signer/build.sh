@@ -132,6 +132,25 @@ else
   exit 1
 fi
 
+# Linux/Android SpiderMonkey archives may include a compiler_builtins object
+# that collides with Go's compiler-rt (___chkstk_ms). Remove that member
+# before linking; no-op on archives that do not contain it.
+if [ -f "$DEPS_DIR/lib/libjsrust.a" ]; then
+  if command -v zig >/dev/null 2>&1; then
+    AR_CMD="zig ar"
+  elif command -v ar >/dev/null 2>&1; then
+    AR_CMD="ar"
+  else
+    AR_CMD=""
+  fi
+  if [ -n "$AR_CMD" ]; then
+    for MEMBER in $($AR_CMD t "$DEPS_DIR/lib/libjsrust.a" | grep -E '^compiler_builtins-.*cgu\.150\.rcgu\.o$' || true); do
+      echo ">>> 移除重复 compiler runtime 成员: ${MEMBER}"
+      $AR_CMD d "$DEPS_DIR/lib/libjsrust.a" "$MEMBER"
+    done
+  fi
+fi
+
 mkdir -p bin
 BIN_NAME="waa-signer"
 if [ "$TARGET_GOOS" = "windows" ]; then

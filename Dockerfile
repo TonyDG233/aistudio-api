@@ -12,7 +12,10 @@
 FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS waa-signer-build
 
 ARG TARGETARCH
-ARG ZIG_VERSION=0.14.1
+# 0.13.x uses zig-linux-<arch>-<version>.zip naming; 0.14+ uses
+# zig-<arch>-linux-<version>. Keep 0.13.0 (verified for amd64/arm64) and
+# retain a fallback for the newer naming scheme.
+ARG ZIG_VERSION=0.13.0
 ARG SPIDERMONKEY_VERSION=v152.0.4-aistudio2api.1
 
 ENV GOTOOLCHAIN=local \
@@ -32,8 +35,11 @@ RUN set -eux; \
         arm64) ZIG_ARCH="aarch64" ;; \
         *) echo "Unsupported build architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac; \
-    curl -fSL --retry 3 -o /tmp/zig.tar.xz \
-        "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"; \
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"; \
+    if ! curl -fsSLI --retry 3 "$ZIG_URL" >/dev/null; then \
+        ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"; \
+    fi; \
+    curl -fSL --retry 3 -o /tmp/zig.tar.xz "$ZIG_URL"; \
     mkdir -p /opt/zig; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
     rm -f /tmp/zig.tar.xz; \
@@ -73,6 +79,13 @@ RUN set -eux; \
         *) echo "Unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     DEPS_DIR="/src/waa-signer/.deps/spidermonkey/${SM_ARCH}"; \
+    LIBJSRUST="${DEPS_DIR}/lib/libjsrust.a"; \
+    if [ -f "${LIBJSRUST}" ]; then \
+        for member in $(zig ar t "${LIBJSRUST}" | grep -E '^compiler_builtins-.*cgu\.150\.rcgu\.o$' || true); do \
+            echo "Removing duplicate compiler runtime member: ${member}"; \
+            zig ar d "${LIBJSRUST}" "${member}"; \
+        done; \
+    fi; \
     mkdir -p /out; \
     CGO_ENABLED=1 GOOS=linux GOARCH="${GO_ARCH}" \
         CC="zig cc -target ${ZIG_TARGET}" \
