@@ -242,9 +242,13 @@ async def _build_gemini_streaming_response(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + preread_window_sec()
     first_chunk: str | None = None
+    saw_routing_wait = False
     try:
         while first_chunk is None:
             remaining = deadline - loop.time()
+            if remaining <= 0 and not saw_routing_wait:
+                break
+            saw_routing_wait = False
             event = await events.next_event(max(0.0, remaining))
             if isinstance(event, KeepaliveTimeout):
                 break
@@ -254,6 +258,7 @@ async def _build_gemini_streaming_response(
                 # model content frame; it must not consume the first window.
                 if remaining <= 0:
                     break
+                saw_routing_wait = True
                 continue
             first_chunk = _render_stream_event(stream_event)
     except StopAsyncIteration:
