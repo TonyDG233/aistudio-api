@@ -6,7 +6,7 @@ import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastApiPath
 from pydantic import BaseModel, Field
@@ -416,9 +416,21 @@ class BundleAccountItem(BaseModel):
     id: str | None = None
     name: str | None = None
     email: str | None = None
-    cookies: str
-    auth_user: str = "0"
+    cookies: object = None
+    cookieObjects: list[dict[str, object]] | None = None
+    auth_user: str | None = None
+    authUser: int | str | None = None
     tier: str | None = None
+    g1Tier: str | None = None
+    g1_tier: str | None = None
+    accountName: str | None = None
+
+
+class RotateCookiesResponse(BaseModel):
+    ok: bool
+    status: int = 200
+    updated: list[str] = Field(default_factory=list)
+    account: AccountResponse | None = None
 
 
 class ImportBundleRequest(BaseModel):
@@ -1387,6 +1399,49 @@ async def probe_and_import(
     )
 
 
+def _extract_bundle_items(raw_data: object) -> list[dict[str, object]]:
+    """从任意输入数据中提取账号条目列表，兼容 4 种常见 JSON 结构：
+    1. 多账号 Bundle 字典（含 accounts 或 profiles 列表）
+    2. 单账号 Playwright storageState 字典（如 auth-49.json，顶层含 cookies）
+    3. 多账号对象数组（元素包含 cookies 或 cookieObjects）
+    4. Cookie-Editor 导出的纯 Cookie 数组（元素含 name 与 value 但不含 cookies）
+    """
+    if isinstance(raw_data, dict):
+        accounts = raw_data.get("accounts")
+        if isinstance(accounts, list):
+            return [item for item in accounts if isinstance(item, dict)]
+        profiles = raw_data.get("profiles")
+        if isinstance(profiles, list):
+            return [item for item in profiles if isinstance(item, dict)]
+        if "cookies" in raw_data and isinstance(raw_data["cookies"], (list, str, dict)):
+            return [raw_data]
+        if "cookieObjects" in raw_data and isinstance(raw_data["cookieObjects"], list):
+            return [raw_data]
+        return []
+
+    if isinstance(raw_data, list):
+        account_items = [
+            item
+            for item in raw_data
+            if isinstance(item, dict) and ("cookies" in item or "cookieObjects" in item)
+        ]
+        if account_items:
+            return account_items
+        # 检查是否为 Cookie-Editor 导出的单条 Cookie 列表
+        is_cookie_array = bool(
+            raw_data
+            and all(
+                isinstance(item, dict) and "name" in item and "value" in item
+                for item in raw_data
+                if isinstance(item, dict)
+            )
+        )
+        if is_cookie_array:
+            return [{"cookies": raw_data}]
+
+    return []
+
+
 @router.post("/import-bundle", response_model=ImportBundleResponse)
 async def import_bundle(
     req: ImportBundleRequest,
@@ -1398,21 +1453,18 @@ async def import_bundle(
     import secrets
     from pathlib import Path
 
-    from aistudio_api.infrastructure.account.cookie_parser import parse_cookie_string
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        parse_cookie_string,
+        parse_storage_state,
+    )
 
     items_to_import: list[dict[str, object]] = []
 
     if req.accounts:
         for a in req.accounts:
-            items_to_import.append(
-                {
-                    "name": a.name or "Google Account",
-                    "email": a.email,
-                    "cookies": a.cookies,
-                    "auth_user": a.auth_user or "0",
-                    "tier": a.tier or "Free",
-                }
-            )
+            a_dict = a.model_dump(exclude_unset=True)
+            if a_dict:
+                items_to_import.append(a_dict)
     elif req.content:
         try:
             raw_data = json.loads(req.content)
@@ -1420,15 +1472,7 @@ async def import_bundle(
             raise HTTPException(
                 status_code=400, detail=f"JSON 内容解析失败: {e}"
             ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+        items_to_import = _extract_bundle_items(raw_data)
     elif req.file_path:
         fpath = Path(req.file_path).expanduser().resolve()
         if not fpath.is_file():
@@ -1440,15 +1484,7 @@ async def import_bundle(
             raise HTTPException(
                 status_code=400, detail=f"读取或解析文件失败: {e}"
             ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+        items_to_import = _extract_bundle_items(raw_data)
     else:
         raise HTTPException(
             status_code=400,
@@ -1463,17 +1499,55 @@ async def import_bundle(
     imported_accounts: list[AccountResponse] = []
     sandbox = get_ui_sandbox(runtime_state)
     for idx, item in enumerate(items_to_import):
-        raw_cookie_str = str(item.get("cookies") or "")
-        if not raw_cookie_str:
-            continue
-        storage_state = parse_cookie_string(raw_cookie_str)
-        if not storage_state.get("cookies"):
+        storage_state: dict[str, object] | None = None
+        cookie_objects = item.get("cookieObjects")
+        cookies_val = item.get("cookies")
+
+        if isinstance(cookie_objects, list) and cookie_objects:
+            storage_state = parse_storage_state({"cookies": cookie_objects})
+            if storage_state is None:
+                storage_state = parse_cookie_string(cookie_objects)
+        elif isinstance(cookies_val, list):
+            storage_state = parse_storage_state(
+                {"cookies": cookies_val, "origins": item.get("origins", [])}
+            )
+            if storage_state is None:
+                storage_state = parse_cookie_string(cookies_val)
+        elif isinstance(cookies_val, dict):
+            storage_state = parse_storage_state(cookies_val)
+            if storage_state is None:
+                storage_state = parse_cookie_string(cookies_val)
+        elif isinstance(cookies_val, str) and cookies_val.strip():
+            storage_state = parse_cookie_string(cookies_val)
+
+        if not storage_state or not storage_state.get("cookies"):
             continue
 
-        acc_name = str(item.get("name") or f"Account {idx + 1}")
         acc_email = str(item["email"]) if item.get("email") else None
-        acc_auth_user = str(item.get("auth_user") or "0")
-        acc_tier = str(item.get("tier") or "")
+        account_name_val = str(item.get("accountName") or "").strip()
+        if not acc_email and "@" in account_name_val:
+            acc_email = account_name_val
+
+        acc_name = str(item.get("name") or "")
+        if not acc_name:
+            if account_name_val:
+                acc_name = account_name_val
+            elif acc_email:
+                acc_name = f"Google ({acc_email.split('@')[0]})"
+            else:
+                acc_name = f"Account {idx + 1}"
+
+        acc_auth_user = str(item.get("auth_user") or item.get("authUser") or "0")
+
+        acc_tier = ""
+        g1_raw = item.get("g1Tier") or item.get("g1_tier")
+        if g1_raw:
+            acc_tier = _TAMPERMONKEY_TIER_MAP.get(str(g1_raw).strip().upper()) or str(
+                g1_raw
+            )
+        if not acc_tier and item.get("tier"):
+            acc_tier = str(item["tier"])
+
         if sandbox is None and (not acc_email or not acc_tier):
             raw_cookies_list = storage_state.get("cookies")
             if isinstance(raw_cookies_list, list):
@@ -1521,4 +1595,61 @@ async def import_bundle(
     return ImportBundleResponse(
         imported_count=len(imported_accounts),
         accounts=imported_accounts,
+    )
+
+
+@router.post("/{account_id}/rotate-cookies", response_model=RotateCookiesResponse)
+async def rotate_account_cookies_endpoint(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> RotateCookiesResponse:
+    """手动调用 Google RotateCookies 刷新指定账号的短效滚动凭据。"""
+    acc = account_service.get_account(account_id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        return RotateCookiesResponse(
+            ok=True,
+            status=200,
+            updated=["__Secure-1PSIDTS", "SIDCC"],
+            account=to_account_response(
+                acc, status=_account_status(runtime_state, acc.id)
+            ),
+        )
+
+    session: Any = None
+    im: Any = getattr(runtime_state, "instance_manager", None)
+    if im is not None:
+        getter: Any = getattr(im, "pool_slots", None)
+        if callable(getter):
+            slots: Any = getter()
+            if isinstance(slots, (list, tuple)):
+                for slot in slots:
+                    if getattr(slot, "account_id", None) == account_id:
+                        session = getattr(slot, "session", None)
+                        break
+
+    res = await account_service.rotate_account_cookies(account_id, session=session)
+    updated_acc = account_service.get_account(account_id) or acc
+    raw_status = res.get("status")
+    status_code: int = (
+        int(raw_status)
+        if isinstance(raw_status, (int, float))
+        else (200 if res.get("ok") else 0)
+    )
+    raw_updated = res.get("updated")
+    updated_list = (
+        [str(u) for u in raw_updated if isinstance(u, str)]
+        if isinstance(raw_updated, (list, tuple))
+        else []
+    )
+    return RotateCookiesResponse(
+        ok=bool(res.get("ok")),
+        status=status_code,
+        updated=updated_list,
+        account=to_account_response(
+            updated_acc, status=_account_status(runtime_state, updated_acc.id)
+        ),
     )

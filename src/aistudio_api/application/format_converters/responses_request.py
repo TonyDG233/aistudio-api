@@ -44,6 +44,10 @@ def _warn_ignored(field: str) -> None:
     logger.warning("[responses] ignored unsupported field: %s", field)
 
 
+def _debug_ignored(field: str) -> None:
+    logger.debug("[responses] ignored unsupported field: %s", field)
+
+
 def _text_from_content(content: object, *, field: str) -> str:
     if content is None:
         return ""
@@ -307,7 +311,7 @@ def _generation_config(req: ResponsesRequest) -> dict[str, object]:
                 )
             config["thinkingConfig"] = {"thinkingLevel": level}
         if reasoning.get("summary") is not None:
-            _warn_ignored("reasoning.summary")
+            _debug_ignored("reasoning.summary")
 
     if req.text is not None:
         config.update(_text_format_config(req.text))
@@ -443,7 +447,7 @@ async def convert_responses_request(
             field="previous_response_id",
         )
     if req.store is not None:
-        _warn_ignored("store")
+        _debug_ignored("store")
     provided = req.model_fields_set
     for field in (
         "parallel_tool_calls",
@@ -454,7 +458,7 @@ async def convert_responses_request(
         "service_tier",
     ):
         if field in provided:
-            _warn_ignored(field)
+            _debug_ignored(field)
 
     contents: list[dict[str, object]] = []
     system_texts: list[str] = []

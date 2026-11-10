@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -95,6 +96,23 @@ DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
     }
 )
 
+ACCOUNT_HOST_ONLY_COOKIES: frozenset[str] = frozenset(
+    {
+        "LSID",
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+        "__Host-GAPS",
+        "ACCOUNT_CHOOSER",
+    }
+)
+
+_ALLOWED_HOST_COOKIES: frozenset[str] = frozenset(
+    {
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+    }
+)
+
 # Minimal authentication cookie set accepted by Google RPC / SAPISIDHASH signing.
 # This is only for outbound signed RPC requests; browser session cookies and DOM
 # storage must keep the full jar (see parse_storage_state / build_google_cookie_list).
@@ -118,18 +136,78 @@ MINIMAL_COOKIE_WHITELIST: frozenset[str] = frozenset(
     }
 )
 
+ROTATE_COOKIE_WHITELIST: frozenset[str] = (
+    MINIMAL_COOKIE_WHITELIST | ACCOUNT_HOST_ONLY_COOKIES
+)
 
-def filter_minimal_cookies(cookies: dict[str, str]) -> dict[str, str]:
-    """Filter a cookie jar down to the authentication cookies a signed RPC needs.
+ROTATING_SESSION_COOKIE_NAMES: tuple[str, ...] = (
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+    "SIDCC",
+    "__Secure-1PSIDCC",
+    "__Secure-3PSIDCC",
+)
 
-    The returned dict is a new mapping; the caller's jar is never mutated, so a
-    browser session keeps its full cross-domain cookie set.
-    """
-    return {
-        name: value
-        for name, value in cookies.items()
-        if name in MINIMAL_COOKIE_WHITELIST and value
-    }
+
+def filter_minimal_cookies(
+    cookies: dict[str, str], *, include_account_host: bool = False
+) -> dict[str, str]:
+    """过滤保留核心鉴权 Cookie；默认排除 accounts.google.com 专属 Cookie。"""
+    allowed = (
+        ROTATE_COOKIE_WHITELIST if include_account_host else MINIMAL_COOKIE_WHITELIST
+    )
+    return {k: v for k, v in cookies.items() if k in allowed and v}
+
+
+def compute_session_anchor(cookies: dict[str, str]) -> str:
+    """提取浏览器会话锚点（用于识别同一窗口下的多登子账号 u/0..u/N）。"""
+    if not cookies:
+        return ""
+    return (
+        cookies.get("SAPISID")
+        or cookies.get("__Secure-3PAPISID")
+        or cookies.get("__Secure-1PAPISID")
+        or cookies.get("SID")
+        or cookies.get("__Secure-3PSID")
+        or ""
+    )
+
+
+def apply_set_cookies(
+    cookies: dict[str, str],
+    set_cookie_headers: list[str] | tuple[str, ...],
+) -> list[str]:
+    """将 HTTP 响应 Set-Cookie 头合并至 cookies 字典，返回发生变更的 Cookie 名称列表。"""
+    updated: list[str] = []
+    if not set_cookie_headers:
+        return updated
+    for raw in set_cookie_headers:
+        if not raw or not isinstance(raw, str):
+            continue
+        parts = [s.strip() for s in raw.split(";")]
+        if not parts or not parts[0]:
+            continue
+        nv, attrs = parts[0], parts[1:]
+        eq = nv.find("=")
+        if eq <= 0:
+            continue
+        name = nv[:eq].strip()
+        val = nv[eq + 1 :].strip()
+        if not name or not val or val == "deleted":
+            continue
+        if name not in ROTATE_COOKIE_WHITELIST:
+            continue
+        attr_str = "; ".join(attrs)
+        if re.search(r"domain=[^;]*gstatic\.com", attr_str, re.IGNORECASE):
+            continue
+        if re.search(r"expires=[^;]*19[789]\d", attr_str, re.IGNORECASE):
+            continue
+        if re.search(r"max-age\s*=\s*(?:0|-\d+)", attr_str, re.IGNORECASE):
+            continue
+        if cookies.get(name) != val:
+            cookies[name] = val
+            updated.append(name)
+    return updated
 
 
 _STUDIO_SCOPED_COOKIES = frozenset({"OSID", "__Secure-OSID", "__Secure-BUCKET"})
@@ -457,6 +535,35 @@ def cookies_for_google_rpc(raw: object) -> dict[str, str]:
     return parse_raw_cookies(raw)
 
 
+def load_cookies_from_auth_file(auth_file: str | Path | None) -> dict[str, str]:
+    """从 auth.json 中读取扁平化 Cookie 键值对。"""
+    if not auth_file:
+        return {}
+    path = Path(auth_file)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        cookies = data.get("cookies")
+        if isinstance(cookies, list):
+            res: dict[str, str] = {}
+            for item in cookies:
+                if (
+                    isinstance(item, dict)
+                    and item.get("name")
+                    and item.get("value") is not None
+                ):
+                    res[str(item["name"])] = str(item["value"])
+            return res
+        if isinstance(cookies, dict):
+            return {str(k): str(v) for k, v in cookies.items() if k}
+    except Exception as e:
+        logger.warning("读取 Cookie 文件失败 (%s): %s", auth_file, e)
+    return {}
+
+
 def parse_cookie_string(
     raw: object, *, discard_transient: bool = True
 ) -> dict[str, object]:
@@ -618,6 +725,82 @@ async def probe_account_benefit_tier(
     except Exception as e:
         logger.debug("探测子账号 u/%s 权益等级失败: %s", u_index, e)
         return None
+
+
+DEFAULT_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+
+async def rotate_google_cookies(
+    cookies: dict[str, str],
+    *,
+    client: httpx.AsyncClient | None = None,
+    user_agent: str | None = None,
+    timeout: float = 15.0,
+) -> dict[str, object]:
+    """调用 accounts.google.com/RotateCookies 刷新短效滚动凭据 (__Secure-1PSIDTS / SIDCC)。
+
+    若调用成功，原地更新传入的 cookies 字典并返回 {"ok": True, "status": 200, "updated": [...]}。
+    """
+    if not cookies:
+        return {"ok": False, "status": 0, "updated": []}
+
+    has_rotation_seed = any(
+        cookies.get(k)
+        for k in (
+            "LSID",
+            "__Host-1PLSID",
+            "__Host-3PLSID",
+            "__Secure-1PSIDTS",
+            "__Secure-3PSIDTS",
+        )
+    )
+    if not has_rotation_seed:
+        return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
+
+    import httpx
+
+    from aistudio_api.config import settings
+
+    rotate_cookies_map = filter_minimal_cookies(cookies, include_account_host=True)
+    cookie_header = "; ".join(f"{k}={v}" for k, v in rotate_cookies_map.items())
+    if not cookie_header:
+        return {"ok": False, "status": 0, "updated": []}
+
+    effective_ua = user_agent or DEFAULT_BROWSER_USER_AGENT
+
+    headers = {
+        "Cookie": cookie_header,
+        "User-Agent": effective_ua,
+        "Content-Type": "application/json",
+        "Origin": "https://accounts.google.com",
+        "Referer": "https://accounts.google.com/RotateCookiesPage",
+    }
+    body = '[null,"-1234567890",0]'
+
+    async def _do_rotate(http_client: httpx.AsyncClient) -> dict[str, object]:
+        resp = await http_client.post(
+            "https://accounts.google.com/RotateCookies",
+            headers=headers,
+            content=body,
+        )
+        set_cookies = resp.headers.get_list("set-cookie")
+        updated = apply_set_cookies(cookies, set_cookies)
+        return {
+            "ok": resp.status_code == 200,
+            "status": resp.status_code,
+            "updated": updated,
+        }
+
+    try:
+        if client is not None:
+            return await _do_rotate(client)
+        async with httpx.AsyncClient(
+            timeout=timeout, proxy=settings.proxy_url
+        ) as new_client:
+            return await _do_rotate(new_client)
+    except Exception as e:
+        logger.debug("请求 RotateCookies 失败: %s", e)
+        return {"ok": False, "status": 0, "updated": [], "error": str(e)}
 
 
 async def probe_google_accounts_infinite(

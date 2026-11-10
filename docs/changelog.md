@@ -3,6 +3,21 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.1] - 2026-11-10
+
+### Changed
+
+- **Responses 协议转换器日志降级**：`/v1/responses` 协议转换器将常规非核心忽略字段（`store`、`include`、`reasoning.summary`、`parallel_tool_calls`、`truncation`、`metadata`、`user`、`service_tier`）日志级别从 `WARNING` 降为 `DEBUG`，仅保留 `seed` 的 `WARNING`（遵守 E-04）。
+
+### Added
+
+- **油猴长效抓取助手与安装路由**：恢复并增强油猴多账号长效抓取脚本 `src/aistudio_api/tools/aistudio-cookie-grabber.user.js` 及在线安装路由 `GET /api/tools/aistudio-cookie-grabber.user.js`（保留结构化多域名 `cookieObjects`、新增下载 `.json` 凭据包按钮、桌面端自动唤起 Tampermonkey 安装界面、移动端浏览器自动阻断并提示）。
+- **Google /RotateCookies 凭据主动轮换与同源兄弟账号同步**：合入 Google `/RotateCookies` 主动滚动凭据轮换（`rotate_google_cookies`）、`POST /api/accounts/{id}/rotate-cookies` 端点及同源多登兄弟账号同步（Sibling Sync）；各子账号独立持有完整 `auth.json`，删除任意重复/同源子账号不影响其余账号保活。
+
+### Fixed
+
+- **批量导入解析与长效根凭据识别**：修复 `/api/accounts/import-bundle` 与前端导入弹窗对单账号 Playwright `storageState`（`auth-*.json`）及 Cookie-Editor 数组的解析断层；新增「账号管理」全页面与弹窗内 `.json` 拖拽导入、多文件批量合并及 `accounts.google.com` 长效根凭据（`LSID` / `__Host-1PLSID`）识别提示。
+
 ## [2.1.0] - 2026-11-08
 
 2.1.0 在 2.0.0 多实例池基础上引入 browser 与 browserless 双引擎，补齐 WAA 独立签名器、设置页事务热切换与 Docker 单镜像双引擎。

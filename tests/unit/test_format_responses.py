@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -366,25 +367,72 @@ async def test_stateless_previous_response_and_item_reference():
     assert reference.value.field == "input[0].type"
 
 
-async def test_lenient_optional_fields_are_accepted_and_store_is_stateless():
-    body = await _convert(
-        store=True,
-        parallel_tool_calls=False,
-        truncation="auto",
-        include=["reasoning.encrypted_content"],
-        metadata={"trace": "1"},
-        user="user-1",
-        service_tier="auto",
-        reasoning={"effort": "low", "summary": "auto"},
-        seed=7,
-    )
+async def test_lenient_optional_fields_are_accepted_and_store_is_stateless(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.DEBUG, logger="aistudio.format.responses"):
+        body = await _convert(
+            store=True,
+            parallel_tool_calls=False,
+            truncation="auto",
+            include=["reasoning.encrypted_content"],
+            metadata={"trace": "1"},
+            user="user-1",
+            service_tier="auto",
+            reasoning={"effort": "high", "summary": "auto"},
+        )
     assert body["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
     config = _as_dict(body["generationConfig"])
-    assert config["thinkingConfig"] == {"thinkingLevel": "LOW"}
+    assert config["thinkingConfig"] == {"thinkingLevel": "HIGH"}
     assert "seed" not in config
+
+    # Non-core fields must only emit DEBUG logs, never WARNING logs
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.name == "aistudio.format.responses" and r.levelno >= logging.WARNING
+    ]
+    assert warning_records == []
+
+    debug_messages = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "aistudio.format.responses" and r.levelno == logging.DEBUG
+    ]
+    for field in (
+        "store",
+        "parallel_tool_calls",
+        "truncation",
+        "include",
+        "metadata",
+        "user",
+        "service_tier",
+        "reasoning.summary",
+    ):
+        assert f"[responses] ignored unsupported field: {field}" in debug_messages
 
     false_store = await _convert(store=False)
     assert false_store["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+
+
+async def test_e04_seed_warns_and_is_not_forwarded(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.DEBUG, logger="aistudio.format.responses"):
+        body = await _convert(seed=7)
+    config = _as_dict(body.get("generationConfig", {}))
+    assert "seed" not in config
+
+    # seed must emit WARNING level log per E-04
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.name == "aistudio.format.responses" and r.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 1
+    assert (
+        warning_records[0].getMessage() == "[responses] ignored unsupported field: seed"
+    )
 
 
 async def test_tools_only_function_and_tool_choice():
