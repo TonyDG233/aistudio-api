@@ -28,6 +28,7 @@ from aistudio_api.api.sse_keepalive import (
     PREREAD_WINDOW_ENV,
     KeepaliveIterator,
     keepalive_interval_sec,
+    preread_first_rendered,
     preread_window_sec,
 )
 from aistudio_api.application.contracts.gemini import (
@@ -803,6 +804,52 @@ async def test_openai_routing_wait_then_pre_header_error_is_real_non_200(
     )
 
     assert response.status_code == expected
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert "error" in response.json()
+
+
+@pytest.mark.asyncio
+async def test_preread_drain_is_bounded_for_tight_progress_stream() -> None:
+    """A progress-only stream that never awaits must not spin past the budget."""
+
+    async def tight(**kwargs: Any) -> AsyncIterator[StreamEvent]:
+        del kwargs
+        while True:
+            yield StreamEvent(kind="routing_wait", payload="resolving-instance")
+
+    events: KeepaliveIterator[StreamEvent] = KeepaliveIterator(tight())
+    result = await asyncio.wait_for(
+        preread_first_rendered(events, lambda _item: None, window=1e-9),
+        1.0,
+    )
+    assert result is None
+    await events.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gemini_routing_wait_then_error_beats_expired_preread_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-expired window must not mask a queued terminal error.
+
+    The CI runner can spend longer than the pre-read window between computing
+    the deadline and the first poll.  The pre-read has to drain frames that are
+    already available instead of breaking before the first ``next_event``.
+    """
+    monkeypatch.setattr(
+        "aistudio_api.api.gemini_service.generation_service.stream_generation",
+        _routing_wait_then_raise(RequestError(502, "upstream exploded")),
+    )
+    monkeypatch.setattr(
+        "aistudio_api.api.gemini_service.preread_window_sec", lambda: 1e-9
+    )
+    response = await _post(
+        _gemini_app(object()),
+        "/v1beta/gemini-3.7-flash:streamGenerateContent?alt=sse",
+        _gemini_request().model_dump(mode="json", exclude_none=True),
+    )
+
+    assert response.status_code == 502
     assert "text/event-stream" not in response.headers["content-type"]
     assert "error" in response.json()
 

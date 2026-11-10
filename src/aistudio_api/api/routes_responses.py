@@ -7,7 +7,6 @@ turned off explicitly via ``features.formats.responses``.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
@@ -26,8 +25,8 @@ from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
     KEEPALIVE_SENTINEL,
     KeepaliveIterator,
-    KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_first_rendered,
     preread_window_sec,
 )
 from aistudio_api.application.contracts.gemini import GeminiGenerateContentRequest
@@ -138,26 +137,12 @@ async def create_response(
         # Phase A: bounded wait for the first real event.  Errors and an
         # exhausted stream before the deadline keep a real HTTP status; a slow
         # upstream switches to HTTP 200 plus ``: keepalive`` comments.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + preread_window_sec()
-        first_event: StreamEvent | None = None
-        saw_routing_wait = False
         try:
-            while first_event is None:
-                remaining = deadline - loop.time()
-                if remaining <= 0 and not saw_routing_wait:
-                    break
-                saw_routing_wait = False
-                event = await events.next_event(max(0.0, remaining))
-                if isinstance(event, KeepaliveTimeout):
-                    break
-                candidate = cast("StreamEvent", event)
-                if candidate.kind == "routing_wait":
-                    if remaining <= 0:
-                        break
-                    saw_routing_wait = True
-                    continue
-                first_event = candidate
+            first_event = await preread_first_rendered(
+                events,
+                lambda item: None if item.kind == "routing_wait" else item,
+                window=preread_window_sec(),
+            )
         except StopAsyncIteration:
             with contextlib.suppress(Exception):
                 await events.aclose()

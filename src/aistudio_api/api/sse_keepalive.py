@@ -20,17 +20,19 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-from collections.abc import AsyncIterator, Awaitable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from inspect import isawaitable
 from typing import Any, Generic, TypeVar, cast
 
 T = TypeVar("T")
+R = TypeVar("R")
 
 DEFAULT_KEEPALIVE_INTERVAL_SEC = 15.0
 KEEPALIVE_ENV = "AISTUDIO_SSE_KEEPALIVE_SEC"
 PREREAD_WINDOW_ENV = "AISTUDIO_SSE_PREREAD_WINDOW_SEC"
 KEEPALIVE_FRAME = ": keepalive\n\n"
 CLOSE_AWAIT_TIMEOUT_SEC = 1.0
+PREREAD_DRAIN_LIMIT = 64
 
 # Timeout marker yielded by ``KeepaliveIterator.__anext__``.  It is a unique
 # object rather than a string so a generic ``T = str`` stream can never collide
@@ -211,6 +213,46 @@ class KeepaliveIterator(Generic[T]):
         return True
 
 
+async def preread_first_rendered(
+    events: KeepaliveIterator[T],
+    render: Callable[[T], R | None],
+    *,
+    window: float,
+) -> R | None:
+    """Pre-read up to ``window`` seconds for the first renderable value.
+
+    ``render`` returns ``None`` for progress-only frames (``routing_wait`` /
+    ``usage``) and for events that produce no wire content; those never end the
+    pre-read.  ``None`` is returned once the window is exhausted so callers can
+    flush headers and keep the stream alive with keepalive comments.
+
+    A non-positive window disables the pre-read entirely: callers must switch to
+    HTTP 200 + keepalive without polling the upstream (zero-window contract).
+
+    When the deadline expires the loop still drains frames that are already
+    available (``timeout=0``) up to :data:`PREREAD_DRAIN_LIMIT`.  A stalled
+    event loop can therefore never turn an already-queued terminal error into
+    a "200 + keepalive" response, while a progress-only stream stays bounded.
+    """
+    if window <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + window
+    drain_budget = PREREAD_DRAIN_LIMIT
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            if drain_budget <= 0:
+                return None
+            drain_budget -= 1
+        item = await events.next_event(max(0.0, remaining))
+        if isinstance(item, KeepaliveTimeout):
+            return None
+        rendered = render(item)
+        if rendered is not None:
+            return rendered
+
+
 __all__ = [
     "CLOSE_AWAIT_TIMEOUT_SEC",
     "DEFAULT_KEEPALIVE_INTERVAL_SEC",
@@ -218,9 +260,11 @@ __all__ = [
     "KEEPALIVE_FRAME",
     "KEEPALIVE_SENTINEL",
     "KEEPALIVE_TIMEOUT",
+    "PREREAD_DRAIN_LIMIT",
     "PREREAD_WINDOW_ENV",
     "KeepaliveIterator",
     "KeepaliveTimeout",
     "keepalive_interval_sec",
+    "preread_first_rendered",
     "preread_window_sec",
 ]

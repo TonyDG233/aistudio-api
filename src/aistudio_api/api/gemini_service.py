@@ -8,7 +8,6 @@ Gemini wire shapes and translates domain errors into Gemini payloads.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 from collections.abc import AsyncGenerator
@@ -27,8 +26,8 @@ from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
     KEEPALIVE_SENTINEL,
     KeepaliveIterator,
-    KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_first_rendered,
     preread_window_sec,
 )
 from aistudio_api.application import generation_service
@@ -192,11 +191,7 @@ def format_sse_error(exc: Exception) -> str:
     }
     if isinstance(exc, (TierRequiredError, RoutingError)):
         error.update(exc.as_fields())
-    return (
-        "data: "
-        + json.dumps({"error": error}, ensure_ascii=False)
-        + "\n\n"
-    )
+    return "data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n"
 
 
 def _render_stream_event(event: StreamEvent) -> str | None:
@@ -239,28 +234,12 @@ async def _build_gemini_streaming_response(
     # deadline.  Errors and an exhausted stream in that window keep the PG-02
     # contract (a real non-200 JSON error, never "200 with an empty body"),
     # while a slow-but-alive upstream flips the response to 200 + keepalives.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + preread_window_sec()
-    first_chunk: str | None = None
-    saw_routing_wait = False
     try:
-        while first_chunk is None:
-            remaining = deadline - loop.time()
-            if remaining <= 0 and not saw_routing_wait:
-                break
-            saw_routing_wait = False
-            event = await events.next_event(max(0.0, remaining))
-            if isinstance(event, KeepaliveTimeout):
-                break
-            stream_event = cast("StreamEvent", event)
-            if stream_event.kind == "routing_wait":
-                # ``routing_wait`` is a resolving progress comment, never a
-                # model content frame; it must not consume the first window.
-                if remaining <= 0:
-                    break
-                saw_routing_wait = True
-                continue
-            first_chunk = _render_stream_event(stream_event)
+        first_chunk = await preread_first_rendered(
+            events,
+            _render_stream_event,
+            window=preread_window_sec(),
+        )
     except StopAsyncIteration:
         with contextlib.suppress(Exception):
             await events.aclose()

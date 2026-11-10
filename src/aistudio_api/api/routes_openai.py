@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
@@ -27,8 +26,8 @@ from aistudio_api.api.sse_keepalive import (
     KEEPALIVE_FRAME,
     KEEPALIVE_SENTINEL,
     KeepaliveIterator,
-    KeepaliveTimeout,
     keepalive_interval_sec,
+    preread_first_rendered,
     preread_window_sec,
 )
 from aistudio_api.api.state import discovery_sessions_for
@@ -140,28 +139,12 @@ async def chat_completions(
         # Phase A: bounded wait for the first renderable event.  Errors and an
         # exhausted stream before the deadline keep the existing PG-02
         # non-200 JSON mapping; a slow upstream switches to 200 + keepalives.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + preread_window_sec()
-        first_event: StreamEvent | None = None
-        saw_routing_wait = False
         try:
-            while first_event is None:
-                remaining = deadline - loop.time()
-                if remaining <= 0 and not saw_routing_wait:
-                    break
-                saw_routing_wait = False
-                event = await events.next_event(max(0.0, remaining))
-                if isinstance(event, KeepaliveTimeout):
-                    break
-                candidate = cast("StreamEvent", event)
-                if candidate.kind == "routing_wait":
-                    # ``routing_wait`` is only a resolving progress comment,
-                    # never a model content frame for the first window.
-                    if remaining <= 0:
-                        break
-                    saw_routing_wait = True
-                    continue
-                first_event = candidate
+            first_event = await preread_first_rendered(
+                events,
+                lambda item: None if item.kind == "routing_wait" else item,
+                window=preread_window_sec(),
+            )
         except StopAsyncIteration:
             with contextlib.suppress(Exception):
                 await events.aclose()
