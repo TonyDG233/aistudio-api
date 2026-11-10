@@ -245,15 +245,15 @@ async def _build_gemini_streaming_response(
     try:
         while first_chunk is None:
             remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            event = await events.next_event(remaining)
+            event = await events.next_event(max(0.0, remaining))
             if isinstance(event, KeepaliveTimeout):
                 break
             stream_event = cast("StreamEvent", event)
             if stream_event.kind == "routing_wait":
                 # ``routing_wait`` is a resolving progress comment, never a
                 # model content frame; it must not consume the first window.
+                if remaining <= 0:
+                    break
                 continue
             first_chunk = _render_stream_event(stream_event)
     except StopAsyncIteration:
