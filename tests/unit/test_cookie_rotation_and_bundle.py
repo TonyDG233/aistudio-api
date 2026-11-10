@@ -44,6 +44,7 @@ async def test_tampermonkey_script_route():
             assert "// ==UserScript==" in resp.text
             assert "cookieObjects" in resp.text
             assert "下载凭据包" in resp.text
+            assert ".innerHTML" not in resp.text
 
 
 @pytest.mark.asyncio
