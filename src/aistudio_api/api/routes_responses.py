@@ -141,9 +141,13 @@ async def create_response(
         loop = asyncio.get_running_loop()
         deadline = loop.time() + preread_window_sec()
         first_event: StreamEvent | None = None
+        saw_routing_wait = False
         try:
             while first_event is None:
                 remaining = deadline - loop.time()
+                if remaining <= 0 and not saw_routing_wait:
+                    break
+                saw_routing_wait = False
                 event = await events.next_event(max(0.0, remaining))
                 if isinstance(event, KeepaliveTimeout):
                     break
@@ -151,6 +155,7 @@ async def create_response(
                 if candidate.kind == "routing_wait":
                     if remaining <= 0:
                         break
+                    saw_routing_wait = True
                     continue
                 first_event = candidate
         except StopAsyncIteration:
