@@ -119,6 +119,7 @@ class AccountKeepaliveService:
         refresher: Any,
         *,
         instance_manager: Any | None = None,
+        account_service: Any | None = None,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = 1.0,
     ) -> None:
@@ -126,6 +127,7 @@ class AccountKeepaliveService:
         self._client = client
         self._refresher = refresher
         self._instance_manager = instance_manager
+        self._account_service = account_service
         self._clock = clock
         self._tick_seconds = max(0.01, tick_seconds)
         self._task: asyncio.Task[None] | None = None
@@ -456,6 +458,35 @@ class AccountKeepaliveService:
         ) = await self._save_control_session()
         if control_attempted and control_account is not None:
             attempts.setdefault(control_account, []).append(control_saved)
+
+        # 对启用中的账号（特别是持有轮换种子或活动槽位的账号）尝试主动轮换短效 Cookie
+        from aistudio_api.application.account_service import AccountService
+
+        acc_svc = self._account_service
+        svc = (
+            acc_svc
+            if isinstance(acc_svc, AccountService)
+            else AccountService(self._store)
+        )
+        slot_sessions: dict[str, Any] = {}
+        for slot in self._pool_slots():
+            acc_id = getattr(slot, "account_id", None)
+            sess = getattr(slot, "session", None)
+            if acc_id and sess:
+                slot_sessions[str(acc_id)] = sess
+
+        rotated_accounts: list[str] = []
+        for account in self._store.list_accounts():
+            if not account.enabled or account.expired:
+                continue
+            acc_sess = slot_sessions.get(account.id)
+            try:
+                rot_res = await svc.rotate_account_cookies(account.id, session=acc_sess)
+                if rot_res.get("ok"):
+                    rotated_accounts.append(account.id)
+                    attempts.setdefault(account.id, []).append(True)
+            except Exception as exc:
+                log.debug("[Keepalive] 账号 %s 轮换 Cookie 异常: %s", account.id, exc)
 
         saved_accounts = [
             account_id

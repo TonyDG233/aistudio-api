@@ -1,18 +1,41 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
+import { useToastStore } from '@/stores/toast.ts'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
-import { Sparkles, FileText, Upload, FolderOpen, CheckCircle2 } from 'lucide-vue-next'
-defineProps<{
-  modelValue: boolean
-}>()
+import {
+  Sparkles,
+  FileText,
+  Upload,
+  FolderOpen,
+  CheckCircle2,
+  ShieldCheck,
+  AlertTriangle,
+  Download,
+} from 'lucide-vue-next'
+import {
+  mergeCredentialFiles,
+  isMobileUserAgent,
+  TAMPERMONKEY_SCRIPT_URL,
+} from '@/utils/cookieImportHelper.ts'
+
+const props = withDefaults(
+  defineProps<{
+    modelValue: boolean
+    initialFiles?: File[]
+  }>(),
+  {
+    initialFiles: () => [],
+  }
+)
 
 const emit = defineEmits<{
   'update:modelValue': [val: boolean]
 }>()
 
 const accountsStore = useAccountsStore()
+const toast = useToastStore()
 
 const activeTab = ref<'text' | 'file'>('text')
 
@@ -29,34 +52,106 @@ const selectedFileSize = ref('')
 const selectedFileContent = ref('')
 const localFilePath = ref('')
 const detectedCount = ref<number | null>(null)
+const hasLongLivedSeed = ref(false)
+const isDragging = ref(false)
+let dragCounter = 0
+
+const isMobile = computed(() => isMobileUserAgent())
+
+async function loadFiles(files: File[]) {
+  if (!files || files.length === 0) return
+  activeTab.value = 'file'
+
+  const fileList = Array.from(files)
+  if (fileList.length === 1) {
+    selectedFileName.value = fileList[0].name
+  } else {
+    selectedFileName.value = `${fileList[0].name} 等 ${fileList.length} 个文件`
+  }
+
+  const totalSize = fileList.reduce((acc, f) => acc + f.size, 0)
+  selectedFileSize.value = `${(totalSize / 1024).toFixed(1)} KB`
+
+  try {
+    const fileTexts = await Promise.all(
+      fileList.map(async (file) => ({
+        name: file.name,
+        content: await file.text(),
+      }))
+    )
+
+    const result = mergeCredentialFiles(fileTexts)
+    selectedFileContent.value = result.content
+    detectedCount.value = result.totalAccounts
+    hasLongLivedSeed.value = result.hasLongLivedSeed
+  } catch (err) {
+    console.error('读取凭据文件失败:', err)
+    selectedFileContent.value = ''
+    detectedCount.value = null
+    hasLongLivedSeed.value = false
+  }
+}
+
+watch(
+  () => props.initialFiles,
+  (newFiles) => {
+    if (newFiles && newFiles.length > 0) {
+      loadFiles(newFiles)
+    }
+  },
+  { immediate: true }
+)
+
+defineExpose({
+  loadFiles,
+})
 
 function onFileChange(event: Event) {
   const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (!file) return
+  const files = target.files
+  if (!files || files.length === 0) return
+  loadFiles(Array.from(files))
+}
 
-  selectedFileName.value = file.name
-  selectedFileSize.value = `${(file.size / 1024).toFixed(1)} KB`
+function onDragEnter() {
+  dragCounter++
+  isDragging.value = true
+}
 
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    const text = (e.target?.result as string) || ''
-    selectedFileContent.value = text
-    try {
-      const parsed = JSON.parse(text)
-      if (Array.isArray(parsed)) {
-        detectedCount.value = parsed.length
-      } else if (Array.isArray(parsed.cookies)) {
-        detectedCount.value = 1
-      } else {
-        const list = parsed.accounts || parsed.profiles || []
-        detectedCount.value = Array.isArray(list) ? list.length : 1
-      }
-    } catch {
-      detectedCount.value = null
-    }
+function onDragOver(event: DragEvent) {
+  event.preventDefault()
+  isDragging.value = true
+}
+
+function onDragLeave() {
+  dragCounter--
+  if (dragCounter <= 0) {
+    dragCounter = 0
+    isDragging.value = false
   }
-  reader.readAsText(file)
+}
+
+function onDropFiles(event: DragEvent) {
+  dragCounter = 0
+  isDragging.value = false
+  const droppedFiles = event.dataTransfer?.files
+  if (!droppedFiles || droppedFiles.length === 0) return
+  const jsonFiles = Array.from(droppedFiles).filter(
+    (f) => f.name.toLowerCase().endsWith('.json') || f.type === 'application/json'
+  )
+  if (jsonFiles.length > 0) {
+    loadFiles(jsonFiles)
+  }
+}
+
+function handleGetTampermonkeyScript() {
+  if (isMobileUserAgent()) {
+    toast.error(
+      '移动端浏览器不支持油猴跨域 Cookie 权限，请在电脑端浏览器安装，或使用 Android 伴侣端 App 提取凭据'
+    )
+    return
+  }
+  window.open(TAMPERMONKEY_SCRIPT_URL, '_blank', 'noopener')
 }
 
 function clearSelectedFile() {
@@ -64,6 +159,7 @@ function clearSelectedFile() {
   selectedFileSize.value = ''
   selectedFileContent.value = ''
   detectedCount.value = null
+  hasLongLivedSeed.value = false
   if (fileInputRef.value) {
     fileInputRef.value.value = ''
   }
@@ -146,12 +242,22 @@ async function handleSubmit() {
       >
         <!-- File Picker Drag & Drop Box -->
         <div
-          class="border-2 border-dashed border-gray-200 hover:border-brand-400 bg-gray-50/70 hover:bg-brand-50/30 rounded-2xl p-5 text-center transition-all cursor-pointer relative"
+          class="border-2 border-dashed rounded-2xl p-5 text-center transition-all cursor-pointer relative"
+          :class="[
+            isDragging
+              ? 'border-brand-500 bg-brand-50/60 ring-2 ring-brand-500/20'
+              : 'border-gray-200 hover:border-brand-400 bg-gray-50/70 hover:bg-brand-50/30',
+          ]"
           @click="fileInputRef?.click()"
+          @dragenter.prevent="onDragEnter"
+          @dragover.prevent="onDragOver"
+          @dragleave.prevent="onDragLeave"
+          @drop.prevent="onDropFiles"
         >
           <input
             ref="fileInputRef"
             type="file"
+            multiple
             accept=".json,application/json"
             class="hidden"
             @change="onFileChange"
@@ -165,38 +271,45 @@ async function handleSubmit() {
             </div>
             <div>
               <p class="text-xs font-semibold text-gray-800">
-                点击选择凭据包文件 (.json)
+                拖拽 .json 文件到此处，或点击选择文件
               </p>
               <p class="text-[11px] text-gray-400 mt-0.5">
-                支持 AIStudio 提取器导出的 aistudio_accounts.json
+                支持旧版 auth-*.json (可多选)、油猴 Bundle、伴侣端及 Cookie-Editor
               </p>
             </div>
           </div>
 
           <div
             v-else
-            class="flex items-center justify-between bg-white p-3 rounded-xl border border-brand-200"
+            class="flex items-center justify-between bg-white p-3.5 rounded-xl border border-brand-200 shadow-2xs"
           >
-            <div class="flex items-center gap-2.5 text-left">
-              <div class="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">
+            <div class="flex items-center gap-2.5 text-left min-w-0">
+              <div class="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0">
                 <CheckCircle2 class="w-4 h-4" />
               </div>
-              <div>
-                <p class="text-xs font-semibold text-gray-800">
+              <div class="min-w-0">
+                <p class="text-xs font-semibold text-gray-800 truncate">
                   {{ selectedFileName }}
                 </p>
-                <p class="text-[11px] text-gray-400">
-                  大小: {{ selectedFileSize }}
+                <div class="flex items-center gap-1.5 flex-wrap text-[11px] text-gray-500 mt-0.5">
+                  <span>大小: {{ selectedFileSize }}</span>
                   <span
                     v-if="detectedCount !== null"
-                    class="ml-1 text-brand-600 font-medium"
+                    class="text-brand-600 font-medium"
                   >· 识别到 {{ detectedCount }} 个账号</span>
-                </p>
+                  <span
+                    v-if="hasLongLivedSeed"
+                    class="inline-flex items-center gap-1 text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-1.5 py-0.5 rounded text-[10px] font-semibold"
+                  >
+                    <ShieldCheck class="w-3 h-3 text-emerald-600" />
+                    <span>含 accounts.google.com 长效保活根凭据</span>
+                  </span>
+                </div>
               </div>
             </div>
             <button
               type="button"
-              class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1"
+              class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1 shrink-0 transition-colors cursor-pointer"
               @click.stop="clearSelectedFile"
             >
               移除
@@ -302,6 +415,59 @@ async function handleSubmit() {
               class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
             >
           </div>
+        </div>
+      </div>
+
+      <!-- Tampermonkey Helper Card -->
+      <div class="bg-gradient-to-br from-amber-50/90 to-amber-100/40 border border-amber-200/90 rounded-2xl p-3.5 space-y-2.5 shadow-2xs">
+        <div class="space-y-1">
+          <div class="flex items-center gap-1.5 font-bold text-amber-950 text-xs flex-wrap">
+            <span>🧩 推荐：油猴多账号长效抓取助手</span>
+            <span class="text-[10px] font-semibold text-amber-800 bg-amber-200/70 px-1.5 py-0.5 rounded">
+              免重复登录 / 含 LSID 跨天保活
+            </span>
+          </div>
+          <p class="text-[11px] text-amber-900/80 leading-relaxed">
+            在日常电脑浏览器同时提取 aistudio 与 accounts.google.com 根凭据，自动识别 u/0..N 子账号与等级。
+          </p>
+        </div>
+
+        <div class="flex items-center gap-1.5 text-[11px] text-amber-800 bg-amber-100/80 px-2.5 py-1.5 rounded-lg border border-amber-200/60">
+          <AlertTriangle class="w-3.5 h-3.5 text-amber-600 shrink-0" />
+          <span>⚠️ 首次使用需在 Tampermonkey「设置 -&gt; 高级(Advanced)」将「脚本 Cookie 访问权限」设为 All</span>
+        </div>
+
+        <div class="flex items-center justify-between gap-2 pt-0.5 flex-wrap">
+          <span
+            v-if="isMobile"
+            class="text-[11px] text-amber-800/90 font-medium"
+          >
+            ⚠️ 移动端受限，请使用电脑端或 Android 伴侣端
+          </span>
+          <span
+            v-else
+            class="text-[11px] text-amber-800/80"
+          >
+            点击将直接调用 Tampermonkey 扩展安装
+          </span>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer"
+            :class="[
+              isMobile
+                ? 'bg-amber-200 text-amber-900 hover:bg-amber-300'
+                : 'bg-amber-600 text-white hover:bg-amber-700 active:scale-98',
+            ]"
+            :title="isMobile ? '移动端不支持油猴权限，请在电脑端浏览器安装，或使用 Android 伴侣端 App 提取凭据' : '在浏览器中安装油猴抓取脚本'"
+            @click="handleGetTampermonkeyScript"
+          >
+            <Download class="w-3.5 h-3.5" />
+            <span>📥 获取油猴脚本 (.user.js)</span>
+            <span
+              v-if="isMobile"
+              class="text-[10px] opacity-80"
+            >(移动端不可用)</span>
+          </button>
         </div>
       </div>
     </div>

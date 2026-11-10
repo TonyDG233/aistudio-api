@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import get_runtime_state
@@ -204,6 +205,24 @@ def stats_response(days: int | None = None) -> StatsResponse:
 @public_router.get("/health", response_model=HealthResponse)
 async def health():
     return health_response()
+
+
+_TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+_TAMPERMONKEY_SCRIPT_PATH = _TOOLS_DIR / "aistudio-cookie-grabber.user.js"
+
+
+@public_router.get("/api/tools/aistudio-cookie-grabber.user.js")
+@public_router.get("/tools/aistudio-cookie-grabber.user.js")
+async def get_tampermonkey_script() -> Response:
+    """提供油猴多账号同步脚本在线安装与更新。"""
+    if not _TAMPERMONKEY_SCRIPT_PATH.is_file():
+        raise HTTPException(status_code=404, detail="Tampermonkey script not found")
+    script_text = _TAMPERMONKEY_SCRIPT_PATH.read_text(encoding="utf-8")
+    return Response(
+        content=script_text,
+        media_type="text/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @protected_router.get("/stats", response_model=StatsResponse)

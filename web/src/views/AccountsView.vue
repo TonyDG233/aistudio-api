@@ -5,6 +5,7 @@ import { useSystemStore } from '@/stores/system.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
 import { useKeepaliveStore } from '@/stores/keepalive.ts'
 import { useDebugStore } from '@/stores/debug.ts'
+import { useToastStore } from '@/stores/toast.ts'
 import { usePolling } from '@/composables/usePolling.ts'
 import type { AccountWithStats } from '@/types/accounts.ts'
 import type { Instance } from '@/types/instances.ts'
@@ -20,6 +21,10 @@ import BindSlotModal from '@/components/instances/BindSlotModal.vue'
 import CookieImportModal from '@/components/modals/CookieImportModal.vue'
 import EditAccountModal from '@/components/modals/EditAccountModal.vue'
 import {
+  isMobileUserAgent,
+  TAMPERMONKEY_SCRIPT_URL,
+} from '@/utils/cookieImportHelper.ts'
+import {
   Plus,
   RotateCcw,
   BookmarkPlus,
@@ -27,6 +32,7 @@ import {
   Trash2,
   Folder,
   Check,
+  FolderUp,
 } from 'lucide-vue-next'
 
 const accountsStore = useAccountsStore()
@@ -34,8 +40,12 @@ const systemStore = useSystemStore()
 const instancesStore = useInstancesStore()
 const keepaliveStore = useKeepaliveStore()
 const debugStore = useDebugStore()
+const toast = useToastStore()
 
 const importModalOpen = ref(false)
+const droppedFiles = ref<File[]>([])
+const isGlobalDragging = ref(false)
+let globalDragCounter = 0
 const editModalOpen = ref(false)
 const editingAccount = ref<AccountWithStats | null>(null)
 const snapshotModalOpen = ref(false)
@@ -136,10 +146,93 @@ async function handleDeletePreset(presetId: string, name: string) {
     await accountsStore.deletePreset(presetId)
   }
 }
+
+function handleTampermonkeyClick() {
+  if (isMobileUserAgent()) {
+    toast.error(
+      '移动端浏览器不支持油猴跨域 Cookie 权限，请在电脑端浏览器安装，或使用 Android 伴侣端 App 提取凭据'
+    )
+    return
+  }
+  window.open(TAMPERMONKEY_SCRIPT_URL, '_blank', 'noopener')
+}
+
+function onGlobalDragEnter(event: DragEvent) {
+  if (importModalOpen.value) return
+  if (event.dataTransfer?.types?.includes('Files')) {
+    globalDragCounter++
+    isGlobalDragging.value = true
+  }
+}
+
+function onGlobalDragOver(event: DragEvent) {
+  if (importModalOpen.value) return
+  if (event.dataTransfer?.types?.includes('Files')) {
+    event.preventDefault()
+    isGlobalDragging.value = true
+  }
+}
+
+function onGlobalDragLeave() {
+  globalDragCounter--
+  if (globalDragCounter <= 0) {
+    globalDragCounter = 0
+    isGlobalDragging.value = false
+  }
+}
+
+function onGlobalDrop(event: DragEvent) {
+  globalDragCounter = 0
+  isGlobalDragging.value = false
+  if (importModalOpen.value) return
+
+  const files = event.dataTransfer?.files
+  if (!files || files.length === 0) return
+
+  const jsonFiles = Array.from(files).filter(
+    (f) => f.name.toLowerCase().endsWith('.json') || f.type === 'application/json'
+  )
+
+  if (jsonFiles.length > 0) {
+    droppedFiles.value = jsonFiles
+    importModalOpen.value = true
+  }
+}
+
+function onImportModalUpdate(val: boolean) {
+  importModalOpen.value = val
+  if (!val) {
+    droppedFiles.value = []
+  }
+}
 </script>
 
 <template>
-  <div class="space-y-5">
+  <div
+    class="space-y-5 relative"
+    @dragenter="onGlobalDragEnter"
+    @dragover="onGlobalDragOver"
+    @dragleave="onGlobalDragLeave"
+    @drop.prevent="onGlobalDrop"
+  >
+    <!-- Fullscreen Drag & Drop JSON Overlay -->
+    <div
+      v-if="isGlobalDragging && !importModalOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-brand-950/70 backdrop-blur-xs p-6 select-none pointer-events-none"
+    >
+      <div class="border-3 border-dashed border-brand-400 bg-brand-900/90 rounded-3xl p-8 max-w-lg w-full text-center text-white shadow-2xl space-y-3">
+        <div class="w-16 h-16 rounded-2xl bg-brand-500/30 text-brand-300 mx-auto flex items-center justify-center">
+          <FolderUp class="w-8 h-8" />
+        </div>
+        <h3 class="text-lg font-bold tracking-tight">
+          📂 松开鼠标自动读取并导入 JSON 凭据文件
+        </h3>
+        <p class="text-xs text-brand-200">
+          (支持单账号 auth-*.json、多文件批量拖入、油猴 Bundle、Cookie-Editor)
+        </p>
+      </div>
+    </div>
+
     <!-- UI Debug (visible only when backend ui_debug=true) -->
     <UiDebugMenu />
 
@@ -161,6 +254,15 @@ async function handleDeletePreset(presetId: string, name: string) {
         >
           <RotateCcw class="w-4 h-4" />
           <span>重置锁定</span>
+        </Button>
+
+        <Button
+          variant="outline"
+          size="md"
+          title="获取油猴多账号长效抓取脚本"
+          @click="handleTampermonkeyClick"
+        >
+          <span>🧩 油猴抓取脚本</span>
         </Button>
 
         <Button
@@ -349,7 +451,11 @@ async function handleDeletePreset(presetId: string, name: string) {
     />
 
     <!-- Cookie Import Modal -->
-    <CookieImportModal v-model="importModalOpen" />
+    <CookieImportModal
+      :model-value="importModalOpen"
+      :initial-files="droppedFiles"
+      @update:model-value="onImportModalUpdate"
+    />
 
     <!-- Edit Account Name Modal -->
     <EditAccountModal

@@ -65,6 +65,67 @@ def write_storage_state(
         _atomic_write_json(target, existing)
 
 
+def _update_auth_json_cookies(auth_path: Path, new_cookies: dict[str, str]) -> bool:
+    """原子更新 auth.json 内的 Cookie 值，保持原有 domain/path/secure/httpOnly 结构不丢失。"""
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        ACCOUNT_HOST_ONLY_COOKIES,
+    )
+
+    if not auth_path.is_file():
+        return False
+    try:
+        with _AUTH_FILE_WRITE_LOCK:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            raw_cookies = data.get("cookies")
+            changed = False
+            if isinstance(raw_cookies, list):
+                seen_names: set[str] = set()
+                for c in raw_cookies:
+                    if isinstance(c, dict) and c.get("name"):
+                        cname = str(c["name"])
+                        seen_names.add(cname)
+                        if new_cookies.get(cname):
+                            new_val = str(new_cookies[cname])
+                            if str(c.get("value") or "") != new_val:
+                                c["value"] = new_val
+                                changed = True
+                for k, v in new_cookies.items():
+                    if k not in seen_names and v:
+                        domain = (
+                            "accounts.google.com"
+                            if k in ACCOUNT_HOST_ONLY_COOKIES
+                            else ".google.com"
+                        )
+                        raw_cookies.append(
+                            {
+                                "name": k,
+                                "value": v,
+                                "domain": domain,
+                                "path": "/",
+                                "secure": True,
+                                "httpOnly": True,
+                                "sameSite": "None",
+                                "expires": -1,
+                            }
+                        )
+                        changed = True
+                if changed:
+                    _atomic_write_json(auth_path, data)
+            elif isinstance(raw_cookies, dict):
+                for k, v in new_cookies.items():
+                    if v and raw_cookies.get(k) != v:
+                        raw_cookies[k] = v
+                        changed = True
+                if changed:
+                    _atomic_write_json(auth_path, data)
+            return changed
+    except Exception as exc:
+        logger.warning("更新 auth.json cookies 失败 (%s): %s", auth_path, exc)
+        return False
+
+
 # 默认搜索路径（与 config.py 保持一致）
 _SEARCH_ROOTS: list[Path] = [
     Path.cwd(),
@@ -136,6 +197,7 @@ class AccountMeta:
     cookie_id: str | None = None
     tier: str = "Free"
     tier_checked_at: str | None = None
+    last_rotated_at: str | None = None
     expired: bool = False
     duplicate_of: str | None = None
     auth_saved_at: str | None = None
@@ -167,6 +229,9 @@ class AccountMeta:
             tier=str(data.get("tier") or "Free"),
             tier_checked_at=str(data["tier_checked_at"])
             if data.get("tier_checked_at") is not None
+            else None,
+            last_rotated_at=str(data["last_rotated_at"])
+            if data.get("last_rotated_at") is not None
             else None,
             expired=bool(data.get("expired", False)),
             duplicate_of=str(data["duplicate_of"])
@@ -386,6 +451,8 @@ class AccountStore:
                                     reconciled = True
                         except Exception:
                             pass
+                if self._sync_sibling_cookies_locked(self._registry):
+                    reconciled = True
                 if reconciled:
                     _atomic_write_json(self._registry_path, self._registry.to_dict())
             except Exception:
@@ -397,6 +464,152 @@ class AccountStore:
         with self._lock:
             self._registry = registry
             _atomic_write_json(self._registry_path, registry.to_dict())
+
+    def _sync_sibling_cookies_locked(self, registry: Registry) -> bool:
+        """同步共享同一浏览器会话 (SAPISID / SID) 的多登兄弟账号 (u/0..u/N) 的滚动 Cookie。"""
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            ROTATING_SESSION_COOKIE_NAMES,
+            compute_session_anchor,
+            load_cookies_from_auth_file,
+        )
+
+        groups: dict[str, list[tuple[AccountMeta, Path, dict[str, str]]]] = {}
+        for acc_id, acc in registry.accounts.items():
+            try:
+                auth_path = _safe_account_dir(self._accounts_dir, acc_id) / "auth.json"
+            except ValueError:
+                continue
+            if not auth_path.is_file():
+                continue
+            cdict = load_cookies_from_auth_file(auth_path)
+            if not cdict:
+                continue
+            anchor = compute_session_anchor(cdict)
+            if not anchor:
+                continue
+            groups.setdefault(anchor, []).append((acc, auth_path, cdict))
+
+        meta_changed = False
+        for group in groups.values():
+            if len(group) <= 1:
+                continue
+            # 按是否存在 __Secure-1PSIDTS 以及最近轮换时间排序（最旧在前，最新在后，后者覆盖前者）
+            group.sort(
+                key=lambda item: (
+                    1
+                    if (
+                        item[2].get("__Secure-1PSIDTS")
+                        or item[2].get("__Secure-3PSIDTS")
+                    )
+                    else 0,
+                    str(item[0].last_rotated_at or ""),
+                    str(item[0].last_used or ""),
+                )
+            )
+            best_cookies: dict[str, str] = {}
+            latest_rotated: str | None = None
+            for acc, _, cdict in group:
+                for k, v in cdict.items():
+                    if v:
+                        best_cookies[k] = v
+                if acc.last_rotated_at and (
+                    latest_rotated is None or acc.last_rotated_at > latest_rotated
+                ):
+                    latest_rotated = acc.last_rotated_at
+
+            for acc, auth_path, cdict in group:
+                to_update: dict[str, str] = {}
+                for k, v in best_cookies.items():
+                    if (
+                        k not in cdict or k in ROTATING_SESSION_COOKIE_NAMES
+                    ) and cdict.get(k) != v:
+                        to_update[k] = v
+                if to_update:
+                    _update_auth_json_cookies(auth_path, to_update)
+                if latest_rotated and acc.last_rotated_at != latest_rotated:
+                    acc.last_rotated_at = latest_rotated
+                    meta_path = auth_path.parent / "meta.json"
+                    if meta_path.exists():
+                        _atomic_write_json(meta_path, acc.to_dict())
+                    meta_changed = True
+        return meta_changed
+
+    def update_account_cookies(
+        self,
+        account_id: str | None = None,
+        *,
+        auth_file: str | Path | None = None,
+        new_cookies: dict[str, str],
+        rotated_at: str | float | None = None,
+    ) -> list[str]:
+        """将更新后的 Cookie 写回目标账号及其同源多登兄弟账号 (u/0..u/N) 的 auth.json。"""
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            compute_session_anchor,
+            load_cookies_from_auth_file,
+        )
+
+        if not new_cookies:
+            return []
+
+        registry = self._load_registry()
+        target_id = account_id
+        if not target_id and auth_file:
+            try:
+                p = Path(auth_file).resolve()
+                cand_id = p.parent.name
+                if cand_id in registry.accounts:
+                    target_id = cand_id
+                elif p.is_file():
+                    cur = load_cookies_from_auth_file(p)
+                    merged = {**cur, **{k: v for k, v in new_cookies.items() if v}}
+                    if merged != cur:
+                        _update_auth_json_cookies(p, merged)
+                    return []
+            except Exception:
+                pass
+
+        target_acc = registry.accounts.get(target_id) if target_id else None
+        target_cid = target_acc.cookie_id if target_acc else None
+        anchor = compute_session_anchor(new_cookies)
+        if not anchor and target_id:
+            t_path = self.get_auth_path_optional(target_id, require_exists=True)
+            if t_path:
+                anchor = compute_session_anchor(load_cookies_from_auth_file(t_path))
+
+        updated_ids: list[str] = []
+        meta_changed = False
+        rotated_str = str(rotated_at) if rotated_at is not None else None
+
+        for acc_id, acc in registry.accounts.items():
+            try:
+                apath = _safe_account_dir(self._accounts_dir, acc_id) / "auth.json"
+            except ValueError:
+                continue
+            if not apath.is_file():
+                continue
+            cur_cookies = load_cookies_from_auth_file(apath)
+            cur_anchor = compute_session_anchor(cur_cookies)
+
+            is_target = bool(target_id and acc_id == target_id)
+            is_same_cid = bool(target_cid and acc.cookie_id == target_cid)
+            is_same_anchor = bool(anchor and cur_anchor == anchor)
+            if not (is_target or is_same_cid or is_same_anchor):
+                continue
+
+            changed = _update_auth_json_cookies(apath, new_cookies)
+            if changed or is_target:
+                updated_ids.append(acc_id)
+
+            if rotated_str is not None and acc.last_rotated_at != rotated_str:
+                acc.last_rotated_at = rotated_str
+                meta_path = apath.parent / "meta.json"
+                if meta_path.exists():
+                    _atomic_write_json(meta_path, acc.to_dict())
+                meta_changed = True
+
+        if meta_changed:
+            self._save_registry(registry)
+        return updated_ids
 
     def list_accounts(self) -> list[AccountMeta]:
         """列出所有账号。"""
@@ -564,6 +777,7 @@ class AccountStore:
 
         account_dir = _safe_account_dir(self._accounts_dir, account_id)
         safe_id = account_dir.name
+        existing_meta = registry.accounts.get(safe_id)
         meta = AccountMeta(
             id=safe_id,
             name=name,
@@ -571,8 +785,10 @@ class AccountStore:
             created_at=created_at,
             last_used=now,
             auth_user=auth_user,
-            cookie_id=cookie_id,
+            cookie_id=cookie_id or (existing_meta.cookie_id if existing_meta else None),
             tier=resolved_tier,
+            tier_checked_at=existing_meta.tier_checked_at if existing_meta else None,
+            last_rotated_at=existing_meta.last_rotated_at if existing_meta else None,
             auth_saved_at=now,
             enabled=resolved_enabled,
             group=resolved_group,
@@ -585,6 +801,7 @@ class AccountStore:
         registry.accounts[safe_id] = meta
         if registry.active_account_id is None:
             registry.active_account_id = safe_id
+        self._sync_sibling_cookies_locked(registry)
         self._save_registry(registry)
         self.refresh_duplicate_flags()
         return meta
