@@ -170,6 +170,7 @@ def parse_arguments(value: object, *, field: str) -> dict[str, object]:
 
 _SCHEMA_OBJECT_KEYS = ("properties", "patternProperties", "dependentSchemas")
 _SCHEMA_LIST_KEYS = ("anyOf", "any_of", "oneOf", "one_of", "allOf", "all_of")
+_SCHEMA_COMBINER_KEYS = ("anyOf", "any_of", "oneOf", "one_of")
 _SCHEMA_SINGLE_KEYS = (
     "items",
     "additionalItems",
@@ -186,40 +187,113 @@ _ARRAY_ITEM_FALLBACK = {"type": "string"}
 _ARRAY_ITEM_FALLBACK_UPPER = {"type": "STRING"}
 
 
-def _schema_type_label(schema: dict[str, object]) -> str:
+def _schema_type_labels(schema: dict[str, object]) -> list[str]:
     raw_type = schema.get("type")
     if isinstance(raw_type, str):
-        return raw_type
+        return [raw_type]
     if isinstance(raw_type, list):
-        for item in raw_type:
-            if isinstance(item, str) and item.strip().lower() != "null":
-                return item
-    return ""
+        return [item for item in raw_type if isinstance(item, str)]
+    return []
 
 
-def _has_schema_items(items: object) -> bool:
-    if isinstance(items, dict):
-        return bool(items)
-    if isinstance(items, list):
-        return bool(items) and isinstance(items[0], dict) and bool(items[0])
-    return items is True
+def _non_null_type_labels(schema: dict[str, object]) -> list[str]:
+    return [
+        label
+        for label in _schema_type_labels(schema)
+        if label.strip().lower() != "null"
+    ]
+
+
+def _is_null_branch(branch: object) -> bool:
+    if not isinstance(branch, dict):
+        return False
+    labels = _schema_type_labels(branch)
+    if not labels or any(label.strip().lower() != "null" for label in labels):
+        return False
+    return not any(
+        key in branch
+        for key in (
+            "properties",
+            "items",
+            "anyOf",
+            "any_of",
+            "oneOf",
+            "one_of",
+            "allOf",
+            "all_of",
+            "enum",
+            "const",
+        )
+    )
 
 
 def _array_item_fallback(type_label: str) -> dict[str, object]:
-    if not any(char.islower() for char in type_label):
+    if type_label and not any(char.islower() for char in type_label):
         return dict(_ARRAY_ITEM_FALLBACK_UPPER)
     return dict(_ARRAY_ITEM_FALLBACK)
 
 
-def _normalize_schema_node(node: object) -> object:
+def _normalize_array_items(value: object, type_label: str) -> dict[str, object]:
+    """Return a non-empty item schema for an array node.
+
+    Tuple-style ``items`` lists keep their first non-empty dict entry; anything
+    that cannot produce a real subschema (``None``, booleans, ``{}`` or an empty
+    tuple) falls back to a ``string`` item so Gemini never sees an empty schema.
+    """
+    fallback = _array_item_fallback(type_label)
+    if isinstance(value, dict):
+        normalized = _normalize_schema_dict(value)
+        return normalized if normalized else fallback
+    if isinstance(value, list):
+        for entry in value:
+            if isinstance(entry, dict) and entry:
+                normalized = _normalize_schema_dict(entry)
+                if normalized:
+                    return normalized
+    return fallback
+
+
+def _prune_schema_required(schema: dict[str, object]) -> None:
+    """Restrict ``required`` to fields that survive in ``properties``."""
+    properties = schema.get("properties")
+    type_labels = _schema_type_labels(schema)
+    is_object = any(label.strip().lower() == "object" for label in type_labels) or (
+        isinstance(properties, dict)
+    )
+    if not is_object:
+        return
+    if not isinstance(properties, dict) or not properties:
+        schema.pop("required", None)
+        return
+    valid_names = {
+        name
+        for name, prop in properties.items()
+        if isinstance(prop, dict) or prop is True
+    }
+    required = schema.get("required")
+    if not isinstance(required, (list, tuple, set)):
+        return
+    filtered: list[str] = []
+    for item in required:
+        if isinstance(item, str) and item in valid_names and item not in filtered:
+            filtered.append(item)
+    if filtered:
+        schema["required"] = filtered
+    else:
+        schema.pop("required", None)
+
+
+def _normalize_schema_node(node: object, *, keep_null: bool = False) -> object:
     if isinstance(node, list):
-        return [_normalize_schema_node(item) for item in node]
+        return [_normalize_schema_node(item, keep_null=keep_null) for item in node]
     if isinstance(node, dict):
-        return _normalize_schema_dict(node)
+        return _normalize_schema_dict(node, keep_null=keep_null)
     return node
 
 
-def _normalize_schema_dict(schema: dict[str, object]) -> dict[str, object]:
+def _normalize_schema_dict(
+    schema: dict[str, object], *, keep_null: bool = False
+) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for key, value in schema.items():
         if key in _SCHEMA_OBJECT_KEYS and isinstance(value, dict):
@@ -227,34 +301,88 @@ def _normalize_schema_dict(schema: dict[str, object]) -> dict[str, object]:
                 name: _normalize_schema_node(sub) for name, sub in value.items()
             }
         elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
-            normalized[key] = [_normalize_schema_node(sub) for sub in value]
+            keep_branch_null = keep_null or key in _SCHEMA_COMBINER_KEYS
+            normalized[key] = [
+                _normalize_schema_node(sub, keep_null=keep_branch_null) for sub in value
+            ]
         elif key in _SCHEMA_SINGLE_KEYS and isinstance(value, dict):
             normalized[key] = _normalize_schema_node(value)
         else:
             normalized[key] = value
 
-    type_label = _schema_type_label(normalized)
-    if "array" in type_label.lower():
-        items = normalized.get("items")
-        if isinstance(items, (dict, list)):
-            items = _normalize_schema_node(items)
-        if isinstance(items, list):
-            normalized["items"] = (
-                items if _has_schema_items(items) else _array_item_fallback(type_label)
-            )
-        elif not _has_schema_items(items):
-            normalized["items"] = _array_item_fallback(type_label)
+    raw_type = normalized.get("type")
+    if isinstance(raw_type, list):
+        labels = [item for item in raw_type if isinstance(item, str)]
+        if not any(label.strip().lower() != "null" for label in labels) and (
+            not keep_null
+        ):
+            normalized["type"] = "string"
+            normalized["nullable"] = True
+    elif (
+        isinstance(raw_type, str)
+        and raw_type.strip().lower() == "null"
+        and not keep_null
+    ):
+        normalized["type"] = "string"
+        normalized["nullable"] = True
+
+    for key in _SCHEMA_COMBINER_KEYS:
+        branches = normalized.get(key)
+        if not isinstance(branches, list) or not branches:
+            continue
+        kept = [branch for branch in branches if not _is_null_branch(branch)]
+        if len(kept) == len(branches):
+            continue
+        normalized["nullable"] = True
+        if kept:
+            normalized[key] = kept
         else:
-            normalized["items"] = items
+            normalized.pop(key, None)
+
+    type_labels = _non_null_type_labels(normalized)
+    type_label = type_labels[0] if type_labels else ""
+    if any("array" in label.strip().lower() for label in type_labels) or (
+        "items" in normalized
+    ):
+        normalized["items"] = _normalize_array_items(
+            normalized.get("items"), type_label
+        )
+
+    has_type = bool(type_labels)
+    has_combiner = any(
+        isinstance(normalized.get(key), list) and bool(normalized.get(key))
+        for key in _SCHEMA_LIST_KEYS
+    )
+    if not has_type and not has_combiner:
+        raw_labels = _schema_type_labels(normalized)
+        properties = normalized.get("properties")
+        enum_values = normalized.get("enum")
+        infers_type_from_structure = (
+            keep_null
+            and bool(raw_labels)
+            and all(label.strip().lower() == "null" for label in raw_labels)
+        ) or (isinstance(enum_values, (list, tuple)) and bool(enum_values))
+        if not infers_type_from_structure and "const" not in normalized:
+            if isinstance(properties, dict) and properties:
+                normalized["type"] = "object"
+            elif "items" in normalized:
+                normalized["type"] = "array"
+            else:
+                normalized["type"] = "string"
+
+    _prune_schema_required(normalized)
     return normalized
 
 
 def normalize_tool_schema(schema: dict[str, object]) -> dict[str, object]:
-    """Recursively give every array schema a non-empty ``items`` node.
+    """Return a Gemini-safe copy of a tool JSON schema.
 
-    Gemini function declarations reject arrays whose ``items`` is missing or
-    empty.  The normalization is idempotent and only touches schema keywords;
-    unrelated JSON values (for example ``default``) are left alone.
+    Gemini function declarations reject arrays without real ``items`` and
+    reject ``required`` entries that do not exist in ``properties``.  The
+    normalization also gives empty property nodes a concrete type, resolves
+    ``null`` unions in favour of the non-null branch, and keeps ``anyOf`` /
+    ``oneOf`` branches valid.  It is recursive, idempotent, and never mutates
+    the caller's schema.
     """
     return _normalize_schema_dict(schema)
 
