@@ -200,8 +200,8 @@ def _has_array_items(items: object) -> bool:
     if isinstance(items, dict):
         return bool(items)
     if isinstance(items, list):
-        return bool(items) and isinstance(items[0], dict) and bool(items[0])
-    return items is True
+        return any(isinstance(entry, dict) and bool(entry) for entry in items)
+    return False
 
 
 def encode_schema_to_wire(
@@ -239,13 +239,16 @@ def encode_schema_to_wire(
                 cast("dict[str, object]", items),
                 include_required=include_required,
             )
-        elif isinstance(items, list) and items and isinstance(items[0], dict):
-            wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
-                items[0],
-                include_required=include_required,
+        elif isinstance(items, list):
+            first_item = next(
+                (entry for entry in items if isinstance(entry, dict) and bool(entry)),
+                None,
             )
-        elif items is True:
-            wire[SchemaIndex.ITEMS] = [6]
+            if first_item is not None:
+                wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
+                    first_item,
+                    include_required=include_required,
+                )
 
     properties = schema.get("properties")
     if isinstance(properties, dict):

@@ -1,12 +1,6 @@
 module github.com/Mag1cFall/AIStudio2API
 
-go 1.23
-
-// Module language baseline: go 1.23 (Q-08).
-// Upstream transport dependencies (uquic/utls/x-net) declare go 1.27 (x-net 1.26),
-// so the effective build toolchain must be Go 1.27. Keep the directive below active:
-// without it, a default Go 1.26.4 cannot resolve these dependencies.
-toolchain go1.27.0
+go 1.27
 
 require (
 	github.com/Mag1cFall/fhttp v0.6.8-firefox.1

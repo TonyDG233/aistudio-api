@@ -433,27 +433,7 @@ if (-not [string]::IsNullOrWhiteSpace($ExtLdFlags)) {
     $ldflags += " -extldflags `"$ExtLdFlags`""
 }
 
-# 5.1 生成构建专用临时 modfile
-# 仓库 go.mod 的 go 指令为 1.23（Q-08 基线），而 uquic/utls 已声明 go 1.27，
-# Go 1.27 工具链会以 "updates to go.mod needed" 拒绝直接构建。此处复制一份临时
-# modfile，并按 go.mod 中已有的 toolchain 指令提升 go 版本，避免修改受版本控制的 go.mod。
-$GoModFile = "$ScriptDir\go.mod"
-$GoSumFile = "$ScriptDir\go.sum"
-$BuildModFile = "$ScriptDir\.deps\waa-signer.mod"
-$BuildSumFile = "$ScriptDir\.deps\waa-signer.sum"
-$goModText = [System.IO.File]::ReadAllText($GoModFile)
-$toolchainMatch = [regex]::Match($goModText, '(?m)^toolchain\s+go(\d+\.\d+)')
-$buildArgs = @()
-if ($toolchainMatch.Success) {
-    $goLangVersion = $toolchainMatch.Groups[1].Value
-    $patchedGoMod = $goModText -replace '(?m)^go\s+\d+\.\d+\s*$', ('go ' + $goLangVersion)
-    [System.IO.File]::WriteAllText($BuildModFile, $patchedGoMod, (New-Object System.Text.UTF8Encoding($false)))
-    Copy-Item $GoSumFile $BuildSumFile -Force
-    $buildArgs = @("-modfile", $BuildModFile)
-    Write-Host ">>> 使用临时 modfile (go $goLangVersion，不修改仓库 go.mod): $BuildModFile" -ForegroundColor Gray
-}
-
-go build @buildArgs -trimpath -tags "netgo,osusergo" -ldflags "$ldflags" -o $OutExe ./cmd/waa-signer
+go build -trimpath -tags "netgo,osusergo" -ldflags "$ldflags" -o $OutExe ./cmd/waa-signer
 if ($LASTEXITCODE -ne 0) {
     Write-Host "错误: 编译 waa-signer 失败！" -ForegroundColor Red
     exit $LASTEXITCODE

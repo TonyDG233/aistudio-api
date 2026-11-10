@@ -4,7 +4,7 @@
 # Stage 1: waa-signer (browserless engine signing daemon)
 #
 # Builds the Go signer with the Go 1.27 toolchain required by waa-signer/go.mod
-# (toolchain go1.27.0) and links the static SpiderMonkey 152 library with Zig.
+# and links the static SpiderMonkey 152 library with Zig.
 # The resulting binary is statically linked, so no mozjs shared library is
 # needed in the runtime image. BuildKit caches the module download, Zig download
 # and SpiderMonkey download layers independently from the source copy.
@@ -18,7 +18,7 @@ ARG TARGETARCH
 ARG ZIG_VERSION=0.13.0
 ARG SPIDERMONKEY_VERSION=v152.0.4-aistudio2api.1
 
-ENV GOTOOLCHAIN=local \
+ENV GOTOOLCHAIN=auto \
     CGO_ENABLED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -87,19 +87,12 @@ RUN set -eux; \
         done; \
     fi; \
     mkdir -p /out; \
-    # go.mod keeps a go 1.23 language baseline for Q-08 while upstream
-    # transport modules declare go 1.27. Use a temporary modfile so the
-    # tracked file stays unchanged and Go 1.27 can resolve dependencies.
-    BUILD_MODFILE="/src/waa-signer/.deps/waa-signer.mod"; \
-    cp go.mod "$BUILD_MODFILE"; \
-    cp go.sum "${BUILD_MODFILE%.mod}.sum"; \
-    sed -i 's/^go 1[.]23$/go 1.27/' "$BUILD_MODFILE"; \
     CGO_ENABLED=1 GOOS=linux GOARCH="${GO_ARCH}" \
         CC="zig cc -target ${ZIG_TARGET}" \
         CXX="zig c++ -target ${ZIG_TARGET}" \
         CGO_CXXFLAGS="-I${DEPS_DIR}/include" \
         CGO_LDFLAGS="-L${DEPS_DIR}/lib" \
-        go build -modfile "$BUILD_MODFILE" -trimpath -tags netgo,osusergo \
+        go build -trimpath -tags netgo,osusergo \
             -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all'" \
             -o /out/waa-signer ./cmd/waa-signer; \
     chmod +x /out/waa-signer
