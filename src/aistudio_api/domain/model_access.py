@@ -20,6 +20,7 @@ _DEFAULT_PAID_MODELS = {
     "deep-research-preview-04-2026",
     "deep-research-max-preview-04-2026",
     "gemini-4-argon",
+    "gemini-4-carbon",
     "gemini-3-flash-preview",
     "gemini-3.6-flash",
     "gemini-nano-banana-2.1",
@@ -219,9 +220,7 @@ def resolve_tier_selector(
             return TierSelector("free", None, "Free", "Free")
         raise TierSelectorError("Free/Paid 实例池不能混合，Free 实例只能是 Free")
     if tier_rank(lower) > tier_rank(upper):
-        raise TierSelectorError(
-            f"min_tier={lower} 高于 max_tier={upper}，闭区间非法"
-        )
+        raise TierSelectorError(f"min_tier={lower} 高于 max_tier={upper}，闭区间非法")
     if tier_rank(lower) < tier_rank("Plus"):
         raise TierSelectorError("Paid 实例的 min_tier 不能低于 Plus")
     if tier_rank(upper) < tier_rank("Pro"):
@@ -338,17 +337,15 @@ def tier_satisfies_min(account_tier: object, min_tier: object) -> bool:
 
 def minimum_required_tier(required_tiers: Iterable[object]) -> str | None:
     """Return the canonical label of the lowest tier allowed by a requirement."""
-    labels = [
-        str(tier).strip()
-        for tier in required_tiers
-        if str(tier or "").strip()
-    ]
+    labels = [str(tier).strip() for tier in required_tiers if str(tier or "").strip()]
     if not labels:
         return None
     return min(labels, key=tier_rank)
 
 
-def tier_satisfies_required(account_tier: object, required_tiers: Iterable[object]) -> bool:
+def tier_satisfies_required(
+    account_tier: object, required_tiers: Iterable[object]
+) -> bool:
     """True when the account tier reaches at least one allowed requirement tier.
 
     ``paid_model_rules`` / ``accessModes`` list the allowed tiers; the lowest

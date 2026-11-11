@@ -62,7 +62,14 @@ export function instanceTierRange(
     const max = only.toLowerCase() === 'ultra' ? tierRank('Ultra_20X') : rank
     return { min: rank, max, only }
   }
-  return { min: tierRank(instance.min_tier), max: tierRank(instance.max_tier), only: null }
+  const min = tierRank(instance.min_tier)
+  const rawMax = (instance.max_tier || '').trim()
+  const max = rawMax
+    ? tierRank(rawMax)
+    : min === tierRank('Free')
+      ? min
+      : tierRank('Ultra_20X')
+  return { min, max, only: null }
 }
 
 export function isTierCompatible(
@@ -79,7 +86,9 @@ export function slotSummary(instance: Instance): string {
     return `仅限 ${tierShortLabel(instance.only_tier)}`
   }
   const min = instance.min_tier || 'Free'
-  const max = instance.max_tier || min
+  const rawMax = (instance.max_tier || '').trim()
+  const max =
+    rawMax || (tierRank(min) === tierRank('Free') ? 'Free' : 'Ultra_20X')
   if (tierRank(min) === tierRank(max)) {
     return `仅限 ${tierShortLabel(min)}`
   }

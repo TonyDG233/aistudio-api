@@ -14,11 +14,24 @@ from aistudio_api.infrastructure.waa.browserless_session import BrowserlessSessi
 from aistudio_api.infrastructure.waa.signer_client import MintProofResult, RpcResult
 
 
+@pytest.fixture(autouse=True)
+def _offline_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep BrowserlessSession.refresh_auth_state offline by default."""
+    from aistudio_api.infrastructure.waa import browserless_session as module
+
+    async def _skip(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del cookies, kwargs
+        return {"ok": False, "status": 0, "updated": []}
+
+    monkeypatch.setattr(module, "rotate_google_cookies", _skip)
+
+
 class FakeSigner:
     def __init__(self) -> None:
         self.mints: list[dict[str, object]] = []
         self.rpc_calls: list[dict[str, object]] = []
         self.released: list[str] = []
+        self.events: list[str] = []
         self.proof = "proof-abc"
         self.response_status = 200
         self.response_body = b"[]"
@@ -39,6 +52,7 @@ class FakeSigner:
 
     async def mint_proof(self, **kwargs: object) -> MintProofResult:
         self.mints.append(dict(kwargs))
+        self.events.append("mint")
         return MintProofResult(
             ok=True,
             proof=self.proof,
@@ -80,6 +94,7 @@ class FakeSigner:
         self, *, account_key: str | None = None
     ) -> dict[str, object]:
         self.released.append(account_key or "")
+        self.events.append("release")
         return {"ok": True}
 
 
@@ -263,6 +278,49 @@ async def test_refresh_auth_state_reloads_and_remints(tmp_path: Path) -> None:
     )
     assert await session.refresh_auth_state() is True
     assert "cookie-new" in str(signer.mints[-1]["cookies"])
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_state_persists_pending_rpc_cookies(
+    tmp_path: Path,
+) -> None:
+    signer = FakeSigner()
+    auth = _write_auth(tmp_path, "a", "cookie-a")
+    session = _session(signer, auth)
+    await session.send_hooked_request(body="[]", url="https://x")
+
+    assert await session.refresh_auth_state() is True
+    # The RPC rotation received before the refresh must survive the disk reload.
+    assert _auth_cookies(auth)["SID"] == "rotated"
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_state_rotates_persists_and_rebuilds_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.waa import browserless_session as module
+
+    seen: list[dict[str, str]] = []
+
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del kwargs
+        seen.append(dict(cookies))
+        cookies["__Secure-1PSIDTS"] = "fresh-ts"
+        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
+
+    monkeypatch.setattr(module, "rotate_google_cookies", rotate)
+    signer = FakeSigner()
+    auth = _write_auth(tmp_path, "a", "cookie-a")
+    session = _session(signer, auth)
+
+    assert await session.refresh_auth_state() is True
+
+    assert seen and seen[0]["SAPISID"] == "cookie-a"
+    assert _auth_cookies(auth)["__Secure-1PSIDTS"] == "fresh-ts"
+    # The Go worker is released before the fresh proof is minted.
+    assert signer.events[:2] == ["release", "mint"]
+    assert signer.released == ["a"]
+    assert "fresh-ts" in str(signer.mints[-1]["cookies"])
 
 
 @pytest.mark.asyncio

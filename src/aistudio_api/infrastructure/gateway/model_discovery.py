@@ -321,6 +321,14 @@ _FALLBACK_MODELS = [
         "paid": True,
     },
     {
+        "id": "gemini-4-carbon",
+        "displayName": "Gemini 4 Carbon",
+        "description": "Ultra-exclusive frontier model",
+        "paid": True,
+        "access_tier": 2,
+        "accessModes": [4],
+    },
+    {
         "id": "gemini-3-flash-preview",
         "displayName": "Gemini 3 Flash Preview",
         "description": "Fast frontier model",
@@ -958,8 +966,12 @@ class ModelDiscoveryService:
 
         A real (live/snapshot) ``paid is False`` record is authoritative and is
         returned as Free before any static substring rule applies, so a static
-        ``image`` style rule can never override live Free truth.  Fallback or
-        unknown models still use the static ``paid_model_rules`` first.
+        ``image`` style rule can never override live Free truth.  A cached
+        Ultra-only ``accessModes`` bit (4 without 3) is likewise authoritative
+        and is returned before static rules, so the broad ``pro_required``
+        ``gemini-4`` substring rule can never downgrade ``gemini-4-carbon`` to
+        Pro.  Fallback or unknown models still use the static
+        ``paid_model_rules`` first.
         """
         clean_m = model_id.removeprefix("models/").lower()
 
@@ -967,6 +979,19 @@ class ModelDiscoveryService:
         truth = discovery_entry_paid_truth(info)
         if truth is False:
             return []
+
+        raw_modes = info.get("accessModes") if info else None
+        modes = (
+            {
+                int(mode)
+                for mode in raw_modes
+                if isinstance(mode, int) and not isinstance(mode, bool)
+            }
+            if isinstance(raw_modes, list)
+            else set()
+        )
+        if 4 in modes and 3 not in modes:
+            return ["Ultra", "Ultra_20X"]
 
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,
@@ -1001,12 +1026,8 @@ class ModelDiscoveryService:
                     return [str(t) for t in req]
 
         if info:
-            modes = info.get("accessModes")
-            if isinstance(modes, list):
-                if 4 in modes and 3 not in modes:
-                    return ["Ultra", "Ultra_20X"]
-                if 3 in modes:
-                    return ["Pro", "Ultra", "Ultra_20X"]
+            if 3 in modes:
+                return ["Pro", "Ultra", "Ultra_20X"]
             if bool(info.get("paid")):
                 return ["Pro", "Ultra", "Ultra_20X"]
 

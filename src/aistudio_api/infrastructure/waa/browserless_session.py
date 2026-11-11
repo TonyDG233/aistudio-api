@@ -29,8 +29,10 @@ from aistudio_api.domain.errors import (
 from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.account.account_store import write_storage_state
 from aistudio_api.infrastructure.account.cookie_parser import (
+    apply_set_cookies,
     calculate_sapisid_hash,
     filter_minimal_cookies,
+    rotate_google_cookies,
 )
 from aistudio_api.infrastructure.gateway.capture import RequestCaptureService
 from aistudio_api.infrastructure.gateway.public_web_constants import (
@@ -177,6 +179,39 @@ def _merge_cookies(
         else:
             merged[position] = dict(update)
     return merged
+
+
+def _rotation_updates(
+    current: list[dict[str, object]], rotated: dict[str, str]
+) -> list[dict[str, object]]:
+    """Diff a rotated cookie map against the live jar, preserving metadata."""
+    existing = {
+        str(cookie.get("name") or ""): cookie
+        for cookie in current
+        if cookie.get("name")
+    }
+    updates: list[dict[str, object]] = []
+    for name, value in rotated.items():
+        if not name or not value:
+            continue
+        previous = existing.get(name)
+        if previous is None:
+            updates.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".google.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            )
+            continue
+        if str(previous.get("value") or "") == value:
+            continue
+        updated = dict(previous)
+        updated["value"] = value
+        updates.append(updated)
+    return updates
 
 
 class BrowserlessSession:
@@ -475,19 +510,32 @@ class BrowserlessSession:
             return proof if proof.startswith("!") else f"!{proof}"
 
     async def refresh_auth_state(self) -> bool:
-        """Reload auth.json, drop minter/transport state, then re-mint."""
+        """Rotate stale credentials, rebuild the Go worker, then re-mint.
+
+        The same-account 403 refresh must do three things that a plain disk
+        reload cannot: persist cookies already received in memory, actively
+        roll ``__Secure-1PSIDTS`` through ``/RotateCookies`` using ``LSID`` as
+        the seed, and destroy the resident Go worker so the next mint builds a
+        fresh cookie jar instead of reusing the expired one.
+        """
         self._force_snapshot_warmup = True
         self._mint = None
+        if self._cookie_dirty:
+            await self.save_current_cookies()
         self._mint_updates = []
         self._rpc_set_cookies = []
-        self._cookie_dirty = False
         self._rpc_account_key = ""
         self._load_storage_state()
+        await self._rotate_cookies()
         if not self._has_sapisid():
             log.warning(
                 "browserless 刷新鉴权失败: realm=%s 缺少 SAPISID", self._realm_id
             )
             return False
+        # Drop the Go-side hot worker: a reused worker keeps the pre-refresh
+        # cookie jar, so mint/rpc would silently send the stale credentials.
+        with suppress(Exception):
+            await self._signer.release_worker(account_key=self.stable_account_key)
         try:
             result = await self._signer.mint_proof(
                 cookies=self._cookie_text(),
@@ -510,7 +558,47 @@ class BrowserlessSession:
         )
         self._mint_updates = _merge_cookies(self._mint_updates, refresh_updates)
         self._cookies = _merge_cookies(self._cookies, refresh_updates)
+        if self._cookie_dirty:
+            await self.save_current_cookies()
         return True
+
+    async def _rotate_cookies(self) -> None:
+        """Roll short-lived Google credentials and persist the result.
+
+        ``rotate_google_cookies`` mutates the passed map in place for the
+        whitelisted rotating cookies; any ``set_cookies`` payload is merged as
+        well so a future signer-side rotation is not dropped. Failures are
+        logged and never abort the 403 refresh path.
+        """
+        cookie_map = _cookie_map(self._cookies)
+        if not cookie_map:
+            return
+        try:
+            rotation = await rotate_google_cookies(cookie_map)
+        except Exception as exc:
+            log.warning(
+                "browserless RotateCookies 失败 realm=%s: %s", self._realm_id, exc
+            )
+            return
+        raw_set = rotation.get("set_cookies")
+        if isinstance(raw_set, list):
+            headers = [item for item in raw_set if isinstance(item, str)]
+            if headers:
+                apply_set_cookies(cookie_map, headers)
+            for item in raw_set:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "")
+                    value = str(item.get("value") or "")
+                    if name and value:
+                        cookie_map[name] = value
+        if not rotation.get("ok"):
+            return
+        updates = _rotation_updates(self._cookies, cookie_map)
+        if not updates:
+            return
+        self._cookies = _merge_cookies(self._cookies, updates)
+        self._cookie_dirty = True
+        await self.save_current_cookies()
 
     async def send_hooked_request(
         self,

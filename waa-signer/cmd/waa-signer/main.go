@@ -65,6 +65,11 @@ type workerEntry struct {
 	// workerGeneration 记录当前 worker 的本地构建代数，由 entry.mu 保护
 	workerGeneration uint64
 
+	// clientRotatingBaseline 是该 Worker 冷启动时客户端传入的滚动凭据快照，
+	// 由 entry.mu 保护。仅用于检测客户端是否主动轮换了凭据，绝不在锁内读取
+	// Worker 运行期状态。
+	clientRotatingBaseline map[string]string
+
 	// 以下字段由 WorkerPool.mu 保护
 	slot               bool
 	building           bool
@@ -81,6 +86,7 @@ func (entry *workerEntry) closeLocked() {
 		_ = entry.worker.Close()
 		entry.worker = nil
 	}
+	entry.clientRotatingBaseline = nil
 }
 
 // close 在无并发使用者时关闭并清空底层 worker
@@ -429,6 +435,20 @@ func (p *WorkerPool) waitForDrain(ctx context.Context, entry *workerEntry) error
 	}
 }
 
+// clientCookieValues 把 storage state 的 Cookie 列表压平成 name->value 快照。
+//
+// 同名 Cookie 以最后一个非空值为准，只用于客户端滚动凭据对比，不参与写回。
+func clientCookieValues(state aistudio.StorageState) map[string]string {
+	values := make(map[string]string, len(state.Cookies))
+	for _, cookie := range state.Cookies {
+		if cookie.Value == "" {
+			continue
+		}
+		values[cookie.Name] = cookie.Value
+	}
+	return values
+}
+
 // AcquireWorker 取得账户 Worker 并登记一次在途使用；返回的释放函数必须调用一次。
 //
 // accountKeyOverride 为调用方（Python account.id）提供的稳定键；为空时回退到
@@ -495,10 +515,16 @@ func (p *WorkerPool) AcquireWorker(
 		st := entry.worker.State()
 		if st.Phase == aistudio.WorkerReady || st.Phase == aistudio.WorkerBusy {
 			worker := entry.worker
-			entry.mu.Unlock()
-			release := p.lease(entry)
-			pinned = false
-			return worker, "hot", key, release, nil
+			incoming := clientCookieValues(state)
+			if poolstate.HasClientRotatedCredentials(entry.clientRotatingBaseline, incoming) {
+				// Python 侧已轮换凭据：旧 Worker 的 Cookie 罐已过期，必须重建。
+				slog.Info("客户端滚动凭据已更新，按最新凭据重建热 Worker", "account", key)
+			} else {
+				entry.mu.Unlock()
+				release := p.lease(entry)
+				pinned = false
+				return worker, "hot", key, release, nil
+			}
 		}
 	}
 
@@ -570,6 +596,7 @@ func (p *WorkerPool) AcquireWorker(
 	now := time.Now()
 	entry.worker = worker
 	entry.workerGeneration++
+	entry.clientRotatingBaseline = poolstate.ExtractRotatingCredentials(clientCookieValues(state))
 	entry.statePath = statePath
 	entry.authUser = authUser
 	entry.proxy = effectiveProxy

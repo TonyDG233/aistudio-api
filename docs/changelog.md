@@ -3,6 +3,14 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.2] - 2026-11-11
+
+### Fixed
+
+- **Ultra-only 模型准入信号优先级**：提权 `ListModels` 的 `item[82]`（`accessModes`）Ultra-only 信号优先于静态 `pro_required` 子串规则，`gemini-4-carbon` 不再被误判为 Pro 可用；同时将 `carbon` 纳入 `paid_model_rules.ultra_required`（`defaults/config.yaml` 与前端 `schema.ts` 同步）与内置模型表。
+- **实例换绑弹窗 tier 显示与过滤**：修复 `InstanceSpec.from_mapping`、`InstanceManager._view` 与前端 `instances.ts` 对 `min_tier` 槽位 `max_tier`（`Ultra_20X`）的归一化与兼容计算，解决弹窗误显示“仅限 Pro”及可用 Pro 账号被过滤的问题。
+- **Browserless 403 同号刷新**：`BrowserlessSession.refresh_auth_state()` 接入 `rotate_google_cookies`（`/RotateCookies`）主动续期并立即落盘 `auth.json`，刷新前先持久化内存中已收到的 Cookie；强制释放 Go 侧驻留热 Worker，使下一次 `mint_proof` 用最新凭据重建 Cookie 罐；waa-signer 热复用路径检测滚动凭据差异后按最新 storage state 重建 Worker，不再继续发送过期 Cookie。
+
 ## [2.1.1] - 2026-11-10
 
 ### Changed

@@ -1400,15 +1400,16 @@ class InstanceManager:
     def _view(self, record: _Record) -> Instance:
         slot = self._pool.get(record.slot_id)
         in_flight = int(slot.active_requests) if slot is not None else 0
+        selector = record.spec.selector
         return Instance(
             id=record.id,
             number=record.number,
             account_id=record.account_id,
             state=record.state,
             surface=record.surface,
-            min_tier=record.spec.selector.min_tier,
-            only_tier=record.only_tier,
-            max_tier=record.max_tier,
+            min_tier=selector.min_tier,
+            only_tier=selector.only_tier or "",
+            max_tier=selector.max_tier,
             in_flight=in_flight,
             latest=record.id == self._latest_id,
             tier=slot.tier if slot is not None else "",

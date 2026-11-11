@@ -792,6 +792,53 @@ async def test_create_accepts_explicit_tier_selector_without_configured_spec(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        InstanceSpec(count=1, surface="chat", min_tier="Pro"),
+        InstanceSpec.from_mapping({"count": 1, "surface": "chat", "min_tier": "Pro"}),
+    ],
+)
+async def test_list_instances_serializes_normalized_paid_interval(
+    tmp_path, spec
+) -> None:
+    store, _accounts = _store_with_accounts(tmp_path)
+    cdp = FakeCDP()
+    manager = _manager(store, cdp, specs=[spec], max_contexts=1)
+    await manager.startup()
+
+    item = (await manager.list_instances()).instances[0]
+
+    assert item.only_tier == ""
+    assert item.min_tier == "Pro"
+    assert item.max_tier == "Ultra_20X"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("only_tier", "expected"),
+    [
+        ("Free", ("Free", "Free", "Free")),
+        ("Pro", ("Pro", "Pro", "Pro")),
+    ],
+)
+async def test_list_instances_serializes_only_tier_interval(
+    tmp_path, only_tier, expected
+) -> None:
+    store, _accounts = _store_with_accounts(tmp_path)
+    cdp = FakeCDP()
+    spec = InstanceSpec.from_mapping(
+        {"count": 1, "surface": "chat", "only_tier": only_tier}
+    )
+    manager = _manager(store, cdp, specs=[spec], max_contexts=1)
+    await manager.startup()
+
+    item = (await manager.list_instances()).instances[0]
+
+    assert (item.only_tier, item.min_tier, item.max_tier) == expected
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_account_already_bound_to_instance(tmp_path) -> None:
     store, accounts = _store_with_accounts(
         tmp_path, ("free", "free@example.com", "Free")

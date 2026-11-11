@@ -105,6 +105,135 @@ func TestResolveAccountKey(t *testing.T) {
 	}
 }
 
+func TestExtractRotatingCredentials(t *testing.T) {
+	cases := []struct {
+		name    string
+		cookies map[string]string
+		want    map[string]string
+	}{
+		{name: "nil input", cookies: nil},
+		{name: "empty input", cookies: map[string]string{}},
+		{name: "only irrelevant cookies", cookies: map[string]string{"SID": "x", "SAPISID": "y"}},
+		{
+			name: "all rotating credentials",
+			cookies: map[string]string{
+				"__Secure-1PSIDTS": "a1",
+				"__Secure-3PSIDTS": "a3",
+				"SIDCC":            "cc",
+				"__Secure-1PSIDCC": "cc1",
+				"__Secure-3PSIDCC": "cc3",
+			},
+			want: map[string]string{
+				"__Secure-1PSIDTS": "a1",
+				"__Secure-3PSIDTS": "a3",
+				"SIDCC":            "cc",
+				"__Secure-1PSIDCC": "cc1",
+				"__Secure-3PSIDCC": "cc3",
+			},
+		},
+		{
+			name: "partial and blank values dropped",
+			cookies: map[string]string{
+				"__Secure-1PSIDTS": "a1",
+				"SIDCC":            "   ",
+				"__Secure-3PSIDCC": "",
+			},
+			want: map[string]string{"__Secure-1PSIDTS": "a1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ExtractRotatingCredentials(tc.cookies)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ExtractRotatingCredentials(%v) = %v, want %v", tc.cookies, got, tc.want)
+			}
+			for name, want := range tc.want {
+				if got[name] != want {
+					t.Fatalf("ExtractRotatingCredentials(%v)[%s] = %q, want %q", tc.cookies, name, got[name], want)
+				}
+			}
+		})
+	}
+}
+
+func TestHasClientRotatedCredentials(t *testing.T) {
+	baseline := map[string]string{
+		"__Secure-1PSIDTS": "old-1psidts",
+		"__Secure-3PSIDTS": "old-3psidts",
+		"SIDCC":            "old-sidcc",
+	}
+	cases := []struct {
+		name     string
+		baseline map[string]string
+		incoming map[string]string
+		want     bool
+	}{
+		{
+			name:     "client unchanged",
+			baseline: baseline,
+			incoming: map[string]string{
+				"__Secure-1PSIDTS": "old-1psidts",
+				"__Secure-3PSIDTS": "old-3psidts",
+				"SIDCC":            "old-sidcc",
+			},
+			want: false,
+		},
+		{
+			name:     "client rotated 1PSIDTS",
+			baseline: baseline,
+			incoming: map[string]string{
+				"__Secure-1PSIDTS": "new-1psidts",
+				"__Secure-3PSIDTS": "old-3psidts",
+				"SIDCC":            "old-sidcc",
+			},
+			want: true,
+		},
+		{
+			name:     "incoming missing key does not misfire",
+			baseline: baseline,
+			incoming: map[string]string{"__Secure-3PSIDTS": "old-3psidts"},
+			want:     false,
+		},
+		{
+			name:     "incoming blank key does not misfire",
+			baseline: baseline,
+			incoming: map[string]string{"__Secure-1PSIDTS": "  ", "SIDCC": "old-sidcc"},
+			want:     false,
+		},
+		{
+			name:     "client rotated SIDCC only",
+			baseline: baseline,
+			incoming: map[string]string{"SIDCC": "new-sidcc"},
+			want:     true,
+		},
+		{
+			name:     "empty baseline never rotates",
+			baseline: nil,
+			incoming: map[string]string{"__Secure-1PSIDTS": "new-1psidts"},
+			want:     false,
+		},
+		{
+			name:     "baseline without rotating keys never rotates",
+			baseline: map[string]string{"SID": "x"},
+			incoming: map[string]string{"SID": "y"},
+			want:     false,
+		},
+		{
+			name:     "nil incoming never rotates",
+			baseline: baseline,
+			incoming: nil,
+			want:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasClientRotatedCredentials(tc.baseline, tc.incoming); got != tc.want {
+				t.Fatalf("HasClientRotatedCredentials(%v, %v) = %v, want %v", tc.baseline, tc.incoming, got, tc.want)
+			}
+		})
+	}
+}
+
 func repeat(ch byte, count int) string {
 	buf := make([]byte, count)
 	for i := range buf {
