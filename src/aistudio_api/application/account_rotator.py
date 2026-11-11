@@ -251,9 +251,7 @@ class AccountStats:
         self._check_date_reset(current_la)
 
         if model:
-            for key in quota_keys(
-                model, surface=surface, scope=self.quota_scope
-            ):
+            for key in quota_keys(model, surface=surface, scope=self.quota_scope):
                 m_stats = self.daily_models.get(key)
                 if m_stats is not None and m_stats.cooldown_until > now:
                     return False
@@ -271,9 +269,7 @@ class AccountStats:
             return max(0.0, self.auth_cooldown - now)
         if model:
             remaining = 0.0
-            for key in quota_keys(
-                model, surface=surface, scope=self.quota_scope
-            ):
+            for key in quota_keys(model, surface=surface, scope=self.quota_scope):
                 m_stats = self.daily_models.get(key)
                 if m_stats is not None and m_stats.cooldown_until > now:
                     remaining = max(remaining, m_stats.cooldown_until - now)
@@ -412,9 +408,7 @@ class AccountStats:
         self.session_expired = False
         self.last_session_expired = 0.0
         if model:
-            for key in quota_keys(
-                model, surface=surface, scope=self.quota_scope
-            ):
+            for key in quota_keys(model, surface=surface, scope=self.quota_scope):
                 st = self.daily_models.get(key)
                 if st is not None:
                     st.cooldown_until = 0.0
@@ -512,10 +506,7 @@ class AccountStats:
                 )
         return cls(
             account_id=str(data.get("account_id") or ""),
-            quota_scope=(
-                quota_scope
-                or str(data.get("quota_scope") or "account")
-            ),
+            quota_scope=(quota_scope or str(data.get("quota_scope") or "account")),
             total_requests=tot_req,
             total_success=tot_succ,
             total_rate_limited=tot_limit,
@@ -981,13 +972,21 @@ class AccountRotator:
         model: str | None = None,
         *,
         surface: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(
                 account_id=account_id, quota_scope=self.quota_scope
             )
         self._stats[account_id].record_session_expired(model, surface=surface)
-        logger.error("账号 %s 登录态失效，已被永久禁用直至重新导入凭据", account_id)
+        logger.error(
+            "账号 %s 登录态失效，已被永久禁用直至重新导入凭据 "
+            "(model=%s surface=%s reason=%s)",
+            account_id,
+            model or "all",
+            surface or "-",
+            reason or "-",
+        )
         self.save_state()
 
     def clear_cooldown(

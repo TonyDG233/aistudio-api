@@ -10,6 +10,7 @@
 - **Ultra-only 模型准入信号优先级**：提权 `ListModels` 的 `item[82]`（`accessModes`）Ultra-only 信号优先于静态 `pro_required` 子串规则，`gemini-4-carbon` 不再被误判为 Pro 可用；同时将 `carbon` 纳入 `paid_model_rules.ultra_required`（`defaults/config.yaml` 与前端 `schema.ts` 同步）与内置模型表。
 - **实例换绑弹窗 tier 显示与过滤**：修复 `InstanceSpec.from_mapping`、`InstanceManager._view` 与前端 `instances.ts` 对 `min_tier` 槽位 `max_tier`（`Ultra_20X`）的归一化与兼容计算，解决弹窗误显示“仅限 Pro”及可用 Pro 账号被过滤的问题。
 - **Browserless 403 同号刷新**：`BrowserlessSession.refresh_auth_state()` 接入 `rotate_google_cookies`（`/RotateCookies`）主动续期并立即落盘 `auth.json`，刷新前先持久化内存中已收到的 Cookie；强制释放 Go 侧驻留热 Worker，使下一次 `mint_proof` 用最新凭据重建 Cookie 罐；waa-signer 热复用路径检测滚动凭据差异后按最新 storage state 重建 Worker，不再继续发送过期 Cookie。
+- **`verify-account` 移动设备验证自动熔断隔离**：新增 `is_account_verification_required_message()` 与 `AuthError.verification_required`，识别 `verify-account` / `verify?` 验证 URL、`must be verified before it can continue using the Gemini API`、`account verification required to restore access`、`free_tier_verification_required` 等上游账号验证信号；`routing_pipeline` 命中后跳过 `tier_allows` 误判与同账号重签重试，直接按 `session_expired` 永久隔离该账号并在请求期换绑切号，后续 `is_account_available` 与 `select_rebind_account` 均排除该账号；管理台重新导入凭据或点击清除锁定后恢复可用。
 
 ## [2.1.1] - 2026-11-10
 

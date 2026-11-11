@@ -768,6 +768,24 @@ class RoutingPipeline:
             )
 
         if isinstance(exc, AuthError):
+            if getattr(exc, "verification_required", False):
+                # Google 移动设备验证（verify-account）风控：账号已被上游锁死，
+                # 任何同号重签都只会二次撞墙，必须立即标记失效并切号。
+                self._record_error("session_expired", context, attempt, exc=exc)
+                logger.error(
+                    "[routing] 账号触发 Google 移动设备验证风控 (verify-account)，"
+                    "已自动标记失效隔离并切号 instance=%s account=%s model=%s "
+                    "reason=%s",
+                    attempt.instance_id,
+                    attempt.candidate.account_id,
+                    context.route.model,
+                    exc,
+                )
+                if has_yielded_data:
+                    raise exc
+                return await self._switch_or_raise(
+                    context, attempt, exc, reason="verification_required"
+                )
             if not tier_allows(attempt.candidate.tier, context.route):
                 # The upstream call really happened and returned 403 on a
                 # tier that cannot satisfy the route: count it as an attempt
