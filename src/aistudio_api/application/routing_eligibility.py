@@ -90,9 +90,7 @@ def parse_model_surface(
         if wanted not in VALID_SURFACES:
             raise ValueError(f"未知 surface: {requested_surface}")
         if surface != wanted:
-            raise ValueError(
-                f"模型前缀 surface={surface} 与请求 surface={wanted} 冲突"
-            )
+            raise ValueError(f"模型前缀 surface={surface} 与请求 surface={wanted} 冲突")
         surface = wanted
 
     clean = text.strip()
@@ -112,9 +110,7 @@ def _str_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [
-        str(item).strip()
-        for item in value
-        if isinstance(item, str) and item.strip()
+        str(item).strip() for item in value if isinstance(item, str) and item.strip()
     ]
 
 
@@ -143,6 +139,24 @@ def _live_paid_truth(clean_model: str) -> bool | None:
     )
 
 
+def _access_modes(entry: Mapping[str, object] | None) -> set[int]:
+    """Integer ``accessModes`` bits from a cached discovery entry.
+
+    ``bool`` is a subclass of ``int`` in Python, but ``True``/``False`` are not
+    access-mode bits; they must never be coerced into ``1``/``0``.
+    """
+    if entry is None:
+        return set()
+    raw_modes = entry.get("accessModes")
+    if not isinstance(raw_modes, list):
+        return set()
+    return {
+        int(mode)
+        for mode in raw_modes
+        if isinstance(mode, int) and not isinstance(mode, bool)
+    }
+
+
 def resolve_required_tiers(
     model_path: str,
     *,
@@ -150,10 +164,15 @@ def resolve_required_tiers(
 ) -> tuple[str, ...]:
     """Resolve allowed tiers with live discovery truth ahead of static rules.
 
-    A real (live/snapshot) record with explicit ``paid is False`` and no Paid
-    ``accessModes`` is authoritative Free: static substring rules such as
-    ``image`` must not override it.  Live Paid, fallback, and unknown models
-    keep the historical order: rules -> accessModes -> paid/capability.
+    Priority order:
+
+    1. Live Free (``paid is False`` without Paid ``accessModes``) -> no
+       restriction; a static ``image`` style rule must not override it.
+    2. Live/cached Ultra-only (``accessModes`` has 4 without 3) -> Ultra only;
+       the broad ``pro_required`` ``gemini-4`` substring rule must not downgrade
+       an Ultra-exclusive model such as ``gemini-4-carbon``.
+    3. ``paid_model_rules`` static substring/prefix/exact matches.
+    4. Remaining cached ``accessModes`` / Paid marker / capability fallback.
     """
     clean = normalize_model_key(model_path)
     if not clean:
@@ -162,6 +181,13 @@ def resolve_required_tiers(
     live_truth = _live_paid_truth(clean)
     if live_truth is False:
         return ()
+
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    info = model_discovery.get_cached_model_info(clean)
+    modes = _access_modes(info)
+    if 4 in modes and 3 not in modes:
+        return ("Ultra", "Ultra_20X")
 
     if rules is None:
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -182,18 +208,7 @@ def resolve_required_tiers(
         if tiers:
             return tiers
 
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-    info = model_discovery.get_cached_model_info(clean)
     if info is not None:
-        raw_modes = info.get("accessModes")
-        modes = (
-            {int(mode) for mode in raw_modes if isinstance(mode, int)}
-            if isinstance(raw_modes, list)
-            else set()
-        )
-        if 4 in modes and 3 not in modes:
-            return ("Ultra", "Ultra_20X")
         if 3 in modes:
             return _PAID_MIN_TIERS
         if bool(info.get("paid")):
@@ -243,9 +258,7 @@ def resolve_model_route(
         if not required:
             required = _PAID_MIN_TIERS
     else:
-        paid = is_paid_model(clean) or any(
-            tier_rank(tier) > 0 for tier in required
-        )
+        paid = is_paid_model(clean) or any(tier_rank(tier) > 0 for tier in required)
         if paid and not required:
             required = _PAID_MIN_TIERS
     minimum = minimum_required_tier(required)

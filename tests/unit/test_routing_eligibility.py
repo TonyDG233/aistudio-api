@@ -44,9 +44,7 @@ def test_bare_model_defaults_to_chat() -> None:
         ("build/gemini-3.7-flash", ("build", "gemini-3.7-flash")),
     ],
 )
-def test_surface_prefix_matrix(
-    model_path: str, expected: tuple[str, str]
-) -> None:
+def test_surface_prefix_matrix(model_path: str, expected: tuple[str, str]) -> None:
     assert parse_model_surface(model_path) == expected
 
 
@@ -115,10 +113,12 @@ def test_empty_rules_do_not_become_ultra_only(monkeypatch) -> None:
     assert route.paid is False
 
 
-def test_discovery_rules_are_resolved_before_access_modes(monkeypatch) -> None:
+def test_discovery_rules_are_resolved_before_non_ultra_access_modes(
+    monkeypatch,
+) -> None:
     service = ModelDiscoveryService()
     service._cached_models = [
-        {"id": "configured-model", "accessModes": [4], "paid": True}
+        {"id": "configured-model", "accessModes": [3], "paid": True}
     ]
     monkeypatch.setattr(
         model_defaults,
@@ -153,3 +153,30 @@ def test_tier_rank_satisfies_requirement() -> None:
     assert tier_allows("Ultra_20X", route)
     assert not tier_allows("Plus", route)
     assert not tier_allows("Free", route)
+
+
+@pytest.mark.asyncio
+async def test_carbon_requires_ultra_and_never_uses_pro_slot() -> None:
+    """``gemini-4-carbon`` is Ultra-only, so a Pro-only pool rejects it (403)."""
+    from aistudio_api.application.routing_pipeline import RoutingPipeline
+    from aistudio_api.domain.errors import TierRequiredError
+    from tests.unit.routing_fakes import FakeManager, make_instance
+
+    model_discovery._cached_models = [
+        {"id": "gemini-4-carbon", "accessModes": [4], "paid": True}
+    ]
+    manager = FakeManager(
+        [make_instance("inst-pro", account_id="pro", tier="Pro")],
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    with pytest.raises(TierRequiredError) as info:
+        await pipeline.begin(model_path="gemini-4-carbon")
+
+    assert info.value.status_code == 403
+    assert info.value.required_tier == "Ultra"
+    assert info.value.current_tier == "Pro"
+    assert manager.begin_calls == []

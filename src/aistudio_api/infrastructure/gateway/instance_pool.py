@@ -99,7 +99,7 @@ class InstanceSpec:
             count=count,
             surface=surface,
             min_tier=selector.min_tier,
-            max_tier=canonical_tier(raw_max) or "",
+            max_tier=selector.max_tier,
         )
 
     @property

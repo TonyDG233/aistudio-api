@@ -187,7 +187,7 @@ features:
 # 未命中任何条目的模型按 Free 模型处理。
 paid_model_rules:
   ultra_required:
-    contains: ["veo", "ultra"]
+    contains: ["veo", "ultra", "carbon"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
     contains: ["argon", "gemini-4", "imagen"]

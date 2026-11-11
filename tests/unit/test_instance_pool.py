@@ -397,6 +397,31 @@ async def test_sync_account_tier_cross_lane_unbinds_free_slot_and_keeps_same_lan
     assert paid.account_id == "paid-acc"
 
 
+def test_from_mapping_min_tier_without_max_keeps_normalized_open_interval() -> None:
+    spec = InstanceSpec.from_mapping({"count": 1, "surface": "chat", "min_tier": "Pro"})
+
+    assert spec.only_tier == ""
+    assert spec.min_tier == "Pro"
+    assert spec.max_tier == "Ultra_20X"
+    assert spec.selector.min_tier == "Pro"
+    assert spec.selector.max_tier == "Ultra_20X"
+    assert spec.accepts_tier("Pro")
+    assert spec.accepts_tier("Ultra")
+    assert not spec.accepts_tier("Free")
+
+
+def test_from_mapping_free_min_tier_without_max_stays_free_only() -> None:
+    spec = InstanceSpec.from_mapping(
+        {"count": 1, "surface": "chat", "min_tier": "Free"}
+    )
+
+    assert spec.only_tier == ""
+    assert spec.min_tier == "Free"
+    assert spec.max_tier == "Free"
+    assert spec.accepts_tier("Free")
+    assert not spec.accepts_tier("Pro")
+
+
 @pytest.mark.asyncio
 async def test_snapshot_has_no_lease_or_page_budget_fields() -> None:
     cdp = FakeCDP()

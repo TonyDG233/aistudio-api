@@ -43,6 +43,18 @@ _OLD = "acc_old"
 _HEALTHY = "acc_healthy"
 
 
+@pytest.fixture(autouse=True)
+def _offline_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the 403 refresh path offline: no /RotateCookies network call."""
+    from aistudio_api.infrastructure.waa import browserless_session as module
+
+    async def _skip(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del cookies, kwargs
+        return {"ok": False, "status": 0, "updated": []}
+
+    monkeypatch.setattr(module, "rotate_google_cookies", _skip)
+
+
 # --------------------------------------------------------------------- signer
 
 
@@ -494,7 +506,8 @@ async def test_mint_login_state_failure_rebinds_to_healthy_account(
         assert switches == 1
         assert _current_account(manager) == _HEALTHY
         assert old_session.is_alive() is False
-        assert signer.released == [_OLD]
+        # refresh_auth_state drops the hot worker, then the rebind closes it.
+        assert signer.released == [_OLD, _OLD]
         assert rotator.rebind_exclusions
         healthy_slot = manager.ready_slot_for_account(_HEALTHY)
         assert healthy_slot is not None
@@ -548,7 +561,8 @@ async def test_second_rpc_403_rebinds_after_same_account_refresh(
         assert switches == 1
         assert _current_account(manager) == _HEALTHY
         assert old_session.is_alive() is False
-        assert signer.released == [_OLD]
+        # Same-account refresh releases the hot worker; the rebind closes it too.
+        assert signer.released == [_OLD, _OLD]
         # First 403 re-signed on the same session, second 403 triggered rebind.
         assert signer.rpc_calls.count(_OLD) == 2
         # initial mint + refresh mint + retry mint

@@ -71,6 +71,66 @@ func ValidateAccountKey(key string) error {
 	return nil
 }
 
+// rotatingCredentialNames 是 Google 每次响应都会轮换的短效凭据名。
+//
+// 这些凭据由客户端（Python）在活跃使用时通过 /RotateCookies 或保活刷新，
+// 因此“客户端是否换过凭据”只需比较客户端自己两次传入的快照。
+var rotatingCredentialNames = []string{
+	"__Secure-1PSIDTS",
+	"__Secure-3PSIDTS",
+	"SIDCC",
+	"__Secure-1PSIDCC",
+	"__Secure-3PSIDCC",
+}
+
+// ExtractRotatingCredentials 从客户端 Cookie 快照中提取滚动凭据的非空值。
+//
+// 返回值是轻量快照，用作该 Worker 冷启动创建时的基线；没有有效滚动凭据时
+// 返回 nil，调用方据此判断“无法轮换检测”。
+func ExtractRotatingCredentials(cookies map[string]string) map[string]string {
+	if len(cookies) == 0 {
+		return nil
+	}
+	snapshot := make(map[string]string, len(rotatingCredentialNames))
+	for _, name := range rotatingCredentialNames {
+		if value := strings.TrimSpace(cookies[name]); value != "" {
+			snapshot[name] = value
+		}
+	}
+	if len(snapshot) == 0 {
+		return nil
+	}
+	return snapshot
+}
+
+// HasClientRotatedCredentials 报告客户端传入的滚动凭据是否已偏离冷启动基线。
+//
+// baseline 是该 Worker 创建时客户端传入的初始滚动凭据快照，incoming 是本次
+// 请求携带的同一份快照。只有客户端主动更新了凭据（例如 403 刷新后先
+// /RotateCookies 再下发新值）才返回 true；Worker 运行期自行从上游响应更新的
+// Cookie 不参与比较，因此并发请求携带同一份旧基线时不会误判回退。
+//
+// incoming 缺失或为空的键不参与比较，避免不完整快照触发无谓重建。
+func HasClientRotatedCredentials(baseline map[string]string, incoming map[string]string) bool {
+	if len(baseline) == 0 {
+		return false
+	}
+	for _, name := range rotatingCredentialNames {
+		previous := baseline[name]
+		if previous == "" {
+			continue
+		}
+		value := strings.TrimSpace(incoming[name])
+		if value == "" {
+			continue
+		}
+		if value != previous {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveAccountKey 优先使用调用方提供的稳定 accountKey，否则回退到 Cookie 哈希。
 //
 // 显式 key 会先做安全校验；回退值由调用方基于 Cookie 计算，保证 mint/rpc/release

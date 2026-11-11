@@ -825,7 +825,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     defaultValue: {},
     recommendedValue: {
       ultra_required: {
-        contains: ['veo', 'ultra'],
+        contains: ['veo', 'ultra', 'carbon'],
         required_tiers: ['Ultra', 'Ultra_20X'],
       },
       pro_required: {
@@ -841,7 +841,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'tags',
     description: '每个规则条目的 contains / prefixes / exact 匹配条件。',
-    explanation: 'contains 为子串匹配，prefixes 为前缀匹配，exact 为归一化后全名精确匹配；三者任一命中即应用该条规则。默认包含 veo/ultra 与 argon/gemini-4/imagen 两组规则。',
+    explanation: 'contains 为子串匹配，prefixes 为前缀匹配，exact 为归一化后全名精确匹配；三者任一命中即应用该条规则。默认包含 veo/ultra/carbon 与 argon/gemini-4/imagen 两组规则。',
     defaultValue: {},
     tags: ['付费模型', '匹配'],
   },
@@ -851,7 +851,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'routing',
     type: 'tags',
     description: '命中该规则时账号必须具备的会员等级列表。',
-    explanation: '例如 veo/ultra 要求 Ultra/Ultra_20X；argon/gemini-4/imagen 要求 Pro 及以上。具体等级随规则条目不同。',
+    explanation: '例如 veo/ultra/carbon 要求 Ultra/Ultra_20X；argon/gemini-4/imagen 要求 Pro 及以上。具体等级随规则条目不同。',
     defaultValue: ['Pro', 'Ultra', 'Ultra_20X'],
     tags: ['付费模型', '会员等级'],
   },
