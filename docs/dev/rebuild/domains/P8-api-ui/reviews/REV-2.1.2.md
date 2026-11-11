@@ -1,10 +1,11 @@
 # REV-2.1.2 — Ultra 提权 / 实例换绑 tier 归一化 / Browserless 403 主动续期与 Go 热 Worker 重建（终审）
 
-- **审查对象**：`2.1.2` 全部工作区改动（3 项修复 + 配套测试 / 前端产物 / changelog）
+- **审查对象**：`2.1.2` 全部工作区改动（3 项修复 + `verify-account` 移动设备验证自动熔断隔离 + 配套测试 / 前端产物 / changelog）
 - **工作区**：`D:\LLM\self_programming\aistudio-api`
 - **基线**：`HEAD = 390d202`（改动均为未提交工作区增量）
 - **审查方式**：独立静态代码审查 + `--ui-debug` 离线沙盒实测 + 全量门禁实跑。
 - **复审轮次**：`REV-2.1.2-R2`（2026-11-11），针对 `P2-1` / `P2-2` / `Q-1` / `Q-2` 四项修复的独立复验，见第五节。
+- **R3 复审**：`REV-2.1.2-R3`（2026-11-11），针对 `verify-account` 移动设备验证风控自动熔断隔离的独立审查，见第七节。
 - **只读声明**：除以下三类操作外，未修改任何业务代码、配置、测试或文档：
   1. 按任务要求对 12 个已改动 Python 文件执行 `uv run ruff format`（其中 6 个仅格式化，无语义变化；已用 `git diff -w` 复核）；
   2. 归档截图 `docs/dev/rebuild/domains/P8-api-ui/reviews/assets/c212-reassign-pro-modal-1440.png`；
@@ -227,3 +228,83 @@
 
 - **P0 = 0 / P1 = 0 / P2 = 0 / Q = 0 / N = 7**
 - **审查结论：PASS**。原 `P2-1`、`P2-2`、`Q-1`、`Q-2` 经 R2 复审确认 100% 修复关闭；全量 Python 门禁、定向 pytest 子集与 Go 单测均通过。`N-7` 为热 Worker 基线的残余性能观察（非正确性缺陷），建议后续迭代评估。
+
+---
+
+## 七、R3 复审记录（2026-11-11，`verify-account` 移动设备验证自动熔断隔离）
+
+- **复审范围**：`src/aistudio_api/domain/errors.py`、`src/aistudio_api/application/routing_pipeline.py`、`src/aistudio_api/application/account_rotator.py`、`src/aistudio_api/application/account_orchestrator.py`、`tests/unit/test_403_auth_refresh.py`，以及 `docs/changelog.md` 的 `[2.1.2]` 增补。
+- **只读声明（R3）**：除写入本报告与 `docs/changelog.md` 的 `[2.1.2]` 章节外，未修改任何业务代码、配置或测试；未启动真实生产服务/真实浏览器，未执行 `git commit` / `git push` / `git tag`。运行时核验使用临时脚本于系统 Temp 目录执行，脚本与临时目录已删除，未落仓库。
+- **基线**：`HEAD = 390d202`，5 个代码/测试文件均为未提交工作区增量。
+
+### 7.1 门禁实跑（R3，Reviewer 亲自执行）
+
+| 门禁命令 | 实际输出 | 结果 |
+|---|---|---|
+| `uv run ruff check .` | `All checks passed!` | **PASS** (exit 0) |
+| `uv run ruff format --check <errors/routing_pipeline/account_rotator/account_orchestrator/test_403_auth_refresh>` | `5 files already formatted` | **PASS** (exit 0) |
+| `uv run pyright src tests` | `0 errors, 0 warnings, 0 informations` | **PASS** (exit 0) |
+| `$env:PYTHONUTF8='1'; uv run pytest -q tests/unit/test_403_auth_refresh.py tests/unit/test_routing_pipeline.py tests/unit/test_account_orchestrator.py` | `53 passed in 0.38s` | **PASS** (exit 0) |
+| `git diff --check` | 无输出 | **PASS** (exit 0) |
+| `git ls-files config.yaml` | 空输出（未跟踪，符合口径） | **PASS** |
+
+### 7.2 逐项审计核验
+
+#### 7.2.1 验证信号识别与 `AuthError.verification_required`
+
+- `errors.py:12-19`：`_ACCOUNT_VERIFICATION_MARKERS` 覆盖 `aistudio.google.com/verify-account`、`aistudio.google.com/verify?`、`must be verified before it can continue using the gemini api`、`must be verified before it can use the gemini api`、`account verification required to restore access`、`free_tier_verification_required`。
+- `errors.py:22-27`：`is_account_verification_required_message()` 先做空值保护，再统一 `lower()` 后做子串匹配，大小写不敏感。
+- `errors.py:30-39`：`AuthError.__init__` 在构造时计算 `verification_required`，因此所有 `AuthError` 子类（含 `SessionExpiredError`）与由 `classify_error` 产生的错误都自动带上该标记。
+- `errors.py:280-283`：`classify_error` 将验证标记判定提前到 grpc 8/429、grpc 16/401、grpc 7/403 之前，覆盖 HTTP 403/400 与 grpc 7/9 等组合。
+- Reviewer 运行时逐条核验（临时脚本，非仓库文件）：`verify-account` URL、`verify?` URL、`must be verified before it can continue...`、`account verification required to restore access`、`free_tier_verification_required` 均返回 `True`；`HTTP 403: WAA denied` 返回 `False`；`classify_error(403/429/400 + 验证消息)` 均返回 `verification_required=True` 的 `AuthError`。
+- 结论：识别逻辑准确，**PASS**（测试覆盖面问题见 `P2-1`、`N-2`）。
+
+#### 7.2.2 `routing_pipeline` 熔断顺序
+
+- `routing_pipeline.py:770-788`：`AuthError` 分支内优先判断 `verification_required`，位于 `tier_allows`（`:789`）与 `_refresh_auth_state`（`:805`）之前，因此不会把验证风控误报为 `TierRequiredError`，也不会发生任何同号重签（0 次 `refresh_auth_state`）。
+- 命中后先 `_record_error("session_expired", ...)` 将账号置为失效（`:774`），再记录明确的 `移动设备验证风控` 错误日志（`:775-783`），最后 `_switch_or_raise(..., reason="verification_required")`（`:786-788`）。
+- `_switch_or_raise` → `_try_rebind`（`:1131-1138`）在 `verification_required` reason 下复用既有请求期换绑逻辑：记录 switch 预算、清理模板缓存、原位换绑到同 lane 的其它账号（`:1081-1098`）。
+- `has_yielded_data=True` 时只记录隔离并抛出异常，不切号（`:784-785`），与既有 `SessionExpiredError` 分支和“已出正文不切号”口径一致。
+- 测试证据 `tests/unit/test_403_auth_refresh.py:462-496`：断言 `outcome == "switch"`、`client.refresh_calls == 0`、`"refresh" not in client.events`、改绑到 `acc-2`、`acc-1` 不可用而 `acc-2` 可用、风控日志恰好 1 条，并断言新请求候选只剩 `acc-2`。
+- 结论：熔断顺序与切号行为符合任务目标，**PASS**。
+
+#### 7.2.3 账号隔离的持续性与恢复路径
+
+- `account_rotator.py:386-400`：`record_session_expired` 将 `session_expired=True`、`auth_cooldown=now+86400` 并计入错误统计。
+- `account_rotator.py:237-259`（`AccountStats.is_available`）：首判 `session_expired` 即返回 `False`；`account_rotator.py:625-637`（`is_account_available`）与 `:639-701`（`select_rebind_account`，`:684-686` 通过 `stats.is_available`）均据此排除该账号。
+- `account_orchestrator.py:52-58`：`session_expired` 事件在携带 `reason` 时会透传给 `record_session_expired(reason=...)`，日志落盘包含 `model/surface/reason`（`account_rotator.py:982-990`）。
+- 恢复路径：`AccountStats.clear_cooldown`（`:402-421`）清零 `session_expired`；管理台批量导入/重新导入 Cookie 后调用 `rotator.add_account + clear_cooldown`（`routes_accounts.py:1301-1304`、`:1384-1386`、`:1583-1586`），`_clear_account_failure_state`（`routes_accounts.py:195-205`）同时清除持久化 `expired` 与 rotator 锁定；`routes_system.py:396-406` 的手动清除锁定同样可恢复。
+- Reviewer 运行时核验（临时脚本）：`record_session_expired("acc-1", reason="verify-account")` 后 `is_account_available("acc-1") == False`、`is_account_available("acc-2") == True`、`select_rebind_account(lane="free", ...)` 返回 `acc-2`；`clear_cooldown("acc-1")` 后恢复 `True` 且 `session_expired=False`。
+- 结论：隔离与恢复闭环成立，**PASS**。
+
+### 7.3 问题清单（R3）
+
+#### P2
+
+1. **验证标记缺少自动化回归覆盖，仅一条消息进入测试。** `tests/unit/test_403_auth_refresh.py` 只使用 `VERIFY_ACCOUNT_MESSAGE`（覆盖 `verify-account` URL 与 `must be verified...`），未覆盖 `aistudio.google.com/verify?`、`account verification required to restore access`、`free_tier_verification_required` 三条标记，也未覆盖仅命中 `must be verified before it can use the gemini api` 的分支。Reviewer 已运行时确认当前实现均命中，但后续改动无回归保护。建议改为参数化用例（5 条正例 + 普通 403 负例）。
+   - **R4 修复：已修复关闭。** `tests/unit/test_403_auth_refresh.py:462-500` 改为 `@pytest.mark.parametrize`：全部 6 条正例（`verify-account`、`verify?project=123`、`...continue using...`、`...use...`、`account verification required to restore access`、`FREE_TIER_VERIFICATION_REQUIRED`）参数化断言 `is True`；`classify_error` 的 grpc 7/403 与 grpc 9/400 组合亦参数化覆盖。
+2. **验证标记判定优先于 429/grpc 8，且隔离为账号级全局生效。** `errors.py:280-283` 在 `grpc_code == 8 or status == 429` 之前返回 `AuthError`，因此任何携带 `free_tier_verification_required` 或验证文案的 429 都会从“额度冷却（到期自动恢复）”升级为“账号 `session_expired` 永久隔离”，且会跨模型/跨 surface 冻结整个账号直到人工清除。当前任务目标即要求账号级隔离，行为符合预期；但若上游未来把验证门收窄到单模型，将造成整号误锁。建议在代码注释/文档中明确这是有意的账号级隔离，或后续按错误详情字段区分模型级与账号级验证。
+   - **R4 修复：已修复关闭。** `domain/errors.py:280-287` 补充明确注释：该分支有意置于 429/401/403 判断之前，命中项目/账号级移动设备验证特征即统一升级为账号级 `session_expired` 熔断隔离，直至人工扫码验证或重置锁定，消除“优先级是否为疏漏”的歧义。
+
+#### Q
+
+1. **`account_orchestrator` 的 `session_expired + reason` 透传分支无单测。** 现有 `tests/unit/test_account_orchestrator.py:36-70` 未传 `reason`，只覆盖 else 分支；本次新增的 `record_session_expired(..., reason=...)` 分支无断言。建议补一条 `reason` 透传断言。
+   - **R4 修复：已修复关闭。** `tests/unit/test_account_orchestrator.py:74-88` 新增 `test_record_rotator_event_forwards_session_expired_reason`，断言 `record_session_expired("acc-1", model="m", surface="chat", reason="verify-account")` 被精确调用。
+2. **`is_account_verification_required_message` 假定入参为 `str`。** `errors.py:26` 直接调用 `text.lower()`；若未来出现 `AuthError(exc)` 之类非字符串入参将抛 `AttributeError`。当前全部调用点为 `str` 且 `pyright` 通过，属防御性加固建议（加 `isinstance(text, str)` 或 `str(text)`）。
+   - **R4 修复：已修复关闭。** `domain/errors.py:22-27` 签名改为 `text: object`，首行 `if not isinstance(text, str) or not text: return False`；回归 `tests/unit/test_403_auth_refresh.py` 参数化 `None` / `123` 入参断言返回 `False`，不再抛异常。
+
+#### N
+
+1. 本次 diff 含纯格式化 hunk（`account_rotator.py` 5 处折行、`account_orchestrator.py` 1 处、`AccountStats.from_dict` 1 处），无行为变化。
+2. `verify?` 仅在域名限定形式（`aistudio.google.com/verify?`）下命中；裸 `verify?`（无域名）不被识别。Reviewer 运行时实测确认，当前上游报错均携带完整域名 URL，不构成缺陷。
+3. `reason` 经 `_summarize_error` 截断至 160 字符（`routing_pipeline.py:331-347`），日志中的完整验证 URL 可能被截断；`verification_required` 分类在异常构造阶段已完成，不受截断影响。
+4. `has_yielded_data=True` 时只写入 `session_expired` 并抛出，不切号、不清模板，与既有 `SessionExpiredError` 分支一致（遵守“已出正文不切号”），账号仍被隔离。
+5. `countTokens` 走 `record_attempts=False`，`_record_error` 不落账，因此该类请求命中验证风控时不会立即隔离账号，需等下一次生成请求触发。
+6. `classify_error` 的验证判定在 `parse_upstream_grpc_error` 之后使用 `clean_msg`；若结构化报文的验证文案只出现在原始 `body` 而未被解析进 `msg`，可能漏判（`clean_msg` 会回退到 `body[:200]`，超长报文截断后仍可能漏判）。属边界观察，建议后续如需可改为同时对原始 `body` 做匹配。
+   - **R4 修复：已修复关闭。** `domain/errors.py:282-287` 改为 `is_account_verification_required_message(clean_msg) or is_account_verification_required_message(body)`；回归 `tests/unit/test_403_auth_refresh.py::test_classify_error_detects_marker_beyond_truncated_clean_msg` 构造 300 字符非标准前缀 + `FREE_TIER_VERIFICATION_REQUIRED`，断言仍返回 `verification_required=True` 的 `AuthError`。
+
+### 7.4 最终判定（R3，经 R4 清零）
+
+- **P0 = 0 / P1 = 0 / P2 = 0 / Q = 0 / N = 5**（原 R3 的 `P2-1`、`P2-2`、`Q-1`、`Q-2`、`N-6` 均已修复关闭）
+- **审查结论：PASS**。`verify-account` 移动设备验证风控的识别、跳过 `tier_allows`/同号重签、`session_expired` 账号级隔离、请求期换绑切号与后续调度排除均与任务目标一致；管理台重新导入凭据/清除锁定可恢复。定向 pytest、lint、format、pyright、`git diff --check` 与 `git ls-files config.yaml` 全部通过；无 P0/P1 阻断项。
+- **R4 门禁实跑**：`uv run ruff format`（3 个文件）、`uv run ruff check .`、`uv run pyright src tests`、`uv run pytest -q tests/unit/test_403_auth_refresh.py tests/unit/test_account_orchestrator.py tests/unit/test_routing_pipeline.py`、`git diff --check` 全部通过。

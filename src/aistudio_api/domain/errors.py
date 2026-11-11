@@ -9,8 +9,34 @@ class AistudioError(Exception):
     pass
 
 
+_ACCOUNT_VERIFICATION_MARKERS: tuple[str, ...] = (
+    "aistudio.google.com/verify-account",
+    "aistudio.google.com/verify?",
+    "must be verified before it can continue using the gemini api",
+    "must be verified before it can use the gemini api",
+    "account verification required to restore access",
+    "free_tier_verification_required",
+)
+
+
+def is_account_verification_required_message(text: object) -> bool:
+    """识别 Google 移动设备账号验证（verify-account）风控报错。"""
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _ACCOUNT_VERIFICATION_MARKERS)
+
+
 class AuthError(AistudioError):
-    pass
+    """认证/鉴权失败。
+
+    ``verification_required`` 为 True 表示上游要求完成 Google 移动设备账号
+    验证（verify-account 风控）；此类账号必须立即隔离切号，禁止同号重签重试。
+    """
+
+    def __init__(self, message: str = "") -> None:
+        self.verification_required = is_account_verification_required_message(message)
+        super().__init__(message)
 
 
 class SessionExpiredError(AuthError):
@@ -251,6 +277,13 @@ def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
 def classify_error(status: int, body: str) -> AistudioError:
     grpc_code, msg = parse_upstream_grpc_error(body)
     clean_msg = msg or body[:200]
+    # 该分支有意置于 429/401/403 判断之前：一旦报文携带项目/账号级移动设备
+    # 验证特征（含结构化解析截断后仅原始 body 仍保留特征的情况），统一升级为
+    # 账号级 session_expired 熔断隔离，直至人工扫码验证或重置锁定。
+    if is_account_verification_required_message(
+        clean_msg
+    ) or is_account_verification_required_message(body):
+        return AuthError(f"禁止访问(需验证账号): {clean_msg}")
     if grpc_code == 8 or status == 429:
         return UsageLimitExceeded(f"配额用完: {clean_msg}")
     if grpc_code == 16 or status == 401:

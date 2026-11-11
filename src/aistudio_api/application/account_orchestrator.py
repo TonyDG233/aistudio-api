@@ -34,9 +34,7 @@ def record_rotator_event(
         return
 
     if event == "success":
-        rotator.record_success(
-            account_id, model=model, usage=usage, surface=surface
-        )
+        rotator.record_success(account_id, model=model, usage=usage, surface=surface)
     elif event == "rate_limited":
         if reason:
             rotator.record_rate_limited(
@@ -52,7 +50,12 @@ def record_rotator_event(
         else:
             rotator.record_auth_error(account_id, model=model, surface=surface)
     elif event == "session_expired":
-        rotator.record_session_expired(account_id, model=model, surface=surface)
+        if reason:
+            rotator.record_session_expired(
+                account_id, model=model, surface=surface, reason=reason
+            )
+        else:
+            rotator.record_session_expired(account_id, model=model, surface=surface)
     elif event == "error":
         rotator.record_error(account_id, model=model, surface=surface)
 

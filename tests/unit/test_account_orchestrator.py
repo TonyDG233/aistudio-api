@@ -66,8 +66,21 @@ def test_record_rotator_event_maps_all_outcomes() -> None:
     rotator.record_session_expired.assert_called_once_with(
         "acc-1", model="m", surface="chat"
     )
-    rotator.record_error.assert_called_once_with(
-        "acc-1", model="m", surface="chat"
+    rotator.record_error.assert_called_once_with("acc-1", model="m", surface="chat")
+
+
+def test_record_rotator_event_forwards_session_expired_reason() -> None:
+    rotator = MagicMock(spec=AccountRotator)
+    record_rotator_event(
+        "session_expired",
+        account_id="acc-1",
+        model="m",
+        surface="chat",
+        reason="verify-account",
+        rotator=rotator,
+    )
+    rotator.record_session_expired.assert_called_once_with(
+        "acc-1", model="m", surface="chat", reason="verify-account"
     )
 
 

@@ -8,9 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from aistudio_api.application.account_rotator import AccountRotator
 from aistudio_api.application.routing_pipeline import RoutingPipeline
-from aistudio_api.domain.errors import AuthError
+from aistudio_api.domain.errors import (
+    AuthError,
+    classify_error,
+    is_account_verification_required_message,
+)
 from aistudio_api.infrastructure.account import cookie_parser
+from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
 from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
@@ -395,3 +401,140 @@ async def test_403_switch_rebind_path_logs_one_clear_at_most(
     assert outcome == "switch"
     assert manager.reassign_calls == [("inst-1", "acc-2")]
     assert _log_count(caplog, CLEARED_TEMPLATES_LOG) == 1
+
+
+class _AccountsStore:
+    """Minimal AccountStore surface consumed by ``AccountRotator``."""
+
+    def __init__(self, accounts: list[AccountMeta]) -> None:
+        self._accounts = {account.id: account for account in accounts}
+
+    def list_accounts(self) -> list[AccountMeta]:
+        return list(self._accounts.values())
+
+    def get_account(self, account_id: str) -> AccountMeta | None:
+        return self._accounts.get(account_id)
+
+    def get_auth_path_optional(
+        self, account_id: str, *, require_exists: bool = False
+    ) -> object | None:
+        del require_exists
+        return object() if account_id in self._accounts else None
+
+
+def _make_account(account_id: str) -> AccountMeta:
+    return AccountMeta(
+        id=account_id,
+        name=account_id,
+        email=None,
+        created_at="2026-01-01T00:00:00Z",
+        tier="Free",
+    )
+
+
+VERIFY_ACCOUNT_MESSAGE = (
+    "Your account must be verified before it can continue using the Gemini API. "
+    "Verify your account at https://aistudio.google.com/verify-account."
+)
+
+
+def test_classify_error_marks_mobile_verification_required() -> None:
+    exc = classify_error(
+        403,
+        f'[[null, [7, "{VERIFY_ACCOUNT_MESSAGE}"]]]',
+    )
+
+    assert isinstance(exc, AuthError)
+    assert exc.verification_required is True
+    assert "需验证账号" in str(exc)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://aistudio.google.com/verify-account",
+        "https://aistudio.google.com/verify?project=123",
+        "Your account must be verified before it can continue using the Gemini API",
+        "Your account must be verified before it can use the Gemini API",
+        "Unusual account activity. Account verification required to restore access",
+        "FREE_TIER_VERIFICATION_REQUIRED",
+    ],
+)
+def test_is_account_verification_required_message_matches_all_markers(
+    text: str,
+) -> None:
+    assert is_account_verification_required_message(text) is True
+
+
+@pytest.mark.parametrize("text", [None, 123])
+def test_is_account_verification_required_message_rejects_non_str(text: object) -> None:
+    assert is_account_verification_required_message(text) is False
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (403, f'[[null, [7, "{VERIFY_ACCOUNT_MESSAGE}"]]]'),
+        (400, f'[[null, [9, "{VERIFY_ACCOUNT_MESSAGE}"]]]'),
+    ],
+)
+def test_classify_error_marks_verification_across_grpc_and_http(
+    status: int, body: str
+) -> None:
+    exc = classify_error(status, body)
+
+    assert isinstance(exc, AuthError)
+    assert exc.verification_required is True
+
+
+def test_classify_error_detects_marker_beyond_truncated_clean_msg() -> None:
+    body = ("x" * 300) + " FREE_TIER_VERIFICATION_REQUIRED"
+
+    exc = classify_error(403, body)
+
+    assert isinstance(exc, AuthError)
+    assert exc.verification_required is True
+
+
+def test_plain_auth_error_does_not_require_verification() -> None:
+    assert AuthError("HTTP 403: WAA denied").verification_required is False
+    plain = classify_error(403, "WAA denied")
+    assert isinstance(plain, AuthError)
+    assert plain.verification_required is False
+
+
+@pytest.mark.asyncio
+async def test_verification_required_isolates_account_without_same_account_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _AccountsStore([_make_account("acc-1"), _make_account("acc-2")])
+    rotator = AccountRotator(store)  # type: ignore[arg-type]
+    client = _TrackingClient(refresh_result=True)
+    manager = RebindFakeManager([make_instance("inst-1", account_id="acc-1", number=1)])
+    context = make_context(manager.instances, max_switches=2)
+    attempt = make_attempt(client, tier="Free")
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=rotator,
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+
+    assert outcome == "switch"
+    assert client.refresh_calls == 0
+    assert "refresh" not in client.events
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+    assert rotator.is_account_available("acc-1") is False
+    assert rotator.is_account_available("acc-2") is True
+    assert _log_count(caplog, "移动设备验证风控") == 1
+
+    # A brand-new request must not touch the isolated account again.
+    next_context = await pipeline.begin(model_path="gemini-3.7-flash")
+    assert [candidate.account_id for candidate in next_context.candidates] == ["acc-2"]
