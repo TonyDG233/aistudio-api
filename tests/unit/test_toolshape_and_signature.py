@@ -45,8 +45,14 @@ def test_pure_text_request_emits_no_toolshape(caplog):
     assert _toolshape_logs(caplog) == []
 
 
-def test_tool_request_emits_toolshape_and_redacts_text(caplog):
+def test_toolshape_suppressed_at_info_level(caplog):
     caplog.set_level("INFO")
+    normalize_gemini_request(_tool_request(), "gemini-3.7-flash")
+    assert _toolshape_logs(caplog) == []
+
+
+def test_tool_request_emits_toolshape_and_redacts_text(caplog):
+    caplog.set_level("DEBUG")
     secret = "SECRET_ARGUMENT_VALUE"
     req = GeminiGenerateContentRequest.model_validate(
         {
@@ -74,7 +80,7 @@ def test_tool_request_emits_toolshape_and_redacts_text(caplog):
 
 @pytest.mark.asyncio
 async def test_retry_does_not_duplicate_toolshape(caplog):
-    caplog.set_level("INFO")
+    caplog.set_level("DEBUG")
     calls = 0
 
     async def fake_generate(**_kwargs):

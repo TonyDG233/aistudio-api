@@ -17,6 +17,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from aistudio_api.application.account_rotator import AccountRotator
 from aistudio_api.application.instance_manager import InstanceManager
 from aistudio_api.application.routing_pipeline import RouteAttempt, RoutingPipeline
 from aistudio_api.domain.errors import AuthError, SessionExpiredError
@@ -255,6 +256,42 @@ async def test_session_stream_maps_login_state_failure(tmp_path: Path) -> None:
                 body="[]", url="https://x"
             )
         ]
+
+
+def _isolated_login_state_error() -> SignerAuthError:
+    return SignerAuthError(
+        "waa-signer mint 登录态失效 (status=502)",
+        status_code=502,
+        reason=(
+            "初始化 SpiderMonkey WAA Worker 失败: 隔离登录态失效 "
+            "url=https://accounts.google.com/servicelogin"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_maps_502_isolated_login_state_to_session_expired(
+    tmp_path: Path,
+) -> None:
+    session = _session(
+        _RaisingSigner(_isolated_login_state_error()),
+        _auth_file(tmp_path, "isolated"),
+    )
+    with pytest.raises(SessionExpiredError):
+        await session.generate_snapshot([AistudioContent.from_user_prompt("hi")])
+    assert session.session_expired is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_state_surfaces_root_session_expired(
+    tmp_path: Path,
+) -> None:
+    session = _session(
+        _RaisingSigner(_isolated_login_state_error()),
+        _auth_file(tmp_path, "refresh-expired"),
+    )
+    assert await session.refresh_auth_state() is False
+    assert session.session_expired is True
 
 
 # ------------------------------------------------------- routing + real pool
@@ -506,13 +543,13 @@ async def test_mint_login_state_failure_rebinds_to_healthy_account(
         assert switches == 1
         assert _current_account(manager) == _HEALTHY
         assert old_session.is_alive() is False
-        # refresh_auth_state drops the hot worker, then the rebind closes it.
-        assert signer.released == [_OLD, _OLD]
+        # 502 isolated-login-state is terminal: no same-account refresh attempt.
+        assert signer.released == [_OLD]
         assert rotator.rebind_exclusions
         healthy_slot = manager.ready_slot_for_account(_HEALTHY)
         assert healthy_slot is not None
         assert healthy_slot.session is not old_session
-        assert signer.mint_calls.count(_OLD) == 2  # initial failure + refresh fail
+        assert signer.mint_calls.count(_OLD) == 1
         assert _HEALTHY in signer.mint_calls
     finally:
         await manager.close_all()
@@ -571,5 +608,170 @@ async def test_second_rpc_403_rebinds_after_same_account_refresh(
         healthy_slot = manager.ready_slot_for_account(_HEALTHY)
         assert healthy_slot is not None
         assert healthy_slot.session is not old_session
+    finally:
+        await manager.close_all()
+
+
+# ------------------------------------------------ same-anchor group isolation
+
+_SHARED_U0 = "acc-shared-u0"
+_SHARED_U1 = "acc-shared-u1"
+_INDEPENDENT = "acc-independent"
+
+
+class _GroupSignerPool:
+    """Expired root session for every same-anchor sibling, healthy independent."""
+
+    def __init__(self, expired: set[str]) -> None:
+        self.expired = expired
+        self.mint_calls: list[str] = []
+        self.rpc_calls: list[str] = []
+        self.released: list[str] = []
+        self.rpc_body = _FIXTURE.read_bytes()
+
+    async def mint_proof(self, **kwargs: object) -> MintProofResult:
+        key = str(kwargs.get("account_key") or "")
+        self.mint_calls.append(key)
+        if key in self.expired:
+            raise _isolated_login_state_error()
+        return MintProofResult(ok=True, proof="!proof", account_key=key, latency_ms=1.0)
+
+    async def send_rpc(self, **kwargs: object) -> RpcResult:
+        key = str(kwargs.get("account_key") or "")
+        self.rpc_calls.append(key)
+        if key in self.expired:
+            raise _isolated_login_state_error()
+        return RpcResult(status=200, body=self.rpc_body, account_key=key)
+
+    async def stream_rpc(
+        self, **kwargs: object
+    ) -> AsyncGenerator[tuple[str, object], None]:
+        result = await self.send_rpc(**kwargs)
+        yield ("status", result.status)
+        yield ("chunk", result.body)
+
+    async def release_worker(
+        self, *, account_key: str | None = None, release_all: bool = False
+    ) -> dict[str, object]:
+        if account_key:
+            self.released.append(account_key)
+        return {"ok": True, "all": release_all}
+
+    async def close(self) -> None:
+        return None
+
+
+def _shared_storage_state(sapisid: str, sid: str) -> dict[str, object]:
+    return {
+        "cookies": [
+            {
+                "name": "SAPISID",
+                "value": sapisid,
+                "domain": ".google.com",
+                "path": "/",
+            },
+            {
+                "name": "SID",
+                "value": sid,
+                "domain": ".google.com",
+                "path": "/",
+            },
+        ],
+        "origins": [],
+    }
+
+
+def _group_store(tmp_path: Path) -> AccountStore:
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    store.save_account(
+        name="u0",
+        email="u0@example.com",
+        storage_state=_shared_storage_state("shared-anchor", "shared-sid"),
+        account_id=_SHARED_U0,
+        auth_user="0",
+        tier="Pro",
+    )
+    store.save_account(
+        name="u1",
+        email="u1@example.com",
+        storage_state=_shared_storage_state("shared-anchor", "shared-sid"),
+        account_id=_SHARED_U1,
+        auth_user="1",
+        tier="Pro",
+    )
+    store.save_account(
+        name="independent",
+        email="independent@example.com",
+        storage_state=_shared_storage_state("independent-anchor", "independent-sid"),
+        account_id=_INDEPENDENT,
+        auth_user="0",
+        tier="Pro",
+    )
+    store.set_active_account(_SHARED_U0)
+    return store
+
+
+async def _group_manager(
+    tmp_path: Path, signer: _GroupSignerPool
+) -> tuple[InstanceManager, RoutingPipeline, AccountRotator]:
+    store = _group_store(tmp_path)
+    runtime = BrowserlessEngineRuntime(
+        {
+            "mode": "browserless",
+            "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
+            "transport": {"mode": "signer_rpc"},
+        },
+        signer_client=cast("Any", signer),
+    )
+    pool = InstancePool(
+        cast(Any, _no_cdp),
+        specs=[InstanceSpec(count=1, surface="chat", min_tier="Pro")],
+        max_contexts=2,
+        engine_runtime=runtime,
+        engine="browserless",
+    )
+    manager = InstanceManager(pool, store)
+    await manager.startup()
+    rotator = AccountRotator(store)
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=rotator,
+        routing_settings_provider=lambda: {
+            "max_switches": 3,
+            "retry_same_delay_sec": 0,
+        },
+    )
+    return manager, pipeline, rotator
+
+
+@pytest.mark.asyncio
+async def test_session_expired_isolates_same_anchor_group_and_rebinds_once(
+    tmp_path: Path,
+) -> None:
+    signer = _GroupSignerPool({_SHARED_U0, _SHARED_U1})
+    manager, pipeline, rotator = await _group_manager(tmp_path, signer)
+    try:
+        old_slot = manager.ready_slot_for_account(_SHARED_U0)
+        assert old_slot is not None
+        old_session = old_slot.session
+        assert isinstance(old_session, BrowserlessSession)
+
+        output, switches = await _generate_with_routing(pipeline)
+
+        assert output.candidates and output.candidates[0].text
+        # The dead sibling must never get a mint attempt: one rebind, one switch.
+        assert switches == 1
+        assert _current_account(manager) == _INDEPENDENT
+        assert signer.mint_calls.count(_SHARED_U0) == 1
+        assert _SHARED_U1 not in signer.mint_calls
+        assert _INDEPENDENT in signer.mint_calls
+        shared_u0_stats = rotator.get_account_stats(_SHARED_U0)
+        shared_u1_stats = rotator.get_account_stats(_SHARED_U1)
+        independent_stats = rotator.get_account_stats(_INDEPENDENT)
+        assert shared_u0_stats is not None and shared_u0_stats.session_expired is True
+        assert shared_u1_stats is not None and shared_u1_stats.session_expired is True
+        assert (
+            independent_stats is not None and independent_stats.session_expired is False
+        )
     finally:
         await manager.close_all()

@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import httpx
 import pytest
 
+from aistudio_api.domain.errors import SessionExpiredError
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
-from aistudio_api.infrastructure.waa.browserless_session import BrowserlessSession
-from aistudio_api.infrastructure.waa.signer_client import MintProofResult, RpcResult
+from aistudio_api.infrastructure.waa.browserless_session import (
+    BrowserlessSession,
+    _map_signer_auth_error,
+)
+from aistudio_api.infrastructure.waa.signer_client import (
+    MintProofResult,
+    RpcResult,
+    SignerAuthError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -656,3 +665,155 @@ async def test_expires_minus_one_is_session_cookie_not_tombstone(
     await session.send_hooked_request(body="[]", url="https://x")
     assert await session.save_current_cookies() is True
     assert _auth_cookies(auth)["SESSION"] == "new-value"
+
+
+def test_isolated_login_state_502_maps_to_session_expired() -> None:
+    exc = SignerAuthError(
+        "waa-signer mint 登录态失效 (status=502)",
+        status_code=502,
+        reason=(
+            "初始化 SpiderMonkey WAA Worker 失败: 隔离登录态失效 "
+            "url=https://accounts.google.com/servicelogin"
+        ),
+    )
+    mapped = _map_signer_auth_error(exc)
+    assert isinstance(mapped, SessionExpiredError)
+    assert "隔离登录态失效" in str(mapped)
+
+
+@pytest.mark.parametrize("marker", ["缺少登录 cookie", "需要重新登录", "请重新登录"])
+def test_missing_login_cookie_markers_map_to_session_expired(marker: str) -> None:
+    exc = SignerAuthError(
+        "waa-signer rpc 登录态失效 (status=502)",
+        status_code=502,
+        reason=f"WAA 冷 Worker 拒绝: {marker}",
+    )
+    mapped = _map_signer_auth_error(exc)
+    assert isinstance(mapped, SessionExpiredError)
+
+
+def test_non_expired_auth_reason_keeps_same_account_resign_path() -> None:
+    exc = SignerAuthError(
+        "waa-signer rpc 拒绝 (status=403)",
+        status_code=403,
+        reason="waa denied: request rejected",
+    )
+    mapped = _map_signer_auth_error(exc)
+    assert not isinstance(mapped, SessionExpiredError)
+
+
+def _write_account_auth(
+    accounts_dir: Path, account_id: str, *, sapisid: str, sid: str
+) -> Path:
+    account_dir = accounts_dir / account_id
+    account_dir.mkdir(parents=True, exist_ok=True)
+    path = account_dir / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "SAPISID",
+                        "value": sapisid,
+                        "domain": ".google.com",
+                        "path": "/",
+                    },
+                    {
+                        "name": "SID",
+                        "value": sid,
+                        "domain": ".google.com",
+                        "path": "/",
+                    },
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.asyncio
+async def test_save_current_cookies_syncs_same_anchor_siblings_and_reloads(
+    tmp_path: Path,
+) -> None:
+    accounts_dir = tmp_path / "accounts"
+    accounts_dir.mkdir()
+    (accounts_dir / "registry.json").write_text(
+        json.dumps({"accounts": {}, "active_account_id": None}), encoding="utf-8"
+    )
+    u0_auth = _write_account_auth(
+        accounts_dir, "acc_u0", sapisid="shared-anchor", sid="sid-u0"
+    )
+    u1_auth = _write_account_auth(
+        accounts_dir, "acc_u1", sapisid="shared-anchor", sid="sid-u1"
+    )
+
+    signer_a = FakeSigner()
+    signer_a.rpc_set_cookies = [
+        {
+            "name": "__Secure-1PSIDTS",
+            "value": "ts-new",
+            "domain": ".google.com",
+            "path": "/",
+        },
+        {"name": "SIDCC", "value": "sidcc-new", "domain": ".google.com", "path": "/"},
+    ]
+    session_a = _session(signer_a, u0_auth, account_id="acc_u0")
+
+    signer_b = FakeSigner()
+    session_b = _session(signer_b, u1_auth, account_id="acc_u1")
+
+    await session_a.send_hooked_request(body="[]", url="https://x")
+    assert await session_a.save_current_cookies() is True
+
+    u1_cookies = _auth_cookies(u1_auth)
+    assert u1_cookies["__Secure-1PSIDTS"] == "ts-new"
+    assert u1_cookies["SIDCC"] == "sidcc-new"
+    # Non-rotating identity cookies stay per-account.
+    assert u1_cookies["SID"] == "sid-u1"
+
+    stat = u1_auth.stat()
+    if stat.st_mtime_ns == session_b._last_loaded_mtime_ns:
+        os.utime(u1_auth, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000))
+
+    await session_b.generate_snapshot([AistudioContent.from_user_prompt("hi")])
+    minted = json.loads(str(signer_b.mints[-1]["cookies"]))
+    minted_map = {cookie["name"]: cookie["value"] for cookie in minted["cookies"]}
+    assert minted_map["__Secure-1PSIDTS"] == "ts-new"
+    assert minted_map["SIDCC"] == "sidcc-new"
+
+
+@pytest.mark.asyncio
+async def test_sibling_sync_skips_older_rotating_cookie_expiry(tmp_path: Path) -> None:
+    accounts_dir = tmp_path / "accounts"
+    accounts_dir.mkdir()
+    (accounts_dir / "registry.json").write_text(
+        json.dumps({"accounts": {}, "active_account_id": None}), encoding="utf-8"
+    )
+    u0_auth = _write_account_auth(
+        accounts_dir, "acc_u0", sapisid="shared-anchor", sid="sid-u0"
+    )
+    u1_auth = _write_account_auth(
+        accounts_dir, "acc_u1", sapisid="shared-anchor", sid="sid-u1"
+    )
+    _append_cookie(u1_auth, "__Secure-1PSIDTS", "ts-newer", expires=2000)
+
+    signer = FakeSigner()
+    signer.rpc_set_cookies = [
+        {
+            "name": "__Secure-1PSIDTS",
+            "value": "ts-older",
+            "domain": ".google.com",
+            "path": "/",
+            "expires": 1000,
+        }
+    ]
+    session = _session(signer, u0_auth, account_id="acc_u0")
+
+    await session.send_hooked_request(body="[]", url="https://x")
+    assert await session.save_current_cookies() is True
+
+    assert _auth_cookies(u0_auth)["__Secure-1PSIDTS"] == "ts-older"
+    # A stale slot must not roll back a sibling that already holds a newer copy.
+    assert _auth_cookies(u1_auth)["__Secure-1PSIDTS"] == "ts-newer"

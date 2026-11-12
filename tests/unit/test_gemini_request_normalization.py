@@ -1105,7 +1105,7 @@ def test_pg04_toolshape_diagnostic_redacts_plaintext_values(caplog):
         }
     )
 
-    caplog.set_level(logging.INFO, logger="aistudio.application.chat_service")
+    caplog.set_level(logging.DEBUG, logger="aistudio.application.chat_service")
     normalize_gemini_request(req, "gemini-3.7-flash")
 
     messages = [
@@ -1120,3 +1120,12 @@ def test_pg04_toolshape_diagnostic_redacts_plaintext_values(caplog):
     assert "has_signature" in joined
     assert "schema_key" in joined
     assert "parameters" in joined
+
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="aistudio.application.chat_service")
+    normalize_gemini_request(req, "gemini-3.7-flash")
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "[toolshape]" in record.getMessage()
+    ]

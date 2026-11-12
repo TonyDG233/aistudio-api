@@ -86,7 +86,7 @@ def _finish_frame() -> str:
 async def test_pg_toolcall_preset_shape_end_to_end_harness(caplog) -> None:
     req = _build_preset_request()
 
-    caplog.set_level(logging.INFO, logger="aistudio.application.chat_service")
+    caplog.set_level(logging.DEBUG, logger="aistudio.application.chat_service")
     normalized = normalize_gemini_request(req, "gemini-3.7-flash")
 
     # --- 1. normalize -> part wire: dummy signature at 14, Struct at 11 ----
@@ -113,6 +113,15 @@ async def test_pg_toolcall_preset_shape_end_to_end_harness(caplog) -> None:
     assert PROMPT_TEXT not in toolshape_log
     assert ARG_VALUE not in toolshape_log
     assert RESPONSE_TEXT not in toolshape_log
+
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="aistudio.application.chat_service")
+    normalize_gemini_request(req, "gemini-3.7-flash")
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "[toolshape]" in record.getMessage()
+    ]
 
     # --- 2. normalize -> modify_body wire body -----------------------------
     modified_body = modify_body(
