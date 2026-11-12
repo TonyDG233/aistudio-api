@@ -27,7 +27,10 @@ from aistudio_api.domain.errors import (
     SessionExpiredError,
 )
 from aistudio_api.domain.model_access import tier_header_value
-from aistudio_api.infrastructure.account.account_store import write_storage_state
+from aistudio_api.infrastructure.account.account_store import (
+    sync_sibling_storage_state_files,
+    write_storage_state,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
     apply_set_cookies,
     calculate_sapisid_hash,
@@ -71,20 +74,39 @@ _BASE_HEADERS: dict[str, str] = {
 _COOKIE_DROP_HEADERS = frozenset({"host", "content-length", "cookie", "authorization"})
 _ACCOUNT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
+_EXPIRED_REASON_MARKERS: tuple[str, ...] = (
+    "隔离登录态失效",
+    "登录态失效",
+    "session expired",
+    "authentication required",
+    "servicelogin",
+    "url=https://accounts.google.com",
+    "缺少登录 cookie",
+    "需要重新登录",
+    "请重新登录",
+)
+
 
 def _map_signer_auth_error(exc: SignerAuthError) -> AuthError:
     """Translate a signer login-state denial into a routing-visible error.
 
     The original signer status and bounded server reason are preserved in the
-    message so routing logs/rotator events stay actionable. 401 is a definite
-    expired session; a 403/WAA denial keeps the first-attempt same-account
-    re-sign path.
+    message so routing logs/rotator events stay actionable.  A 401, or any
+    reason carrying an explicit dead-login-state / login-page-redirect marker
+    (cold WAA worker, missing login cookie, ``accounts.google.com`` redirect),
+    is terminal: it returns ``SessionExpiredError`` and never enters the
+    same-account re-sign path.  Every other 403/502 signer auth denial keeps
+    the first-attempt same-account re-sign path via ``AuthError``.
     """
     reason = exc.reason or str(exc)
     message = (
         f"browserless 登录态失效 (status={exc.status_code or 'unknown'}): {reason}"
     )
-    if exc.status_code == 401:
+    lowered = reason.lower()
+    expired = exc.status_code == 401 or any(
+        marker in lowered for marker in _EXPIRED_REASON_MARKERS
+    )
+    if expired:
         return SessionExpiredError(message)
     return AuthError(message)
 
@@ -270,6 +292,8 @@ class BrowserlessSession:
         self.last_proof_latency_ms: float | None = None
         self._in_flight = 0
         self._closed = False
+        self._session_expired = False
+        self._last_loaded_mtime_ns = 0
         self._storage_state: dict[str, object] = {
             "cookies": [],
             "origins": [],
@@ -302,6 +326,11 @@ class BrowserlessSession:
     @property
     def in_flight_count(self) -> int:
         return self._in_flight
+
+    @property
+    def session_expired(self) -> bool:
+        """True when the root Google login state was confirmed dead."""
+        return self._session_expired
 
     @property
     def account_key(self) -> str:
@@ -351,6 +380,7 @@ class BrowserlessSession:
     # -------------------------------------------------------------- lifecycle
 
     def _load_storage_state(self) -> None:
+        self._last_loaded_mtime_ns = self._auth_file_mtime_ns()
         if not self._auth_file:
             return
         path = Path(self._auth_file)
@@ -379,6 +409,66 @@ class BrowserlessSession:
         self._cookies = [
             cookie for cookie in self._cookies if not _cookie_expired(cookie, now)
         ]
+
+    def _auth_file_mtime_ns(self) -> int:
+        if not self._auth_file:
+            return 0
+        try:
+            return Path(self._auth_file).stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def _reload_if_changed(self) -> None:
+        """Pick up rolling credentials refreshed by a same-anchor sibling slot.
+
+        Multi-login sub-accounts (``u/0..u/N``) share one root browser session;
+        when the sibling owning the live slot rotates ``__Secure-1PSIDTS`` /
+        ``SIDCC`` and persists them, this slot must reload the file before the
+        next mint/rpc instead of sending the stale jar.  Pending Set-Cookie
+        updates already received by this session are re-applied on top.
+        """
+        if not self._auth_file:
+            return
+        mtime = self._auth_file_mtime_ns()
+        if not mtime or mtime == self._last_loaded_mtime_ns:
+            return
+        pending: list[dict[str, object]] = [
+            *self._mint_updates,
+            *self._rpc_set_cookies,
+        ]
+        self._load_storage_state()
+        if pending:
+            self._cookies = _merge_cookies(self._cookies, pending)
+        log.info(
+            "browserless 检测到同源兄弟凭据更新，已重新加载 auth.json realm=%s",
+            self._realm_id,
+        )
+
+    def _raise_signer_auth_error(self, exc: SignerAuthError) -> AuthError:
+        mapped = _map_signer_auth_error(exc)
+        if isinstance(mapped, SessionExpiredError):
+            self._mark_root_session_expired()
+        return mapped
+
+    def _mark_root_session_expired(self) -> None:
+        """Flag the root login state dead and isolate its same-anchor siblings."""
+        self._session_expired = True
+        if not self._auth_file or not self._account_id:
+            return
+        try:
+            accounts_dir = Path(self._auth_file).resolve().parent.parent
+            if not (accounts_dir / "registry.json").is_file():
+                return
+            from aistudio_api.infrastructure.account.account_store import AccountStore
+
+            store = AccountStore(accounts_dir)
+            store.mark_session_expired_group(self._account_id)
+        except Exception as exc:
+            log.warning(
+                "browserless 标记同源会话失效失败 realm=%s: %s",
+                self._realm_id,
+                exc,
+            )
 
     def _cookie_text(self) -> str:
         return json.dumps(
@@ -446,6 +536,7 @@ class BrowserlessSession:
         del timeout_s
         if self._closed:
             raise RuntimeError(f"browserless session {self._realm_id} is closed")
+        self._reload_if_changed()
         if not self._has_sapisid():
             raise RuntimeError(
                 f"browserless session {self._realm_id} has no SAPISID cookie"
@@ -462,6 +553,7 @@ class BrowserlessSession:
         prompt = " ".join(build_snapshot_hash_parts(contents))
         content_hash = sha256(prompt.encode("utf-8")).hexdigest()
         page_prompt = _last_text_part(contents) or prompt
+        self._reload_if_changed()
         async with self._snapshot_lock:
             now = time.monotonic()
             warmup = should_warm_snapshot(
@@ -485,11 +577,12 @@ class BrowserlessSession:
                     account_key=self.stable_account_key,
                 )
             except SignerAuthError as exc:
-                raise _map_signer_auth_error(exc) from exc
+                raise self._raise_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise RuntimeError(f"browserless proof mint failed: {exc}") from exc
             if not result.proof:
                 raise RuntimeError("browserless proof mint returned empty proof")
+            self._session_expired = False
             self._mint = result
             mint_updates = self._apply_cookie_payload(
                 result.set_cookies, result.deleted_cookies
@@ -547,11 +640,25 @@ class BrowserlessSession:
                 proxy=self._proxy,
                 account_key=self.stable_account_key,
             )
+        except SignerAuthError as exc:
+            mapped = self._raise_signer_auth_error(exc)
+            if isinstance(mapped, SessionExpiredError):
+                log.error(
+                    "browserless 刷新鉴权发现根登录态失效 realm=%s: %s",
+                    self._realm_id,
+                    mapped,
+                )
+            else:
+                log.warning(
+                    "browserless 重新 mint 失败: realm=%s: %s", self._realm_id, exc
+                )
+            return False
         except SignerError as exc:
             log.warning("browserless 重新 mint 失败: realm=%s: %s", self._realm_id, exc)
             return False
         if not result.ok:
             return False
+        self._session_expired = False
         self._mint = result
         refresh_updates = self._apply_cookie_payload(
             result.set_cookies, result.deleted_cookies
@@ -624,7 +731,7 @@ class BrowserlessSession:
                     account_key=self.stable_account_key,
                 )
             except SignerAuthError as exc:
-                raise _map_signer_auth_error(exc) from exc
+                raise self._raise_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise BrowserTransportError(f"browserless rpc failed: {exc}") from exc
             self._apply_rpc_metadata(
@@ -662,7 +769,7 @@ class BrowserlessSession:
                 ):
                     yield event
             except SignerAuthError as exc:
-                raise _map_signer_auth_error(exc) from exc
+                raise self._raise_signer_auth_error(exc) from exc
             except SignerError as exc:
                 raise BrowserTransportError(
                     f"browserless rpc stream failed: {exc}"
@@ -691,6 +798,11 @@ class BrowserlessSession:
         except OSError as exc:
             log.warning("browserless cookie 回写失败 realm=%s: %s", self._realm_id, exc)
             return False
+        with suppress(Exception):
+            sync_sibling_storage_state_files(self._auth_file, self._cookies)
+        self._last_loaded_mtime_ns = self._auth_file_mtime_ns()
+        self._mint_updates = []
+        self._rpc_set_cookies = []
         self._cookie_dirty = False
         return True
 

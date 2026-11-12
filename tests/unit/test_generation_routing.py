@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -257,5 +258,79 @@ async def test_stream_generation_retries_same_attempt_before_switch():
     ]
 
     assert calls == 2
-    assert any(event.kind == "body" and event.payload == "recovered" for event in events)
+    assert any(
+        event.kind == "body" and event.payload == "recovered" for event in events
+    )
     assert _released(attempt) is True
+
+
+@pytest.mark.asyncio
+async def test_generate_thinking_only_skips_retry_and_warns(caplog):
+    client = MagicMock()
+    client.generate_content = AsyncMock(
+        return_value=ModelOutput(
+            candidates=[Candidate(thinking="only reasoning")],
+            usage={"prompt_tokens": 1, "completion_tokens": 2},
+        )
+    )
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    with caplog.at_level(logging.WARNING, logger="aistudio.generation"):
+        outcome = await generation_service.generate(
+            model_path="gemini-3.7-flash",
+            req=_request(),
+            pipeline=pipeline,
+            api_format="openai",
+        )
+
+    assert client.generate_content.await_count == 1
+    assert pipeline.empty_retries == 0
+    assert outcome.output.candidates[0].thinking == "only reasoning"
+    warnings = [
+        record for record in caplog.records if "思维链截断告警" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert "thinking_len=14" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_stream_generation_thinking_only_skips_retry_and_warns(caplog):
+    calls = 0
+
+    async def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        yield ("thinking", "deep reasoning")
+        yield ("finish_reason", 1)
+        yield ("usage", {"prompt_tokens": 1, "completion_tokens": 2})
+        yield ("response_id", "resp-think")
+
+    client = MagicMock()
+    client.stream_generate_content = fake_stream
+    attempt = make_attempt(client)
+    pipeline = ScriptedPipeline([attempt], context=make_context())
+
+    with caplog.at_level(logging.WARNING, logger="aistudio.generation"):
+        events = [
+            event
+            async for event in generation_service.stream_generation(
+                model_path="gemini-3.7-flash",
+                req=_request(),
+                pipeline=pipeline,
+                api_format="openai",
+            )
+        ]
+
+    assert calls == 1
+    assert pipeline.empty_retries == 0
+    assert any(event.kind == "thinking" for event in events)
+    assert not any(event.kind in ("body", "tool_calls", "images") for event in events)
+    warnings = [
+        record for record in caplog.records if "思维链截断告警" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert "thinking_len=14" in warnings[0].getMessage()
+    assert events[-1].kind == "usage"

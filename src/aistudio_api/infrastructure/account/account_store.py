@@ -126,6 +126,141 @@ def _update_auth_json_cookies(auth_path: Path, new_cookies: dict[str, str]) -> b
         return False
 
 
+def _numeric_cookie_expiry(cookie: dict[str, object]) -> float | None:
+    """Return a positive numeric expiry timestamp, else ``None``."""
+    raw = cookie.get("expires")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if value > 0 else None
+
+
+def _is_stale_rotating_update(
+    source: dict[str, object], existing: dict[str, object]
+) -> bool:
+    """True when the sibling already holds a strictly newer copy of the cookie.
+
+    Both sides must carry a real (``> 0``) expiry timestamp; session cookies
+    (``-1``) and missing expiry metadata keep the previous last-writer-wins
+    behaviour because they cannot be ordered.
+    """
+    source_expires = _numeric_cookie_expiry(source)
+    existing_expires = _numeric_cookie_expiry(existing)
+    if source_expires is None or existing_expires is None:
+        return False
+    return source_expires < existing_expires
+
+
+def _apply_rotating_cookie_objects(
+    auth_path: Path, rotating_objects: dict[str, dict[str, object]]
+) -> bool:
+    """Replace whole rotating cookie records (value + expiry metadata) atomically."""
+    if not auth_path.is_file() or not rotating_objects:
+        return False
+    try:
+        with _AUTH_FILE_WRITE_LOCK:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            raw_cookies = data.get("cookies")
+            changed = False
+            if isinstance(raw_cookies, list):
+                seen: set[str] = set()
+                for item in raw_cookies:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "")
+                    source = rotating_objects.get(name)
+                    if source is None:
+                        continue
+                    seen.add(name)
+                    if _is_stale_rotating_update(source, item):
+                        continue
+                    for key, value in source.items():
+                        if item.get(key) != value:
+                            item[key] = value
+                            changed = True
+                for name, source in rotating_objects.items():
+                    if name not in seen:
+                        raw_cookies.append(dict(source))
+                        changed = True
+                if changed:
+                    _atomic_write_json(auth_path, data)
+            elif isinstance(raw_cookies, dict):
+                for name, source in rotating_objects.items():
+                    value = str(source.get("value") or "")
+                    if value and raw_cookies.get(name) != value:
+                        raw_cookies[name] = value
+                        changed = True
+                if changed:
+                    _atomic_write_json(auth_path, data)
+            return changed
+    except Exception as exc:
+        logger.warning("同步同源兄弟滚动 Cookie 失败 (%s): %s", auth_path, exc)
+        return False
+
+
+def sync_sibling_storage_state_files(
+    auth_file: str | Path, cookies: list[dict[str, object]]
+) -> int:
+    """Propagate freshly rotated session cookies to same-anchor sibling accounts.
+
+    ``BrowserlessSession.save_current_cookies`` writes only its own
+    ``auth.json``; multi-login sub-accounts (``u/0..u/N``) share one root
+    browser session and must all carry the newest ``__Secure-1PSIDTS`` /
+    ``SIDCC`` material.  Given the just-written ``auth_file`` (shape
+    ``<accounts_dir>/<account_id>/auth.json``), update every other sibling
+    ``auth.json`` whose session anchor matches.
+
+    Returns the number of sibling files that changed.
+    """
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        ROTATING_SESSION_COOKIE_NAMES,
+        compute_session_anchor,
+        load_cookies_from_auth_file,
+    )
+
+    source = Path(auth_file).resolve()
+    accounts_dir = source.parent.parent
+    if not (accounts_dir / "registry.json").is_file():
+        return 0
+
+    cookie_map = {
+        str(item.get("name") or ""): str(item.get("value") or "")
+        for item in cookies
+        if isinstance(item, dict) and item.get("name")
+    }
+    anchor = compute_session_anchor(cookie_map)
+    if not anchor:
+        return 0
+    rotating_objects = {
+        str(item["name"]): dict(item)
+        for item in cookies
+        if isinstance(item, dict)
+        and str(item.get("name") or "") in ROTATING_SESSION_COOKIE_NAMES
+        and item.get("value")
+    }
+    if not rotating_objects:
+        return 0
+
+    updated = 0
+    for sibling_dir in accounts_dir.iterdir():
+        if not sibling_dir.is_dir():
+            continue
+        sibling_auth = sibling_dir / "auth.json"
+        if not sibling_auth.is_file() or sibling_auth.resolve() == source:
+            continue
+        try:
+            sibling_map = load_cookies_from_auth_file(sibling_auth)
+        except Exception:
+            continue
+        if compute_session_anchor(sibling_map) != anchor:
+            continue
+        if _apply_rotating_cookie_objects(sibling_auth, rotating_objects):
+            updated += 1
+    return updated
+
+
 # 默认搜索路径（与 config.py 保持一致）
 _SEARCH_ROOTS: list[Path] = [
     Path.cwd(),
@@ -615,6 +750,45 @@ class AccountStore:
         """列出所有账号。"""
         registry = self._load_registry()
         return list(registry.accounts.values())
+
+    def get_sibling_account_ids(self, account_id: str) -> list[str]:
+        """返回共享同一非空浏览器会话锚点的其他多登兄弟账号。"""
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            compute_session_anchor,
+            load_cookies_from_auth_file,
+        )
+
+        registry = self._load_registry()
+        if account_id not in registry.accounts:
+            return []
+        try:
+            own_path = _safe_account_dir(self._accounts_dir, account_id) / "auth.json"
+        except ValueError:
+            return []
+        anchor = compute_session_anchor(load_cookies_from_auth_file(own_path))
+        if not anchor:
+            return []
+
+        siblings: list[str] = []
+        for acc_id in list(registry.accounts):
+            if acc_id == account_id:
+                continue
+            try:
+                auth_path = _safe_account_dir(self._accounts_dir, acc_id) / "auth.json"
+            except ValueError:
+                continue
+            if not auth_path.is_file():
+                continue
+            if compute_session_anchor(load_cookies_from_auth_file(auth_path)) == anchor:
+                siblings.append(acc_id)
+        return siblings
+
+    def mark_session_expired_group(self, account_id: str) -> list[str]:
+        """将账号及其同源多登兄弟标记为 ``expired``，返回受影响的账号 ID。"""
+        ids = [account_id, *self.get_sibling_account_ids(account_id)]
+        for acc_id in ids:
+            self.update_account_refresh(acc_id, expired=True)
+        return ids
 
     def refresh_duplicate_flags(self) -> int:
         """按邮箱重算重复标记（忽略大小写）。

@@ -35,7 +35,7 @@ from aistudio_api.domain.errors import (
     SurfaceSwitchExhaustedError,
     UsageLimitExceeded,
 )
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("generation")
@@ -74,6 +74,21 @@ def _output_is_empty(output: ModelOutput) -> bool:
     return not (
         candidate.text
         or candidate.thinking
+        or candidate.function_calls
+        or candidate.images
+        or candidate.reasoning_images
+    )
+
+
+def _is_thinking_only(candidate: Candidate) -> bool:
+    """True when the candidate carries reasoning but no answer payload.
+
+    Such a response is ``thinking``-only truncation: it must not be treated as
+    an empty response (no retry / account switch, which would burn quota), only
+    surfaced as a warning.
+    """
+    return bool(candidate.thinking) and not (
+        candidate.text
         or candidate.function_calls
         or candidate.images
         or candidate.reasoning_images
@@ -272,9 +287,7 @@ async def generate(
                         model=normalized.model,
                         surface=surface,
                     ):
-                        raise UsageLimitExceeded(
-                            "forced 429 (AISTUDIO_TEST_HOOKS)"
-                        )
+                        raise UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
                     output = await attempt.client.generate_content(
                         model=normalized.model,
                         capture_prompt=normalized.capture_prompt,
@@ -325,6 +338,18 @@ async def generate(
 
                 record_function_call_signatures(output.function_calls)
                 finish_reason = _finish_reason(output, normalized)
+                candidate = output.candidates[0] if output.candidates else None
+                if candidate is not None and _is_thinking_only(candidate):
+                    logger.warning(
+                        "[generation] 思维链截断告警: 模型仅返回 thinking 未产出正文或"
+                        "工具调用 (已跳过重试以保护配额): format=%s model=%s "
+                        "instance=%s finish_reason=%s thinking_len=%d",
+                        api_format,
+                        normalized.model,
+                        attempt.instance_id,
+                        finish_reason,
+                        len(candidate.thinking),
+                    )
                 pipeline.record_success(
                     context,
                     attempt,
@@ -447,13 +472,18 @@ async def stream_generation(
                         else None
                     )
                     produced_content = False
+                    produced_answer = False
+                    thinking_chars = 0
                     if forced_429(
                         account_id=attempt.account_id,
                         model=normalized.model,
                         surface=surface,
                     ):
                         raise UsageLimitExceeded("forced 429 (AISTUDIO_TEST_HOOKS)")
-                    async for event_type, text in attempt.client.stream_generate_content(
+                    async for (
+                        event_type,
+                        text,
+                    ) in attempt.client.stream_generate_content(
                         model=normalized.model,
                         capture_prompt=normalized.capture_prompt,
                         capture_images=normalized.capture_images,
@@ -491,6 +521,17 @@ async def stream_generation(
                                 record_function_call_signatures(text)
                             if text:
                                 produced_content = True
+                                if event_type == "thinking":
+                                    thinking_chars += (
+                                        len(text) if isinstance(text, str) else 0
+                                    )
+                                elif event_type in (
+                                    "body",
+                                    "tool_calls",
+                                    "images",
+                                    "reasoning_images",
+                                ):
+                                    produced_answer = True
                             if (
                                 unwrapper is not None
                                 and event_type in _ATG_STREAM_EVENT_TYPES
@@ -541,12 +582,28 @@ async def stream_generation(
                         effective_model_path,
                     )
                     continue
-                if not produced_content and atg.enabled and tool_name and (
-                    atg.cfg.mode == "required"
+                if (
+                    not produced_content
+                    and atg.enabled
+                    and tool_name
+                    and (atg.cfg.mode == "required")
                 ):
                     raise SyntheticRequiredError(
                         "synthetic tool call required but not present in upstream "
                         "response"
+                    )
+
+                clean_model = normalized.model
+                if thinking_chars > 0 and not produced_answer:
+                    logger.warning(
+                        "[generation] 思维链截断告警: 流式响应仅返回 thinking 未产出"
+                        "正文或工具调用 (已跳过重试以保护配额): format=%s model=%s "
+                        "instance=%s finish_reason=%s thinking_len=%d",
+                        api_format,
+                        clean_model,
+                        attempt.candidate.instance_id,
+                        final_finish_reason,
+                        thinking_chars,
                     )
 
                 if unwrapper is not None:

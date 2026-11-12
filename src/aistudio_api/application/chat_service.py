@@ -779,7 +779,7 @@ def _emit_toolshape(
         channel=channel,
         surface=surface,
     )
-    logger.info(
+    logger.debug(
         "[toolshape] %s",
         json.dumps(summary, ensure_ascii=False, sort_keys=True),
     )

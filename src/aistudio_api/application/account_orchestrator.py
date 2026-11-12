@@ -10,8 +10,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from aistudio_api.infrastructure.utils.logger import get_logger
+
 if TYPE_CHECKING:
     from aistudio_api.application.account_rotator import AccountRotator
+
+logger = get_logger("account-orchestrator")
+
+
+def _sibling_account_ids(rotator: AccountRotator, account_id: str) -> list[str]:
+    """Resolve same-anchor multi-login siblings through the backing store."""
+    store = getattr(rotator, "account_store", None)
+    getter = getattr(store, "get_sibling_account_ids", None)
+    if not callable(getter):
+        return []
+    try:
+        result = getter(account_id)
+    except Exception as exc:
+        logger.warning("读取同源兄弟账号失败 account=%s: %s", account_id, exc)
+        return []
+    if not isinstance(result, (list, tuple, set, frozenset)):
+        return []
+    return [str(item) for item in result if item and str(item) != account_id]
 
 
 def record_rotator_event(
@@ -56,6 +76,13 @@ def record_rotator_event(
             )
         else:
             rotator.record_session_expired(account_id, model=model, surface=surface)
+        for sibling_id in _sibling_account_ids(rotator, account_id):
+            rotator.record_session_expired(
+                sibling_id,
+                model=model,
+                surface=surface,
+                reason=f"sibling_session_expired({account_id})",
+            )
     elif event == "error":
         rotator.record_error(account_id, model=model, surface=surface)
 

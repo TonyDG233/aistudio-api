@@ -11,6 +11,14 @@
 - **实例换绑弹窗 tier 显示与过滤**：修复 `InstanceSpec.from_mapping`、`InstanceManager._view` 与前端 `instances.ts` 对 `min_tier` 槽位 `max_tier`（`Ultra_20X`）的归一化与兼容计算，解决弹窗误显示“仅限 Pro”及可用 Pro 账号被过滤的问题。
 - **Browserless 403 同号刷新**：`BrowserlessSession.refresh_auth_state()` 接入 `rotate_google_cookies`（`/RotateCookies`）主动续期并立即落盘 `auth.json`，刷新前先持久化内存中已收到的 Cookie；强制释放 Go 侧驻留热 Worker，使下一次 `mint_proof` 用最新凭据重建 Cookie 罐；waa-signer 热复用路径检测滚动凭据差异后按最新 storage state 重建 Worker，不再继续发送过期 Cookie。
 - **`verify-account` 移动设备验证自动熔断隔离**：新增 `is_account_verification_required_message()` 与 `AuthError.verification_required`，识别 `verify-account` / `verify?` 验证 URL、`must be verified before it can continue using the Gemini API`、`account verification required to restore access`、`free_tier_verification_required` 等上游账号验证信号；`routing_pipeline` 命中后跳过 `tier_allows` 误判与同账号重签重试，直接按 `session_expired` 永久隔离该账号并在请求期换绑切号，后续 `is_account_available` 与 `select_rebind_account` 均排除该账号；管理台重新导入凭据或点击清除锁定后恢复可用。
+- **WAA 502「隔离登录态失效」判定为终态**：`_map_signer_auth_error` 在 401 之外，将 reason 命中 `隔离登录态失效` / `登录态失效` / `session expired` / `authentication required` / `servicelogin` / `url=https://accounts.google.com` 的 `SignerAuthError`（含 Go Worker 冷启动 502）统一映射为 `SessionExpiredError`，不再先耗时走同账号 403 重签路径；`refresh_auth_state()` 重新 mint 命中该错误时置 `_session_expired=True` 并返回 False，由路由直接换绑切号。
+- **同源多登账号整组隔离**：账号根登录态确认失效时，`AccountStore.mark_session_expired_group()` / `get_sibling_account_ids()` 按 SAPISID/SID 会话锚点把 `u/0..u/N` 兄弟账号一并标记 `expired`；`account_orchestrator` 在 `session_expired` 事件中同步记录兄弟账号失效，`account_rotator.record_auth_error` 在 store 已判过期时将本次 403 提升为终态事件，`get_account_stats` 将 store 过期态镜像到统计视图，避免同源账号逐个撞墙重试。
+- **同源兄弟滚动凭据同步与热重载**：`BrowserlessSession.save_current_cookies()` 落盘后调用 `sync_sibling_storage_state_files()` 把 `__Secure-1PSIDTS` / `SIDCC` 等滚动 Cookie 原子同步到同锚点兄弟 `auth.json`；`_reload_if_changed()` 在目标文件 `st_mtime_ns` 变化时自动重载快照并叠加本会话待落盘的 Set-Cookie，避免兄弟槽位继续发送过期滚动凭据。
+- **`[toolshape]` 诊断日志降级**：`chat_service._emit_toolshape()` 由 `logger.info` 降为 `logger.debug`，完整 Schema 摘要不再刷屏占满常规日志与上下文，仍保留脱敏摘要供 DEBUG 排障与 PG-04 断言使用。
+- **同源兄弟滚动凭据防回灌**：`account_store.sync_sibling_storage_state_files()` 同步 `__Secure-1PSIDTS` / `SIDCC` 等滚动 Cookie 时，若兄弟与来源双方都带数字 `expires`（`> 0`）且来源过期时间更早，则跳过覆盖，避免较旧槽位把较新凭据回灌；无过期元数据时保持原 last-writer-wins 行为。
+- **WAA 登录态失效判定对齐**：`browserless_session._EXPIRED_REASON_MARKERS` 补齐 `缺少登录 cookie` / `需要重新登录` / `请重新登录`，与 `signer_client._AUTH_FAILURE_MARKERS` 对齐；`_map_signer_auth_error` docstring 明确 401 或命中明确登录态失效/重定向登录页标记返回终态 `SessionExpiredError`，其余 403/502 鉴权错误保留同号重签 `AuthError`。
+- **同源会话标记可观测性与并发安全**：`_mark_root_session_expired()` 标记失败由 `log.debug` 提升为 `log.warning`，符合非关键回退显式记录口径；`get_sibling_account_ids()` 改为迭代 `list(registry.accounts)` 快照，消除并发增删账号时的字典大小变更竞态。
+- **思维链截断显式告警**：非流式与流式生成在模型仅返回 `thinking`、未产出正文/工具调用/图片时输出 `[generation] 思维链截断告警`（WARNING，含 format/model/instance/finish_reason/thinking_len）；该场景仍视为非空响应，**不触发空响应重试或切号**，避免额外消耗上游配额。
 
 ## [2.1.1] - 2026-11-10
 

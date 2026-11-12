@@ -612,6 +612,11 @@ class AccountRotator:
 
         self._save_task = loop.create_task(_delayed())
 
+    @property
+    def account_store(self) -> AccountStore:
+        """Expose the backing store for sibling/session-expiry coordination."""
+        return self._store
+
     def get_account_stats(self, account_id: str) -> AccountStats | None:
         """获取指定账号的统计对象。"""
         stats = self._stats.get(account_id)
@@ -620,6 +625,13 @@ class AccountRotator:
         ):
             stats = AccountStats(account_id=account_id, quota_scope=self.quota_scope)
             self._stats[account_id] = stats
+        if stats is not None:
+            account = self._store.get_account(account_id)
+            if account is not None and getattr(account, "expired", False) is True:
+                # Store-level expiry (credential import / refresh / root login
+                # death) is authoritative for admission; mirror it into the
+                # rotator view so stats and selection stay consistent.
+                stats.session_expired = True
         return stats
 
     def is_account_available(
@@ -952,6 +964,16 @@ class AccountRotator:
         surface: str | None = None,
         reason: str | None = None,
     ) -> None:
+        account = self._store.get_account(account_id)
+        if account is not None and getattr(account, "expired", False) is True:
+            # The 403 refresh path may have discovered that the root login
+            # state is dead and marked the account (and siblings) expired in
+            # the store.  Promote this attempt to the terminal event so routing
+            # skips the whole same-anchor group instead of ping-ponging.
+            self.record_session_expired(
+                account_id, model, surface=surface, reason=reason
+            )
+            return
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(
                 account_id=account_id, quota_scope=self.quota_scope
