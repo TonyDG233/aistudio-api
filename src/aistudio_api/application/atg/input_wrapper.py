@@ -18,13 +18,12 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from .config import DEFAULT_INPUT_CONTEXT_INSTRUCTION
+
 INPUT_TOOL_PREFIX = "atg_ctx_"
 DUMMY_THOUGHT_SIGNATURE = "context_engineering_is_the_way_to_go"
 INIT_CONTEXT_TEXT = "Initialize context retrieval."
-CONTEXT_INSTRUCTION = (
-    "Above is the complete conversation context. "
-    "Respond directly to the final user turn and any attached media."
-)
+CONTEXT_INSTRUCTION = DEFAULT_INPUT_CONTEXT_INSTRUCTION
 
 
 def _has_existing_tool_parts(contents: list[object]) -> bool:
@@ -49,6 +48,7 @@ def wrap_input_contents(
     request_dict: dict[str, object],
     *,
     tool_prefix: str = INPUT_TOOL_PREFIX,
+    context_instruction: str = CONTEXT_INSTRUCTION,
 ) -> tuple[dict[str, object], str | None]:
     """Wrap ``request_dict["contents"]`` into a dual-track 3-turn tool exchange."""
     contents = request_dict.get("contents")
@@ -120,6 +120,15 @@ def wrap_input_contents(
 
     ctx_tool_name = f"{tool_prefix}{uuid4().hex[:12]}"
     call_id = f"call_{ctx_tool_name}"
+    effective_instruction = (
+        context_instruction
+        if isinstance(context_instruction, str) and context_instruction.strip()
+        else CONTEXT_INSTRUCTION
+    )
+    if "{tool_name}" in effective_instruction:
+        effective_instruction = effective_instruction.replace(
+            "{tool_name}", ctx_tool_name
+        )
 
     turn0: dict[str, object] = {
         "role": "user",
@@ -146,7 +155,7 @@ def wrap_input_contents(
                 "response": {
                     "conversation_turns": history_turns,
                     "attached_media_count": len(media_parts),
-                    "instruction": CONTEXT_INSTRUCTION,
+                    "instruction": effective_instruction,
                 },
             }
         },

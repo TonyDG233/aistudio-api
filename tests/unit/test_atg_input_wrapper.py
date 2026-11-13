@@ -484,3 +484,199 @@ def test_purge_synthetic_history_cleans_both_prefixes_and_anchor_on_replay():
     assert fr["conversation_turns"] == [
         {"index": 0, "role": "user", "content": "Follow-up question"}
     ]
+
+
+def test_wrap_input_only_without_wrap_output_skips_output_tool_and_control():
+    raw: dict[str, Any] = {
+        **_base_text_request(),
+        "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
+    }
+    proc = AtgProcessor(
+        load_atg_config(
+            {
+                "mode": "required",
+                "wrap_input": True,
+                "wrap_output": False,
+            }
+        )
+    )
+    res = proc.wrap(raw, "gemini-3.7-flash")
+    assert res.synthetic_hit is True
+    assert res.tool_name == ""
+    wrapped = cast("dict[str, Any]", res.body)
+    names = _declared_names(wrapped)
+    assert any(n.startswith(INPUT_TOOL_PREFIX) for n in names)
+    assert not any(n.startswith("atg_emit_") for n in names)
+    # 3 dual-track turns only, no trailing output control turn
+    assert len(wrapped["contents"]) == 3
+    assert wrapped["contents"][0]["parts"][0]["text"] == INIT_CONTEXT_TEXT
+    # toolConfig was not rewritten for output tool
+    assert wrapped["toolConfig"]["functionCallingConfig"]["mode"] == "NONE"
+
+    # unwrap_response is a no-op when wrap_output=False
+    from aistudio_api.domain.models import Candidate, ModelOutput
+
+    output = ModelOutput(candidates=[Candidate(text="native stream answer")], usage={})
+    unwrapped = proc.unwrap_response(output, "")
+    assert unwrapped.output.candidates[0].text == "native stream answer"
+    assert unwrapped.stats.synthetic_hit is False
+
+
+def test_wrap_output_only_without_wrap_input():
+    raw = _base_text_request()
+    proc = AtgProcessor(
+        load_atg_config(
+            {
+                "mode": "prefer",
+                "wrap_input": False,
+                "wrap_output": True,
+            }
+        )
+    )
+    res = proc.wrap(raw, "gemini-3.7-flash")
+    assert res.synthetic_hit is True
+    assert res.tool_name.startswith("atg_emit_")
+    wrapped = cast("dict[str, Any]", res.body)
+    names = _declared_names(wrapped)
+    assert not any(n.startswith(INPUT_TOOL_PREFIX) for n in names)
+    assert res.tool_name in names
+    assert len(wrapped["contents"]) == 4
+
+
+def test_wrap_input_false_and_wrap_output_false_returns_passthrough():
+    raw = _base_text_request()
+    proc = AtgProcessor(
+        load_atg_config(
+            {
+                "mode": "prefer",
+                "wrap_input": False,
+                "wrap_output": False,
+            }
+        )
+    )
+    res = proc.wrap(raw, "gemini-3.7-flash")
+    assert res.synthetic_hit is False
+    assert res.tool_name == ""
+    assert res.body == _base_text_request()
+
+
+def test_custom_control_template_and_input_context_instruction():
+    # 1) Custom control_template with {tool_name} and custom input_context_instruction
+    proc = AtgProcessor(
+        load_atg_config(
+            {
+                "mode": "prefer",
+                "wrap_input": True,
+                "wrap_output": True,
+                "control_template": "CUSTOM_CTRL::{tool_name}",
+                "input_context_instruction": "CUSTOM_INPUT_INST::{tool_name}",
+            }
+        )
+    )
+    res = proc.wrap(_base_text_request(), "gemini-3.7-flash")
+    assert res.synthetic_hit is True
+    wrapped = cast("dict[str, Any]", res.body)
+    ctx_names = [n for n in _declared_names(wrapped) if n.startswith(INPUT_TOOL_PREFIX)]
+    assert len(ctx_names) == 1
+    fr_resp = wrapped["contents"][2]["parts"][0]["functionResponse"]["response"]
+    assert fr_resp["instruction"] == f"CUSTOM_INPUT_INST::{ctx_names[0]}"
+    assert wrapped["contents"][3]["parts"][0]["text"] == f"CUSTOM_CTRL::{res.tool_name}"
+
+    # 2) Custom control_template WITHOUT {tool_name} placeholder auto-appends function name
+    proc_no_placeholder = AtgProcessor(
+        load_atg_config(
+            {
+                "mode": "prefer",
+                "wrap_input": False,
+                "wrap_output": True,
+                "control_template": "Always use the emit tool.",
+            }
+        )
+    )
+    res2 = proc_no_placeholder.wrap(_base_text_request(), "gemini-3.7-flash")
+    wrapped2 = cast("dict[str, Any]", res2.body)
+    assert (
+        wrapped2["contents"][-1]["parts"][0]["text"]
+        == f"Always use the emit tool. (Function name: {res2.tool_name})"
+    )
+
+    # 3) Standalone wrap_input_contents with custom & blank instruction
+    standalone_raw, _ = wrap_input_contents(
+        _base_text_request(), context_instruction="Standalone instruction."
+    )
+    standalone = cast("dict[str, Any]", standalone_raw)
+    assert (
+        standalone["contents"][2]["parts"][0]["functionResponse"]["response"][
+            "instruction"
+        ]
+        == "Standalone instruction."
+    )
+    blank_raw, _ = wrap_input_contents(_base_text_request(), context_instruction=" ")
+    blank_fallback = cast("dict[str, Any]", blank_raw)
+    assert (
+        blank_fallback["contents"][2]["parts"][0]["functionResponse"]["response"][
+            "instruction"
+        ]
+        == CONTEXT_INSTRUCTION
+    )
+
+
+def test_stream_generation_with_wrap_input_only_passes_native_body(monkeypatch):
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from aistudio_api.application import generation_service
+    from tests.unit.routing_fakes import ScriptedPipeline, make_attempt, make_context
+
+    monkeypatch.setattr(
+        generation_service,
+        "create_atg_processor",
+        lambda base=None: create_atg_processor(
+            {
+                **(base or {}),
+                "mode": "required",
+                "wrap_input": True,
+                "wrap_output": False,
+            }
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+    client = MagicMock()
+
+    async def fake_stream(**kwargs):
+        captured["tools"] = kwargs.get("tools")
+        captured["contents"] = kwargs.get("contents")
+        yield ("body", "native ")
+        yield ("body", "stream!")
+        yield ("usage", {"prompt_tokens": 1, "completion_tokens": 2})
+        yield ("done", None)
+
+    client.stream_generate_content = fake_stream
+    pipeline = ScriptedPipeline([make_attempt(client)], context=make_context())
+    req = GeminiGenerateContentRequest.model_validate(_base_text_request())
+
+    async def run():
+        return [
+            ev
+            async for ev in generation_service.stream_generation(
+                model_path="gemini-3.7-flash",
+                req=req,
+                pipeline=pipeline,
+                api_format="gemini",
+            )
+        ]
+
+    events = asyncio.run(run())
+    body_text = "".join(str(ev.payload) for ev in events if ev.kind == "body")
+    assert body_text == "native stream!"
+    # Input was wrapped into 3 turns with atg_ctx_*, and NO atg_emit_* was injected
+    assert len(captured["contents"]) == 3
+    wire_tool_names = [
+        decl[0]
+        for tool in (captured["tools"] or [])
+        for decl in (tool[1] if len(tool) > 1 and isinstance(tool[1], list) else [])
+        if isinstance(decl, list) and decl
+    ]
+    assert any(str(name).startswith(INPUT_TOOL_PREFIX) for name in wire_tool_names)
+    assert not any(str(name).startswith("atg_emit_") for name in wire_tool_names)

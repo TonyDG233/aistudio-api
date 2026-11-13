@@ -552,7 +552,10 @@ class BrowserlessSession:
     ) -> str:
         prompt = " ".join(build_snapshot_hash_parts(contents))
         content_hash = sha256(prompt.encode("utf-8")).hexdigest()
-        page_prompt = _last_text_part(contents) or prompt
+        raw_page_prompt = _last_text_part(contents) or prompt
+        page_prompt = (
+            raw_page_prompt[-256:] if len(raw_page_prompt) > 256 else raw_page_prompt
+        )
         self._reload_if_changed()
         async with self._snapshot_lock:
             now = time.monotonic()
@@ -569,10 +572,10 @@ class BrowserlessSession:
                     auth_user=self._auth_user,
                     g1_tier=tier_header_value(self._tier) or "",
                     model=self._current_model or DEFAULT_CHAT_MODEL,
-                    prompt=prompt,
+                    prompt=page_prompt,
                     page_prompt=page_prompt,
                     digest=content_hash,
-                    wire_contents=[content.to_wire() for content in contents],
+                    wire_contents=None,
                     proxy=self._proxy,
                     account_key=self.stable_account_key,
                 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -12,6 +13,8 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("capture")
+
+_SNAPSHOT_SENTINEL = "__AISTUDIO_SNAPSHOT_PLACEHOLDER_9f8e7d6c__"
 
 
 @dataclass
@@ -110,7 +113,10 @@ class RequestCaptureService:
         # Measure the complete request body (contents + tools + system
         # instruction + generationConfig) before the real snapshot exists so
         # large tool histories still trigger warmup.
-        payload_size = len(build_body("").encode("utf-8"))
+        template_body = build_body(_SNAPSHOT_SENTINEL)
+        payload_size = max(
+            0, len(template_body.encode("utf-8")) - len(_SNAPSHOT_SENTINEL)
+        )
 
         # 签名是一次性的票据（根据请求内容穿进 snapshot 计算），每次请求实时生成，不可复用缓存
         previous_snapshot_at = getattr(self._session, "_last_snapshot_at", None)
@@ -125,7 +131,12 @@ class RequestCaptureService:
         else:
             interval_text = "首次"
 
-        body = build_body(snapshot)
+        if template_body.count(_SNAPSHOT_SENTINEL) == 1:
+            body = template_body.replace(
+                _SNAPSHOT_SENTINEL, json.dumps(snapshot)[1:-1], 1
+            )
+        else:
+            body = build_body(snapshot)
         captured = CapturedRequest(
             url=template.url,
             headers=dict(template.headers),

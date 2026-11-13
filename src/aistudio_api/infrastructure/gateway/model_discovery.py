@@ -329,6 +329,14 @@ _FALLBACK_MODELS = [
         "accessModes": [4],
     },
     {
+        "id": "gemini-4-hydrogen",
+        "displayName": "Gemini 4 Hydrogen",
+        "description": "Free tier Gemini 4 Hydrogen model",
+        "paid": False,
+        "access_tier": 1,
+        "accessModes": [1],
+    },
+    {
         "id": "gemini-3-flash-preview",
         "displayName": "Gemini 3 Flash Preview",
         "description": "Fast frontier model",
@@ -350,7 +358,9 @@ _FALLBACK_MODELS = [
         "id": "gemini-3.1-pro-preview",
         "displayName": "Gemini 3.1 Pro Preview",
         "description": "Pro capabilities with complex reasoning",
-        "paid": False,
+        "paid": True,
+        "access_tier": 2,
+        "accessModes": [3, 4],
     },
     {
         "id": "gemini-3.6-flash",
@@ -992,6 +1002,9 @@ class ModelDiscoveryService:
         )
         if 4 in modes and 3 not in modes:
             return ["Ultra", "Ultra_20X"]
+
+        if "hydrogen" in clean_m and truth is not True:
+            return []
 
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,

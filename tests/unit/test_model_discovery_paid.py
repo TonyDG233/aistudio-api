@@ -71,3 +71,19 @@ async def test_model_api_does_not_expose_paid_marker(monkeypatch) -> None:
     first = response.json()["models"][0]
     assert "paid" not in first
     assert "access_tier" not in first
+
+
+def test_fallback_models_tier_metadata_matches_playground_matrix() -> None:
+    from aistudio_api.infrastructure.gateway.model_discovery import _FALLBACK_MODELS
+
+    by_id = {str(item["id"]): item for item in _FALLBACK_MODELS}
+    assert by_id["gemini-4-argon"]["paid"] is True
+    assert by_id["gemini-4-carbon"]["paid"] is True
+    assert by_id["gemini-4-carbon"]["access_tier"] == 2
+    assert by_id["gemini-4-carbon"]["accessModes"] == [4]
+    assert by_id["gemini-4-hydrogen"]["paid"] is False
+    assert by_id["gemini-4-hydrogen"]["access_tier"] == 1
+    assert by_id["gemini-4-hydrogen"]["accessModes"] == [1]
+    assert by_id["gemini-3.1-pro-preview"]["paid"] is True
+    assert by_id["gemini-3.1-pro-preview"]["access_tier"] == 2
+    assert by_id["gemini-3.1-pro-preview"]["accessModes"] == [3, 4]

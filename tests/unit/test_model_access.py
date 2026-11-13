@@ -59,8 +59,10 @@ def test_paid_models_are_chat_only_and_require_paid_account() -> None:
     assert is_chat_only_model("gemini-3.8-flash") is False
     assert model_requires_paid_account("gemini-3-flash-preview") is True
     assert model_account_requirement("gemini-3-flash-preview") == "paid"
-    assert model_requires_paid_account("gemini-3.1-pro-preview") is False
-    assert model_account_requirement("gemini-3.1-pro-preview") == "any"
+    assert model_requires_paid_account("gemini-3.1-pro-preview") is True
+    assert model_account_requirement("gemini-3.1-pro-preview") == "paid"
+    assert model_requires_paid_account("gemini-pro-latest") is False
+    assert model_account_requirement("gemini-pro-latest") == "any"
     assert surface_capability("gemini-3-flash-preview", ("chat", "build")) == ("chat",)
 
 
@@ -179,7 +181,8 @@ def test_snapshot_restores_status_and_applies_downgrade(tmp_path, monkeypatch) -
 def test_fallback_paid_models_allow_catalog_projection_without_discovery() -> None:
     assert is_chat_only_model("gemini-4-argon") is True
     assert is_chat_only_model("gemini-3-flash-preview") is True
-    assert is_chat_only_model("gemini-3.1-pro-preview") is False
+    assert is_chat_only_model("gemini-3.1-pro-preview") is True
+    assert is_chat_only_model("gemini-pro-latest") is False
     assert is_chat_only_model("gemini-3.8-flash") is False
 
 
@@ -193,8 +196,9 @@ def test_default_paid_seeds_cover_every_live_paid_model() -> None:
     clear_paid_models()
     for model_id in sorted(live_paid):
         assert is_paid_model(model_id) is True, model_id
-    # Q2: "pro" in the name is not a Paid signal.
-    assert is_paid_model("gemini-3.1-pro-preview") is False
+    # Q2: "pro" in the name alone is not a Paid signal, whereas 3.1-pro-preview is Paid.
+    assert is_paid_model("gemini-pro-latest") is False
+    assert is_paid_model("gemini-3.1-pro-preview") is True
 
 
 def test_live_evidence_entries_all_have_explicit_paid_flags() -> None:

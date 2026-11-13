@@ -75,15 +75,49 @@ test('N-2 protocol card describes Claude and Responses as enabled by default', (
   expect(card).toContain("asBool(formats.value.responses, true)")
 })
 
-test('protocol card places ATG wrap_input switch next to strict switch with tooltip', () => {
+test('protocol card places ATG wrap_output, wrap_input and strict switches in responsive grid with tooltips', () => {
   const card = source('../src/components/settings/ProtocolAtgCard.vue')
 
-  expect(card).toContain('<div class="grid grid-cols-1 gap-3 md:grid-cols-2">')
+  expect(card).toContain('<div class="grid grid-cols-1 gap-3 xl:grid-cols-3">')
+  expect(card).toContain('输出侧伪装封装（工具输出）')
+  expect(card).toContain('跟随协议策略 · 将模型回答装入合成工具')
+  expect(card).toContain('asBool(atg.wrap_output, true)')
+  expect(card).toContain("updateAtg('wrap_output', $event)")
+  expect(card).toContain('schema-key="features.atg.wrap_output"')
+
   expect(card).toContain('输入侧伪装封装（图文双轨）')
-  expect(card).toContain('跟随各协议策略生效 · 文本装入合成工具，图片分流原生视觉通道')
+  expect(card).toContain('跟随协议策略 · 文本装入工具，图片走原生')
   expect(card).toContain('asBool(atg.wrap_input, false)')
   expect(card).toContain("updateAtg('wrap_input', $event)")
   expect(card).toContain('schema-key="features.atg.wrap_input"')
+
+  expect(card).toContain('严格模式')
+  expect(card).toContain('对不完整的合成协议更早报错')
+  expect(card).toContain('asBool(atg.strict, false)')
+  expect(card).toContain("updateAtg('strict', $event)")
+  expect(card).toContain('schema-key="features.atg.strict"')
+})
+
+test('protocol card renders full-width ATG prompt template textareas with reset buttons in advanced panel', () => {
+  const card = source('../src/components/settings/ProtocolAtgCard.vue')
+
+  expect(card).toContain('公开提示词模板配置')
+  expect(card).toContain('md:col-span-2')
+  expect(card).toContain('输出侧工具引导提示词模板')
+  expect(card).toContain('schema-key="features.atg.control_template"')
+  expect(card).toContain("asString(atg.control_template, DEFAULT_CONTROL_TEMPLATE)")
+  expect(card).toContain("updateAtg('control_template', DEFAULT_CONTROL_TEMPLATE)")
+
+  expect(card).toContain('输入侧上下文封装引导词')
+  expect(card).toContain('schema-key="features.atg.input_context_instruction"')
+  expect(card).toContain(
+    'asString(atg.input_context_instruction, DEFAULT_INPUT_CONTEXT_INSTRUCTION)',
+  )
+  expect(card).toContain(
+    "updateAtg('input_context_instruction', DEFAULT_INPUT_CONTEXT_INSTRUCTION)",
+  )
+  expect(card).toContain('恢复默认模板')
+  expect(card).toContain('<textarea')
 })
 
 test('N-7 client tooltip separates 429 terminal failures, rescues, errors and aborts', () => {

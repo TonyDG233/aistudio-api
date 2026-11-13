@@ -42,7 +42,7 @@ class AtgProcessor:
         self.enabled = cfg.enabled
         self._injector = create_injector(cfg) if self.enabled else None
         self._extractor: Extractor | None = (
-            create_extractor(cfg) if self.enabled else None
+            create_extractor(cfg) if self.enabled and cfg.wrap_output else None
         )
 
     def is_synthetic_tool_name(self, name: object) -> bool:
@@ -83,7 +83,12 @@ class AtgProcessor:
 
     def unwrap_response(self, output: ModelOutput, tool_name: str) -> UnwrapResult:
         """Unwrap a non-streaming :class:`ModelOutput`."""
-        if not self.enabled or not tool_name or self._extractor is None:
+        if (
+            not self.enabled
+            or not self.cfg.wrap_output
+            or not tool_name
+            or self._extractor is None
+        ):
             from .extractor import AtgStats
 
             return UnwrapResult(output=output, stats=AtgStats())
