@@ -18,7 +18,7 @@
 |---|---|---|---|
 | **B2-1 P1 基础闭环** | 账号注册表、Cookie 跨域 twin 保真与导入过滤、D-08 预设 `RLock`、D-13 删除 notes、D-05 toggle/preset rebind 信号、Paid 种子与发现同步 | 已完成（PASS） | `reviews/REV-B2-1-p1-account.md` |
 | **C1b Tier 安全与 403 刷新修复** | `httpx[socks]` 代理全覆盖、`strict_tier()` 失败不覆盖既有 Pro/Ultra、`detect-tier` 400/502 语义与池同步 | 已完成（PASS） | `reviews/REV-C1b-vps-tier-and-403-fix.md` |
-| **Stage 2.1.1/2.1.3 轮换与同源兄弟同步** | `/RotateCookies` 轮换、`sync_sibling_storage_state_files`（含过期时间比较防回灌）、`mark_session_expired_group` 整组隔离 | 已完成（PASS） | 见 `P8-api-ui/reviews/REV-2.1.1.md`、`P3-pool-instance/reviews/REV-2.1.3.md` |
+| **Stage 2.1.1/2.1.3 轮换与同源兄弟同步** | `/RotateCookies` 轮换、`sync_sibling_storage_state_files`（含过期时间比较防回灌）、`mark_session_expired_group` 整组隔离 | 已完成（PASS） | 见 `P8-api-ui/reviews/REV-2.1.1.md`、`P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md` |
 | **后续演进：OAuth / refresh_token 评估（P1-E2）** | 评估是否补充非 Cookie OAuth 凭据链路（当前保持 defer） | 延后（Defer） | — |
 
 ## `reviews/` 审查报告与截图索引

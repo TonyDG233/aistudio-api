@@ -25,7 +25,7 @@
 | **C1 浏览器指纹加固与 401 噪音修复** | 按账号确定性 Windows 指纹脚本/metrics、`/health` 探活与 5 分钟缺 Key 去重、Tier 单源收敛 | 已完成（PASS） | `reviews/REV-C1-fingerprint-and-auth-noise.md` |
 | **C1d 快照截断与 WAA 预热** | 256 码点尾截断、首次/>600s/>32KB/403 预热、低质量重投、`activate(force=True)` 强制重启 | 已完成（PASS） | `reviews/REV-C1d-waa-snapshot-warmup-fix.md` |
 | **Stage 2.1-A 双引擎与事务热切换** | `waa-signer` 集成、`BrowserlessSession`、ContextVar 事务锁与取消回滚、orphan 观测 | 已完成（PASS） | `reviews/REV-2.1-A.md` |
-| **Stage 2.1.3 无浏览器终态与兄弟同步** | 502 登录态终态、`save_current_cookies()` 兄弟同步（防旧覆盖新）、`st_mtime_ns` 热重载 | 已完成（PASS） | `reviews/REV-2.1.3.md` |
+| **Stage 2.1.3.1 无浏览器终态与兄弟同步** | 502 登录态终态、`save_current_cookies()` 兄弟同步（防旧覆盖新）、`st_mtime_ns` 热重载 | 已完成（PASS） | `reviews/REV-2.1.3.1-session-expired-sibling-sync.md` |
 | **后续演进：Build surface 评估（P4）** | Post-C / 后续评估 Build 渠道修复或永久废弃决策（当前仅保留配置/接口骨架） | 待评估 | — |
 
 ## `reviews/` 审查报告与截图索引
@@ -36,5 +36,5 @@
 - [`reviews/REV-C1-fingerprint-and-auth-noise.md`](reviews/REV-C1-fingerprint-and-auth-noise.md) — C1 浏览器按账号指纹/401 噪音/Tier 单源复核（2026-11-01，PASS）
 - [`reviews/REV-C1d-waa-snapshot-warmup-fix.md`](reviews/REV-C1d-waa-snapshot-warmup-fix.md) — C1d WAA 快照预热/截断/强制重启复核（2026-11-06，PASS）
 - [`reviews/REV-2.1-A.md`](reviews/REV-2.1-A.md) — Stage 2.1-A 双引擎共存与事务热切换终审（PASS）
-- [`reviews/REV-2.1.3.md`](reviews/REV-2.1.3.md) — Stage 2.1.3 502 登录态终态/同源兄弟整组隔离/toolshape 降级审查（PASS）
+- [`reviews/REV-2.1.3.1-session-expired-sibling-sync.md`](reviews/REV-2.1.3.1-session-expired-sibling-sync.md) — 2.1.3.1 502 登录态终态/同源兄弟整组隔离/toolshape 降级/思维链截断告警审查（PASS）
 - 截图资产：无（UI 截图归档于 `P8-api-ui/reviews/assets/`）。

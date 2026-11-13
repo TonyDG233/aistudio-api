@@ -1,4 +1,4 @@
-# REV-2.1.3 无浏览器 502 登录态终态 / 同源兄弟整组隔离 / toolshape 日志降级 独立审查报告
+# REV-2.1.3.1-session-expired-sibling-sync — 无浏览器 502 登录态终态 / 同源兄弟整组隔离 / toolshape 日志降级 独立审查报告
 
 ## 0. 审查基线与只读声明
 
@@ -6,7 +6,7 @@
 - `HEAD`：`ba07c863cadefeb73d5ea122cb8ad176ad0e24d0`（`ba07c86 feat(routing,errors): 新增 verify-account 移动设备验证风控自动熔断隔离并跳过同号重试`）。
 - 当前索引：`git diff --cached` 为空（无 staged 改动）；`git status --short` 全部为 ` M`（10 个已跟踪文件的未暂存修改）。
 - 变更规模：10 files changed, 653 insertions(+), 18 deletions(-)。
-- 只读声明：本次审查仅在 `docs/changelog.md` 增补 2.1.2 修复条目，并将本报告写入 `docs/dev/rebuild/domains/P3-pool-instance/reviews/REV-2.1.3.md`；**未修改任何业务代码、配置或测试**；未执行 `git add/commit/push`；未启动真实服务、真实浏览器、真实账号或外网请求，全部为离线命令与离线测试。
+- 只读声明：本次审查仅在 `docs/changelog.md` 增补修复条目，并将本报告写入 `docs/dev/rebuild/domains/P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md`（原命名 `REV-2.1.3.md`，已按四位审查标号规范收口重命名）；**未修改任何业务代码、配置或测试**；未执行 `git add/commit/push`；未启动真实服务、真实浏览器、真实账号或外网请求，全部为离线命令与离线测试。
 - 审查结论：**PASS（0 个未关闭 P0/P1；4 项 P2 为非阻塞建议；Q/N 项仅作记录）**。
 
 ---
@@ -144,7 +144,7 @@
 
 - 复审对象：在 R1 审查后新增的收口改动，`HEAD` 仍为 `ba07c863cadefeb73d5ea122cb8ad176ad0e24d0`。
 - 变更规模：`git diff --stat` = **13 files changed, 888 insertions(+), 26 deletions(-)**；较 R1 新增 `src/aistudio_api/application/generation_service.py`（71 行变更）与 `tests/unit/test_generation_routing.py`（+77），`docs/changelog.md` 增补 8 条收口说明。
-- 索引状态：`git diff --cached` 为空；`docs/dev/rebuild/domains/P3-pool-instance/reviews/REV-2.1.3.md` 仍为 untracked（`??`）。
+- 索引状态：`git diff --cached` 为空；`docs/dev/rebuild/domains/P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md`（原名 `REV-2.1.3.md`）在 R2 时为 untracked（`??`）。
 - 只读声明：R2 仅更新本报告，**未修改任何业务代码、配置或测试**；未执行 `git add/commit/push`；未启动真实服务/真实浏览器/真实账号/外网请求。
 
 ### 6.2 P2 / N 收口逐项核查

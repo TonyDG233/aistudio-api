@@ -1,10 +1,10 @@
-# REV-2.1.6-ui-polish-mobile — 前端 UI 极简审美对齐与 375px 移动端防挤压审查（R2 复审）
+# REV-2.1.3.5-ui-polish-mobile — 前端 UI 极简审美对齐与 375px 移动端防挤压审查（R2 复审）
 
-- **审查对象**：`2.1.6` 前端 UI 极简审美对齐与移动端防挤压整改（R1 8 个 + R2 6 个共 14 个 `web/src/**/*.vue` 源文件 + `web/tests/dashboardStatsUi.test.ts` + 7 个 `src/aistudio_api/static/assets/*` 构建产物 + 6 张多分辨率截图）
+- **审查对象**：`2.1.3.5`（原误标 `2.1.6`）前端 UI 极简审美对齐与移动端防挤压整改（R1 8 个 + R2 6 个共 14 个 `web/src/**/*.vue` 源文件 + `web/tests/dashboardStatsUi.test.ts` + 7 个 `src/aistudio_api/static/assets/*` 构建产物 + 6 张多分辨率截图）
 - **工作区**：`D:\LLM\self_programming\aistudio-api`
 - **基线**：`HEAD = a3f3931`（改动均为未提交工作区增量）
 - **审查方式**：R1 + R2 独立只读静态代码审查 + `--ui-debug` 离线沙盒（`127.0.0.1:18097`）Playwright 多视口 DOM 实测（`1440x900` / `1024x900` / `768x900` / `375x812`）+ 前端全量门禁实跑。
-- **只读声明**：除写入本报告 `REV-2.1.6-ui-polish-mobile.md`、更新 `docs/dev/rebuild/domains/P8-api-ui/index.md` 与 `docs/changelog.md` 外，未修改任何业务代码、配置或测试文件；未执行 `git commit` / `git push` / `git tag`；未启动真实生产服务或真实浏览器（18097 端口沙盒已在 `finally` 停止并确认无监听进程残留，Playwright 浏览器已关闭）。
+- **只读声明**：除写入本报告 `docs/dev/rebuild/domains/P8-api-ui/reviews/REV-2.1.3.5-ui-polish-mobile.md`（原命名 `REV-2.1.6-ui-polish-mobile.md`，已按四位审查标号规范收口重命名）、更新 `docs/dev/rebuild/domains/P8-api-ui/index.md` 与 `docs/changelog.md` 外，未修改任何业务代码、配置或测试文件；未执行 `git commit` / `git push` / `git tag`；未启动真实生产服务或真实浏览器（18097 端口沙盒已在 `finally` 停止并确认无监听进程残留，Playwright 浏览器已关闭）。
 
 ---
 

@@ -3,39 +3,39 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
-## [2.1.6] - 2026-11-13
+## [2.1.3] - 2026-11-13
+
+### Added
+
+- **ATG 输入/输出双独立开关与公开可编辑提示词模板**：`features.atg` 新增 `wrap_output`（默认 `true`）、`control_template` 与 `input_context_instruction`，完整支持仅输出、仅输入（原生流式）、双封装与双关闭四组合，以及自定义模板缺 `{tool_name}` 自动补齐函数名与空白回退；设置页 `ProtocolAtgCard.vue` 将输出侧、输入侧与严格模式开关调整为 `grid-cols-1 xl:grid-cols-3` 防拥挤布局，并在高级参数展开区公开两个全宽模板 `<textarea>` 与「恢复默认模板」按钮。
+- **ATG 输入侧伪装工具调用与图文双轨分流（`wrap_input`）**：新增 `features.atg.wrap_input`（默认 `false`）与 `application/atg/input_wrapper.py`，100% 继承 `resolve_atg_mode(cfg, api_format)` 各协议独立策略（策略为 `off` 时静默直通，仅在 `prefer`/`required` 且 `wrap_input=true` 时生效）。开启后将非工具链对话输入封装为 `atg_ctx_*` 3-Turn 伪装工具交换（Turn 0 锚点 `"Initialize context retrieval."` → Turn 1 `functionCall` + PG-01 `thoughtSignature` → Turn 2 `functionResponse` 文本 Struct 与原生 `inlineData`/`fileData` 媒体 Part 同轮并置分流），保留完整多模态看图能力；`detect_client_synthetic_transport` 先于封装执行避免误判，`purge_synthetic_history` 自动清理历史 `atg_ctx_*` 与锚点防止多轮嵌套；设置页 `ProtocolAtgCard.vue` 在「各协议独立策略」正下方并排提供「严格模式」与「输入侧伪装封装（图文双轨）」开关及规范字典 Tooltip。
+- **思维链截断显式告警**：非流式与流式生成在模型仅返回 `thinking`、未产出正文/工具调用/图片时输出 `[generation] 思维链截断告警`（WARNING，含 format/model/instance/finish_reason/thinking_len）；该场景仍视为非空响应，**不触发空响应重试或切号**，避免额外消耗上游配额。
 
 ### Changed
 
+- **流式首字输出（TTFT）加速优化**：`capture.py` 引入 `_SNAPSHOT_SENTINEL` 对大请求体仅执行单次 `build_body` 序列化并原位安全替换（含哨兵碰撞回退）；`browserless_session.py` 与 Go 侧 `runtime.go` `fillPrompt` 在保持完整请求 `digest` 的同时将页面虚拟输入框截断至末尾 256 个 Unicode 码点并省略冗余 `wireContents` 传输；`waa-signer` `transport_browser.go` 将 CORS `OPTIONS` 预检缺省缓存延长至 `600s`。
+- **`[toolshape]` 诊断日志降级**：`chat_service._emit_toolshape()` 由 `logger.info` 降为 `logger.debug`，完整 Schema 摘要不再刷屏占满常规日志与上下文，仍保留脱敏摘要供 DEBUG 排障与 PG-04 断言使用。
 - **管理台极简审美对齐与 375px 移动端防挤压**：
   - `AccountRow.vue` 账号行左侧改为响应式双层布局（`flex-col sm:flex-row`），`375px` 窄屏下账号邮箱独占整行展示，不再被状态开关、索引与分组徽章挤压截断；常规 `u/x` 徽章同步收口为中性灰细边框风格。
   - 统一 `AccountRow.vue`（恢复 / 换槽 / 激活）与 `InstancePoolCard.vue`（换绑 / 重启 / 唤醒 / 绑定账号 / 关闭）全部槽位操作按钮尺寸、圆角与 Lucide 线性图标规范。
   - `InstancePoolCard.vue` 与 `DashboardView.vue` 的引擎标签统一为中性灰胶囊并允许换行，移除实例池每行重复的引擎标签。
   - `CookieImportModal.vue`、`CookieGroupBlock.vue`、`AccountsView.vue`、`DashboardView.vue`、`SettingsView.vue`、`ProtocolAtgCard.vue`、`SecurityBrowserCard.vue`、`LogConfigCard.vue`、`SchedulingCard.vue`、`ModelStatsTable.vue`、`QuickApiExamples.vue` 与 `YamlSourceEditor.vue` 全站去除彩色 Emoji 与高饱和琥珀/蓝紫色块，统一设置页全卡片 `<Button variant="primary" size="sm">` + `<Save />` 保存按钮规范，回归白底细灰框、翡翠绿主色、CSS 状态圆点与 Lucide 线性图标（并同步更新 `src/aistudio_api/static/` 构建产物）。
-
-## [2.1.2] - 2026-11-11
-
-### Added
-
-- **流式首字输出（TTFT）加速优化**：`capture.py` 引入 `_SNAPSHOT_SENTINEL` 对大请求体仅执行单次 `build_body` 序列化并原位安全替换（含哨兵碰撞回退）；`browserless_session.py` 与 Go 侧 `runtime.go` `fillPrompt` 在保持完整请求 `digest` 的同时将页面虚拟输入框截断至末尾 256 个 Unicode 码点并省略冗余 `wireContents` 传输；`waa-signer` `transport_browser.go` 将 CORS `OPTIONS` 预检缺省缓存延长至 `600s`。
-- **ATG 输入/输出双独立开关与公开可编辑提示词模板**：`features.atg` 新增 `wrap_output`（默认 `true`）、`control_template` 与 `input_context_instruction`，完整支持仅输出、仅输入（原生流式）、双封装与双关闭四组合，以及自定义模板缺 `{tool_name}` 自动补齐函数名与空白回退；设置页 `ProtocolAtgCard.vue` 将输出侧、输入侧与严格模式开关调整为 `grid-cols-1 xl:grid-cols-3` 防拥挤布局，并在高级参数展开区公开两个全宽模板 `<textarea>` 与「恢复默认模板」按钮。
-- **ATG 输入侧伪装工具调用与图文双轨分流（`wrap_input`）**：新增 `features.atg.wrap_input`（默认 `false`）与 `application/atg/input_wrapper.py`，100% 继承 `resolve_atg_mode(cfg, api_format)` 各协议独立策略（策略为 `off` 时静默直通，仅在 `prefer`/`required` 且 `wrap_input=true` 时生效）。开启后将非工具链对话输入封装为 `atg_ctx_*` 3-Turn 伪装工具交换（Turn 0 锚点 `"Initialize context retrieval."` → Turn 1 `functionCall` + PG-01 `thoughtSignature` → Turn 2 `functionResponse` 文本 Struct 与原生 `inlineData`/`fileData` 媒体 Part 同轮并置分流），保留完整多模态看图能力；`detect_client_synthetic_transport` 先于封装执行避免误判，`purge_synthetic_history` 自动清理历史 `atg_ctx_*` 与锚点防止多轮嵌套；设置页 `ProtocolAtgCard.vue` 在「各协议独立策略」正下方并排提供「严格模式」与「输入侧伪装封装（图文双轨）」开关及规范字典 Tooltip。
+- **`domains/` 双层治理重构与四位审查标号制度固化**：归并 `B-docs-and-audit`→`docs-and-audit` 与重复 `P` 域（`P3-browser`/`P7-logs`/`P10-tests-evidence`），清理空壳 `_template`，新增 `P10-android-apk` 规划域与 `docs/dev/rebuild/domains/INDEX.md` 总索引；在 `AGENT.md` 与 `INDEX.md` 固化「三段式发布版本号（`X.Y.Z`）+ 隐藏第四位审查文档标号（`REV-X.Y.Z.W`）」制度，将本周期审查报告统一收口为 `REV-2.1.3.1` ~ `REV-2.1.3.6`。
 
 ### Fixed
 
-- **`gemini-4-hydrogen` 免费准入与各档配额校准**：`defaults/config.yaml` 将 `paid_model_rules.pro_required` 收窄为 `["argon", "imagen"]`，校准 `Free.flash_models`（含 `"hydrogen"`）每日软限额为 `50`，并在各付费档 `tier_quotas` 中将 `flash_models` 置于 `argon_models` 之前；`model_discovery.py` 内置 `_FALLBACK_MODELS` 收录 `gemini-4-hydrogen` 并在 `get_required_tiers` 与 `routing_eligibility.py` `resolve_required_tiers` 增加 `hydrogen` 免付费防线，防止冷启动或旧配置误将其归入 Pro 队列。
+- **`gemini-4-hydrogen` / `gemini-3.1-pro-preview` 准入与 Playground 每日配额矩阵对齐**：`defaults/config.yaml` 将 `paid_model_rules.pro_required` 收窄为 `["argon", "imagen"]`，校准 `Free`、`Plus`、`Pro`、`Ultra`、`Ultra_20X` 各档 `tier_quotas` 以对齐 Playground 每日配额矩阵（`Free.flash_models` 软限额调整为 `50`，各档 `flash_models` 含 `"hydrogen"` 且置于 `argon_models` 之前），对齐 `gemini-4-hydrogen` 与 `gemini-3.1-pro-preview` 准入规则；`model_discovery.py` 内置 `_FALLBACK_MODELS` 收录 `gemini-4-hydrogen` 并在 `get_required_tiers` 与 `routing_eligibility.py` `resolve_required_tiers` 增加 `hydrogen` 免付费防线，防止冷启动或旧配置误将其归入 Pro 队列。
+- **WAA 502「隔离登录态失效」判定为终态**：`_map_signer_auth_error` 在 401 之外，将 reason 命中 `隔离登录态失效` / `登录态失效` / `session expired` / `authentication required` / `servicelogin` / `url=https://accounts.google.com` 的 `SignerAuthError`（含 Go Worker 冷启动 502）统一映射为 `SessionExpiredError`，不再先耗时走同账号 403 重签路径；`refresh_auth_state()` 重新 mint 命中该错误时置 `_session_expired=True` 并返回 False，由路由直接换绑切号；`browserless_session._EXPIRED_REASON_MARKERS` 补齐 `缺少登录 cookie` / `需要重新登录` / `请重新登录`，与 `signer_client._AUTH_FAILURE_MARKERS` 对齐，并明确 docstring 边界。
+- **同源多登账号整组隔离、滚动凭据同步与防回灌**：账号根登录态确认失效时，`AccountStore.mark_session_expired_group()` / `get_sibling_account_ids()` 按 SAPISID/SID 会话锚点把 `u/0..u/N` 兄弟账号一并标记 `expired`（迭代 `list(registry.accounts)` 快照消除并发增删竞态，`_mark_root_session_expired()` 异常日志提升为 `warning`）；`account_orchestrator` 在 `session_expired` 事件中同步记录兄弟账号失效，`account_rotator.record_auth_error` 在 store 已判过期时将本次 403 提升为终态事件，`get_account_stats` 将 store 过期态镜像到统计视图；`BrowserlessSession.save_current_cookies()` 落盘后调用 `sync_sibling_storage_state_files()` 将 `__Secure-1PSIDTS` / `SIDCC` 等滚动 Cookie 原子同步到同锚点兄弟 `auth.json`（双方均带有效数字 `expires` 且来源更早时跳过覆盖以防回灌），`_reload_if_changed()` 在 `st_mtime_ns` 变化时自动重载快照并叠加待落盘 Set-Cookie。
+
+## [2.1.2] - 2026-11-11
+
+### Fixed
+
 - **Ultra-only 模型准入信号优先级**：提权 `ListModels` 的 `item[82]`（`accessModes`）Ultra-only 信号优先于静态 `pro_required` 子串规则，`gemini-4-carbon` 不再被误判为 Pro 可用；同时将 `carbon` 纳入 `paid_model_rules.ultra_required`（`defaults/config.yaml` 与前端 `schema.ts` 同步）与内置模型表。
 - **实例换绑弹窗 tier 显示与过滤**：修复 `InstanceSpec.from_mapping`、`InstanceManager._view` 与前端 `instances.ts` 对 `min_tier` 槽位 `max_tier`（`Ultra_20X`）的归一化与兼容计算，解决弹窗误显示“仅限 Pro”及可用 Pro 账号被过滤的问题。
 - **Browserless 403 同号刷新**：`BrowserlessSession.refresh_auth_state()` 接入 `rotate_google_cookies`（`/RotateCookies`）主动续期并立即落盘 `auth.json`，刷新前先持久化内存中已收到的 Cookie；强制释放 Go 侧驻留热 Worker，使下一次 `mint_proof` 用最新凭据重建 Cookie 罐；waa-signer 热复用路径检测滚动凭据差异后按最新 storage state 重建 Worker，不再继续发送过期 Cookie。
 - **`verify-account` 移动设备验证自动熔断隔离**：新增 `is_account_verification_required_message()` 与 `AuthError.verification_required`，识别 `verify-account` / `verify?` 验证 URL、`must be verified before it can continue using the Gemini API`、`account verification required to restore access`、`free_tier_verification_required` 等上游账号验证信号；`routing_pipeline` 命中后跳过 `tier_allows` 误判与同账号重签重试，直接按 `session_expired` 永久隔离该账号并在请求期换绑切号，后续 `is_account_available` 与 `select_rebind_account` 均排除该账号；管理台重新导入凭据或点击清除锁定后恢复可用。
-- **WAA 502「隔离登录态失效」判定为终态**：`_map_signer_auth_error` 在 401 之外，将 reason 命中 `隔离登录态失效` / `登录态失效` / `session expired` / `authentication required` / `servicelogin` / `url=https://accounts.google.com` 的 `SignerAuthError`（含 Go Worker 冷启动 502）统一映射为 `SessionExpiredError`，不再先耗时走同账号 403 重签路径；`refresh_auth_state()` 重新 mint 命中该错误时置 `_session_expired=True` 并返回 False，由路由直接换绑切号。
-- **同源多登账号整组隔离**：账号根登录态确认失效时，`AccountStore.mark_session_expired_group()` / `get_sibling_account_ids()` 按 SAPISID/SID 会话锚点把 `u/0..u/N` 兄弟账号一并标记 `expired`；`account_orchestrator` 在 `session_expired` 事件中同步记录兄弟账号失效，`account_rotator.record_auth_error` 在 store 已判过期时将本次 403 提升为终态事件，`get_account_stats` 将 store 过期态镜像到统计视图，避免同源账号逐个撞墙重试。
-- **同源兄弟滚动凭据同步与热重载**：`BrowserlessSession.save_current_cookies()` 落盘后调用 `sync_sibling_storage_state_files()` 把 `__Secure-1PSIDTS` / `SIDCC` 等滚动 Cookie 原子同步到同锚点兄弟 `auth.json`；`_reload_if_changed()` 在目标文件 `st_mtime_ns` 变化时自动重载快照并叠加本会话待落盘的 Set-Cookie，避免兄弟槽位继续发送过期滚动凭据。
-- **`[toolshape]` 诊断日志降级**：`chat_service._emit_toolshape()` 由 `logger.info` 降为 `logger.debug`，完整 Schema 摘要不再刷屏占满常规日志与上下文，仍保留脱敏摘要供 DEBUG 排障与 PG-04 断言使用。
-- **同源兄弟滚动凭据防回灌**：`account_store.sync_sibling_storage_state_files()` 同步 `__Secure-1PSIDTS` / `SIDCC` 等滚动 Cookie 时，若兄弟与来源双方都带数字 `expires`（`> 0`）且来源过期时间更早，则跳过覆盖，避免较旧槽位把较新凭据回灌；无过期元数据时保持原 last-writer-wins 行为。
-- **WAA 登录态失效判定对齐**：`browserless_session._EXPIRED_REASON_MARKERS` 补齐 `缺少登录 cookie` / `需要重新登录` / `请重新登录`，与 `signer_client._AUTH_FAILURE_MARKERS` 对齐；`_map_signer_auth_error` docstring 明确 401 或命中明确登录态失效/重定向登录页标记返回终态 `SessionExpiredError`，其余 403/502 鉴权错误保留同号重签 `AuthError`。
-- **同源会话标记可观测性与并发安全**：`_mark_root_session_expired()` 标记失败由 `log.debug` 提升为 `log.warning`，符合非关键回退显式记录口径；`get_sibling_account_ids()` 改为迭代 `list(registry.accounts)` 快照，消除并发增删账号时的字典大小变更竞态。
-- **思维链截断显式告警**：非流式与流式生成在模型仅返回 `thinking`、未产出正文/工具调用/图片时输出 `[generation] 思维链截断告警`（WARNING，含 format/model/instance/finish_reason/thinking_len）；该场景仍视为非空响应，**不触发空响应重试或切号**，避免额外消耗上游配额。
 
 ## [2.1.1] - 2026-11-10
 

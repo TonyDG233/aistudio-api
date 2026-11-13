@@ -1,11 +1,11 @@
-# REV-2.1.4-atg-input-wrap — ATG 输入侧伪装工具调用（`wrap_input`）与图文双轨分流独立审查报告
+# REV-2.1.3.3-atg-input-wrap — ATG 输入侧伪装工具调用（`wrap_input`）与图文双轨分流独立审查报告
 
 - **审查对象**：ATG 输入侧伪装工具调用（`wrap_input`）+ 图片多模态双轨分流 + 继承各协议独立策略（`mode_by_format`）前后端改动
-- **审查角色**：独立只读 Reviewer（`REV-2.1.4-atg-input-wrap`）
+- **审查角色**：独立只读 Reviewer（`REV-2.1.3.3-atg-input-wrap`，原命名 `REV-2.1.4-atg-input-wrap`）
 - **审查日期**：2026-11-13
 - **最终判定**：**PASS**
 
-> **只读声明**：本审查严格遵守只读审计边界，未修改任何业务源码或测试文件，未在非 `--ui-debug` 模式下启动服务，未执行 `git commit` 或 `git push`；仅按任务授权写入本报告、`assets/c214-atg-wrap-input-1440.png`、更新 `docs/dev/rebuild/domains/P5-generation/index.md` 与 `docs/changelog.md`。
+> **只读声明**：本审查严格遵守只读审计边界，未修改任何业务源码或测试文件，未在非 `--ui-debug` 模式下启动服务，未执行 `git commit` 或 `git push`；仅按任务授权写入本报告（`docs/dev/rebuild/domains/P5-generation/reviews/REV-2.1.3.3-atg-input-wrap.md`）、`assets/c214-atg-wrap-input-1440.png`、更新 `docs/dev/rebuild/domains/P5-generation/index.md` 与 `docs/changelog.md`。
 
 ---
 
