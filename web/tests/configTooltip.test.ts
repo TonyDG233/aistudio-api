@@ -82,6 +82,7 @@ const defaultRecommended: Record<string, unknown> = {
   'features.atg.tool_prefix': defaults.features.atg.tool_prefix,
   'features.atg.control_position': defaults.features.atg.control_position,
   'features.atg.strict': defaults.features.atg.strict,
+  'features.atg.wrap_input': defaults.features.atg.wrap_input,
   'features.atg.empty_retries': defaults.features.atg.empty_retries,
   'features.atg.recovery': defaults.features.atg.recovery,
   'features.atg.side_buffer_bytes': defaults.features.atg.side_buffer_bytes,

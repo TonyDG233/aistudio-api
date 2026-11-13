@@ -5,6 +5,10 @@
 
 ## [2.1.2] - 2026-11-11
 
+### Added
+
+- **ATG 输入侧伪装工具调用与图文双轨分流（`wrap_input`）**：新增 `features.atg.wrap_input`（默认 `false`）与 `application/atg/input_wrapper.py`，100% 继承 `resolve_atg_mode(cfg, api_format)` 各协议独立策略（策略为 `off` 时静默直通，仅在 `prefer`/`required` 且 `wrap_input=true` 时生效）。开启后将非工具链对话输入封装为 `atg_ctx_*` 3-Turn 伪装工具交换（Turn 0 锚点 `"Initialize context retrieval."` → Turn 1 `functionCall` + PG-01 `thoughtSignature` → Turn 2 `functionResponse` 文本 Struct 与原生 `inlineData`/`fileData` 媒体 Part 同轮并置分流），保留完整多模态看图能力；`detect_client_synthetic_transport` 先于封装执行避免误判，`purge_synthetic_history` 自动清理历史 `atg_ctx_*` 与锚点防止多轮嵌套；设置页 `ProtocolAtgCard.vue` 在「各协议独立策略」正下方并排提供「严格模式」与「输入侧伪装封装（图文双轨）」开关及规范字典 Tooltip。
+
 ### Fixed
 
 - **Ultra-only 模型准入信号优先级**：提权 `ListModels` 的 `item[82]`（`accessModes`）Ultra-only 信号优先于静态 `pro_required` 子串规则，`gemini-4-carbon` 不再被误判为 Pro 可用；同时将 `carbon` 纳入 `paid_model_rules.ultra_required`（`defaults/config.yaml` 与前端 `schema.ts` 同步）与内置模型表。

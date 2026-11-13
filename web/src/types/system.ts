@@ -96,3 +96,29 @@ export interface CreateApiKeyRequest {
 export interface UpdateApiKeyRequest {
   name: string
 }
+
+export type AtgMode = 'off' | 'prefer' | 'required'
+export type AtgFormatOverrideMode = 'inherit' | AtgMode
+
+export interface AtgModeByFormat {
+  gemini?: AtgFormatOverrideMode
+  openai?: AtgFormatOverrideMode
+  claude?: AtgFormatOverrideMode
+  responses?: AtgFormatOverrideMode
+}
+
+export interface AtgConfig {
+  mode?: AtgMode | boolean
+  mode_by_format?: AtgModeByFormat
+  tool_prefix?: string
+  control_position?: 'head' | 'tail'
+  strict?: boolean
+  wrap_input?: boolean
+  empty_retries?: number
+  recovery?: 'repair' | 'fail'
+  side_buffer_bytes?: number
+  client_synthetic_guard?: boolean
+  max_response_bytes?: number
+  text_model_pattern?: string
+  non_text_model_pattern?: string
+}

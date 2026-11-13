@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 
 from .client_patterns import Detection, detect_client_synthetic_transport
 from .config import AtgConfig
+from .history_purge import purge_synthetic_history
+from .input_wrapper import wrap_input_contents
 from .model_filter import create_model_filter
 
 DEFAULT_CONTROL_TEMPLATE = (
@@ -126,6 +128,7 @@ class Injector:
         # similar answer-via-tool-call mechanism, skip the local wrap so two
         # synthetic transports never stack. Declared client tools are always
         # surfaced so unrecognized mechanisms can be identified from logs.
+        # Must run BEFORE purge/wrap_input so our own atg_ctx_* is never scanned.
         client_tools: list[str] = []
         if cfg.client_synthetic_guard is not False:
             detected = detect_client_synthetic_transport(body, self._prefix)
@@ -138,6 +141,17 @@ class Injector:
                         client_synthetic=detected,
                     )
                 client_tools = detected.tools
+
+        purged_body = purge_synthetic_history(body, self._prefix)
+        if purged_body is not body:
+            body.clear()
+            body.update(purged_body)
+
+        if cfg.wrap_input:
+            wrapped_body, _ = wrap_input_contents(body)
+            if wrapped_body is not body:
+                body.clear()
+                body.update(wrapped_body)
 
         existing_names = _collect_existing_names(body)
         tool_name = _generate_tool_name(self._prefix, existing_names)

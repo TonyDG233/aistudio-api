@@ -75,6 +75,17 @@ test('N-2 protocol card describes Claude and Responses as enabled by default', (
   expect(card).toContain("asBool(formats.value.responses, true)")
 })
 
+test('protocol card places ATG wrap_input switch next to strict switch with tooltip', () => {
+  const card = source('../src/components/settings/ProtocolAtgCard.vue')
+
+  expect(card).toContain('<div class="grid grid-cols-1 gap-3 md:grid-cols-2">')
+  expect(card).toContain('输入侧伪装封装（图文双轨）')
+  expect(card).toContain('跟随各协议策略生效 · 文本装入合成工具，图片分流原生视觉通道')
+  expect(card).toContain('asBool(atg.wrap_input, false)')
+  expect(card).toContain("updateAtg('wrap_input', $event)")
+  expect(card).toContain('schema-key="features.atg.wrap_input"')
+})
+
 test('N-7 client tooltip separates 429 terminal failures, rescues, errors and aborts', () => {
   const chart = source('../src/components/dashboard/UsageRequestChart.vue')
 

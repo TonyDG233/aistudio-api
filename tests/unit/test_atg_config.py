@@ -34,11 +34,13 @@ def test_load_atg_config_defaults():
     assert cfg.tool_prefix == "atg_emit_"
     assert cfg.control_position == "tail"
     assert cfg.strict is False
+    assert cfg.wrap_input is False
     assert cfg.empty_retries == 2
     assert cfg.recovery == "repair"
     assert cfg.side_buffer_bytes == 0
     assert cfg.client_synthetic_guard is True
     assert cfg.max_response_bytes == 16 * MB
+    assert cfg.to_dict()["wrap_input"] is False
 
 
 def test_load_atg_config_feature_defaults_expose_max_response_bytes(tmp_path):
@@ -46,6 +48,7 @@ def test_load_atg_config_feature_defaults_expose_max_response_bytes(tmp_path):
     config_path.write_text("api_keys: []\n", encoding="utf-8")
     atg = _features(config_path)["atg"]
     assert atg["max_response_bytes"] == 16 * MB
+    assert atg["wrap_input"] is False
 
 
 def test_enabled_derived_from_mode():
@@ -144,6 +147,10 @@ def test_tool_prefix_falls_back_when_blank():
 def test_bool_coercion():
     assert load_atg_config({"strict": "true"}).strict is True
     assert load_atg_config({"strict": "off"}).strict is False
+    assert load_atg_config({"wrap_input": True}).wrap_input is True
+    assert load_atg_config({"wrap_input": "true"}).wrap_input is True
+    assert load_atg_config({"wrap_input": "off"}).wrap_input is False
+    assert load_atg_config({"wrap_input": 0}).wrap_input is False
     assert (
         load_atg_config({"client_synthetic_guard": "off"}).client_synthetic_guard
         is False
@@ -151,6 +158,41 @@ def test_bool_coercion():
     assert (
         load_atg_config({"client_synthetic_guard": 0}).client_synthetic_guard is False
     )
+
+
+def test_resolve_atg_mode_with_atg_config_and_to_dict():
+    cfg = load_atg_config(
+        {
+            "mode": "prefer",
+            "wrap_input": True,
+            "mode_by_format": {
+                "gemini": "off",
+                "openai": "inherit",
+                "claude": "required",
+                "responses": "bogus",
+            },
+        }
+    )
+    assert resolve_atg_mode(cfg, "gemini") == "off"
+    assert resolve_atg_mode(cfg, "openai") == "prefer"
+    assert resolve_atg_mode(cfg, "claude") == "required"
+    assert resolve_atg_mode(cfg, "responses") == "prefer"
+    exported = cfg.to_dict()
+    assert exported["wrap_input"] is True
+    assert exported["mode"] == "prefer"
+    assert load_atg_config(exported).wrap_input is True
+
+
+def test_validate_config_mapping_invalid_wrap_input_falls_back_to_false():
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        validate_config_mapping,
+    )
+
+    normalized = validate_config_mapping(
+        {"features": {"atg": {"mode": "prefer", "wrap_input": "not-a-bool"}}}
+    )
+    features = cast("dict[str, Any]", normalized["features"])
+    assert features["atg"]["wrap_input"] is False
 
 
 # ========== Hot reload from config.yaml ==========
