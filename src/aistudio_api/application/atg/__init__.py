@@ -14,14 +14,13 @@ global mutable state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aistudio_api.domain.models import ModelOutput
 
 from .client_patterns import Detection
-from .config import AtgConfig, load_atg_config
+from .config import AtgConfig, load_atg_config, resolve_atg_mode
 from .extractor import Extractor, UnwrapResult, create_extractor
-from .history_purge import purge_synthetic_history
 from .injector import InjectResult, create_injector
 from .stream_extractor import StreamUnwrapper, create_stream_extractor
 
@@ -49,21 +48,31 @@ class AtgProcessor:
     def is_synthetic_tool_name(self, name: object) -> bool:
         return isinstance(name, str) and name.startswith(self.cfg.tool_prefix)
 
-    def wrap(self, body: object, model_name: str = "") -> WrapResult:
+    def wrap(
+        self,
+        body: object,
+        model_name: str = "",
+        *,
+        api_format: str | None = None,
+    ) -> WrapResult:
         """Wrap an outgoing Gemini request body; purge stale synthetic history first."""
-        if not self.enabled or not isinstance(body, dict):
+        effective_mode = (
+            resolve_atg_mode(self.cfg, api_format)
+            if api_format is not None
+            else self.cfg.mode
+        )
+        if effective_mode == "off" or not isinstance(body, dict):
             return WrapResult(
                 body=body if isinstance(body, dict) else {},
                 synthetic_hit=False,
                 tool_name="",
             )
 
-        contents = body.get("contents")
-        if isinstance(contents, list):
-            body["contents"] = purge_synthetic_history(contents, self.cfg.tool_prefix)
+        injector = self._injector
+        if injector is None or effective_mode != self.cfg.mode:
+            injector = create_injector(replace(self.cfg, mode=effective_mode))
 
-        assert self._injector is not None
-        result: InjectResult = self._injector.inject_gemini(body, model_name)
+        result: InjectResult = injector.inject_gemini(body, model_name)
         return WrapResult(
             body=result.body,
             synthetic_hit=result.synthetic_hit,

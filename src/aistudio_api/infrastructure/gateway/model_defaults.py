@@ -304,6 +304,18 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     value = default_value
                 raw_model_discovery[key] = value
 
+        raw_atg = raw_features.get("atg")
+        if isinstance(raw_atg, dict):
+            wrap_input = raw_atg.get("wrap_input", False)
+            if not isinstance(wrap_input, bool):
+                logger.warning(
+                    "配置 features.atg.wrap_input 非法（%r），已回退默认值 false",
+                    wrap_input,
+                )
+                raw_atg["wrap_input"] = False
+            else:
+                raw_atg["wrap_input"] = wrap_input
+
     return config
 
 

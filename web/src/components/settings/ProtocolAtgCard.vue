@@ -291,19 +291,36 @@ function formatLabel(key: string): string {
         </div>
       </div>
 
-      <div class="flex items-start gap-1.5">
-        <div class="flex-1 min-w-0">
-          <ConfigSwitch
-            :model-value="asBool(atg.strict, false)"
-            label="严格模式"
-            description="对不完整的合成协议更早报错"
-            @update:model-value="updateAtg('strict', $event)"
+      <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0">
+            <ConfigSwitch
+              :model-value="asBool(atg.strict, false)"
+              label="严格模式"
+              description="对不完整的合成协议更早报错"
+              @update:model-value="updateAtg('strict', $event)"
+            />
+          </div>
+          <FieldHelpTip
+            schema-key="features.atg.strict"
+            class="mt-2 shrink-0"
           />
         </div>
-        <FieldHelpTip
-          schema-key="features.atg.strict"
-          class="mt-2 shrink-0"
-        />
+
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0">
+            <ConfigSwitch
+              :model-value="asBool(atg.wrap_input, false)"
+              label="输入侧伪装封装（图文双轨）"
+              description="跟随各协议策略生效 · 文本装入合成工具，图片分流原生视觉通道"
+              @update:model-value="updateAtg('wrap_input', $event)"
+            />
+          </div>
+          <FieldHelpTip
+            schema-key="features.atg.wrap_input"
+            class="mt-2 shrink-0"
+          />
+        </div>
       </div>
 
       <!-- Advanced -->

@@ -12,6 +12,7 @@ The features section is re-read on every construction so a hot-reloaded
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from aistudio_api.infrastructure.gateway.model_defaults import get_features_config
@@ -40,22 +41,43 @@ def _parse_mode(value: object) -> str:
     return "off"
 
 
-def resolve_atg_mode(api_format: str) -> str:
+def resolve_atg_mode(
+    cfg_or_format: str | AtgConfig | Mapping[str, object],
+    api_format: str | None = None,
+) -> str:
     """Resolve the effective ATG mode for a protocol face.
 
-    ``features.atg.mode_by_format.<format>`` inherits ``features.atg.mode``
-    unless it explicitly names ``off`` / ``prefer`` / ``required``.
+    Supports both ``resolve_atg_mode(api_format)`` (reading ``features.atg``)
+    and ``resolve_atg_mode(cfg, api_format)`` (reading a loaded
+    :class:`AtgConfig` or raw mapping). ``mode_by_format.<format>`` inherits
+    ``mode`` unless it explicitly names ``off`` / ``prefer`` / ``required``.
     """
-    features = get_features_config()
-    atg = features.get("atg")
-    if isinstance(atg, dict):
-        by_format = atg.get("mode_by_format")
-        if isinstance(by_format, dict):
-            value = str(by_format.get(api_format, "inherit")).strip().lower()
-            if value in _VALID_MODES:
-                return value
-        return _parse_mode(atg.get("mode", DEFAULT_MODE))
-    return DEFAULT_MODE
+    if isinstance(cfg_or_format, str):
+        target_format = cfg_or_format
+        features = get_features_config()
+        raw_atg = features.get("atg")
+        atg: Mapping[str, object] = raw_atg if isinstance(raw_atg, Mapping) else {}
+    else:
+        if api_format is None:
+            raise TypeError(
+                "resolve_atg_mode(cfg, api_format) requires api_format when cfg is provided"
+            )
+        target_format = api_format
+        if isinstance(cfg_or_format, AtgConfig):
+            by_format = cfg_or_format.mode_by_format
+            if isinstance(by_format, Mapping):
+                value = str(by_format.get(target_format, "inherit")).strip().lower()
+                if value in _VALID_MODES:
+                    return value
+            return _parse_mode(cfg_or_format.mode)
+        atg = cfg_or_format
+
+    by_format = atg.get("mode_by_format")
+    if isinstance(by_format, Mapping):
+        value = str(by_format.get(target_format, "inherit")).strip().lower()
+        if value in _VALID_MODES:
+            return value
+    return _parse_mode(atg.get("mode", DEFAULT_MODE))
 
 
 def _parse_bounded_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
@@ -92,9 +114,11 @@ def _coerce_bool(value: object, default: bool) -> bool:
 @dataclass(frozen=True)
 class AtgConfig:
     mode: str = DEFAULT_MODE
+    mode_by_format: dict[str, str] = field(default_factory=dict)
     tool_prefix: str = DEFAULT_TOOL_PREFIX
     control_position: str = DEFAULT_CONTROL_POSITION
     strict: bool = False
+    wrap_input: bool = False
     empty_retries: int = DEFAULT_EMPTY_RETRIES
     recovery: str = DEFAULT_RECOVERY
     side_buffer_bytes: int = 0
@@ -108,6 +132,23 @@ class AtgConfig:
     def enabled(self) -> bool:
         """Derived flag: ATG is active whenever the mode is not ``off``."""
         return self.mode != "off"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "mode_by_format": dict(self.mode_by_format),
+            "tool_prefix": self.tool_prefix,
+            "control_position": self.control_position,
+            "strict": self.strict,
+            "wrap_input": self.wrap_input,
+            "empty_retries": self.empty_retries,
+            "recovery": self.recovery,
+            "side_buffer_bytes": self.side_buffer_bytes,
+            "client_synthetic_guard": self.client_synthetic_guard,
+            "max_response_bytes": self.max_response_bytes,
+            "text_model_pattern": self.text_model_pattern,
+            "non_text_model_pattern": self.non_text_model_pattern,
+        }
 
 
 def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
@@ -123,6 +164,16 @@ def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
         return raw.get(key, default)
 
     mode = _parse_mode(pick("mode", DEFAULT_MODE))
+    raw_by_format = pick("mode_by_format", {})
+    mode_by_format: dict[str, str] = {}
+    if isinstance(raw_by_format, Mapping):
+        for fmt, val in raw_by_format.items():
+            if not isinstance(fmt, str):
+                continue
+            parsed_val = str(val or "inherit").strip().lower()
+            mode_by_format[fmt] = (
+                parsed_val if parsed_val in _VALID_MODES else "inherit"
+            )
     tool_prefix = str(pick("tool_prefix", DEFAULT_TOOL_PREFIX) or "").strip()
     if not tool_prefix:
         tool_prefix = DEFAULT_TOOL_PREFIX
@@ -144,9 +195,11 @@ def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
 
     return AtgConfig(
         mode=mode,
+        mode_by_format=mode_by_format,
         tool_prefix=tool_prefix,
         control_position=control_position,
         strict=_coerce_bool(pick("strict", False), False),
+        wrap_input=_coerce_bool(pick("wrap_input", False), False),
         empty_retries=_parse_bounded_int(
             pick("empty_retries", DEFAULT_EMPTY_RETRIES),
             DEFAULT_EMPTY_RETRIES,

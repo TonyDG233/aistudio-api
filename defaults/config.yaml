@@ -157,6 +157,7 @@ features:
   # tool_prefix：合成工具名前缀，默认 atg_emit_。
   # control_position：合成控制块插入位置，head（首部）或 tail（尾部，默认）。
   # strict：严格模式；为 true 时对不完整的合成协议更早报错。
+  # wrap_input：是否开启输入侧伪装工具调用（Text-in-Tool + Media-in-Turn 双轨封装），默认 false。
   # empty_retries：空响应重试次数，范围 0..5，默认 2。
   # recovery：恢复策略，repair（尝试修复，默认）或 fail（直接失败）。
   # side_buffer_bytes：侧缓冲字节数，范围 >=0，默认 0（不额外缓存）。
@@ -174,6 +175,7 @@ features:
     tool_prefix: atg_emit_
     control_position: tail
     strict: false
+    wrap_input: false
     empty_retries: 2
     recovery: repair
     side_buffer_bytes: 0

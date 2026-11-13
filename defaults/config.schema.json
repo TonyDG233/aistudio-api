@@ -362,6 +362,7 @@
             "tool_prefix": { "type": "string", "default": "atg_emit_" },
             "control_position": { "enum": ["head", "tail"], "default": "tail" },
             "strict": { "type": "boolean", "default": false },
+            "wrap_input": { "type": "boolean", "default": false },
             "empty_retries": {
               "type": "integer",
               "minimum": 0,

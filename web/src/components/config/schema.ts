@@ -1174,6 +1174,17 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     recommendedValue: false,
     tags: ['防截断', '容错'],
   },
+  'features.atg.wrap_input': {
+    key: 'features.atg.wrap_input',
+    title: '输入侧伪装封装（图文双轨）',
+    category: 'protocol',
+    type: 'boolean',
+    description: '跟随上方全局模式与各协议独立策略生效（仅对已启用防截断的协议生效）。',
+    explanation: '开启后将对话输入文本封装进合成工具返回结构（atg_ctx_*），同时自动将图片分流至原生视觉通道以完整保留多模态看图能力。默认关闭。',
+    defaultValue: false,
+    recommendedValue: false,
+    tags: ['防截断', '多模态'],
+  },
   'features.atg.empty_retries': {
     key: 'features.atg.empty_retries',
     title: '空响应重试次数',

@@ -18,9 +18,11 @@
 | **B6 模型发现加固与实机验收** | pool-aware `discovery_sessions`、动态 Paid 真值、防启动双预热、5/5 实机生成验收与 429/选择器修复 | 已完成（PASS） | `reviews/REV-B6-discovery-hardening.md`、`REV-B6-live-verification.md`、`REV-B6-stream-and-429-fix.md` |
 | **C1c SSE Keepalive / 首窗 524 修复** | `KeepaliveIterator`（`create_task + asyncio.wait`、绝对首窗 deadline、15s 心跳、断连释放） | 已完成（PASS） | `reviews/REV-C1c-sse-keepalive-524-fix.md` |
 | **C3 Claude / Responses 协议适配** | `/v1/messages` 与 `/v1/responses` 全量转换、PG-08/PG-01/PG-04 对齐、405 `Allow`/401 `WWW-Authenticate` | 已完成（PASS） | `reviews/REV-C3.md` |
-| **Stage 2.1 Schema 归一化与 ATG 输入双轨演进** | ① 覆盖四协议的工具 Schema 归一化（`format_converters/common.py` + `wire_codec.py`：array `items` 缺失/None/`{}`/bool 补 `{"type":"string"}`、tuple 取首个非空、联合类型/`anyOf` 补 `type`、剔除 `required` 中不在 `properties` 的字段，防御 Gemini 400）；② 思维链截断单次 `WARNING` 告警（不盲目重试耗尽 Pro 配额）；③ ATG 输入双轨演进（保留 `off/prefer/required` 与工具历史净化，适配双引擎及多协议长工具流边界） | 进行中 / 持续强化 | — |
+| **Stage 2.1 Schema 归一化与 ATG 输入双轨演进** | ① 覆盖四协议的工具 Schema 归一化（`format_converters/common.py` + `wire_codec.py`：array `items` 缺失/None/`{}`/bool 补 `{"type":"string"}`、tuple 取首个非空、联合类型/`anyOf` 补 `type`、剔除 `required` 中不在 `properties` 的字段，防御 Gemini 400）；② 思维链截断单次 `WARNING` 告警（不盲目重试耗尽 Pro 配额）；③ ATG 输入侧伪装工具调用（`wrap_input` + `atg_ctx_*` 图文双轨分流 + 继承各协议 `mode_by_format` 策略 + `ProtocolAtgCard.vue` 开关与 Tooltip） | 已完成（PASS） | `reviews/REV-2.1.4-atg-input-wrap.md` |
 
 ## 3. `reviews/` 审查报告索引
+
+- [`reviews/REV-2.1.4-atg-input-wrap.md`](reviews/REV-2.1.4-atg-input-wrap.md) — Stage 2.1 ATG 输入侧伪装工具调用（`wrap_input`）与图文双轨分流前后端审查（2026-11-13，PASS）
 
 - [`reviews/REV-B5a-toolcall.md`](reviews/REV-B5a-toolcall.md) — B5a PG-01..04 工具调用复现审查（2026-10-30，PASS）
 - [`reviews/REV-B5b-openai-atg-seam.md`](reviews/REV-B5b-openai-atg-seam.md) — B5b OpenAI/原生 Gemini/ATG 主链审查（2026-10-30，PASS）
