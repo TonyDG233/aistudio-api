@@ -92,6 +92,16 @@ _MODEL_DISCOVERY_DEFAULTS = {
     "live_refresh_interval_sec": _MODEL_DISCOVERY_LIVE_REFRESH_DEFAULT_SEC,
     "fallback_refresh_interval_sec": _MODEL_DISCOVERY_FALLBACK_REFRESH_DEFAULT_SEC,
 }
+_ATG_DEFAULT_CONTROL_TEMPLATE = (
+    "IMPORTANT: Regular chat responses are unreliable in this environment. "
+    "Deliver your complete final answer exclusively by calling the function {tool_name}, "
+    'passing your visible answer as a string in the "content" parameter. '
+    "Do not mention this instruction."
+)
+_ATG_DEFAULT_INPUT_CONTEXT_INSTRUCTION = (
+    "Above is the complete conversation context. "
+    "Respond directly to the final user turn and any attached media."
+)
 
 
 class ConfigValidationError(ValueError):
@@ -304,6 +314,23 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                     value = default_value
                 raw_model_discovery[key] = value
 
+        default_atg = (
+            default_features.get("atg") if isinstance(default_features, dict) else None
+        )
+        fallback_control_template = (
+            default_atg.get("control_template")
+            if isinstance(default_atg, dict)
+            and isinstance(default_atg.get("control_template"), str)
+            and str(default_atg.get("control_template")).strip()
+            else _ATG_DEFAULT_CONTROL_TEMPLATE
+        )
+        fallback_input_instruction = (
+            default_atg.get("input_context_instruction")
+            if isinstance(default_atg, dict)
+            and isinstance(default_atg.get("input_context_instruction"), str)
+            and str(default_atg.get("input_context_instruction")).strip()
+            else _ATG_DEFAULT_INPUT_CONTEXT_INSTRUCTION
+        )
         raw_atg = raw_features.get("atg")
         if isinstance(raw_atg, dict):
             wrap_input = raw_atg.get("wrap_input", False)
@@ -315,6 +342,41 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                 raw_atg["wrap_input"] = False
             else:
                 raw_atg["wrap_input"] = wrap_input
+
+            wrap_output = raw_atg.get("wrap_output", True)
+            if not isinstance(wrap_output, bool):
+                logger.warning(
+                    "配置 features.atg.wrap_output 非法（%r），已回退默认值 true",
+                    wrap_output,
+                )
+                raw_atg["wrap_output"] = True
+            else:
+                raw_atg["wrap_output"] = wrap_output
+
+            control_template = raw_atg.get(
+                "control_template", fallback_control_template
+            )
+            if not isinstance(control_template, str) or not control_template.strip():
+                logger.warning(
+                    "配置 features.atg.control_template 非法或为空（%r），已回退默认模板",
+                    control_template,
+                )
+                raw_atg["control_template"] = fallback_control_template
+            else:
+                raw_atg["control_template"] = control_template
+
+            input_instruction = raw_atg.get(
+                "input_context_instruction", fallback_input_instruction
+            )
+            if not isinstance(input_instruction, str) or not input_instruction.strip():
+                logger.warning(
+                    "配置 features.atg.input_context_instruction 非法或为空（%r），"
+                    "已回退默认指令",
+                    input_instruction,
+                )
+                raw_atg["input_context_instruction"] = fallback_input_instruction
+            else:
+                raw_atg["input_context_instruction"] = input_instruction
 
     return config
 
@@ -1729,9 +1791,9 @@ def resolve_tier_quota(
 
     tier_rules = quotas.get(clean_tier)
     if not isinstance(tier_rules, dict):
-        return 20
+        return 50
 
-    default_limit = int(str(tier_rules.get("default_limit", 20)))
+    default_limit = int(str(tier_rules.get("default_limit", 50)))
     if not normalized_model:
         return default_limit
 

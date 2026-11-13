@@ -817,3 +817,85 @@ async def test_sibling_sync_skips_older_rotating_cookie_expiry(tmp_path: Path) -
     assert _auth_cookies(u0_auth)["__Secure-1PSIDTS"] == "ts-older"
     # A stale slot must not roll back a sibling that already holds a newer copy.
     assert _auth_cookies(u1_auth)["__Secure-1PSIDTS"] == "ts-newer"
+
+
+@pytest.mark.asyncio
+async def test_generate_snapshot_truncates_page_prompt_and_omits_wire_contents(
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+
+    signer = FakeSigner()
+    session = _session(signer, _write_auth(tmp_path, "a", "cookie-a"))
+    long_text = "A" * 500 + "TAIL-END-256-MARKER"
+    contents = [AistudioContent.from_user_prompt(long_text)]
+
+    proof = await session.generate_snapshot(contents)
+    assert proof == "!proof-abc"
+    assert len(signer.mints) == 1
+    mint = signer.mints[0]
+    expected_tail = long_text[-256:]
+    assert mint["page_prompt"] == expected_tail
+    assert mint["prompt"] == expected_tail
+    assert len(str(mint["page_prompt"])) == 256
+    assert mint["digest"] == sha256(long_text.encode("utf-8")).hexdigest()
+    assert mint["wire_contents"] is None
+
+
+@pytest.mark.asyncio
+async def test_capture_serializes_body_once_via_snapshot_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.gateway import capture as capture_module
+
+    signer = FakeSigner()
+    signer.proof = 'snap-"quoted"\\ok'
+    session = _session(signer, _write_auth(tmp_path, "a", "cookie-a"))
+
+    calls: list[str] = []
+    real_modify_body = capture_module.modify_body
+
+    def counting_modify_body(*args: object, **kwargs: object) -> str:
+        calls.append(str(kwargs.get("snapshot") or ""))
+        return real_modify_body(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(capture_module, "modify_body", counting_modify_body)
+
+    captured = await session.capture_service.capture(
+        prompt="hello capture sentinel", model="models/gemini-3.7-flash"
+    )
+    assert captured is not None
+    assert len(calls) == 1
+    assert calls[0] == capture_module._SNAPSHOT_SENTINEL
+    assert capture_module._SNAPSHOT_SENTINEL not in captured.body
+    parsed = json.loads(captured.body)
+    assert parsed[4] == '!snap-"quoted"\\ok'
+
+
+@pytest.mark.asyncio
+async def test_capture_falls_back_when_prompt_contains_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.gateway import capture as capture_module
+
+    signer = FakeSigner()
+    session = _session(signer, _write_auth(tmp_path, "a", "cookie-a"))
+
+    calls: list[str] = []
+    real_modify_body = capture_module.modify_body
+
+    def counting_modify_body(*args: object, **kwargs: object) -> str:
+        calls.append(str(kwargs.get("snapshot") or ""))
+        return real_modify_body(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(capture_module, "modify_body", counting_modify_body)
+
+    prompt_with_sentinel = f"prefix {capture_module._SNAPSHOT_SENTINEL} suffix"
+    captured = await session.capture_service.capture(
+        prompt=prompt_with_sentinel, model="models/gemini-3.7-flash"
+    )
+    assert captured is not None
+    assert len(calls) == 2
+    parsed = json.loads(captured.body)
+    assert parsed[4] == "!proof-abc"
+    assert parsed[1][0][0][0][1] == prompt_with_sentinel

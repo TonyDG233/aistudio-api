@@ -22,6 +22,7 @@ _DEFAULT_PAID_MODELS = {
     "gemini-4-argon",
     "gemini-4-carbon",
     "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
     "gemini-3.6-flash",
     "gemini-nano-banana-2.1",
     "gemini-3.1-flash-image",

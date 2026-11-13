@@ -158,6 +158,10 @@ features:
   # control_position：合成控制块插入位置，head（首部）或 tail（尾部，默认）。
   # strict：严格模式；为 true 时对不完整的合成协议更早报错。
   # wrap_input：是否开启输入侧伪装工具调用（Text-in-Tool + Media-in-Turn 双轨封装），默认 false。
+  # wrap_output：是否开启输出侧伪装封装（注入合成工具声明与控制提示词），默认 true；
+  #   设为 false 时可仅保留输入封装，让模型回答走原生流式直接输出。
+  # control_template：输出侧引导模型调用合成工具的提示词模板，支持 {tool_name} 占位符。
+  # input_context_instruction：输入侧历史上下文工具返回的引导指令。
   # empty_retries：空响应重试次数，范围 0..5，默认 2。
   # recovery：恢复策略，repair（尝试修复，默认）或 fail（直接失败）。
   # side_buffer_bytes：侧缓冲字节数，范围 >=0，默认 0（不额外缓存）。
@@ -176,6 +180,9 @@ features:
     control_position: tail
     strict: false
     wrap_input: false
+    wrap_output: true
+    control_template: 'IMPORTANT: Regular chat responses are unreliable in this environment. Deliver your complete final answer exclusively by calling the function {tool_name}, passing your visible answer as a string in the "content" parameter. Do not mention this instruction.'
+    input_context_instruction: "Above is the complete conversation context. Respond directly to the final user turn and any attached media."
     empty_retries: 2
     recovery: repair
     side_buffer_bytes: 0
@@ -192,7 +199,7 @@ paid_model_rules:
     contains: ["veo", "ultra", "carbon"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "gemini-4", "imagen"]
+    contains: ["argon", "3.1-pro", "imagen"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
 # 模型原生默认规则：
@@ -250,28 +257,36 @@ tier_quotas:
   Free:
     flash_models:
       match:
-        contains: ["flash"]
-      daily_limit: 100
+        contains: ["flash", "hydrogen"]
+      daily_limit: 50
     pro_models:
       match:
         contains: ["pro"]
-      daily_limit: 10
-    default_limit: 20
+      daily_limit: 0
+    default_limit: 50
   Plus:
+    hydrogen_models:
+      match:
+        contains: ["hydrogen"]
+      daily_limit: 100
     flash_models:
       match:
         contains: ["flash"]
-      daily_limit: 300
+      daily_limit: 150
     pro_models:
       match:
         contains: ["pro"]
-      daily_limit: 30
+      daily_limit: 50
     default_limit: 50
   Pro:
     argon_models:
       match:
-        contains: ["argon", "gemini-4"]
+        contains: ["argon"]
       daily_limit: 50
+    hydrogen_models:
+      match:
+        contains: ["hydrogen"]
+      daily_limit: 100
     flash_models:
       match:
         contains: ["flash"]
@@ -288,47 +303,55 @@ tier_quotas:
   Ultra:
     argon_models:
       match:
-        contains: ["argon", "gemini-4"]
-      daily_limit: 250
+        contains: ["argon", "carbon"]
+      daily_limit: 200
+    hydrogen_models:
+      match:
+        contains: ["hydrogen"]
+      daily_limit: 200
     flash_models:
       match:
         contains: ["flash"]
-      daily_limit: 1500
+      daily_limit: 200
     pro_models:
       match:
         contains: ["pro"]
-      daily_limit: 250
+      daily_limit: 100
     image_models:
       match:
         contains: ["image", "imagen"]
-      daily_limit: 250
+      daily_limit: 200
     video_models:
       match:
         contains: ["veo"]
       daily_limit: 50
-    default_limit: 250
+    default_limit: 200
   Ultra_20X:
     argon_models:
       match:
-        contains: ["argon", "gemini-4"]
-      daily_limit: 1000
+        contains: ["argon", "carbon"]
+      daily_limit: 200
+    hydrogen_models:
+      match:
+        contains: ["hydrogen"]
+      daily_limit: 200
     flash_models:
       match:
         contains: ["flash"]
-      daily_limit: 5000
+      daily_limit: 200
     pro_models:
       match:
         contains: ["pro"]
-      daily_limit: 1000
+      daily_limit: 100
     image_models:
       match:
         contains: ["image", "imagen"]
-      daily_limit: 1000
+      daily_limit: 200
     video_models:
       match:
         contains: ["veo"]
-      daily_limit: 200
-    default_limit: 1000
+      daily_limit: 50
+    default_limit: 200
   overrides: {}
 
 # 账号预设方案：

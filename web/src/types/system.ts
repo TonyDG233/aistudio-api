@@ -114,6 +114,9 @@ export interface AtgConfig {
   control_position?: 'head' | 'tail'
   strict?: boolean
   wrap_input?: boolean
+  wrap_output?: boolean
+  control_template?: string
+  input_context_instruction?: string
   empty_retries?: number
   recovery?: 'repair' | 'fail'
   side_buffer_bytes?: number

@@ -363,6 +363,15 @@
             "control_position": { "enum": ["head", "tail"], "default": "tail" },
             "strict": { "type": "boolean", "default": false },
             "wrap_input": { "type": "boolean", "default": false },
+            "wrap_output": { "type": "boolean", "default": true },
+            "control_template": {
+              "type": "string",
+              "default": "IMPORTANT: Regular chat responses are unreliable in this environment. Deliver your complete final answer exclusively by calling the function {tool_name}, passing your visible answer as a string in the \"content\" parameter. Do not mention this instruction."
+            },
+            "input_context_instruction": {
+              "type": "string",
+              "default": "Above is the complete conversation context. Respond directly to the final user turn and any attached media."
+            },
             "empty_retries": {
               "type": "integer",
               "minimum": 0,

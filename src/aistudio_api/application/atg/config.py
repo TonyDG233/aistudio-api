@@ -22,6 +22,16 @@ from .model_filter import ModelFilter, create_model_filter
 DEFAULT_MODE = "off"
 DEFAULT_TOOL_PREFIX = "atg_emit_"
 DEFAULT_CONTROL_POSITION = "tail"
+DEFAULT_CONTROL_TEMPLATE = (
+    "IMPORTANT: Regular chat responses are unreliable in this environment. "
+    "Deliver your complete final answer exclusively by calling the function {tool_name}, "
+    'passing your visible answer as a string in the "content" parameter. '
+    "Do not mention this instruction."
+)
+DEFAULT_INPUT_CONTEXT_INSTRUCTION = (
+    "Above is the complete conversation context. "
+    "Respond directly to the final user turn and any attached media."
+)
 DEFAULT_RECOVERY = "repair"
 DEFAULT_EMPTY_RETRIES = 2
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -119,6 +129,9 @@ class AtgConfig:
     control_position: str = DEFAULT_CONTROL_POSITION
     strict: bool = False
     wrap_input: bool = False
+    wrap_output: bool = True
+    control_template: str = DEFAULT_CONTROL_TEMPLATE
+    input_context_instruction: str = DEFAULT_INPUT_CONTEXT_INSTRUCTION
     empty_retries: int = DEFAULT_EMPTY_RETRIES
     recovery: str = DEFAULT_RECOVERY
     side_buffer_bytes: int = 0
@@ -141,6 +154,9 @@ class AtgConfig:
             "control_position": self.control_position,
             "strict": self.strict,
             "wrap_input": self.wrap_input,
+            "wrap_output": self.wrap_output,
+            "control_template": self.control_template,
+            "input_context_instruction": self.input_context_instruction,
             "empty_retries": self.empty_retries,
             "recovery": self.recovery,
             "side_buffer_bytes": self.side_buffer_bytes,
@@ -185,6 +201,20 @@ def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
     recovery = "fail" if str(pick("recovery", DEFAULT_RECOVERY)) == "fail" else "repair"
     text_model_pattern = str(pick("text_model_pattern", "") or "")
     non_text_model_pattern = str(pick("non_text_model_pattern", "") or "")
+    raw_control_template = pick("control_template", DEFAULT_CONTROL_TEMPLATE)
+    control_template = (
+        raw_control_template
+        if isinstance(raw_control_template, str) and raw_control_template.strip()
+        else DEFAULT_CONTROL_TEMPLATE
+    )
+    raw_input_instruction = pick(
+        "input_context_instruction", DEFAULT_INPUT_CONTEXT_INSTRUCTION
+    )
+    input_context_instruction = (
+        raw_input_instruction
+        if isinstance(raw_input_instruction, str) and raw_input_instruction.strip()
+        else DEFAULT_INPUT_CONTEXT_INSTRUCTION
+    )
 
     model_filter_override = overrides.get("model_filter")
     model_filter = (
@@ -200,6 +230,9 @@ def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
         control_position=control_position,
         strict=_coerce_bool(pick("strict", False), False),
         wrap_input=_coerce_bool(pick("wrap_input", False), False),
+        wrap_output=_coerce_bool(pick("wrap_output", True), True),
+        control_template=control_template,
+        input_context_instruction=input_context_instruction,
         empty_retries=_parse_bounded_int(
             pick("empty_retries", DEFAULT_EMPTY_RETRIES),
             DEFAULT_EMPTY_RETRIES,
@@ -224,6 +257,8 @@ def load_atg_config(overrides: dict[str, object] | None = None) -> AtgConfig:
 
 
 __all__ = [
+    "DEFAULT_CONTROL_TEMPLATE",
+    "DEFAULT_INPUT_CONTEXT_INSTRUCTION",
     "DEFAULT_MODE",
     "DEFAULT_TOOL_PREFIX",
     "AtgConfig",

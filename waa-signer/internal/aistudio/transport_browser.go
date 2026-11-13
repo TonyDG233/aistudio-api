@@ -578,7 +578,7 @@ func (transport *browserRoundTripper) ensurePreflight(request *stdhttp.Request) 
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return fmt.Errorf("CORS 预检返回 HTTP %d", response.StatusCode)
 	}
-	maxAge := 5 * time.Second
+	maxAge := 600 * time.Second
 	if seconds, err := strconv.Atoi(response.Header.Get("Access-Control-Max-Age")); err == nil {
 		maxAge = min(time.Duration(seconds)*time.Second, 24*time.Hour)
 	}

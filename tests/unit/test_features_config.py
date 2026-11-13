@@ -68,9 +68,7 @@ def test_hash_include_code_defaults_true_and_env_overrides_yaml(tmp_path, monkey
     assert resolve_hash_include_code() is True
 
 
-def test_routing_retry_same_delay_default_env_clamp_and_invalid(
-    tmp_path, monkeypatch
-):
+def test_routing_retry_same_delay_default_env_clamp_and_invalid(tmp_path, monkeypatch):
     """VPS #1: 429 same-account delay defaults to 2.0s and is env-overridable."""
     path = _write_config(
         tmp_path,
@@ -671,9 +669,118 @@ def test_auth_error_cooldown_inherits_tracked_template_default():
 
 
 def test_auth_error_cooldown_still_rejects_non_numeric_when_present():
-    with pytest.raises(
-        ConfigValidationError, match=r"rotator\.cooldowns\.auth_error"
-    ):
+    with pytest.raises(ConfigValidationError, match=r"rotator\.cooldowns\.auth_error"):
         validate_config_mapping(
             {"rotator": {"cooldowns": {"auth_error": "not-a-number"}}}
         )
+
+
+def test_default_tier_quotas_free_flash_limit_and_hydrogen_bucket():
+    from aistudio_api.application.routing_eligibility import resolve_required_tiers
+    from aistudio_api.config import resolve_default_config_template
+    from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
+
+    default_path = resolve_default_config_template()
+    invalidate_config_cache()
+    defaults = validate_config_mapping({})
+    tier_quotas = defaults["tier_quotas"]
+    assert isinstance(tier_quotas, dict)
+
+    assert tier_quotas["Free"]["flash_models"]["daily_limit"] == 50
+    assert tier_quotas["Free"]["pro_models"]["daily_limit"] == 0
+    assert tier_quotas["Free"]["default_limit"] == 50
+    assert "hydrogen" in tier_quotas["Free"]["flash_models"]["match"]["contains"]
+    assert (
+        resolve_tier_quota("Free", "gemini-4-hydrogen", config_path=default_path) == 50
+    )
+    assert (
+        resolve_tier_quota("Free", "gemini-3.7-flash", config_path=default_path) == 50
+    )
+    assert (
+        resolve_tier_quota("Free", "gemini-3.1-pro-preview", config_path=default_path)
+        == 0
+    )
+
+    for (
+        tier_name,
+        expected_hydrogen,
+        expected_flash,
+        expected_pro,
+        expected_default,
+    ) in (
+        ("Plus", 100, 150, 50, 50),
+        ("Pro", 100, 150, 50, 50),
+        ("Ultra", 200, 200, 100, 200),
+        ("Ultra_20X", 200, 200, 100, 200),
+    ):
+        bucket_keys = list(tier_quotas[tier_name].keys())
+        assert bucket_keys.index("hydrogen_models") < bucket_keys.index("flash_models")
+        assert tier_quotas[tier_name]["hydrogen_models"]["match"]["contains"] == [
+            "hydrogen"
+        ]
+        assert tier_quotas[tier_name]["flash_models"]["match"]["contains"] == ["flash"]
+        assert tier_quotas[tier_name]["default_limit"] == expected_default
+        assert (
+            resolve_tier_quota(tier_name, "gemini-4-hydrogen", config_path=default_path)
+            == expected_hydrogen
+        )
+        assert (
+            resolve_tier_quota(tier_name, "gemini-3.8-flash", config_path=default_path)
+            == expected_flash
+        )
+        assert (
+            resolve_tier_quota(
+                tier_name, "gemini-3.1-pro-preview", config_path=default_path
+            )
+            == expected_pro
+        )
+
+    assert tier_quotas["Pro"]["argon_models"]["match"]["contains"] == ["argon"]
+    assert resolve_tier_quota("Pro", "gemini-4-argon", config_path=default_path) == 50
+    assert (
+        resolve_tier_quota("Pro", "gemini-3-pro-image", config_path=default_path) == 50
+    )
+    assert (
+        resolve_tier_quota("Pro", "gemini-3.1-flash-image", config_path=default_path)
+        == 150
+    )
+
+    for ultra_tier in ("Ultra", "Ultra_20X"):
+        assert tier_quotas[ultra_tier]["argon_models"]["match"]["contains"] == [
+            "argon",
+            "carbon",
+        ]
+        assert (
+            resolve_tier_quota(ultra_tier, "gemini-4-argon", config_path=default_path)
+            == 200
+        )
+        assert (
+            resolve_tier_quota(ultra_tier, "gemini-4-carbon", config_path=default_path)
+            == 200
+        )
+        assert (
+            resolve_tier_quota(
+                ultra_tier, "veo-3.1-generate-preview", config_path=default_path
+            )
+            == 50
+        )
+
+    paid_rules = defaults["paid_model_rules"]
+    assert isinstance(paid_rules, dict)
+    assert "gemini-4" not in paid_rules["pro_required"]["contains"]
+    assert "3.1-pro" in paid_rules["pro_required"]["contains"]
+    assert resolve_required_tiers("gemini-4-hydrogen", rules=paid_rules) == ()
+    assert resolve_required_tiers("gemini-4-argon", rules=paid_rules) == (
+        "Pro",
+        "Ultra",
+        "Ultra_20X",
+    )
+    assert resolve_required_tiers("gemini-3.1-pro-preview", rules=paid_rules) == (
+        "Pro",
+        "Ultra",
+        "Ultra_20X",
+    )
+    assert resolve_required_tiers("gemini-4-carbon", rules=paid_rules) == (
+        "Ultra",
+        "Ultra_20X",
+    )

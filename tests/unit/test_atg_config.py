@@ -6,6 +6,8 @@ import os
 from typing import Any, cast
 
 from aistudio_api.application.atg.config import (
+    DEFAULT_CONTROL_TEMPLATE,
+    DEFAULT_INPUT_CONTEXT_INSTRUCTION,
     AtgConfig,
     load_atg_config,
     resolve_atg_mode,
@@ -35,12 +37,19 @@ def test_load_atg_config_defaults():
     assert cfg.control_position == "tail"
     assert cfg.strict is False
     assert cfg.wrap_input is False
+    assert cfg.wrap_output is True
+    assert cfg.control_template == DEFAULT_CONTROL_TEMPLATE
+    assert cfg.input_context_instruction == DEFAULT_INPUT_CONTEXT_INSTRUCTION
     assert cfg.empty_retries == 2
     assert cfg.recovery == "repair"
     assert cfg.side_buffer_bytes == 0
     assert cfg.client_synthetic_guard is True
     assert cfg.max_response_bytes == 16 * MB
-    assert cfg.to_dict()["wrap_input"] is False
+    exported = cfg.to_dict()
+    assert exported["wrap_input"] is False
+    assert exported["wrap_output"] is True
+    assert exported["control_template"] == DEFAULT_CONTROL_TEMPLATE
+    assert exported["input_context_instruction"] == DEFAULT_INPUT_CONTEXT_INSTRUCTION
 
 
 def test_load_atg_config_feature_defaults_expose_max_response_bytes(tmp_path):
@@ -49,6 +58,9 @@ def test_load_atg_config_feature_defaults_expose_max_response_bytes(tmp_path):
     atg = _features(config_path)["atg"]
     assert atg["max_response_bytes"] == 16 * MB
     assert atg["wrap_input"] is False
+    assert atg["wrap_output"] is True
+    assert atg["control_template"] == DEFAULT_CONTROL_TEMPLATE
+    assert atg["input_context_instruction"] == DEFAULT_INPUT_CONTEXT_INSTRUCTION
 
 
 def test_enabled_derived_from_mode():
@@ -151,6 +163,10 @@ def test_bool_coercion():
     assert load_atg_config({"wrap_input": "true"}).wrap_input is True
     assert load_atg_config({"wrap_input": "off"}).wrap_input is False
     assert load_atg_config({"wrap_input": 0}).wrap_input is False
+    assert load_atg_config({"wrap_output": True}).wrap_output is True
+    assert load_atg_config({"wrap_output": "true"}).wrap_output is True
+    assert load_atg_config({"wrap_output": "off"}).wrap_output is False
+    assert load_atg_config({"wrap_output": 0}).wrap_output is False
     assert (
         load_atg_config({"client_synthetic_guard": "off"}).client_synthetic_guard
         is False
@@ -160,11 +176,41 @@ def test_bool_coercion():
     )
 
 
+def test_template_and_instruction_override_and_blank_fallback():
+    custom_tpl = "Use tool {tool_name} now."
+    custom_inst = "Read turns carefully."
+    cfg = load_atg_config(
+        {
+            "control_template": custom_tpl,
+            "input_context_instruction": custom_inst,
+        }
+    )
+    assert cfg.control_template == custom_tpl
+    assert cfg.input_context_instruction == custom_inst
+
+    for blank in ("", "   ", None, 123):
+        fallback_cfg = load_atg_config(
+            {
+                "control_template": blank,
+                "input_context_instruction": blank,
+            }
+        )
+        assert fallback_cfg.control_template == DEFAULT_CONTROL_TEMPLATE
+        assert (
+            fallback_cfg.input_context_instruction == DEFAULT_INPUT_CONTEXT_INSTRUCTION
+        )
+
+
 def test_resolve_atg_mode_with_atg_config_and_to_dict():
+    custom_tpl = "Call {tool_name} exclusively."
+    custom_inst = "Custom input context instruction."
     cfg = load_atg_config(
         {
             "mode": "prefer",
             "wrap_input": True,
+            "wrap_output": False,
+            "control_template": custom_tpl,
+            "input_context_instruction": custom_inst,
             "mode_by_format": {
                 "gemini": "off",
                 "openai": "inherit",
@@ -179,8 +225,15 @@ def test_resolve_atg_mode_with_atg_config_and_to_dict():
     assert resolve_atg_mode(cfg, "responses") == "prefer"
     exported = cfg.to_dict()
     assert exported["wrap_input"] is True
+    assert exported["wrap_output"] is False
+    assert exported["control_template"] == custom_tpl
+    assert exported["input_context_instruction"] == custom_inst
     assert exported["mode"] == "prefer"
-    assert load_atg_config(exported).wrap_input is True
+    reloaded = load_atg_config(exported)
+    assert reloaded.wrap_input is True
+    assert reloaded.wrap_output is False
+    assert reloaded.control_template == custom_tpl
+    assert reloaded.input_context_instruction == custom_inst
 
 
 def test_validate_config_mapping_invalid_wrap_input_falls_back_to_false():
@@ -189,10 +242,26 @@ def test_validate_config_mapping_invalid_wrap_input_falls_back_to_false():
     )
 
     normalized = validate_config_mapping(
-        {"features": {"atg": {"mode": "prefer", "wrap_input": "not-a-bool"}}}
+        {
+            "features": {
+                "atg": {
+                    "mode": "prefer",
+                    "wrap_input": "not-a-bool",
+                    "wrap_output": "not-a-bool",
+                    "control_template": "   ",
+                    "input_context_instruction": "",
+                }
+            }
+        }
     )
     features = cast("dict[str, Any]", normalized["features"])
     assert features["atg"]["wrap_input"] is False
+    assert features["atg"]["wrap_output"] is True
+    assert features["atg"]["control_template"] == DEFAULT_CONTROL_TEMPLATE
+    assert (
+        features["atg"]["input_context_instruction"]
+        == DEFAULT_INPUT_CONTEXT_INSTRUCTION
+    )
 
 
 # ========== Hot reload from config.yaml ==========

@@ -10,7 +10,10 @@ from aistudio_api.application.routing_eligibility import (
     tier_allows,
 )
 from aistudio_api.domain.model_access import clear_paid_models, set_paid_models
-from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+from aistudio_api.infrastructure.gateway.model_discovery import (
+    _FALLBACK_MODELS,
+    model_discovery,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -167,3 +170,55 @@ def test_only_bool_access_modes_are_not_pro() -> None:
     ]
     assert resolve_required_tiers("bool-only-model", rules={}) == ()
     assert model_discovery.get_required_tiers("bool-only-model") == []
+
+
+def test_hydrogen_is_free_on_cold_start_despite_gemini4_rule() -> None:
+    """Cold start (empty cache) must never misclassify gemini-4-hydrogen as Pro."""
+    assert model_discovery._cached_models == []
+    route = resolve_model_route("gemini-4-hydrogen")
+    assert route.paid is False
+    assert route.lane == "free"
+    assert route.required_tiers == ()
+    assert tier_allows("Free", route) is True
+    assert model_discovery.get_required_tiers("gemini-4-hydrogen") == []
+    assert model_discovery.get_required_tiers("models/gemini-4-hydrogen") == []
+
+    fallback_ids = {str(item.get("id")) for item in _FALLBACK_MODELS}
+    assert "gemini-4-hydrogen" in fallback_ids
+    hydrogen_entry = next(
+        item for item in _FALLBACK_MODELS if item.get("id") == "gemini-4-hydrogen"
+    )
+    assert hydrogen_entry["paid"] is False
+    assert hydrogen_entry["access_tier"] == 1
+    assert hydrogen_entry["accessModes"] == [1]
+
+
+def test_gemini_3_1_pro_preview_requires_pro_in_default_config_and_fallback() -> None:
+    """gemini-3.1-pro-preview is Paid (Pro+) on cold start and in shipped defaults."""
+    from collections.abc import Mapping
+    from typing import cast
+
+    from aistudio_api.infrastructure.gateway.model_defaults import _default_config
+
+    assert model_discovery._cached_models == []
+    default_rules = cast("Mapping[str, object]", _default_config()["paid_model_rules"])
+    pro_rule = cast("Mapping[str, object]", default_rules["pro_required"])
+    assert "3.1-pro" in cast("list[str]", pro_rule["contains"])
+
+    route = resolve_model_route("gemini-3.1-pro-preview", rules=default_rules)
+    assert route.paid is True
+    assert route.lane == "paid"
+    assert route.required_tier == "Pro"
+    assert route.required_tiers == ("Pro", "Ultra", "Ultra_20X")
+    assert tier_allows("Free", route) is False
+    assert tier_allows("Plus", route) is False
+    assert tier_allows("Pro", route) is True
+    assert tier_allows("Ultra", route) is True
+    assert tier_allows("Ultra_20X", route) is True
+
+    pro_entry = next(
+        item for item in _FALLBACK_MODELS if item.get("id") == "gemini-3.1-pro-preview"
+    )
+    assert pro_entry["paid"] is True
+    assert pro_entry["access_tier"] == 2
+    assert pro_entry["accessModes"] == [3, 4]

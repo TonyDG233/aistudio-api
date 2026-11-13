@@ -7,10 +7,13 @@
 
 ### Added
 
+- **流式首字输出（TTFT）加速优化**：`capture.py` 引入 `_SNAPSHOT_SENTINEL` 对大请求体仅执行单次 `build_body` 序列化并原位安全替换（含哨兵碰撞回退）；`browserless_session.py` 与 Go 侧 `runtime.go` `fillPrompt` 在保持完整请求 `digest` 的同时将页面虚拟输入框截断至末尾 256 个 Unicode 码点并省略冗余 `wireContents` 传输；`waa-signer` `transport_browser.go` 将 CORS `OPTIONS` 预检缺省缓存延长至 `600s`。
+- **ATG 输入/输出双独立开关与公开可编辑提示词模板**：`features.atg` 新增 `wrap_output`（默认 `true`）、`control_template` 与 `input_context_instruction`，完整支持仅输出、仅输入（原生流式）、双封装与双关闭四组合，以及自定义模板缺 `{tool_name}` 自动补齐函数名与空白回退；设置页 `ProtocolAtgCard.vue` 将输出侧、输入侧与严格模式开关调整为 `grid-cols-1 xl:grid-cols-3` 防拥挤布局，并在高级参数展开区公开两个全宽模板 `<textarea>` 与「恢复默认模板」按钮。
 - **ATG 输入侧伪装工具调用与图文双轨分流（`wrap_input`）**：新增 `features.atg.wrap_input`（默认 `false`）与 `application/atg/input_wrapper.py`，100% 继承 `resolve_atg_mode(cfg, api_format)` 各协议独立策略（策略为 `off` 时静默直通，仅在 `prefer`/`required` 且 `wrap_input=true` 时生效）。开启后将非工具链对话输入封装为 `atg_ctx_*` 3-Turn 伪装工具交换（Turn 0 锚点 `"Initialize context retrieval."` → Turn 1 `functionCall` + PG-01 `thoughtSignature` → Turn 2 `functionResponse` 文本 Struct 与原生 `inlineData`/`fileData` 媒体 Part 同轮并置分流），保留完整多模态看图能力；`detect_client_synthetic_transport` 先于封装执行避免误判，`purge_synthetic_history` 自动清理历史 `atg_ctx_*` 与锚点防止多轮嵌套；设置页 `ProtocolAtgCard.vue` 在「各协议独立策略」正下方并排提供「严格模式」与「输入侧伪装封装（图文双轨）」开关及规范字典 Tooltip。
 
 ### Fixed
 
+- **`gemini-4-hydrogen` 免费准入与各档配额校准**：`defaults/config.yaml` 将 `paid_model_rules.pro_required` 收窄为 `["argon", "imagen"]`，校准 `Free.flash_models`（含 `"hydrogen"`）每日软限额为 `50`，并在各付费档 `tier_quotas` 中将 `flash_models` 置于 `argon_models` 之前；`model_discovery.py` 内置 `_FALLBACK_MODELS` 收录 `gemini-4-hydrogen` 并在 `get_required_tiers` 与 `routing_eligibility.py` `resolve_required_tiers` 增加 `hydrogen` 免付费防线，防止冷启动或旧配置误将其归入 Pro 队列。
 - **Ultra-only 模型准入信号优先级**：提权 `ListModels` 的 `item[82]`（`accessModes`）Ultra-only 信号优先于静态 `pro_required` 子串规则，`gemini-4-carbon` 不再被误判为 Pro 可用；同时将 `carbon` 纳入 `paid_model_rules.ultra_required`（`defaults/config.yaml` 与前端 `schema.ts` 同步）与内置模型表。
 - **实例换绑弹窗 tier 显示与过滤**：修复 `InstanceSpec.from_mapping`、`InstanceManager._view` 与前端 `instances.ts` 对 `min_tier` 槽位 `max_tier`（`Ultra_20X`）的归一化与兼容计算，解决弹窗误显示“仅限 Pro”及可用 Pro 账号被过滤的问题。
 - **Browserless 403 同号刷新**：`BrowserlessSession.refresh_auth_state()` 接入 `rotate_google_cookies`（`/RotateCookies`）主动续期并立即落盘 `auth.json`，刷新前先持久化内存中已收到的 Cookie；强制释放 Go 侧驻留热 Worker，使下一次 `mint_proof` 用最新凭据重建 Cookie 罐；waa-signer 热复用路径检测滚动凭据差异后按最新 storage state 重建 Worker，不再继续发送过期 Cookie。

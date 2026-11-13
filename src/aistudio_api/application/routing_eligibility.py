@@ -189,6 +189,9 @@ def resolve_required_tiers(
     if 4 in modes and 3 not in modes:
         return ("Ultra", "Ultra_20X")
 
+    if "hydrogen" in clean and live_truth is not True:
+        return ()
+
     if rules is None:
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,

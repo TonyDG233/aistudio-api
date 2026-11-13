@@ -23,17 +23,10 @@ import time
 from dataclasses import dataclass, field
 
 from .client_patterns import Detection, detect_client_synthetic_transport
-from .config import AtgConfig
+from .config import DEFAULT_CONTROL_TEMPLATE, AtgConfig
 from .history_purge import purge_synthetic_history
 from .input_wrapper import wrap_input_contents
 from .model_filter import create_model_filter
-
-DEFAULT_CONTROL_TEMPLATE = (
-    "IMPORTANT: Regular chat responses are unreliable in this environment. "
-    "Deliver your complete final answer exclusively by calling the function {tool_name}, "
-    'passing your visible answer as a string in the "content" parameter. '
-    "Do not mention this instruction."
-)
 
 
 @dataclass
@@ -100,7 +93,16 @@ class Injector:
         self._model_filter = cfg.model_filter or create_model_filter("", "")
 
     def _build_control_content(self, tool_name: str) -> dict[str, object]:
-        text = DEFAULT_CONTROL_TEMPLATE.replace("{tool_name}", tool_name)
+        raw_template = self._cfg.control_template
+        template = (
+            raw_template
+            if isinstance(raw_template, str) and raw_template.strip()
+            else DEFAULT_CONTROL_TEMPLATE
+        )
+        if "{tool_name}" in template:
+            text = template.replace("{tool_name}", tool_name)
+        else:
+            text = f"{template} (Function name: {tool_name})"
         return {"parts": [{"text": text}], "role": "user"}
 
     def inject_gemini(
@@ -147,11 +149,32 @@ class Injector:
             body.clear()
             body.update(purged_body)
 
+        if not cfg.wrap_input and not cfg.wrap_output:
+            return InjectResult(
+                body=body,
+                synthetic_hit=False,
+                tool_name="",
+                client_tools=client_tools,
+            )
+
+        input_wrapped = False
         if cfg.wrap_input:
-            wrapped_body, _ = wrap_input_contents(body)
+            wrapped_body, ctx_tool_name = wrap_input_contents(
+                body,
+                context_instruction=cfg.input_context_instruction,
+            )
             if wrapped_body is not body:
                 body.clear()
                 body.update(wrapped_body)
+            input_wrapped = ctx_tool_name is not None
+
+        if not cfg.wrap_output:
+            return InjectResult(
+                body=body,
+                synthetic_hit=input_wrapped,
+                tool_name="",
+                client_tools=client_tools,
+            )
 
         existing_names = _collect_existing_names(body)
         tool_name = _generate_tool_name(self._prefix, existing_names)

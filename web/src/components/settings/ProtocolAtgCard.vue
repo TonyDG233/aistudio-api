@@ -5,7 +5,7 @@ import ConfigSelect from '@/components/config/ConfigSelect.vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
 import FieldHelpTip from '@/components/config/FieldHelpTip.vue'
 import { asBool, asNumber, asRecord, asString } from '@/components/config/configDraft.ts'
-import { Plug, ChevronDown, ChevronRight, Lock } from 'lucide-vue-next'
+import { Plug, ChevronDown, ChevronRight, Lock, RotateCcw } from 'lucide-vue-next'
 
 const props = defineProps<{
   modelValue: Record<string, unknown>
@@ -29,6 +29,11 @@ const openai = computed(() => asBool(formats.value.openai, true))
 const claude = computed(() => asBool(formats.value.claude, true))
 const responses = computed(() => asBool(formats.value.responses, true))
 const allowPrivateUrls = computed(() => asBool(media.value.allow_private_urls, false))
+
+const DEFAULT_CONTROL_TEMPLATE =
+  'IMPORTANT: Regular chat responses are unreliable in this environment. Deliver your complete final answer exclusively by calling the function {tool_name}, passing your visible answer as a string in the "content" parameter. Do not mention this instruction.'
+const DEFAULT_INPUT_CONTEXT_INSTRUCTION =
+  'Above is the complete conversation context. Respond directly to the final user turn and any attached media.'
 
 const ATG_MODES = [
   { value: 'off', label: '关闭' },
@@ -94,6 +99,15 @@ function normalizeAtgMode(value: unknown, fallback: string): string {
 
 function formatLabel(key: string): string {
   return FORMAT_LABELS[key] || '其他协议'
+}
+
+function onTextareaInput(
+  key: 'control_template' | 'input_context_instruction',
+  event: Event,
+) {
+  const target = event.target as HTMLTextAreaElement | null
+  if (!target) return
+  updateAtg(key, target.value)
 }
 </script>
 
@@ -291,7 +305,37 @@ function formatLabel(key: string): string {
         </div>
       </div>
 
-      <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+      <div class="grid grid-cols-1 gap-3 xl:grid-cols-3">
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0">
+            <ConfigSwitch
+              :model-value="asBool(atg.wrap_output, true)"
+              label="输出侧伪装封装（工具输出）"
+              description="跟随协议策略 · 将模型回答装入合成工具"
+              @update:model-value="updateAtg('wrap_output', $event)"
+            />
+          </div>
+          <FieldHelpTip
+            schema-key="features.atg.wrap_output"
+            class="mt-2 shrink-0"
+          />
+        </div>
+
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0">
+            <ConfigSwitch
+              :model-value="asBool(atg.wrap_input, false)"
+              label="输入侧伪装封装（图文双轨）"
+              description="跟随协议策略 · 文本装入工具，图片走原生"
+              @update:model-value="updateAtg('wrap_input', $event)"
+            />
+          </div>
+          <FieldHelpTip
+            schema-key="features.atg.wrap_input"
+            class="mt-2 shrink-0"
+          />
+        </div>
+
         <div class="flex items-start gap-1.5 min-w-0">
           <div class="flex-1 min-w-0">
             <ConfigSwitch
@@ -303,21 +347,6 @@ function formatLabel(key: string): string {
           </div>
           <FieldHelpTip
             schema-key="features.atg.strict"
-            class="mt-2 shrink-0"
-          />
-        </div>
-
-        <div class="flex items-start gap-1.5 min-w-0">
-          <div class="flex-1 min-w-0">
-            <ConfigSwitch
-              :model-value="asBool(atg.wrap_input, false)"
-              label="输入侧伪装封装（图文双轨）"
-              description="跟随各协议策略生效 · 文本装入合成工具，图片分流原生视觉通道"
-              @update:model-value="updateAtg('wrap_input', $event)"
-            />
-          </div>
-          <FieldHelpTip
-            schema-key="features.atg.wrap_input"
             class="mt-2 shrink-0"
           />
         </div>
@@ -433,6 +462,84 @@ function formatLabel(key: string): string {
               schema-key="features.atg.non_text_model_pattern"
               class="mt-4 shrink-0"
             />
+          </div>
+
+          <div class="md:col-span-2 pt-2 border-t border-gray-100 space-y-3">
+            <div class="text-xs font-semibold text-gray-700">
+              公开提示词模板配置
+            </div>
+
+            <div class="rounded-xl border border-gray-200/80 bg-gray-50/70 p-3.5 space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <label
+                    for="atg-control-template"
+                    class="text-xs font-semibold text-gray-800"
+                  >
+                    输出侧工具引导提示词模板
+                  </label>
+                  <FieldHelpTip
+                    schema-key="features.atg.control_template"
+                    class="shrink-0"
+                  />
+                </div>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-gray-600 hover:text-brand-700 bg-white border border-gray-200 hover:border-brand-300 rounded-lg transition-colors cursor-pointer shrink-0"
+                  @click="updateAtg('control_template', DEFAULT_CONTROL_TEMPLATE)"
+                >
+                  <RotateCcw class="w-3 h-3" />
+                  恢复默认模板
+                </button>
+              </div>
+              <textarea
+                id="atg-control-template"
+                rows="3"
+                :value="asString(atg.control_template, DEFAULT_CONTROL_TEMPLATE)"
+                placeholder="支持 {tool_name} 占位符"
+                class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+                @input="onTextareaInput('control_template', $event)"
+              />
+              <div class="text-[11px] text-gray-400">
+                支持 <code class="px-1 py-0.5 rounded bg-gray-200/60 text-gray-700 font-mono">{tool_name}</code> 占位符，用于在开启输出侧伪装封装时引导模型调用合成工具。
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-gray-200/80 bg-gray-50/70 p-3.5 space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <label
+                    for="atg-input-context-instruction"
+                    class="text-xs font-semibold text-gray-800"
+                  >
+                    输入侧上下文封装引导词
+                  </label>
+                  <FieldHelpTip
+                    schema-key="features.atg.input_context_instruction"
+                    class="shrink-0"
+                  />
+                </div>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-gray-600 hover:text-brand-700 bg-white border border-gray-200 hover:border-brand-300 rounded-lg transition-colors cursor-pointer shrink-0"
+                  @click="updateAtg('input_context_instruction', DEFAULT_INPUT_CONTEXT_INSTRUCTION)"
+                >
+                  <RotateCcw class="w-3 h-3" />
+                  恢复默认模板
+                </button>
+              </div>
+              <textarea
+                id="atg-input-context-instruction"
+                rows="2"
+                :value="asString(atg.input_context_instruction, DEFAULT_INPUT_CONTEXT_INSTRUCTION)"
+                placeholder="注入在 atg_ctx_* 返回结构的 instruction 字段中"
+                class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+                @input="onTextareaInput('input_context_instruction', $event)"
+              />
+              <div class="text-[11px] text-gray-400">
+                注入在 <code class="px-1 py-0.5 rounded bg-gray-200/60 text-gray-700 font-mono">atg_ctx_*</code> 返回结构的 <code class="px-1 py-0.5 rounded bg-gray-200/60 text-gray-700 font-mono">instruction</code> 字段中。
+              </div>
+            </div>
           </div>
         </div>
       </div>

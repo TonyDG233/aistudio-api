@@ -350,6 +350,11 @@ func (runtime *Runtime) FillPrompt(ctx context.Context, prompt string, submit bo
 
 func (runtime *Runtime) fillPrompt(ctx context.Context, prompt string, submit bool) error {
 	prompt = textareaValue(prompt)
+	if len(prompt) > 256 {
+		if runes := []rune(prompt); len(runes) > 256 {
+			prompt = string(runes[len(runes)-256:])
+		}
+	}
 	result := make(chan error, 1)
 	if !runtime.loop.post(func() {
 		if err := ctx.Err(); err != nil {
