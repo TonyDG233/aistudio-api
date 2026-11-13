@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Terminal, Copy, Check } from 'lucide-vue-next'
+import { Terminal, Copy, Check, Lightbulb, Link2 } from 'lucide-vue-next'
 import { useClipboard } from '@/composables/useClipboard.ts'
 import { useSystemStore } from '@/stores/system.ts'
 import {
@@ -89,7 +89,8 @@ onMounted(() => {
       v-if="!currentEnabled"
       class="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-800 leading-relaxed"
     >
-      💡 当前协议在「系统与模型配置 -&gt; 协议开关」中未启用，前往开启后即可调用
+      <Lightbulb class="w-3.5 h-3.5 text-amber-500 shrink-0 inline mr-1" />
+      <span>当前协议在「系统与模型配置 -&gt; 协议开关」中未启用，前往开启后即可调用</span>
     </div>
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
@@ -126,7 +127,7 @@ onMounted(() => {
 
     <div class="border-t border-gray-100 pt-4 space-y-2.5">
       <div class="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
-        <span>🔗</span>
+        <Link2 class="w-3.5 h-3.5 text-gray-400 shrink-0 inline mr-1" />
         <span>反代接入地址</span>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">

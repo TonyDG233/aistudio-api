@@ -15,6 +15,7 @@ import ProtocolAtgCard from '@/components/settings/ProtocolAtgCard.vue'
 import ModelRulesPanel from '@/components/config/ModelRulesPanel.vue'
 import SchemaDictionaryModal from '@/components/config/SchemaDictionaryModal.vue'
 import YamlSourceEditor from '@/components/config/YamlSourceEditor.vue'
+import Button from '@/components/ui/Button.vue'
 import {
   applySection,
   asRecord,
@@ -36,6 +37,11 @@ import {
   CheckCircle2,
   AlertCircle,
   Puzzle,
+  Wrench,
+  BookOpen,
+  Undo2,
+  RotateCcw,
+  Save,
 } from 'lucide-vue-next'
 
 const toast = useToastStore()
@@ -348,7 +354,8 @@ onBeforeRouteLeave((_to, _from, next) => {
       class="p-4 bg-amber-50/80 border border-amber-200 rounded-2xl text-xs text-amber-900 space-y-1.5"
     >
       <div class="font-bold flex items-center gap-1.5">
-        <span>🛠️ UI Debug 沙盒模式已启动</span>
+        <Wrench class="w-4 h-4 text-amber-600 shrink-0 inline mr-1" />
+        <span>UI Debug 沙盒模式已启动</span>
       </div>
       <p class="leading-relaxed">
         真实浏览器与真实磁盘写入已阻断，本页修改仅写入内存沙盒的临时配置。前往「账号管理 / 控制面板 / 日志」可通过顶部 UI Debug 菜单切换模拟场景检查样式。
@@ -453,21 +460,26 @@ onBeforeRouteLeave((_to, _from, next) => {
       <div class="flex items-center gap-2 text-xs text-gray-600 flex-wrap">
         <span>配置文件: <code class="font-mono text-gray-900 bg-white px-1.5 py-0.5 rounded border border-gray-200">config.yaml</code></span>
         <span
-          class="font-semibold"
+          class="inline-flex items-center gap-1.5 font-semibold"
           :class="isDirty ? 'text-amber-700' : 'text-emerald-700'"
         >
-          {{ isDirty ? '🟠 有未保存修改' : '🟢 已同步' }}
+          <span
+            class="w-1.5 h-1.5 rounded-full shrink-0"
+            :class="isDirty ? 'bg-amber-500' : 'bg-emerald-500'"
+          />
+          <span>{{ isDirty ? '有未保存修改' : '已同步' }}</span>
         </span>
       </div>
 
       <div class="flex items-center gap-2 flex-wrap">
-        <button
-          type="button"
-          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer"
+        <Button
+          variant="secondary"
+          size="sm"
           @click="dictModalOpen = true"
         >
-          📖 参数规范字典
-        </button>
+          <BookOpen class="w-3.5 h-3.5" />
+          <span>参数规范字典</span>
+        </Button>
 
         <div class="inline-flex items-center bg-white border border-gray-200 rounded-xl text-xs font-medium overflow-hidden">
           <button
@@ -476,7 +488,7 @@ onBeforeRouteLeave((_to, _from, next) => {
             :class="activeMode === 'visual' ? 'bg-brand-50 text-brand-700 font-semibold' : 'text-gray-600 hover:bg-gray-50'"
             @click="switchMode('visual')"
           >
-            {{ activeMode === 'visual' ? '●' : '○' }} 可视化模式
+            可视化模式
           </button>
           <span class="text-gray-300">|</span>
           <button
@@ -485,36 +497,45 @@ onBeforeRouteLeave((_to, _from, next) => {
             :class="activeMode === 'yaml' ? 'bg-brand-50 text-brand-700 font-semibold' : 'text-gray-600 hover:bg-gray-50'"
             @click="switchMode('yaml')"
           >
-            {{ activeMode === 'yaml' ? '●' : '○' }} YAML 源码
+            YAML 源码
           </button>
         </div>
 
-        <button
-          type="button"
-          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+        <Button
+          variant="secondary"
+          size="sm"
           :disabled="!isDirty"
           @click="restoreDraft"
         >
-          ↩ 还原修改
-        </button>
+          <Undo2 class="w-3.5 h-3.5" />
+          <span>还原修改</span>
+        </Button>
 
-        <button
-          type="button"
-          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-          :disabled="resetting"
+        <Button
+          variant="secondary"
+          size="sm"
+          :loading="resetting"
           @click="resetToDefaults"
         >
-          {{ resetting ? '重置中...' : '↺ 重置默认' }}
-        </button>
+          <RotateCcw
+            v-if="!resetting"
+            class="w-3.5 h-3.5"
+          />
+          <span>{{ resetting ? '重置中...' : '重置默认' }}</span>
+        </Button>
 
-        <button
-          type="button"
-          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          :disabled="savingGlobal"
+        <Button
+          variant="primary"
+          size="sm"
+          :loading="savingGlobal"
           @click="saveGlobal"
         >
-          {{ savingGlobal ? '保存中...' : '💾 保存并热重载' }}
-        </button>
+          <Save
+            v-if="!savingGlobal"
+            class="w-3.5 h-3.5"
+          />
+          <span>{{ savingGlobal ? '保存中...' : '保存并热重载' }}</span>
+        </Button>
       </div>
     </div>
 
@@ -572,14 +593,18 @@ onBeforeRouteLeave((_to, _from, next) => {
               </h3>
             </div>
 
-            <button
-              type="button"
-              class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-              :disabled="isSaving('model')"
+            <Button
+              variant="primary"
+              size="sm"
+              :loading="isSaving('model')"
               @click="saveSection('model')"
             >
-              💾 保存模型规则
-            </button>
+              <Save
+                v-if="!isSaving('model')"
+                class="w-3.5 h-3.5"
+              />
+              <span>保存模型规则</span>
+            </Button>
           </div>
 
           <ModelRulesPanel

@@ -3,6 +3,16 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.6] - 2026-11-13
+
+### Changed
+
+- **管理台极简审美对齐与 375px 移动端防挤压**：
+  - `AccountRow.vue` 账号行左侧改为响应式双层布局（`flex-col sm:flex-row`），`375px` 窄屏下账号邮箱独占整行展示，不再被状态开关、索引与分组徽章挤压截断；常规 `u/x` 徽章同步收口为中性灰细边框风格。
+  - 统一 `AccountRow.vue`（恢复 / 换槽 / 激活）与 `InstancePoolCard.vue`（换绑 / 重启 / 唤醒 / 绑定账号 / 关闭）全部槽位操作按钮尺寸、圆角与 Lucide 线性图标规范。
+  - `InstancePoolCard.vue` 与 `DashboardView.vue` 的引擎标签统一为中性灰胶囊并允许换行，移除实例池每行重复的引擎标签。
+  - `CookieImportModal.vue`、`CookieGroupBlock.vue`、`AccountsView.vue`、`DashboardView.vue`、`SettingsView.vue`、`ProtocolAtgCard.vue`、`SecurityBrowserCard.vue`、`LogConfigCard.vue`、`SchedulingCard.vue`、`ModelStatsTable.vue`、`QuickApiExamples.vue` 与 `YamlSourceEditor.vue` 全站去除彩色 Emoji 与高饱和琥珀/蓝紫色块，统一设置页全卡片 `<Button variant="primary" size="sm">` + `<Save />` 保存按钮规范，回归白底细灰框、翡翠绿主色、CSS 状态圆点与 Lucide 线性图标（并同步更新 `src/aistudio_api/static/` 构建产物）。
+
 ## [2.1.2] - 2026-11-11
 
 ### Added

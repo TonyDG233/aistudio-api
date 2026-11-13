@@ -2,8 +2,9 @@
 import { computed } from 'vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
 import FieldHelpTip from '@/components/config/FieldHelpTip.vue'
+import Button from '@/components/ui/Button.vue'
 import { asBool, asRecord } from '@/components/config/configDraft.ts'
-import { Shield, Info } from 'lucide-vue-next'
+import { Shield, Info, Save } from 'lucide-vue-next'
 
 const props = defineProps<{
   modelValue: Record<string, unknown>
@@ -59,14 +60,18 @@ function toggleAnonymous(next: boolean) {
         </h3>
       </div>
 
-      <button
-        type="button"
-        class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-        :disabled="saving"
+      <Button
+        variant="primary"
+        size="sm"
+        :loading="saving"
         @click="emit('save')"
       >
-        💾 保存安全配置
-      </button>
+        <Save
+          v-if="!saving"
+          class="w-3.5 h-3.5"
+        />
+        <span>保存安全配置</span>
+      </Button>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">

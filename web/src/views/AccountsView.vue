@@ -33,6 +33,7 @@ import {
   Folder,
   Check,
   FolderUp,
+  Puzzle,
 } from 'lucide-vue-next'
 
 const accountsStore = useAccountsStore()
@@ -225,7 +226,7 @@ function onImportModalUpdate(val: boolean) {
           <FolderUp class="w-8 h-8" />
         </div>
         <h3 class="text-lg font-bold tracking-tight">
-          📂 松开鼠标自动读取并导入 JSON 凭据文件
+          松开鼠标自动读取并导入 JSON 凭据文件
         </h3>
         <p class="text-xs text-brand-200">
           (支持单账号 auth-*.json、多文件批量拖入、油猴 Bundle、Cookie-Editor)
@@ -257,12 +258,13 @@ function onImportModalUpdate(val: boolean) {
         </Button>
 
         <Button
-          variant="outline"
+          variant="secondary"
           size="md"
           title="获取油猴多账号长效抓取脚本"
           @click="handleTampermonkeyClick"
         >
-          <span>🧩 油猴抓取脚本</span>
+          <Puzzle class="w-4 h-4" />
+          <span>油猴抓取脚本</span>
         </Button>
 
         <Button
@@ -291,10 +293,10 @@ function onImportModalUpdate(val: boolean) {
         </div>
         <button
           type="button"
-          class="inline-flex items-center gap-1 text-[11px] font-medium text-brand-600 hover:text-brand-700 bg-brand-50 hover:bg-brand-100/80 px-2 py-1 rounded-md transition-colors cursor-pointer"
+          class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
           @click="snapshotModalOpen = true"
         >
-          <BookmarkPlus class="w-3 h-3" />
+          <BookmarkPlus class="w-3 h-3 text-brand-600" />
           <span>保存当前方案</span>
         </button>
       </div>

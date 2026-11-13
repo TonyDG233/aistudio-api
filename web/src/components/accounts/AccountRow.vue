@@ -3,7 +3,6 @@ import { ref, computed, watch } from 'vue'
 import type { AccountWithStats } from '@/types/accounts.ts'
 import type { Instance as InstanceType } from '@/types/instances.ts'
 import Badge from '@/components/ui/Badge.vue'
-import Button from '@/components/ui/Button.vue'
 import ModelQuotaGrid from './ModelQuotaGrid.vue'
 import {
   CheckCircle2,
@@ -17,6 +16,7 @@ import {
   Tag,
   Check,
   ArrowLeftRight,
+  Play,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
@@ -167,103 +167,105 @@ async function handleRefresh() {
   >
     <!-- Sub-Account Header Bar -->
     <div class="flex flex-col xl:flex-row xl:items-center justify-between gap-2">
-      <div class="flex items-center gap-2.5 min-w-0 flex-1">
-        <!-- Batch Selection -->
-        <input
-          v-if="batchMode"
-          type="checkbox"
-          class="w-3.5 h-3.5 shrink-0 accent-brand-600 cursor-pointer"
-          :checked="selected"
-          title="选择此账号"
-          @change="emit('toggleSelect')"
-        >
-
-        <!-- Enable/Disable Switch -->
-        <button
-          type="button"
-          role="switch"
-          :aria-checked="isEnabled"
-          :disabled="togglingEnabled"
-          class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none"
-          :class="[isEnabled ? 'bg-emerald-500' : 'bg-gray-300', { 'opacity-50 cursor-wait': togglingEnabled }]"
-          title="启用或禁用此账号参与调度"
-          @click="handleToggleEnabled"
-        >
-          <span
-            class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out"
-            :class="isEnabled ? 'translate-x-4' : 'translate-x-0'"
-          />
-        </button>
-
-        <!-- User Index Badge: u/0, u/1... -->
-        <span
-          class="px-2 py-0.5 rounded-full text-xs font-mono font-bold shrink-0"
-          :class="[
-            !isEnabled
-              ? 'bg-gray-200 text-gray-500'
-              : isExpired
-                ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                : active
-                  ? 'bg-brand-500 text-white'
-                  : 'bg-blue-50 text-blue-700 border border-blue-200/60',
-          ]"
-        >
-          u/{{ account.auth_user }}
-        </span>
-
-        <!-- Benefit Tier Badge: Free / Plus / Pro / Ultra -->
-        <button
-          type="button"
-          class="px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold shrink-0 transition-opacity hover:opacity-80 cursor-pointer"
-          :class="[
-            accountTier === 'Ultra' || accountTier === 'Ultra_20X'
-              ? 'bg-purple-100 text-purple-800 border border-purple-300'
-              : accountTier === 'Pro'
-                ? 'bg-amber-100 text-amber-800 border border-amber-300'
-                : accountTier === 'Plus'
-                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                  : 'bg-gray-100 text-gray-600 border border-gray-200/80',
-            { 'opacity-50 cursor-wait': detectingTier },
-          ]"
-          :disabled="detectingTier"
-          title="点击重新探测此子账号的会员等级"
-          @click="handleDetectTier"
-        >
-          {{ detectingTier ? '...' : tierShortLabel(accountTier) }}
-        </button>
-
-        <!-- Group Tag / Inline Editor -->
-        <div class="flex items-center shrink-0 max-w-[96px] truncate">
-          <div
-            v-if="editingGroup"
-            class="flex items-center gap-1"
+      <div class="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-2.5 min-w-0 flex-1">
+        <div class="flex items-center gap-2 shrink-0 flex-wrap">
+          <!-- Batch Selection -->
+          <input
+            v-if="batchMode"
+            type="checkbox"
+            class="w-3.5 h-3.5 shrink-0 accent-brand-600 cursor-pointer"
+            :checked="selected"
+            title="选择此账号"
+            @change="emit('toggleSelect')"
           >
-            <input
-              v-model="groupInput"
-              type="text"
-              class="px-1.5 py-0.5 text-[11px] font-mono border rounded focus:outline-none focus:ring-1 focus:ring-brand-500 w-20"
-              placeholder="default"
-              @keydown.enter="saveGroup"
-              @blur="saveGroup"
+
+          <!-- Enable/Disable Switch -->
+          <button
+            type="button"
+            role="switch"
+            :aria-checked="isEnabled"
+            :disabled="togglingEnabled"
+            class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none"
+            :class="[isEnabled ? 'bg-emerald-500' : 'bg-gray-300', { 'opacity-50 cursor-wait': togglingEnabled }]"
+            title="启用或禁用此账号参与调度"
+            @click="handleToggleEnabled"
+          >
+            <span
+              class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out"
+              :class="isEnabled ? 'translate-x-4' : 'translate-x-0'"
+            />
+          </button>
+
+          <!-- User Index Badge: u/0, u/1... -->
+          <span
+            class="px-2 py-0.5 rounded-full text-xs font-mono font-bold shrink-0"
+            :class="[
+              !isEnabled
+                ? 'bg-gray-200 text-gray-500'
+                : isExpired
+                  ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                  : active
+                    ? 'bg-brand-500 text-white'
+                    : 'bg-gray-100 text-gray-700 border border-gray-200',
+            ]"
+          >
+            u/{{ account.auth_user }}
+          </span>
+
+          <!-- Benefit Tier Badge: Free / Plus / Pro / Ultra -->
+          <button
+            type="button"
+            class="px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold shrink-0 transition-opacity hover:opacity-80 cursor-pointer"
+            :class="[
+              accountTier === 'Ultra' || accountTier === 'Ultra_20X'
+                ? 'bg-purple-100 text-purple-800 border border-purple-300'
+                : accountTier === 'Pro'
+                  ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                  : accountTier === 'Plus'
+                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                    : 'bg-gray-100 text-gray-600 border border-gray-200/80',
+              { 'opacity-50 cursor-wait': detectingTier },
+            ]"
+            :disabled="detectingTier"
+            title="点击重新探测此子账号的会员等级"
+            @click="handleDetectTier"
+          >
+            {{ detectingTier ? '...' : tierShortLabel(accountTier) }}
+          </button>
+
+          <!-- Group Tag / Inline Editor -->
+          <div class="flex items-center shrink-0 max-w-[96px] truncate">
+            <div
+              v-if="editingGroup"
+              class="flex items-center gap-1"
             >
+              <input
+                v-model="groupInput"
+                type="text"
+                class="px-1.5 py-0.5 text-[11px] font-mono border rounded focus:outline-none focus:ring-1 focus:ring-brand-500 w-20"
+                placeholder="default"
+                @keydown.enter="saveGroup"
+                @blur="saveGroup"
+              >
+              <button
+                type="button"
+                class="text-emerald-600 hover:text-emerald-700"
+                @click="saveGroup"
+              >
+                <Check class="w-3 h-3" />
+              </button>
+            </div>
             <button
+              v-else
               type="button"
-              class="text-emerald-600 hover:text-emerald-700"
-              @click="saveGroup"
+              class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium text-gray-500 bg-gray-100 hover:bg-gray-200/80 transition-colors cursor-pointer border border-gray-200 max-w-full truncate"
+              title="点击修改所属分组"
+              @click="startEditGroup"
             >
-              <Check class="w-3 h-3" />
+              <Tag class="w-2.5 h-2.5 text-gray-400 shrink-0" />
+              <span class="truncate">{{ account.group || 'default' }}</span>
             </button>
           </div>
-          <button
-            v-else
-            type="button"
-            class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium text-gray-500 bg-gray-100 hover:bg-gray-200/80 transition-colors cursor-pointer border border-gray-200 max-w-full truncate"
-            title="点击修改所属分组"
-            @click="startEditGroup"
-          >
-            <Tag class="w-2.5 h-2.5 text-gray-400 shrink-0" />
-            <span class="truncate">{{ account.group || 'default' }}</span>
-          </button>
         </div>
 
         <!-- Account Name & Memo -->
@@ -363,7 +365,7 @@ async function handleRefresh() {
           <button
             v-if="isExpired"
             type="button"
-            class="px-2 py-0.5 text-[11px] font-medium text-rose-700 bg-rose-100 hover:bg-rose-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
             title="刷新登录态并清除失效标记与鉴权冷却"
             :disabled="refreshing"
             @click="emit('clearCooldown')"
@@ -375,22 +377,24 @@ async function handleRefresh() {
           <button
             v-if="boundNumber !== null"
             type="button"
-            class="px-2 py-0.5 text-[11px] font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
             title="更换该账号绑定的实例槽位"
             @click="emit('changeSlot')"
           >
-            <ArrowLeftRight class="w-3 h-3" />
+            <ArrowLeftRight class="w-3 h-3 text-gray-500" />
             <span>换槽</span>
           </button>
 
-          <Button
+          <button
             v-if="!active && !isExpired && isEnabled && boundNumber === null"
-            variant="secondary"
-            size="sm"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+            title="激活此账号并分配实例槽位"
             @click="emit('activate')"
           >
+            <Play class="w-3 h-3 text-brand-600" />
             <span>激活</span>
-          </Button>
+          </button>
 
           <button
             type="button"

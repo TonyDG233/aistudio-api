@@ -4,6 +4,7 @@ import type { Instance } from '@/types/instances.ts'
 import type { CookieGroup } from './useCookieGroups.ts'
 import { formatDate } from '@/utils/format.ts'
 import {
+  AlertTriangle,
   Cookie,
   ChevronDown,
   ChevronRight,
@@ -113,9 +114,9 @@ const someSelected = computed(
             </span>
             <span
               v-if="expiredCount > 0"
-              class="px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-rose-100 text-rose-700 border border-rose-200"
+              class="inline-flex items-center gap-1 text-xs text-rose-600 font-medium"
             >
-              ⚠ {{ expiredCount }} 个失效
+              <AlertTriangle class="w-3 h-3" />{{ expiredCount }} 个失效
             </span>
             <span
               v-for="instance in runningInstances"

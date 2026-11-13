@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   AlertTriangle,
   Download,
+  Puzzle,
 } from 'lucide-vue-next'
 import {
   mergeCredentialFiles,
@@ -419,50 +420,51 @@ async function handleSubmit() {
       </div>
 
       <!-- Tampermonkey Helper Card -->
-      <div class="bg-gradient-to-br from-amber-50/90 to-amber-100/40 border border-amber-200/90 rounded-2xl p-3.5 space-y-2.5 shadow-2xs">
+      <div class="rounded-2xl border border-gray-200 bg-gray-50/70 p-3.5 space-y-2.5">
         <div class="space-y-1">
-          <div class="flex items-center gap-1.5 font-bold text-amber-950 text-xs flex-wrap">
-            <span>🧩 推荐：油猴多账号长效抓取助手</span>
-            <span class="text-[10px] font-semibold text-amber-800 bg-amber-200/70 px-1.5 py-0.5 rounded">
-              免重复登录 / 含 LSID 跨天保活
+          <div class="flex items-center gap-1.5 flex-wrap text-xs font-semibold text-gray-800">
+            <Puzzle class="w-3.5 h-3.5 text-brand-600 shrink-0" />
+            <span>推荐：油猴多账号长效抓取助手</span>
+            <span class="px-2 py-0.5 text-[10px] font-medium bg-brand-50 text-brand-700 border border-brand-200/60 rounded-full">
+              免重复登录 · 跨天保活
             </span>
           </div>
-          <p class="text-[11px] text-amber-900/80 leading-relaxed">
+          <p class="text-[11px] text-gray-500 leading-relaxed">
             在日常电脑浏览器同时提取 aistudio 与 accounts.google.com 根凭据，自动识别 u/0..N 子账号与等级。
           </p>
         </div>
 
-        <div class="flex items-center gap-1.5 text-[11px] text-amber-800 bg-amber-100/80 px-2.5 py-1.5 rounded-lg border border-amber-200/60">
-          <AlertTriangle class="w-3.5 h-3.5 text-amber-600 shrink-0" />
-          <span>⚠️ 首次使用需在 Tampermonkey「设置 -&gt; 高级(Advanced)」将「脚本 Cookie 访问权限」设为 All</span>
+        <div class="flex items-center gap-1.5 text-[11px] text-gray-600 bg-white px-2.5 py-1.5 rounded-lg border border-gray-200/80">
+          <AlertTriangle class="w-3.5 h-3.5 text-gray-500 shrink-0" />
+          <span>首次使用需在 Tampermonkey「设置 -&gt; 高级(Advanced)」将「脚本 Cookie 访问权限」设为 All</span>
         </div>
 
         <div class="flex items-center justify-between gap-2 pt-0.5 flex-wrap">
           <span
             v-if="isMobile"
-            class="text-[11px] text-amber-800/90 font-medium"
+            class="text-[11px] text-gray-600 font-medium"
           >
-            ⚠️ 移动端受限，请使用电脑端或 Android 伴侣端
+            移动端受限，请使用电脑端或 Android 伴侣端
           </span>
           <span
             v-else
-            class="text-[11px] text-amber-800/80"
+            class="text-[11px] text-gray-500"
           >
             点击将直接调用 Tampermonkey 扩展安装
           </span>
           <button
             type="button"
-            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer"
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-xl border transition-all"
             :class="[
               isMobile
-                ? 'bg-amber-200 text-amber-900 hover:bg-amber-300'
-                : 'bg-amber-600 text-white hover:bg-amber-700 active:scale-98',
+                ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
+                : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200 shadow-xs cursor-pointer',
             ]"
             :title="isMobile ? '移动端不支持油猴权限，请在电脑端浏览器安装，或使用 Android 伴侣端 App 提取凭据' : '在浏览器中安装油猴抓取脚本'"
             @click="handleGetTampermonkeyScript"
           >
             <Download class="w-3.5 h-3.5" />
-            <span>📥 获取油猴脚本 (.user.js)</span>
+            <span>获取油猴脚本 (.user.js)</span>
             <span
               v-if="isMobile"
               class="text-[10px] opacity-80"

@@ -12,6 +12,8 @@ import {
   Brain,
   Database,
   Users,
+  List,
+  TrendingUp,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -44,21 +46,23 @@ const statList = computed(() => normalizeModelStats(props.stats))
         <div class="inline-flex rounded-lg bg-gray-100 p-0.5 text-xs">
           <button
             type="button"
-            class="rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
             :class="viewMode === 'table' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-800'"
             :aria-pressed="viewMode === 'table'"
             @click="viewMode = 'table'"
           >
-            📋 列表明细
+            <List class="w-3.5 h-3.5" />
+            <span>列表明细</span>
           </button>
           <button
             type="button"
-            class="rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer"
             :class="viewMode === 'chart' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-800'"
             :aria-pressed="viewMode === 'chart'"
             @click="viewMode = 'chart'"
           >
-            📈 趋势图表
+            <TrendingUp class="w-3.5 h-3.5" />
+            <span>趋势图表</span>
           </button>
         </div>
       </div>
