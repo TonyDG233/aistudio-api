@@ -100,10 +100,10 @@
 - 每个 Step 一个主题；用户审计确认后才 commit；不合并、不 push。
 - 文档每页一个职责；05/10 不超过一页；不新增文档；不把 534 当 MVP；不用文档自洽冒充进展。
 - 真实账号/IP/Google 测试须事前得到用户同意；证据在实现/验收时生成，不预填。
-- 文档布局：根只放稳定入口；域细节进 `domains/Px/`，事故进 `incidents/`，历史进 `archive/`，证据进 `docs/dev/evidence/`；每 Step 不新建文档。
+- 文档布局：根只放稳定入口；域总索引见 `domains/INDEX.md`，域计划看板进 `domains/<Domain>/index.md`，审查报告与截图进 `domains/<Domain>/reviews/`，`docs/` 与根 `.md` 审计进 `domains/docs-and-audit/`，事故进 `incidents/`，历史进 `archive/`，证据进 `docs/dev/evidence/`；每 Step 不新建文档。
 - B5a 详情只放 `domains/P5-generation/09-pg-toolcall-analysis.md`；`05` 一行步骤，`10` 一个指针。
 - worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改。
-- 不再预写纸面 PKG；直接依据 `06`/`08-09`/台账/测试表，参考主仓 `rebuild` 移植代码并跑通 `pytest`；单步审查发现问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。旧纸面批次草稿与初审已归档至 `archive/batch-drafts-20261029/`，仅作历史留底，严禁作为施工依据；B 阶段每步真实代码施工后的审查报告写入对应 `domains/Px/reviews/`。
+- 不再预写纸面 PKG；直接依据 `06`/`08-09`/台账/测试表，参考主仓 `rebuild` 移植代码并跑通 `pytest`；单步审查发现问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。旧纸面批次草稿与初审已归档至 `archive/batch-drafts-20261029/`，仅作历史留底，严禁作为施工依据；各阶段代码与文档施工后的审查报告统一写入对应 `domains/<Domain>/reviews/`。
 
 ## 6. 停止条件
 
@@ -121,6 +121,7 @@
 - `docs/dev/rebuild/06-feature-ledger.md`
 - `docs/dev/rebuild/08-08-upstream-99c38ba-full-diff-audit.md`
 - `docs/dev/rebuild/08-09-decision-record.md`
+- `docs/dev/rebuild/domains/INDEX.md`
 - `docs/dev/rebuild/domains/P5-generation/index.md`
 - `docs/dev/rebuild/domains/P5-generation/09-pg-toolcall-analysis.md`
 - `docs/dev/rebuild/10-handoff-prompt.md`

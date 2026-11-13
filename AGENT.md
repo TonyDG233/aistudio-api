@@ -425,7 +425,8 @@ aistudio-api/
 
 - **主 agent = integrator**：唯一提交权；负责顺序、分派、回收报告、验收；不得把多个 domain 打包给少量 agent。
 - **worker**：每次只接一个 `Dxx-NNN` 或一个明确文件域；在主工作区直接修改并跑通 `uv run pytest`；不得改 `05/06/08-09`/架构文档；报告必须含改动文件、测试项、预期、实际、命令与结果。
-- **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `domains/Px/reviews/REV-<Step>.md`；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
+- **reviewer**：只读；对照 `06`/`08-09` 检查实际 diff 与测试结果；报告写 `docs/dev/rebuild/domains/<Domain>/reviews/REV-<Step>.md`；必须含 PASS/CONDITIONAL/FAIL、file:line、pytest 实跑、只读声明。
+- **域双层治理与总索引**：`docs/dev/rebuild/domains/INDEX.md` 为全部 11 个业务域的总入口索引；每个域采用双层目录分工——域根目录 `index.md` 存放域职责边界、任务计划与里程碑进度看板，`reviews/` 存放独立只读 Reviewer 的审计报告（`REV-*.md`）与成果留档；凡涉及 `docs/` 与仓库根目录 `.md`（如 `AGENT.md`、`README.md`）的变更计划与审计留档，统一归口至 `docs/dev/rebuild/domains/docs-and-audit/`。
 - **前端 Review 截图归档（强制）**：凡涉及前端 UI 的审查步骤，Reviewer 必须在 `docs/dev/rebuild/domains/<Domain>/reviews/assets/` 保留 1~2 张最具代表性的完整页面实测截图，并在对应 `REV-*.md` 中引用，便于后续直观追溯 UI 样貌。
 - **复杂任务并行拆分（强制）**：当单步任务涉及多个独立页面或跨模块改动时，主控 Integrator 必须按文件域拆分为多个独立的并行子 Agent（`task`）执行；每个子 Agent 只读取/修改自己职责范围内的少量文件，严禁单 Agent 同时加载全站导致上下文膨胀、质量下降。
 - worker/reviewer 报告必须原样交用户；用户审计前主 agent 不直接改代码/文档，不自行派下一步。

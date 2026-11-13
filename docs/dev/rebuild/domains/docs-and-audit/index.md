@@ -1,7 +1,34 @@
-# B-docs-and-audit / B7 文档与审计域
+# docs-and-audit / 文档架构与全仓审计域
 
-- 状态：B7 审计与文档定稿已完成；未修改 `src/`、`tests/`，未 stage/commit。
-- 审计日期：2026-11-01（UTC+8）。
+- **域定位**：**专门针对 `docs/` 与仓库根目录 `.md`（如 `AGENT.md`、`README.md`、`README_EN.md`）变更工作的任务计划看板与审计留档域**。
+- 状态：B7 审计/文档定稿与 C5a 全仓文档对齐终审均已 PASS；当前处于单工作区常态文档治理阶段。
+- 关联范围：`AGENT.md`、`README.md`、`README_EN.md`、`docs/*.md`、`docs/dev/rebuild/*.md`、`config/config.schema.json`。
+
+## 0. 任务计划与里程碑看板
+
+| 阶段 / 任务 | 内容摘要 | 结论 / 状态 | 对应审查报告 |
+|---|---|---|---|
+| **B7-1 提交历史与架构耦合审计** | 审计 `99c38ba..HEAD` 33 个提交与 `api -> application -> domain <- infrastructure` 分层边界、耦合/全局状态/死分支 | 已完成（PASS） | `reviews/REV-B7-commit-history-audit.md`、`reviews/REV-B7-architecture-coupling-audit.md`、`reviews/REV-B7-docs-and-audit-summary.md` |
+| **B7-2 P0 分层解耦与 VPS 修复复核** | 验证 `api/application/domain/infrastructure` AST 边界测试、DTO/渲染器归位与 VPS 三项修复 | 已完成（PASS） | `reviews/REV-B7-p0-decoupling-and-vps-fix.md` |
+| **B7-3 配置单一来源与全绿复核** | 验证 `defaults/config.yaml` 单一模板、启动迁移原子写、`/health` 200 静默与 Windows 全绿门禁 | 已完成（PASS） | `reviews/REV-B7-config-sync-and-green-tests.md` |
+| **C5a 全仓文档与规格收尾终审** | 核对中英文 README、`changelog.md`、6 份规格文档、`AGENT.md` 行号/锚点/代码事实一致性 | 已完成（PASS） | `reviews/REV-C5a.md` |
+| **域双层治理重构与文档同步** | `B-docs-and-audit`→`docs-and-audit`、重复 `P` 域归并、新建 `P10-android-apk`、`INDEX.md` 及 `AGENT.md`/`05` 同步 | 已完成（PASS） | `reviews/REV-domains-restructure.md` |
+| **常态文档架构治理** | 维护 `docs/` 规格、`AGENT.md` 与 `domains/INDEX.md` 双层治理体系同步演进 | 持续进行中 | 后续 `REV-*.md` 统一落盘 `reviews/` |
+
+## 0.1 `reviews/` 审查报告索引
+
+- [`reviews/REV-B7-commit-history-audit.md`](reviews/REV-B7-commit-history-audit.md) — B7 提交历史逐条审计（2026-11-01）
+- [`reviews/REV-B7-architecture-coupling-audit.md`](reviews/REV-B7-architecture-coupling-audit.md) — B7 分层耦合与 D-01..D-14 架构审计（2026-11-01）
+- [`reviews/REV-B7-docs-and-audit-summary.md`](reviews/REV-B7-docs-and-audit-summary.md) — B7 文档与审计总结及修复复审（2026-11-01，PASS）
+- [`reviews/REV-B7-p0-decoupling-and-vps-fix.md`](reviews/REV-B7-p0-decoupling-and-vps-fix.md) — B7 P0 分层解耦与 VPS 修复复核（2026-11-01，PASS）
+- [`reviews/REV-B7-config-sync-and-green-tests.md`](reviews/REV-B7-config-sync-and-green-tests.md) — B7 配置单一来源与 Windows 全绿测试复核（2026-11-01，PASS）
+- [`reviews/REV-C5a.md`](reviews/REV-C5a.md) — C5a 根目录文档、全量规格与 `AGENT.md` 终审（2026-11-08，PASS）
+- [`reviews/REV-domains-restructure.md`](reviews/REV-domains-restructure.md) — `domains/` 双层治理重构、`P10-android-apk` 与 `AGENT.md`/`05` 同步审查（2026-11-13，PASS）
+
+---
+
+## B7 历史基线记录（2026-11-01 留档）
+
 - 目标工作树：`D:\LLM\self_programming\aistudio-api\.kilo\worktrees\rebuild-upstream`。
 - 分支 / HEAD：`rebuild-upstream` / `55f1c64 ci(rebuild): 移除上游 DockerHub 硬编码依赖以适配 GHCR 自动构建`。
 - 提交范围：`99c38ba..HEAD`，共 **33** 个提交（28 个重建分支提交 + 5 个上游提交），其中 **3** 个合并提交。
