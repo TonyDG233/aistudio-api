@@ -4,8 +4,9 @@ import ConfigInput from '@/components/config/ConfigInput.vue'
 import ConfigSelect from '@/components/config/ConfigSelect.vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
 import FieldHelpTip from '@/components/config/FieldHelpTip.vue'
+import Button from '@/components/ui/Button.vue'
 import { asBool, asNumber, asRecord, asString } from '@/components/config/configDraft.ts'
-import { Plug, ChevronDown, ChevronRight, Lock, RotateCcw } from 'lucide-vue-next'
+import { Plug, ChevronDown, ChevronRight, Lock, RotateCcw, Save } from 'lucide-vue-next'
 
 const props = defineProps<{
   modelValue: Record<string, unknown>
@@ -115,20 +116,24 @@ function onTextareaInput(
   <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-5">
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 pb-4">
       <div class="flex items-center gap-2.5">
-        <Plug class="w-4 h-4 text-sky-600" />
+        <Plug class="w-4 h-4 text-brand-600" />
         <h3 class="font-bold text-gray-900 text-sm">
           协议开关与防截断网关
         </h3>
       </div>
 
-      <button
-        type="button"
-        class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-        :disabled="saving"
+      <Button
+        variant="primary"
+        size="sm"
+        :loading="saving"
         @click="emit('save')"
       >
-        💾 保存协议配置
-      </button>
+        <Save
+          v-if="!saving"
+          class="w-3.5 h-3.5"
+        />
+        <span>保存协议配置</span>
+      </Button>
     </div>
 
     <!-- Protocol faces -->

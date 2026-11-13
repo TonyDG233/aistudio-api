@@ -5,6 +5,7 @@ import { useInstancesStore } from '@/stores/instances.ts'
 import type { Instance } from '@/types'
 import Button from '@/components/ui/Button.vue'
 import {
+  ArrowLeftRight,
   Boxes,
   Plus,
   RefreshCw,
@@ -86,7 +87,7 @@ async function handleClose(instance: Instance) {
 <template>
   <div class="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden">
     <div class="px-5 py-3 border-b border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-gray-50/40">
-      <div class="flex items-center gap-2 min-w-0">
+      <div class="flex items-center gap-2 flex-wrap min-w-0">
         <Boxes class="w-4 h-4 text-brand-600 shrink-0" />
         <h3 class="font-semibold text-gray-900 text-sm">
           实例池
@@ -95,10 +96,7 @@ async function handleClose(instance: Instance) {
           {{ instancesStore.usedCount }} / {{ instancesStore.maxInstances }}
         </span>
         <span
-          class="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
-          :class="instancesStore.engine === 'browserless'
-            ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
-            : 'bg-sky-50 text-sky-700 border-sky-200'"
+          class="inline-flex items-center text-xs font-medium px-2.5 py-0.5 rounded-full bg-gray-100 text-gray-700 border border-gray-200/80 shrink-0 whitespace-nowrap"
         >
           引擎: {{ engineName }}
         </span>
@@ -188,15 +186,6 @@ async function handleClose(instance: Instance) {
                 {{ enginePhaseLabel(instancesStore.enginePhase) }}
               </span>
               <span
-                v-else
-                class="px-1.5 py-0.5 rounded text-[10px] font-mono border"
-                :class="instancesStore.engine === 'browserless'
-                  ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
-                  : 'bg-sky-50 text-sky-700 border-sky-200'"
-              >
-                {{ engineName }}
-              </span>
-              <span
                 v-if="instance.in_flight > 0"
                 class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-50 text-amber-700 border border-amber-200"
               >
@@ -234,47 +223,48 @@ async function handleClose(instance: Instance) {
           <template v-if="instance.account_id">
             <button
               type="button"
-              class="px-2 py-1 text-[11px] font-medium text-brand-700 bg-brand-50 hover:bg-brand-100 border border-brand-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
               :disabled="isBusy(instance)"
               @click="emit('reassign', instance)"
             >
-              换绑
+              <ArrowLeftRight class="w-3 h-3 text-gray-500" />
+              <span>换绑</span>
             </button>
             <button
               type="button"
-              class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-gray-600 bg-gray-50 hover:bg-gray-100 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
               :disabled="isBusy(instance)"
               @click="handleRestart(instance)"
             >
-              <RotateCcw class="w-3 h-3" />
+              <RotateCcw class="w-3 h-3 text-gray-500" />
               <span>重启</span>
             </button>
             <button
               v-if="canWake(instance)"
               type="button"
-              class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-brand-700 bg-brand-50 hover:bg-brand-100 border border-brand-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
               :disabled="isBusy(instance)"
               @click="handleWake(instance)"
             >
-              <RotateCcw class="w-3 h-3" />
+              <RotateCcw class="w-3 h-3 text-brand-600" />
               <span>唤醒</span>
             </button>
           </template>
           <template v-else>
             <button
               type="button"
-              class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-brand-700 bg-brand-50 hover:bg-brand-100 border border-brand-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
               :disabled="isBusy(instance)"
               @click="emit('reassign', instance)"
             >
-              <UserPlus class="w-3 h-3" />
+              <UserPlus class="w-3 h-3 text-brand-600" />
               <span>绑定账号</span>
             </button>
           </template>
 
           <button
             type="button"
-            class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
             :disabled="isBusy(instance)"
             @click="handleClose(instance)"
           >

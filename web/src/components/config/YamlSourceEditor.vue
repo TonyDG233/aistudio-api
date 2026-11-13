@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { FileCode } from 'lucide-vue-next'
+import { FileCode2 } from 'lucide-vue-next'
 
 const props = defineProps<{
   modelValue: string
@@ -48,9 +48,9 @@ function handleKeydown(event: KeyboardEvent) {
   <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-3">
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
       <div class="flex items-center gap-2">
-        <FileCode class="w-4 h-4 text-brand-600" />
-        <h3 class="font-bold text-gray-900 text-sm">
-          📄 config.yaml 完整源码编辑器
+        <h3 class="font-bold text-gray-900 text-sm flex items-center">
+          <FileCode2 class="w-4 h-4 text-brand-600 shrink-0 inline mr-1.5" />
+          <span>config.yaml 完整源码编辑器</span>
         </h3>
       </div>
       <span class="text-[11px] text-gray-400 font-mono">
@@ -84,7 +84,7 @@ function handleKeydown(event: KeyboardEvent) {
       />
     </div>
     <div class="text-[11px] text-gray-400">
-      YAML 模式修改后可直接使用顶部「💾 保存并热重载」全局保存；切换回可视化模式会自动解析同步。
+      YAML 模式修改后可直接使用顶部「保存并热重载」全局保存；切换回可视化模式会自动解析同步。
     </div>
   </div>
 </template>

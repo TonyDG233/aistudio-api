@@ -6,6 +6,7 @@ import ConfigInput from '@/components/config/ConfigInput.vue'
 import ConfigSelect from '@/components/config/ConfigSelect.vue'
 import ConfigSwitch from '@/components/config/ConfigSwitch.vue'
 import FieldHelpTip from '@/components/config/FieldHelpTip.vue'
+import Button from '@/components/ui/Button.vue'
 import {
   asArray,
   asBool,
@@ -26,6 +27,7 @@ import {
   AlertTriangle,
   Cpu,
   Activity,
+  Save,
 } from 'lucide-vue-next'
 
 type SlotMode = 'single' | 'min' | 'range'
@@ -546,27 +548,32 @@ function handleSave() {
   <div class="bg-white border border-gray-200/80 rounded-2xl p-5 sm:p-6 shadow-xs space-y-5">
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 pb-4">
       <div class="flex items-center gap-2.5">
-        <Scale class="w-4 h-4 text-emerald-600" />
+        <Scale class="w-4 h-4 text-brand-600" />
         <h3 class="font-bold text-gray-900 text-sm">
           实例池、配额与路由调度
         </h3>
       </div>
 
-      <button
-        type="button"
-        class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-brand-500 hover:bg-brand-600 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-        :disabled="saving || hasSlotError"
+      <Button
+        variant="primary"
+        size="sm"
+        :loading="saving"
+        :disabled="hasSlotError"
         @click="handleSave"
       >
-        💾 保存调度配置
-      </button>
+        <Save
+          v-if="!saving"
+          class="w-3.5 h-3.5"
+        />
+        <span>保存调度配置</span>
+      </Button>
     </div>
 
     <!-- Runtime engine (independent dirty/save from scheduling) -->
     <div class="rounded-2xl border border-gray-200/80 bg-gray-50/60 p-3.5 sm:p-4 space-y-4">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
         <div class="flex items-center gap-1.5 flex-wrap min-w-0">
-          <Cpu class="w-4 h-4 text-indigo-600" />
+          <Cpu class="w-4 h-4 text-brand-600" />
           <span class="text-xs font-bold text-gray-900">运行引擎</span>
           <FieldHelpTip schema-key="engine.mode" />
           <span
@@ -583,14 +590,20 @@ function handleSave() {
           </span>
         </div>
 
-        <button
-          type="button"
-          class="inline-flex items-center justify-center px-3 py-1.5 text-xs font-medium rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-          :disabled="engineSaving || !engineDirty"
+        <Button
+          variant="primary"
+          size="sm"
+          :loading="engineSaving"
+          :disabled="!engineDirty"
+          class="shrink-0"
           @click="handleEngineSave"
         >
-          {{ engineSaving ? '切换中...' : '💾 保存并切换引擎' }}
-        </button>
+          <Save
+            v-if="!engineSaving"
+            class="w-3.5 h-3.5"
+          />
+          <span>{{ engineSaving ? '切换中...' : '保存并切换引擎' }}</span>
+        </Button>
       </div>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-1 p-1 bg-gray-100 rounded-xl text-[11px] font-medium">

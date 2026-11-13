@@ -137,10 +137,7 @@ usePolling(loadData, 10000)
                 当前运行实例
               </h3>
               <span
-                class="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
-                :class="instancesStore.engine === 'browserless'
-                  ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
-                  : 'bg-sky-50 text-sky-700 border-sky-200'"
+                class="inline-flex items-center text-xs font-medium px-2.5 py-0.5 rounded-full bg-gray-100 text-gray-700 border border-gray-200/80 shrink-0 whitespace-nowrap"
               >
                 引擎: {{ engineName }}
               </span>
@@ -161,10 +158,11 @@ usePolling(loadData, 10000)
           </div>
           <RouterLink
             to="/accounts"
-            class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition-colors whitespace-nowrap"
+            class="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition-colors whitespace-nowrap"
             title="前往账号与实例池管理"
           >
-            🟢 {{ runningCount }}/{{ instances.length }} 运行中
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+            <span>{{ runningCount }}/{{ instances.length }} 运行中</span>
           </RouterLink>
         </div>
 
@@ -261,7 +259,7 @@ usePolling(loadData, 10000)
           color="default"
         >
           <template #icon>
-            <Activity class="w-4 h-4 text-blue-600" />
+            <Activity class="w-4 h-4 text-brand-600" />
           </template>
           <template #footer>
             成功 {{ (statsTotals?.success || 0).toLocaleString() }}
@@ -289,7 +287,7 @@ usePolling(loadData, 10000)
           color="default"
         >
           <template #icon>
-            <Database class="w-4 h-4 text-teal-600" />
+            <Database class="w-4 h-4 text-brand-600" />
           </template>
           <template #footer>
             <span :title="reasoningTokens.toLocaleString()">思考 {{ formatCompactNumber(reasoningTokens) }}</span>
