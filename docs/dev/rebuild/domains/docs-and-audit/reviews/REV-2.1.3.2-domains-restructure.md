@@ -1,9 +1,9 @@
-# REV-domains-restructure：`docs/dev/rebuild/domains/` 重构与 `AGENT.md` / `05-restart-map.md` 同步只读审查报告
+# REV-2.1.3.2-domains-restructure：`docs/dev/rebuild/domains/` 重构与 `AGENT.md` / `05-restart-map.md` 同步只读审查报告
 
 - **审查结论**：**PASS**（0 P0 / 0 P1 / 0 P2 / 0 Q / 2 N）
 - **审查日期**：2026-11-13
 - **审查对象**：`docs/dev/rebuild/domains/` 双层治理重构、`P10-android-apk` 新建、`AGENT.md` §10.1 与 `docs/dev/rebuild/05-restart-map.md` 同步更新
-- **只读声明**：本次审查严格遵守只读 Reviewer 红线，未修改任何业务代码、配置、测试或其它受保护文档；未执行 `git add` / `git commit` / `git push`；未启动服务、浏览器或任何网络请求。仅将本审查报告写入 `docs/dev/rebuild/domains/docs-and-audit/reviews/REV-domains-restructure.md`，并在 `docs/dev/rebuild/domains/docs-and-audit/index.md` 登记本报告链接。
+- **只读声明**：本次审查严格遵守只读 Reviewer 红线，未修改任何业务代码、配置、测试或其它受保护文档；未执行 `git add` / `git commit` / `git push`；未启动服务、浏览器或任何网络请求。仅将本审查报告写入 `docs/dev/rebuild/domains/docs-and-audit/reviews/REV-2.1.3.2-domains-restructure.md`（原命名 `REV-domains-restructure.md`，已按四位审查标号规范收口重命名），并在 `docs/dev/rebuild/domains/docs-and-audit/index.md` 登记本报告链接。
 
 ---
 
@@ -37,14 +37,14 @@
 |---|---|---|---|---|
 | `P1-account` | `index.md:1-28` | 2 份：`REV-B2-1-p1-account.md`、`REV-C1b-vps-tier-and-403-fix.md`（+ `.gitkeep`） | 0 | 全覆盖（`index.md:26-27`） |
 | `P2-routing` | `index.md:1-26` | 1 份：`REV-B2-4-p2-routing.md`（+ `.gitkeep`） | 0 | 全覆盖（`index.md:25`） |
-| `P3-pool-instance` | `index.md:1-40` | 7 份：原 `P3-browser` 迁入 5 份（`REV-B2-2`、`REV-B2-3`、`REV-merge-99600c7`、`REV-C1`、`REV-C1d`）+ 原有 2 份（`REV-2.1-A`、`REV-2.1.3`） | 0 | 全覆盖（`index.md:33-39`） |
+| `P3-pool-instance` | `index.md:1-40` | 7 份：原 `P3-browser` 迁入 5 份（`REV-B2-2`、`REV-B2-3`、`REV-merge-99600c7`、`REV-C1`、`REV-C1d`）+ 原有 2 份（`REV-2.1-A`、`REV-2.1.3.1-session-expired-sibling-sync`［原 `REV-2.1.3`］） | 0 | 全覆盖（`index.md:33-39`） |
 | `P5-generation` | `index.md:1-47` | 7 份：`REV-B5a`、`REV-B5b`、`REV-B6-{discovery-hardening,live-verification,stream-and-429-fix}`、`REV-C1c`、`REV-C3`（+ `.gitkeep` 与 `09-pg-toolcall-analysis.md`） | 0 | 全覆盖（`index.md:25-31`） |
 | `P6-keepalive` | `index.md:1-21` | 1 份：`REV-B3-p6-keepalive.md`（+ `.gitkeep`） | 0 | 全覆盖（`index.md:20`） |
 | `P7-logs-stats` | `index.md:1-36` | 3 份：原 `P7-logs` 迁入 1 份（`REV-B4-p7-logs.md`）+ 原有 2 份（`REV-C4`、`REV-C4b`） | 6 张：`c4-dashboard-*.png`（2）+ `c4b-settings-tooltip-*.png`（4） | 全覆盖（`index.md:26-36`） |
 | `P8-api-ui` | `index.md:1-41` | 7 份：`REV-C2{a,b,c,d}.md`、`REV-2.1-B.md`、`REV-2.1.1.md`、`REV-2.1.2.md` | 16 张：`c2b-*`（2）、`c2c-*`（2）、`c2d-*`（3）、`c21b-*`（6）、`c211-*`（2）、`c212-*`（1） | 全覆盖（`index.md:27-41`） |
 | `P9-boot` | `index.md:1-27` | 1 份：`REV-B1-p9-pre.md`（+ `.gitkeep`） | 0 | 全覆盖（`index.md:26`） |
 | `P10-android-apk` | `index.md:1-33` | 0 份（规划中，`reviews/.gitkeep` 就位） | 0 | 一致（`index.md:31-33`） |
-| `docs-and-audit` | `index.md:1-130` | 6 份（迁移后原文件）：5 份 `REV-B7-*.md` + `REV-C5a.md`（+ 本报告 `REV-domains-restructure.md`） | 0 | 全覆盖（`index.md:15,20-26`） |
+| `docs-and-audit` | `index.md:1-130` | 6 份（迁移后原文件）：5 份 `REV-B7-*.md` + `REV-C5a.md`（+ 本报告 `REV-2.1.3.2-domains-restructure.md`） | 0 | 全覆盖（`index.md:15,20-26`） |
 | `upstream-merges` | `index.md:1-76` | 1 份：`REV-MERGE-852de53-oct31.md` | 0 | 已引用（`index.md:70`） |
 
 **迁移零丢失确认**：全仓共 **36** 份既有 `REV-*.md` 报告与 **22** 张 `assets/*.png` 截图；`git status --short` 中仅存在 3 个空壳目录的 `.gitkeep` 删除记录（`P3-browser/reviews/.gitkeep`、`P7-logs/reviews/.gitkeep`、`domains/_template/.gitkeep`），没有任何历史 `REV-*.md` 或 `assets/*.png` 被删除或遗漏。

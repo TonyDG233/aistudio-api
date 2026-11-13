@@ -1,11 +1,11 @@
-# REV-2.1.5-atg-ttft-hydrogen — 流式 TTFT 加速、Hydrogen 免费准入与配额校准、ATG 双独立开关与公开模板独立审查报告
+# REV-2.1.3.4-atg-ttft-hydrogen — 流式 TTFT 加速、Hydrogen 免费准入与配额校准、ATG 双独立开关与公开模板独立审查报告
 
-- **审查对象**：Stage 2.1.5 四项协同改动（模块 A：流式 TTFT 首字输出加速；模块 B：`gemini-4-hydrogen` 免费准入与配额校准；模块 C：ATG 输入/输出双独立开关 `wrap_output` + `wrap_input` 与公开可编辑提示词模板；模块 D：前端 `ProtocolAtgCard.vue` 响应式防拥挤布局与模板编辑框）
-- **审查角色**：独立只读 Reviewer（`REV-2.1.5-atg-ttft-hydrogen`）
+- **审查对象**：`2.1.3` 周期第四步四项协同改动（模块 A：流式 TTFT 首字输出加速；模块 B：`gemini-4-hydrogen` 免费准入与配额校准；模块 C：ATG 输入/输出双独立开关 `wrap_output` + `wrap_input` 与公开可编辑提示词模板；模块 D：前端 `ProtocolAtgCard.vue` 响应式防拥挤布局与模板编辑框）
+- **审查角色**：独立只读 Reviewer（`REV-2.1.3.4-atg-ttft-hydrogen`，原命名 `REV-2.1.5-atg-ttft-hydrogen`）
 - **审查日期**：2026-11-13
 - **最终判定**：**PASS**
 
-> **只读声明**：本审查严格遵守只读审计边界，未修改任何业务源码或测试文件，未在非 `--ui-debug` 模式下启动服务，未执行 `git commit` 或 `git push`；仅按任务授权写入本审查报告、归档两张实测截图（`assets/c215-atg-templates-1440.png`、`assets/c215-atg-mobile-375.png`），并同步更新 `docs/dev/rebuild/domains/P5-generation/index.md` 与 `docs/changelog.md`。
+> **只读声明**：本审查严格遵守只读审计边界，未修改任何业务源码或测试文件，未在非 `--ui-debug` 模式下启动服务，未执行 `git commit` 或 `git push`；仅按任务授权写入本审查报告（`docs/dev/rebuild/domains/P5-generation/reviews/REV-2.1.3.4-atg-ttft-hydrogen.md`）、归档两张实测截图（`assets/c215-atg-templates-1440.png`、`assets/c215-atg-mobile-375.png`），并同步更新 `docs/dev/rebuild/domains/P5-generation/index.md` 与 `docs/changelog.md`。
 
 ---
 

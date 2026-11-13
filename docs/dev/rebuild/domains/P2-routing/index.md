@@ -17,7 +17,7 @@
 |---|---|---|---|
 | **B2-4 P2/D05 路由闭环** | Free/Pro 分流、Paid chat-only、403 本地 `TierRequiredError`、`quota_scope`（`account`/`account_surface`）、429 重试/切换/503、204/瞬态 404 同号重试 | 已完成（PASS） | `reviews/REV-B2-4-p2-routing.md` |
 | **Stage 2.1.2 `accessModes` Ultra 提权与 `verify-account` 熔断** | `accessModes [4]` 优先于宽泛 `gemini-4` 规则；`AuthError.verification_required` 跳过同号重签直接 `session_expired` 隔离并切号 | 已完成（PASS） | 见 `P8-api-ui/reviews/REV-2.1.2.md` §3.1/§7 |
-| **Stage 2.1.3 同源兄弟失效传播** | `account_orchestrator` 将 `session_expired` 传播至同源兄弟账号，rotator 镜像过期态排除调度 | 已完成（PASS） | 见 `P3-pool-instance/reviews/REV-2.1.3.md` |
+| **Stage 2.1.3 同源兄弟失效传播** | `account_orchestrator` 将 `session_expired` 传播至同源兄弟账号，rotator 镜像过期态排除调度 | 已完成（PASS） | 见 `P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md` |
 | **后续演进：异步/多槽竞态优化** | 持续观测 `release-before-reassign` 竞态与 `quota_scope` 旧键迁移表现 | 按需跟进 | — |
 
 ## `reviews/` 审查报告与截图索引

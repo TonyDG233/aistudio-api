@@ -12,8 +12,9 @@
 | **B7-2 P0 分层解耦与 VPS 修复复核** | 验证 `api/application/domain/infrastructure` AST 边界测试、DTO/渲染器归位与 VPS 三项修复 | 已完成（PASS） | `reviews/REV-B7-p0-decoupling-and-vps-fix.md` |
 | **B7-3 配置单一来源与全绿复核** | 验证 `defaults/config.yaml` 单一模板、启动迁移原子写、`/health` 200 静默与 Windows 全绿门禁 | 已完成（PASS） | `reviews/REV-B7-config-sync-and-green-tests.md` |
 | **C5a 全仓文档与规格收尾终审** | 核对中英文 README、`changelog.md`、6 份规格文档、`AGENT.md` 行号/锚点/代码事实一致性 | 已完成（PASS） | `reviews/REV-C5a.md` |
-| **域双层治理重构与文档同步** | `B-docs-and-audit`→`docs-and-audit`、重复 `P` 域归并、新建 `P10-android-apk`、`INDEX.md` 及 `AGENT.md`/`05` 同步 | 已完成（PASS） | `reviews/REV-domains-restructure.md` |
-| **常态文档架构治理** | 维护 `docs/` 规格、`AGENT.md` 与 `domains/INDEX.md` 双层治理体系同步演进 | 持续进行中 | 后续 `REV-*.md` 统一落盘 `reviews/` |
+| **域双层治理重构与文档同步** | `B-docs-and-audit`→`docs-and-audit`、重复 `P` 域归并、新建 `P10-android-apk`、`INDEX.md` 及 `AGENT.md`/`05` 同步 | 已完成（PASS） | `reviews/REV-2.1.3.2-domains-restructure.md` |
+| **2.1.3 版本标号制度与审查收口** | 四位标号规范写入 `AGENT.md`/`INDEX.md`、5 份 `REV-2.1.3.1~5` 统一重命名与写法质量审计、`changelog.md` `[2.1.3]` 整理 | 已完成（PASS） | `reviews/REV-2.1.3.6-versioning-and-review-audit.md` |
+| **常态文档架构治理** | 维护 `docs/` 规格、`AGENT.md` 与 `domains/INDEX.md` 双层治理体系同步演进 | 持续进行中 | 后续 `REV-X.Y.Z.W-<slug>.md` 统一落盘 `reviews/` |
 
 ## 0.1 `reviews/` 审查报告索引
 
@@ -23,7 +24,8 @@
 - [`reviews/REV-B7-p0-decoupling-and-vps-fix.md`](reviews/REV-B7-p0-decoupling-and-vps-fix.md) — B7 P0 分层解耦与 VPS 修复复核（2026-11-01，PASS）
 - [`reviews/REV-B7-config-sync-and-green-tests.md`](reviews/REV-B7-config-sync-and-green-tests.md) — B7 配置单一来源与 Windows 全绿测试复核（2026-11-01，PASS）
 - [`reviews/REV-C5a.md`](reviews/REV-C5a.md) — C5a 根目录文档、全量规格与 `AGENT.md` 终审（2026-11-08，PASS）
-- [`reviews/REV-domains-restructure.md`](reviews/REV-domains-restructure.md) — `domains/` 双层治理重构、`P10-android-apk` 与 `AGENT.md`/`05` 同步审查（2026-11-13，PASS）
+- [`reviews/REV-2.1.3.2-domains-restructure.md`](reviews/REV-2.1.3.2-domains-restructure.md) — 2.1.3.2 `domains/` 双层治理重构、`P10-android-apk` 与 `AGENT.md`/`05` 同步审查（2026-11-13，PASS）
+- [`reviews/REV-2.1.3.6-versioning-and-review-audit.md`](reviews/REV-2.1.3.6-versioning-and-review-audit.md) — 2.1.3.6 四位版本标号制度固化、`REV-2.1.3.1~5` 写法审计与 `[2.1.3]` changelog 收口审查（2026-11-13，PASS）
 
 ---
 

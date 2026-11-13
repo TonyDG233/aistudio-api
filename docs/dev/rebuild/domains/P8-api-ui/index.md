@@ -19,7 +19,7 @@
 | **Stage 2.1-B 双引擎设置 UI 与 Docker 双引擎** | `--ui-debug` CLI 标志、浏览器/WAA 引擎切换卡与 YAML 保存门控、首页引擎徽章、Dockerfile 多阶段内置双引擎 | 已完成（PASS） | `reviews/REV-2.1-B.md` |
 | **Stage 2.1.1 拖拽导入与油猴在线安装** | 全页面拖拽与多文件 Bundle 合并、4 种凭据格式兼容、油猴脚本在线安装与移动端阻断 | 已完成（PASS） | `reviews/REV-2.1.1.md` |
 | **Stage 2.1.2 实例换绑 `max_tier` 归一化 UI** | `Pro 至 Ultra_20X` 槽位摘要与 `ReassignAccountModal` 兼容过滤联动实测 | 已完成（PASS） | `reviews/REV-2.1.2.md` |
-| **Stage 2.1.6 UI 极简审美对齐与移动端防挤压** | 账号行双层响应式（375px 邮箱不挤压）、槽位操作按钮统一样式、引擎徽章去重与全站去 Emoji/杂色块 | 已完成（PASS） | `reviews/REV-2.1.6-ui-polish-mobile.md` |
+| **Stage 2.1.3.5 UI 极简审美对齐与移动端防挤压** | 账号行双层响应式（375px 邮箱不挤压）、槽位操作按钮统一样式、引擎徽章去重与全站去 Emoji/杂色块 | 已完成（PASS） | `reviews/REV-2.1.3.5-ui-polish-mobile.md` |
 | **后续演进：文案统一与 Schema 同步** | 清理空态 `API Key` 文案差异（N-12/N-15）及协议默认开启文案同步（C3 N-2） | 按需微调 | — |
 
 ## `reviews/` 审查报告与截图索引
@@ -32,7 +32,7 @@
 - [`reviews/REV-2.1-B.md`](reviews/REV-2.1-B.md) — Stage 2.1-B 双引擎 UI / Docker 多阶段 / `--ui-debug` 终审（PASS）
 - [`reviews/REV-2.1.1.md`](reviews/REV-2.1.1.md) — 2.1.1 凭据拖拽全格式导入与油猴在线安装终审（PASS）
 - [`reviews/REV-2.1.2.md`](reviews/REV-2.1.2.md) — 2.1.2 Ultra 提权 / 换绑 tier 归一化 / 403 续期 / `verify-account` 终审（2026-11-11，PASS）
-- [`reviews/REV-2.1.6-ui-polish-mobile.md`](reviews/REV-2.1.6-ui-polish-mobile.md) — 2.1.6 UI 极简审美对齐与 375px 移动端防挤压审查（2026-11-13，R2 PASS）
+- [`reviews/REV-2.1.3.5-ui-polish-mobile.md`](reviews/REV-2.1.3.5-ui-polish-mobile.md) — 2.1.3.5 UI 极简审美对齐与 375px 移动端防挤压审查（2026-11-13，R2 PASS）
 
 ### 截图资产（`reviews/assets/`）
 - **C2b**：[`c2b-settings-overview-1440.png`](reviews/assets/c2b-settings-overview-1440.png)、[`c2b-settings-protocol-atg-1440.png`](reviews/assets/c2b-settings-protocol-atg-1440.png)
@@ -41,4 +41,4 @@
 - **2.1-B**：[`c21b-dashboard-engine-badge-1440.png`](reviews/assets/c21b-dashboard-engine-badge-1440.png)、[`c21b-dashboard-engine-badge-768.png`](reviews/assets/c21b-dashboard-engine-badge-768.png)、[`c21b-settings-browser-1440.png`](reviews/assets/c21b-settings-browser-1440.png)、[`c21b-settings-engine-waa-1440.png`](reviews/assets/c21b-settings-engine-waa-1440.png)、[`c21b-settings-engine-waa-1024.png`](reviews/assets/c21b-settings-engine-waa-1024.png)、[`c21b-settings-engine-waa-768.png`](reviews/assets/c21b-settings-engine-waa-768.png)
 - **2.1.1**：[`c211-accounts-import-1440.png`](reviews/assets/c211-accounts-import-1440.png)、[`c211-accounts-import-768.png`](reviews/assets/c211-accounts-import-768.png)
 - **2.1.2**：[`c212-reassign-pro-modal-1440.png`](reviews/assets/c212-reassign-pro-modal-1440.png)
-- **2.1.6**：[`c216-accounts-desktop-1440.png`](reviews/assets/c216-accounts-desktop-1440.png)、[`c216-accounts-mobile-375.png`](reviews/assets/c216-accounts-mobile-375.png)、[`c216-import-modal-1440.png`](reviews/assets/c216-import-modal-1440.png)、[`c216-dashboard-1440.png`](reviews/assets/c216-dashboard-1440.png)、[`c216-dashboard-mobile-375.png`](reviews/assets/c216-dashboard-mobile-375.png)、[`c216-settings-1440.png`](reviews/assets/c216-settings-1440.png)
+- **2.1.3.5**：[`c216-accounts-desktop-1440.png`](reviews/assets/c216-accounts-desktop-1440.png)、[`c216-accounts-mobile-375.png`](reviews/assets/c216-accounts-mobile-375.png)、[`c216-import-modal-1440.png`](reviews/assets/c216-import-modal-1440.png)、[`c216-dashboard-1440.png`](reviews/assets/c216-dashboard-1440.png)、[`c216-dashboard-mobile-375.png`](reviews/assets/c216-dashboard-mobile-375.png)、[`c216-settings-1440.png`](reviews/assets/c216-settings-1440.png)
