@@ -115,7 +115,8 @@ rotator:
 features:
   # P2 请求路由预算（只保留连续切号上限；无 defer/熔断/后台重排）。
   # max_switches：连续切号上限（0 表示不切号）。
-  # retry_same_delay_sec：429 同账号首次重试前的退避秒数，范围 0..30，默认 2.0；
+  # retry_same_delay_sec：上游瞬态错误（204/404/408/5xx）同账号原位重试前的退避秒数，范围 0..30，默认 2.0；
+  #   注：429 配额限流不做同账号重试，首击直接走 switch_backoff_sec 退避切号；
   #   可用 AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
   # switch_backoff_sec：切号前的退避基准秒数，范围 0..30，默认 4.0；
   #   实际等待为 ±25% 抖动区间（默认 3.0..5.0），0 表示不等待。

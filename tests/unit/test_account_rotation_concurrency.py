@@ -110,6 +110,31 @@ def test_clear_cooldown_resets_counter():
     assert 0 < stats.get_cooldown_remaining("gemini-2.5-pro") <= 60.0
 
 
+def test_rate_limit_cooldown_escalates_short_drip_extended(monkeypatch):
+    """429 首次命中即切号后：第 1 次 60s，第 2 次 300s，第 3 次起 600s。"""
+    from aistudio_api.application import account_rotator as rotator_module
+
+    monkeypatch.setattr(
+        rotator_module, "get_seconds_until_pacific_midnight", lambda: 86400.0
+    )
+    stats = AccountStats(account_id="acc_1")
+    model = "gemini-2.5-pro"
+
+    stats.record_rate_limited(model=model)
+    assert stats.get_model_daily(model).drip_mode is False
+    assert stats.get_cooldown_remaining(model) == pytest.approx(60.0, abs=1.0)
+
+    stats.record_rate_limited(model=model)
+    assert stats.get_model_daily(model).drip_mode is True
+    assert stats.get_cooldown_remaining(model) == pytest.approx(300.0, abs=1.0)
+
+    stats.record_rate_limited(model=model)
+    assert stats.get_cooldown_remaining(model) == pytest.approx(600.0, abs=1.0)
+
+    stats.record_rate_limited(model=model)
+    assert stats.get_cooldown_remaining(model) == pytest.approx(600.0, abs=1.0)
+
+
 def test_quota_scope_account_shares_chat_and_build_keys():
     stats = AccountStats(account_id="acc_1", quota_scope="account")
     stats.record_success(model="gemini-3.7-flash", surface="chat")
