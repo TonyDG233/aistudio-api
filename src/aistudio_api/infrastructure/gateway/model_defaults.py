@@ -52,6 +52,10 @@ _RETRY_SAME_DELAY_DEFAULT_SEC = 2.0
 _RETRY_SAME_DELAY_MAX_SEC = 30.0
 _RETRY_SAME_DELAY_ENV = "AISTUDIO_RETRY_SAME_DELAY_SEC"
 
+DEFAULT_SWITCH_BACKOFF_SEC = 4.0
+MIN_SWITCH_BACKOFF_SEC = 0.0
+MAX_SWITCH_BACKOFF_SEC = 30.0
+
 _LEGACY_KEEPALIVE_KEYS = (
     "auto_switch",
     "auto_switch_interval_hours",
@@ -236,6 +240,9 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
                 raw_routing["max_switches"] = 2
             raw_routing["retry_same_delay_sec"] = _normalize_retry_same_delay(
                 raw_routing
+            )
+            raw_routing["switch_backoff_sec"] = _normalize_switch_backoff_sec(
+                raw_routing.get("switch_backoff_sec", DEFAULT_SWITCH_BACKOFF_SEC)
             )
 
         default_features = defaults.get("features")
@@ -1398,10 +1405,45 @@ def _coerce_retry_same_delay(value: object) -> float | None:
     return min(_RETRY_SAME_DELAY_MAX_SEC, max(0.0, parsed))
 
 
+def _normalize_switch_backoff_sec(raw: object) -> float:
+    """Coerce ``features.routing.switch_backoff_sec`` into 0..30 seconds.
+
+    ``int``/``float``/numeric ``str`` are accepted; booleans, non-numeric
+    values and NaN fall back to :data:`DEFAULT_SWITCH_BACKOFF_SEC`, while
+    negative/oversized numbers are clamped into
+    :data:`MIN_SWITCH_BACKOFF_SEC`..:data:`MAX_SWITCH_BACKOFF_SEC`.
+    """
+    if raw is None or isinstance(raw, bool):
+        logger.warning(
+            "配置 features.routing.switch_backoff_sec 非法（%r），回退默认 %s",
+            raw,
+            DEFAULT_SWITCH_BACKOFF_SEC,
+        )
+        return DEFAULT_SWITCH_BACKOFF_SEC
+    try:
+        parsed = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "配置 features.routing.switch_backoff_sec 非法（%r），回退默认 %s",
+            raw,
+            DEFAULT_SWITCH_BACKOFF_SEC,
+        )
+        return DEFAULT_SWITCH_BACKOFF_SEC
+    if parsed != parsed:  # NaN
+        logger.warning(
+            "配置 features.routing.switch_backoff_sec 非法（%r），回退默认 %s",
+            raw,
+            DEFAULT_SWITCH_BACKOFF_SEC,
+        )
+        return DEFAULT_SWITCH_BACKOFF_SEC
+    return min(MAX_SWITCH_BACKOFF_SEC, max(MIN_SWITCH_BACKOFF_SEC, parsed))
+
+
 def _routing_defaults() -> dict[str, object]:
     return {
         "max_switches": 2,
         "retry_same_delay_sec": _RETRY_SAME_DELAY_DEFAULT_SEC,
+        "switch_backoff_sec": DEFAULT_SWITCH_BACKOFF_SEC,
     }
 
 
@@ -1899,6 +1941,7 @@ def get_configured_routing_settings(
 
     ``retry_same_delay_sec`` 默认 2.0 秒，限制在 0..30；环境变量
     ``AISTUDIO_RETRY_SAME_DELAY_SEC`` 可覆盖（非法值忽略，不抛异常）。
+    ``switch_backoff_sec`` 默认 4.0 秒，同样限制在 0..30。
     """
     resolved_path = _resolve_config_path(config_path)
     config = _load_yaml_config(resolved_path)
@@ -1926,6 +1969,9 @@ def get_configured_routing_settings(
     return {
         "max_switches": raw_switches,
         "retry_same_delay_sec": _resolve_retry_same_delay(raw_routing),
+        "switch_backoff_sec": _normalize_switch_backoff_sec(
+            raw_routing.get("switch_backoff_sec", DEFAULT_SWITCH_BACKOFF_SEC)
+        ),
     }
 
 

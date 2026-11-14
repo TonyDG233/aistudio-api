@@ -30,6 +30,8 @@ const defaultRecommended: Record<string, unknown> = {
   'features.routing.max_switches': defaults.features.routing.max_switches,
   'features.routing.retry_same_delay_sec':
     defaults.features.routing.retry_same_delay_sec,
+  'features.routing.switch_backoff_sec':
+    defaults.features.routing.switch_backoff_sec,
   'rotator.quota_scope': defaults.rotator.quota_scope,
   'rotator.cooldowns.rate_limited_short':
     defaults.rotator.cooldowns.rate_limited_short,
@@ -37,7 +39,6 @@ const defaultRecommended: Record<string, unknown> = {
     defaults.rotator.cooldowns.rate_limited_drip,
   'rotator.cooldowns.rate_limited_drip_extended':
     defaults.rotator.cooldowns.rate_limited_drip_extended,
-  'rotator.cooldowns.auth_error': defaults.rotator.cooldowns.auth_error,
   'security.api_allow_anonymous': defaults.security.api_allow_anonymous,
   'browser.fingerprint_spoof_enabled':
     defaults.browser.fingerprint_spoof_enabled,

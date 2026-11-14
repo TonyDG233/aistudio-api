@@ -101,6 +101,45 @@ def test_routing_retry_same_delay_defaults_to_two_seconds(tmp_path, monkeypatch)
     assert settings["retry_same_delay_sec"] == 2.0
 
 
+def test_routing_switch_backoff_default_clamp_and_invalid(tmp_path):
+    """Switch backoff defaults to 4.0s and is clamped into 0..30."""
+    configured = _write_config(
+        tmp_path,
+        "features:\n  routing:\n    max_switches: 2\n    switch_backoff_sec: 6\n",
+    )
+    assert get_configured_routing_settings(configured)["switch_backoff_sec"] == 6.0
+
+    missing = tmp_path / "missing.yaml"
+    missing.write_text("features:\n  routing:\n    max_switches: 2\n", encoding="utf-8")
+    assert get_configured_routing_settings(missing)["switch_backoff_sec"] == 4.0
+
+    too_high = tmp_path / "high.yaml"
+    too_high.write_text(
+        "features:\n  routing:\n    switch_backoff_sec: 99\n", encoding="utf-8"
+    )
+    assert get_configured_routing_settings(too_high)["switch_backoff_sec"] == 30.0
+
+    negative = tmp_path / "negative.yaml"
+    negative.write_text(
+        "features:\n  routing:\n    switch_backoff_sec: -5\n", encoding="utf-8"
+    )
+    assert get_configured_routing_settings(negative)["switch_backoff_sec"] == 0.0
+
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_text(
+        "features:\n  routing:\n    switch_backoff_sec: not-a-number\n",
+        encoding="utf-8",
+    )
+    assert get_configured_routing_settings(invalid)["switch_backoff_sec"] == 4.0
+
+    normalized = validate_config_mapping({"features": {"routing": {}}})
+    features_block = normalized["features"]
+    assert isinstance(features_block, dict)
+    routing_block = features_block.get("routing")
+    assert isinstance(routing_block, dict)
+    assert routing_block["switch_backoff_sec"] == 4.0
+
+
 def test_invalid_rotator_type_fails_startup_validation(tmp_path):
     path = _write_config(tmp_path, "rotator:\n  - not-a-mapping\n")
 

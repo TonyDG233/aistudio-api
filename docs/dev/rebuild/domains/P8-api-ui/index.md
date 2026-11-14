@@ -1,7 +1,7 @@
 # P8-api-ui / API 管理面与 Web 管理控制台域
 
 - 域标识：`P8-api-ui`
-- 核心职责边界：FastAPI 管理端点与响应模型、Vite + Vue 3 + TypeScript + Tailwind 管理控制台（Dashboard Bento / Accounts & 实例池 / Settings & 75 词条字典 / Logs）、`AISTUDIO_UI_DEBUG=1`（`--ui-debug`）纯内存/临时目录离线沙盒（100% 阻断真实浏览器与外网请求）、多分辨率（`1440x900`/`1024x900`/`768x900`）响应式验收、油猴长效抓取助手与全格式拖拽导入、D-12 增量不重排原则。
+- 核心职责边界：FastAPI 管理端点与响应模型、Vite + Vue 3 + TypeScript + Tailwind 管理控制台（Dashboard Bento / Accounts & 实例池 / Settings & 75 词条字典 / Logs）、`AISTUDIO_UI_DEBUG=1`（`--ui-debug`）纯内存/临时目录离线沙盒（100% 阻断真实浏览器与外网请求）、多分辨率（`1440x900`/`1024x900`/`768x900`/`375x812`）响应式验收、油猴长效抓取助手与全格式拖拽导入、D-12 增量不重排原则。
 - 核心代码模块：
   - `src/aistudio_api/api/`（`routes_system.py`、`routes_accounts.py`、`routes_instances.py`、`routes_debug*.py`、`ui_sandbox.py`、`response_models.py`）
   - `src/aistudio_api/tools/aistudio-cookie-grabber.user.js`
@@ -20,6 +20,7 @@
 | **Stage 2.1.1 拖拽导入与油猴在线安装** | 全页面拖拽与多文件 Bundle 合并、4 种凭据格式兼容、油猴脚本在线安装与移动端阻断 | 已完成（PASS） | `reviews/REV-2.1.1.md` |
 | **Stage 2.1.2 实例换绑 `max_tier` 归一化 UI** | `Pro 至 Ultra_20X` 槽位摘要与 `ReassignAccountModal` 兼容过滤联动实测 | 已完成（PASS） | `reviews/REV-2.1.2.md` |
 | **Stage 2.1.3.5 UI 极简审美对齐与移动端防挤压** | 账号行双层响应式（375px 邮箱不挤压）、槽位操作按钮统一样式、引擎徽章去重与全站去 Emoji/杂色块 | 已完成（PASS） | `reviews/REV-2.1.3.5-ui-polish-mobile.md` |
+| **Stage 2.2.0.4 设置页超时同步与切号退避 UI** | `请求超时 (秒)` 默认 300 并同步写回 `signer.request_timeout_s` + `transport.read_timeout_s`；新增「切换账号退避等待」(`features.routing.switch_backoff_sec`，默认 4、0-30 秒) 并移除死框「鉴权失败冷却」；冷却与重试 5 项 5/3/2/1 列响应式（375px 单列不挤压） | 已完成（PASS） | `reviews/REV-2.2.0.4-settings-timeout-and-switch-backoff-ui.md` |
 | **后续演进：文案统一与 Schema 同步** | 清理空态 `API Key` 文案差异（N-12/N-15）及协议默认开启文案同步（C3 N-2） | 按需微调 | — |
 
 ## `reviews/` 审查报告与截图索引
@@ -33,6 +34,7 @@
 - [`reviews/REV-2.1.1.md`](reviews/REV-2.1.1.md) — 2.1.1 凭据拖拽全格式导入与油猴在线安装终审（PASS）
 - [`reviews/REV-2.1.2.md`](reviews/REV-2.1.2.md) — 2.1.2 Ultra 提权 / 换绑 tier 归一化 / 403 续期 / `verify-account` 终审（2026-11-11，PASS）
 - [`reviews/REV-2.1.3.5-ui-polish-mobile.md`](reviews/REV-2.1.3.5-ui-polish-mobile.md) — 2.1.3.5 UI 极简审美对齐与 375px 移动端防挤压审查（2026-11-13，R2 PASS）
+- [`reviews/REV-2.2.0.4-settings-timeout-and-switch-backoff-ui.md`](reviews/REV-2.2.0.4-settings-timeout-and-switch-backoff-ui.md) — 2.2.0.4 设置页超时同步（300s）与切号退避等待前后端打通 + 四分辨率 UI 防挤压审查（2026-11-14，PASS）
 
 ### 截图资产（`reviews/assets/`）
 - **C2b**：[`c2b-settings-overview-1440.png`](reviews/assets/c2b-settings-overview-1440.png)、[`c2b-settings-protocol-atg-1440.png`](reviews/assets/c2b-settings-protocol-atg-1440.png)
@@ -42,3 +44,4 @@
 - **2.1.1**：[`c211-accounts-import-1440.png`](reviews/assets/c211-accounts-import-1440.png)、[`c211-accounts-import-768.png`](reviews/assets/c211-accounts-import-768.png)
 - **2.1.2**：[`c212-reassign-pro-modal-1440.png`](reviews/assets/c212-reassign-pro-modal-1440.png)
 - **2.1.3.5**：[`c216-accounts-desktop-1440.png`](reviews/assets/c216-accounts-desktop-1440.png)、[`c216-accounts-mobile-375.png`](reviews/assets/c216-accounts-mobile-375.png)、[`c216-import-modal-1440.png`](reviews/assets/c216-import-modal-1440.png)、[`c216-dashboard-1440.png`](reviews/assets/c216-dashboard-1440.png)、[`c216-dashboard-mobile-375.png`](reviews/assets/c216-dashboard-mobile-375.png)、[`c216-settings-1440.png`](reviews/assets/c216-settings-1440.png)
+- **2.2.0.4**：[`rev-2.2.0.4-settings-desktop-1440.png`](reviews/assets/rev-2.2.0.4-settings-desktop-1440.png)、[`rev-2.2.0.4-settings-mobile-375.png`](reviews/assets/rev-2.2.0.4-settings-mobile-375.png)
