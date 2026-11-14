@@ -1413,7 +1413,7 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
 
 
 def _coerce_retry_same_delay(value: object) -> float | None:
-    """Parse a 429 same-account retry delay and clamp it to 0..30 seconds."""
+    """Normalize the transient-error same-account retry delay (in seconds)."""
     if value is None or isinstance(value, bool):
         return None
     try:

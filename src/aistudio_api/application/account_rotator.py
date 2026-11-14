@@ -345,11 +345,13 @@ class AccountStats:
         cd_drip = float(str(cooldowns["rate_limited_drip"]))
         cd_drip_ext = float(str(cooldowns["rate_limited_drip_extended"]))
 
+        # 429 首次命中即切号，单次请求只会调用一次本方法：
+        # 第 1 次 -> 短冷却；第 2 次 -> 进入 drip 模式；第 3 次及以后 -> 扩展冷却。
         is_drip = m_stats.drip_mode
         limit_count = m_stats.rate_limited
         if is_drip:
-            cooldown_duration = cd_drip if limit_count <= 4 else cd_drip_ext
-        elif limit_count <= 2:
+            cooldown_duration = cd_drip if limit_count < 3 else cd_drip_ext
+        elif limit_count <= 1:
             cooldown_duration = cd_short
         else:
             m_stats.drip_mode = True

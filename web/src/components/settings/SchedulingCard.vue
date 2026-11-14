@@ -1000,6 +1000,9 @@ function handleSave() {
             type="number"
             @update:model-value="updateRotator('max_retries', Math.max(0, Math.trunc(asNumber($event, 5))))"
           />
+          <p class="mt-1 text-[11px] text-gray-500 leading-relaxed">
+            单次请求总尝试上限（注：429/需验证首击直接切号，不原号重试）
+          </p>
         </div>
         <FieldHelpTip
           schema-key="rotator.max_retries"
@@ -1332,6 +1335,9 @@ function handleSave() {
                     type="number"
                     @update:model-value="updateFeature('routing', 'retry_same_delay_sec', Math.min(30, Math.max(0, asNumber($event, 2))))"
                   />
+                  <p class="mt-1 text-[11px] text-gray-500 leading-relaxed">
+                    瞬态错误原号重试等待
+                  </p>
                 </div>
                 <FieldHelpTip
                   schema-key="features.routing.retry_same_delay_sec"

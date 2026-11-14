@@ -7,8 +7,9 @@ pinned slot, circuit breaker or background rebalance.
 
 Error policy:
 * tier/403 admission rejects locally and never switches;
-* 429 retries the same instance first, then switches inside the existing pool,
-  and finally returns a 503 (never 429);
+* 429 immediately records model cooldown and switches to the next healthy LRU
+  account after switch backoff (no same-account retry), then finally returns a
+  503 (never 429);
 * 204 / transient RPC 404 retry the same instance without switching;
 * once streaming body data was yielded, no switch happens.
 """
@@ -1003,30 +1004,10 @@ class RoutingPipeline:
             self._record_error("rate_limited", context, attempt, exc=exc)
             if has_yielded_data:
                 raise exc
-            if (
-                attempt.same_retries == 0
-                and context.total_attempts < context.max_retries
-            ):
-                attempt.same_retries += 1
-                context.retry_same = True
-                context.budget.record_retry("429")
-                logger.warning(
-                    "[routing] 429 同账号重试 model=%s surface=%s "
-                    "instance=%s account=%s reason=%s",
-                    context.route.model,
-                    context.route.surface,
-                    attempt.instance_id,
-                    attempt.account_id,
-                    reason_summary,
-                )
-                if context.retry_same_delay_sec > 0:
-                    logger.info(
-                        "[routing] 429 同账号退避 %.2fs 后重试 instance=%s",
-                        context.retry_same_delay_sec,
-                        attempt.instance_id,
-                    )
-                    await asyncio.sleep(context.retry_same_delay_sec)
-                return "retry_same"
+            # 429 首次命中即切号，绝不拿同一个号再撞第 2 次 429：连续撞墙会
+            # 触发 Google verify-account 风控。_switch_or_raise 内部先按
+            # switch_backoff_sec 做 3~5 秒随机退避，再换绑到下一个健康 LRU 账号。
+            attempt.client.clear_templates()
             return await self._switch_or_raise(
                 context,
                 attempt,

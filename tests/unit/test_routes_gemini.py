@@ -498,7 +498,8 @@ async def test_429_single_free_slot_rebinds_to_alternate_free_account(
     data = response.json()
     assert data["candidates"][0]["content"]["parts"][0]["text"] == "rebound ok"
     assert manager.reassign_calls == [("inst-1", "free-b")]
-    assert free_a_calls == 2
+    # 首次 429 即切号：free-a 只被调用一次，绝不同号二次撞 429。
+    assert free_a_calls == 1
     assert free_b_calls == 1
     assert manager.begin_calls == ["inst-1", "inst-1"]
     assert manager.active_requests == 0

@@ -356,14 +356,13 @@ async def test_429_dead_slot_is_rebound_while_request_continues_on_other_slot(
     assert first.instance_id == "inst-1"
     error = UsageLimitExceeded("429")
 
-    assert (
-        await pipeline.handle_error(context, first, error, has_yielded_data=False)
-        == "retry_same"
-    )
+    # 首次 429 即直接切号：绝不拿同一个号再撞第 2 次 429。
     assert (
         await pipeline.handle_error(context, first, error, has_yielded_data=False)
         == "switch"
     )
+    assert first.same_retries == 0
+    assert context.retry_same is False
     # The failed slot was healed immediately, but this request continues on
     # inst-2 instead of re-taking the slot it just failed.
     assert manager.reassign_calls == [("inst-1", "free-c")]
@@ -465,12 +464,9 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
     assert first.account_id == "free-a"
     assert (
         await pipeline.handle_error(context, first, error, has_yielded_data=False)
-        == "retry_same"
-    )
-    assert (
-        await pipeline.handle_error(context, first, error, has_yielded_data=False)
         == "switch"
     )
+    assert first.same_retries == 0
     await pipeline.release(first)
 
     second = await pipeline.acquire(context)
@@ -478,12 +474,9 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
     assert second.account_id == "free-b"
     assert (
         await pipeline.handle_error(context, second, error, has_yielded_data=False)
-        == "retry_same"
-    )
-    assert (
-        await pipeline.handle_error(context, second, error, has_yielded_data=False)
         == "switch"
     )
+    assert second.same_retries == 0
     await pipeline.release(second)
 
     third = await pipeline.acquire(context)
@@ -505,12 +498,9 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
     assert rotator.exclusions[1] == {"free-a", "free-b"}
 
     # The third 429 has no switch budget left and must not loop or re-bind.
-    assert (
-        await pipeline.handle_error(context, third, error, has_yielded_data=False)
-        == "retry_same"
-    )
     with pytest.raises(SurfaceSwitchExhaustedError):
         await pipeline.handle_error(context, third, error, has_yielded_data=False)
+    assert third.same_retries == 0
     assert manager.reassign_calls == [
         ("inst-1", "free-b"),
         ("inst-1", "free-c"),
@@ -518,14 +508,19 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
 
 
 @pytest.mark.asyncio
-async def test_429_same_retry_sleeps_configured_delay(monkeypatch) -> None:
-    """VPS #1: a 429 same-account retry backs off before hitting upstream again."""
+async def test_first_429_switches_directly_without_same_account_retry(
+    monkeypatch,
+) -> None:
+    """首次 429 即切号：0 次同账号重试，也不再等待 retry_same_delay_sec。"""
     from aistudio_api.application import routing_pipeline as routing_pipeline_module
 
     sleep_mock = AsyncMock()
     monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
     manager = FakeManager(
-        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
     )
     pipeline = RoutingPipeline(
         instance_manager=manager,
@@ -535,7 +530,6 @@ async def test_429_same_retry_sleeps_configured_delay(monkeypatch) -> None:
         },
     )
     context = await pipeline.begin(model_path="gemini-4-argon")
-    assert context.retry_same_delay_sec == 2.0
     attempt = await pipeline.acquire(context)
     assert attempt is not None
 
@@ -546,31 +540,20 @@ async def test_429_same_retry_sleeps_configured_delay(monkeypatch) -> None:
         has_yielded_data=False,
     )
 
-    assert outcome == "retry_same"
-    sleep_mock.assert_awaited_once_with(2.0)
+    assert outcome == "switch"
+    assert attempt.same_retries == 0
+    assert context.retry_same is False
+    sleep_mock.assert_not_awaited()
+    await pipeline.release(attempt)
+
+    second = await pipeline.acquire(context)
+    assert second is not None
+    assert second.account_id == "acc-2"
+    await pipeline.release(second)
 
 
 @pytest.mark.asyncio
-async def test_routing_settings_failure_uses_default_retry_delay() -> None:
-    """A broken settings provider must not silently disable the 429 backoff."""
-    manager = FakeManager(
-        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
-    )
-
-    def broken_provider() -> dict[str, object]:
-        raise RuntimeError("config store unavailable")
-
-    pipeline = RoutingPipeline(
-        instance_manager=manager,
-        routing_settings_provider=broken_provider,
-    )
-    context = await pipeline.begin(model_path="gemini-4-argon")
-
-    assert context.retry_same_delay_sec == 2.0
-
-
-@pytest.mark.asyncio
-async def test_429_same_retry_skips_delay_when_zero(monkeypatch) -> None:
+async def test_single_slot_first_429_exhausts_without_same_retry(monkeypatch) -> None:
     from aistudio_api.application import routing_pipeline as routing_pipeline_module
 
     sleep_mock = AsyncMock()
@@ -589,12 +572,32 @@ async def test_429_same_retry_skips_delay_when_zero(monkeypatch) -> None:
     attempt = await pipeline.acquire(context)
     assert attempt is not None
 
-    outcome = await pipeline.handle_error(
-        context, attempt, UsageLimitExceeded("429"), has_yielded_data=False
+    with pytest.raises(SurfaceSwitchExhaustedError):
+        await pipeline.handle_error(
+            context, attempt, UsageLimitExceeded("429"), has_yielded_data=False
+        )
+
+    assert attempt.same_retries == 0
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_routing_settings_failure_uses_default_retry_delay() -> None:
+    """A broken settings provider must not silently disable the transient backoff."""
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
     )
 
-    assert outcome == "retry_same"
-    sleep_mock.assert_not_awaited()
+    def broken_provider() -> dict[str, object]:
+        raise RuntimeError("config store unavailable")
+
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=broken_provider,
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+
+    assert context.retry_same_delay_sec == 2.0
 
 
 @pytest.mark.asyncio
@@ -635,7 +638,7 @@ async def test_auth_retry_same_never_sleeps(monkeypatch) -> None:
 async def test_transient_request_error_retry_same_sleeps_configured_delay(
     monkeypatch, status: int
 ) -> None:
-    """Q-8: transient RequestError retries back off like the 429 branch."""
+    """Q-8: transient RequestError retries back off on the same account."""
     from aistudio_api.application import routing_pipeline as routing_pipeline_module
 
     sleep_mock = AsyncMock()
@@ -667,11 +670,19 @@ async def test_transient_request_error_retry_same_sleeps_configured_delay(
 
 @pytest.mark.asyncio
 async def test_429_warning_includes_model_and_upstream_reason(caplog) -> None:
-    manager = FakeManager(
-        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="free-a", tier="Free", number=1)]
     )
-    pipeline = _pipeline(manager)
-    context = await pipeline.begin(model_path="gemini-4-argon")
+    manager.account_tiers["healthy"] = "Free"
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", _HealingRotator()),
+        routing_settings_provider=lambda: {"max_switches": 2},
+        switch_backoff_range=(0.0, 0.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
 
@@ -683,10 +694,10 @@ async def test_429_warning_includes_model_and_upstream_reason(caplog) -> None:
             has_yielded_data=False,
         )
 
-    assert outcome == "retry_same"
+    assert outcome == "switch"
     messages = [record.getMessage() for record in caplog.records]
     assert any(
-        "gemini-4-argon" in message and "HTTP 429: RPM burst" in message
+        "gemini-3.7-flash" in message and "HTTP 429: RPM burst" in message
         for message in messages
     )
     assert all("SAPISID" not in message for message in messages)
@@ -695,11 +706,19 @@ async def test_429_warning_includes_model_and_upstream_reason(caplog) -> None:
 @pytest.mark.asyncio
 async def test_429_warning_redacts_cookie_and_bearer(caplog) -> None:
     """Reason summaries must not leak cookie or Bearer secrets to warnings."""
-    manager = FakeManager(
-        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="free-a", tier="Free", number=1)]
     )
-    pipeline = _pipeline(manager)
-    context = await pipeline.begin(model_path="gemini-4-argon")
+    manager.account_tiers["healthy"] = "Free"
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", _HealingRotator()),
+        routing_settings_provider=lambda: {"max_switches": 2},
+        switch_backoff_range=(0.0, 0.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
     secret = "SENTINELSECRETCOOKIE123"
@@ -714,9 +733,9 @@ async def test_429_warning_redacts_cookie_and_bearer(caplog) -> None:
             has_yielded_data=False,
         )
 
-    assert outcome == "retry_same"
+    assert outcome == "switch"
     messages = [record.getMessage() for record in caplog.records]
-    assert any("gemini-4-argon" in message for message in messages)
+    assert any("gemini-3.7-flash" in message for message in messages)
     assert all(secret not in message for message in messages)
 
 
@@ -807,7 +826,7 @@ async def test_pro_account_without_paid_instance_is_capacity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_429_retries_same_then_switches_then_503() -> None:
+async def test_429_switches_immediately_then_503_when_exhausted() -> None:
     manager = FakeManager(
         [
             make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
@@ -820,18 +839,13 @@ async def test_429_retries_same_then_switches_then_503() -> None:
     first = await pipeline.acquire(context)
     assert first is not None
     error = UsageLimitExceeded("429")
-    assert (
-        await pipeline.handle_error(context, first, error, has_yielded_data=False)
-        == "retry_same"
-    )
-    assert context.retry_same is True
-    assert first.same_retries == 1
-    assert context.budget.switches == 0
-
+    # 首次 429 不做同账号重试，直接切到下一个健康账号。
     assert (
         await pipeline.handle_error(context, first, error, has_yielded_data=False)
         == "switch"
     )
+    assert context.retry_same is False
+    assert first.same_retries == 0
     assert context.budget.switches == 1
     assert manager.wake_calls[-1] == (True, "chat")
     await pipeline.release(first)
@@ -839,12 +853,10 @@ async def test_429_retries_same_then_switches_then_503() -> None:
     second = await pipeline.acquire(context)
     assert second is not None
     assert second.instance_id == "inst-2"
-    assert (
-        await pipeline.handle_error(context, second, error, has_yielded_data=False)
-        == "retry_same"
-    )
+    # 第二个账号同样首次 429 即耗尽预算/候选 -> 503。
     with pytest.raises(SurfaceSwitchExhaustedError) as info:
         await pipeline.handle_error(context, second, error, has_yielded_data=False)
+    assert second.same_retries == 0
     assert info.value.status_code == 503
     assert info.value.code == "surface_switch_exhausted"
     assert not isinstance(info.value, UsageLimitExceeded)
@@ -926,16 +938,11 @@ async def test_switch_budget_zero_exhausts_immediately() -> None:
     context = await pipeline.begin(model_path="gemini-4-argon")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
-    assert (
-        await pipeline.handle_error(
-            context, attempt, UsageLimitExceeded("429"), has_yielded_data=False
-        )
-        == "retry_same"
-    )
     with pytest.raises(SurfaceSwitchExhaustedError):
         await pipeline.handle_error(
             context, attempt, UsageLimitExceeded("429"), has_yielded_data=False
         )
+    assert attempt.same_retries == 0
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1071,7 @@ async def test_paid_tier_required_error_raises_without_switch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auth_error_then_429_follows_same_instance_policy() -> None:
+async def test_auth_error_then_429_switches_without_same_retry() -> None:
     manager = FakeManager(
         [
             make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
@@ -1086,26 +1093,28 @@ async def test_auth_error_then_429_follows_same_instance_policy() -> None:
     assert first.same_retries == 1
     assert context.budget.switches == 0
 
-    # 随后 429 复用同一重试预算：立即切号，而不是再次原位重试。
+    # 随后 429 首次命中即切号，绝不再原位重试。
     assert (
         await pipeline.handle_error(
             context, first, UsageLimitExceeded("429"), has_yielded_data=False
         )
         == "switch"
     )
+    # 403 已消耗的同号重试计数保持为 1，但 429 不再新增同号重试。
+    assert first.same_retries == 1
+    assert context.retry_same is False
     assert context.budget.switches == 1
     await pipeline.release(first)
 
     second = await pipeline.acquire(context)
     assert second is not None
     assert second.instance_id == "inst-2"
-    # 新实例上的 429 重新获得一次同账号重试机会。
-    assert (
+    # 新实例上的 429 同样不允许同账号重试：预算/候选耗尽即 503。
+    with pytest.raises(SurfaceSwitchExhaustedError):
         await pipeline.handle_error(
             context, second, UsageLimitExceeded("429"), has_yielded_data=False
         )
-        == "retry_same"
-    )
+    assert second.same_retries == 0
     await pipeline.release(second)
 
 
@@ -1388,15 +1397,6 @@ async def test_exhausted_budget_heals_dead_slot_without_charging_budget() -> Non
     assert attempt is not None
     rotator.unavailable.add("dead")
 
-    assert (
-        await pipeline.handle_error(
-            context,
-            attempt,
-            UsageLimitExceeded("429"),
-            has_yielded_data=False,
-        )
-        == "retry_same"
-    )
     with pytest.raises(SurfaceSwitchExhaustedError):
         await pipeline.handle_error(
             context,
@@ -1405,6 +1405,7 @@ async def test_exhausted_budget_heals_dead_slot_without_charging_budget() -> Non
             has_yielded_data=False,
         )
 
+    assert attempt.same_retries == 0
     assert manager.reassign_calls == [("inst-1", "healthy")]
     assert context.budget.switches == 0
     assert attempt.handle.released is True  # type: ignore[attr-defined]
@@ -1502,15 +1503,12 @@ async def test_429_rebind_waits_randomized_switch_backoff(monkeypatch) -> None:
     rotator.unavailable.add("free-a")
     error = UsageLimitExceeded("429")
 
-    assert (
-        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
-        == "retry_same"
-    )
-    sleep_mock.assert_not_awaited()
+    # 首次 429 即触发切号，并在激活新账号前完成退避。
     assert (
         await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
         == "switch"
     )
+    assert attempt.same_retries == 0
     sleep_mock.assert_awaited_once_with(2.0)
     assert manager.reassign_calls == [("inst-1", "healthy")]
     # The cool-down must happen before the new account is activated.
@@ -1540,15 +1538,6 @@ async def test_exhausted_budget_rebind_still_waits_switch_backoff(monkeypatch) -
     assert attempt is not None
     rotator.unavailable.add("dead")
 
-    assert (
-        await pipeline.handle_error(
-            context,
-            attempt,
-            UsageLimitExceeded("429"),
-            has_yielded_data=False,
-        )
-        == "retry_same"
-    )
     with pytest.raises(SurfaceSwitchExhaustedError):
         await pipeline.handle_error(
             context,
@@ -1557,6 +1546,7 @@ async def test_exhausted_budget_rebind_still_waits_switch_backoff(monkeypatch) -
             has_yielded_data=False,
         )
 
+    assert attempt.same_retries == 0
     # record_budget=False must still cool down before the rebind.
     sleep_mock.assert_awaited_once_with(2.0)
     assert manager.reassign_calls == [("inst-1", "healthy")]
