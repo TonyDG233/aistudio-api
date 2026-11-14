@@ -342,6 +342,13 @@ def _normalize_backoff_range(raw: object) -> tuple[float, float]:
     return (value, value)
 
 
+def _backoff_range_from_seconds(sec: float) -> tuple[float, float]:
+    """Expand one configured backoff second value into a ±25% jitter range."""
+    if sec <= 0.0:
+        return (0.0, 0.0)
+    return (round(sec * 0.75, 4), round(sec * 1.25, 4))
+
+
 def _default_switch_backoff_range() -> tuple[float, float]:
     """Resolve the 429/verification switch backoff without touching app wiring.
 
@@ -421,9 +428,14 @@ class RoutingPipeline:
         self._client_recorder = client_recorder
         self._count_token_recorder = count_token_recorder
         self._clock = clock
-        self._switch_backoff_range = (
+        self._explicit_switch_backoff_range = (
             _normalize_backoff_range(switch_backoff_range)
             if switch_backoff_range is not None
+            else None
+        )
+        self._switch_backoff_range = (
+            self._explicit_switch_backoff_range
+            if self._explicit_switch_backoff_range is not None
             else _default_switch_backoff_range()
         )
         # Serializes dead-slot healing so two concurrent begin() calls cannot
@@ -649,6 +661,42 @@ class RoutingPipeline:
         )
 
         return get_configured_routing_settings()
+
+    def _resolve_switch_backoff_range(self) -> tuple[float, float]:
+        """Resolve the switch backoff dynamically, honouring live config edits.
+
+        Priority: explicit constructor override > explicit ``routing_settings``
+        provider key (so tests can inject it directly and beat the shared env
+        default) > ``AISTUDIO_SWITCH_BACKOFF_SECONDS`` (single value or
+        ``low,high``) > ``features.routing.switch_backoff_sec`` > production
+        default ``(3.0, 5.0)``.  A provider that exists but omits the key still
+        falls through to the live ``get_configured_routing_settings()`` read.
+        """
+        if self._explicit_switch_backoff_range is not None:
+            return self._explicit_switch_backoff_range
+
+        settings: dict[str, object] | None = None
+        if self._routing_settings_provider is not None:
+            settings = self._routing_settings()
+            if "switch_backoff_sec" in settings:
+                return _backoff_range_from_seconds(
+                    _as_float(settings["switch_backoff_sec"], 0.0)
+                )
+
+        if (os.getenv(_SWITCH_BACKOFF_ENV) or "").strip():
+            return _default_switch_backoff_range()
+
+        if settings is None or "switch_backoff_sec" not in settings:
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_configured_routing_settings,
+            )
+
+            settings = get_configured_routing_settings()
+        if "switch_backoff_sec" in settings:
+            return _backoff_range_from_seconds(
+                _as_float(settings["switch_backoff_sec"], 0.0)
+            )
+        return DEFAULT_SWITCH_BACKOFF_RANGE
 
     def _max_retries(self) -> int:
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -1258,7 +1306,7 @@ class RoutingPipeline:
 
     async def _switch_backoff(self, *, instance_id: str = "", reason: str = "") -> None:
         """Sleep one randomized switch backoff interval (0 disables it)."""
-        low, high = self._switch_backoff_range
+        low, high = self._resolve_switch_backoff_range()
         if high <= 0.0:
             return
         delay = random.uniform(low, high)

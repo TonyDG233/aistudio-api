@@ -124,6 +124,26 @@ function setWorkerNumber(key: string, raw: unknown, fallback: number, min = 1, m
   updateSigner({ [key]: value })
 }
 
+function setRequestTimeout(raw: unknown) {
+  const value = Math.min(600, Math.max(1, Math.trunc(asNumber(raw, 300))))
+  updateEngine({
+    browserless: {
+      ...browserless.value,
+      signer: { ...signer.value, request_timeout_s: value },
+      transport: { ...transport.value, read_timeout_s: value },
+    },
+  })
+}
+
+function setSwitchBackoff(raw: unknown) {
+  const value = Math.min(30, Math.max(0, asNumber(raw, 4)))
+  updateFeature('routing', 'switch_backoff_sec', value)
+}
+
+function onSwitchBackoffInput(event: Event) {
+  setSwitchBackoff((event.target as HTMLInputElement).value)
+}
+
 async function testConnection() {
   if (testingConnection.value) return
   testingConnection.value = true
@@ -738,7 +758,7 @@ function handleSave() {
           />
         </div>
 
-        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <div class="flex items-start gap-1.5 min-w-0">
             <div class="flex-1 min-w-0">
               <ConfigInput
@@ -790,10 +810,10 @@ function handleSave() {
           <div class="flex items-start gap-1.5 min-w-0">
             <div class="flex-1 min-w-0">
               <ConfigInput
-                :model-value="asNumber(signer.request_timeout_s, 90)"
+                :model-value="asNumber(signer.request_timeout_s, 300)"
                 label="请求超时 (秒)"
                 type="number"
-                @update:model-value="setWorkerNumber('request_timeout_s', $event, 90, 1, 600)"
+                @update:model-value="setRequestTimeout($event)"
               />
             </div>
             <FieldHelpTip
@@ -1033,77 +1053,101 @@ function handleSave() {
           <div class="text-xs font-bold text-gray-800">
             请求频率限制冷却与重试（秒）
           </div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
-            <div class="flex items-start gap-1.5 min-w-0">
-              <div class="flex-1 min-w-0">
-                <ConfigInput
-                  :model-value="asNumber(cooldowns.rate_limited_short, 60)"
-                  label="短时限流冷却"
-                  type="number"
-                  @update:model-value="updateCooldown('rate_limited_short', $event)"
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+            <div class="flex h-full flex-col justify-between gap-1.5 min-w-0">
+              <div class="flex flex-1 items-start gap-1.5 min-w-0">
+                <div class="flex flex-1 flex-col min-w-0">
+                  <ConfigInput
+                    class="flex flex-1 flex-col [&>input]:mt-auto"
+                    :model-value="asNumber(cooldowns.rate_limited_short, 60)"
+                    label="短时限流冷却"
+                    type="number"
+                    @update:model-value="updateCooldown('rate_limited_short', $event)"
+                  />
+                </div>
+                <FieldHelpTip
+                  schema-key="rotator.cooldowns.rate_limited_short"
+                  class="mt-4 shrink-0"
                 />
               </div>
-              <FieldHelpTip
-                schema-key="rotator.cooldowns.rate_limited_short"
-                class="mt-4 shrink-0"
-              />
             </div>
-            <div class="flex items-start gap-1.5 min-w-0">
-              <div class="flex-1 min-w-0">
-                <ConfigInput
-                  :model-value="asNumber(cooldowns.rate_limited_drip, 300)"
-                  label="持续限流冷却"
-                  type="number"
-                  @update:model-value="updateCooldown('rate_limited_drip', $event)"
+            <div class="flex h-full flex-col justify-between gap-1.5 min-w-0">
+              <div class="flex flex-1 items-start gap-1.5 min-w-0">
+                <div class="flex flex-1 flex-col min-w-0">
+                  <ConfigInput
+                    class="flex flex-1 flex-col [&>input]:mt-auto"
+                    :model-value="asNumber(cooldowns.rate_limited_drip, 300)"
+                    label="持续限流冷却"
+                    type="number"
+                    @update:model-value="updateCooldown('rate_limited_drip', $event)"
+                  />
+                </div>
+                <FieldHelpTip
+                  schema-key="rotator.cooldowns.rate_limited_drip"
+                  class="mt-4 shrink-0"
                 />
               </div>
-              <FieldHelpTip
-                schema-key="rotator.cooldowns.rate_limited_drip"
-                class="mt-4 shrink-0"
-              />
             </div>
-            <div class="flex items-start gap-1.5 min-w-0">
-              <div class="flex-1 min-w-0">
-                <ConfigInput
-                  :model-value="asNumber(cooldowns.rate_limited_drip_extended, 600)"
-                  label="延长冷却"
-                  type="number"
-                  @update:model-value="updateCooldown('rate_limited_drip_extended', $event)"
+            <div class="flex h-full flex-col justify-between gap-1.5 min-w-0">
+              <div class="flex flex-1 items-start gap-1.5 min-w-0">
+                <div class="flex flex-1 flex-col min-w-0">
+                  <ConfigInput
+                    class="flex flex-1 flex-col [&>input]:mt-auto"
+                    :model-value="asNumber(cooldowns.rate_limited_drip_extended, 600)"
+                    label="延长冷却"
+                    type="number"
+                    @update:model-value="updateCooldown('rate_limited_drip_extended', $event)"
+                  />
+                </div>
+                <FieldHelpTip
+                  schema-key="rotator.cooldowns.rate_limited_drip_extended"
+                  class="mt-4 shrink-0"
                 />
               </div>
-              <FieldHelpTip
-                schema-key="rotator.cooldowns.rate_limited_drip_extended"
-                class="mt-4 shrink-0"
-              />
             </div>
-            <div class="flex items-start gap-1.5 min-w-0">
-              <div class="flex-1 min-w-0">
-                <ConfigInput
-                  :model-value="asNumber(cooldowns.auth_error, 0)"
-                  label="鉴权失败冷却"
-                  description="默认 0 秒，表示不锁定账号"
-                  type="number"
-                  @update:model-value="updateCooldown('auth_error', $event)"
+            <div class="flex h-full flex-col justify-between gap-1.5 min-w-0">
+              <div class="flex flex-1 items-start gap-1.5 min-w-0">
+                <div class="flex flex-1 flex-col min-w-0">
+                  <ConfigInput
+                    class="flex flex-1 flex-col [&>input]:mt-auto"
+                    :model-value="asNumber(routing.retry_same_delay_sec, 2)"
+                    label="同账号重试等待"
+                    type="number"
+                    @update:model-value="updateFeature('routing', 'retry_same_delay_sec', Math.min(30, Math.max(0, asNumber($event, 2))))"
+                  />
+                </div>
+                <FieldHelpTip
+                  schema-key="features.routing.retry_same_delay_sec"
+                  class="mt-4 shrink-0"
                 />
               </div>
-              <FieldHelpTip
-                schema-key="rotator.cooldowns.auth_error"
-                class="mt-4 shrink-0"
-              />
             </div>
-            <div class="flex items-start gap-1.5 min-w-0">
-              <div class="flex-1 min-w-0">
-                <ConfigInput
-                  :model-value="asNumber(routing.retry_same_delay_sec, 2)"
-                  label="同账号重试等待"
-                  type="number"
-                  @update:model-value="updateFeature('routing', 'retry_same_delay_sec', Math.min(30, Math.max(0, asNumber($event, 2))))"
+            <div class="flex h-full flex-col justify-between gap-1.5 min-w-0">
+              <div class="flex flex-1 items-start gap-1.5 min-w-0">
+                <div class="flex flex-1 flex-col min-w-0">
+                  <div class="flex flex-1 flex-col space-y-1.5 min-w-0">
+                    <div class="flex flex-wrap items-center justify-between gap-x-2">
+                      <label class="block text-xs font-semibold text-gray-700">
+                        切换账号退避等待
+                      </label>
+                      <span class="text-[11px] text-gray-400">0-30 秒</span>
+                    </div>
+                    <input
+                      :value="asNumber(routing.switch_backoff_sec, 4)"
+                      type="number"
+                      min="0"
+                      max="30"
+                      step="0.5"
+                      class="mt-auto w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+                      @input="onSwitchBackoffInput"
+                    >
+                  </div>
+                </div>
+                <FieldHelpTip
+                  schema-key="features.routing.switch_backoff_sec"
+                  class="mt-4 shrink-0"
                 />
               </div>
-              <FieldHelpTip
-                schema-key="features.routing.retry_same_delay_sec"
-                class="mt-4 shrink-0"
-              />
             </div>
           </div>
         </div>

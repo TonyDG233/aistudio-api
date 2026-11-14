@@ -42,6 +42,20 @@ class SessionBuild:
     cdp: Any = None
 
 
+def _float(value: object, default: float) -> float:
+    """Best-effort float parse for YAML/env-provided engine settings."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
 class BrowserEngineRuntime:
     """Traditional CloakBrowser engine runtime (control browser + pool pages)."""
 
@@ -140,16 +154,17 @@ class BrowserlessEngineRuntime:
 
     def _ensure_client(self) -> SignerClient:
         if self._signer is None:
+            req_timeout = _float(self._signer_settings.get("request_timeout_s"), 300.0)
+            raw_read_timeout = _float(
+                self._transport_settings.get("read_timeout_s"), req_timeout
+            )
+            read_timeout = max(req_timeout, raw_read_timeout)
             self._signer = SignerClient(
                 self._endpoint(),
-                request_timeout_s=float(
-                    self._signer_settings.get("request_timeout_s", 300) or 300
-                ),
-                read_timeout_s=float(
-                    self._transport_settings.get("read_timeout_s", 300) or 300
-                ),
-                connect_timeout_s=float(
-                    self._transport_settings.get("connect_timeout_s", 15) or 15
+                request_timeout_s=req_timeout,
+                read_timeout_s=read_timeout,
+                connect_timeout_s=_float(
+                    self._transport_settings.get("connect_timeout_s"), 15.0
                 ),
                 max_connections=int(
                     self._transport_settings.get("max_connections", 6) or 6
@@ -244,8 +259,9 @@ class BrowserlessEngineRuntime:
             locale=str(self._signer_settings.get("locale") or settings.locale),
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             http2=bool(self._transport_settings.get("http2", True)),
-            read_timeout_s=float(
-                self._transport_settings.get("read_timeout_s", 300) or 300
+            read_timeout_s=max(
+                _float(self._signer_settings.get("request_timeout_s"), 300.0),
+                _float(self._transport_settings.get("read_timeout_s"), 300.0),
             ),
         )
         return SessionBuild(session=session)

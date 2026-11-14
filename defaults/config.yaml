@@ -117,9 +117,12 @@ features:
   # max_switches：连续切号上限（0 表示不切号）。
   # retry_same_delay_sec：429 同账号首次重试前的退避秒数，范围 0..30，默认 2.0；
   #   可用 AISTUDIO_RETRY_SAME_DELAY_SEC 环境变量覆盖。
+  # switch_backoff_sec：切号前的退避基准秒数，范围 0..30，默认 4.0；
+  #   实际等待为 ±25% 抖动区间（默认 3.0..5.0），0 表示不等待。
   routing:
     max_switches: 2
     retry_same_delay_sec: 2.0
+    switch_backoff_sec: 4.0
 
   # P6 保活节奏：auth/metadata 默认 24h 刷新一次。
   # active_activity 默认关闭（不启用 idle 回收）；active_activity_seconds 为判定窗口。

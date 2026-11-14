@@ -1639,6 +1639,100 @@ def test_default_switch_backoff_uses_production_range_without_env(monkeypatch) -
     assert pipeline._switch_backoff_range == (3.0, 5.0)
 
 
+def test_backoff_range_from_seconds_applies_quarter_jitter() -> None:
+    from aistudio_api.application.routing_pipeline import _backoff_range_from_seconds
+
+    assert _backoff_range_from_seconds(0.0) == (0.0, 0.0)
+    assert _backoff_range_from_seconds(-2.0) == (0.0, 0.0)
+    assert _backoff_range_from_seconds(4.0) == (3.0, 5.0)
+    assert _backoff_range_from_seconds(2.0) == (1.5, 2.5)
+
+
+def test_explicit_routing_settings_switch_backoff_beats_env(monkeypatch) -> None:
+    """An injected provider key must win over the shared pytest env default."""
+    monkeypatch.setenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", "0")
+    pipeline = RoutingPipeline(
+        instance_manager=FakeManager([]),
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "switch_backoff_sec": 4.0,
+        },
+    )
+    assert pipeline._resolve_switch_backoff_range() == (3.0, 5.0)
+
+
+def test_switch_backoff_reads_live_config_when_env_missing(monkeypatch) -> None:
+    from aistudio_api.infrastructure.gateway import model_defaults
+
+    monkeypatch.delenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", raising=False)
+    monkeypatch.setattr(
+        model_defaults,
+        "get_configured_routing_settings",
+        lambda *args, **kwargs: {"max_switches": 2, "switch_backoff_sec": 2.0},
+    )
+    pipeline = RoutingPipeline(instance_manager=FakeManager([]))
+
+    assert pipeline._resolve_switch_backoff_range() == (1.5, 2.5)
+
+
+def test_switch_backoff_provider_without_key_reads_live_config(monkeypatch) -> None:
+    """P2-2: a provider that omits ``switch_backoff_sec`` must not skip live config."""
+    from aistudio_api.infrastructure.gateway import model_defaults
+
+    monkeypatch.delenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", raising=False)
+    monkeypatch.setattr(
+        model_defaults,
+        "get_configured_routing_settings",
+        lambda *args, **kwargs: {"max_switches": 2, "switch_backoff_sec": 2.0},
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=FakeManager([]),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    assert pipeline._resolve_switch_backoff_range() == (1.5, 2.5)
+
+
+def test_switch_backoff_range_falls_back_to_default(monkeypatch) -> None:
+    from aistudio_api.infrastructure.gateway import model_defaults
+
+    monkeypatch.delenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", raising=False)
+    monkeypatch.setattr(
+        model_defaults,
+        "get_configured_routing_settings",
+        lambda *args, **kwargs: {"max_switches": 2},
+    )
+    pipeline = RoutingPipeline(instance_manager=FakeManager([]))
+    assert pipeline._resolve_switch_backoff_range() == (3.0, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_switch_backoff_sleep_uses_resolved_range(monkeypatch) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+
+    sleep_mock = AsyncMock()
+    captured: list[tuple[float, float]] = []
+
+    def _fake_uniform(low: float, high: float) -> float:
+        captured.append((low, high))
+        return 4.0
+
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(routing_pipeline_module.random, "uniform", _fake_uniform)
+    pipeline = RoutingPipeline(
+        instance_manager=FakeManager([]),
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "switch_backoff_sec": 4.0,
+        },
+    )
+
+    await pipeline._switch_backoff(instance_id="inst-1", reason="429")
+
+    assert captured == [(3.0, 5.0)]
+    sleep_mock.assert_awaited_once_with(4.0)
+
+
 def test_paid_model_build_is_rejected_by_paid_chat_only_rule() -> None:
     rules = {
         "argon": {

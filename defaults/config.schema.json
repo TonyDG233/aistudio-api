@@ -308,6 +308,12 @@
               "minimum": 0,
               "maximum": 30,
               "default": 2.0
+            },
+            "switch_backoff_sec": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 30,
+              "default": 4.0
             }
           },
           "additionalProperties": true
