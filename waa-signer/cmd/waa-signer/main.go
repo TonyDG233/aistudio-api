@@ -15,12 +15,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	_ "time/tzdata"
+	"unicode"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
@@ -856,6 +859,239 @@ func discoverProxy() string {
 	return ""
 }
 
+const defaultFallbackDNSServers = "8.8.8.8:53,1.1.1.1:53,223.5.5.5:53"
+
+var androidCACertDirs = []string{
+	"/apex/com.android.conscrypt/cacerts",
+	"/system/etc/security/cacerts",
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if val := strings.TrimSpace(os.Getenv(name)); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func parseDNSPort(port string) (string, bool) {
+	if port == "" {
+		return "", false
+	}
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return "", false
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", false
+	}
+	return strconv.Itoa(n), true
+}
+
+func isValidHostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	allLastDigits := true
+	for i, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		isLast := i == len(labels)-1
+		for j := 0; j < len(label); j++ {
+			c := label[j]
+			isDigit := c >= '0' && c <= '9'
+			isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			if isLast && !isDigit {
+				allLastDigits = false
+			}
+			if j == 0 || j == len(label)-1 {
+				if !isAlpha && !isDigit {
+					return false
+				}
+			} else if !isAlpha && !isDigit && c != '-' {
+				return false
+			}
+		}
+	}
+	return !allLastDigits
+}
+
+func normalizeDNSHost(host string) (string, bool) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", false
+	}
+	if idx := strings.IndexByte(host, '%'); idx >= 0 {
+		host = host[:idx]
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() != nil {
+			return "", false
+		}
+		return host, true
+	}
+	if net.ParseIP(host) != nil {
+		return host, true
+	}
+	if isValidHostname(host) {
+		return host, true
+	}
+	return "", false
+}
+
+func parseDNSServers(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || unicode.IsSpace(r)
+	})
+	if len(fields) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, item := range fields {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if strings.IndexFunc(item, func(r rune) bool {
+			return r == '/' || unicode.IsSpace(r) || unicode.IsControl(r)
+		}) >= 0 {
+			continue
+		}
+		var rawHost, rawPort string
+		if host, port, err := net.SplitHostPort(item); err == nil {
+			rawHost = strings.TrimSpace(host)
+			rawPort = strings.TrimSpace(port)
+			if rawPort == "" {
+				rawPort = "53"
+			}
+		} else {
+			rawHost = item
+			if strings.HasPrefix(rawHost, "[") && strings.HasSuffix(rawHost, "]") {
+				rawHost = rawHost[1 : len(rawHost)-1]
+			}
+			rawHost = strings.TrimSpace(rawHost)
+			rawPort = "53"
+		}
+		port, ok := parseDNSPort(rawPort)
+		if !ok {
+			continue
+		}
+		host, ok := normalizeDNSHost(rawHost)
+		if !ok {
+			continue
+		}
+		normalized := net.JoinHostPort(host, port)
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func hasNonEmptyFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+func resolveRuntimeDNSServers(goos, dnsRaw, resolvConfPath string) []string {
+	raw := strings.TrimSpace(dnsRaw)
+	if raw == "" {
+		raw = firstNonEmptyEnv("WAA_DNS_SERVERS", "AISTUDIO_DNS_SERVERS")
+	}
+	if raw == "" && goos != "windows" && goos != "darwin" {
+		if !hasNonEmptyFile(resolvConfPath) {
+			raw = defaultFallbackDNSServers
+		}
+	}
+	if raw == "" {
+		return nil
+	}
+	return parseDNSServers(raw)
+}
+
+func newCustomDNSResolver(servers []string) *net.Resolver {
+	var rr atomic.Uint64
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if len(servers) == 0 {
+				return nil, errors.New("no DNS servers configured")
+			}
+			dialNetwork := "udp"
+			if strings.HasPrefix(strings.ToLower(network), "tcp") {
+				dialNetwork = "tcp"
+			}
+			start := int((rr.Add(1) - 1) % uint64(len(servers)))
+			dialer := net.Dialer{Timeout: 3 * time.Second}
+			var lastErr error
+			for i := range servers {
+				target := servers[(start+i)%len(servers)]
+				conn, err := dialer.DialContext(ctx, dialNetwork, target)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, errors.New("no DNS servers configured")
+		},
+	}
+}
+
+func resolveAndroidCertDir(goos, sslCertDir, sslCertFile, bundlePath string, candidateDirs []string) string {
+	if goos == "windows" || goos == "darwin" {
+		return ""
+	}
+	if strings.TrimSpace(sslCertDir) != "" || strings.TrimSpace(sslCertFile) != "" {
+		return ""
+	}
+	if _, err := os.Stat(bundlePath); err == nil {
+		return ""
+	}
+	existingDirs := make([]string, 0, len(candidateDirs))
+	for _, dir := range candidateDirs {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			existingDirs = append(existingDirs, dir)
+		}
+	}
+	if len(existingDirs) == 0 {
+		return ""
+	}
+	return strings.Join(existingDirs, ":")
+}
+
+func configureRuntimeNetwork(dnsRaw string) {
+	if servers := resolveRuntimeDNSServers(runtime.GOOS, dnsRaw, "/etc/resolv.conf"); len(servers) > 0 {
+		net.DefaultResolver = newCustomDNSResolver(servers)
+		slog.Info("已配置纯 Go 自定义 DNS 解析器", "servers", servers)
+	}
+	if certDir := resolveAndroidCertDir(
+		runtime.GOOS,
+		os.Getenv("SSL_CERT_DIR"),
+		os.Getenv("SSL_CERT_FILE"),
+		"/etc/ssl/certs/ca-certificates.crt",
+		androidCACertDirs,
+	); certDir != "" {
+		if err := os.Setenv("SSL_CERT_DIR", certDir); err != nil {
+			slog.Warn("设置 SSL_CERT_DIR 失败", "ssl_cert_dir", certDir, "error", err)
+		} else {
+			slog.Info("已自动注入 Android 系统 CA 证书目录", "ssl_cert_dir", certDir)
+		}
+	}
+}
+
 func main() {
 	defaultListen := os.Getenv("LISTEN_ADDR")
 	if defaultListen == "" {
@@ -877,15 +1113,19 @@ func main() {
 	if defaultTZ == "" {
 		defaultTZ = "America/Los_Angeles"
 	}
+	defaultDNS := firstNonEmptyEnv("WAA_DNS_SERVERS", "AISTUDIO_DNS_SERVERS")
 
 	listenAddr := flag.String("listen", defaultListen, "HTTP listen address")
 	proxyURL := flag.String("proxy", discoverProxy(), "Upstream HTTP/HTTPS/SOCKS5 proxy URL")
 	stateDir := flag.String("state-dir", defaultStateDir, "Directory for worker fingerprints and interpreter cache")
 	locale := flag.String("locale", defaultLocale, "Browser profile locale")
 	timezone := flag.String("timezone", defaultTZ, "Browser profile IANA timezone")
+	dnsFlag := flag.String("dns", defaultDNS, "Comma/whitespace-separated DNS servers (host or host:port)")
 	maxWorkers := flag.Int("max-workers", envInt("WAA_MAX_WORKERS", defaultMaxWorkers), "Maximum concurrent WAA workers")
 	idleTTL := flag.Duration("idle-ttl", envDuration("WAA_IDLE_TTL", defaultIdleTTL), "Idle worker TTL before reclamation (e.g. 900s)")
 	flag.Parse()
+
+	configureRuntimeNetwork(*dnsFlag)
 
 	if *maxWorkers < 1 {
 		slog.Error("max-workers 必须为正整数", "max_workers", *maxWorkers)

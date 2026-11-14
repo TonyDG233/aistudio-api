@@ -57,6 +57,7 @@ android/app/build/
 android/local.properties
 android/**/.idea/
 android/**/*.iml
+android/app/src/main/jniLibs/**/*.so
 *.apk
 *.aab
 
