@@ -22,7 +22,7 @@
 | 域目录 | 职责范围 | 根计划与看板 | 最新审查报告 |
 |---|---|---|---|
 | `P1-account` | 账号注册表、Cookie 跨域保真与 `/RotateCookies` 轮换、同源兄弟同步、Tier 探测安全、预设与 D-08/D-13 | [`P1-account/index.md`](P1-account/index.md) | [`REV-C1b-vps-tier-and-403-fix.md`](P1-account/reviews/REV-C1b-vps-tier-and-403-fix.md) |
-| `P2-routing` | Free/Pro 分池路由、`active_requests` 准入、403 两阶段重签/切号/不降级、`verify-account` 熔断、429 重试切换与 `quota_scope` | [`P2-routing/index.md`](P2-routing/index.md) | [`REV-2.2.0.2-anti-correlation-and-timeout-guard.md`](P2-routing/reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md) |
+| `P2-routing` | Free/Pro 分池路由、`active_requests` 准入、403 两阶段重签/切号/不降级、`verify-account` 熔断、429 重试切换、`quota_scope`、LRU 全池选号与预防性主动轮换 | [`P2-routing/index.md`](P2-routing/index.md) | [`REV-2.2.0.5-lru-and-proactive-switch.md`](P2-routing/reviews/REV-2.2.0.5-lru-and-proactive-switch.md) |
 | `P3-pool-instance` | 单实例边界、双引擎（`browser` CDP/CloakBrowser + `browserless` WAA Signer）、多实例池、指纹加固、快照预热与事务热切换 | [`P3-pool-instance/index.md`](P3-pool-instance/index.md) | [`REV-2.1.3.1-session-expired-sibling-sync.md`](P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md) |
 | `P5-generation` | 四协议生成主链（Gemini/OpenAI/Claude/Responses）、WIRE/JSPB 解析、PG-01..PG-08 工具调用、ATG、SSE Keepalive、模型发现与 `countTokens` | [`P5-generation/index.md`](P5-generation/index.md) | [`REV-2.1.3.4-atg-ttft-hydrogen.md`](P5-generation/reviews/REV-2.1.3.4-atg-ttft-hydrogen.md) |
 | `P6-keepalive` | 24h Cookie 回写与轮换保活、24h Tier/Email 刷新、单全局串行 job 锁、手动保活入口与 429 冷却重置 | [`P6-keepalive/index.md`](P6-keepalive/index.md) | [`REV-B3-p6-keepalive.md`](P6-keepalive/reviews/REV-B3-p6-keepalive.md) |

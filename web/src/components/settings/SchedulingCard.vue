@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { accountsApi } from '@/api/accounts.ts'
 import { systemApi } from '@/api/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import ConfigInput from '@/components/config/ConfigInput.vue'
@@ -203,6 +204,64 @@ const maxContexts = computed(() => asNumber(props.modelValue.max_contexts, 2))
 const maxSwitches = computed(() => asNumber(routing.value.max_switches, 2))
 const maxRetries = computed(() => asNumber(rotator.value.max_retries, 5))
 const quotaScope = computed(() => asString(rotator.value.quota_scope, 'account'))
+
+// ── 预防性主动轮换（车轮战平摊风控） ──
+const PROACTIVE_MODE_OPTIONS = [
+  { value: 'off', label: '关闭' },
+  { value: 'free_only', label: '仅 Free 池' },
+  { value: 'paid_only', label: '仅 Pro+ 池' },
+  { value: 'all', label: '全部池' },
+  { value: 'groups', label: '指定分组' },
+]
+const PROACTIVE_SCOPE_HINTS: Record<string, string> = {
+  free_only: '仅 Free 池账号参与轮换，Pro+ 池槽位保持不动。',
+  paid_only: '仅 Pro 及以上付费池账号参与轮换，Free 池槽位保持不动。',
+  all: 'Free 池与付费池的全部健康账号都参与轮换。',
+}
+
+const proactiveSwitchMode = computed(() => {
+  const mode = asString(routing.value.proactive_switch_mode, 'off')
+  return PROACTIVE_MODE_OPTIONS.some((option) => option.value === mode) ? mode : 'off'
+})
+const proactiveSwitchThreshold = computed(() =>
+  Math.min(1000, Math.max(1, Math.trunc(asNumber(routing.value.proactive_switch_threshold, 15)))),
+)
+const proactiveSwitchGroups = computed(() =>
+  asArray(routing.value.proactive_switch_groups)
+    .map((item) => asString(item).trim())
+    .filter(Boolean),
+)
+const proactiveScopeHint = computed(() => PROACTIVE_SCOPE_HINTS[proactiveSwitchMode.value] || '')
+
+const knownGroups = ref<string[]>([])
+const groupsLoaded = ref(false)
+const newProactiveGroup = ref('')
+const proactiveGroupOptions = computed(() => {
+  const names = new Set<string>(['default'])
+  for (const name of knownGroups.value.map((item) => item.trim()).filter(Boolean)) {
+    names.add(name)
+  }
+  for (const name of proactiveSwitchGroups.value) names.add(name)
+  return [...names]
+})
+
+async function loadProactiveGroups() {
+  if (groupsLoaded.value) return
+  groupsLoaded.value = true
+  try {
+    const groups = await accountsApi.listGroups()
+    if (Array.isArray(groups)) {
+      knownGroups.value = groups.map(String).filter(Boolean)
+    }
+  } catch {
+    // 账号接口不可用时保留 default 与已保存的分组名，不阻断配置编辑。
+  }
+}
+
+onMounted(loadProactiveGroups)
+watch(proactiveSwitchMode, (mode) => {
+  if (mode === 'groups') void loadProactiveGroups()
+})
 
 const TIER_KEYS = ['Free', 'Plus', 'Pro', 'Ultra', 'Ultra_20X'] as const
 type TierKey = (typeof TIER_KEYS)[number]
@@ -493,6 +552,40 @@ function updateFeature(
       [section]: { ...scoped, [key]: value },
     },
   })
+}
+
+function setProactiveSwitchMode(mode: string) {
+  if (mode === proactiveSwitchMode.value) return
+  updateFeature('routing', 'proactive_switch_mode', mode)
+}
+
+function setProactiveThreshold(raw: unknown) {
+  const value = Math.min(1000, Math.max(1, Math.trunc(asNumber(raw, 15))))
+  updateFeature('routing', 'proactive_switch_threshold', value)
+}
+
+function onProactiveThresholdInput(event: Event) {
+  setProactiveThreshold((event.target as HTMLInputElement).value)
+}
+
+function toggleProactiveGroup(group: string) {
+  const current = proactiveSwitchGroups.value
+  const next = current.includes(group)
+    ? current.filter((item) => item !== group)
+    : [...current, group]
+  updateFeature('routing', 'proactive_switch_groups', next)
+}
+
+function addProactiveGroup() {
+  const name = newProactiveGroup.value.trim()
+  if (!name) return
+  if (!knownGroups.value.includes(name)) {
+    knownGroups.value = [...knownGroups.value, name]
+  }
+  if (!proactiveSwitchGroups.value.includes(name)) {
+    updateFeature('routing', 'proactive_switch_groups', [...proactiveSwitchGroups.value, name])
+  }
+  newProactiveGroup.value = ''
 }
 
 function updateSlot(index: number, field: string, value: unknown) {
@@ -912,6 +1005,130 @@ function handleSave() {
           schema-key="rotator.max_retries"
           class="mt-4 shrink-0"
         />
+      </div>
+    </div>
+
+    <!-- Proactive rotation -->
+    <div class="rounded-2xl border border-gray-200/80 bg-gray-50/60 p-3.5 sm:p-4 space-y-3">
+      <div class="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+        <div class="min-w-0">
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="text-xs font-bold text-gray-900">预防性主动轮换 (车轮战平摊风控)</span>
+            <FieldHelpTip schema-key="features.routing.proactive_switch_mode" />
+          </div>
+          <p class="mt-1 text-[11px] text-gray-500 leading-relaxed">
+            单号连续调用满阈值后趁空闲切到休息最久(LRU)的健康号，轮完一圈继续循环复用，不锁定原账号。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-1.5 sm:flex sm:flex-wrap sm:shrink-0">
+          <button
+            v-for="option in PROACTIVE_MODE_OPTIONS"
+            :key="option.value"
+            type="button"
+            class="px-2.5 py-1.5 rounded-lg border text-[11px] font-medium transition-colors cursor-pointer leading-tight whitespace-nowrap"
+            :class="proactiveSwitchMode === option.value
+              ? 'bg-white border-brand-200 text-brand-700 shadow-2xs font-semibold'
+              : 'bg-white/70 border-gray-200 text-gray-600 hover:bg-white hover:text-gray-900'"
+            @click="setProactiveSwitchMode(option.value)"
+          >
+            {{ option.label }}
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="proactiveSwitchMode !== 'off'"
+        class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-3 mt-3 border-t border-gray-200/70 dark:border-gray-800/70"
+      >
+        <div class="flex items-start gap-1.5 min-w-0">
+          <div class="flex-1 min-w-0 space-y-1.5">
+            <div class="flex flex-wrap items-center justify-between gap-x-2">
+              <label class="block text-xs font-semibold text-gray-700">
+                连续调用轮换阈值 (次)
+              </label>
+              <span class="text-[11px] text-gray-400">1-1000 次</span>
+            </div>
+            <input
+              :value="proactiveSwitchThreshold"
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+              class="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-mono outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+              @input="onProactiveThresholdInput"
+            >
+            <p class="text-[11px] text-gray-400 leading-relaxed">
+              达到该次数且槽位空闲时自动换绑下一个最久未用账号
+            </p>
+          </div>
+          <FieldHelpTip
+            schema-key="features.routing.proactive_switch_threshold"
+            class="mt-4 shrink-0"
+          />
+        </div>
+
+        <div
+          v-if="proactiveSwitchMode === 'groups'"
+          class="min-w-0 space-y-1.5"
+        >
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="text-xs font-semibold text-gray-700">参与轮换的账号分组 (点击多选)</span>
+            <FieldHelpTip schema-key="features.routing.proactive_switch_groups" />
+          </div>
+          <div class="flex flex-wrap gap-1.5">
+            <button
+              v-for="group in proactiveGroupOptions"
+              :key="group"
+              type="button"
+              class="px-2.5 py-1 text-[11px] rounded-lg border transition-colors cursor-pointer break-all"
+              :class="proactiveSwitchGroups.includes(group)
+                ? 'bg-brand-50 border-brand-200 text-brand-700 font-semibold'
+                : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'"
+              @click="toggleProactiveGroup(group)"
+            >
+              {{ group }}
+            </button>
+          </div>
+          <div class="flex flex-col gap-1.5 sm:flex-row">
+            <input
+              v-model="newProactiveGroup"
+              type="text"
+              placeholder="输入分组名后回车添加"
+              class="flex-1 min-w-0 px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+              @keydown.enter.prevent="addProactiveGroup"
+            >
+            <button
+              type="button"
+              class="inline-flex items-center justify-center gap-1 px-2.5 py-2 text-[11px] font-medium rounded-xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer shrink-0"
+              @click="addProactiveGroup"
+            >
+              <Plus class="w-3 h-3" />
+              添加分组
+            </button>
+          </div>
+          <p
+            v-if="!proactiveSwitchGroups.length"
+            class="text-[11px] text-amber-600 leading-relaxed"
+          >
+            未勾选任何分组时不会发生轮换。
+          </p>
+        </div>
+
+        <div
+          v-else
+          class="min-w-0 rounded-xl border border-gray-200/70 bg-white p-3 space-y-1"
+        >
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="text-xs font-semibold text-gray-700">当前生效范围</span>
+            <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+              {{ PROACTIVE_MODE_OPTIONS.find((option) => option.value === proactiveSwitchMode)?.label }}
+            </span>
+          </div>
+          <p class="text-[11px] text-gray-500 leading-relaxed">
+            {{ proactiveScopeHint }}
+          </p>
+        </div>
       </div>
     </div>
 
