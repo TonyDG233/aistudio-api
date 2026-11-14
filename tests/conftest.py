@@ -164,6 +164,7 @@ def isolate_test_config(monkeypatch, _shared_test_env):
     monkeypatch.setenv("AISTUDIO_MODEL_CACHE_FILE", str(model_cache_file))
     monkeypatch.setenv("AISTUDIO_ROTATOR_STATE_FILE", str(rotator_file))
     monkeypatch.setenv("AISTUDIO_RETRY_SAME_DELAY_SEC", "0")
+    monkeypatch.setenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", "0")
     monkeypatch.setattr(settings, "model_cache_file", str(model_cache_file))
 
     saved_models = model_discovery._cached_models

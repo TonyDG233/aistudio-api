@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import uuid
 from collections.abc import Mapping
@@ -35,6 +36,12 @@ from aistudio_api.infrastructure.gateway.public_web_constants import (
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("model_discovery")
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+)
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+MAX_HTTP_ACCOUNT_CANDIDATES = 2
 
 
 def _ui_debug_active() -> bool:
@@ -245,6 +252,31 @@ def _http_candidate_key(candidate: _HttpCandidate) -> str:
     )
 
 
+def _active_rotator() -> object | None:
+    """Resolve the process-wide rotator without an infrastructure -> application import.
+
+    The rotator is created by the application layer during startup.  Looking it
+    up through ``sys.modules`` keeps this module's import graph boundary clean
+    (infrastructure must not import application) while still honoring the
+    global auth-lock state when the app is running.
+    """
+    module = sys.modules.get("aistudio_api.application.account_rotator")
+    return getattr(module, "_rotator", None) if module is not None else None
+
+
+def _auth_locked(rotator: object | None, account_id: str) -> bool:
+    """True when the global rotator has locked this account (dead login/verify)."""
+    if rotator is None or not account_id:
+        return False
+    checker = getattr(rotator, "is_auth_locked", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker(account_id))
+    except Exception:
+        return False
+
+
 def _account_http_candidates() -> list[_HttpCandidate]:
     """Return healthy enabled accounts ordered paid-first for ListModels HTTP."""
     try:
@@ -256,10 +288,13 @@ def _account_http_candidates() -> list[_HttpCandidate]:
         logger.debug("读取账号列表用于模型发现失败: %s", exc)
         return []
 
+    rotator = _active_rotator()
     healthy = [
         account
         for account in accounts
-        if getattr(account, "enabled", True) and not getattr(account, "expired", False)
+        if getattr(account, "enabled", True)
+        and not getattr(account, "expired", False)
+        and not _auth_locked(rotator, str(getattr(account, "id", "") or ""))
     ]
     healthy.sort(
         key=lambda account: (
@@ -291,7 +326,9 @@ def _account_http_candidates() -> list[_HttpCandidate]:
                 auth_file=str(auth_path),
             )
         )
-    return candidates
+    # Never fan out a failed discovery across the whole account pool: two
+    # paid-first healthy candidates are enough, the rest stay untouched.
+    return candidates[:MAX_HTTP_ACCOUNT_CANDIDATES]
 
 
 def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
@@ -1135,7 +1172,13 @@ class ModelDiscoveryService:
         auth_header = calculate_sapisid_hash(minimal_cookies)
         cookie_header = "; ".join(f"{k}={v}" for k, v in minimal_cookies.items())
         headers = {
-            "Content-Type": "application/json+protobuf",
+            "accept": "*/*",
+            "accept-language": ACCEPT_LANGUAGE,
+            "content-type": "application/json+protobuf",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "user-agent": BROWSER_USER_AGENT,
             "X-User-Agent": GRPC_WEB_USER_AGENT,
             "X-Goog-Api-Key": WEB_API_KEY,
             "X-Goog-AuthUser": auth_user or "0",

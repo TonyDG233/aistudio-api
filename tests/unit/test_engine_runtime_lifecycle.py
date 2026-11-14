@@ -72,10 +72,41 @@ def _browserless_settings(
             "binary_path": "waa-signer/bin/waa-signer",
             "auto_start": True,
             "max_workers": 8,
-            "request_timeout_s": 90,
+            "request_timeout_s": 300,
         },
-        "transport": {"mode": "signer_rpc", "read_timeout_s": 120},
+        "transport": {"mode": "signer_rpc", "read_timeout_s": 300},
     }
+
+
+@pytest.mark.asyncio
+async def test_browserless_runtime_defaults_to_300s_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturingSigner:
+        def __init__(self, endpoint: str, **kwargs: object) -> None:
+            captured["endpoint"] = endpoint
+            captured.update(kwargs)
+            self.endpoint = endpoint
+
+    monkeypatch.setattr(engine_runtime_module, "SignerClient", _CapturingSigner)
+    runtime = BrowserlessEngineRuntime(
+        {"mode": "browserless", "signer": {}, "transport": {}}
+    )
+
+    build = await runtime.create_session(
+        slot_id="slot-1",
+        auth_file=None,
+        auth_user="0",
+        tier="Free",
+        account_id="acc-1",
+        realm_id="realm-1",
+    )
+
+    assert captured["request_timeout_s"] == 300.0
+    assert captured["read_timeout_s"] == 300.0
+    assert build.session._read_timeout_s == 300.0  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

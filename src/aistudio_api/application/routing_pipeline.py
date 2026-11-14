@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import random
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -58,6 +60,8 @@ from aistudio_api.infrastructure.utils.log_broadcast import sanitize_log_message
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 DEFAULT_RETRY_SAME_DELAY_SEC = 2.0
+DEFAULT_SWITCH_BACKOFF_RANGE = (3.0, 5.0)
+_SWITCH_BACKOFF_ENV = "AISTUDIO_SWITCH_BACKOFF_SECONDS"
 
 logger = get_logger("routing")
 
@@ -328,6 +332,52 @@ def _as_float(value: object, default: float) -> float:
     return default
 
 
+def _normalize_backoff_range(raw: object) -> tuple[float, float]:
+    """Coerce one explicit backoff override into a non-negative interval."""
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        low = max(0.0, _as_float(raw[0], 0.0))
+        high = max(low, _as_float(raw[1], low))
+        return (low, high)
+    value = max(0.0, _as_float(raw, 0.0))
+    return (value, value)
+
+
+def _default_switch_backoff_range() -> tuple[float, float]:
+    """Resolve the 429/verification switch backoff without touching app wiring.
+
+    Production defaults to a 3-5s random jitter so two slots never fire the
+    same-IP account switch at exactly the same instant.  Tests disable it by
+    setting ``AISTUDIO_SWITCH_BACKOFF_SECONDS`` through the shared autouse
+    fixture instead of leaking pytest detection into production code; the env
+    var accepts either a fixed value (``4``) or an explicit range (``3,5``).
+    """
+    raw = (os.getenv(_SWITCH_BACKOFF_ENV) or "").strip()
+    if raw:
+        if "," in raw:
+            low_raw, _, high_raw = raw.partition(",")
+            try:
+                low = max(0.0, float(low_raw))
+                high = max(low, float(high_raw))
+                return (low, high)
+            except ValueError:
+                logger.warning(
+                    "[routing] 忽略非法 %s=%r，回退默认切号退避",
+                    _SWITCH_BACKOFF_ENV,
+                    raw,
+                )
+        else:
+            try:
+                value = max(0.0, float(raw))
+                return (value, value)
+            except ValueError:
+                logger.warning(
+                    "[routing] 忽略非法 %s=%r，回退默认切号退避",
+                    _SWITCH_BACKOFF_ENV,
+                    raw,
+                )
+    return DEFAULT_SWITCH_BACKOFF_RANGE
+
+
 def _summarize_error(exc: Exception | None, summary: str | None = None) -> str:
     """Compact, sanitized upstream reason used in routing/rotator warnings.
 
@@ -361,6 +411,7 @@ class RoutingPipeline:
         client_recorder: Callable[..., None] | None = None,
         count_token_recorder: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        switch_backoff_range: tuple[float, float] | None = None,
     ) -> None:
         self._manager = instance_manager
         self._accounts = account_store
@@ -370,6 +421,14 @@ class RoutingPipeline:
         self._client_recorder = client_recorder
         self._count_token_recorder = count_token_recorder
         self._clock = clock
+        self._switch_backoff_range = (
+            _normalize_backoff_range(switch_backoff_range)
+            if switch_backoff_range is not None
+            else _default_switch_backoff_range()
+        )
+        # Serializes dead-slot healing so two concurrent begin() calls cannot
+        # rebind the same slot twice (or race the idle-check with reassign).
+        self._heal_lock = asyncio.Lock()
 
     def _rotator_or_none(self) -> AccountRotator | None:
         return cast("AccountRotator | None", self._rotator)
@@ -432,6 +491,25 @@ class RoutingPipeline:
             for instance in eligible
             if self._account_available(instance.account_id, route)
         ]
+        # A previous request may have exhausted max_switches and left a
+        # dead/429 account bound to an idle slot.  Heal those slots before
+        # admitting the request: a permanently stuck slot must never turn the
+        # whole pool into a 503 while dozens of healthy accounts wait.
+        if len(available) < len(eligible) and await self._heal_unavailable_instances(
+            route, eligible
+        ):
+            refreshed = {
+                instance.id: instance
+                for instance in manager.eligible_instances(
+                    paid=route.paid, surface=route.surface
+                )
+            }
+            eligible = [refreshed.get(instance.id, instance) for instance in eligible]
+            available = [
+                instance
+                for instance in eligible
+                if self._account_available(instance.account_id, route)
+            ]
         if not available:
             raise SurfaceCapacityError(
                 surface=route.surface,
@@ -771,7 +849,8 @@ class RoutingPipeline:
             if getattr(exc, "verification_required", False):
                 # Google 移动设备验证（verify-account）风控：账号已被上游锁死，
                 # 任何同号重签都只会二次撞墙，必须立即标记失效并切号。
-                self._record_error("session_expired", context, attempt, exc=exc)
+                # 该事件只隔离当前单账号，绝不连坐同源兄弟号。
+                self._record_error("verification_required", context, attempt, exc=exc)
                 logger.error(
                     "[routing] 账号触发 Google 移动设备验证风控 (verify-account)，"
                     "已自动标记失效隔离并切号 instance=%s account=%s model=%s "
@@ -866,8 +945,14 @@ class RoutingPipeline:
                 quota_exhausted=True,
             )
 
-        if isinstance(exc, RequestError) and exc.status in (204, 404):
+        if isinstance(exc, RequestError):
             if exc.status == 404 and not is_transient_rpc_error(exc):
+                # A real 404 (model/route not found) is deterministic: never
+                # retry and never switch accounts.
+                self._record_error("error", context, attempt, exc=exc)
+                raise exc
+            transient = exc.status in (204, 404, 408, 425) or exc.status >= 500
+            if not transient:
                 self._record_error("error", context, attempt, exc=exc)
                 raise exc
             if (
@@ -875,9 +960,11 @@ class RoutingPipeline:
                 and attempt.same_retries == 0
                 and context.total_attempts < context.max_retries
             ):
-                # Record the failed upstream execution before retrying the
-                # same instance; the retry (and any later success) adds its
-                # own independent attempt.
+                # Upstream transient failures (output timeout, connection
+                # reset, 5xx, ambiguous RPC 404) are NOT account-level
+                # failures.  Retry the same account once and then surface the
+                # error: never rebind a healthy Pro/Free account away because
+                # the upstream hiccuped.
                 self._record_error("error", context, attempt, exc=exc)
                 attempt.same_retries += 1
                 context.retry_same = True
@@ -891,25 +978,63 @@ class RoutingPipeline:
                     attempt.account_id,
                     reason_summary,
                 )
+                if context.retry_same_delay_sec > 0:
+                    logger.info(
+                        "[routing] %s 同账号退避 %.2fs 后重试 instance=%s",
+                        exc.status,
+                        context.retry_same_delay_sec,
+                        attempt.instance_id,
+                    )
+                    await asyncio.sleep(context.retry_same_delay_sec)
                 return "retry_same"
             self._record_error("error", context, attempt, exc=exc)
             if exc.status == 204:
-                raise BrowserTransportError(
+                message = (
                     "上游返回 204 空响应，同账号重试后仍为空"
-                ) from exc
+                    if attempt.same_retries > 0
+                    else "上游返回 204 空响应"
+                )
+                raise BrowserTransportError(message) from exc
             raise exc
 
         if is_browser_session_hang_error(exc):
+            # Output timeouts (``SignerTimeoutError`` wrapped as
+            # ``BrowserTransportError``), network aborts and template-capture
+            # timeouts are transport/hang failures, never quota (429) or
+            # credential (401/403/verify) failures.  Switching accounts here
+            # would evict a healthy Pro slot for no reason and cascade through
+            # the whole pool on a single network blip, so only one same-account
+            # retry is allowed and every later failure is surfaced as-is.
             self._record_error("error", context, attempt, exc=exc)
             attempt.client.clear_templates()
-            if has_yielded_data:
-                raise exc
-            return await self._switch_or_raise(
-                context, attempt, exc, reason="session_hang"
+            if (
+                not has_yielded_data
+                and attempt.same_retries == 0
+                and context.total_attempts < context.max_retries
+            ):
+                attempt.same_retries += 1
+                context.retry_same = True
+                context.budget.record_retry("session_hang")
+                logger.warning(
+                    "[routing] 会话挂起/超时同账号重试（绝不切号） model=%s "
+                    "surface=%s instance=%s account=%s reason=%s",
+                    context.route.model,
+                    context.route.surface,
+                    attempt.instance_id,
+                    attempt.account_id,
+                    reason_summary,
+                )
+                return "retry_same"
+            logger.warning(
+                "[routing] 会话挂起/超时不再换绑账号，直接报错 model=%s surface=%s "
+                "instance=%s account=%s yielded=%s reason=%s",
+                context.route.model,
+                context.route.surface,
+                attempt.instance_id,
+                attempt.account_id,
+                has_yielded_data,
+                reason_summary,
             )
-
-        if isinstance(exc, RequestError):
-            self._record_error("error", context, attempt, exc=exc)
             raise exc
 
         if isinstance(exc, (AistudioError, BrowserTransportError)):
@@ -970,6 +1095,7 @@ class RoutingPipeline:
         *,
         reuse: bool,
         summary: str = "",
+        record_budget: bool = True,
     ) -> bool:
         """Request-triggered single-slot rebind.
 
@@ -977,11 +1103,11 @@ class RoutingPipeline:
         several healthy accounts in that lane (e.g. ``1 Free + 1 Pro`` slots and
         Free accounts A/B).  A 429 on the sole Free slot marks A failed, but
         ``next_candidate()`` then has no second instance to switch to.  This
-        path releases the active handle first, picks another eligible account in
-        the same lane, rebinds the *existing* slot in place (close Page/Context,
-        activate the new account), clears the old template cache and lets the
-        caller re-acquire the slot.  It is synchronous with the request and
-        never spawns a background rebind.
+        path picks another eligible account in the same lane first, then
+        releases the active handle, rebinds the *existing* slot in place (close
+        Page/Context, activate the new account), clears the old template cache
+        and lets the caller re-acquire the slot.  It is synchronous with the
+        request and never spawns a background rebind.
 
         With multiple slots the same heal happens immediately after a dead slot
         error, but the current request keeps moving to another ready candidate
@@ -991,6 +1117,11 @@ class RoutingPipeline:
         when each account 429s.  Loop and duplicate protection comes from
         ``attempted_accounts``/``failed_accounts`` plus the per-request
         ``max_switches`` budget.
+
+        ``record_budget=False`` is used only by the budget-exhausted path to
+        pre-heal the dead slot for *future* requests; it never keeps the
+        current request alive.  429 / verification rebinds additionally wait a
+        randomized same-IP backoff before the caller re-acquires.
         """
         manager = self._manager
         reassign = getattr(manager, "reassign", None)
@@ -1003,23 +1134,25 @@ class RoutingPipeline:
             | set(context.attempted_accounts)
             | {attempt.account_id}
         )
-        bound_fn = getattr(manager, "instance_account_ids", None)
-        if callable(bound_fn):
-            try:
-                raw_bound = bound_fn()
-            except Exception as exc:
-                logger.debug("[routing] 读取已绑定账号失败: %s", exc)
-                raw_bound = ()
-            bound = (
-                {str(item) for item in raw_bound}
-                if isinstance(raw_bound, (list, tuple, set, frozenset))
-                else set()
-            )
-            bound.discard(attempt.account_id)
-            exclusions |= bound
+        bound = self._bound_account_ids()
+        bound.discard(attempt.account_id)
+        exclusions |= bound
 
-        # The pool refuses to activate while the handle is held; release it
-        # before touching the slot, then let the caller re-acquire it.
+        # Pick the rebind target *before* dropping the handle: when no eligible
+        # account exists the request keeps its handle instead of opening an
+        # idle window it never uses.  ``select_rebind_account`` depends only on
+        # lane/model/tier and the exclusion set, never on ``active_requests``.
+        account = self._pick_rebind_account(selector, context, attempt, exclusions)
+        if account is None:
+            return False
+        target_id = str(getattr(account, "id", "") or "")
+        if not target_id:
+            return False
+
+        # The pool refuses to activate while the handle is held.  Release it
+        # first, then read ``active_requests``: the ledger counts this request's
+        # own handle, so only after release does ``> 0`` mean another concurrent
+        # request is still in flight on the slot.
         await self.release(attempt)
         if self._instance_active_requests(attempt.instance_id) > 0:
             logger.info(
@@ -1029,25 +1162,16 @@ class RoutingPipeline:
             return False
 
         for _ in range(len(exclusions) + 1):
-            try:
-                account = selector(
-                    lane=context.route.lane,
-                    model=context.route.model,
-                    surface=context.route.surface,
-                    exclude_account_ids=exclusions,
-                    only_tier=attempt.candidate.only_tier,
-                    min_tier=attempt.candidate.min_tier,
-                    max_tier=attempt.candidate.max_tier,
-                    required_tiers=context.route.required_tiers,
+            if reason in ("429", "verification_required"):
+                # Back off *before* the new account is activated, not after:
+                # the goal is to cool the same-IP switch moment itself.  This
+                # applies even on the budget-exhausted pre-heal path
+                # (``record_budget=False``) so the fresh account never starts
+                # cold right after an instant switch.
+                await self._switch_backoff(
+                    instance_id=attempt.instance_id,
+                    reason=reason,
                 )
-            except Exception as exc:
-                logger.warning("[routing] 选择改绑账号失败: %s", exc)
-                return False
-            if account is None:
-                return False
-            target_id = str(getattr(account, "id", "") or "")
-            if not target_id:
-                return False
             try:
                 result = reassign(attempt.instance_id, target_id)
                 instance = await result if inspect.isawaitable(result) else result
@@ -1060,6 +1184,14 @@ class RoutingPipeline:
                 )
                 context.failed_accounts.add(target_id)
                 exclusions.add(target_id)
+                account = self._pick_rebind_account(
+                    selector, context, attempt, exclusions
+                )
+                if account is None:
+                    return False
+                target_id = str(getattr(account, "id", "") or "")
+                if not target_id:
+                    return False
                 continue
 
             if isinstance(instance, Instance):
@@ -1078,13 +1210,15 @@ class RoutingPipeline:
             ]
             if reuse:
                 context.attempted_instances.discard(attempt.instance_id)
-            context.budget.record_switch(reason)
+            if record_budget:
+                context.budget.record_switch(reason)
             context.retry_same = False
             context.last_reason = f"rebind:{reason}"
             attempt.client.clear_templates()
             logger.warning(
                 "[routing] 请求期改绑 reason=%s model=%s surface=%s "
-                "instance=%s %s -> %s reuse=%s detail=%s budget=%s",
+                "instance=%s %s -> %s reuse=%s budget_charged=%s detail=%s "
+                "budget=%s",
                 reason,
                 context.route.model,
                 context.route.surface,
@@ -1092,11 +1226,49 @@ class RoutingPipeline:
                 attempt.account_id,
                 target_id,
                 reuse,
+                record_budget,
                 summary,
                 context.budget.snapshot(),
             )
             return True
         return False
+
+    def _pick_rebind_account(
+        self,
+        selector: Callable[..., object],
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exclusions: set[str],
+    ) -> object | None:
+        """Select one rebind target for this slot (never reads active_requests)."""
+        try:
+            return selector(
+                lane=context.route.lane,
+                model=context.route.model,
+                surface=context.route.surface,
+                exclude_account_ids=exclusions,
+                only_tier=attempt.candidate.only_tier,
+                min_tier=attempt.candidate.min_tier,
+                max_tier=attempt.candidate.max_tier,
+                required_tiers=context.route.required_tiers,
+            )
+        except Exception as exc:
+            logger.warning("[routing] 选择改绑账号失败: %s", exc)
+            return None
+
+    async def _switch_backoff(self, *, instance_id: str = "", reason: str = "") -> None:
+        """Sleep one randomized switch backoff interval (0 disables it)."""
+        low, high = self._switch_backoff_range
+        if high <= 0.0:
+            return
+        delay = random.uniform(low, high)
+        logger.info(
+            "[routing] 切号退避 %.2fs 后继续（防同 IP 瞬切连坐）instance=%s reason=%s",
+            delay,
+            instance_id or "-",
+            reason or "-",
+        )
+        await asyncio.sleep(delay)
 
     def _instance_active_requests(self, instance_id: str) -> int:
         getter = getattr(self._manager, "instance_active_requests", None)
@@ -1107,6 +1279,141 @@ class RoutingPipeline:
             return int(value) if isinstance(value, (int, float, str)) else 0
         except Exception:
             return 0
+
+    def _bound_account_ids(self) -> set[str]:
+        bound_fn = getattr(self._manager, "instance_account_ids", None)
+        if not callable(bound_fn):
+            return set()
+        try:
+            raw_bound = bound_fn()
+        except Exception as exc:
+            logger.debug("[routing] 读取已绑定账号失败: %s", exc)
+            return set()
+        return (
+            {str(item) for item in raw_bound if item}
+            if isinstance(raw_bound, (list, tuple, set, frozenset))
+            else set()
+        )
+
+    def _live_instance(self, instance_id: str, route: ModelRoute) -> Instance | None:
+        """Re-read one slot's current view (bound account/state/in-flight).
+
+        Prefers a manager ``get_instance`` accessor when available and falls
+        back to the lane view, which also reflects accounts rebound by a
+        concurrent request after the caller took its snapshot.
+        """
+        manager = self._manager
+        getter = getattr(manager, "get_instance", None)
+        if callable(getter):
+            try:
+                current = getter(instance_id)
+            except Exception as exc:
+                logger.debug("[routing] 读取实例 %s 最新状态失败: %s", instance_id, exc)
+            else:
+                if isinstance(current, Instance):
+                    return current
+        lister = getattr(manager, "lane_instances", None)
+        if callable(lister):
+            try:
+                items = lister(paid=route.paid)
+                if isinstance(items, Iterable):
+                    for item in items:
+                        if isinstance(item, Instance) and item.id == instance_id:
+                            return item
+            except Exception as exc:
+                logger.debug("[routing] 枚举 %s 车道实例失败: %s", route.lane, exc)
+        return None
+
+    async def _heal_unavailable_instances(
+        self, route: ModelRoute, eligible: Iterable[Instance]
+    ) -> int:
+        """Rebind idle slots whose bound account is currently unavailable.
+
+        This is the request-admission counterpart of :meth:`_try_rebind`: a
+        slot left bound to a 429/dead account by an exhausted request must be
+        healed before the next request, otherwise ``begin()`` would reject a
+        fully healthy pool with a permanent 503.
+
+        Healing is serialized by :attr:`_heal_lock`; each slot is re-read
+        inside the lock so a concurrent ``begin()``/``acquire()`` that already
+        rebound it or started a request is observed.  Only idle slots are
+        touched (``active_requests == 0``); a busy slot is skipped untouched so
+        an in-flight request on another model is never drained.  The rebind
+        does not consume any request switch/retry budget because no attempt has
+        been made yet, and ``healed`` only counts real account changes.
+        """
+        manager = self._manager
+        reassign = getattr(manager, "reassign", None)
+        selector = getattr(self._rotator, "select_rebind_account", None)
+        if not callable(reassign) or not callable(selector):
+            return 0
+
+        healed = 0
+        async with self._heal_lock:
+            bound = self._bound_account_ids()
+            for stale in list(eligible):
+                live = self._live_instance(stale.id, route)
+                if live is None or not live.account_id:
+                    continue
+                if self._instance_active_requests(live.id) > 0:
+                    logger.info(
+                        "[routing] 跳过死槽自愈：实例仍有在途请求 instance=%s "
+                        "account=%s",
+                        live.id,
+                        live.account_id,
+                    )
+                    continue
+                if self._account_available(live.account_id, route):
+                    continue
+                exclusions = set(bound)
+                exclusions.discard(live.account_id)
+                try:
+                    account = selector(
+                        lane=route.lane,
+                        model=route.model,
+                        surface=route.surface,
+                        exclude_account_ids=exclusions,
+                        only_tier=live.only_tier,
+                        min_tier=live.min_tier,
+                        max_tier=live.max_tier,
+                        required_tiers=route.required_tiers,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[routing] 死槽自愈选择账号失败 instance=%s: %s",
+                        live.id,
+                        exc,
+                    )
+                    continue
+                if account is None:
+                    continue
+                target_id = str(getattr(account, "id", "") or "")
+                if not target_id or target_id == live.account_id:
+                    continue
+                try:
+                    result = reassign(live.id, target_id)
+                    updated = await result if inspect.isawaitable(result) else result
+                except Exception as exc:
+                    logger.warning(
+                        "[routing] 死槽自愈改绑失败 instance=%s target=%s: %s",
+                        live.id,
+                        target_id,
+                        exc,
+                    )
+                    continue
+                bound.add(target_id)
+                healed += 1
+                logger.warning(
+                    "[routing] 死槽自愈完成 reason=begin model=%s surface=%s "
+                    "instance=%s %s -> %s state=%s",
+                    route.model,
+                    route.surface,
+                    live.id,
+                    live.account_id,
+                    target_id,
+                    getattr(updated, "state", "-"),
+                )
+        return healed
 
     async def _switch_or_raise(
         self,
@@ -1136,6 +1443,18 @@ class RoutingPipeline:
                 summary=_summarize_error(exc),
             ):
                 return "switch"
+        elif not self._account_available(attempt.account_id, context.route):
+            # Budget/candidates are exhausted for THIS request, but the slot
+            # must not stay bound to a dead/429 account: heal it in place for
+            # subsequent requests without charging the exhausted budget.
+            await self._try_rebind(
+                context,
+                attempt,
+                reason,
+                reuse=False,
+                summary=_summarize_error(exc),
+                record_budget=False,
+            )
         if not can_continue or context.next_candidate() is None:
             if quota_exhausted:
                 raise SurfaceSwitchExhaustedError(

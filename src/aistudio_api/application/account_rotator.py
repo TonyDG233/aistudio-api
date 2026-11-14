@@ -648,6 +648,17 @@ class AccountRotator:
         stats = self.get_account_stats(account_id)
         return bool(stats and stats.is_available(model, surface=surface))
 
+    def is_auth_locked(self, account_id: str) -> bool:
+        """True when the account is locked by a dead login / verify-account.
+
+        ``get_account_stats`` mirrors the store-level ``expired`` flag into
+        ``session_expired``, so this covers both a rotator-recorded lock and a
+        credential death detected by the account store.  Keepalive and model
+        discovery use it to stop probing a locked account.
+        """
+        stats = self.get_account_stats(account_id)
+        return bool(stats is not None and stats.session_expired)
+
     def select_rebind_account(
         self,
         *,

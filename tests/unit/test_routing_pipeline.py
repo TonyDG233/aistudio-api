@@ -22,6 +22,7 @@ from aistudio_api.domain.errors import (
     UsageLimitExceeded,
 )
 from aistudio_api.domain.instances import InstanceState
+from aistudio_api.infrastructure.waa.signer_client import SignerTimeoutError
 from tests.unit.routing_fakes import (
     FakeHandle,
     FakeManager,
@@ -67,9 +68,7 @@ async def test_begin_wakes_sleeping_and_unstarted_candidates() -> None:
                 last_used=5.0,
                 number=2,
             ),
-            make_instance(
-                "inst-c", account_id="acc-c", last_used=20.0, number=3
-            ),
+            make_instance("inst-c", account_id="acc-c", last_used=20.0, number=3),
         ],
         current_instance_id="inst-a",
     )
@@ -93,7 +92,9 @@ def test_warm_ready_is_only_a_tie_breaker() -> None:
         last_used=1.0,
         number=1,
     )
-    ready = make_instance("inst-ready", state=InstanceState.ACTIVE, last_used=1.0, number=2)
+    ready = make_instance(
+        "inst-ready", state=InstanceState.ACTIVE, last_used=1.0, number=2
+    )
     ordered = pipeline._order(route, [sleeping, ready])
     assert [item.id for item in ordered] == ["inst-ready", "inst-sleep"]
 
@@ -212,12 +213,18 @@ async def test_paid_route_prefers_pro_slot_before_idle_ultra() -> None:
     manager = FakeManager(
         [
             make_instance(
-                "inst-ultra", account_id="ultra", tier="Ultra",
-                number=1, last_used=1.0,
+                "inst-ultra",
+                account_id="ultra",
+                tier="Ultra",
+                number=1,
+                last_used=1.0,
             ),
             make_instance(
-                "inst-pro", account_id="pro", tier="Pro",
-                number=2, last_used=2.0,
+                "inst-pro",
+                account_id="pro",
+                tier="Pro",
+                number=2,
+                last_used=2.0,
             ),
         ]
     )
@@ -230,9 +237,7 @@ async def test_paid_route_prefers_pro_slot_before_idle_ultra() -> None:
 
 def test_order_uses_candidate_account_tier_rank() -> None:
     pipeline = _pipeline(FakeManager([]))
-    route = make_route(
-        "gemini-4-argon", paid=True, required_tiers=("Pro",)
-    )
+    route = make_route("gemini-4-argon", paid=True, required_tiers=("Pro",))
     ultra = make_instance(
         "inst-ultra", account_id="ultra", tier="Ultra", number=1, last_used=0.0
     )
@@ -250,12 +255,19 @@ async def test_busy_pro_slot_falls_back_to_idle_ultra() -> None:
     manager = FakeManager(
         [
             make_instance(
-                "inst-pro", account_id="pro", tier="Pro",
-                number=1, last_used=1.0, in_flight=1,
+                "inst-pro",
+                account_id="pro",
+                tier="Pro",
+                number=1,
+                last_used=1.0,
+                in_flight=1,
             ),
             make_instance(
-                "inst-ultra", account_id="ultra", tier="Ultra",
-                number=2, last_used=2.0,
+                "inst-ultra",
+                account_id="ultra",
+                tier="Ultra",
+                number=2,
+                last_used=2.0,
             ),
         ]
     )
@@ -480,7 +492,9 @@ async def test_single_slot_allows_successive_429_rebinds_within_budget(
     pipeline.record_success(context, third)
     await pipeline.release(third)
 
-    rebind_accounts = [account_id for _instance_id, account_id in manager.reassign_calls]
+    rebind_accounts = [
+        account_id for _instance_id, account_id in manager.reassign_calls
+    ]
     assert rebind_accounts == ["free-b", "free-c"]
     assert len(rebind_accounts) == len(set(rebind_accounts))
     assert context.budget.switches == 2
@@ -584,8 +598,8 @@ async def test_429_same_retry_skips_delay_when_zero(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_429_same_retries_never_sleep(monkeypatch) -> None:
-    """403 and 204 retry_same paths must not apply the 429 backoff."""
+async def test_auth_retry_same_never_sleeps(monkeypatch) -> None:
+    """The 403 re-sign retry must not apply the 429 backoff."""
     from aistudio_api.application import routing_pipeline as routing_pipeline_module
 
     sleep_mock = AsyncMock()
@@ -606,26 +620,49 @@ async def test_non_429_same_retries_never_sleep(monkeypatch) -> None:
 
     assert (
         await pipeline.handle_error(
-            context, attempt, AuthError("HTTP 403: WAA denied"),
+            context,
+            attempt,
+            AuthError("HTTP 403: WAA denied"),
             has_yielded_data=False,
         )
         == "retry_same"
     )
     sleep_mock.assert_not_awaited()
 
-    context2 = await pipeline.begin(model_path="gemini-4-argon")
-    attempt2 = await pipeline.acquire(context2)
-    assert attempt2 is not None
-    assert (
-        await pipeline.handle_error(
-            context2,
-            attempt2,
-            RequestError(204, "no content"),
-            has_yielded_data=False,
-        )
-        == "retry_same"
+
+@pytest.mark.parametrize("status", [204, 503])
+@pytest.mark.asyncio
+async def test_transient_request_error_retry_same_sleeps_configured_delay(
+    monkeypatch, status: int
+) -> None:
+    """Q-8: transient RequestError retries back off like the 429 branch."""
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = FakeManager(
+        [make_instance("inst-1", account_id="acc-1", tier="Pro", number=1)]
     )
-    sleep_mock.assert_not_awaited()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "retry_same_delay_sec": 2.0,
+        },
+    )
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    outcome = await pipeline.handle_error(
+        context,
+        attempt,
+        RequestError(status, "upstream hiccup"),
+        has_yielded_data=False,
+    )
+
+    assert outcome == "retry_same"
+    sleep_mock.assert_awaited_once_with(2.0)
 
 
 @pytest.mark.asyncio
@@ -672,8 +709,7 @@ async def test_429_warning_redacts_cookie_and_bearer(caplog) -> None:
             context,
             attempt,
             UsageLimitExceeded(
-                f"HTTP 429: Cookie: SAPISID={secret}; "
-                f"Authorization: Bearer {secret}"
+                f"HTTP 429: Cookie: SAPISID={secret}; Authorization: Bearer {secret}"
             ),
             has_yielded_data=False,
         )
@@ -760,9 +796,7 @@ async def test_pro_account_without_paid_instance_is_capacity() -> None:
         def list_accounts(self):
             return [SimpleNamespace(tier="Pro", enabled=True, expired=False)]
 
-    manager = FakeManager(
-        [make_instance("inst-free", account_id="free", tier="Free")]
-    )
+    manager = FakeManager([make_instance("inst-free", account_id="free", tier="Free")])
     pipeline = RoutingPipeline(
         instance_manager=manager,
         account_store=_Accounts(),
@@ -850,10 +884,11 @@ async def test_204_and_transient_404_retry_same_instance() -> None:
         )
         == "retry_same"
     )
-    with pytest.raises(BrowserTransportError):
+    with pytest.raises(BrowserTransportError) as info:
         await pipeline.handle_error(
             context, attempt, RequestError(204, "no content"), has_yielded_data=False
         )
+    assert "同账号重试后仍为空" in str(info.value)
 
     transient = RequestError(
         404,
@@ -934,9 +969,7 @@ async def test_session_expired_switch_then_success() -> None:
 
 @pytest.mark.asyncio
 async def test_session_expired_exhausted_raises_original() -> None:
-    pipeline = _pipeline(
-        FakeManager([make_instance("inst-1", account_id="acc-1")])
-    )
+    pipeline = _pipeline(FakeManager([make_instance("inst-1", account_id="acc-1")]))
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
@@ -984,9 +1017,7 @@ async def test_auth_error_switch_then_success() -> None:
 
 @pytest.mark.asyncio
 async def test_auth_error_exhausted_raises_original() -> None:
-    pipeline = _pipeline(
-        FakeManager([make_instance("inst-1", account_id="acc-1")])
-    )
+    pipeline = _pipeline(FakeManager([make_instance("inst-1", account_id="acc-1")]))
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
@@ -1025,9 +1056,7 @@ async def test_paid_tier_required_error_raises_without_switch() -> None:
     )
 
     with pytest.raises(TierRequiredError):
-        await pipeline.handle_error(
-            context, attempt, error, has_yielded_data=False
-        )
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
 
     assert context.budget.switches == 0
     assert context.failed_accounts == set()
@@ -1081,7 +1110,7 @@ async def test_auth_error_then_429_follows_same_instance_policy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_hang_switch_then_success() -> None:
+async def test_session_hang_retries_same_account_without_switch() -> None:
     manager = FakeManager(
         [
             make_instance("inst-1", account_id="acc-1", number=1),
@@ -1092,27 +1121,28 @@ async def test_session_hang_switch_then_success() -> None:
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     first = await pipeline.acquire(context)
     assert first is not None
+    hang = BrowserTransportError("cdp disconnected")
+
+    # 首次传输中断：同账号重试 1 次，绝不切号/换绑。
     assert (
-        await pipeline.handle_error(
-            context,
-            first,
-            BrowserTransportError("cdp disconnected"),
-            has_yielded_data=False,
-        )
-        == "switch"
+        await pipeline.handle_error(context, first, hang, has_yielded_data=False)
+        == "retry_same"
     )
+    assert first.same_retries == 1
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+
+    # 同账号重试后仍然失败：直接抛出原异常，绝不触发 _switch_or_raise。
+    with pytest.raises(BrowserTransportError):
+        await pipeline.handle_error(context, first, hang, has_yielded_data=False)
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
     await pipeline.release(first)
-    second = await pipeline.acquire(context)
-    assert second is not None
-    assert second.instance_id == "inst-2"
-    await pipeline.release(second)
 
 
 @pytest.mark.asyncio
-async def test_session_hang_exhausted_raises_original() -> None:
-    pipeline = _pipeline(
-        FakeManager([make_instance("inst-1", account_id="acc-1")])
-    )
+async def test_session_hang_after_body_yielded_raises_without_retry() -> None:
+    pipeline = _pipeline(FakeManager([make_instance("inst-1", account_id="acc-1")]))
     context = await pipeline.begin(model_path="gemini-3.7-flash")
     attempt = await pipeline.acquire(context)
     assert attempt is not None
@@ -1121,8 +1151,492 @@ async def test_session_hang_exhausted_raises_original() -> None:
             context,
             attempt,
             BrowserTransportError("cdp disconnected"),
+            has_yielded_data=True,
+        )
+    assert attempt.same_retries == 0
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+
+
+@pytest.mark.asyncio
+async def test_signer_timeout_stream_error_never_switches() -> None:
+    manager = FakeManager(
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    first = await pipeline.acquire(context)
+    assert first is not None
+    timeout = BrowserTransportError(
+        "browserless rpc stream failed: waa-signer 请求超时"
+    )
+
+    assert (
+        await pipeline.handle_error(context, first, timeout, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert first.same_retries == 1
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+
+    with pytest.raises(BrowserTransportError):
+        await pipeline.handle_error(context, first, timeout, has_yielded_data=False)
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+    await pipeline.release(first)
+
+
+@pytest.mark.asyncio
+async def test_raw_signer_timeout_error_never_switches() -> None:
+    manager = FakeManager(
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    timeout = SignerTimeoutError("waa-signer 请求超时")
+
+    # 裸 SignerTimeoutError 也享受一次同账号重试，绝不切号。
+    assert (
+        await pipeline.handle_error(context, attempt, timeout, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert attempt.same_retries == 1
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+
+    with pytest.raises(SignerTimeoutError):
+        await pipeline.handle_error(
+            context,
+            attempt,
+            timeout,
             has_yielded_data=False,
         )
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+    await pipeline.release(attempt)
+
+
+class _HealingRotator:
+    """Rotator fake exposing availability + rebind selection for heal tests."""
+
+    def __init__(
+        self, unavailable: set[str] | None = None, target: str | None = "healthy"
+    ) -> None:
+        self.unavailable = set(unavailable or ())
+        self.target = target
+        self.select_exclusions: list[set[str]] = []
+
+    def get_account_stats(self, account_id: str):
+        del account_id
+        return SimpleNamespace(
+            total_requests=0,
+            model_requests_total=lambda _model: 0,
+        )
+
+    def is_account_available(
+        self, account_id: str, *, model=None, surface=None
+    ) -> bool:
+        del model, surface
+        return account_id not in self.unavailable
+
+    def select_rebind_account(self, **kwargs):
+        excluded: set[str] = set(kwargs.get("exclude_account_ids") or ())
+        self.select_exclusions.append(excluded)
+        if self.target is None or self.target in excluded:
+            return None
+        return SimpleNamespace(id=self.target, tier="Free")
+
+    def record_rate_limited(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def record_auth_error(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def record_session_expired(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def record_success(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def record_error(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+
+@pytest.mark.asyncio
+async def test_begin_heals_idle_slot_left_on_unavailable_account() -> None:
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator({"dead"})
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert [candidate.account_id for candidate in context.candidates] == ["healthy"]
+    assert manager.reassign_calls == [("inst-1", "healthy")]
+
+
+@pytest.mark.asyncio
+async def test_begin_does_not_heal_slot_with_active_requests() -> None:
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    manager.active_by_instance["inst-1"] = 1
+    rotator = _HealingRotator({"dead"})
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    with pytest.raises(SurfaceCapacityError):
+        await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_heal_rereads_live_account_and_skips_rebound_slot() -> None:
+    from dataclasses import replace
+
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator({"dead"})
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    stale = manager.instances[0]
+    # A concurrent request already rebound the slot to a healthy account.
+    manager.instances[0] = replace(manager.instances[0], account_id="healthy")
+
+    healed = await pipeline._heal_unavailable_instances(  # type: ignore[attr-defined]
+        make_route("gemini-3.7-flash"), [stale]
+    )
+
+    assert healed == 0
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_heal_skips_slot_that_became_busy_after_snapshot() -> None:
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator({"dead"})
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    stale = manager.instances[0]
+    # Another model on the same slot acquired an in-flight request after the
+    # candidate snapshot was taken.  Healing must never drain it.
+    manager.active_by_instance["inst-1"] = 1
+
+    healed = await pipeline._heal_unavailable_instances(  # type: ignore[attr-defined]
+        make_route("gemini-3.7-flash"), [stale]
+    )
+
+    assert healed == 0
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_heals_dead_slot_without_charging_budget() -> None:
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 0},
+        switch_backoff_range=(0.0, 0.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    rotator.unavailable.add("dead")
+
+    assert (
+        await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded("429"),
+            has_yielded_data=False,
+        )
+        == "retry_same"
+    )
+    with pytest.raises(SurfaceSwitchExhaustedError):
+        await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded("429"),
+            has_yielded_data=False,
+        )
+
+    assert manager.reassign_calls == [("inst-1", "healthy")]
+    assert context.budget.switches == 0
+    assert attempt.handle.released is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_204_without_retry_reports_plain_empty_response() -> None:
+    pipeline = _pipeline(FakeManager([make_instance("inst-1", account_id="acc")]))
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    with pytest.raises(BrowserTransportError) as info:
+        await pipeline.handle_error(
+            context,
+            attempt,
+            RequestError(204, "no content"),
+            has_yielded_data=True,
+        )
+
+    assert str(info.value) == "上游返回 204 空响应"
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+@pytest.mark.asyncio
+async def test_transient_request_error_never_switches_or_rebinds(status: int) -> None:
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [
+            make_instance("inst-1", account_id="free-a", tier="Free", number=1),
+            make_instance("inst-2", account_id="free-b", tier="Free", number=2),
+        ]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    error = RequestError(status, "upstream hiccup")
+
+    assert (
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    assert context.budget.switches == 0
+
+    with pytest.raises(RequestError):
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
+
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_429_rebind_waits_randomized_switch_backoff(monkeypatch) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    order: list[str] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        assert delay == 2.0
+        order.append("sleep")
+
+    sleep_mock = AsyncMock(side_effect=_fake_sleep)
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="free-a", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    original_reassign = manager.reassign
+
+    async def _recording_reassign(instance_id: str, account_id: str):
+        order.append("reassign")
+        return await original_reassign(instance_id, account_id)
+
+    monkeypatch.setattr(manager, "reassign", _recording_reassign)
+    rotator = _HealingRotator()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+        switch_backoff_range=(2.0, 2.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    rotator.unavailable.add("free-a")
+    error = UsageLimitExceeded("429")
+
+    assert (
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
+        == "retry_same"
+    )
+    sleep_mock.assert_not_awaited()
+    assert (
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
+        == "switch"
+    )
+    sleep_mock.assert_awaited_once_with(2.0)
+    assert manager.reassign_calls == [("inst-1", "healthy")]
+    # The cool-down must happen before the new account is activated.
+    assert order == ["sleep", "reassign"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_rebind_still_waits_switch_backoff(monkeypatch) -> None:
+    from aistudio_api.application import routing_pipeline as routing_pipeline_module
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(routing_pipeline_module.asyncio, "sleep", sleep_mock)
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator()
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 0},
+        switch_backoff_range=(2.0, 2.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    rotator.unavailable.add("dead")
+
+    assert (
+        await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded("429"),
+            has_yielded_data=False,
+        )
+        == "retry_same"
+    )
+    with pytest.raises(SurfaceSwitchExhaustedError):
+        await pipeline.handle_error(
+            context,
+            attempt,
+            UsageLimitExceeded("429"),
+            has_yielded_data=False,
+        )
+
+    # record_budget=False must still cool down before the rebind.
+    sleep_mock.assert_awaited_once_with(2.0)
+    assert manager.reassign_calls == [("inst-1", "healthy")]
+    assert context.budget.switches == 0
+
+
+@pytest.mark.asyncio
+async def test_try_rebind_selects_target_before_releasing_handle() -> None:
+    """Q-10: pick the target first, then release the handle for the rebind."""
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    released_at_selection: list[bool] = []
+
+    class _RecordingRotator(_HealingRotator):
+        def select_rebind_account(self, **kwargs):
+            handle = manager.last_handles.get("inst-1")
+            released_at_selection.append(bool(handle and handle.released))
+            return super().select_rebind_account(**kwargs)
+
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", _RecordingRotator()),
+        routing_settings_provider=lambda: {"max_switches": 2},
+        switch_backoff_range=(0.0, 0.0),
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    rebound = await pipeline._try_rebind(  # type: ignore[attr-defined]
+        context, attempt, "429", reuse=False
+    )
+
+    assert rebound is True
+    assert released_at_selection == [False]
+    assert attempt.handle.released is True  # type: ignore[attr-defined]
+    assert manager.reassign_calls == [("inst-1", "healthy")]
+
+
+@pytest.mark.asyncio
+async def test_try_rebind_keeps_handle_when_no_target_account() -> None:
+    """Q-10: no eligible target means no handle release / idle window."""
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=cast("Any", _HealingRotator(target=None)),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    rebound = await pipeline._try_rebind(  # type: ignore[attr-defined]
+        context, attempt, "429", reuse=False
+    )
+
+    assert rebound is False
+    assert attempt.handle.released is False  # type: ignore[attr-defined]
+    assert manager.reassign_calls == []
+
+
+def test_default_switch_backoff_reads_zero_env(monkeypatch) -> None:
+    """Q-7: pytest disables the backoff through the env var, not PYTEST detection."""
+    monkeypatch.setenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", "0")
+    pipeline = _pipeline(FakeManager([]))
+    assert pipeline._switch_backoff_range == (0.0, 0.0)
+
+
+def test_default_switch_backoff_uses_production_range_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("AISTUDIO_SWITCH_BACKOFF_SECONDS", raising=False)
+    pipeline = _pipeline(FakeManager([]))
+    assert pipeline._switch_backoff_range == (3.0, 5.0)
 
 
 def test_paid_model_build_is_rejected_by_paid_chat_only_rule() -> None:

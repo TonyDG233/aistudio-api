@@ -88,3 +88,41 @@ def test_record_rotator_event_ignores_missing_account() -> None:
     rotator = MagicMock(spec=AccountRotator)
     record_rotator_event("success", account_id=None, rotator=rotator)
     rotator.record_success.assert_not_called()
+
+
+def test_verification_required_isolates_current_account_without_siblings() -> None:
+    rotator = MagicMock(spec=AccountRotator)
+    rotator.account_store.get_sibling_account_ids.return_value = ["sib-1", "sib-2"]
+
+    record_rotator_event(
+        "verification_required",
+        account_id="acc-1",
+        model="gemini-3.7-flash",
+        surface="chat",
+        reason="verify-account",
+        rotator=rotator,
+    )
+
+    rotator.record_session_expired.assert_called_once_with(
+        "acc-1",
+        model="gemini-3.7-flash",
+        surface="chat",
+        reason="verify-account",
+    )
+    rotator.account_store.get_sibling_account_ids.assert_not_called()
+
+
+def test_session_expired_still_isolates_same_anchor_siblings() -> None:
+    rotator = MagicMock(spec=AccountRotator)
+    rotator.account_store.get_sibling_account_ids.return_value = ["sib-1"]
+
+    record_rotator_event(
+        "session_expired",
+        account_id="acc-1",
+        model="m",
+        surface="chat",
+        rotator=rotator,
+    )
+
+    calls = [call.args[0] for call in rotator.record_session_expired.call_args_list]
+    assert calls == ["acc-1", "sib-1"]

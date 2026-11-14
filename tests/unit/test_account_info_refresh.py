@@ -363,7 +363,7 @@ def test_403_non_key_does_not_retry(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 ARK_APP_HTML = (
     "<!doctype html><html><head><script>"
-    'window.WIZ_global_data = {"oPEP7c":"tonygemini38@gmail.com","bLBL6b":"x"};'
+    'window.WIZ_global_data = {"oPEP7c":"testuser38@gmail.com","bLBL6b":"x"};'
     "</script></head><body>"
     '<a href="mailto:helper@schema.org">helper</a>'
     '<a href="mailto:noreply@example.com">n</a>'
@@ -393,10 +393,10 @@ def test_email_backfill_from_wiz_global_data(tmp_path: Path) -> None:
 
     result = asyncio.run(refresher.refresh_account(account))
 
-    assert result.email == "tonygemini38@gmail.com"
+    assert result.email == "testuser38@gmail.com"
     stored = store.get_account(account.id)
     assert stored is not None
-    assert stored.email == "tonygemini38@gmail.com"
+    assert stored.email == "testuser38@gmail.com"
 
 
 def test_email_backfill_fallback_filters_noise_domains(tmp_path: Path) -> None:
@@ -705,6 +705,42 @@ def test_refresh_route_via_asgi_409(fake_service) -> None:
         assert resp.status_code == 409
     finally:
         app.dependency_overrides.pop(get_account_info_refresher, None)
+
+
+def test_rpc_headers_use_firefox_152_and_browser_fetch_metadata(tmp_path: Path) -> None:
+    store, account = _make_store(tmp_path)
+    transport = FakeTransport([TransportResponse(status=200, body="[1]")])
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    asyncio.run(refresher.refresh_account(account, refresh_email=False))
+
+    headers = transport.requests[0].headers
+    assert "Firefox/152.0" in headers["user-agent"]
+    assert headers["accept-language"].startswith("en-US")
+    assert headers["sec-fetch-dest"] == "empty"
+    assert headers["sec-fetch-mode"] == "cors"
+    assert headers["sec-fetch-site"] == "cross-site"
+
+
+def test_app_html_headers_are_navigation_like(tmp_path: Path) -> None:
+    store, account = _make_store(tmp_path)
+    html = '<script>{"oPEP7c":"existing@gmail.com"}</script>'
+    transport = FakeTransport(
+        [
+            TransportResponse(status=200, body="[1]"),
+            TransportResponse(status=200, body=html),
+        ]
+    )
+    refresher = AccountInfoRefresher(store, transport=transport)
+
+    asyncio.run(refresher.refresh_account(account, refresh_email=True))
+
+    page_headers = transport.requests[1].headers
+    assert "Firefox/152.0" in page_headers["user-agent"]
+    assert page_headers["sec-fetch-dest"] == "document"
+    assert page_headers["sec-fetch-mode"] == "navigate"
+    assert page_headers["sec-fetch-site"] == "none"
+    assert page_headers["accept-language"].startswith("en-US")
 
 
 def test_account_response_includes_tier_and_expired() -> None:

@@ -155,7 +155,7 @@
 | P-06 | 低 | 保留 | `src/aistudio_api/static/assets/index.js` | 构建产物仍含 `updateNotes`、`batchToggleGroup`、`/notes`（源码已按 D-13 清理）；`web/node_modules` 不存在 | 交付的管理页 bundle 仍带已删除端点的死客户端代码（无 UI 调用者，调用会 404） | 否（建议 P8/B4 统一重建） |
 | P-07 | 说明 | 保留 | `transport.py:127`、`model_discovery.py:291`、`api_service_gemini.py:168` | 这些调用方仍以 `get_active_account()` 取当前账号；在 toggle/apply 返回 `rebind_required` 到 B2-3 落地之间，registry 会短暂保持「active=已禁用」 | D-05 明确设计的切口：B2-3 必须完成「停新请求→有界等待→关旧页→切号→改写 active」 | 否（B2-3 交付项） |
 | P-08 | 说明 | 保留 | `model_discovery.py:425-470` | `get_required_tiers` 仍读 `paid_model_rules` 的 `required_tiers` | 与「单一 paid 源」不冲突（不参与 paid 分类），但 tier 准入仍有第二套规则入口，需 B2-4/P2（D05-046）收敛 | 否 |
-| P-09 | 低 | 保留 | `tests/unit/test_account_info_refresh.py:292,322,325` | 测试使用 `tonygemini38@gmail.com`，该地址出现在 `docs/dev/evidence/` 真实账号证据中 | 真实个人邮箱进入代码库（无凭据、无请求） | 否（建议改 `example.com`） |
+| P-09 | 低 | 保留 | `tests/unit/test_account_info_refresh.py:292,322,325` | 测试使用 `testuser38@gmail.com`，该地址出现在 `docs/dev/evidence/` 测试证据中 | 真实个人邮箱进入代码库（无凭据、无请求） | 否（建议改 `example.com`） |
 | P-10 | 低 | 保留 | `tests/unit/test_model_catalog.py:38-58`；`tests/unit/test_model_discovery_paid.py:27` | 测试直接改写全局 paid 集合不复位；`ModelDiscoveryService()` 构造会读 `settings.model_cache_file` | 本机若存在真实 `data/models_cache.json` 或测试顺序变化，paid 全局状态可能串扰 | 否 |
 | P-11 | 低 | 保留 | `account_info_refresher.py:186-191` | `getattr(settings, "account_refresh_concurrency", 0)`，但 `config.py` 与 YAML 均无该键 | 并发度恒为 3 且静默回落，无法配置 | 否 |
 

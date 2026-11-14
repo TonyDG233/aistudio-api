@@ -255,7 +255,7 @@ class BrowserlessSession:
         locale: str = "en-US",
         timezone: str = "America/Los_Angeles",
         http2: bool = True,
-        read_timeout_s: float = 120.0,
+        read_timeout_s: float = 300.0,
         direct_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._signer = signer
@@ -273,7 +273,7 @@ class BrowserlessSession:
         self._locale = locale
         self._timezone = timezone
         self._http2 = bool(http2)
-        self._read_timeout_s = max(1.0, float(read_timeout_s or 120.0))
+        self._read_timeout_s = max(1.0, float(read_timeout_s or 300.0))
         self._current_model: str = DEFAULT_CHAT_MODEL
         self._cookies: list[dict[str, object]] = []
         self._origins: list[dict[str, object]] = []

@@ -704,7 +704,7 @@ def _normalize_engine_settings(
         minimum=1,
     )
     request_timeout_s = _engine_number(
-        signer.get("request_timeout_s", 90),
+        signer.get("request_timeout_s", 300),
         "browserless.signer.request_timeout_s",
         minimum=1,
     )
@@ -753,7 +753,7 @@ def _normalize_engine_settings(
         minimum=1,
     )
     read_timeout_s = _engine_number(
-        transport.get("read_timeout_s", 120),
+        transport.get("read_timeout_s", 300),
         "browserless.transport.read_timeout_s",
         minimum=1,
     )
