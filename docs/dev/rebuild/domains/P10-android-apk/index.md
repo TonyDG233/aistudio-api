@@ -21,13 +21,13 @@
 
 | 里程碑 | 任务名称 | 核心交付内容与技术要点 | 状态 |
 |---|---|---|---|
-| **M1** | NDK 交叉编译 `libwaa_signer.so` | 配置 Android NDK（`arm64-v8a`）与 Zig/CGO 工具链，交叉编译 `waa-signer`（Go 1.27 + SpiderMonkey 152 + Firefox 152 uTLS + `camoufoxnative` Windows 指纹）为可执行/可加载 `libwaa_signer.so`，产出放入 `jniLibs/arm64-v8a/` 并补齐本地子进程生命周期守护 | 待开始（依赖 2.1.0 稳定） |
+| **M1** | NDK 交叉编译 `libwaa_signer.so` | 配置 Android NDK（`arm64-v8a`）与 Zig/CGO 工具链，交叉编译 `waa-signer`（Go 1.27 + SpiderMonkey 152 + Firefox 152 uTLS + `camoufoxnative` Windows 指纹）为可执行/可加载 `libwaa_signer.so`，产出放入 `jniLibs/arm64-v8a/` 并补齐本地子进程生命周期守护 | 已完成 PASS（`REV-2.2.0.1` 二轮复审：`P1-1`/`P1-2`/`P2-1`～`P2-4` 与 `Q-1` 全部闭环；遗留 `P2-5`/`Q-2`/`Q-3` 非阻断项转 M2/M3） |
 | **M2** | Python 网关嵌入与配置锁定 | 集成 Chaquopy / 嵌入式 Python 运行时至 `android/`，内嵌 `aistudio_api` FastAPI 服务监听 `127.0.0.1:8080`；启动期强制锁定 `engine.type=browserless`，禁用 `browser`/CDP 路径与桌面浏览器探测，复用标准化 `defaults/config.yaml` 与 `data/` 存储目录 | 待开始 |
 | **M3** | `MediaSession` 无感保活服务 | 新增 `foregroundServiceType="mediaPlayback"` 前台服务与通知栏媒体控制卡片（启动/停止/端口状态）；实现静音 PCM `AudioTrack`（不申请/不抢占音频焦点）+ `PARTIAL_WAKE_LOCK` 息屏防休眠；不提供悬浮小窗 | 待开始 |
 | **M4** | WebView 提取直通本地 `AccountStore` | 打通现有 `android/` 多 Profile WebView 登录提取流与嵌入式网关 `data/accounts/` 的直写通路（原子写 `auth.json`/`meta.json` 并热通知网关重载/清冷却），同时保持 WebView 仅限登录凭据采集，与推理 WAA 指纹链路严格物理隔离 | 待开始 |
 
 ## 3. `reviews/` 审查报告与成果索引
 
-> 当前处于 Stage 2.2.0 前置规划期，待 M1–M4 逐步落地后，独立只读 Reviewer 报告与实机/APK 截图成果将归档于本域 `reviews/`（当前占位：`reviews/.gitkeep`）。
+> M1 独立只读审查已产出首份报告并完成二轮复审：`waa-signer` 交叉编译与 `WaaSignerSupervisor` 子进程守护的 `P1`/`P2`/`Q` 问题已按报告逐项整改，二轮复审结论 `PASS`。
 
-- （暂无审查报告）
+- [`REV-2.2.0.1-waa-signer-android-ndk.md`](reviews/REV-2.2.0.1-waa-signer-android-ndk.md) — Stage 2.2.0 M1 独立代码与门禁审查（二轮复审结论 `PASS`；`P1-1`/`P1-2`/`P2-1`/`P2-2`/`P2-3`/`P2-4` 与 `Q-1` 主体全部闭环；新发现非阻断项 `P2-5`、`Q-3` 与顺延 `Q-2` 转 M2/M3）

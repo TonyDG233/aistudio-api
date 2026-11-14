@@ -1,13 +1,14 @@
 ﻿# Requires -Version 5.1
 <#
 .SYNOPSIS
-    一键编译 WAA Signer (Windows x64)
+    一键编译 WAA Signer (Windows x64 / Android arm64)
 .DESCRIPTION
     自动检测环境、检测系统/进程代理、下载 SpiderMonkey 静态依赖，
-    并通过 Go + CGO (Zig / MinGW-w64 GCC / Clang) 构建独立的 waa-signer.exe。
+    并通过 Go + CGO (Zig / MinGW-w64 GCC / Clang) 构建独立的 waa-signer.exe 或 Android arm64 静态产物。
 #>
 [CmdletBinding()]
 param(
+    [string]$Target = "windows-amd64",
     [string]$Proxy = "",
     [string]$LocalFile = "",
     [switch]$ForceDownload
@@ -39,12 +40,37 @@ if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
 Set-Location $ScriptDir
 
 $SM_VERSION = "v152.0.4-aistudio2api.1"
-$ARCH = "windows-amd64"
-$Tarball = "spidermonkey-$SM_VERSION-$ARCH.tar.gz"
+switch ($Target) {
+    "windows-amd64" {
+        $ARCH = "windows-amd64"
+        $TargetGOOS = "windows"
+        $TargetGOARCH = "amd64"
+        $ZigTarget = "x86_64-windows-gnu"
+        $OutExe = "$ScriptDir\bin\waa-signer.exe"
+        $NeedWinShim = $true
+        $RequireZig = $false
+        $GoExtLdFlagsBase = ""
+    }
+    "android-arm64" {
+        $ARCH = "linux-arm64"
+        $TargetGOOS = "linux"
+        $TargetGOARCH = "arm64"
+        $ZigTarget = "aarch64-linux-musl"
+        $RepoRoot = Split-Path $ScriptDir -Parent
+        $OutExe = Join-Path $RepoRoot "android\app\src\main\jniLibs\arm64-v8a\libwaa_signer.so"
+        $NeedWinShim = $false
+        $RequireZig = $true
+        $GoExtLdFlagsBase = "-static"
+    }
+    default {
+        Write-Host "错误: 不支持的目标平台: $Target (支持: windows-amd64, android-arm64)" -ForegroundColor Red
+        exit 1
+    }
+}
 
+$Tarball = "spidermonkey-$SM_VERSION-$ARCH.tar.gz"
 $DepsDir = "$ScriptDir\.deps\spidermonkey\$ARCH"
-$BinDir = "$ScriptDir\bin"
-$OutExe = "$BinDir\waa-signer.exe"
+$OutDir = Split-Path $OutExe -Parent
 
 # 1. 检查 Go 环境
 if (-not (Get-Command "go" -ErrorAction SilentlyContinue)) {
@@ -103,12 +129,12 @@ if (-not $zigCmd) {
 }
 
 if ($zigCmd) {
-    Write-Host ">>> 检测到 Zig 编译器，启用高性能免配置 CGO 静态交叉编译" -ForegroundColor Green
+    Write-Host ">>> 检测到 Zig 编译器，启用高性能免配置 CGO 静态交叉编译 ($ZigTarget)" -ForegroundColor Green
     $UseZig = $true
-    $CC = "zig cc -target x86_64-windows-gnu"
-    $CXX = "zig c++ -target x86_64-windows-gnu"
-    $ExtLdFlags = "-Wl,--strip-all"
-} elseif (Get-Command "clang" -ErrorAction SilentlyContinue) {
+    $CC = "zig cc -target $ZigTarget"
+    $CXX = "zig c++ -target $ZigTarget"
+    $ExtLdFlags = if ($GoExtLdFlagsBase) { "$GoExtLdFlagsBase -Wl,--strip-all" } else { "-Wl,--strip-all" }
+} elseif (-not $RequireZig -and (Get-Command "clang" -ErrorAction SilentlyContinue)) {
     Write-Host ">>> 检测到 Clang 编译器" -ForegroundColor Green
     $CC = "clang"
     $CXX = "clang++"
@@ -117,7 +143,9 @@ if ($zigCmd) {
     $hasGcc = Get-Command "gcc" -ErrorAction SilentlyContinue
     Write-Host ""
     Write-Host "==================================================================" -ForegroundColor Yellow
-    if ($hasGcc) {
+    if ($RequireZig) {
+        Write-Host "【重要提示】目标 $Target 交叉编译必须使用内置 LLVM libc++ 的 Zig 编译器！" -ForegroundColor Red
+    } elseif ($hasGcc) {
         Write-Host "【重要提示】检测到当前系统仅有 GNU GCC (MinGW-w64)，无法直接编译本服务！" -ForegroundColor Red
         Write-Host "原因: SpiderMonkey 官方核心引擎基于 LLVM libc++ 构建，" -ForegroundColor Yellow
         Write-Host "      GNU GCC 缺失 libc++ 与 libunwind 依赖库，会导致 cannot find -lc++ 报错。" -ForegroundColor Yellow
@@ -145,9 +173,9 @@ if ($zigCmd) {
                     $env:PATH = "$zigDir;$env:PATH"
                     Write-Host ">>> Zig 编译器已就绪: $($foundZig.FullName)" -ForegroundColor Green
                     $UseZig = $true
-                    $CC = "zig cc -target x86_64-windows-gnu"
-                    $CXX = "zig c++ -target x86_64-windows-gnu"
-                    $ExtLdFlags = "-Wl,--strip-all"
+                    $CC = "zig cc -target $ZigTarget"
+                    $CXX = "zig c++ -target $ZigTarget"
+                    $ExtLdFlags = if ($GoExtLdFlagsBase) { "$GoExtLdFlagsBase -Wl,--strip-all" } else { "-Wl,--strip-all" }
                 }
             }
         }
@@ -379,61 +407,71 @@ if ($UseZig -and (Test-Path $LibStatic)) {
 
     $ShimSrc = "$ScriptDir\tools\fstat64i32_shim.c"
     $ShimObj = "$ScriptDir\.deps\fstat_shim.o"
-    if (-not (Test-Path $ShimSrc)) {
-        Write-Host "错误: 缺少 fstat64i32 shim 源码: $ShimSrc" -ForegroundColor Red
-        exit 1
-    }
-    Write-Host ">>> 编译并注入 fstat64i32 CRT shim..." -ForegroundColor Cyan
-    & $ZigExe cc -target x86_64-windows-gnu -O2 -c $ShimSrc -o $ShimObj
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ShimObj)) {
-        Write-Host "错误: 编译 fstat64i32 shim 失败。" -ForegroundColor Red
-        exit 1
-    }
-    $rustMembers = @(& $ZigExe ar t $LibRust)
-    if ($rustMembers -contains "fstat_shim.o") {
-        & $ZigExe ar d $LibRust "fstat_shim.o"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "错误: 移除旧 fstat_shim.o 成员失败。" -ForegroundColor Red
+    if ($NeedWinShim) {
+        if (-not (Test-Path $ShimSrc)) {
+            Write-Host "错误: 缺少 fstat64i32 shim 源码: $ShimSrc" -ForegroundColor Red
             exit 1
         }
-    }
-    & $ZigExe ar r $LibRust $ShimObj
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "错误: 注入 fstat_shim.o 失败。" -ForegroundColor Red
-        exit 1
-    }
-    $rustMembers = @(& $ZigExe ar t $LibRust)
-    if (-not ($rustMembers -contains "fstat_shim.o")) {
-        Write-Host "错误: 注入后未在 libjsrust.a 中找到 fstat_shim.o。" -ForegroundColor Red
-        exit 1
+        Write-Host ">>> 编译并注入 fstat64i32 CRT shim..." -ForegroundColor Cyan
+        & $ZigExe cc -target $ZigTarget -O2 -c $ShimSrc -o $ShimObj
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ShimObj)) {
+            Write-Host "错误: 编译 fstat64i32 shim 失败。" -ForegroundColor Red
+            exit 1
+        }
+        $rustMembers = @(& $ZigExe ar t $LibRust)
+        if ($rustMembers -contains "fstat_shim.o") {
+            & $ZigExe ar d $LibRust "fstat_shim.o"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "错误: 移除旧 fstat_shim.o 成员失败。" -ForegroundColor Red
+                exit 1
+            }
+        }
+        & $ZigExe ar r $LibRust $ShimObj
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "错误: 注入 fstat_shim.o 失败。" -ForegroundColor Red
+            exit 1
+        }
+        $rustMembers = @(& $ZigExe ar t $LibRust)
+        if (-not ($rustMembers -contains "fstat_shim.o")) {
+            Write-Host "错误: 注入后未在 libjsrust.a 中找到 fstat_shim.o。" -ForegroundColor Red
+            exit 1
+        }
     }
     Write-Host ">>> libjsrust.a Zig 兼容后处理完成。" -ForegroundColor Green
 }
 
 # 4. 创建产物目录
-if (-not (Test-Path $BinDir)) {
-    New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
+if (-not (Test-Path $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 }
 
 # 5. 执行 Go 编译
-Write-Host ">>> 开始编译 waa-signer (CGO_ENABLED=1 GOOS=windows GOARCH=amd64)..." -ForegroundColor Cyan
+Write-Host ">>> 开始编译 waa-signer (Target=$Target CGO_ENABLED=1 GOOS=$TargetGOOS GOARCH=$TargetGOARCH)..." -ForegroundColor Cyan
 
 $env:CGO_ENABLED = "1"
-$env:GOOS = "windows"
-$env:GOARCH = "amd64"
+$env:GOOS = $TargetGOOS
+$env:GOARCH = $TargetGOARCH
 $env:CC = $CC
 $env:CXX = $CXX
 $IncludePath = "$DepsDir\include" -replace '\\', '/'
 $LibPath = "$DepsDir\lib" -replace '\\', '/'
-$env:CGO_CXXFLAGS = "-I$IncludePath"
+if ($Target -eq "android-arm64") {
+    $env:CGO_CPPFLAGS = "-I$IncludePath"
+    Remove-Item Env:CGO_CXXFLAGS -ErrorAction SilentlyContinue
+} else {
+    $env:CGO_CXXFLAGS = "-I$IncludePath"
+    Remove-Item Env:CGO_CPPFLAGS -ErrorAction SilentlyContinue
+}
 $env:CGO_LDFLAGS = "-L$LibPath"
 
 $ldflags = "-s -w"
-if (-not [string]::IsNullOrWhiteSpace($ExtLdFlags)) {
+if ($Target -eq "android-arm64") {
+    $ldflags = "-s -w -linkmode external -extldflags '$ExtLdFlags'"
+} elseif (-not [string]::IsNullOrWhiteSpace($ExtLdFlags)) {
     $ldflags += " -extldflags `"$ExtLdFlags`""
 }
 
-go build -trimpath -tags "netgo,osusergo" -ldflags "$ldflags" -o $OutExe ./cmd/waa-signer
+go build -trimpath -tags "netgo,osusergo" -ldflags $ldflags -o $OutExe ./cmd/waa-signer
 if ($LASTEXITCODE -ne 0) {
     Write-Host "错误: 编译 waa-signer 失败！" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -441,6 +479,11 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "==================================================================" -ForegroundColor Green
 Write-Host ">>> 编译成功！产物位置: $OutExe" -ForegroundColor Green
-Write-Host ">>> 验证与运行方式:" -ForegroundColor Cyan
-Write-Host "    $OutExe -listen 127.0.0.1:8081" -ForegroundColor White
+if ($Target -eq "windows-amd64") {
+    Write-Host ">>> 验证与运行方式:" -ForegroundColor Cyan
+    Write-Host "    $OutExe -listen 127.0.0.1:8081" -ForegroundColor White
+} else {
+    $sizeBytes = (Get-Item $OutExe).Length
+    Write-Host ">>> 产物大小: $sizeBytes 字节" -ForegroundColor Cyan
+}
 Write-Host "==================================================================" -ForegroundColor Green

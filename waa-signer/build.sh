@@ -7,42 +7,81 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+TARGET="${TARGET:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target)
+      if [ $# -lt 2 ]; then
+        echo "错误: --target 缺少参数值" >&2
+        exit 1
+      fi
+      TARGET="$2"
+      shift 2
+      ;;
+    --target=*)
+      TARGET="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "错误: 未知参数: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 SM_VERSION="v152.0.4-aistudio2api.1"
-ARCH="$(uname -m)"
-HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
-case "$ARCH" in
-  x86_64|amd64)
-    GO_ARCH="amd64"
-    ;;
-  aarch64|arm64)
-    GO_ARCH="arm64"
-    ;;
-  *)
-    echo "不支持的架构: $ARCH" >&2
-    exit 1
-    ;;
-esac
+if [ "$TARGET" = "android-arm64" ]; then
+  GO_ARCH="arm64"
+  TARGET_GOOS="linux"
+  OS_PREFIX="linux"
+  OUT_PATH="${SCRIPT_DIR}/../android/app/src/main/jniLibs/arm64-v8a/libwaa_signer.so"
+elif [ -z "$TARGET" ]; then
+  ARCH="$(uname -m)"
+  HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
-TARGET_OS="${GOOS:-$HOST_OS}"
-case "$TARGET_OS" in
-  linux|android)
-    TARGET_GOOS="linux"
-    OS_PREFIX="linux"
-    ;;
-  darwin)
-    TARGET_GOOS="darwin"
-    OS_PREFIX="darwin"
-    ;;
-  windows|mingw*|msys*|cygwin*)
-    TARGET_GOOS="windows"
-    OS_PREFIX="windows"
-    ;;
-  *)
-    echo "不支持的操作系统: $TARGET_OS" >&2
-    exit 1
-    ;;
-esac
+  case "$ARCH" in
+    x86_64|amd64)
+      GO_ARCH="amd64"
+      ;;
+    aarch64|arm64)
+      GO_ARCH="arm64"
+      ;;
+    *)
+      echo "不支持的架构: $ARCH" >&2
+      exit 1
+      ;;
+  esac
+
+  TARGET_OS="${GOOS:-$HOST_OS}"
+  case "$TARGET_OS" in
+    linux|android)
+      TARGET_GOOS="linux"
+      OS_PREFIX="linux"
+      ;;
+    darwin)
+      TARGET_GOOS="darwin"
+      OS_PREFIX="darwin"
+      ;;
+    windows|mingw*|msys*|cygwin*)
+      TARGET_GOOS="windows"
+      OS_PREFIX="windows"
+      ;;
+    *)
+      echo "不支持的操作系统: $TARGET_OS" >&2
+      exit 1
+      ;;
+  esac
+
+  BIN_NAME="waa-signer"
+  if [ "$TARGET_GOOS" = "windows" ]; then
+    BIN_NAME="waa-signer.exe"
+  fi
+  OUT_PATH="${SCRIPT_DIR}/bin/${BIN_NAME}"
+else
+  echo "错误: 不支持的目标平台: ${TARGET} (支持: android-arm64)" >&2
+  exit 1
+fi
 
 SM_ARCH="${OS_PREFIX}-${GO_ARCH}"
 DEPS_DIR="${SCRIPT_DIR}/.deps/spidermonkey/${SM_ARCH}"
@@ -119,6 +158,9 @@ if command -v zig >/dev/null 2>&1; then
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
   EXTLDFLAGS="-static -Wl,--strip-all"
+elif [ "$TARGET" = "android-arm64" ]; then
+  echo "错误: android-arm64 交叉编译需要 zig 编译器 (zig cc -target aarch64-linux-musl)" >&2
+  exit 1
 elif command -v clang >/dev/null 2>&1; then
   CC_CMD="clang"
   CXX_CMD="clang++"
@@ -136,6 +178,9 @@ fi
 # that collides with Go's compiler-rt (___chkstk_ms). Remove that member
 # before linking; no-op on archives that do not contain it.
 if [ -f "$DEPS_DIR/lib/libjsrust.a" ]; then
+  if [ ! -f "$DEPS_DIR/lib/libjsrust.a.orig" ]; then
+    cp "$DEPS_DIR/lib/libjsrust.a" "$DEPS_DIR/lib/libjsrust.a.orig"
+  fi
   if command -v zig >/dev/null 2>&1; then
     AR_CMD="zig ar"
   elif command -v ar >/dev/null 2>&1; then
@@ -151,21 +196,18 @@ if [ -f "$DEPS_DIR/lib/libjsrust.a" ]; then
   fi
 fi
 
-mkdir -p bin
-BIN_NAME="waa-signer"
-if [ "$TARGET_GOOS" = "windows" ]; then
-  BIN_NAME="waa-signer.exe"
-fi
+mkdir -p "$(dirname "$OUT_PATH")"
 
 echo ">>> 开始编译 waa-signer (CGO_ENABLED=1 GOOS=${TARGET_GOOS} GOARCH=${GO_ARCH})..."
 CGO_ENABLED=1 GOOS="${TARGET_GOOS}" GOARCH="${GO_ARCH}" \
   CC="${CC_CMD}" \
   CXX="${CXX_CMD}" \
+  CGO_CPPFLAGS="-I${DEPS_DIR}/include" \
   CGO_CXXFLAGS="-I${DEPS_DIR}/include" \
   CGO_LDFLAGS="-L${DEPS_DIR}/lib" \
   go build -trimpath -tags netgo,osusergo \
   -ldflags="-s -w -linkmode external -extldflags '${EXTLDFLAGS}'" \
-  -o "bin/${BIN_NAME}" ./cmd/waa-signer
+  -o "${OUT_PATH}" ./cmd/waa-signer
 
-echo ">>> 编译成功: ${SCRIPT_DIR}/bin/${BIN_NAME}"
-ls -lh "bin/${BIN_NAME}"
+echo ">>> 编译成功: ${OUT_PATH}"
+ls -lh "${OUT_PATH}"

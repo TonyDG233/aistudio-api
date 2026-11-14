@@ -17,6 +17,10 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -48,6 +52,13 @@ android {
         checkReleaseBuilds = false
         checkDependencies = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += setOf("**/libwaa_signer.so")
+        }
+    }
 }
 
 ktlint {
@@ -76,4 +87,8 @@ dependencies {
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // Unit Tests
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
 }
