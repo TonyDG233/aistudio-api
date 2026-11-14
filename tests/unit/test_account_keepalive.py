@@ -15,6 +15,7 @@ from aistudio_api.application.account_keepalive import (
     AccountKeepaliveService,
     KeepaliveSettings,
 )
+from aistudio_api.application.account_service import AccountService
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
     RefreshInProgressError,
@@ -152,10 +153,21 @@ class FakeManager:
         return tuple(self._slots)
 
 
+class FakeRotator:
+    """Minimal rotator surface: only auth-lock state matters to keepalive."""
+
+    def __init__(self, locked: set[str] | None = None) -> None:
+        self.locked = set(locked or ())
+
+    def get_account_stats(self, account_id: str) -> SimpleNamespace:
+        return SimpleNamespace(session_expired=account_id in self.locked)
+
+
 class FakeRefresher:
     def __init__(self, *, ok: bool = True) -> None:
         self.calls: list[list[str]] = []
         self.skip_flags: list[bool] = []
+        self.email_flags: list[bool] = []
         self._ok = ok
 
     async def refresh_accounts(
@@ -167,6 +179,7 @@ class FakeRefresher:
     ) -> list[SimpleNamespace]:
         self.calls.append([account.id for account in accounts])
         self.skip_flags.append(skip_fresh_free_tier)
+        self.email_flags.append(refresh_email)
         return [
             SimpleNamespace(
                 account_id=account.id,
@@ -266,6 +279,8 @@ def _service(
     client: Any | None = None,
     refresher: Any | None = None,
     manager: Any | None = None,
+    account_service: Any | None = None,
+    rotator: Any | None = None,
     clock: FakeClock | None = None,
 ) -> AccountKeepaliveService:
     client_obj: Any = client or FakeClient()
@@ -274,6 +289,8 @@ def _service(
         client_obj,
         refresher or FakeRefresher(),
         instance_manager=manager,
+        account_service=account_service,
+        rotator=rotator if rotator is not None else FakeRotator(),
         clock=clock or FakeClock(),
         tick_seconds=3600.0,
     )
@@ -580,12 +597,72 @@ async def test_metadata_refresh_only_targets_due_healthy_accounts(tmp_path):
     assert result["ok"] is True
     assert refresher.calls == [["acc_stale"]]
     assert refresher.skip_flags == [True]
+    assert refresher.email_flags == [False]
     stale_after = store.get_account("acc_stale")
     expired_after = store.get_account("acc_expired")
     assert stale_after is not None
     assert expired_after is not None
     assert stale_after.last_refresh_attempt_at is not None
     assert expired_after.last_refresh_attempt_at is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_skips_auth_locked_and_disabled_accounts(tmp_path):
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    stale_at = (now - timedelta(days=2)).isoformat()
+    healthy = _account(store, "acc_ok", "ok@example.com")
+    locked = _account(store, "acc_locked", "locked@example.com")
+    disabled = _account(store, "acc_disabled", "disabled@example.com")
+    for account in (healthy, locked, disabled):
+        store.update_account_refresh(account.id, tier_checked_at=stale_at)
+    store.toggle_account_enabled(disabled.id, False)
+
+    refresher = FakeRefresher()
+    rotator = FakeRotator({"acc_locked"})
+    service = _service(
+        store,
+        refresher=refresher,
+        rotator=rotator,
+        clock=FakeClock(now.timestamp()),
+    )
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["ok"] is True
+    assert refresher.calls == [["acc_ok"]]
+    assert refresher.email_flags == [False]
+    locked_after = store.get_account("acc_locked")
+    disabled_after = store.get_account("acc_disabled")
+    assert locked_after is not None
+    assert disabled_after is not None
+    assert locked_after.last_refresh_attempt_at is None
+    assert disabled_after.last_refresh_attempt_at is None
+
+
+@pytest.mark.asyncio
+async def test_auth_update_skips_auth_locked_accounts(tmp_path, monkeypatch):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_ok", "ok@example.com")
+    _account(store, "acc_locked", "locked@example.com")
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated.append(account_id)
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        account_service=account_service,
+        rotator=FakeRotator({"acc_locked"}),
+    )
+
+    await service.run_now("auth_update", settings=_settings())
+
+    assert rotated == ["acc_ok"]
 
 
 @pytest.mark.asyncio

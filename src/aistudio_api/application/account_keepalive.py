@@ -120,6 +120,7 @@ class AccountKeepaliveService:
         *,
         instance_manager: Any | None = None,
         account_service: Any | None = None,
+        rotator: Any | None = None,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = 1.0,
     ) -> None:
@@ -128,6 +129,7 @@ class AccountKeepaliveService:
         self._refresher = refresher
         self._instance_manager = instance_manager
         self._account_service = account_service
+        self._rotator = rotator
         self._clock = clock
         self._tick_seconds = max(0.01, tick_seconds)
         self._task: asyncio.Task[None] | None = None
@@ -168,6 +170,44 @@ class AccountKeepaliveService:
 
     def resume(self) -> None:
         self._paused = False
+
+    def _rotator_handle(self) -> Any | None:
+        """Injected rotator first, then the process-wide instance."""
+        if self._rotator is not None:
+            return self._rotator
+        try:
+            from aistudio_api.application import account_rotator as rotator_module
+
+            return getattr(rotator_module, "_rotator", None)
+        except Exception:
+            return None
+
+    def _is_auth_locked(self, account_id: str) -> bool:
+        """True for accounts locked by session expiry / verify-account.
+
+        Background keepalive must not keep probing a verify-account lock: a
+        successful ``GetAiStudioBenefitTier`` 200 would otherwise clear the
+        local ``expired`` flag and silently wash the lock away.
+        """
+        rotator = self._rotator_handle()
+        if rotator is None:
+            return False
+        checker = getattr(rotator, "is_auth_locked", None)
+        if callable(checker):
+            try:
+                return bool(checker(account_id))
+            except Exception as exc:
+                log.debug("[Keepalive] auth lock probe failed %s: %s", account_id, exc)
+                return False
+        getter = getattr(rotator, "get_account_stats", None)
+        if not callable(getter):
+            return False
+        try:
+            stats = getter(account_id)
+        except Exception as exc:
+            log.debug("[Keepalive] auth lock stats failed %s: %s", account_id, exc)
+            return False
+        return bool(getattr(stats, "session_expired", False))
 
     def _settings(self) -> KeepaliveSettings:
         return KeepaliveSettings.from_config()
@@ -344,7 +384,9 @@ class AccountKeepaliveService:
         accounts = [
             account
             for account in self._store.list_accounts()
-            if not getattr(account, "expired", False)
+            if getattr(account, "enabled", True)
+            and not getattr(account, "expired", False)
+            and not self._is_auth_locked(account.id)
         ]
         now = self._clock()
         due = [
@@ -357,9 +399,13 @@ class AccountKeepaliveService:
             return {"ok": True, "reason": "no_due_accounts", "count": 0}
 
         try:
+            # Background metadata refresh must not re-fetch the apps HTML for
+            # accounts that already have an email.  ``refresh_email=False``
+            # still backfills a genuinely missing email because the refresher
+            # treats ``not account.email`` as an automatic override.
             results = await self._refresher.refresh_accounts(
                 due,
-                refresh_email=True,
+                refresh_email=False,
                 skip_fresh_free_tier=True,
             )
         except RefreshInProgressError:
@@ -478,6 +524,11 @@ class AccountKeepaliveService:
         rotated_accounts: list[str] = []
         for account in self._store.list_accounts():
             if not account.enabled or account.expired:
+                continue
+            if self._is_auth_locked(account.id):
+                log.debug(
+                    "[Keepalive] 跳过已锁定账号的 Cookie 轮换 account=%s", account.id
+                )
                 continue
             acc_sess = slot_sessions.get(account.id)
             try:

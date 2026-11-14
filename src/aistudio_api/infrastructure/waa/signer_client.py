@@ -227,7 +227,7 @@ class SignerClient:
         self,
         endpoint: str,
         *,
-        request_timeout_s: float = 90.0,
+        request_timeout_s: float = 300.0,
         read_timeout_s: float | None = None,
         connect_timeout_s: float = 15.0,
         max_connections: int = 6,

@@ -69,6 +69,17 @@ def record_rotator_event(
             )
         else:
             rotator.record_auth_error(account_id, model=model, surface=surface)
+    elif event == "verification_required":
+        # verify-account is a per-account upstream risk lock.  Unlike a real
+        # Cookie/session expiry it must never be propagated to the same-anchor
+        # siblings (u/0..u/N): those sessions are still healthy and switching
+        # to one of them is the correct recovery.
+        if reason:
+            rotator.record_session_expired(
+                account_id, model=model, surface=surface, reason=reason
+            )
+        else:
+            rotator.record_session_expired(account_id, model=model, surface=surface)
     elif event == "session_expired":
         if reason:
             rotator.record_session_expired(

@@ -57,8 +57,9 @@ if TYPE_CHECKING:
 logger = get_logger("account_refresher")
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
 )
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -544,9 +545,13 @@ class AccountInfoRefresher:
     ) -> dict[str, str]:
         headers: dict[str, str] = {
             "accept": "*/*",
+            "accept-language": ACCEPT_LANGUAGE,
             "content-type": "application/json+protobuf",
             "origin": AI_STUDIO_ORIGIN,
             "referer": AI_STUDIO_HOME_URL,
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
             "user-agent": USER_AGENT,
             "x-goog-api-key": self._web_api_key,
             "x-goog-authuser": str(auth_user or "0"),
@@ -615,6 +620,10 @@ class AccountInfoRefresher:
             "accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             ),
+            "accept-language": ACCEPT_LANGUAGE,
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
             "user-agent": USER_AGENT,
             "x-goog-authuser": str(auth_user or "0"),
         }

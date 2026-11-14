@@ -33,7 +33,7 @@ engine:
       binary_path: waa-signer/bin/waa-signer
       auto_start: true
       startup_timeout_s: 30
-      request_timeout_s: 90
+      request_timeout_s: 300
       state_dir: data/waa/workers
       max_workers: 8
       idle_ttl_s: 900
@@ -45,7 +45,7 @@ engine:
       http2: true
       max_connections: 6
       connect_timeout_s: 15
-      read_timeout_s: 120
+      read_timeout_s: 300
 
 # 实例配置：1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface。
 # - count：该槽位的实例数量（正整数）；相同 tier 区间会合并计数。

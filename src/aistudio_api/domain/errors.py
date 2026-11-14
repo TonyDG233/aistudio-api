@@ -306,9 +306,15 @@ def is_browser_session_hang_error(exc: Exception) -> bool:
     """识别由于 CDP 断开、模板捕获超时、页面传输中断或 BotGuard 握手未就绪引起的会话异常。"""
     if isinstance(exc, BrowserTransportError):
         return True
+    # The raw signer timeout is a ``SignerError(RuntimeError)`` whose Chinese
+    # message ("waa-signer 请求超时") does not contain the English keywords
+    # below.  Match it by class name and by the localized marker so a bare
+    # ``SignerTimeoutError`` also gets the single same-account retry.
+    if exc.__class__.__name__ == "SignerTimeoutError":
+        return True
     if isinstance(exc, (RuntimeError, TimeoutError)):
         err = str(exc).lower()
-        return any(
+        return "超时" in err or any(
             k in err
             for k in (
                 "template capture",

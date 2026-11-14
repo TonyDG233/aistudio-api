@@ -568,6 +568,7 @@ async def lifespan(_app: FastAPI):
         client,
         account_refresher,
         instance_manager=instance_manager,
+        rotator=rotator,
     )
     runtime_state.keepalive = keepalive
     # App owns the first metadata refresh below so the two startup probes can

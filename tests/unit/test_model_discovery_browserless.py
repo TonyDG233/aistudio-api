@@ -257,6 +257,128 @@ def test_dirty_snapshot_falls_back_to_full_builtin_table(
     }
 
 
+def test_account_http_candidates_caps_to_two_paid_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        _account_http_candidates,
+    )
+
+    _point_cache(monkeypatch, tmp_path)
+    accounts: list[SimpleNamespace] = []
+    auth_paths: dict[str, Path] = {}
+    for index, tier in enumerate(("Free", "Pro", "Ultra", "Plus", "Free")):
+        account = _account(f"acc_{index}", tier=tier)
+        accounts.append(account)
+        auth_paths[account.id] = _write_auth(
+            tmp_path / f"auth-{index}.json",
+            sapisid=f"sapisid-{index}",
+            sid=f"sid-{index}",
+        )
+    _install_store(
+        monkeypatch,
+        _FakeAccountStore(accounts=accounts, auth_paths=auth_paths),
+    )
+
+    candidates = _account_http_candidates()
+
+    assert len(candidates) == 2
+    assert [candidate.tier for candidate in candidates] == ["Ultra", "Pro"]
+
+
+def test_account_http_candidates_skips_auth_locked_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.application import account_rotator as rotator_module
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        _account_http_candidates,
+    )
+
+    _point_cache(monkeypatch, tmp_path)
+    accounts: list[SimpleNamespace] = []
+    auth_paths: dict[str, Path] = {}
+    for index, tier in enumerate(("Ultra", "Pro", "Plus")):
+        account = _account(f"acc_{index}", tier=tier)
+        accounts.append(account)
+        auth_paths[account.id] = _write_auth(
+            tmp_path / f"auth-{index}.json",
+            sapisid=f"sapisid-{index}",
+            sid=f"sid-{index}",
+        )
+    _install_store(
+        monkeypatch,
+        _FakeAccountStore(accounts=accounts, auth_paths=auth_paths),
+    )
+
+    class _LockedRotator:
+        def is_auth_locked(self, account_id: str) -> bool:
+            return account_id == "acc_0"
+
+    monkeypatch.setattr(rotator_module, "_rotator", _LockedRotator(), raising=False)
+
+    candidates = _account_http_candidates()
+
+    assert [candidate.tier for candidate in candidates] == ["Pro", "Plus"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_http_sends_browser_like_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    captured: dict[str, str] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> list[object]:
+            return [
+                [
+                    [
+                        "models/gemini-x",
+                        None,
+                        "001",
+                        "Gemini X",
+                        "",
+                        1,
+                        1,
+                        ["generateContent"],
+                    ]
+                ]
+            ]
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *args: object) -> bool:
+            del args
+            return False
+
+        async def post(
+            self, url: str, *, headers: dict[str, str], content: str
+        ) -> _Response:
+            del url, content
+            captured.update(headers)
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    service = ModelDiscoveryService()
+
+    models = await service._fetch_via_http({"SAPISID": "sap"}, "0")
+
+    assert [model["id"] for model in models] == ["gemini-x"]
+    assert captured["user-agent"].endswith("Firefox/152.0")
+    assert captured["accept-language"].startswith("en-US")
+    assert captured["sec-fetch-dest"] == "empty"
+    assert captured["sec-fetch-mode"] == "cors"
+    assert captured["sec-fetch-site"] == "cross-site"
+
+
 @pytest.mark.asyncio
 async def test_all_candidates_fail_keeps_previous_valid_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

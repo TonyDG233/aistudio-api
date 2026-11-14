@@ -94,9 +94,7 @@ def test_rebind_selection_is_rank_based_and_prefers_minimal_paid_tier(
     )
     rotator = AccountRotator(store)
 
-    picked = rotator.select_rebind_account(
-        lane="paid", required_tiers=("Pro",)
-    )
+    picked = rotator.select_rebind_account(lane="paid", required_tiers=("Pro",))
     assert picked is not None
     assert picked.id == accounts["pro"].id
 
@@ -131,6 +129,21 @@ def test_rebind_selection_obeys_only_tier_interval(tmp_path) -> None:
         )
         is None
     )
+
+
+def test_rotator_is_auth_locked_tracks_session_expiry(tmp_path) -> None:
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("pro", "pro@example.com", "Pro"),
+    )
+    rotator = AccountRotator(store)
+    locked_id = accounts["pro"].id
+
+    assert rotator.is_auth_locked(locked_id) is False
+    rotator.record_session_expired(locked_id)
+    assert rotator.is_auth_locked(locked_id) is True
 
 
 def test_rotator_has_no_group_or_affinity_parameters() -> None:
