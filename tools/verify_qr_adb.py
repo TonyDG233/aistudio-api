@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -1663,8 +1664,6 @@ DECODE_BACKENDS: tuple[str, ...] = ("cv2", "zxingcpp", "pyzbar", "builtin")
 
 def available_backends() -> list[str]:
     """探测当前环境可用的解码后端（至少包含内置解码器）。"""
-    import importlib.util
-
     found: list[str] = []
     for name in DECODE_BACKENDS:
         if name == "pyzbar":
@@ -1736,8 +1735,8 @@ def decode_with_backend(name: str, data: bytes) -> str:
 
 
 def _decode_with_cv2(data: bytes) -> str:
-    import cv2
-    import numpy as np
+    cv2 = importlib.import_module("cv2")
+    np = importlib.import_module("numpy")
 
     image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if image is None:
@@ -1761,8 +1760,8 @@ def _decode_with_cv2(data: bytes) -> str:
 
 
 def _decode_with_zxingcpp(data: bytes) -> str:
-    import numpy as np
-    import zxingcpp
+    np = importlib.import_module("numpy")
+    zxingcpp = importlib.import_module("zxingcpp")
 
     gray = load_gray_image(data)
     pixels = np.frombuffer(bytes(gray.pixels), dtype=np.uint8).reshape(
@@ -1778,8 +1777,8 @@ def _decode_with_zxingcpp(data: bytes) -> str:
 def _decode_with_pyzbar(data: bytes) -> str:
     import io
 
-    from PIL import Image  # pyright: ignore[reportMissingImports]
-    from pyzbar.pyzbar import decode as zbar_decode  # pyright: ignore[reportMissingImports]
+    Image = importlib.import_module("PIL.Image")
+    zbar_decode = importlib.import_module("pyzbar.pyzbar").decode
 
     with Image.open(io.BytesIO(data)) as image:
         for result in zbar_decode(image.convert("L")):
