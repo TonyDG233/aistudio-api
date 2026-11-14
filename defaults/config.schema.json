@@ -314,6 +314,22 @@
               "minimum": 0,
               "maximum": 30,
               "default": 4.0
+            },
+            "proactive_switch_mode": {
+              "type": "string",
+              "enum": ["off", "free_only", "paid_only", "all", "groups"],
+              "default": "off"
+            },
+            "proactive_switch_threshold": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 15
+            },
+            "proactive_switch_groups": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
             }
           },
           "additionalProperties": true

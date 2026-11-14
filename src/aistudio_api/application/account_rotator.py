@@ -321,6 +321,11 @@ class AccountStats:
         self.total_requests += 1
         self.total_rate_limited += 1
         self.last_rate_limited = now
+        # A just-429'd account must move to the LRU tail even when it has no
+        # cooldown left (drip mode): otherwise the rebind selector can pick the
+        # same freshly-failed account right back and ping-pong between two
+        # accounts instead of cycling the whole pool.
+        self.last_used = now
         cooldown_seconds = get_seconds_until_pacific_midnight()
 
         m_stats = self.get_model_daily(model, surface=surface)
@@ -670,6 +675,7 @@ class AccountRotator:
         min_tier: str = "",
         max_tier: str = "",
         required_tiers: tuple[str, ...] | list[str] | None = None,
+        allowed_groups: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> AccountMeta | None:
         """Pick a healthy same-lane account for a request-triggered slot rebind.
 
@@ -680,9 +686,21 @@ class AccountRotator:
         ``exclude_account_ids`` also carries accounts already attempted by the
         request and accounts bound to other instances; no background rebind is
         implied — this is only a read-only selection helper.
+
+        ``allowed_groups`` (non-empty) restricts candidates to accounts whose
+        ``group`` matches, used by the proactive ``groups`` rotation mode.
+
+        Ordering is strict LRU first: the account whose ``last_used`` is oldest
+        wins, so five healthy accounts rotate ``1 -> 2 -> 3 -> 4 -> 5 -> 1``
+        instead of ping-ponging between the two with the fewest historical
+        requests.  ``tier_rank``/``total_requests``/``model_requests_total``
+        only break ties, which keeps the legacy ``last_used == 0.0`` behaviour.
         """
         excluded = set(exclude_account_ids or ())
         required = tuple(required_tiers or ())
+        groups = {
+            str(group).strip() for group in (allowed_groups or ()) if str(group).strip()
+        }
         selector = None
         if only_tier:
             selector = resolve_tier_selector(only_tier=only_tier)
@@ -696,6 +714,8 @@ class AccountRotator:
             if account.id in excluded:
                 continue
             if not account.enabled or getattr(account, "expired", False):
+                continue
+            if groups and getattr(account, "group", "default") not in groups:
                 continue
             tier = getattr(account, "tier", "Free") or "Free"
             if instance_lane_for_tier(tier) != lane:
@@ -716,12 +736,24 @@ class AccountRotator:
         return min(
             candidates,
             key=lambda item: (
+                item[1].last_used,
                 tier_rank(getattr(item[0], "tier", "Free")),
                 item[1].total_requests,
                 item[1].model_requests_total(model),
-                item[1].last_used,
             ),
         )[0]
+
+    def mark_account_used(self, account_id: str, *, when: float | None = None) -> None:
+        """Move one account to the LRU tail without recording a failure/cooldown.
+
+        Used by proactive rotation: the account served its turn and should rest
+        until every other healthy account has been used once more.  No auth or
+        quota cooldown is applied, so it stays immediately reusable.
+        """
+        stats = self.get_account_stats(account_id)
+        if stats is not None:
+            stats.last_used = time.time() if when is None else float(when)
+            self._schedule_debounced_save()
 
     def get_all_stats(self) -> dict[str, dict[str, object]]:
         """获取所有账号的运行透视与配额状态。"""
@@ -1076,4 +1108,9 @@ _rotator: AccountRotator | None = None
 def init_rotator(account_store: AccountStore) -> AccountRotator:
     global _rotator
     _rotator = AccountRotator(account_store)
+    return _rotator
+
+
+def get_account_rotator() -> AccountRotator | None:
+    """Process-wide rotator accessor for LRU-aware slot selection helpers."""
     return _rotator

@@ -46,6 +46,18 @@ log = get_logger("instances")
 DEFAULT_DRAIN_TIMEOUT_S = 12.0
 
 
+def _account_rotator() -> Any | None:
+    """Best-effort access to the process-wide rotator for LRU-aware selection."""
+    try:
+        from aistudio_api.application.account_rotator import get_account_rotator
+    except Exception:
+        return None
+    try:
+        return get_account_rotator()
+    except Exception:
+        return None
+
+
 class InstanceError(RuntimeError):
     code = "instance_error"
     status_code = 409
@@ -480,10 +492,30 @@ class InstanceManager:
             self._set_active_account(account.id)
             return self._view(record)
 
-    async def reassign(self, instance_id: str, account_id: str) -> Instance:
+    async def reassign(
+        self,
+        instance_id: str,
+        account_id: str,
+        *,
+        require_idle: bool = False,
+    ) -> Instance:
+        """Rebind one instance to another account.
+
+        ``require_idle=True`` is the proactive/healing path: the idle check and
+        the rebind happen under the same lifecycle lock, and a slot that became
+        busy in between is returned untouched (no retire/drain), so a request
+        admitted concurrently is never interrupted.
+        """
         account = self._validate_account(account_id)
         async with self._lifecycle_lock:
             record = self._record(instance_id)
+            slot = self._pool.get(record.slot_id)
+            if (
+                require_idle
+                and slot is not None
+                and int(slot.active_requests) > 0
+            ):
+                return self._view(record)
             if record.account_id == account.id:
                 return self._view(record)
             if instance_lane_for_tier(account.tier) != record.lane:
@@ -511,11 +543,22 @@ class InstanceManager:
             was_current = self._current_id == record.id
             slot = self._pool.get(record.slot_id)
             if slot is not None and int(slot.active_requests) > 0:
+                if require_idle:
+                    # N-5: defence in depth. The idle path must never retire a
+                    # busy slot, even if an ``await`` is later inserted between
+                    # the in-lock idle check and this point.
+                    return self._view(record)
                 # Bounded safe drain/retire: stop new work, drain once, then
                 # force-close the old Page/Context before the new account starts.
                 await self._retire_record(record)
             try:
                 await self._activate(record, account)
+            except InstanceBusyError:
+                if require_idle:
+                    # A request slipped in between the idle check and the
+                    # activation await; keep the current binding untouched.
+                    return self._view(record)
+                raise
             except InstanceError as exc:
                 if previous is None:
                     record.account_id = ""
@@ -1055,6 +1098,54 @@ class InstanceManager:
         slot = self._pool.get(record.slot_id)
         return int(slot.active_requests) if slot is not None else 0
 
+    def instance_consecutive_requests(self, instance_id: str) -> int:
+        """Consecutive successful calls on the slot's current account binding."""
+        record = self._records.get(instance_id)
+        if record is None:
+            return 0
+        slot = self._pool.get(record.slot_id)
+        if slot is None:
+            return 0
+        streak = getattr(slot, "consecutive_requests", 0)
+        return int(streak) if isinstance(streak, (int, float)) else 0
+
+    def record_instance_request_success(self, instance_id: str) -> int:
+        """Count one successful call on an instance; returns the new streak."""
+        record = self._records.get(instance_id)
+        if record is None:
+            return 0
+        recorder = getattr(self._pool, "record_slot_request_success", None)
+        if not callable(recorder):
+            return 0
+        try:
+            streak = recorder(record.slot_id)
+        except Exception as exc:
+            log.debug("[instances] 记录实例连续成功次数失败 %s: %s", instance_id, exc)
+            return 0
+        return int(streak) if isinstance(streak, (int, float)) else 0
+
+    def reset_instance_consecutive_requests(self, instance_id: str) -> int:
+        """Reset one slot's consecutive-success streak to zero.
+
+        Proactive rotation uses this when no alternative account exists (Q-2):
+        the current account keeps serving a fresh full cycle instead of making
+        every subsequent ``begin()`` rescan the account pool.
+        """
+        record = self._records.get(instance_id)
+        if record is None:
+            return 0
+        resetter = getattr(self._pool, "reset_slot_consecutive_requests", None)
+        if not callable(resetter):
+            return 0
+        try:
+            streak = resetter(record.slot_id)
+        except Exception as exc:
+            log.debug(
+                "[instances] 重置实例连续成功次数失败 %s: %s", instance_id, exc
+            )
+            return 0
+        return int(streak) if isinstance(streak, (int, float)) else 0
+
     async def close_all(self) -> None:
         async with self._lifecycle_lock:
             tasks = list(self._tasks.values())
@@ -1116,7 +1207,17 @@ class InstanceManager:
         accounts: list[AccountMeta],
         used: set[str],
     ) -> AccountMeta | None:
-        for account in accounts:
+        """Pick the next eligible account for a slot.
+
+        Among the eligible candidates the one with the smallest
+        ``AccountRotator`` ``last_used`` timestamp wins, i.e. the
+        least-recently-used account, so manual/startup selection cycles the
+        whole pool instead of ping-ponging between the first two accounts in
+        ``list_accounts()``. Equal timestamps fall back to the caller-provided
+        list order (active account first, then ``list_accounts()``).
+        """
+        eligible: list[tuple[int, AccountMeta]] = []
+        for index, account in enumerate(accounts):
             if account.id in used:
                 continue
             if not account.enabled or account.expired:
@@ -1128,8 +1229,27 @@ class InstanceManager:
                 is None
             ):
                 continue
-            return account
-        return None
+            eligible.append((index, account))
+        if not eligible:
+            return None
+        if len(eligible) == 1:
+            return eligible[0][1]
+
+        rotator = _account_rotator()
+        getter = getattr(rotator, "get_account_stats", None) if rotator else None
+        if not callable(getter):
+            return eligible[0][1]
+
+        def _lru_key(item: tuple[int, AccountMeta]) -> tuple[float, int]:
+            index, account = item
+            try:
+                stats = getter(account.id)
+                last_used = float(getattr(stats, "last_used", 0.0) or 0.0)
+            except Exception:
+                last_used = 0.0
+            return (last_used, index)
+
+        return min(eligible, key=_lru_key)[1]
 
     def _require_account_for_record(
         self, record: _Record, *, allow_disabled: bool = False

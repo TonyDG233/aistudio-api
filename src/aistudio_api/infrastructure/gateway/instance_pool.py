@@ -179,6 +179,7 @@ class InstanceSlot:
     generation: int = 0
     engine_epoch: int = 0
     active_requests: int = 0
+    consecutive_requests: int = 0
     last_error: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
@@ -377,6 +378,26 @@ class InstancePool:
     def get(self, slot_id: str) -> InstanceSlot | None:
         return self._slots.get(slot_id)
 
+    def record_slot_request_success(self, slot_id: str) -> int:
+        """Increment and return one slot's consecutive successful-call streak.
+
+        The counter drives proactive rotation (M5); it resets whenever the slot
+        is bound to a different account or retired.
+        """
+        slot = self._slots.get(slot_id)
+        if slot is None:
+            return 0
+        slot.consecutive_requests += 1
+        return slot.consecutive_requests
+
+    def reset_slot_consecutive_requests(self, slot_id: str) -> int:
+        """Clear one slot's consecutive-success streak and return the new value."""
+        slot = self._slots.get(slot_id)
+        if slot is None:
+            return 0
+        slot.consecutive_requests = 0
+        return 0
+
     def slots(self) -> tuple[InstanceSlot, ...]:
         return tuple(self._slots.values())
 
@@ -443,6 +464,7 @@ class InstancePool:
                         slot.auth_file = None
                         slot.auth_user = "0"
                         slot.tier = "Free"
+                        slot.consecutive_requests = 0
                         slot.last_error = None
                         if slot.context_id or slot.session is not None:
                             slot.state = SlotState.INVALID
@@ -598,9 +620,14 @@ class InstancePool:
                     f"instance busy: {slot_id} ({slot.active_requests} in-flight)"
                 )
 
+            previous_account_id = slot.account_id
             await self._close_runtime(slot)
             slot.state = SlotState.STARTING
             slot.account_id = account_id
+            if previous_account_id != account_id:
+                # A fresh binding starts a new consecutive-success streak so
+                # proactive rotation never counts the previous account's calls.
+                slot.consecutive_requests = 0
             slot.auth_file = auth_file
             slot.auth_user = auth_user or "0"
             slot.tier = tier or "Free"
@@ -769,6 +796,7 @@ class InstancePool:
                 if slot.active_requests > 0:
                     slot.active_requests = 0
                     slot.active_zero.set()
+                slot.consecutive_requests = 0
                 slot.state = SlotState.UNSTARTED
                 return False
             slot.state = SlotState.RETIRING
@@ -792,6 +820,7 @@ class InstancePool:
                 # aborted; the slot must be reusable for the new binding.
                 slot.active_requests = 0
                 slot.active_zero.set()
+            slot.consecutive_requests = 0
             slot.state = SlotState.UNSTARTED
             slot.last_error = None
             return timed_out

@@ -1749,3 +1749,566 @@ def test_paid_model_build_is_rejected_by_paid_chat_only_rule() -> None:
         )
     assert info.value.code == "surface_instance_busy"
     assert "[ROUTING-RULE: PAID_CHAT_ONLY]" in str(info.value)
+
+
+class _ConsecutiveFakeManager:
+    """Rebind-capable fake manager exposing the proactive streak API."""
+
+    def __init__(
+        self,
+        instances: list[Any],
+        *,
+        streaks: dict[str, int],
+        fail_reassign: Exception | None = None,
+    ) -> None:
+        from tests.unit.routing_fakes import RebindFakeManager
+
+        self._inner = RebindFakeManager(instances)
+        self.streaks = dict(streaks)
+        self.reassign_calls = self._inner.reassign_calls
+        self.account_tiers = self._inner.account_tiers
+        self.require_idle_calls: list[tuple[str, str]] = []
+        self.reset_calls: list[str] = []
+        self.fail_reassign = fail_reassign
+
+    @property
+    def instances(self):
+        return self._inner.instances
+
+    @property
+    def configured_surfaces(self) -> frozenset[str]:
+        return self._inner.configured_surfaces
+
+    @property
+    def current_instance_id(self) -> str | None:
+        return self._inner.current_instance_id
+
+    def eligible_instances(self, *, paid: bool, surface: str | None = None):
+        return self._inner.eligible_instances(paid=paid, surface=surface)
+
+    def lane_instances(self, *, paid: bool):
+        return self._inner.lane_instances(paid=paid)
+
+    async def wake_eligible(self, *, paid: bool = False, surface: str | None = None):
+        return await self._inner.wake_eligible(paid=paid, surface=surface)
+
+    async def wake(self, instance_id: str):
+        return await self._inner.wake(instance_id)
+
+    async def begin_request(self, instance_id: str):
+        return await self._inner.begin_request(instance_id)
+
+    def instance_account_ids(self) -> set[str]:
+        return self._inner.instance_account_ids()
+
+    def instance_active_requests(self, instance_id: str) -> int:
+        return self._inner.instance_active_requests(instance_id)
+
+    def instance_consecutive_requests(self, instance_id: str) -> int:
+        return self.streaks.get(instance_id, 0)
+
+    def record_instance_request_success(self, instance_id: str) -> int:
+        value = self.streaks.get(instance_id, 0) + 1
+        self.streaks[instance_id] = value
+        return value
+
+    def reset_instance_consecutive_requests(self, instance_id: str) -> int:
+        self.reset_calls.append(instance_id)
+        self.streaks[instance_id] = 0
+        return 0
+
+    async def reassign(
+        self,
+        instance_id: str,
+        account_id: str,
+        *,
+        require_idle: bool = False,
+    ):
+        if require_idle:
+            self.require_idle_calls.append((instance_id, account_id))
+        if self.fail_reassign is not None:
+            raise self.fail_reassign
+        updated = await self._inner.reassign(instance_id, account_id)
+        self.streaks[instance_id] = 0
+        return updated
+
+
+def _proactive_pipeline(
+    manager: Any,
+    *,
+    store: Any,
+    rotator: Any,
+    settings: dict[str, Any],
+) -> RoutingPipeline:
+    return RoutingPipeline(
+        instance_manager=manager,
+        account_store=store,
+        rotator=rotator,
+        routing_settings_provider=lambda: {"max_switches": 2, **settings},
+    )
+
+
+@pytest.mark.asyncio
+async def test_proactive_free_only_rotates_idle_free_slot(tmp_path) -> None:
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free-a", "free-a@example.com", "Free"),
+        ("free-b", "free-b@example.com", "Free"),
+    )
+    rotator = AccountRotator(store)
+    a = accounts["free-a"].id
+    b = accounts["free-b"].id
+    stats_a = rotator.get_account_stats(a)
+    assert stats_a is not None
+    stats_a.last_used = 10.0
+
+    manager = _ConsecutiveFakeManager(
+        [make_instance("inst-1", account_id=a, tier="Free", number=1)],
+        streaks={"inst-1": 2},
+    )
+    manager.account_tiers[b] = "Free"
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "free_only",
+            "proactive_switch_threshold": 2,
+        },
+    )
+
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert manager.reassign_calls == [("inst-1", b)]
+    assert manager.require_idle_calls == [("inst-1", b)]
+    assert manager.streaks["inst-1"] == 0
+    assert [candidate.account_id for candidate in context.candidates] == [b]
+    # The outgoing account rests at the LRU tail but keeps serving later.
+    assert stats_a.last_used > 10.0
+    assert stats_a.is_available("gemini-3.7-flash") is True
+
+
+@pytest.mark.asyncio
+async def test_proactive_free_only_leaves_paid_slot_untouched(tmp_path) -> None:
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("pro-a", "pro-a@example.com", "Pro"),
+        ("pro-b", "pro-b@example.com", "Pro"),
+    )
+    rotator = AccountRotator(store)
+    a = accounts["pro-a"].id
+    b = accounts["pro-b"].id
+    manager = _ConsecutiveFakeManager(
+        [make_instance("inst-pro", account_id=a, tier="Pro", number=1)],
+        streaks={"inst-pro": 5},
+    )
+    manager.account_tiers[b] = "Pro"
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "free_only",
+            "proactive_switch_threshold": 2,
+        },
+    )
+
+    await pipeline.begin(model_path="gemini-4-argon")
+
+    assert manager.reassign_calls == []
+    assert manager.streaks["inst-pro"] == 5
+
+
+@pytest.mark.asyncio
+async def test_proactive_rotation_keeps_account_when_no_alternative(tmp_path) -> None:
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path, ("solo", "solo@example.com", "Free")
+    )
+    rotator = AccountRotator(store)
+    manager = _ConsecutiveFakeManager(
+        [
+            make_instance(
+                "inst-1", account_id=accounts["solo"].id, tier="Free", number=1
+            )
+        ],
+        streaks={"inst-1": 5},
+    )
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "all",
+            "proactive_switch_threshold": 2,
+        },
+    )
+
+    await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert manager.reassign_calls == []
+    # Q-2: no alternative account resets the streak so the slot keeps serving
+    # a fresh full cycle instead of rescanning on every request.
+    assert manager.reset_calls == ["inst-1"]
+    assert manager.streaks["inst-1"] == 0
+    assert manager.instances[0].account_id == accounts["solo"].id
+
+
+@pytest.mark.asyncio
+async def test_proactive_groups_cycles_only_matching_group(tmp_path) -> None:
+    from aistudio_api.application.account_rotator import AccountRotator
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    store = AccountStore(accounts_dir=tmp_path / "accounts")
+    alpha1 = store.save_account(
+        name="alpha1",
+        email="alpha1@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+        group="alpha",
+    )
+    alpha2 = store.save_account(
+        name="alpha2",
+        email="alpha2@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+        group="alpha",
+    )
+    beta1 = store.save_account(
+        name="beta1",
+        email="beta1@example.com",
+        storage_state={"cookies": []},
+        tier="Free",
+        group="beta",
+    )
+    store.set_active_account(alpha1.id)
+    rotator = AccountRotator(store)
+    stats_alpha1 = rotator.get_account_stats(alpha1.id)
+    stats_alpha2 = rotator.get_account_stats(alpha2.id)
+    stats_beta1 = rotator.get_account_stats(beta1.id)
+    assert stats_alpha1 is not None
+    assert stats_alpha2 is not None
+    assert stats_beta1 is not None
+    stats_alpha1.last_used = 10.0
+    stats_alpha2.last_used = 5.0
+    # beta1 rested the longest but must never be selected in groups mode.
+    stats_beta1.last_used = 0.0
+
+    manager = _ConsecutiveFakeManager(
+        [make_instance("inst-1", account_id=alpha1.id, tier="Free", number=1)],
+        streaks={"inst-1": 3},
+    )
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "groups",
+            "proactive_switch_threshold": 3,
+            "proactive_switch_groups": ["alpha"],
+        },
+    )
+
+    await pipeline.begin(model_path="gemini-3.7-flash")
+    assert manager.reassign_calls == [("inst-1", alpha2.id)]
+
+    # Next full cycle returns to the first account in the allowed group.
+    manager.streaks["inst-1"] = 3
+    await pipeline.begin(model_path="gemini-3.7-flash")
+    assert manager.reassign_calls == [
+        ("inst-1", alpha2.id),
+        ("inst-1", alpha1.id),
+    ]
+    assert all(target != beta1.id for _slot, target in manager.reassign_calls)
+
+
+@pytest.mark.asyncio
+async def test_record_success_increments_slot_streak(tmp_path) -> None:
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path, ("free-a", "free-a@example.com", "Free")
+    )
+    rotator = AccountRotator(store)
+    manager = _ConsecutiveFakeManager(
+        [
+            make_instance(
+                "inst-1", account_id=accounts["free-a"].id, tier="Free", number=1
+            )
+        ],
+        streaks={},
+    )
+    pipeline = _proactive_pipeline(manager, store=store, rotator=rotator, settings={})
+    context = await pipeline.begin(model_path="gemini-3.7-flash")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+
+    pipeline.record_success(context, attempt)
+    pipeline.record_success(context, attempt)
+
+    assert manager.streaks["inst-1"] == 2
+    await pipeline.release(attempt)
+
+
+class _NeverEnterLock:
+    """Lock stand-in that fails if anything enters it."""
+
+    async def __aenter__(self):
+        raise AssertionError("proactive fast path must not take _heal_lock")
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_proactive_fast_path_skips_global_heal_lock(tmp_path) -> None:
+    """P2-2: below-threshold requests never serialize on the global heal lock."""
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free-a", "free-a@example.com", "Free"),
+        ("free-b", "free-b@example.com", "Free"),
+    )
+    rotator = AccountRotator(store)
+    manager = _ConsecutiveFakeManager(
+        [
+            make_instance(
+                "inst-1", account_id=accounts["free-a"].id, tier="Free", number=1
+            )
+        ],
+        streaks={"inst-1": 1},
+    )
+    manager.account_tiers[accounts["free-b"].id] = "Free"
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "all",
+            "proactive_switch_threshold": 5,
+        },
+    )
+    cast("Any", pipeline)._heal_lock = _NeverEnterLock()
+
+    await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_rotation_does_not_touch_lru_when_reassign_fails(
+    tmp_path,
+) -> None:
+    """Q-3: the outgoing account only rests after a confirmed rebind."""
+    from aistudio_api.application.account_rotator import AccountRotator
+    from tests.unit.test_instance_manager import _store_with_accounts
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free-a", "free-a@example.com", "Free"),
+        ("free-b", "free-b@example.com", "Free"),
+    )
+    rotator = AccountRotator(store)
+    a = accounts["free-a"].id
+    b = accounts["free-b"].id
+    stats_a = rotator.get_account_stats(a)
+    assert stats_a is not None
+    stats_a.last_used = 10.0
+    manager = _ConsecutiveFakeManager(
+        [make_instance("inst-1", account_id=a, tier="Free", number=1)],
+        streaks={"inst-1": 2},
+        fail_reassign=RuntimeError("bootstrap failed"),
+    )
+    manager.account_tiers[b] = "Free"
+    pipeline = _proactive_pipeline(
+        manager,
+        store=store,
+        rotator=rotator,
+        settings={
+            "proactive_switch_mode": "all",
+            "proactive_switch_threshold": 2,
+        },
+    )
+
+    await pipeline.begin(model_path="gemini-3.7-flash")
+
+    assert manager.reassign_calls == []
+    assert stats_a.last_used == 10.0
+    assert manager.streaks["inst-1"] == 2
+
+
+class _RequireIdleRebindFakeManager:
+    """Rebind fake that accepts (and records) ``require_idle``."""
+
+    def __init__(self, instances: list[Any]) -> None:
+        from tests.unit.routing_fakes import RebindFakeManager
+
+        self._inner = RebindFakeManager(instances)
+        self.reassign_calls = self._inner.reassign_calls
+        self.account_tiers = self._inner.account_tiers
+        self.require_idle_calls: list[tuple[str, str]] = []
+
+    @property
+    def instances(self):
+        return self._inner.instances
+
+    @property
+    def configured_surfaces(self) -> frozenset[str]:
+        return self._inner.configured_surfaces
+
+    @property
+    def current_instance_id(self) -> str | None:
+        return self._inner.current_instance_id
+
+    def eligible_instances(self, *, paid: bool, surface: str | None = None):
+        return self._inner.eligible_instances(paid=paid, surface=surface)
+
+    def lane_instances(self, *, paid: bool):
+        return self._inner.lane_instances(paid=paid)
+
+    async def begin_request(self, instance_id: str):
+        return await self._inner.begin_request(instance_id)
+
+    def instance_account_ids(self) -> set[str]:
+        return self._inner.instance_account_ids()
+
+    def instance_active_requests(self, instance_id: str) -> int:
+        return self._inner.instance_active_requests(instance_id)
+
+    async def reassign(
+        self,
+        instance_id: str,
+        account_id: str,
+        *,
+        require_idle: bool = False,
+    ):
+        if require_idle:
+            self.require_idle_calls.append((instance_id, account_id))
+        return await self._inner.reassign(instance_id, account_id)
+
+
+@pytest.mark.asyncio
+async def test_heal_passes_require_idle_to_reassign() -> None:
+    """P2-1: dead-slot healing asks the manager to re-check idleness in-lock."""
+    manager = _RequireIdleRebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator(unavailable={"dead"}, target="healthy")
+    pipeline = RoutingPipeline(
+        instance_manager=cast("Any", manager),
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    healed = await pipeline._heal_unavailable_instances(  # type: ignore[attr-defined]
+        make_route("gemini-3.7-flash"), [manager.instances[0]]
+    )
+
+    assert healed == 1
+    assert manager.require_idle_calls == [("inst-1", "healthy")]
+
+
+class _RacingRebindFakeManager(_RequireIdleRebindFakeManager):
+    """Rebind fake that loses the idle race and keeps the previous binding."""
+
+    async def reassign(
+        self,
+        instance_id: str,
+        account_id: str,
+        *,
+        require_idle: bool = False,
+    ):
+        if require_idle:
+            self.require_idle_calls.append((instance_id, account_id))
+        # A request admitted between the caller's idle check and the rebind is
+        # observed by the manager's in-lock re-check, so the rebind is dropped
+        # and the record keeps its previous account.
+        for item in self.instances:
+            if item.id == instance_id:
+                return item
+        raise RuntimeError(f"unknown instance {instance_id}")
+
+
+@pytest.mark.asyncio
+async def test_heal_does_not_count_race_dropped_rebind() -> None:
+    """Q-6: a rebind dropped by a busy race is not reported as healed."""
+    manager = _RacingRebindFakeManager(
+        [make_instance("inst-1", account_id="dead", tier="Free", number=1)]
+    )
+    manager.account_tiers["healthy"] = "Free"
+    rotator = _HealingRotator(unavailable={"dead"}, target="healthy")
+    pipeline = RoutingPipeline(
+        instance_manager=cast("Any", manager),
+        rotator=cast("Any", rotator),
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+
+    healed = await pipeline._heal_unavailable_instances(  # type: ignore[attr-defined]
+        make_route("gemini-3.7-flash"), [manager.instances[0]]
+    )
+
+    assert healed == 0
+    assert manager.require_idle_calls == [("inst-1", "healthy")]
+    assert manager.instances[0].account_id == "dead"
+    assert manager.reassign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_require_idle_reassign_leaves_busy_slot_untouched(tmp_path) -> None:
+    """P2-1: a request admitted after the idle check is never drained."""
+    from aistudio_api.application.instance_manager import InstanceManager
+    from aistudio_api.infrastructure.gateway.instance_pool import (
+        InstancePool,
+        InstanceSpec,
+    )
+    from tests.unit.test_instance_manager import (
+        FakeCDP,
+        _factory,
+        _ready,
+        _store_with_accounts,
+    )
+
+    store, accounts = _store_with_accounts(
+        tmp_path,
+        ("free-a", "free-a@example.com", "Free"),
+        ("free-b", "free-b@example.com", "Free"),
+    )
+    cdp = FakeCDP()
+    pool = InstancePool(
+        cast("Any", lambda: _ready(cdp)),
+        specs=[InstanceSpec(count=1, surface="chat", min_tier="Free")],
+        max_contexts=1,
+        session_factory=_factory(cdp),
+        load_attempts=1,
+    )
+    manager = InstanceManager(pool, store, drain_timeout_s=0.0)
+    await manager.startup()
+    instance = (await manager.list_instances()).instances[0]
+    a = accounts["free-a"].id
+    b = accounts["free-b"].id
+    assert instance.account_id == a
+    slot = manager.pool_slots()[0]
+    handle = await pool.begin_request(slot.slot_id)
+    try:
+        updated = await manager.reassign(instance.id, b, require_idle=True)
+        assert updated.account_id == a
+        assert updated.state is InstanceState.ACTIVE
+        assert slot.active_requests == 1
+        assert cdp.disposed == []
+    finally:
+        handle.release()
+
+    rebound = await manager.reassign(instance.id, b, require_idle=True)
+    assert rebound.account_id == b

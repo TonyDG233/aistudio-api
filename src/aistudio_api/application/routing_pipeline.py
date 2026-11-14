@@ -22,7 +22,7 @@ import random
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from aistudio_api.application.account_orchestrator import record_rotator_event
 from aistudio_api.application.routing_eligibility import (
@@ -62,6 +62,7 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 DEFAULT_RETRY_SAME_DELAY_SEC = 2.0
 DEFAULT_SWITCH_BACKOFF_RANGE = (3.0, 5.0)
 _SWITCH_BACKOFF_ENV = "AISTUDIO_SWITCH_BACKOFF_SECONDS"
+_PROACTIVE_SWITCH_MODES = ("off", "free_only", "paid_only", "all", "groups")
 
 logger = get_logger("routing")
 
@@ -404,6 +405,29 @@ def _summarize_error(exc: Exception | None, summary: str | None = None) -> str:
     return sanitize_log_message(collapsed)[:160]
 
 
+def _call_reassign(
+    reassign: Callable[..., Any], instance_id: str, account_id: str
+) -> Any:
+    """Call ``reassign`` with ``require_idle=True`` when the manager supports it.
+
+    Production :meth:`InstanceManager.reassign` re-checks idleness under its
+    lifecycle lock, so proactive/healing rotation can never drain a request
+    admitted between the caller's check and the rebind. Older fakes and
+    managers without the keyword keep the two-argument contract.
+    """
+    try:
+        parameters = inspect.signature(reassign).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_keyword = "require_idle" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_keyword:
+        return reassign(instance_id, account_id, require_idle=True)
+    return reassign(instance_id, account_id)
+
+
 class RoutingPipeline:
     """Plan and execute one request's route over existing instances."""
 
@@ -530,6 +554,18 @@ class RoutingPipeline:
                     "登录态失效，请等待额度刷新或前往管理页检查。"
                 ),
             )
+
+        # Proactive rotation (M5): a slot that served N consecutive successful
+        # calls while idle is gently rebound to the next LRU account before this
+        # new request is admitted.  A busy slot is never touched.
+        if await self._proactive_rotate_instances(eligible, route):
+            refreshed = {
+                instance.id: instance
+                for instance in manager.eligible_instances(
+                    paid=route.paid, surface=route.surface
+                )
+            }
+            available = [refreshed.get(instance.id, instance) for instance in available]
 
         ordered = self._order(route, available)
         settings = self._routing_settings()
@@ -809,6 +845,12 @@ class RoutingPipeline:
             usage=usage,
             rotator=self._rotator_or_none(),
         )
+        incrementer = getattr(self._manager, "record_instance_request_success", None)
+        if callable(incrementer):
+            try:
+                incrementer(attempt.instance_id)
+            except Exception as exc:
+                logger.debug("[routing] 记录实例连续成功次数失败: %s", exc)
         if self._stats_recorder is not None:
             try:
                 self._stats_recorder(
@@ -1439,7 +1481,7 @@ class RoutingPipeline:
                 if not target_id or target_id == live.account_id:
                     continue
                 try:
-                    result = reassign(live.id, target_id)
+                    result = _call_reassign(reassign, live.id, target_id)
                     updated = await result if inspect.isawaitable(result) else result
                 except Exception as exc:
                     logger.warning(
@@ -1447,6 +1489,17 @@ class RoutingPipeline:
                         live.id,
                         target_id,
                         exc,
+                    )
+                    continue
+                if getattr(updated, "account_id", target_id) != target_id:
+                    # Q-6: a concurrent request occupied the slot before the
+                    # manager's in-lock idle check, so the manager dropped the
+                    # rebind and kept the previous binding. Not a heal.
+                    logger.info(
+                        "[routing] 死槽自愈跳过：实例在换绑前进入在途请求 "
+                        "instance=%s account=%s",
+                        live.id,
+                        live.account_id,
                     )
                     continue
                 bound.add(target_id)
@@ -1462,6 +1515,248 @@ class RoutingPipeline:
                     getattr(updated, "state", "-"),
                 )
         return healed
+
+    async def _proactive_rotate_instances(
+        self, eligible: Iterable[Instance], route: ModelRoute
+    ) -> int:
+        """Gently rebind idle slots that reached the consecutive-call cap.
+
+        Runs under :attr:`_heal_lock` so it can never race a concurrent
+        ``begin()``/``acquire()`` on the same slot.  Only idle slots
+        (``active_requests == 0``) rotate; a slot with an in-flight request is
+        skipped untouched, so proactive rotation never drains live work.
+
+        The outgoing account is moved to the LRU tail without any failure or
+        cooldown marker, which makes the pool cycle ``1 -> 2 -> ... -> N -> 1``
+        and reuse every account instead of pinning one slot forever.  When no
+        other healthy account exists nothing happens: the current account keeps
+        serving.
+        """
+        settings = self._routing_settings()
+        mode = (
+            str(settings.get("proactive_switch_mode", "off") or "off").strip().lower()
+        )
+        if mode == "off":
+            return 0
+        if mode not in _PROACTIVE_SWITCH_MODES:
+            logger.warning(
+                "[routing] 未知 proactive_switch_mode=%r，忽略预防性主动轮换", mode
+            )
+            return 0
+        threshold = min(
+            1000,
+            max(
+                1,
+                _as_int(settings.get("proactive_switch_threshold", 15), 15),
+            ),
+        )
+        allowed_groups: set[str] = set()
+        if mode == "groups":
+            raw_groups = settings.get("proactive_switch_groups", [])
+            if isinstance(raw_groups, (list, tuple, set, frozenset)):
+                allowed_groups = {
+                    str(group).strip() for group in raw_groups if str(group).strip()
+                }
+            if not allowed_groups:
+                return 0
+
+        manager = self._manager
+        reassign = getattr(manager, "reassign", None)
+        selector = getattr(self._rotator, "select_rebind_account", None)
+        if not callable(reassign) or not callable(selector):
+            return 0
+
+        candidates = list(eligible)
+        if not self._proactive_rotation_due(
+            candidates, route, mode, threshold, allowed_groups
+        ):
+            # P2-2 fast path: when no idle slot reached the cap, admission must
+            # never serialize on the global heal lock.
+            return 0
+
+        rotated = 0
+        async with self._heal_lock:
+            bound = self._bound_account_ids()
+            for stale in candidates:
+                live = self._live_instance(stale.id, route)
+                if live is None or not live.account_id:
+                    continue
+                if self._instance_active_requests(live.id) > 0:
+                    continue
+                consecutive = self._instance_consecutive_requests(live.id)
+                if consecutive < threshold:
+                    continue
+                if not self._proactive_mode_allows(mode, route, live, allowed_groups):
+                    continue
+                try:
+                    account = selector(
+                        lane=route.lane,
+                        model=route.model,
+                        surface=route.surface,
+                        exclude_account_ids=set(bound),
+                        only_tier=live.only_tier,
+                        min_tier=live.min_tier,
+                        max_tier=live.max_tier,
+                        required_tiers=route.required_tiers,
+                        allowed_groups=allowed_groups or None,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[routing] 预防性主动轮换选择账号失败 instance=%s: %s",
+                        live.id,
+                        exc,
+                    )
+                    continue
+                if account is None:
+                    # Q-2: no alternative account, so let the current account
+                    # serve a fresh cycle instead of rescanning every request.
+                    self._reset_instance_consecutive_requests(live.id)
+                    continue
+                target_id = str(getattr(account, "id", "") or "")
+                if not target_id or target_id == live.account_id:
+                    self._reset_instance_consecutive_requests(live.id)
+                    continue
+                try:
+                    result = _call_reassign(reassign, live.id, target_id)
+                    updated = await result if inspect.isawaitable(result) else result
+                except Exception as exc:
+                    logger.warning(
+                        "[routing] 预防性主动轮换改绑失败 instance=%s target=%s: %s",
+                        live.id,
+                        target_id,
+                        exc,
+                    )
+                    continue
+                if getattr(updated, "account_id", target_id) != target_id:
+                    # P2-1: a concurrent request occupied the slot between the
+                    # idle check and the rebind, so the manager kept the old
+                    # binding. Drop this rotation without touching the LRU.
+                    logger.info(
+                        "[routing] 预防性主动轮换跳过：实例在换绑前进入在途请求 "
+                        "instance=%s account=%s",
+                        live.id,
+                        live.account_id,
+                    )
+                    continue
+                # Q-3: move the outgoing account to the LRU tail only after the
+                # new binding is confirmed.
+                self._touch_account_last_used(live.account_id)
+                bound.add(target_id)
+                rotated += 1
+                logger.info(
+                    "[routing] 预防性主动轮换 instance=%s model=%s %s -> %s "
+                    "(连续调用=%d >= 阈值=%d, mode=%s)",
+                    live.id,
+                    route.model,
+                    live.account_id,
+                    target_id,
+                    consecutive,
+                    threshold,
+                    mode,
+                )
+        return rotated
+
+    def _proactive_rotation_due(
+        self,
+        eligible: Iterable[Instance],
+        route: ModelRoute,
+        mode: str,
+        threshold: int,
+        allowed_groups: set[str],
+    ) -> bool:
+        """Lock-free precheck: is any idle eligible slot at the cap?
+
+        This is the P2-2 fast path. It only reads already-cached instance views
+        and counters, and a hit is re-validated inside ``_heal_lock`` before any
+        rebind happens.
+        """
+        for instance in eligible:
+            live = self._live_instance(instance.id, route)
+            if live is None or not live.account_id:
+                continue
+            if self._instance_active_requests(live.id) > 0:
+                continue
+            if not self._proactive_mode_allows(mode, route, live, allowed_groups):
+                continue
+            if self._instance_consecutive_requests(live.id) >= threshold:
+                return True
+        return False
+
+    def _proactive_mode_allows(
+        self,
+        mode: str,
+        route: ModelRoute,
+        live: Instance,
+        allowed_groups: set[str],
+    ) -> bool:
+        """Whether one slot participates in the configured proactive scope."""
+        lane = "paid" if route.paid else "free"
+        if mode == "free_only":
+            return lane == "free"
+        if mode == "paid_only":
+            return lane == "paid"
+        if mode == "all":
+            return True
+        if mode == "groups":
+            return bool(allowed_groups) and (
+                self._account_group(live.account_id) in allowed_groups
+            )
+        return False
+
+    def _account_group(self, account_id: str) -> str:
+        store = self._accounts
+        getter = getattr(store, "get_account", None)
+        if not callable(getter):
+            return "default"
+        try:
+            account = getter(account_id)
+        except Exception:
+            return "default"
+        return str(getattr(account, "group", "default") or "default")
+
+    def _instance_consecutive_requests(self, instance_id: str) -> int:
+        getter = getattr(self._manager, "instance_consecutive_requests", None)
+        if not callable(getter):
+            return 0
+        try:
+            return max(0, _as_int(getter(instance_id), 0))
+        except Exception:
+            return 0
+
+    def _reset_instance_consecutive_requests(self, instance_id: str) -> int:
+        """Clear one slot's streak when proactive rotation has no target (Q-2)."""
+        resetter = getattr(
+            self._manager, "reset_instance_consecutive_requests", None
+        )
+        if not callable(resetter):
+            return 0
+        try:
+            return max(0, _as_int(resetter(instance_id), 0))
+        except Exception as exc:
+            logger.debug("[routing] 重置实例连续成功次数失败: %s", exc)
+            return 0
+
+    def _touch_account_last_used(self, account_id: str) -> None:
+        """Move the outgoing account to the LRU tail (no failure/cooldown)."""
+        rotator = self._rotator_or_none()
+        if rotator is None or not account_id:
+            return
+        marker = getattr(rotator, "mark_account_used", None)
+        if callable(marker):
+            try:
+                marker(account_id)
+                return
+            except Exception as exc:
+                logger.debug("[routing] 更新账号 LRU 时间戳失败: %s", exc)
+        getter = getattr(rotator, "get_account_stats", None)
+        if not callable(getter):
+            return
+        try:
+            stats = getter(account_id)
+        except Exception:
+            return
+        if stats is not None:
+            cast("Any", stats).last_used = time.time()
 
     async def _switch_or_raise(
         self,

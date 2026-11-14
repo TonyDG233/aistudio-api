@@ -20,9 +20,13 @@
 | **Stage 2.1.3 同源兄弟失效传播** | `account_orchestrator` 将 `session_expired` 传播至同源兄弟账号，rotator 镜像过期态排除调度 | 已完成（PASS） | 见 `P3-pool-instance/reviews/REV-2.1.3.1-session-expired-sibling-sync.md` |
 | **Stage 2.2.0 防风控自愈补丁** | 瞬态 `RequestError`（204/404/408/425/5xx）与 hang/超时只同号重试 1 次、耗尽直接抛错不踢健康号；`begin()` 死槽自愈与预算耗尽 `record_budget=False` 尽力换绑；独立 `verification_required` 仅隔离单号；429/验证切号 3–5s 随机退避；keepalive 过滤禁用/过期/锁定账号；发现与刷新请求头对齐 Firefox/152；300s 超时接入生产装配；`_heal_lock` 串行化死槽自愈 | 已完成（PASS） | [`reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md`](reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md) |
 | **后续演进：异步/多槽竞态优化** | `REV-2.2.0.2` 的 P2-1/P2-2 已闭环；保留非阻塞 Q-7（pytest 环境探测）、Q-8（瞬态重试退避）、Q-10（释放句柄时机）与独立 `verification_locked` 状态作为后续演进 | 按需跟进 | [`reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md`](reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md) §7.5 |
+| **2.2.0.5 LRU 选号修复 + 预防性主动轮换** | `select_rebind_account` / `_pick_account` 改严格 LRU（消除 5 号乒乓、模型级 429 隔离）；新增 `proactive_switch_mode/threshold/groups` 前后端打通（`off/free_only/paid_only/all/groups`）、槽位连击累计与空闲期主动换绑；`SchedulingCard.vue` 移动端防挤压适配；P2-1/P2-2 并发修复与 Q-2/Q-3/Q-4 收口 | 已完成（PASS；P2-1/P2-2 与 Q-2/Q-3/Q-4 已闭环） | [`reviews/REV-2.2.0.5-lru-and-proactive-switch.md`](reviews/REV-2.2.0.5-lru-and-proactive-switch.md) |
 
 ## `reviews/` 审查报告与截图索引
 
 - [`reviews/REV-B2-4-p2-routing.md`](reviews/REV-B2-4-p2-routing.md) — B2-4 多实例池路由、Tier 403、429 重试切换只读审查（2026-10-29，PASS）
 - [`reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md`](reviews/REV-2.2.0.2-anti-correlation-and-timeout-guard.md) — Stage 2.2.0 防风控自愈补丁（瞬态/hang 不切号、死槽自愈、verification_required 单号隔离、429 切号退避、keepalive 过滤、请求头对齐）只读审查（2026-11-14，**PASS**：P1-1/P2-1/P2-2 与 Q-1~Q-6/Q-9 已闭环；Q-7/Q-8/Q-10 为非阻塞残留）
-- 截图资产：无（纯后端路由域）。
+- [`reviews/REV-2.2.0.5-lru-and-proactive-switch.md`](reviews/REV-2.2.0.5-lru-and-proactive-switch.md) — LRU 全池大循环选号修复（消除 5 号乒乓 + 模型级 429 隔离）与预防性主动轮换（`proactive_switch_mode/threshold/groups`）前后端打通、移动端防挤压适配只读审查（2026-11-14，**PASS**：P2-1/P2-2 与 Q-2/Q-3/Q-4 已闭环，Q-1/Q-5 / N-1~N-4 非阻塞；4 分辨率沙盒实测无溢出/重叠）
+- 截图资产：
+  - [`reviews/assets/rev-2.2.0.5-proactive-switch-desktop-1440.png`](reviews/assets/rev-2.2.0.5-proactive-switch-desktop-1440.png) — 1440×900 主动轮换卡片（指定分组展开态）
+  - [`reviews/assets/rev-2.2.0.5-proactive-switch-mobile-375.png`](reviews/assets/rev-2.2.0.5-proactive-switch-mobile-375.png) — 375×812 移动端卡片（指定分组展开态）

@@ -156,6 +156,22 @@ test('schema recommended values match defaults/config.yaml', () => {
   }
 })
 
+test('proactive switch schema entries match the distribution defaults', () => {
+  const mode = CONFIG_SCHEMA['features.routing.proactive_switch_mode']
+  expect(mode?.defaultValue).toBe(defaults.features.routing.proactive_switch_mode)
+  expect(mode?.recommendedValue).toBe('free_only')
+
+  const threshold = CONFIG_SCHEMA['features.routing.proactive_switch_threshold']
+  expect(threshold?.defaultValue).toBe(
+    defaults.features.routing.proactive_switch_threshold,
+  )
+  expect(threshold?.recommendedValue).toBe(15)
+
+  const groups = CONFIG_SCHEMA['features.routing.proactive_switch_groups']
+  expect(groups?.defaultValue).toEqual(defaults.features.routing.proactive_switch_groups)
+  expect(groups?.recommendedValue).toEqual([])
+})
+
 test('entries without a single default hide the recommended badge', () => {
   for (const key of [
     'system.drop_unsupported_params',

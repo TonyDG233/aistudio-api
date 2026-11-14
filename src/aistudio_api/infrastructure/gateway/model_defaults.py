@@ -56,6 +56,12 @@ DEFAULT_SWITCH_BACKOFF_SEC = 4.0
 MIN_SWITCH_BACKOFF_SEC = 0.0
 MAX_SWITCH_BACKOFF_SEC = 30.0
 
+DEFAULT_PROACTIVE_SWITCH_MODE = "off"
+DEFAULT_PROACTIVE_SWITCH_THRESHOLD = 15
+MIN_PROACTIVE_SWITCH_THRESHOLD = 1
+MAX_PROACTIVE_SWITCH_THRESHOLD = 1000
+_VALID_PROACTIVE_SWITCH_MODES = ("off", "free_only", "paid_only", "all", "groups")
+
 _LEGACY_KEEPALIVE_KEYS = (
     "auto_switch",
     "auto_switch_interval_hours",
@@ -243,6 +249,20 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
             )
             raw_routing["switch_backoff_sec"] = _normalize_switch_backoff_sec(
                 raw_routing.get("switch_backoff_sec", DEFAULT_SWITCH_BACKOFF_SEC)
+            )
+            raw_routing["proactive_switch_mode"] = _normalize_proactive_switch_mode(
+                raw_routing.get("proactive_switch_mode", DEFAULT_PROACTIVE_SWITCH_MODE)
+            )
+            raw_routing["proactive_switch_threshold"] = (
+                _normalize_proactive_switch_threshold(
+                    raw_routing.get(
+                        "proactive_switch_threshold",
+                        DEFAULT_PROACTIVE_SWITCH_THRESHOLD,
+                    )
+                )
+            )
+            raw_routing["proactive_switch_groups"] = _normalize_proactive_switch_groups(
+                raw_routing.get("proactive_switch_groups", [])
             )
 
         default_features = defaults.get("features")
@@ -1439,11 +1459,77 @@ def _normalize_switch_backoff_sec(raw: object) -> float:
     return min(MAX_SWITCH_BACKOFF_SEC, max(MIN_SWITCH_BACKOFF_SEC, parsed))
 
 
+def _normalize_proactive_switch_mode(raw: object) -> str:
+    """Coerce ``features.routing.proactive_switch_mode`` into a known mode."""
+    if isinstance(raw, str):
+        mode = raw.strip().lower()
+        if mode in _VALID_PROACTIVE_SWITCH_MODES:
+            return mode
+    logger.warning(
+        "配置 features.routing.proactive_switch_mode 非法（%r），回退默认 %s",
+        raw,
+        DEFAULT_PROACTIVE_SWITCH_MODE,
+    )
+    return DEFAULT_PROACTIVE_SWITCH_MODE
+
+
+def _normalize_proactive_switch_threshold(raw: object) -> int:
+    """Coerce the consecutive-call cap into 1..1000 (default 15).
+
+    Integral floats such as ``20.0`` are narrowed to ``int`` so a hand-written
+    YAML float is honored instead of silently falling back; booleans,
+    fractional floats, strings and out-of-range values use the default.
+    """
+    value: object = raw
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < MIN_PROACTIVE_SWITCH_THRESHOLD
+        or value > MAX_PROACTIVE_SWITCH_THRESHOLD
+    ):
+        logger.warning(
+            "配置 features.routing.proactive_switch_threshold 非法（%r），回退默认 %s",
+            raw,
+            DEFAULT_PROACTIVE_SWITCH_THRESHOLD,
+        )
+        return DEFAULT_PROACTIVE_SWITCH_THRESHOLD
+    return value
+
+
+def _normalize_proactive_switch_groups(raw: object) -> list[str]:
+    """Coerce the groups scope into a de-duplicated, non-empty string list."""
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        logger.warning(
+            "配置 features.routing.proactive_switch_groups 非法（%r），回退默认 []",
+            raw,
+        )
+        return []
+    groups: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            logger.warning(
+                "配置 features.routing.proactive_switch_groups 含非字符串项（%r），已忽略",
+                item,
+            )
+            continue
+        group = item.strip()
+        if group and group not in groups:
+            groups.append(group)
+    return groups
+
+
 def _routing_defaults() -> dict[str, object]:
     return {
         "max_switches": 2,
         "retry_same_delay_sec": _RETRY_SAME_DELAY_DEFAULT_SEC,
         "switch_backoff_sec": DEFAULT_SWITCH_BACKOFF_SEC,
+        "proactive_switch_mode": DEFAULT_PROACTIVE_SWITCH_MODE,
+        "proactive_switch_threshold": DEFAULT_PROACTIVE_SWITCH_THRESHOLD,
+        "proactive_switch_groups": [],
     }
 
 
@@ -1971,6 +2057,17 @@ def get_configured_routing_settings(
         "retry_same_delay_sec": _resolve_retry_same_delay(raw_routing),
         "switch_backoff_sec": _normalize_switch_backoff_sec(
             raw_routing.get("switch_backoff_sec", DEFAULT_SWITCH_BACKOFF_SEC)
+        ),
+        "proactive_switch_mode": _normalize_proactive_switch_mode(
+            raw_routing.get("proactive_switch_mode", DEFAULT_PROACTIVE_SWITCH_MODE)
+        ),
+        "proactive_switch_threshold": _normalize_proactive_switch_threshold(
+            raw_routing.get(
+                "proactive_switch_threshold", DEFAULT_PROACTIVE_SWITCH_THRESHOLD
+            )
+        ),
+        "proactive_switch_groups": _normalize_proactive_switch_groups(
+            raw_routing.get("proactive_switch_groups", [])
         ),
     }
 

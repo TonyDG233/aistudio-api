@@ -823,3 +823,79 @@ def test_default_tier_quotas_free_flash_limit_and_hydrogen_bucket():
         "Ultra",
         "Ultra_20X",
     )
+
+
+def test_proactive_switch_defaults_off_and_threshold_fifteen(tmp_path):
+    path = _write_config(tmp_path, "features:\n  routing: {}\n")
+
+    settings = get_configured_routing_settings(path)
+
+    assert settings["proactive_switch_mode"] == "off"
+    assert settings["proactive_switch_threshold"] == 15
+    assert settings["proactive_switch_groups"] == []
+
+
+def test_proactive_switch_normalizes_mode_threshold_and_groups(tmp_path):
+    path = _write_config(
+        tmp_path,
+        "features:\n  routing:\n"
+        "    proactive_switch_mode: Groups\n"
+        "    proactive_switch_threshold: 42\n"
+        "    proactive_switch_groups: [alpha, ' beta ', alpha, '']\n",
+    )
+
+    settings = get_configured_routing_settings(path)
+
+    assert settings["proactive_switch_mode"] == "groups"
+    assert settings["proactive_switch_threshold"] == 42
+    assert settings["proactive_switch_groups"] == ["alpha", "beta"]
+
+
+def test_proactive_switch_accepts_integral_float_threshold(tmp_path):
+    path = _write_config(
+        tmp_path,
+        "features:\n  routing:\n    proactive_switch_threshold: 20.0\n",
+    )
+
+    settings = get_configured_routing_settings(path)
+
+    assert settings["proactive_switch_threshold"] == 20
+    assert isinstance(settings["proactive_switch_threshold"], int)
+
+
+def test_proactive_switch_invalid_values_fall_back_to_defaults(tmp_path):
+    path = _write_config(
+        tmp_path,
+        "features:\n  routing:\n"
+        "    proactive_switch_mode: nope\n"
+        "    proactive_switch_threshold: 0\n"
+        "    proactive_switch_groups: not-a-list\n",
+    )
+
+    settings = get_configured_routing_settings(path)
+
+    assert settings["proactive_switch_mode"] == "off"
+    assert settings["proactive_switch_threshold"] == 15
+    assert settings["proactive_switch_groups"] == []
+
+
+def test_validate_config_mapping_normalizes_proactive_switch_block():
+    normalized = validate_config_mapping(
+        {
+            "features": {
+                "routing": {
+                    "proactive_switch_mode": "ALL",
+                    "proactive_switch_threshold": 1001,
+                    "proactive_switch_groups": ("x", "x", " y ", 3),
+                }
+            }
+        }
+    )
+
+    features = normalized.get("features")
+    assert isinstance(features, dict)
+    routing = features.get("routing")
+    assert isinstance(routing, dict)
+    assert routing["proactive_switch_mode"] == "all"
+    assert routing["proactive_switch_threshold"] == 15
+    assert routing["proactive_switch_groups"] == ["x", "y"]
