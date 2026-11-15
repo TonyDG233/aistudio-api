@@ -2,6 +2,11 @@
 
 本文档记录 Google AI Studio 官方 Web 客户端与 Google WAA (Web Attestation & Anti-abuse / BotGuard) 服务端的交互协议、数据链路与验证逻辑。
 
+> [!NOTE]
+> **双引擎说明（2.1.x）**：本仓库支持 `browser`（默认）与 `browserless` 两种全局运行引擎：
+> - **`browser` 模式**：使用下文所述的浏览器页面内 `BotGuardService` + Wasm 沙箱链路与页面内 Fetch/XHR 重放；
+> - **`browserless` 模式**：不启动 Chromium 实例，由内置 `waa-signer`（基于 SpiderMonkey 152 + Firefox 152 宿主环境）独立完成 `Waa/Create` 挑战握手与 `!` 前缀证明（proof）铸造，再由 `BrowserlessSession` 直连发送请求（详见 `docs/WAA_VM_ARCHITECTURE.md` 与 `waa-signer/README.md`）。
+
 ---
 
 ## 目录
@@ -477,7 +482,7 @@ BotGuard 与 WAA 会采集 WebGL/屏幕/UA/硬件指标。容器或 Termux 启�
 7. **JS 覆盖面**：`navigator.hardwareConcurrency/deviceMemory`、`screen.width/height`、WebGL `UNMASKED_VENDOR_WEBGL`/`UNMASKED_RENDERER_WEBGL` 等（`fingerprint_spoof.js:61-62`、`:306-344`）。
 8. **只读摘要**：`get_account_fingerprint` 不启动浏览器即可返回 `id · gpu · WxH@dpr · c/GB`，用于实例/账号 UI（`fingerprint.py:420-433`、`routes_instances.py:82-99`）。
 
-配置开关为 `browser.fingerprint_spoof_enabled`（默认 `true`）或 `AISTUDIO_FINGERPRINT_SPOOF` 环境变量（`defaults/config.yaml:49-52`、`aistudio_api/config.py:337-388`）。
+配置开关为 `browser.fingerprint_spoof_enabled`（默认 `true`）或 `AISTUDIO_FINGERPRINT_SPOOF` 环境变量（`defaults/config.yaml:84-85`、`aistudio_api/config.py:337-388`）。
 
 ### 10.2 C1d 快照写入、预热与质量校验
 

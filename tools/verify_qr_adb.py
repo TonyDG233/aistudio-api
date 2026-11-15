@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Island（炼妖壶）工作资料 + ADB 实机 verify-account 全链路工具。
 
-**【实机验证结论留档：Island 工作资料（User 10）独立设备 ID 扫码验证已成功打通】**
+**【实机验证最终结论：验证配额绑定物理设备主板 TEE，重建工作资料无法刷新】**
 
 经真机实测确认，此前报 ``doesn't meet device security requirements`` 的根因是手机内的
 Google Play 服务（``com.google.android.gms``）版本偏旧（``26.43.30``）。将 Google Play
 服务升级至最新 ``26.44.32+``、在工作资料（Island 壶中界 ``User 10``）内开启 VPN 代理并登录
-待验证的 Google 账号后，通过本脚本向 ``User 10`` 注入二维码挑战链接可 **100% 正常通过验证**，
-且全程使用 ``User 10`` 独立的 ``ANDROID_ID``。
+待验证的 Google 账号后，通过本脚本向 ``User 10`` 注入二维码挑战链接可在工作资料内正常完成
+扫码验证，且全程使用 ``User 10`` 独立的 ``ANDROID_ID``。
 
-当单个工作资料达到验证次数上限时，可通过 ``reset-island`` 子命令引导销毁并重建工作资料以获取
-全新的 ``ANDROID_ID``，并一键映射恢复 GMS、浏览器与 VPN 环境。
+但用户最终实测确认：当整台物理手机累计验证达 **5 个账号** 后，即使通过 ``reset-island``
+销毁并重建工作资料（更换 ``ANDROID_ID``）仍会触发设备上限拦截——证明 Google
+``recaptcha.net/qr/`` 的滚动验证配额（约 5 个账号/台，恢复周期大于 24 小时，预计按周/月
+滚动）绑定在物理设备主板 TEE 硬件证明信息上，无法通过重建工作资料无限刷新。
+
+因此本脚本保留作为免摄像头剪贴板二维码解码 + ADB 推送验证辅助工具。
 
 一条命令完成：递交二维码（图片 / 剪贴板 / URL）→ 连接 ADB → 对比并抓取主空间
 （User 0）与 Island 工作资料（User 10）的 ANDROID_ID / GSF ID → 安全校验后把

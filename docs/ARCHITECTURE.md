@@ -2,7 +2,7 @@
 
 本文档说明本仓库的系统架构、实例模型、请求路由、单页生命周期、保活、日志与协议中立生成链。文档以当前 HEAD 代码为事实标准；出现分歧时以代码为准，并同步回本文档。所有实现引用均使用 `file:line`。
 
-当前版本为 2.0.0：Gemini、OpenAI Chat Completions、Claude Messages 与 OpenAI Responses 四协议默认启用，共享同一条生成主链、SSE 首包/保活与双口径统计台账；浏览器侧按账号注入确定性 Windows 桌面指纹。
+当前版本为 2.1.x（双引擎架构基线）：支持 `browser`（默认，CloakBrowser CDP）与 `browserless`（无浏览器 HTTP + `waa-signer`）双引擎全局切换；Gemini、OpenAI Chat Completions、Claude Messages 与 OpenAI Responses 四协议默认启用，共享同一条生成主链、SSE 首包/保活与双口径统计台账；浏览器与无浏览器侧均按账号注入确定性桌面指纹。
 
 ---
 
@@ -47,14 +47,15 @@ flowchart TD
 
     subgraph APP["2. Application 应用层 (application/)"]
         Generation["generation_service.py<br/>协议中立生成主链"]
-        Routing["routing_pipeline.py<br/>候选排序 / 获取 / 重试 / 改绑"]
+        Routing["routing_pipeline.py<br/>LRU 轮换 / 死槽自愈 / 改绑"]
         Eligibility["routing_eligibility.py<br/>surface / lane / tier 准入"]
         Safety["routing_safety.py<br/>单请求切号预算"]
         Instances["instance_manager.py<br/>实例生命周期与 D-05 换绑"]
+        EngineSwitch["engine_switch.py<br/>双引擎热切换与槽位重建"]
         Keepalive["account_keepalive.py<br/>24h Cookie / 元数据"]
         ChatSvc["chat_service.py<br/>请求规范化"]
         Signature["signature_cache.py<br/>PG-01 思维签名缓存"]
-        ATG["atg/<br/>合成工具传输"]
+        ATG["atg/<br/>输入/输出合成工具双轨包装<br/>(input_wrapper.py)"]
         Contracts["contracts/<br/>Gemini/OpenAI/Claude/Responses DTO"]
         Formats["format_converters/<br/>四协议请求/响应/媒体"]
     end
@@ -77,12 +78,18 @@ flowchart TD
         Streaming["gateway/streaming.py<br/>流式终态与分发"]
         Transport["gateway/transport.py<br/>CDP Binding 流传输"]
         Discovery["gateway/model_discovery.py<br/>ListModels / Paid 真值"]
+        WAA["waa/<br/>browserless_session / signer_client<br/>local_daemon / engine_runtime"]
         Browser["browser/<br/>CDP / CloakBrowser / JS / fingerprint"]
-        Account["account/<br/>Cookie / 账号存储"]
+        Account["account/<br/>Cookie / cookie_rotator / 账号存储"]
         Logs["utils/logger.py<br/>log_broadcast.py"]
     end
 
+    subgraph TOOLS["外部辅助工具 (tools/)"]
+        CookieGrabber["src/aistudio_api/tools/aistudio-cookie-grabber.user.js<br/>Tampermonkey 同源多登 Cookie 提取"]
+    end
+
     Client --> API
+    CookieGrabber -. "导出 Cookie" .-> Account
     API --> APP
     APP --> DOMAIN
     INFRA --> DOMAIN
@@ -90,6 +97,8 @@ flowchart TD
     Pooled --> Browser
     Session --> Browser
     BotGuard --> Browser
+    EngineSwitch -. "切换 / 重建" .-> WAA
+    EngineSwitch -. "切换 / 重建" .-> Pool
 ```
 
 **依赖约束**：
@@ -125,15 +134,22 @@ flowchart TD
 | Application | `routing_eligibility.py` | surface/lane/required tier 解析与 Paid 准入 |
 | Application | `routing_safety.py` | 单请求 `max_switches` 预算；无熔断/租约 |
 | Application | `instance_manager.py` | 实例记录、启动、创建、关闭、`reassign`、D-05 `rebind_account` |
-| Application | `account_keepalive.py` | 24h Cookie 回写、tier/email 刷新、可选控制页活动 |
+| Application | `engine_switch.py` | 运行时双引擎（`browser` / `browserless`）热切换与槽位重建 |
+| Application | `account_keepalive.py` | 24h Cookie 回写、tier/email 刷新、`/RotateCookies` 协调、可选控制页活动 |
 | Application | `chat_service.py` | Gemini/OpenAI 请求归一、多模态、工具 Struct、`[toolshape]` |
 | Application | `signature_cache.py` | 按 `call_id` 持久化真实 `thoughtSignature`，TTL 30 天 |
 | Application | `format_converters/` | Gemini/OpenAI/Claude/Responses 请求响应与媒体转换 |
 | Application | `atg/` | 合成工具包装、提取、修复、流式解包 |
+| Application | `atg/input_wrapper.py` | ATG 输入封装：文本历史包为 `atg_ctx_*` Struct，图片保留在同 Turn 原生视觉槽位 `[2]` |
 | Domain | `model_access.py` | Tier 排序、Paid 判定、lane 推导与 tier 选择器单源 |
 | Infrastructure | `instance_pool.py` | 单页实例、`active_requests`、有界 retire、Page→Context 关闭顺序、tier 同步 |
 | Infrastructure | `pooled_session.py` | 池化会话的 Page/Cookie/模板/快照/传输/鉴权刷新 |
 | Infrastructure | `session.py` | 控制面单页会话与有界 rebind（D-05/D-10/D-11） |
+| Infrastructure | `waa/browserless_session.py` | 无浏览器模式槽位会话：HTTP/TLS 传输、Cookie 与确定性指纹管理 |
+| Infrastructure | `waa/signer_client.py` | WAA 签名客户端：调用本地签名守护进程完成 `/v1/proof/mint` 与 `/v1/rpc/send` |
+| Infrastructure | `waa/local_daemon.py` | `waa-signer` 本地守护进程生命周期与端口托管 |
+| Infrastructure | `waa/engine_runtime.py` | `browserless` 引擎运行时装配与槽位工厂管理 |
+| Infrastructure | `account/cookie_rotator.py` | `/RotateCookies` HTTP 滚动续期、同源多登凭据同步与根会话失效整组隔离 |
 | Infrastructure | `browser/fingerprint.py` | 按账号确定性 Windows 桌面指纹与注入脚本 |
 | Infrastructure | `gateway/transport.py` | `refresh_page_auth_state`：403 重签前强制刷新 CDP Cookie |
 | Infrastructure | `botguard_bootstrap.py` | WAA 握手、Temporary Chat、真实模板捕获、输入清理 |
@@ -142,6 +158,7 @@ flowchart TD
 | Infrastructure | `stream_parser.py` | XSSI 去除、增量分块、截断 JSON 修复 |
 | Infrastructure | `streaming.py` | finish/usage 终态、`CONTINUING=22`、工具流空闲 STOP |
 | Infrastructure | `logger.py` / `log_broadcast.py` | 三 Sink、ring、SSE、脱敏、归档 |
+| Tools | `src/aistudio_api/tools/aistudio-cookie-grabber.user.js` | Tampermonkey 油猴脚本，提取同源多登账号（`u/0..u/N`）完整 Cookie |
 
 ---
 
@@ -274,7 +291,7 @@ sequenceDiagram
 
 Live Free 真值优先：真实 `paid is False` 且无 Paid `accessModes` 的记录，静态子串规则（如 `image`）不得把它覆盖为 Paid（`model_discovery.py:300-320`、`601-660`、`routing_eligibility.py:134-164`）。
 
-### 4.2 负载均衡顺序
+### 4.2 负载均衡、LRU 全池大循环与预防性主动轮换
 
 `RoutingPipeline._order` 的排序键（`routing_pipeline.py:466-506`）：
 
@@ -293,29 +310,35 @@ Live Free 真值优先：真实 `paid is False` 且无 Paid `accessModes` 的记
 
 sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个槽垄断流量。候选包含 `UNSTARTED/SLEEPING/STARTING/ACTIVE`；请求到达会唤醒所有合格休眠实例（`instance_manager.py:253-272`、`518-558`）。
 
-### 4.3 错误恢复
+同时，在账号选取与主动轮换层面引入两项协同机制，驱动全池账号平缓大循环：
+
+- **LRU 第一优先级选号**：`AccountRotator.select_rebind_account` 与 `InstanceManager._pick_account` 均以 `last_used`（最久未使用 LRU）为第一排序优先级（`(last_used, tier_rank, total_requests, model_requests_total)`），确保改绑或新槽激活优先启用休息最久的健康账号。
+- **预防性主动轮换**：支持 `proactive_switch_mode`（`off` / `free_only` / `paid_only` / `all` / `groups`）与 `proactive_switch_threshold`（默认 `15` 次）配置；当槽位空闲且同一账号连续成功调用达到阈值时，在下一轮请求到来前主动平缓换绑至下一 LRU 健康账号，降低单账号连续高强度调用触发 429 或风控的概率。
+
+### 4.3 错误恢复与风控隔离
 
 | 错误 | 策略 | 实现 |
 |---|---|---|
-| `UsageLimitExceeded` (429) | 同账号退避（默认 2.0s）重试一次 → 池内切号 → 预算耗尽返回 503 | `routing_pipeline.py:754-910`、`:822-853`、`:1102-1150` |
-| `AuthError` (403) | 首次强制刷新页面鉴权（CDP Cookie）并同账号重签重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py:778-820`、`:912-954`、`transport.py:157-183` |
+| `UsageLimitExceeded` (429) | **首击直接退避切号**：不做同账号二次硬撞重试；首次命中即记录模型级冷却（60s → 300s → 600s）并刷新 `last_used`，经 `switch_backoff_sec`（默认 `4.0s` ±25% 抖动）退避后切换至下一健康 LRU 账号；预算耗尽返回 503 | `routing_pipeline.py`、`account_rotator.py` |
+| `AuthError` (403) | 首次强制刷新页面鉴权（CDP Cookie / Browserless 凭据）并同账号重签重试；第二次切号；Paid tier 403 不切号 | `routing_pipeline.py:778-820`、`:912-954`、`transport.py:157-183` |
 | `SessionExpiredError` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:769-776` |
-| `session_hang` | 清模板缓存；未出正文则切号/改绑 | `routing_pipeline.py:892-899` |
-| `RequestError` 204/404 | 同账号重试一次；204 仍空 → `BrowserTransportError` | `routing_pipeline.py:855-890` |
+| `verification_required` (`verify-account`) | 识别 Google 移动设备验证风控，单账号独立标记隔离（**不连坐同源兄弟号**）；未出正文则清模板并切号/改绑 | `routing_pipeline.py`、`account_rotator.py` |
+| 上游瞬态错误（204/404/408/5xx）与传输超时（`is_browser_session_hang_error`） | 按 `retry_same_delay_sec`（默认 `2.0s`）同账号原位重试 1 次（清模板）；仍失败/超时则直接抛出，**绝不触发切号** | `routing_pipeline.py` |
 | 已出正文 | 不切号，直接抛出 | `has_yielded_data` 分支（`routing_pipeline.py:772-776`、`:788-790`） |
 
 `RoutingBudget` 只记录连续切号次数，同账号重试不计入；默认 `max_switches=2`（`routing_safety.py:13-49`、`routing_pipeline.py::RoutingPipeline.begin`）。没有 lease、reservation、defer、pinned、circuit breaker 或后台 rebalance。
 
-### 4.4 失败槽立即改绑（immediate failed-slot rebind）
+### 4.4 死槽自愈与失败槽立即改绑（immediate failed-slot rebind）
 
-当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/session_expired/session_hang 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py:956-1100`）：
+- **`begin()` 死槽自愈**：每次 `RoutingPipeline.begin()` 在选路前自动检测处于异常/不可用状态的死槽，并执行自愈改绑（`reassign(require_idle=True)`，仅在槽位空闲时替换健康账号），避免死槽长期滞留占用池容量。
+- **失败槽立即改绑**：当某 lane 只有 1 个配置槽、但账号库里有多个健康账号时，429/403 二次/`session_expired`/`verification_required` 不能只靠“切到另一个实例”恢复。`_try_rebind` 的处理（`routing_pipeline.py:956-1100`）：
 
 1. 释放当前 `ActiveRequest` 句柄（否则池拒绝激活）。
 2. 清空该实例的模板缓存。
 3. 若实例仍有在途请求，跳过改绑（`instance_active_requests > 0`）。
 4. 排除 `failed_accounts`、`attempted_accounts`、当前账号，以及已绑定到其他实例的账号。
-5. 调用 `AccountRotator.select_rebind_account`，按 lane、模型、surface、tier 区间/required tiers、可用性筛选，选择最小 tier → 总请求数 → 模型请求数 → LRU 的账号（`account_rotator.py:648-710`）。
-6. 调用 `InstanceManager.reassign`（`instance_manager.py:424-478`）原位关闭旧 Page/Context 并激活新账号；成功后更新候选、消耗一次切号预算、清模板缓存。
+5. 调用 `AccountRotator.select_rebind_account`，按 lane、模型、surface、tier 区间/required tiers、可用性筛选，以 `last_used`（最久未使用 LRU）为第一优先级选择健康账号（排序键 `(last_used, tier_rank, total_requests, model_requests_total)`）。
+6. 调用 `InstanceManager.reassign`（`instance_manager.py:424-478`）原位关闭旧运行态（Page/Context 或 `BrowserlessSession`）并激活新账号；成功后更新候选、消耗一次切号预算、清模板缓存。
 7. 没有其他候选时 `reuse=True`，请求重新取该槽；有其他候选时 `reuse=False`，当前请求继续走其他槽，失败槽已被修复供后续请求使用。
 
 没有“每槽只能 rebind 一次”的硬上限；循环保护来自 `attempted_accounts`/`failed_accounts` 与单请求 `max_switches` 预算。
@@ -369,6 +392,7 @@ sticky 只是最终 tie-break：它让健康槽保持登录，但不会让单个
 - 所有 job 共用一把全局串行锁；busy 时立即返回 `{"reason":"busy"}`，**不推进** `next_due`（`account_keepalive.py:225-251`）。
 - 失败按 job 短重试：无活动页 60s、刷新进行中 60s、普通失败 300s；成功才按 24h 间隔推进（`account_keepalive.py:212-223`）。
 - `auth_update` 按账号聚合每个 slot 的结果；只有该账号全部尝试成功才 `mark_auth_saved`，部分失败返回 `partial` 并记录失败 slot（`account_keepalive.py:409-503`）。
+- **`/RotateCookies` 自动续期与同源兄弟凭据同步**：`infrastructure/account/cookie_rotator.py` 支持通过 Google `/RotateCookies` HTTP 端点滚动续期短周期 Cookie，并在同源多登子账号（`u/0..u/N`）间按 `expires` 时间戳比较同步最新凭据（防止旧凭据回灌）；若底层根会话失效则整组同步隔离。同时后台刷新与保活流程跳过已处于 `is_auth_locked`（如 `expired` / `verification_required`）的账号，防止误洗白。
 - 启动时 keepalive metadata refresh 先跑，app 侧用 `covered_ids` 去重；已验证 Free 且 `tier_checked_at` 在 3 天内跳过 benefit-tier 探测（`api/app.py:194-301`、`509-537`）。
 - 429 冷却（60/300/600）与美西午夜跨天重置仍由 `AccountRotator` 负责（`account_rotator.py`）。
 
@@ -448,6 +472,9 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:838-9
 ### 8.3 ATG（Anti-Truncation Gateway）
 
 - 默认 off，按协议/模型开启；`mode` 支持 `off/prefer/required`，`mode_by_format` 可按 gemini/openai/claude/responses 覆盖（`defaults/config.yaml:134-150`、`application/atg/config.py`）。
+- **输入 / 输出双独立开关**：提供 `wrap_output`（默认 `true`，输出合成工具通道注入与还原）与 `wrap_input`（默认 `false`，输入历史封装）两个独立开关，可按场景单独启用或组合使用。
+- **图文双轨分流（`application/atg/input_wrapper.py`）**：开启 `wrap_input` 时，文本对话历史被封装为 `atg_ctx_*` `functionResponse` Struct，同时将多模态图片 `inlineData` 保留在同 Turn 原生视觉槽位 `[2]`，兼顾长上下文防截断/防越狱与原生视觉识图能力。
+- **可编辑提示词模板**：支持自定义 `control_template`（输出合成控制模板）与 `input_context_instruction`（输入上下文封装指令）。
 - `prefer`：注入合成传输；上游未返回合成工具调用时回落纯文本。
 - `required`：必须出现合成调用，否则 `SyntheticRequiredError`。
 - 流式解包对 `body/thinking/tool_calls/images/reasoning_images` 事件调用 unwrapper；`usage/finish_reason/response_id/thought_signature` 等其他事件原样透传（`generation_service.py:49-59`、`:382-611`）。
@@ -526,7 +553,7 @@ ListModels 单条模型字段（0-based 数组下标，`model_discovery.py:838-9
 - **Client**：每个客户端生成请求只记一次终态。`generation_service._record_client_terminal`（`generation_service.py:161-227`）
   通过 `RoutingPipeline.record_client`（`routing_pipeline.py:718-739`）写入；字段为
   `requests/success/errors/aborted/rate_limited/rescued_requests`（`state.py:142-200`）。
-- 429 同号重试或切号成功后，Client 仍只记 1 次成功并计 1 次 `rescued`；Attempt 会记录失败尝试与最终成功两条。
+- 429 切号或 403/瞬态错误重试成功后，Client 仍只记 1 次成功并计 1 次 `rescued`；Attempt 会记录失败尝试与最终成功两条。
 - `countTokens` 独立进入 `count_tokens` 台账（`state.py:243-269`、`:882-898`），不进入生成成功率分母，也不计入生成 Token 总量。
 - 统计持久化为 v2 envelope：`schema_version/models/daily/count_tokens`（`state.py:40-66`、`:725-750`）；
   `load_stats` 只从 `models`/`daily` 读取，保留键（`finish_reasons` 等）不会被渲染为模型行（`state.py:626-709`）。

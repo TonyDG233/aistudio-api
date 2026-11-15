@@ -14,6 +14,7 @@
 | **C5a 全仓文档与规格收尾终审** | 核对中英文 README、`changelog.md`、6 份规格文档、`AGENT.md` 行号/锚点/代码事实一致性 | 已完成（PASS） | `reviews/REV-C5a.md` |
 | **域双层治理重构与文档同步** | `B-docs-and-audit`→`docs-and-audit`、重复 `P` 域归并、新建 `P10-android-apk`、`INDEX.md` 及 `AGENT.md`/`05` 同步 | 已完成（PASS） | `reviews/REV-2.1.3.2-domains-restructure.md` |
 | **2.1.3 版本标号制度与审查收口** | 四位标号规范写入 `AGENT.md`/`INDEX.md`、5 份 `REV-2.1.3.1~5` 统一重命名与写法质量审计、`changelog.md` `[2.1.3]` 整理 | 已完成（PASS） | `reviews/REV-2.1.3.6-versioning-and-review-audit.md` |
+| **2.1.4.1 README 与 9 份核心文档重写及契约对齐** | 独立只读核查 `README.md`/`README_EN.md`（对标 `upstream/master`）及 `waa-signer/README.md` + 6 份 `docs/*.md` 契约与 `defaults/config.yaml` 一致性（初审 `P1-1`/`P2-1..3`/`Q-1` 已复审关闭） | 已完成（PASS） | `reviews/REV-2.1.4.1-readme-and-docs-overhaul.md` |
 | **常态文档架构治理** | 维护 `docs/` 规格、`AGENT.md` 与 `domains/INDEX.md` 双层治理体系同步演进 | 持续进行中 | 后续 `REV-X.Y.Z.W-<slug>.md` 统一落盘 `reviews/` |
 
 ## 0.1 `reviews/` 审查报告索引
@@ -26,6 +27,7 @@
 - [`reviews/REV-C5a.md`](reviews/REV-C5a.md) — C5a 根目录文档、全量规格与 `AGENT.md` 终审（2026-11-08，PASS）
 - [`reviews/REV-2.1.3.2-domains-restructure.md`](reviews/REV-2.1.3.2-domains-restructure.md) — 2.1.3.2 `domains/` 双层治理重构、`P10-android-apk` 与 `AGENT.md`/`05` 同步审查（2026-11-13，PASS）
 - [`reviews/REV-2.1.3.6-versioning-and-review-audit.md`](reviews/REV-2.1.3.6-versioning-and-review-audit.md) — 2.1.3.6 四位版本标号制度固化、`REV-2.1.3.1~5` 写法审计与 `[2.1.3]` changelog 收口审查（2026-11-13，PASS）
+- [`reviews/REV-2.1.4.1-readme-and-docs-overhaul.md`](reviews/REV-2.1.4.1-readme-and-docs-overhaul.md) — 2.1.4.1 README 重写与 9 份核心文档契约一致性独立只读审查及复审关闭（2026-11-15，PASS）
 
 ---
 

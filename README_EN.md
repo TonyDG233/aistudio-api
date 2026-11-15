@@ -1,8 +1,8 @@
 # aistudio-api
 
 <p align="center">
-  <a href="https://github.com/TonyDG233/aistudio-api"><img src="https://img.shields.io/badge/API-Gemini%20v1beta-4285F4?style=flat-square&logo=google" alt="Gemini API"></a>
-  <a href="https://deepwiki.com/TonyDG233/aistudio-api"><img src="https://img.shields.io/badge/DeepWiki-TonyDG233%2Faistudio--api-5B68E4?style=flat-square&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==" alt="DeepWiki"></a>
+  <a href="https://github.com/TonyDG233/aistudio-api"><img src="https://img.shields.io/badge/API-Gemini%20%7C%20OpenAI%20%7C%20Claude%20%7C%20Responses-4285F4?style=flat-square&logo=google" alt="Supported Protocols"></a>
+  <a href="https://deepwiki.com/TonyDG233/aistudio-api"><img src="https://img.shields.io/badge/DeepWiki-TonyDG233%2Faistudio--api-5B68E4?style=flat-square&logo=bookstack&logoColor=white" alt="DeepWiki"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/Framework-FastAPI-009688?style=flat-square&logo=fastapi" alt="FastAPI"></a>
   <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Vite-4FC08D?style=flat-square&logo=vuedotjs" alt="Vue 3"></a>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/Python-3.11%2B%20%7C%20uv-261230?style=flat-square&logo=python" alt="Python uv"></a>
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  A Google AI Studio reverse proxy gateway that exposes one unified backend through Gemini, OpenAI, Claude, and OpenAI Responses protocols.
+  Google AI Studio reverse proxy service that exposes web AI Studio as four standard API protocols: <b>Google Gemini (<code>/v1beta</code>)</b>, <b>OpenAI Chat (<code>/v1/chat/completions</code>)</b>, <b>Claude Messages (<code>/v1/messages</code>)</b>, and <b>OpenAI Responses (<code>/v1/responses</code>)</b>.
 </p>
 
 <p align="center">
@@ -22,23 +22,22 @@
 ## Table of Contents
 
 - [Features](#features)
-- [Protocol Matrix](#protocol-matrix)
-- [Architecture](#architecture)
-- [Instance Pool and Account Scheduling](#instance-pool-and-account-scheduling)
-- [Engines (Browser / Browserless)](#engines-browser--browserless)
-- [Large-Context Tool Calling and SillyTavern](#large-context-tool-calling-and-sillytavern)
-- [Browser Fingerprint and Keepalive](#browser-fingerprint-and-keepalive)
+- [Architecture & Documentation](#architecture--documentation)
 - [Quick Start](#quick-start)
+  - [Docker Deployment](#docker-deployment)
   - [Android (Termux)](#android-termux)
   - [Windows](#windows)
   - [Linux / macOS](#linux--macos)
-  - [Docker / Compose](#docker--compose)
-- [Configuration and Environment Variables](#configuration-and-environment-variables)
-- [Web Console](#web-console)
-- [Client Integration](#client-integration)
-- [Development and Testing](#development-and-testing)
-- [Documentation](#documentation)
-- [Acknowledgments](#acknowledgments)
+- [Obtaining & Importing Account Credentials (Cookies)](#obtaining--importing-account-credentials-cookies)
+- [Third-Party Client Setup Guide (SillyTavern / Cherry Studio / Claude Code / NextChat)](#third-party-client-setup-guide-sillytavern--cherry-studio--claude-code--nextchat)
+- [Configuration & Environment Variables](#configuration--environment-variables)
+- [API Usage Examples](#api-usage-examples)
+  - [cURL](#curl)
+  - [Python SDK (google-genai)](#python-sdk-google-genai)
+  - [Function Calling](#function-calling)
+- [Web Management Console](#web-management-console)
+- [Development & Testing](#development--testing)
+- [Credits & Acknowledgments](#credits--acknowledgments)
 - [License](#license)
 
 ---
@@ -47,357 +46,68 @@
 
 | Feature | Description |
 |---|---|
-| **Four protocol faces** | One protocol-neutral generation pipeline serves Gemini `/v1beta`, OpenAI `/v1/chat/completions`, Claude `/v1/messages`, and OpenAI Responses `/v1/responses`. Gemini is always on; OpenAI / Claude / Responses are enabled by default and can be disabled in `features.formats`. |
-| **Multi-instance account pool** | One instance = one account + one BrowserContext + one Page + one surface (chat or build). Instances are declared with `count`, `surface`, and tier selectors; Free and Paid lanes stay isolated. |
-| **Dual-engine hot switch** | `browser` (CloakBrowser/CDP) and `browserless` (built-in waa-signer, no Chromium) are global alternatives. Saving in the console runs Validate → Preflight → Drain → Destroy → Rebuild → Commit with automatic rollback; new requests receive 503 + `Retry-After` during the switch. |
-| **Built-in WAA signer** | In browserless mode, waa-signer executes the BotGuard challenge with SpiderMonkey 152 and sends protected RPC over uTLS/HTTP2/HTTP3. It supports an auto-started local subprocess or an explicit remote endpoint. |
-| **Tier admission** | `only_tier` / `min_tier` / `max_tier` form a closed interval. Free models only hit Free instances; paid models only hit instances whose account tier matches. Insufficient paid tier returns a local 403 without switching accounts or downgrading. |
-| **429 / 403 scheduling** | 429 retries the same account after a short backoff, then wakes or switches eligible pooled instances, bounded by a switch budget. 403 has no hard cooldown: the first failure re-signs and retries in place, the second switches to a healthy account. |
-| **Large-context tool calls** | PG-01 thought-signature cache, PG-04 Struct coercion, and PG-08 lenient tool history keep long sessions and tool chains valid against Gemini upstream. |
-| **SillyTavern compatibility** | Missing or duplicate tool-call ids, orphan tool outputs, and invalid JSON arguments are normalized instead of producing a 400 when a preset rebuilds the tool channel. |
-| **SSE anti-524** | The first event has a bounded pre-read window. After it expires, the server returns 200 and emits `: keepalive` comment frames so gateways such as Cloudflare do not answer 524 for a silent connection. |
-| **WAA snapshot warmup** | On the first request, after long idle periods, for large payloads, or when a snapshot fails the quality check, a page-local warmup runs before the one-time signature is fetched. |
-| **ATG anti-truncation** | A built-in Anti-Truncation Gateway synthetic tool transport, off by default, can enable `prefer` / `required` per protocol via `mode_by_format`; model settings only drive text/non_text filtering. |
-| **Deterministic desktop fingerprint** | A per-account stable Windows desktop screen and GPU (WebGL) fingerprint is injected via CDP before navigation and stays consistent across restarts. |
-| **24h keepalive** | Upstream auth and account metadata (tier / email) refresh every 24 hours by default and can be triggered manually from the console. |
-| **Persistent state** | Accounts, statistics, 429 cooldowns, model cache, and tool signatures are persisted separately, so service restarts do not lose state. |
-| **Web console** | Four pages: dashboard, accounts, settings, and logs. Statistics trends are embedded directly in the dashboard. |
-| **UI Debug sandbox** | With `AISTUDIO_UI_DEBUG=1`, a pure in-memory and temp-directory sandbox blocks real browsers, real accounts, outbound requests, and real disk writes. |
-| **Lightweight CDP** | Pure Python asynchronous WebSocket access to the Chrome DevTools Protocol, without Node.js, Playwright, or Selenium. |
-| **Android companion app** | `android/` is a native Jetpack Compose app with isolated multi-profile login, Bitwarden autofill, and one-click bundle export. |
+| **Four-Protocol Native Compatibility** | Supports Gemini `/v1beta`, OpenAI `/v1/chat/completions`, Claude `/v1/messages`, and OpenAI Responses `/v1/responses` with Thinking, multimodal inputs, function calling, and `countTokens`. |
+| **Dual-Engine Hot Switch (Browserless WAA / Controlled Browser)** | Switch live in the Web Console between the lightweight browserless engine (`waa-signer` with SpiderMonkey 152 + Firefox 152 uTLS fingerprint, ~80–150 MB RAM) and the `browser` engine (CloakBrowser Chromium). |
+| **Free / Pro Tiered Pool & Anti-Risk Rotation** | Physically isolates Free and Pro+ pools so free models never consume Pro quota; features full-pool LRU rotation, **proactive idle rotation (rotates smoothly every N successful calls, scoped to Free-only / Paid-only / all / custom groups)**, 429 first-hit backoff switching without blind retries, and automatic `verify-account` isolation. |
+| **Long-Lived Cookie Renewal & Tampermonkey Grabber** | Includes a Tampermonkey script to export cross-domain long-lived `.json` credential bundles (with `LSID`); supports automatic `/RotateCookies` rolling renewal, multi-login sub-account probing (`u/0..u/N`), and cookie sync. |
+| **ATG Anti-Truncation & SillyTavern Compatibility** | Optional dual-switch Anti-Truncation Gateway (`wrap_input` text/media dual-track split + `wrap_output` synthetic tool streaming unwrap with editable templates), plus automatic tool-history repair and thought-signature caching for SillyTavern presets. |
+| **Persistent State & Web Management Console** | Accounts, token stats, 429 cooldowns, and model cache persist to disk; the Web Console provides trend charts, account and slot management, visual config hot-reloading, and live SSE log streaming. |
+| **Dynamic Model Discovery & Parameter Filtering** | Automatically syncs available models upstream and applies per-model safety settings and unsupported-parameter filtering to prevent 400 rejections. |
+| **SSE Keepalive Anti-Timeout** | Streaming endpoints use a first-event pre-read window and periodic heartbeat frames so reverse proxies like Cloudflare do not time out (524) on long thinking turns. |
+| **Deterministic Fingerprint & Separate Auth** | Generates per-account deterministic desktop fingerprints and keeps external API keys completely separate from the Web Console password. |
+| **Android Companion App** | `android/` provides a native Jetpack Compose app with isolated multi-profile login, Bitwarden autofill, and credential bundle export. |
 
 > [!NOTE]
-> **Memory footprint**: The standalone Python backend uses about 35 - 45 MB RAM. With one controlled Chromium instance, total system memory (PSS) is about 350 - 450 MB (~250 - 350 MB on native Linux). At least 1 GB free RAM is recommended on Android Termux.
+> **Memory Footprint**: With the `browserless` engine, resident memory is only ~80–150 MB with near-instant startup. With the `browser` (CloakBrowser Chromium) engine, a single controlled browser instance uses ~350–450 MB total RAM (~250–350 MB on native Linux).
 
----
-
-## Protocol Matrix
-
-| Protocol | Method and Endpoint | Details |
-|---|---|---|
-| **Gemini** | `POST /v1beta/{model}:generateContent` | Non-streaming generation |
-| | `POST /v1beta/{model}:streamGenerateContent?alt=sse` | Streaming generation |
-| | `POST /v1beta/{model}:countTokens` | Real upstream count, returns `totalTokens` |
-| | `GET /v1beta/models`, `GET /v1beta/models/{model}` | Dynamic model discovery |
-| **OpenAI Chat** | `POST /v1/chat/completions` | Streaming and non-streaming, tool calls, multimodal input, image output |
-| | `GET /v1/models`, `GET /v1/models/{model}` | OpenAI-style model list |
-| **Claude** | `POST /v1/messages` | Streaming and non-streaming, tool calls, thinking, images |
-| | `POST /v1/messages/count_tokens` | Returns `input_tokens` |
-| **OpenAI Responses** | `POST /v1/responses` | Supports `input`, `instructions`, tools, and streaming events |
-| | `POST /v1/responses/input_tokens` | Returns `input_tokens` |
-
-None of the three countTokens endpoints consume generation quota or enter generation success-rate and token statistics.
-
-Protocol switches live in `defaults/config.yaml`:
-
-```yaml
-features:
-  formats:
-    openai: true
-    claude: true
-    responses: true
-    media:
-      allow_private_urls: false
-```
-
----
-
-## Architecture
+## Architecture & Documentation
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│ Clients: Gemini SDK / OpenAI SDK / Claude SDK / SillyTavern    │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ HTTP / SSE (four protocols)
-┌──────────────────────────────▼───────────────────────────────┐
-│               FastAPI API layer (default port 8080)           │
-│  routes_gemini / routes_openai / routes_claude /              │
-│  routes_responses / routes_models / routes_system             │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ conversion + unified auth
-┌──────────────────────────────▼───────────────────────────────┐
-│              Application: GenerationService                   │
-│  RoutingPipeline (candidates, retries, switching,             │
-│  active_requests), SignatureCache (PG-01), ATG, converters    │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ scheduling and admission
-┌──────────────────────────────▼───────────────────────────────┐
-│ InstancePool: 1 instance = account + Context + Page + surface │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ one global engine
-        ┌──────────────────────┴───────────────────────┐
-        │ browser (default)                             │ browserless
-┌───────▼──────────────────────────────┐  ┌────────────▼──────────────────────────────┐
-│ Controlled CloakBrowser (Chromium)   │  │ Built-in waa-signer (SpiderMonkey 152)    │
-│ in-page XHR Replay + CDP             │  │ proof minting + native uTLS/HTTP2/HTTP3   │
-└───────┬──────────────────────────────┘  └────────────┬──────────────────────────────┘
-        └──────────────────────┬───────────────────────┘
-                               │ HTTPS / RPC
-┌──────────────────────────────▼───────────────────────────────┐
-│                Google AI Studio (alkalimakersuite)            │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│  Client (Gemini / OpenAI / Claude / Responses / Tavern)│
+└───────────────────────────┬────────────────────────────┘
+                            │ HTTP / SSE
+┌───────────────────────────▼────────────────────────────┐
+│              FastAPI HTTP Gateway (Port 8080)          │
+├───────────────────────────┬────────────────────────────┤
+│  Instance Pool & LRU      │  4-Protocol Adapters /     │
+│  Anti-Risk Routing        │  ATG / Wire Codec          │
+└───────────────────────────┼────────────────────────────┘
+                            │ Live Engine Switch
+        ┌───────────────────┴───────────────────┐
+        │ browserless (WAA)                     │ browser (CloakBrowser)
+┌───────▼───────────────────────┐ ┌─────────────▼──────────────────────┐
+│ waa-signer (SpiderMonkey 152) │ │ Controlled Chromium + CDP + XHR    │
+└───────┬───────────────────────┘ └─────────────┬──────────────────────┘
+        └───────────────────┬───────────────────┘
+                            │ HTTPS / RPC
+┌───────────────────────────▼────────────────────────────┐
+│         Google AI Studio (alkalimakersuite-pa)         │
+└────────────────────────────────────────────────────────┘
 ```
 
-The code is organized in four layers: `api/` (protocols and auth), `application/` (generation, routing, instances, keepalive, ATG), `domain/` (pure models and error contracts), and `infrastructure/` (browser, CDP, wire codecs, accounts, logging). The application layer never imports FastAPI or the API layer.
+Technical reference documentation:
 
----
-
-## Instance Pool and Account Scheduling
-
-### Instance definition
-
-- **One instance = one account + one BrowserContext + one Page + one surface**.
-- The chat and build surfaces of the same account never coexist. To switch surface, close the instance and rebuild it, or use another account.
-- Instances are the scheduling and concurrency unit; Context/Page are implementation details and are not user-configurable.
-- Global capacity is limited by `max_contexts` (1 - 16; defaults to the sum of instance `count`, capped at 16).
-
-### Configuration example
-
-```yaml
-instances:
-  - count: 1
-    surface: chat
-    only_tier: Free
-  - count: 1
-    surface: chat
-    min_tier: Pro
-
-max_contexts: 2
-```
-
-### Tier selectors
-
-At least one of `only_tier` / `min_tier` / `max_tier` is required; semantics are a closed interval:
-
-- `only_tier: Free` normalizes to `Free..Free`; `only_tier: Ultra` expands to `Ultra..Ultra_20X`; `Plus` / `Pro` stay exact.
-- A standalone `min_tier: Free` means `Free..Free`; a standalone paid `min_tier` means `min..Ultra_20X`.
-- A standalone `max_tier` uses `Pro` as the paid lower bound and must not be lower than `Pro`.
-- `min_tier` + `max_tier` requires `min <= max`; Free and paid lanes cannot be mixed.
-- Unknown tier names or non-string values fail fast at startup.
-
-### Concurrency and scheduling
-
-- `active_requests` is the only concurrency primitive: success, failure, cancellation, disconnect, and stream close all release it in `finally`.
-- **429**: retry the same account after `retry_same_delay_sec` (default 2 seconds); if it still fails, wake or switch to an eligible pooled instance. Consecutive switching is bounded by `max_switches` (default 2), and per-request scheduling retries by `max_retries` (default 5).
-- **429 cooldowns**: short rate limit 60 seconds, continuous drip 300 seconds, extended cooldown 600 seconds; all configurable.
-- **403 auth**: no hard cooldown. The first 403 re-signs and retries in place; the second 403 switches to a healthy account.
-- **Paid tier insufficient (D-04)**: returns a local 403 with `tier/model/required_tier/current_tier`, without switching, downgrading to Free, or using 503.
-- **Routing exhausted (D-06)**: returns 503 rendered in the current protocol's error format.
-- **In-place rebind**: when an account is disabled or a preset is applied, stop new requests and wait in a bounded way for `active_requests` to reach zero (or force-close on timeout), then close the old Page/Context and switch accounts; no concurrent page is created during the transition.
-- After body bytes have been sent, the account is not switched; a streaming response stays on its instance until completion.
-
-### Quota scope
-
-`rotator.quota_scope` supports:
-
-- `account` (default): chat and build share the account quota.
-- `account_surface`: chat and build are accounted separately.
-
-This only affects statistics keys, quota display, and 429 cooldown scope; it does not create new instances.
-
----
-
-## Engines (Browser / Browserless)
-
-### Engine boundaries
-
-The engine is a global either/or choice set by `engine.mode`, defaulting to `browser`:
-
-- **browser**: one instance = one account + one BrowserContext + one Page + one surface, using controlled CloakBrowser (Chromium) with in-page XHR replay.
-- **browserless**: one instance = one account + one BrowserlessSession + one surface, with no Chromium. Each slot owns its own Cookies, deterministic fingerprint, proof minter, and transport; sessions and response headers are never shared across slots.
-
-Both engines share the same protocol faces, routing, accounts, statistics, keepalive, and logging. Switching engines does not change slot counts or tier selectors.
-
-### Hot switch from the console
-
-Saving `engine.mode` on the Settings page runs a transactional switch:
-
-1. **Validate**: validate the target engine settings and slot topology; invalid input returns 422.
-2. **Preflight**: establish one usable session with the new engine; failure returns 503 while the old engine keeps serving.
-3. **Drain**: wait for in-flight requests with a bounded timeout.
-4. **Destroy**: close old slots and the old engine (including CloakBrowser processes when leaving `browser`).
-5. **Rebuild**: rebuild the original slot topology and account bindings on the new engine.
-6. **Commit**: persist the new config and engine epoch; any failure rolls back the old engine and config.
-
-New requests during the switch receive 503 with `Retry-After`. `GET /api/system/status`, `GET /api/instances`, and `POST /api/engine/health-check` expose the engine, switch phase, and health result.
-
-### WAA signer: local and remote
-
-browserless mode delegates proof signing to waa-signer, which can be deployed in two ways:
-
-```yaml
-engine:
-  mode: browserless
-  browserless:
-    signer:
-      mode: local_subprocess      # local_subprocess | remote_http
-      endpoint: http://127.0.0.1:8081
-      binary_path: waa-signer/bin/waa-signer
-      auto_start: true
-      state_dir: data/waa/workers
-      max_workers: 8
-      idle_ttl_s: 900
-      locale: en-US
-      timezone: America/Los_Angeles
-```
-
-- `local_subprocess`: `binary_path` resolves relative to the repository root; with `auto_start: true` the main service spawns the process and waits for `/health`.
-- `remote_http`: point `endpoint` at a remote signer; the main service does not spawn a local process.
-- `state_dir` stores Worker fingerprints and interpreter caches and resolves relative to the process working directory (`/app/data/waa/workers` in Docker, persisted with the data volume).
-- `max_workers` must cover the number of instance slots; `locale` and `timezone` should match the declared account environment.
-
-### Single-image dual engines in Docker
-
-The official image bundles both CloakBrowser and waa-signer:
-
-- A multi-stage build produces a statically linked waa-signer at `/app/waa-signer/bin/waa-signer`, matching the default `engine.browserless.signer.binary_path`.
-- `local_subprocess` + `auto_start` is the default, so switching to browserless starts the signer automatically without an extra container or mount.
-- To run the signer separately, set `mode: remote_http` and point `endpoint` at it.
-- Both engines share the same image and data volume; no image rebuild is needed to switch engines.
-
----
-
-## Large-Context Tool Calling and SillyTavern
-
-### PG-01 thought-signature cache
-
-Gemini requires historical `functionCall` parts to carry a `thoughtSignature`. When a client (OpenAI / Claude adapter or a SillyTavern preset) rebuilds the tool channel and loses the signature, the gateway restores it by tool-call id:
-
-- Cache file: `data/signature_cache.json`
-- Capacity: 4096 entries; TTL: 30 days
-- Reads do not consume entries and can be reused across turns
-- A placeholder signature accepted by upstream is used when no real signature exists
-
-### PG-04 Struct coercion
-
-`functionCall` arguments and `functionResponse` results are always coerced into Struct shapes. Invalid string JSON arguments are wrapped into a legal object instead of producing a 400. Logs only emit a sanitized `[toolshape]` summary (argument names, types, lengths) and never prompt or tool content.
-
-### PG-08 lenient tool history
-
-Compatibility normalization for common SillyTavern shapes:
-
-- Missing tool-call ids are synthesized deterministically
-- Duplicate ids are deduplicated and renumbered
-- Orphan tool outputs are wrapped as legal tool results
-- Invalid JSON arguments are preserved and wrapped as Struct
-- Logs use the `[pg08]` prefix and never include message bodies
-
-### C1c SSE first packet and heartbeat (anti-524)
-
-- The first-event pre-read window is 15 seconds by default; if an event arrives, streaming starts normally.
-- After the window expires, the server returns HTTP 200 and immediately emits `: keepalive\n\n`, then one heartbeat every 15 seconds.
-- Once output has started, an upstream failure ends the stream with an SSE error rather than a silent disconnect.
-- Environment overrides:
-  - `AISTUDIO_SSE_KEEPALIVE_SEC` (default 15)
-  - `AISTUDIO_SSE_PREREAD_WINDOW_SEC` (default follows the keepalive interval)
-
-### C1d WAA snapshot warmup
-
-Snapshot warmup is a page-local call and does not depend on switching models. Before fetching the real signature, Python runs a local warmup on the first request, after more than 600 seconds since the last snapshot, when the payload or hash prompt reaches 32 KiB, or when a forced refresh is requested.
-
-Both warmup and the real snapshot call `dms[snapKey](service, hash)` inside the page:
-
-- Only the last 256 Unicode code points of the prompt are written to the composer textarea; the full payload never enters the DOM, while the hash still covers the full prompt.
-- Warmup uses a 64-zero placeholder hash and is best-effort; a warmup failure never blocks the real snapshot.
-- Snapshot quality requires a length `>=1520` bytes/characters (JS string length) and a leading `!`; a low-quality first result triggers one warmup and retry, and a second failure raises `low_quality_snapshot`.
-- Calls are serialized through `aistudio.snapQueue`, and the textarea is cleared in `finally`.
-
-### ATG anti-truncation gateway
-
-ATG extracts model output from the tool channel through a synthetic tool call so long text is not truncated upstream. It is off by default:
-
-```yaml
-features:
-  atg:
-    mode: "off"            # off | prefer | required
-    mode_by_format:
-      gemini: inherit
-      openai: inherit
-      claude: inherit
-      responses: inherit
-    tool_prefix: atg_emit_
-    control_position: tail
-    strict: false
-    empty_retries: 2
-    recovery: repair
-    client_synthetic_guard: true
-```
-
-- `mode` is the global default; `mode_by_format` overrides it per protocol (gemini/openai/claude/responses, where `inherit` follows the global value).
-- `text_model_pattern` / `non_text_model_pattern` only drive text/non_text model filtering; there is no per-model mode switch.
-- `prefer`: fall back to plain text when the synthetic call is missing.
-- `required`: fail explicitly when the synthetic call is missing.
-- `client_synthetic_guard`: skip local wrapping when the client already ships an equivalent synthetic transport.
-
----
-
-## Browser Fingerprint and Keepalive
-
-- **Deterministic fingerprint**: stable Windows desktop screen size, device pixel ratio, WebGL vendor/renderer, and related metrics are generated per account and injected via CDP before navigation. Enabled by default; disable with `browser.fingerprint_spoof_enabled: false`.
-- **Low-memory Chromium flags**: single renderer process, in-process GPU, V8 heap limit, ANGLE SwiftShader, and muted audio.
-- **24h keepalive**: auth and metadata refresh every 24 hours by default, plus a metadata refresh at startup. Manual trigger is available in the console.
-- **429 daily reset**: account model limits reset on the Pacific natural day.
-- **Single-page lifecycle**: at most one active Page per account; rebinding uses a bounded drain and never creates a concurrent page.
+- [System Architecture Specification (ARCHITECTURE.md)](./docs/ARCHITECTURE.md)
+- [Instance Pool & Routing Specification (INSTANCE_POOL_AND_ROUTING_SPEC.md)](./docs/INSTANCE_POOL_AND_ROUTING_SPEC.md)
+- [Protocol & Tool-Call Specification (PROTOCOL_AND_TOOLCALL_SPEC.md)](./docs/PROTOCOL_AND_TOOLCALL_SPEC.md)
+- [Keepalive & Logging Specification (KEEPALIVE_AND_LOGGING_SPEC.md)](./docs/KEEPALIVE_AND_LOGGING_SPEC.md)
+- [Wire Protocol Specification (WIRE_SPECIFICATION.md)](./docs/WIRE_SPECIFICATION.md)
+- [BotGuard Verification Chain (BOTGUARD_VERIFICATION_CHAIN.md)](./docs/BOTGUARD_VERIFICATION_CHAIN.md)
+- [WAA VM Architecture (WAA_VM_ARCHITECTURE.md)](./docs/WAA_VM_ARCHITECTURE.md)
+- [Changelog (changelog.md)](./docs/changelog.md)
+- [Agent & Engineering Conventions (AGENT.md)](./AGENT.md)
 
 ---
 
 ## Quick Start
 
-### Android (Termux)
+### Docker Deployment
 
-> [!TIP]
-> Install Termux from [F-Droid](https://f-droid.org/packages/com.termux/) or [GitHub Releases](https://github.com/termux/termux-app/releases). Do not use the Google Play build.
+> [!NOTE]
+> The official Docker image comes with both `waa-signer` (browserless engine) and `CloakBrowser` (controlled browser engine) pre-built inside the container—**ready out of the box** with one-click switching in the Web Console. If you need an outbound proxy to reach Google, add `-e AISTUDIO_PROXY=http://host.docker.internal:7890` (Windows/macOS) or your host proxy URL.
 
-```bash
-# 1. Update the base environment and install git
-pkg update -y && pkg install -y git
-
-# 2. Clone the repository
-git clone https://github.com/TonyDG233/aistudio-api.git
-cd aistudio-api
-
-# 3. Initialize dependencies (mobile mirrors are configured automatically)
-bash scripts/setup-env.sh
-uv sync
-
-# 4. Install the controlled browser (first run only, about 1-2 minutes)
-bash scripts/setup-browser.sh
-
-# 5. Start the service
-uv run python main.py server --port 8080
-```
-
-Open `http://localhost:8080` and import Cookies or a credential bundle under Accounts. Also tap `Acquire Wakelock` in the Termux notification and disable battery optimization for Termux.
-
-### Windows
-
-Prerequisite: [Python 3.11+](https://www.python.org/downloads/) with `Add python.exe to PATH` checked.
-
-```bat
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-git clone https://github.com/TonyDG233/aistudio-api.git
-cd aistudio-api
-uv sync
-scripts\install-browser.bat
-uv run python main.py server --port 8080
-```
-
-### Linux / macOS
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/TonyDG233/aistudio-api.git
-cd aistudio-api
-uv sync
-bash scripts/setup-browser.sh
-uv run python3 main.py server --port 8080
-```
-
-Open `http://localhost:8080` after startup.
-
-### Docker / Compose
-
-The image bundles both CloakBrowser (browser engine) and waa-signer (browserless engine), so one container can hot-switch between them:
+Start with `docker run`:
 
 ```bash
 docker run -d \
@@ -406,204 +116,305 @@ docker run -d \
   -p 8080:8080 \
   -v aistudio-api-data:/app/data \
   -e AISTUDIO_WEB_PASSWORD=your-console-password \
-  ghcr.io/tonydg233/aistudio-api:2.1.0
+  ghcr.io/tonydg233/aistudio-api:latest
 ```
 
-GHCR provides both the pinned baseline `ghcr.io/tonydg233/aistudio-api:2.1.0` and the rolling `ghcr.io/tonydg233/aistudio-api:latest` tag. With `docker run`, the container initializes `/app/data/config.yaml` from `/app/defaults/config.yaml` on first start. waa-signer lives at `/app/waa-signer/bin/waa-signer` and is started automatically by the browserless engine, with no extra container or mount.
-
-Before using the repository's root `docker-compose.yml`, you must prepare `config.yaml` on the host; it is bind-mounted over `/app/config.yaml`. If the file does not exist, Docker creates a directory with that name and the entrypoint cannot materialize the template as the `/app/config.yaml` file:
+Or start with Docker Compose:
 
 ```bash
+# Prepare host config.yaml before using the root docker-compose.yml
 cp defaults/config.yaml config.yaml
 docker compose up -d
 ```
 
-`docker-compose.deploy.yml` uses a named volume and `/app/data/config.yaml`, so it can initialize from `/app/defaults/config.yaml` on first start. Open `http://localhost:8080` after startup.
+---
+
+### Android (Termux)
+
+> [!TIP]
+> Install Termux from [F-Droid](https://f-droid.org/packages/com.termux/) or [GitHub Releases](https://github.com/termux/termux-app/releases). **Do NOT use the Google Play Store build.**
+
+Open Termux and run the following commands step by step:
+
+```bash
+# Step 1: Update base packages and install git
+pkg update -y && pkg install -y git
+
+# Step 2: Clone repository and enter directory
+git clone https://github.com/TonyDG233/aistudio-api.git
+cd aistudio-api
+
+# Step 3: Initialize Python environment & sync dependencies
+bash scripts/setup-env.sh
+uv sync
+
+# Step 4: Start the server
+uv run python main.py server --port 8080
+```
+
+<details>
+<summary><b>[Optional Advanced] Install controlled browser or build local waa-signer</b></summary>
+
+- If using the default `browser` (controlled Chromium) engine, run once:
+  ```bash
+  bash scripts/setup-browser.sh
+  ```
+- If switching to the lightweight `browserless` engine, build local `waa-signer` (see [waa-signer README](./waa-signer/README.md)):
+  ```bash
+  pkg install -y golang zig
+  bash waa-signer/build.sh
+  ```
+</details>
+
+> [!TIP]
+> **Background Persistence**: Pull down the Android notification shade, tap `Acquire Wakelock` on Termux, and disable battery optimization for Termux in system settings.
 
 ---
 
-## Configuration and Environment Variables
+### Windows
 
-### Configuration precedence
+Prerequisite: [Git](https://git-scm.com/) installed. Open PowerShell and run:
 
-1. The path in `AISTUDIO_CONFIG_PATH`
-2. The path in `AISTUDIO_CONFIG_FILE` (backward compatible)
-3. `config.yaml` in the project root
-4. If missing, the file is copied from `defaults/config.yaml`
+```powershell
+# Step 1: Install uv package manager
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-`defaults/config.yaml` is the only tracked default template and the single source of default values.
+# Step 2: Clone repository and enter directory
+git clone https://github.com/TonyDG233/aistudio-api.git
+cd aistudio-api
 
-### Main configuration blocks
+# Step 3: Sync dependencies (uv manages Python automatically)
+uv sync
 
-| Block | Purpose |
-|---|---|
-| `api_keys` / `security` | Public API keys and anonymous access policy |
-| `instances` / `max_contexts` | Instance specs and global capacity |
-| `engine` | Request engine (browser / browserless), switch transaction, WAA signer and transport settings |
-| `rotator` | Retries, 429 cooldowns, quota scope |
-| `features.routing` | Consecutive switch budget and same-account 429 backoff |
-| `features.keepalive` | 24h auth and metadata refresh cadence |
-| `features.model_discovery` | Model catalog refresh intervals |
-| `features.formats` | OpenAI / Claude / Responses switches and private media access |
-| `features.atg` | Anti-truncation gateway mode and parameters |
-| `paid_model_rules` | Paid model tier admission |
-| `model_defaults` | Model profiles, default tools, safety settings, parameter filtering |
-| `tier_quotas` | Daily soft quotas per tier (display and scheduling weight only) |
-| `account_presets` | Account preset schemes |
-| `diagnostics` / `browser` / `logging` | Diagnostics, fingerprint, logging |
+# Step 4: Start the server
+uv run python main.py server --port 8080
+```
 
-### Environment variables
+<details>
+<summary><b>[Optional Advanced] Install controlled browser or build local waa-signer.exe</b></summary>
+
+- For `browser` (controlled Chromium) mode:
+  ```bat
+  scripts\install-browser.bat
+  ```
+- For `browserless` mode, compile `waa-signer.exe`:
+  ```powershell
+  winget install GoLang.Go zig.zig
+  .\waa-signer\build.bat
+  ```
+</details>
+
+---
+
+### Linux / macOS
+
+Open a terminal and run:
+
+```bash
+# Step 1: Install uv package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Step 2: Clone repository and enter directory
+git clone https://github.com/TonyDG233/aistudio-api.git
+cd aistudio-api
+
+# Step 3: Sync dependencies
+uv sync
+
+# Step 4: Start the server
+uv run python3 main.py server --port 8080
+```
+
+<details>
+<summary><b>[Optional Advanced] Install controlled browser or build local waa-signer</b></summary>
+
+- Install controlled browser (`browser` mode):
+  ```bash
+  bash scripts/setup-browser.sh
+  ```
+- Build local signer (`browserless` mode, requires Go 1.27+ and `zig` / `clang` / `gcc`):
+  ```bash
+  bash waa-signer/build.sh
+  ```
+</details>
+
+> [!IMPORTANT]
+> **After starting the service, open `http://localhost:8080` to enter the Web Console, then follow the guide below to (1) create an API Key and (2) import your Google account credentials.**
+
+---
+
+## Obtaining & Importing Account Credentials (Cookies)
+
+This service never stores your Google password; it uses web session cookies and automatically rotates them in the background.
+
+### Method 1 (Recommended, Long-Lived): Export `.json` Credential Bundle with Built-in Tampermonkey Script
+
+1. **Install Script**: Install [Tampermonkey](https://www.tampermonkey.net/) in your desktop browser, then open **Accounts → + Import Credentials** in the Web Console to install the grabber script (or open `http://localhost:8080/api/tools/aistudio-cookie-grabber.user.js`).
+2. **Export in Incognito**: Open a **fresh Incognito / Private window**, sign in to [Google AI Studio](https://aistudio.google.com/), and click **Export JSON Credential Bundle** in the bottom-right script panel (automatically includes long-lived `accounts.google.com` root cookies).
+3. **Drag & Import**: Return to **Accounts → + Import Credentials** in the Web Console and drop the `.json` file into the dialog.
+
+> [!WARNING]
+> After exporting, **simply close the Incognito window—do NOT click Google's "Sign out" button**, or the exported root cookies will be invalidated immediately.
+
+### Method 2: Export & Import via Cookie-Editor Extension
+
+1. Sign in to [Google AI Studio](https://aistudio.google.com/) in your browser and make sure the chat workspace loads normally;
+2. Install the **Cookie-Editor** extension (Chrome / Edge / Firefox);
+3. On the `aistudio.google.com` tab, click Cookie-Editor and choose **Export → Export as JSON** (or Export as Header);
+4. Paste the clipboard content into **Accounts → + Import Credentials** in the Web Console. The service verifies connectivity and probes multi-login sub-accounts (`u/0`, `u/1`...) automatically.
+
+### Step 3: Create an External API Key in the Web Console
+
+API authentication is enabled by default (requests without a valid key are rejected). Go to **Settings → API Key Management** in the Web Console, add a custom API Key (e.g. `sk-my-secret-key`), and save.
+
+---
+
+## Third-Party Client Setup Guide (SillyTavern / Cherry Studio / Claude Code / NextChat)
+
+This gateway natively supports all four major protocols. Pick the matching settings for your client:
+
+| Protocol Mode | Example Clients | Base URL / Endpoint | API Key |
+|---|---|---|---|
+| **OpenAI-Compatible** | SillyTavern (OpenAI source), Cherry Studio, Cursor, NextChat | Base URL: `http://localhost:8080/v1`<br/>Endpoint: `/v1/chat/completions` | Key configured in Console API Key Management |
+| **Google Gemini Native** | SillyTavern (Gemini source), Cherry Studio (Gemini), `google-genai` SDK | Base URL: `http://localhost:8080`<br/>(or `http://localhost:8080/v1beta` if required) | Key configured in Console API Key Management |
+| **Anthropic Claude Native** | SillyTavern (Claude source), Claude Code | Base URL: `http://localhost:8080`<br/>Endpoint: `/v1/messages` | Key configured in Console API Key Management |
+| **OpenAI Responses** | Codex CLI, OpenAI Responses clients | Base URL: `http://localhost:8080/v1`<br/>Endpoint: `/v1/responses` | Key configured in Console API Key Management |
+
+**Common Model Names**:
+- Available on Free accounts: `gemini-4-hydrogen`, `gemini-3.8-flash`
+- Requires Pro or higher: `gemini-4-argon`, `gemini-3.1-pro-preview`
+- Requires Ultra: `gemini-4-carbon`
+- Image generation: `gemini-3.1-flash-image-preview`
+
+> [!TIP]
+> **Recommended Settings (configurable visually on the Settings page)**:
+> - **Proactive Rotation**: Set proactive rotation scope to **Free-only** so each account smoothly rotates when idle after N successful calls, reducing high-frequency risk flags.
+> - **ATG Anti-Truncation**: For long-form roleplay in SillyTavern, enable ATG per protocol as needed (supports independent `wrap_input` / `wrap_output` toggles and custom prompt templates).
+
+---
+
+## Configuration & Environment Variables
+
+Config precedence: `AISTUDIO_CONFIG_PATH` > `AISTUDIO_CONFIG_FILE` > root `config.yaml` (copied from `defaults/config.yaml` if missing). Most settings can be edited and hot-reloaded from the Web Console.
+
+### Common Environment Variables
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `AISTUDIO_PORT` | int | `8080` | API listening port |
-| `AISTUDIO_WEB_PASSWORD` | string | `""` | Console password; setting it enables login auth |
-| `AISTUDIO_ADMIN_PASSWORD` | string | `""` | Compatibility alias for the console password |
-| `AISTUDIO_PROXY` | string | auto | Outbound proxy (`http://`, `https://`, `socks5://`); also reads `HTTPS_PROXY` / `HTTP_PROXY` |
-| `AISTUDIO_DATA_DIR` | string | `data/` | Data root (`/app/data` in Docker) |
-| `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | Account credential directory |
-| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | Usage and token statistics file |
-| `AISTUDIO_ROTATOR_STATE_FILE` | string | `data/rotator_state.json` | 429 cooldown and scheduling state |
-| `AISTUDIO_MODEL_CACHE_FILE` | string | `data/models_cache.json` | Model catalog snapshot |
-| `AISTUDIO_CONFIG_PATH` | string | `config.yaml` | Config file path (highest precedence) |
-| `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | Config file path (compatibility) |
-| `AISTUDIO_AUTH_FILE` | string | auto | Single-file auth override |
-| `AISTUDIO_PERSIST_STATS` | bool | `true` | Persist statistics |
-| `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | Persist scheduling state |
-| `AISTUDIO_BROWSER_EXECUTABLE` | string | auto | Chromium executable (`/opt/cloakbrowser/chrome` in Docker) |
-| `AISTUDIO_BROWSER_PORT` | int | `9222` | CDP debugging port |
-| `AISTUDIO_BROWSER_HEADLESS` | bool | `true` | Run headless |
-| `AISTUDIO_FINGERPRINT_SPOOF` / `AISTUDIO_FINGERPRINT_SPOOF_ENABLED` | bool | `true` | Browser fingerprint spoofing |
+| `AISTUDIO_PORT` | int | `8080` | HTTP server listening port |
+| `AISTUDIO_WEB_PASSWORD` | string | `""` | Web Console password (empty disables login; completely independent from API keys) |
+| `AISTUDIO_PROXY` | string | Auto | Outbound proxy URL (`http://`, `https://`, or `socks5://`) |
+| `AISTUDIO_DATA_DIR` | string | `data/` | Root data directory (`/app/data` in Docker) |
+| `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | Account credentials directory |
+| `AISTUDIO_CONFIG_PATH` | string | `config.yaml` | Configuration YAML file path |
+| `AISTUDIO_STATS_FILE` | string | `data/stats.json` | Model usage and token statistics file |
+| `AISTUDIO_ROTATOR_STATE_FILE` | string | `data/rotator_state.json` | Account 429 cooldown and rotation state file |
+| `AISTUDIO_MODEL_CACHE_FILE` | string | `data/models_cache.json` | Cached model catalog snapshot |
+| `AISTUDIO_PERSIST_STATS` | bool | `true` | Persist request and token statistics |
+| `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | Persist account 429 cooldown and rotation state |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | Default text model |
-| `AISTUDIO_DEFAULT_IMAGE_MODEL` | string | `gemini-3.1-flash-image-preview` | Default image model |
-| `AISTUDIO_TIMEZONE` | string | auto | Browser and wire timezone (falls back to `America/Los_Angeles`) |
-| `AISTUDIO_LOCALE` | string | `en-US` | Browser locale |
-| `AISTUDIO_TMP_DIR` | string | system temp | Temporary directory |
+| `AISTUDIO_DEFAULT_IMAGE_MODEL` | string | `gemini-3.1-flash-image-preview` | Default image generation model |
+| `AISTUDIO_TIMEZONE` | string | Auto | Browser & wire timezone (falls back to `America/Los_Angeles`) |
 | `AISTUDIO_SSE_KEEPALIVE_SEC` | float | `15` | SSE heartbeat interval (seconds) |
-| `AISTUDIO_SSE_PREREAD_WINDOW_SEC` | float | `15` | First-event pre-read window (seconds) |
-| `AISTUDIO_RETRY_SAME_DELAY_SEC` | float | `2.0` | 429 same-account backoff (0 - 30) |
-| `AISTUDIO_UI_DEBUG` | bool | `false` | Enable the pure-offline UI debug sandbox |
-| `AISTUDIO_HASH_INCLUDE_CODE` | bool | `true` | Diagnostics: include code parts in the snapshot hash |
-| `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Print request/response details to the console (also `DEBUG=1`) |
-| `AISTUDIO_DUMP_FILE` / `AISTUDIO_DUMP_TO_FILE` | bool | `false` | Write exchanges to disk |
-| `AISTUDIO_DUMP_DIR` | string | `data/dumps` | Exchange dump directory |
-| `AISTUDIO_DUMP_RAW_RESPONSE` | bool | `false` | Export raw upstream responses |
-| `AISTUDIO_DUMP_RAW_RESPONSE_DIR` | string | `data/dumps` | Raw response export directory |
+| `AISTUDIO_RETRY_SAME_DELAY_SEC` | float | `2.0` | Backoff seconds before same-account retry on upstream transient errors (`204`/`404`/`408`/`5xx`) |
+| `AISTUDIO_SWITCH_BACKOFF_SECONDS` | float | `4.0` | Base backoff seconds before switching accounts on 429/risk events (±25% jitter, 3–5 s by default) |
 
 ---
 
-## Web Console
+## API Usage Examples
 
-Open `http://localhost:8080` (login is required after setting `AISTUDIO_WEB_PASSWORD`). The sidebar has four pages:
+Supported authentication methods:
+- Query param: `?key=YOUR_API_KEY`
+- Header: `x-goog-api-key: YOUR_API_KEY`, `x-api-key: YOUR_API_KEY`, or `Authorization: Bearer YOUR_API_KEY`
 
-1. **Dashboard**: running instances, in-flight requests, account and quota overview, model usage statistics, 7 / 30 / 90-day request and token trend charts, and quick API examples. Statistics are archived by Asia/Shanghai natural day for the last 90 days and distinguish client-request from attempt denominators.
-2. **Accounts**: Cookie text and bundle import, sub-account probing, instance slot creation/rebinding/restart, account enablement and grouping, presets, quota and 429 state, and manual keepalive.
-3. **Settings**: API key management, request engine (browser / browserless hot switch), security and browser, scheduling and retries, protocol switches and ATG, log configuration, model rules, and YAML source editing with hot reload on save. Engine changes use a transactional switch with rollback.
-4. **Logs**: live SSE log stream, level filtering, search, pause, and 1 / 3 / 7-day export.
+### cURL
 
-### UI Debug sandbox
+<details>
+<summary><b>1. List Models (Gemini / OpenAI)</b></summary>
 
 ```bash
-AISTUDIO_UI_DEBUG=1 uv run python main.py server --port 8080
+# Gemini model list
+curl http://localhost:8080/v1beta/models \
+  -H "x-goog-api-key: your-api-key"
+
+# OpenAI model list
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer your-api-key"
 ```
+</details>
 
-When enabled:
-
-- Configuration, accounts, statistics, model cache, logs, and dumps are redirected to a temporary directory.
-- No real browser starts, no real account is accessed, and no outbound request is made.
-- Saving configuration never writes the real `config.yaml`.
-- The dashboard and log page expose scenario switches (`all_states`, `mass_accounts`, `all_429`, `empty`) and debug actions that simulate requests or 429 responses.
-
-This sandbox is for UI development and acceptance only; it never touches a real browser or real disk.
-
----
-
-## Client Integration
-
-### Authentication
-
-Public API requests accept any of:
-
-- Query: `?key=YOUR_API_KEY`
-- Header: `x-goog-api-key: YOUR_API_KEY`
-- Header: `x-api-key: YOUR_API_KEY`
-- Header: `Authorization: Bearer YOUR_API_KEY`
-
-When `api_keys` is empty and `security.api_allow_anonymous` is `false`, all public API requests are rejected. The console password is completely independent from API keys.
-
-### SillyTavern
-
-- OpenAI-compatible connection: Base URL `http://<host>:8080/v1`, API key set to any configured `api_keys` entry.
-- Claude-compatible connection: Base URL `http://<host>:8080`, endpoint `/v1/messages`.
-- Gemini-compatible connection: Base URL `http://<host>:8080`, API version `v1beta`.
-
-### cURL examples
-
-**Gemini non-streaming**
+<details>
+<summary><b>2. Gemini Generate Content (Non-streaming / SSE)</b></summary>
 
 ```bash
-curl http://localhost:8080/v1beta/models/gemini-3.7-flash:generateContent \
+# Non-streaming
+curl http://localhost:8080/v1beta/models/gemini-3.8-flash:generateContent \
   -H "x-goog-api-key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [{"role": "user", "parts": [{"text": "Explain quantum computing in one sentence."}]}]
   }'
-```
 
-**Gemini streaming**
-
-```bash
-curl "http://localhost:8080/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse" \
+# Streaming (SSE)
+curl "http://localhost:8080/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse" \
   -H "x-goog-api-key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "contents": [{"role": "user", "parts": [{"text": "Explain Python coroutines."}]}]
+    "contents": [{"role": "user", "parts": [{"text": "Explain Python asyncio."}]}]
   }'
 ```
+</details>
 
-**OpenAI Chat**
+<details>
+<summary><b>3. OpenAI Chat Completions</b></summary>
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.7-flash",
+    "model": "gemini-3.8-flash",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": false
   }'
 ```
+</details>
 
-**Claude Messages**
+<details>
+<summary><b>4. Claude Messages</b></summary>
 
 ```bash
 curl http://localhost:8080/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.7-flash",
+    "model": "gemini-3.8-flash",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
+</details>
 
-**OpenAI Responses**
+<details>
+<summary><b>5. OpenAI Responses</b></summary>
 
 ```bash
 curl http://localhost:8080/v1/responses \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.7-flash",
+    "model": "gemini-3.8-flash",
     "input": "Hello"
   }'
 ```
+</details>
 
-**countTokens**
+<details>
+<summary><b>6. Token Counting (countTokens)</b></summary>
 
 ```bash
 # Gemini
-curl http://localhost:8080/v1beta/models/gemini-3.7-flash:countTokens \
+curl http://localhost:8080/v1beta/models/gemini-3.8-flash:countTokens \
   -H "x-goog-api-key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"contents": [{"parts": [{"text": "hello"}]}]}'
@@ -612,14 +423,17 @@ curl http://localhost:8080/v1beta/models/gemini-3.7-flash:countTokens \
 curl http://localhost:8080/v1/messages/count_tokens \
   -H "x-api-key: your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"model": "gemini-3.7-flash", "messages": [{"role": "user", "content": "hello"}]}'
+  -d '{"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "hello"}]}'
 
-# Responses
+# OpenAI Responses
 curl http://localhost:8080/v1/responses/input_tokens \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"model": "gemini-3.7-flash", "input": "hello"}'
+  -d '{"model": "gemini-3.8-flash", "input": "hello"}'
 ```
+</details>
+
+---
 
 ### Python SDK (google-genai)
 
@@ -628,42 +442,118 @@ from google import genai
 
 client = genai.Client(
     api_key="your-api-key",
-    http_options={"api_version": "v1beta", "base_url": "http://localhost:8080"},
+    http_options={
+        "api_version": "v1beta",
+        "base_url": "http://localhost:8080",
+    },
 )
 
-for chunk in client.models.generate_content_stream(
-    model="gemini-3.7-flash",
+# 1. Streaming response
+response = client.models.generate_content_stream(
+    model="gemini-3.8-flash",
     contents="What is reactive programming?",
-):
+)
+for chunk in response:
     print(chunk.text, end="", flush=True)
+
+# 2. Non-streaming response
+result = client.models.generate_content(
+    model="gemini-3.8-flash",
+    contents="Write a quicksort implementation in Python.",
+)
+print(result.text)
 ```
 
 ---
 
-## Development and Testing
+### Function Calling
 
-The frontend lives in `web/` and uses Vue 3 + TypeScript + Vite + Tailwind CSS with `bun`:
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(
+    api_key="your-api-key",
+    http_options={
+        "api_version": "v1beta",
+        "base_url": "http://localhost:8080",
+    },
+)
+
+weather_tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="get_current_weather",
+            description="Get real-time weather conditions for a given location",
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "location": types.Schema(
+                        type="STRING",
+                        description="City name, e.g. 'San Francisco' or 'Tokyo'",
+                    ),
+                    "unit": types.Schema(
+                        type="STRING",
+                        enum=["celsius", "fahrenheit"],
+                        description="Temperature unit",
+                    ),
+                },
+                required=["location"],
+            ),
+        )
+    ]
+)
+
+response = client.models.generate_content(
+    model="gemini-3.8-flash",
+    contents="What is the weather in Tokyo right now?",
+    config=types.GenerateContentConfig(tools=[weather_tool]),
+)
+
+if response.function_calls:
+    for call in response.function_calls:
+        print(f"Tool called: {call.name}")
+        print(f"Arguments: {call.args}")
+```
+
+---
+
+## Web Management Console
+
+The service includes a built-in static Web Console at `http://localhost:8080`:
+
+- **Dashboard**: Real-time pool status, in-flight requests, account/quota overview, 7 / 30 / 90-day request and token trend charts, and quick API testers.
+- **Accounts**: Import Cookie text or Tampermonkey `.json` bundles, probe multi-login sub-accounts, manage instance slots, groups, presets, 429 cooldowns, and trigger keepalive.
+- **Settings**: API key management, live engine switching (`browser` / `browserless`), proactive rotation rules, protocol switches and ATG settings, model rules, and YAML editing with hot reload on save.
+- **Logs**: Live SSE log stream, level filtering, keyword search, pause, and 1 / 3 / 7-day log export.
+- **Access Control**: Set `AISTUDIO_WEB_PASSWORD` to require login; completely independent from external API keys.
+
+---
+
+## Development & Testing
+
+Frontend source lives in `web/` (Vue 3 + TypeScript + Vite + Tailwind CSS):
 
 ```bash
 cd web
 bun install
-bun run dev          # dev server (default 3000, proxied to 8080)
-bun run type-check
-bun run lint
-bun run build        # output to src/aistudio_api/static
+bun run dev          # Start local dev server (localhost:3000 -> 8080)
+bun run type-check   # TypeScript type check
+bun run lint         # ESLint check
+bun run build        # Build production assets into src/aistudio_api/static
 ```
 
-Python tooling uses `uv`:
+Python checks and tests (managed via `uv`):
 
 ```bash
-uv sync --extra dev      # development and test environment
+uv sync --extra dev
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright src tests
 uv run pytest
 ```
 
-Android checks:
+Android companion checks:
 
 ```bash
 cd android
@@ -672,23 +562,15 @@ cd android
 
 ---
 
-## Documentation
+## Credits & Acknowledgments
 
-- [System architecture](./docs/ARCHITECTURE.md): four layers, request lifecycle, instance pool, routing, logging.
-- [Wire protocol specification](./docs/WIRE_SPECIFICATION.md): Protobuf-JSON array mapping, field indices, multimodal parts, schema encoding.
-- [BotGuard verification chain](./docs/BOTGUARD_VERIFICATION_CHAIN.md): WAA challenge handshake, dynamic Wasm signing, content hashing.
-- [WAA Signer standalone service](./waa-signer/README.md): SpiderMonkey 152 runtime, HTTP API, manual builds, and Docker bundling.
-- [Instance pool and routing specification](./docs/INSTANCE_POOL_AND_ROUTING_SPEC.md): instances, tier selectors, 429 / 403, surface routing.
-- [Keepalive and logging specification](./docs/KEEPALIVE_AND_LOGGING_SPEC.md): 24h keepalive, three log sinks, redaction.
-- [Protocol and tool-call specification](./docs/PROTOCOL_AND_TOOLCALL_SPEC.md): four-protocol conversion, PG-01/04/08, ATG, countTokens.
-- [Changelog](./docs/changelog.md).
-- [Agent and engineering conventions](./AGENT.md).
+This project builds upon and draws inspiration from the following open-source projects and community efforts:
 
----
-
-## Acknowledgments
-
-The foundational architecture, CDP communication layer, and reverse-engineered protocol implementation of this project originate from the upstream project [DeconstructedCube/aistudio-api](https://github.com/DeconstructedCube/aistudio-api). Thanks to the upstream author and contributors for their work on Google AI Studio protocol analysis, in-page XHR replay, wire codecs, and the BotGuard verification chain.
+- **[DeconstructedCube/aistudio-api](https://github.com/DeconstructedCube/aistudio-api)**: Provided the foundational architecture, lightweight CDP transport layer, in-page XHR replay, and core wire codec implementation.
+- **[Mag1cFall/AIStudio2API](https://github.com/Mag1cFall/AIStudio2API)**: Provided the embedded SpiderMonkey 152 runtime, Firefox 152 DOM / WebIDL host environment, and uTLS transport stack design from which `waa-signer` was extracted and adapted.
+- **[Lianues/aistudio-pg-bridge](https://github.com/Lianues/aistudio-pg-bridge)**: Pioneered the lightweight browserless WAA proof signing concept and established the `/v1/proof/mint` interface specification.
+- **[spinsnow](https://waa.spinsnow.fun)**: Provided a public, stable Node.js VM WAA attestation relay reference.
+- **[Camoufox](https://github.com/daijro/camoufox)** & **[go-browserforge](https://github.com/brainplusplus/go-browserforge)**: Provided real-world browser fingerprint datasets and anti-fingerprinting generation algorithms.
 
 ---
 
