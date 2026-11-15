@@ -119,13 +119,22 @@ docker run -d \
   ghcr.io/tonydg233/aistudio-api:latest
 ```
 
-Or start with Docker Compose:
+Or start with Docker Compose (no preparation needed—one command; `Docker Compose v2.24+` recommended):
 
 ```bash
-# Prepare host config.yaml before using the root docker-compose.yml
-cp defaults/config.yaml config.yaml
+# 1) Default deployment: bootstraps ./data/config.yaml on first start
 docker compose up -d
+
+# 2) Standalone production deployment (prebuilt GHCR image; tag defaults to latest)
+AISTUDIO_IMAGE_TAG=2.1.4 docker compose -f docker-compose.deploy.yml up -d
+
+# 3) Rebuild the image from local sources before starting (uncomment build: . in docker-compose.yml first)
+docker compose up -d --build
 ```
+
+> [!NOTE]
+> - **Upgrading from an older layout**: if you previously used a root `./config.yaml`, run `mkdir -p data && mv config.yaml data/config.yaml` before starting to keep your existing configuration and API keys. If a custom compose file still mounts it at `/app/config.yaml`, `docker-entrypoint.sh` also migrates it to `/app/data/config.yaml` automatically.
+> - **Optional env file**: create a `.env` file in the repository root and every variable in it (e.g. `AISTUDIO_SSE_KEEPALIVE_SEC`, `AISTUDIO_DEFAULT_TEXT_MODEL`) is injected into the container automatically. When `.env` is absent nothing breaks and no empty directory is created.
 
 ---
 

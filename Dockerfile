@@ -222,8 +222,9 @@ EXPOSE 8080 9222
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -fsS http://localhost:8080/health || exit 1
+    CMD curl -fsS "http://localhost:${AISTUDIO_PORT:-8080}/health" || exit 1
 
-# Container entrypoint and default command
+# Container entrypoint and default command. main.py resolves --port from
+# settings.port (AISTUDIO_PORT), so passing -e AISTUDIO_PORT=9000 is honored.
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["python3", "main.py", "server", "--port", "8080", "--browser-port", "9222"]
+CMD ["python3", "main.py", "server"]

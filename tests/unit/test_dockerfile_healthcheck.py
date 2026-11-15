@@ -68,7 +68,7 @@ def test_dockerfile_healthcheck_keeps_interval():
     block = _dockerfile_healthcheck_block(
         (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     )
-    assert "curl -fsS http://localhost:8080/health" in block
+    assert 'curl -fsS "http://localhost:${AISTUDIO_PORT:-8080}/health"' in block
     assert "--interval=30s" in block
 
 
@@ -81,3 +81,15 @@ def test_compose_healthchecks_keep_interval():
             path.read_text(encoding="utf-8")
         ):
             assert '"interval": "30s"' in block, f"{name} healthcheck: {block}"
+
+
+def test_every_compose_file_defines_port_aware_healthcheck():
+    for name in ("docker-compose.yml", "docker-compose.deploy.yml"):
+        path = _REPO_ROOT / name
+        assert path.exists(), f"{name} must exist"
+        blocks = _compose_healthcheck_blocks(path.read_text(encoding="utf-8"))
+        assert blocks, f"{name} must define a healthcheck block"
+        joined = "\n".join(blocks)
+        assert "$${AISTUDIO_PORT:-8080}/health" in joined, (
+            f"{name} healthcheck must probe the port-aware /health route: {joined}"
+        )

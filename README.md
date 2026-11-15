@@ -118,13 +118,22 @@ docker run -d \
   ghcr.io/tonydg233/aistudio-api:latest
 ```
 
-使用 Docker Compose 启动：
+使用 Docker Compose 启动（无需任何前置准备，直接一键启动；建议使用 `Docker Compose v2.24+`）：
 
 ```bash
-# 使用仓库根目录 docker-compose.yml 前先准备宿主机配置文件
-cp defaults/config.yaml config.yaml
+# 1) 默认部署：首次启动自动在 ./data/config.yaml 生成默认配置
 docker compose up -d
+
+# 2) 生产独立部署（使用 GHCR 预构建镜像，默认标签 latest，可固定版本）
+AISTUDIO_IMAGE_TAG=2.1.4 docker compose -f docker-compose.deploy.yml up -d
+
+# 3) 基于本地源码重新构建镜像后启动（需先取消 docker-compose.yml 中 build: . 的注释）
+docker compose up -d --build
 ```
+
+> [!NOTE]
+> - **从旧版升级**：若从旧版仓库根目录的 `./config.yaml` 升级，请在启动前执行 `mkdir -p data && mv config.yaml data/config.yaml`；若自定义 compose 仍将旧配置挂载到 `/app/config.yaml`，`docker-entrypoint.sh` 亦会自动将其迁移至 `/app/data/config.yaml`。
+> - **可选环境变量文件**：在仓库根目录创建 `.env` 后，其中的全部环境变量（如 `AISTUDIO_SSE_KEEPALIVE_SEC`、`AISTUDIO_DEFAULT_TEXT_MODEL`）会自动注入容器；不存在 `.env` 时不报错、也不会创建空目录。
 
 ---
 
