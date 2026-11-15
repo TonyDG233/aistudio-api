@@ -9,9 +9,9 @@
 *.swo
 
 # Python
-__pycache__
-*.pyc
-*.pyo
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
 *.egg-info
 dist
 build
@@ -20,6 +20,9 @@ build
 # Environment (use .env.example as reference, mount .env at runtime)
 .env
 .env.local
+
+# Local runtime config (may contain api_keys; images bootstrap from defaults/config.yaml)
+config.yaml
 
 # Logs
 *.log
@@ -33,6 +36,24 @@ tests/
 # Temporary files
 /tmp
 snapshot_*.log
+
+# Runtime data and local dumps (never bake personal accounts/logs into the image)
+data/
+data2/
+dumps/
+server-logs/
+
+# Local virtualenvs
+.venv/
+venv/
+
+# Frontend dependencies and Android sources (not part of the backend image)
+web/node_modules/
+android/
+
+# Agent/tooling scratch space
+.kilo/
+tools/reverse/
 
 # Chrome/Chromium profiles (not needed in container)
 chromium-profile/

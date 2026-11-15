@@ -1,19 +1,33 @@
 services:
   aistudio-api:
-    image: ghcr.io/tonydg233/aistudio-api:2.1.0
+    image: ghcr.io/tonydg233/aistudio-api:${AISTUDIO_IMAGE_TAG:-latest}
     container_name: aistudio-api
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux: reach host proxy via host.docker.internal
+    env_file:
+      - path: ./.env
+        required: false                       # Optional: inject every var from ./.env when present
     ports:
-      - "8080:8080"
+      - "${AISTUDIO_PORT:-8080}:${AISTUDIO_PORT:-8080}"
     volumes:
       - aistudio-api-data:/app/data
     environment:
+      - AISTUDIO_PORT=${AISTUDIO_PORT:-8080}
+      - AISTUDIO_WEB_PASSWORD=${AISTUDIO_WEB_PASSWORD:-}
+      - AISTUDIO_PROXY=${AISTUDIO_PROXY:-}
+      - AISTUDIO_TIMEZONE=${AISTUDIO_TIMEZONE:-}   # Empty = auto-detect (never force TZ=Asia/Shanghai)
       - AISTUDIO_DATA_DIR=/app/data
       - AISTUDIO_ACCOUNTS_DIR=/app/data/accounts
       - AISTUDIO_STATS_FILE=/app/data/stats.json
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
-      - AISTUDIO_CONFIG_FILE=/app/data/config.yaml
       - AISTUDIO_BROWSER_EXECUTABLE=/opt/cloakbrowser/chrome
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${AISTUDIO_PORT:-8080}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
 
 volumes:
   aistudio-api-data:

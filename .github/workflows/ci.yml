@@ -5,12 +5,10 @@ on:
     branches:
       - master
       - main
-      - rebuild-upstream
   pull_request:
     branches:
       - master
       - main
-      - rebuild-upstream
   workflow_dispatch:
 
 concurrency:
@@ -42,6 +40,10 @@ jobs:
               - 'tests/**'
               - 'pyproject.toml'
               - 'uv.lock'
+              - 'Dockerfile'
+              - 'docker-compose*.yml'
+              - 'docker-entrypoint.sh'
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
             frontend:
               - 'web/**'

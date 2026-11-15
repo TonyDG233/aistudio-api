@@ -95,7 +95,7 @@ func TestMintResponseCookieContract(t *testing.T) {
 func TestHealthResponseContract(t *testing.T) {
 	encoded, err := json.Marshal(HealthResponse{
 		OK: true, Status: "ok", Engine: "spidermonkey-152", Workers: 1,
-		IdleWorkers: 1, MaxWorkers: 8, Version: "2.1.0", Ready: true,
+		IdleWorkers: 1, MaxWorkers: 8, Version: "2.1.4", Ready: true,
 	})
 	if err != nil {
 		t.Fatalf("marshal HealthResponse: %v", err)

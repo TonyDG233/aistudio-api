@@ -1,26 +1,34 @@
 services:
   aistudio-api:
-    build: .
+    image: ghcr.io/tonydg233/aistudio-api:${AISTUDIO_IMAGE_TAG:-latest}
+    # Local source build is opt-in. Keep `build: .` commented so `docker compose up -d`
+    # always pulls the prebuilt GHCR image; uncomment it to build from this checkout.
+    # build: .
     container_name: aistudio-api
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux: reach host proxy via host.docker.internal
+    env_file:
+      - path: ./.env
+        required: false                       # Optional: inject every var from ./.env when present
     ports:
-      - "8080:8080"    # API server
+      - "${AISTUDIO_PORT:-8080}:${AISTUDIO_PORT:-8080}"    # API server
       # - "9222:9222"  # Optional: expose only when debugging browser
     volumes:
-      - ./data:/app/data           # Account data, stats.json and rotator_state.json persistence
-      - ./config.yaml:/app/config.yaml  # Model configuration file
-      - ./.env:/app/.env:ro        # Environment config (read-only)
+      - ./data:/app/data           # Accounts, stats, rotator state and config.yaml bootstrap
     environment:
-      - AISTUDIO_PORT=8080
+      - AISTUDIO_PORT=${AISTUDIO_PORT:-8080}
+      - AISTUDIO_WEB_PASSWORD=${AISTUDIO_WEB_PASSWORD:-}
+      - AISTUDIO_PROXY=${AISTUDIO_PROXY:-}
+      - AISTUDIO_TIMEZONE=${AISTUDIO_TIMEZONE:-}   # Empty = auto-detect (never force TZ=Asia/Shanghai)
       - AISTUDIO_BROWSER_PORT=9222
       - AISTUDIO_BROWSER_HEADLESS=1
       - AISTUDIO_DATA_DIR=/app/data
       - AISTUDIO_ACCOUNTS_DIR=/app/data/accounts
       - AISTUDIO_STATS_FILE=/app/data/stats.json
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
-      - AISTUDIO_CONFIG_FILE=/app/config.yaml
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${AISTUDIO_PORT:-8080}/health || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 10s

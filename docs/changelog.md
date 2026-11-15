@@ -3,6 +3,29 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.4] - 2026-11-15
+
+在 2.1.3 基础上补齐主动轮换、切号退避、真 LRU 选号与防风控超时口径，并完成文档体系与 Docker 开箱即用分发重塑。
+
+### Added
+
+- **预防性主动轮换与范围框选（`proactive_switch`）**：槽位单账号连续成功调用达到阈值（默认 `15` 次）且当前空闲（`active_requests == 0`）时，自动平缓换绑至池中休息最久（LRU）的健康账号；支持 `关闭（off）`、`仅 Free 池（free_only）`、`仅 Pro+ 池（paid_only）`、`全部池（all）` 与 `指定账号分组（groups）` 五种模式，并可在前端设置页可视化配置参与轮转的账号范围。
+- **切换账号退避等待（`switch_backoff_sec`）**：新增 429 / 风控切号前的退避等待配置（默认 `4.0` 秒，叠加 `±25%` 随机抖动即 `3~5` 秒），并在设置页替换原未生效的 `auth_error` 冷却输入框，采用移动端单列防挤压响应式布局。
+- **Android `arm64-v8a` 静态签名器交叉编译与守护基建**：`waa-signer/build.ps1` 与 `waa-signer/build.sh` 新增 `android-arm64` 构建目标；Go 运行时缺失 `/etc/resolv.conf` 时启用自定义 DNS Resolver，并自动探测 Android 14+ 系统根证书目录；Android 端新增 `WaaSignerSupervisor.kt` 进程守护。
+- **二维码 / ADB 验证辅助工具（`tools/verify_qr_adb.py`）**：支持剪贴板与图片离线二维码解码、无线 ADB `--host` 配对（可经 VPN 穿透连接）、`inspect-ids`、`setup-island`、`reset-island`、`update-gms` 子命令、`help` 中文速查手册，以及 GMS `DeepLinkActivity` 验证完成后自动退出。
+
+### Changed
+
+- **真 LRU 全池大循环选号**：`AccountRotator.select_rebind_account` 与 `InstanceManager._pick_account` 将 `last_used`（最久未使用时间戳）提为第一排序优先级，并在触发限流 / 错误时同步刷新 `last_used`，彻底消除多账号池仅在固定两个账号间乒乓切换的问题。
+- **429 首击直接退避切号（移除同账号二次撞墙）**：遇到 `429 (UsageLimitExceeded)` 不再执行同账号二次重试，首击立即记录模型级冷却并经退避等待切换至下一健康 LRU 账号；前端「调度重试次数上限」问号提示同步标注该防风控特例。
+- **长思考流式超时对齐 `300s` 并禁止超时 / 瞬态错误乱切号**：`request_timeout_s` 与 `read_timeout_s` 默认值统一提升至 `300` 秒且前后端保存同步生效；生成超时（`SignerTimeoutError` / `session_hang`）与上游瞬态错误（`204/404/408/5xx`）仅允许原账号重试 1 次，不再触发切号踢走健康 Pro / Free 账号。
+- **文档体系与 Docker 开箱即用分发重塑**：对齐上游清爽结构重写 `README.md` 与 `README_EN.md`（精简内部架构章节，补齐快速开始、油猴 / Cookie-Editor 导号与 API Key 引导、四协议客户端对接表），同步更新 `docs/` 下 6 份核心规范文档；重构 `docker-compose.yml` / `docker-compose.deploy.yml` / `Dockerfile` / `.dockerignore` 实现零前置步骤开箱即用——首次启动自动播种 `./data/config.yaml`，从旧版根目录 `./config.yaml` 升级需在启动前执行 `mkdir -p data && mv config.yaml data/config.yaml`（若自定义 compose 仍将旧配置挂载到 `/app/config.yaml`，入口脚本亦会自动迁移至 `/app/data/config.yaml`），可选 `./.env` 通过 `env_file` 注入（`required: false`，缺失不报错），移除硬编码 `AISTUDIO_CONFIG_PATH` 与 `TZ=Asia/Shanghai`（改用 `AISTUDIO_TIMEZONE` 透传以保持指纹时区一致），`docker-compose.yml` 与 `docker-compose.deploy.yml` 健康检查均改用 `$${AISTUDIO_PORT:-8080}` 变量展开，`docker-compose.yml` 默认仅拉取预构建镜像（本地源码构建需手动取消 `build: .` 注释），CI 后端路径过滤补齐 Docker 相关文件。
+
+### Fixed
+
+- **死槽抱死 `503` 自动自愈**：`RoutingPipeline.begin()` 新增 `_heal_unavailable_instances`（配合 `InstanceManager.reassign(require_idle=True)` 的并发安全保护），当槽位因前序请求耗尽切号预算而停留在不可用账号时，新请求准入自动原位换绑健康账号。
+- **`verify-account` 独立隔离与保活指纹对齐**：`verification_required` 事件独立隔离单账号（不连坐同源 `u/0..u/N` 兄弟账号），后台探活与 Cookie 轮换自动跳过已锁定账号，防止被 `GetAiStudioBenefitTier=200` 误洗白；`account_info_refresher` 与 `model_discovery` 请求头全面对齐 `Firefox/152.0`。
+
 ## [2.1.3] - 2026-11-13
 
 ### Added
