@@ -30,15 +30,16 @@
 
 | 交付物 | 作用 | 状态 |
 |---|---|---|
-| `tools/verify_qr_adb.py` | Island 工作资料 + ADB 实机 `verify-account` 全链路：二维码离线解码（PNG/BMP/DIB，纯 Python 兜底）→ 主/工作空间 ANDROID_ID/GSF 对比 → 链接注入目标空间 → 前台窗口/进程归属/logcat 取证 → 完成报告 | 离线代码 `PASS`（`REV-2.2.0.3` 整改复审：门禁全绿、59/59 用例通过、无 `P0`；`P1-1`~`P1-3`、`P2-1`~`P2-8`、`Q-1`~`Q-4` 全部闭环）；**实机绕过尝试已失败**（见 §2.2） |
-| `tests/unit/test_verify_qr_adb.py` | 59 个离线用例：解析器、防串味拦截、`--allow-main-user` 基线、内置解码器（RGBA/LA 8/16bit、破坏纠错、旋转、BMP/DIB、解码炸弹）、shell 转义、verify 状态机与 CLI | 通过 |
+| `tools/verify_qr_adb.py` | Island 工作资料 + ADB 实机 `verify-account` 全链路：二维码离线解码（PNG/BMP/DIB，纯 Python 兜底）→ 主/工作空间 ANDROID_ID/GSF 对比 → 链接注入目标空间 → 前台窗口/进程归属/logcat 取证 → `DeepLinkActivity` 退回 Chrome 自动结束 → `reset-island` / `update-gms` / `help` 中文速查手册 | **实机验证已成功打通**；独立复审 **`PASS`**（`REV-2.2.0.7`：7 项门禁全绿、116/116 通过、隐私零残留，`P1-1`/`P2-1`~`P2-3`/`Q-1`~`Q-2`/`N-3` 全部闭环） |
+| `tests/unit/test_verify_qr_adb.py` | 116 个离线用例：解析器、防串味拦截、`--allow-main-user` 基线、内置解码器、shell 转义、verify 状态机、`DeepLinkActivity -> Chrome`（含空焦点过渡帧防抖）、9 命令 `help`、`update-gms`、`reset-island` 四阶段及 CLI | 116/116 通过 |
 | `data/tools/island/Island.v6.2.1.apk` | Island 安装包（`3,499,707` 字节，SHA-256 `374e5d23…f611`，被 `.gitignore:12:/data/` 忽略、不入库） | 就绪 |
 
-> **【实机验证结论留档：Island 工作资料绕过设备验证尝试已失败】** 经真机控制变量实测，通过 Android `FLAG_MANAGED_PROFILE`（Island / 壶中界 `User 10`）隔离 `ANDROID_ID` 与独立 KeyMint 密钥以突破 Google AI Studio `verify-account`（`recaptcha.net/qr/`）单设备验证限额的方案**已证实无效**：Google 的 `recaptcha.net/qr/`（DroidGuard / Play Integrity）会检测并直接拒绝第三方受管工作资料（Managed Profile）沙盒环境（返回 `We couldn't verify your account with this device... or doesn't meet device security requirements`），而切回同一台物理手机的原生主空间（`User 0`）则可正常通过验证。因此 `tools/verify_qr_adb.py` 无法用于重置或绕过单台物理手机的验证配额限制，仅保留作为剪贴板二维码离线解码与主空间（`--allow-main-user`）免摄像头 ADB 辅助推送工具留底。
+> **【实机验证结论留档：Island 工作资料（User 10）独立设备 ID 扫码验证已成功打通】** 经真机实测确认，此前报 `doesn't meet device security requirements` 的根因是手机内的 Google Play 服务（`com.google.android.gms`）版本偏旧（`26.43.30`）。将 Google Play 服务升级至最新 `26.44.32+`、在工作资料（Island 壶中界 `User 10`）内开启 VPN 代理并登录待验证的 Google 账号后，通过 `tools/verify_qr_adb.py` 向 `User 10` 注入二维码挑战链接可 **100% 正常通过验证**，且全程使用 `User 10` 独立的 `ANDROID_ID`。当单个工作资料达到验证次数上限时，可通过 `reset-island` 子命令引导销毁并重建工作资料以获取全新的 `ANDROID_ID`，并一键映射恢复 GMS、浏览器与 VPN 环境。
 
 ## 3. `reviews/` 审查报告与成果索引
 
 > M1 独立只读审查已产出首份报告并完成二轮复审：`waa-signer` 交叉编译与 `WaaSignerSupervisor` 子进程守护的 `P1`/`P2`/`Q` 问题已按报告逐项整改，二轮复审结论 `PASS`。
 
 - [`REV-2.2.0.1-waa-signer-android-ndk.md`](reviews/REV-2.2.0.1-waa-signer-android-ndk.md) — Stage 2.2.0 M1 独立代码与门禁审查（二轮复审结论 `PASS`；`P1-1`/`P1-2`/`P2-1`/`P2-2`/`P2-3`/`P2-4` 与 `Q-1` 主体全部闭环；新发现非阻断项 `P2-5`、`Q-3` 与顺延 `Q-2` 转 M2/M3）
-- [`REV-2.2.0.3-verify-qr-adb-tool.md`](reviews/REV-2.2.0.3-verify-qr-adb-tool.md) — 实机验证工具链独立只读审查（整改后离线复审结论 `PASS`；`ruff`/`ruff format`/`pyright`/`pytest 59 passed`/`git add -N` 后 `git diff --check` 全绿、无 `P0`；`P1-1` RGBA/LA 通道错位、`P1-2` `--allow-main-user` 死路、`P1-3` 无 `u<uid>` 焦点假 PASS，以及 `P2-1`~`P2-8`、`Q-1`~`Q-4` 全部关闭，逐项证据见报告 §7。报告头部已留档：**Island 受管工作资料绕过设备验证的实机尝试已失败**）
+- [`REV-2.2.0.3-verify-qr-adb-tool.md`](reviews/REV-2.2.0.3-verify-qr-adb-tool.md) — 实机验证工具链独立只读审查（整改后离线复审结论 `PASS`；`ruff`/`ruff format`/`pyright`/`pytest 59 passed`/`git add -N` 后 `git diff --check` 全绿、无 `P0`）
+- [`REV-2.2.0.7-verify-qr-adb-reset-and-help.md`](reviews/REV-2.2.0.7-verify-qr-adb-reset-and-help.md) — `tools/verify_qr_adb.py` 升级（`reset-island` / `update-gms` / `DeepLinkActivity` 完成判定 / `help` 手册 / 实机成功结论留档）独立只读审查（整改复审结论 **`PASS`**：7 项门禁全绿、116/116 用例通过、隐私零残留；`P1-1`、`P2-1`~`P2-3`、`Q-1`~`Q-2`、`N-3` 全部关闭）

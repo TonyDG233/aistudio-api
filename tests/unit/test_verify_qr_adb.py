@@ -455,7 +455,19 @@ def test_parse_resolved_component() -> None:
     assert tool.parse_resolved_component(output) == (
         "com.android.chrome/com.google.android.apps.chrome.Main"
     )
-    assert tool.parse_resolved_component("No activity found") is None
+    prefixed = (
+        "priority=0 preferredOrder=0 12345\nu10 com.v2ray.ang/.ui.MainActivity$Inner\n"
+    )
+    assert tool.parse_resolved_component(prefixed) == (
+        "com.v2ray.ang/.ui.MainActivity$Inner"
+    )
+    inline_prefixed = "priority=0 preferredOrder=0 u10 com.v2ray.ang/.ui.MainActivity\n"
+    assert tool.parse_resolved_component(inline_prefixed) == (
+        "com.v2ray.ang/.ui.MainActivity"
+    )
+    assert (
+        tool.parse_resolved_component("priority=0 12345 1/2\nNo activity found") is None
+    )
 
 
 def test_parse_adb_devices() -> None:
@@ -1082,6 +1094,27 @@ def test_shell_quote_protects_special_urls() -> None:
     assert any("am start --user 10" in command for command in commands)
 
 
+def test_shell_quote_protects_component_action_and_package() -> None:
+    runner = FakeAdb()
+    adb = _client(runner)
+    adb.start_component("com.example.app/.MainActivity$Inner", user_id=10)
+    adb.start_settings_action("android.settings.SYNC_SETTINGS$EXTRA", user_id=0)
+    adb.resolve_launcher_activity("com.v2ray.ang$dev", 10)
+    adb.start_package_launcher("com.v2ray.ang$dev", 10)
+    commands = [call[-1] for call in runner.calls if call[-2:-1] == ("shell",)]
+    assert "am start --user 10 -n 'com.example.app/.MainActivity$Inner'" in commands
+    assert "am start --user 0 -a 'android.settings.SYNC_SETTINGS$EXTRA'" in commands
+    assert any(
+        command.endswith("--user 10 'com.v2ray.ang$dev'")
+        and "resolve-activity" in command
+        for command in commands
+    )
+    assert (
+        "am start --user 10 -a android.intent.action.MAIN"
+        " -c android.intent.category.LAUNCHER -p 'com.v2ray.ang$dev'" in commands
+    )
+
+
 def test_read_java_properties_unescapes_windows_path(tmp_path: Path) -> None:
     props = tmp_path / "local.properties"
     props.write_text("sdk.dir=D\\:\\\\work\\\\android-sdk\n", encoding="utf-8")
@@ -1121,7 +1154,7 @@ def test_run_verification_completes_and_reports_evidence() -> None:
         _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lines.append
     )
     assert report.completed is True
-    assert report.completion_reason == "验证界面已从前台关闭"
+    assert report.completion_reason == "GMS 验证界面已完成并关闭"
     assert report.isolation_ok is True
     assert report.target.android_id == WORK_ANDROID_ID
     assert (
@@ -1206,7 +1239,7 @@ def test_run_verification_trusts_unlabeled_focus_with_target_processes() -> None
         _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lambda _line: None
     )
     assert report.completed is True
-    assert report.completion_reason == "验证界面已从前台关闭"
+    assert report.completion_reason == "GMS 验证界面已完成并关闭"
 
 
 def test_run_verification_aborts_when_focus_jumps_to_other_user() -> None:
@@ -1718,3 +1751,574 @@ def test_parser_exposes_setup_island_options() -> None:
     assert args.unhide is False
     assert args.browser is None
     assert args.user is None
+
+
+# ---------------------------------------------------------------------------
+# DeepLinkActivity -> Chrome 自动完成 & 纯浏览器回退
+# ---------------------------------------------------------------------------
+
+
+def test_run_verification_completes_immediately_when_deeplink_returns_to_chrome() -> (
+    None
+):
+    deeplink_focus = _focus(
+        10,
+        "com.google.android.gms",
+        "com.google.android.gms.recaptchabase.modac.DeepLinkActivity",
+    )
+    chrome_focus = _focus(
+        10,
+        "com.android.chrome",
+        "com.google.android.apps.chrome.Main",
+    )
+    runner = FakeAdb(
+        focus_sequence=[deeplink_focus] * 3 + [chrome_focus] * 10,
+    )
+    clock, sleeper, _state = _clock()
+    cfg = tool.VerifyConfig(url=QR_A_URL, timeout=60.0, interval=1.5)
+    report = tool.run_verification(
+        _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lambda _line: None
+    )
+    assert report.completed is True
+    assert report.completion_reason == "GMS 验证界面已完成并关闭"
+    assert len(report.samples) == 4
+
+
+def test_run_verification_completes_chrome_to_deeplink_to_chrome() -> None:
+    chrome_focus = _focus(
+        10,
+        "com.android.chrome",
+        "com.google.android.apps.chrome.Main",
+    )
+    deeplink_focus = _focus(
+        10,
+        "com.google.android.gms",
+        "com.google.android.gms.recaptchabase.modac.DeepLinkActivity",
+    )
+    runner = FakeAdb(
+        focus_sequence=[chrome_focus, deeplink_focus, deeplink_focus, chrome_focus],
+    )
+    clock, sleeper, _state = _clock()
+    cfg = tool.VerifyConfig(url=QR_A_URL, timeout=60.0, interval=1.5)
+    report = tool.run_verification(
+        _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lambda _line: None
+    )
+    assert report.completed is True
+    assert report.completion_reason == "GMS 验证界面已完成并关闭"
+    assert len(report.samples) == 4
+
+
+def test_run_verification_ignores_empty_focus_transition_frame() -> None:
+    deeplink_focus = _focus(
+        10,
+        "com.google.android.gms",
+        "com.google.android.gms.recaptchabase.modac.DeepLinkActivity",
+    )
+    empty_focus = "WINDOW MANAGER\n  mCurrentFocus=null\n  mFocusedApp=null\n"
+    chrome_focus = _focus(
+        10,
+        "com.android.chrome",
+        "com.google.android.apps.chrome.Main",
+    )
+    runner = FakeAdb(
+        focus_sequence=[deeplink_focus, empty_focus, deeplink_focus, chrome_focus],
+    )
+    clock, sleeper, _state = _clock()
+    cfg = tool.VerifyConfig(url=QR_A_URL, timeout=60.0, interval=1.5)
+    report = tool.run_verification(
+        _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lambda _line: None
+    )
+    assert report.completed is True
+    assert report.completion_reason == "GMS 验证界面已完成并关闭"
+    assert len(report.samples) == 4
+    assert report.samples[1].focus.component is None
+    assert report.samples[1].focus.package is None
+
+
+def test_run_verification_completes_for_pure_browser_flow_without_gms_ui() -> None:
+    chrome_focus = _focus(
+        10,
+        "com.android.chrome",
+        "com.google.android.apps.chrome.Main",
+    )
+    runner = FakeAdb(
+        focus_sequence=[chrome_focus] * 2 + [LAUNCHER_FOCUS] * 4,
+    )
+    clock, sleeper, _state = _clock()
+    cfg = tool.VerifyConfig(url=QR_A_URL, timeout=20.0, interval=1.5)
+    report = tool.run_verification(
+        _client(runner), cfg, clock=clock, sleeper=sleeper, writer=lambda _line: None
+    )
+    assert report.completed is True
+    assert report.completion_reason == "验证界面已从前台关闭"
+
+
+# ---------------------------------------------------------------------------
+# help 子命令与无参数速查手册
+# ---------------------------------------------------------------------------
+
+
+ALL_NINE_COMMANDS = (
+    "help",
+    "devices",
+    "connect",
+    "install-island",
+    "setup-island",
+    "reset-island",
+    "update-gms",
+    "inspect-ids",
+    "verify",
+)
+
+
+def test_cli_no_args_prints_help_manual_and_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert tool.main([]) == 0
+    output = capsys.readouterr().out
+    assert "指令速查手册" in output
+    for command in ALL_NINE_COMMANDS:
+        assert command in output
+
+
+def test_cli_help_subcommand_and_topic_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert tool.main(["help"]) == 0
+    manual = capsys.readouterr().out
+    for command in ALL_NINE_COMMANDS:
+        assert command in manual
+
+    assert tool.main(["help", "reset-island"]) == 0
+    detail = capsys.readouterr().out
+    assert "--timeout" in detail
+    assert "--open-vpn" in detail
+
+    assert tool.main(["help", "unknown-command"]) == 3
+    assert "未知子命令" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# update-gms：GMS 版本读取与商店升级页唤起
+# ---------------------------------------------------------------------------
+
+
+class UpdateGmsAdb(FakeAdb):
+    def __init__(
+        self,
+        *,
+        users: str = USERS_OUTPUT,
+        gms_version_str: str = "26.44.32 (190400-123456789)",
+        market_fails: bool = False,
+        https_fails: bool = False,
+    ) -> None:
+        super().__init__(users=users)
+        self.gms_version_str = gms_version_str
+        self.market_fails = market_fails
+        self.https_fails = https_fails
+
+    def _shell(self, command: str) -> Any:
+        if command.startswith("dumpsys package com.google.android.gms"):
+            return _ok(f"Packages:\n  versionName={self.gms_version_str}\n")
+        if (
+            command.startswith("am start")
+            and "market://details?id=com.google.android.gms" in command
+        ):
+            if self.market_fails:
+                return _ok(
+                    "Error: Activity not started, unable to resolve Intent "
+                    "{ act=android.intent.action.VIEW dat=market://details?id=com.google.android.gms }\n"
+                )
+            return _ok(
+                "Starting: Intent { act=android.intent.action.VIEW dat=market://... }\n"
+            )
+        if (
+            command.startswith("am start")
+            and "https://play.google.com/store/apps/details?id=com.google.android.gms"
+            in command
+        ):
+            if self.https_fails:
+                return _err("Error: unable to start browser")
+            return _ok(
+                "Starting: Intent { act=android.intent.action.VIEW dat=https://... }\n"
+            )
+        return super()._shell(command)
+
+
+def test_run_update_gms_prefers_work_profile_and_uses_market() -> None:
+    runner = UpdateGmsAdb(gms_version_str="26.43.30 (190400-100000)")
+    lines: list[str] = []
+    report = tool.run_update_gms(_client(runner), writer=lines.append)
+    assert report.ok is True
+    assert len(report.entries) == 1
+    entry = report.entries[0]
+    assert entry.user_id == 10
+    assert entry.gms_installed is True
+    assert entry.gms_version == "26.43.30"
+    assert entry.channel == "market://"
+    assert any("26.43.30" in line for line in lines)
+
+
+def test_run_update_gms_falls_back_to_https_when_market_fails() -> None:
+    runner = UpdateGmsAdb(market_fails=True)
+    report = tool.run_update_gms(_client(runner), writer=lambda _line: None)
+    assert report.ok is True
+    assert report.entries[0].channel == "https:// fallback"
+    shell_cmds = [call[-1] for call in runner.calls if "shell" in call]
+    assert any(
+        "am start --user 10 -a android.intent.action.VIEW -d 'market://details?id=com.google.android.gms'"
+        in cmd
+        for cmd in shell_cmds
+    )
+    assert any(
+        "am start --user 10 -a android.intent.action.VIEW -c android.intent.category.BROWSABLE"
+        " -d 'https://play.google.com/store/apps/details?id=com.google.android.gms'"
+        in cmd
+        for cmd in shell_cmds
+    )
+
+
+def test_run_update_gms_falls_back_to_user0_when_no_work_profile() -> None:
+    runner = UpdateGmsAdb(users="\tUserInfo{0:机主:c13} running\n")
+    report = tool.run_update_gms(_client(runner), writer=lambda _line: None)
+    assert report.ok is True
+    assert [entry.user_id for entry in report.entries] == [0]
+
+
+def test_run_update_gms_all_users_and_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = UpdateGmsAdb(gms_version_str="26.44.32 (190400-123456)")
+    original = tool.AdbClient
+    monkeypatch.setattr(
+        tool,
+        "AdbClient",
+        lambda *_args, serial=None, **_kwargs: original(
+            Path("adb"), serial=serial, runner=runner, timeout=1.0
+        ),
+    )
+    assert tool.main(["update-gms", "--all-users"]) == 0
+    output = capsys.readouterr().out
+    assert "User 0" in output
+    assert "User 10" in output
+    assert "User 11" not in output
+
+    with pytest.raises(tool.ToolError, match="不能同时"):
+        tool.run_update_gms(_client(runner), user_id=0, all_users=True)
+    with pytest.raises(tool.SafetyError, match="不存在"):
+        tool.run_update_gms(_client(runner), user_id=99)
+
+
+def test_run_update_gms_fails_when_both_market_and_https_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = UpdateGmsAdb(market_fails=True, https_fails=True)
+    report = tool.run_update_gms(_client(runner), writer=lambda _line: None)
+    assert report.ok is False
+    assert len(report.entries) == 1
+    assert report.entries[0].ok is False
+    assert report.entries[0].channel == "https:// fallback"
+
+    original = tool.AdbClient
+    monkeypatch.setattr(
+        tool,
+        "AdbClient",
+        lambda *_args, serial=None, **_kwargs: original(
+            Path("adb"), serial=serial, runner=runner, timeout=1.0
+        ),
+    )
+    assert tool.main(["update-gms"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# reset-island：4 阶段工作资料重建与自动迁移
+# ---------------------------------------------------------------------------
+
+
+class ResetIslandAdb(SetupAdb):
+    """可编程模拟 ``reset-island`` 四阶段的假设备。"""
+
+    def __init__(
+        self,
+        *,
+        old_id: str = WORK_ANDROID_ID,
+        new_id: str = "1122334455667788",
+        main_id: str = MAIN_ANDROID_ID,
+        direct_remove_ok: bool = True,
+        remove_polls_before_gone: int = 0,
+        create_polls_before_ready: int = 1,
+        in_place_replace: bool = False,
+        sync_settings_fails: bool = False,
+        vpn_resolve_fails: bool = False,
+        gms_mapped_after_setup_only: bool = False,
+    ) -> None:
+        super().__init__()
+        self.old_id = old_id
+        self.new_id = new_id
+        self.main_id = main_id
+        self.direct_remove_ok = direct_remove_ok
+        self.remove_polls_before_gone = remove_polls_before_gone
+        self.create_polls_before_ready = create_polls_before_ready
+        self.in_place_replace = in_place_replace
+        self.sync_settings_fails = sync_settings_fails
+        self.vpn_resolve_fails = vpn_resolve_fails
+        self.gms_mapped_after_setup_only = gms_mapped_after_setup_only
+        self.gms_mapped_in_work = not gms_mapped_after_setup_only
+        self.work_exists = True
+        self.work_recreated = False
+        self.wait_remove_polls = 0
+        self.wait_create_polls = 0
+        self.removal_ui_opened = False
+
+    def _users_text(self) -> str:
+        if self.work_exists:
+            return USERS_OUTPUT
+        return (
+            "Users:\n\tUserInfo{0:机主:c13} running\n\tUserInfo{11:访客:400} running\n"
+        )
+
+    def _shell(self, command: str) -> Any:
+        if command == "pm list users":
+            if self.removal_ui_opened and self.work_exists and not self.work_recreated:
+                self.wait_remove_polls += 1
+                if self.wait_remove_polls > self.remove_polls_before_gone:
+                    if self.in_place_replace:
+                        self.work_recreated = True
+                    else:
+                        self.work_exists = False
+            elif not self.work_exists and not self.work_recreated:
+                self.wait_create_polls += 1
+                if self.wait_create_polls > self.create_polls_before_ready:
+                    self.work_exists = True
+                    self.work_recreated = True
+            return _ok(self._users_text())
+        if command == "pm list packages --user 10":
+            if self.gms_mapped_after_setup_only and not self.gms_mapped_in_work:
+                return _ok("")
+            return _ok(self.main_packages)
+        if command == "pm install-existing --user 10 com.google.android.gms":
+            self.gms_mapped_in_work = True
+            return _ok("Package com.google.android.gms installed for user: 10\n")
+        if command == "settings --user 0 get secure android_id":
+            return _ok(self.main_id + "\n")
+        if command == "settings --user 10 get secure android_id":
+            if not self.work_exists:
+                return _ok("\n")
+            return _ok((self.new_id if self.work_recreated else self.old_id) + "\n")
+        if command.startswith("dumpsys package com.google.android.gms"):
+            return _ok("Packages:\n  versionName=26.44.32 (190400-123456)\n")
+        if command == "pm remove-user 10":
+            if self.direct_remove_ok:
+                self.work_exists = False
+                return _ok("Success: removed user\n")
+            return _err("java.lang.SecurityException: Requires MANAGE_USERS")
+        if "android.settings.SYNC_SETTINGS" in command:
+            self.removal_ui_opened = True
+            if self.sync_settings_fails:
+                return _err("Error: unable to start settings")
+            return _ok("Starting: Intent { act=android.settings.SYNC_SETTINGS }\n")
+        if tool.ISLAND_MAIN_ACTIVITY in command and " -n " in command:
+            self.removal_ui_opened = True
+            return _ok(f"Starting: Intent {{ cmp={tool.ISLAND_MAIN_ACTIVITY} }}\n")
+        if (
+            "cmd package resolve-activity" in command
+            and "android.intent.category.LAUNCHER" in command
+        ):
+            if self.vpn_resolve_fails:
+                return _ok("No activity found\n")
+            return _ok("priority=0\ncom.v2ray.ang/.ui.MainActivity\n")
+        if command.startswith("am start --user 10 -n ") and "com.v2ray.ang" in command:
+            return _ok("Starting: Intent { cmp=com.v2ray.ang/.ui.MainActivity }\n")
+        if (
+            command.startswith("am start --user 10")
+            and "android.intent.category.LAUNCHER" in command
+            and "com.v2ray.ang" in command
+        ):
+            return _ok(
+                "Starting: Intent { act=android.intent.action.MAIN"
+                " cat=[android.intent.category.LAUNCHER] pkg=com.v2ray.ang }\n"
+            )
+        return super()._shell(command)
+
+
+def test_run_reset_island_direct_remove_migrates_and_opens_vpn() -> None:
+    runner = ResetIslandAdb(
+        direct_remove_ok=True,
+        create_polls_before_ready=1,
+        gms_mapped_after_setup_only=True,
+    )
+    clock, sleeper, _state = _clock()
+    lines: list[str] = []
+    report = tool.run_reset_island(
+        _setup_client(runner),
+        timeout=30.0,
+        interval=1.0,
+        clock=clock,
+        sleeper=sleeper,
+        writer=lines.append,
+    )
+    assert report.ok is True
+    assert report.removal_method == "pm remove-user"
+    assert report.old_user_id == 10
+    assert report.new_user_id == 10
+    assert report.old_android_id == WORK_ANDROID_ID
+    assert report.new_android_id == "1122334455667788"
+    assert report.new_gms_version == "26.44.32"
+    assert report.vpn_opened_pkg == "com.v2ray.ang"
+    assert report.vpn_open_ok is True
+    assert "am start" in (report.vpn_open_method or "")
+    assert any("为您自动打开梯子软件" in line for line in lines)
+    assert "1122334455667788" in report.render()
+
+
+def test_run_reset_island_non_root_fallback_waits_and_opens_settings() -> None:
+    runner = ResetIslandAdb(
+        direct_remove_ok=False,
+        remove_polls_before_gone=2,
+        create_polls_before_ready=1,
+        vpn_resolve_fails=True,
+    )
+    clock, sleeper, _state = _clock()
+    lines: list[str] = []
+    report = tool.run_reset_island(
+        _setup_client(runner),
+        timeout=30.0,
+        interval=1.0,
+        clock=clock,
+        sleeper=sleeper,
+        writer=lines.append,
+    )
+    assert report.ok is True
+    assert report.removal_method == "手机端手动销毁"
+    assert report.vpn_open_ok is True
+    assert report.vpn_open_method == "am start -p (com.v2ray.ang)"
+    assert not any(cmd.startswith("monkey") for cmd in runner.shell_commands)
+    assert any(
+        "am start --user 10 -a android.intent.action.MAIN"
+        " -c android.intent.category.LAUNCHER -p 'com.v2ray.ang'" in cmd
+        for cmd in runner.shell_commands
+    )
+    assert any("Scoped Settings -> Island -> Destroy" in line for line in lines)
+    assert any("android.settings.SYNC_SETTINGS" in cmd for cmd in runner.shell_commands)
+
+
+def test_run_reset_island_detects_in_place_id_change_between_polls() -> None:
+    runner = ResetIslandAdb(
+        direct_remove_ok=False,
+        remove_polls_before_gone=1,
+        in_place_replace=True,
+    )
+    clock, sleeper, _state = _clock()
+    report = tool.run_reset_island(
+        _setup_client(runner),
+        timeout=30.0,
+        interval=1.0,
+        open_vpn=False,
+        clock=clock,
+        sleeper=sleeper,
+        writer=lambda _line: None,
+    )
+    assert report.ok is True
+    assert report.new_android_id == "1122334455667788"
+    assert report.vpn_opened_pkg is None
+
+
+def test_cli_reset_island_no_vpn_skips_vpn_mapping_and_launch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = ResetIslandAdb(
+        direct_remove_ok=True,
+        create_polls_before_ready=0,
+    )
+    original = tool.AdbClient
+    monkeypatch.setattr(
+        tool,
+        "AdbClient",
+        lambda *_args, serial=None, **_kwargs: original(
+            Path("adb"), serial=serial, runner=runner, timeout=1.0
+        ),
+    )
+    assert tool.main(["reset-island", "--no-vpn", "--interval", "0"]) == 0
+    output = capsys.readouterr().out
+    assert "VPN 界面状态" not in output
+    assert not any(
+        "com.v2ray.ang" in cmd
+        for cmd in runner.shell_commands
+        if cmd.startswith(("pm install-existing", "pm enable", "am start"))
+    )
+
+
+def test_run_reset_island_clamps_interval_minimum() -> None:
+    runner = ResetIslandAdb(
+        direct_remove_ok=True,
+        create_polls_before_ready=3,
+    )
+    clock, sleeper, _state = _clock()
+    sleep_calls: list[float] = []
+
+    def tracking_sleeper(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        sleeper(seconds)
+
+    report = tool.run_reset_island(
+        _setup_client(runner),
+        timeout=30.0,
+        interval=0.0,
+        clock=clock,
+        sleeper=tracking_sleeper,
+        writer=lambda _line: None,
+    )
+    assert report.ok is True
+    assert sleep_calls
+    assert all(value >= 0.1 for value in sleep_calls)
+
+
+def test_run_reset_island_timeouts_and_unchanged_id_errors() -> None:
+    clock, sleeper, _state = _clock()
+    never_removed = ResetIslandAdb(direct_remove_ok=False, remove_polls_before_gone=999)
+    with pytest.raises(tool.ToolError, match=r"等待销毁旧工作资料.*超时"):
+        tool.run_reset_island(
+            _setup_client(never_removed),
+            timeout=3.0,
+            interval=1.0,
+            clock=clock,
+            sleeper=sleeper,
+            writer=lambda _line: None,
+        )
+
+    clock2, sleeper2, _state2 = _clock()
+    never_created = ResetIslandAdb(direct_remove_ok=True, create_polls_before_ready=999)
+    with pytest.raises(tool.ToolError, match="等待新建工作资料就绪超时"):
+        tool.run_reset_island(
+            _setup_client(never_created),
+            timeout=3.0,
+            interval=1.0,
+            clock=clock2,
+            sleeper=sleeper2,
+            writer=lambda _line: None,
+        )
+
+
+def test_parser_exposes_reset_island_and_update_gms_options() -> None:
+    parser = tool.build_parser()
+    reset_default = parser.parse_args(["reset-island"])
+    assert reset_default.command == "reset-island"
+    assert reset_default.timeout == 180.0
+    assert reset_default.no_vpn is False
+    assert reset_default.open_vpn is True
+    assert reset_default.browser is None
+
+    reset_custom = parser.parse_args(
+        ["reset-island", "--timeout", "90", "--browser", "mark.via", "--no-open-vpn"]
+    )
+    assert reset_custom.timeout == 90.0
+    assert reset_custom.browser == "mark.via"
+    assert reset_custom.open_vpn is False
+
+    gms_args = parser.parse_args(["update-gms", "--user", "0"])
+    assert gms_args.command == "update-gms"
+    assert gms_args.user == 0
+    assert gms_args.all_users is False
+
+    gms_all = parser.parse_args(["update-gms", "--all-users"])
+    assert gms_all.all_users is True
