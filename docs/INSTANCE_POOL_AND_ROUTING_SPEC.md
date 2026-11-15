@@ -42,6 +42,7 @@
   - [6.4 “最小满足 tier”的精确定义](#64-最小满足-tier的精确定义)
   - [6.5 `_current_tier` 与 403 判定](#65-_current_tier-与-403-判定)
   - [6.6 切换预算与重试上限](#66-切换预算与重试上限)
+  - [6.7 预防性主动轮换与死槽自愈](#67-预防性主动轮换与死槽自愈)
 - [7. 执行、错误处理与请求期改绑](#7-执行错误处理与请求期改绑)
   - [7.1 `acquire`](#71-acquire)
   - [7.2 `handle_error` 决策表](#72-handle_error-决策表)
@@ -49,6 +50,7 @@
   - [7.4 单槽与多槽语义](#74-单槽与多槽语义)
   - [7.5 429 耗尽错误](#75-429-耗尽错误)
   - [7.6 成功记录](#76-成功记录)
+  - [7.7 `verification_required` 单账号隔离](#77-verification_required-单账号隔离)
 - [8. `quota_scope` 双模式记账](#8-quota_scope-双模式记账)
   - [8.1 两种模式](#81-两种模式)
   - [8.2 键构造](#82-键构造)
@@ -77,18 +79,19 @@
 
 | 术语 | 含义 | 证据 |
 |---|---|---|
-| Instance | 用户可见实例：一个账号 + 一个 BrowserContext + 一个 Page + 一个 surface | `src/aistudio_api/domain/instances.py:18-33` |
-| InstanceSlot | 池内运行槽位，持有账号、context、page、session、`active_requests` | `src/aistudio_api/infrastructure/gateway/instance_pool.py:140-218` |
-| PooledSession | 单个 BrowserContext 的会话外壳，持有 page、cookie jar、transport | `src/aistudio_api/infrastructure/gateway/pooled_session.py:54-74` |
+| Instance | 用户可见实例（双引擎统一边界）：`browser` 模式下 `1 账号 + 1 BrowserContext + 1 Page + 1 surface`；`browserless` 模式下 `1 账号 + 1 BrowserlessSession + 1 surface` | `src/aistudio_api/domain/instances.py:18-33` |
+| InstanceSlot | 池内运行槽位，持有账号、运行载体（`browser` 为 context/page/session；`browserless` 为 `BrowserlessSession`）、`active_requests` | `src/aistudio_api/infrastructure/gateway/instance_pool.py:140-218` |
+| PooledSession | `browser` 模式下单个 BrowserContext 的会话外壳，持有 page、cookie jar、transport | `src/aistudio_api/infrastructure/gateway/pooled_session.py:54-74` |
+| BrowserlessSession | `browserless` 模式下的无浏览器槽位会话，独立持有 Cookie、确定性指纹、proof 铸造器与 HTTP/TLS 传输器 | `src/aistudio_api/infrastructure/waa/browserless_session.py` |
 | Lane | `free` / `paid` 两条物理隔离的实例池 | `src/aistudio_api/domain/model_access.py:317-330` |
 | `active_requests` | 唯一并发原语；一个实例同一时刻只允许一个请求句柄 | `instance_pool.py:1-11`, `:206-218` |
 | RouteCandidate | 路由阶段冻结的候选快照 | `src/aistudio_api/application/routing_pipeline.py:176-237` |
 | 最小满足 tier | 满足模型 `required_tiers` 的最低账号 tier | `domain/model_access.py:339-362` |
-| 改绑（rebind） | 不新建实例，原地关闭旧 Page/Context 后激活同槽位的新账号 | `instance_pool.py:615-658`, `instance_manager.py:424-478` |
+| 改绑（rebind） | 不新建实例，原地关闭旧运行载体（Page/Context 或 `BrowserlessSession`）后激活同槽位的新账号 | `instance_pool.py:615-658`, `instance_manager.py:424-478` |
 
 核心不变量：
 
-1. 一个实例只对应一个账号、一个 Context、一个 Page、一个 surface（`instance_pool.py:1-11`, `:140-168`）。
+1. 全局引擎二选一（`browser` 默认、`browserless` 可选）：`browser` 模式下 `1 实例 = 1 账号 + 1 BrowserContext + 1 Page + 1 surface`；`browserless` 模式下 `1 实例 = 1 账号 + 1 BrowserlessSession + 1 surface`（无 Chromium Context/Page，独立持有 Cookie、确定性指纹、proof 铸造器与传输器）（`instance_pool.py:1-11`, `:140-168`）。
 2. Free 与 Paid 是物理隔离的两条 lane，lane 由账号 tier 推导，不由模型名推导（`domain/model_access.py:317-330`）。
 3. 实例创建时必须满足 lane 与 tier 区间；跨 lane 改绑在管理器层直接拒绝（`instance_pool.py:409-446`, `instance_manager.py:424-478`）。
 4. 同一账号不能同时占用两个实例；`create` / `reassign` 均检查（`instance_manager.py:291-352`, `:424-478`）。
@@ -262,7 +265,7 @@ for spec in pool.specs:
 
 ### 3.6 默认配置
 
-`defaults/config.yaml:28-37` 默认两条实例：
+`defaults/config.yaml:61-67` 默认两条实例：
 
 ```yaml
 instances:
@@ -446,7 +449,8 @@ if active_requests == 0: active_zero.set()
 ensure_started()
 route = resolve_model_route(model_path, requested_surface, enabled_surfaces)
 if route.surface == "build": raise SurfaceCapacityError
-wake(route)                       # 唤醒同 lane/surface 的 sleeping/unstarted
+_heal_unavailable_instances(route) # 死槽自愈：对不可用槽位调用 reassign(require_idle=True)
+wake(route)                        # 唤醒同 lane/surface 的 sleeping/unstarted
 lane_candidates = manager.eligible_instances(paid=route.paid, surface=route.surface)
 if not lane_candidates:
     if paid and current_tier 不满足 required: raise TierRequiredError
@@ -457,7 +461,7 @@ if not eligible:
     raise SurfaceCapacityError
 available = [i for i in eligible if account_available(i.account_id, route)]
 if not available: raise SurfaceCapacityError(冷却/登录态)
-ordered = _order(route, available)
+ordered = _order(route, available) # 含空闲槽位的预防性主动轮换（proactive_switch_mode）
 max_switches = features.routing.max_switches (default 2)
 return RouteContext(route, candidates, budget, max_retries)
 ```
@@ -467,11 +471,12 @@ return RouteContext(route, candidates, budget, max_retries)
 1. `_ensure_started` 在 instance manager 尚未配置 surface 时调用 `startup()`（`routing_pipeline.py:583-592`）。
 2. `resolve_model_route` 冻结 surface、lane、`required_tiers`、`required_tier`、`tier`（`routing_eligibility.py:207-260`）。
 3. `build` surface 目前显式拒绝，不会静默换面（`routing_pipeline.py:392-396`）。
-4. `_wake` 只唤醒同 lane/surface 的 `UNSTARTED`/`SLEEPING`（`routing_pipeline.py:594-605`, `instance_manager.py:518-558`）。
-5. `eligible_instances` 已按 lane/surface 过滤，并包含 `UNSTARTED`/`SLEEPING`/`STARTING`/`ACTIVE`（`instance_manager.py:253-272`）。
-6. `tier_allows` 按模型 `required_tiers` 做最低要求过滤（`routing_eligibility.py:263-264`, `model_access.py:351-362`）。
-7. `_account_available` 通过 rotator 检查账号 enabled/expired/session/cooldown（`routing_pipeline.py:540-558`, `account_rotator.py:634-646`）。
-8. 若 Paid 请求没有可用账号，先用 `_current_tier` 判断是否属于 tier 不足，再决定 403 还是 503（`routing_pipeline.py:402-413`, `:420-426`, `:520-538`）。
+4. `_heal_unavailable_instances` 在唤醒与筛选前自动执行死槽自愈，将不可用槽位安全改绑到健康账号（见 §6.7）。
+5. `_wake` 只唤醒同 lane/surface 的 `UNSTARTED`/`SLEEPING`（`routing_pipeline.py:594-605`, `instance_manager.py:518-558`）。
+6. `eligible_instances` 已按 lane/surface 过滤，并包含 `UNSTARTED`/`SLEEPING`/`STARTING`/`ACTIVE`（`instance_manager.py:253-272`）。
+7. `tier_allows` 按模型 `required_tiers` 做最低要求过滤（`routing_eligibility.py:263-264`, `model_access.py:351-362`）。
+8. `_account_available` 通过 rotator 检查账号 enabled/expired/verification_required/session/cooldown（`routing_pipeline.py:540-558`, `account_rotator.py:634-646`）。
+9. 若 Paid 请求没有可用账号，先用 `_current_tier` 判断是否属于 tier 不足，再决定 403 还是 503（`routing_pipeline.py:402-413`, `:420-426`, `:520-538`）。
 
 ### 6.3 候选排序
 
@@ -531,11 +536,21 @@ return RouteContext(route, candidates, budget, max_retries)
 
 ### 6.6 切换预算与重试上限
 
-- `max_switches`：来自 `features.routing.max_switches`，默认 2；非法值回退 2（`model_defaults.py:1498-1533`, `defaults/config.yaml:87-89`）。
-- `retry_same_delay_sec`：429 同账号首次重试退避，默认 2.0s，范围 0..30；`AISTUDIO_RETRY_SAME_DELAY_SEC` 可覆盖（`model_defaults.py:989-1051`, `routing_pipeline.py:445-454`, `defaults/config.yaml:85-89`）。
-- `max_retries`：来自 `rotator.max_retries`，默认 5，最小 1（`routing_pipeline.py:575-581`, `defaults/config.yaml:73-74`）。
+- `max_switches`：来自 `features.routing.max_switches`，默认 2；非法值回退 2（`model_defaults.py:1498-1533`, `defaults/config.yaml:128-134`）。
+- `switch_backoff_sec`：429 首击记录模型级冷却后、切号前的退避等待，默认 `4.0s`（±25% 随机抖动）；429 不做同账号重试（`routing_pipeline.py`）。
+- `retry_same_delay_sec`：默认 `2.0s`，范围 `0..30`，`AISTUDIO_RETRY_SAME_DELAY_SEC` 可覆盖（`model_defaults.py:989-1051`, `defaults/config.yaml:128-134`）。**仅用于上游瞬态错误（204/404/408/5xx）与传输超时（`is_browser_session_hang_error`，默认 300s 读取超时）的同账号原位重试 1 次**，且重试后仍失败直接抛出，绝不触发切号。
+- `max_retries`：来自 `rotator.max_retries`，默认 5，最小 1（`routing_pipeline.py:575-581`, `defaults/config.yaml:106-113`）。
 - `RoutingBudget` 只统计 switch；`record_retry` 单独统计同账号重试（`routing_safety.py:14-50`）。
 - `can_continue` 需要同时满足 `total_attempts < max_retries` 且 `budget.can_switch()`（`routing_pipeline.py:1102-1150`）。
+
+### 6.7 预防性主动轮换与死槽自愈
+
+1. **预防性主动轮换（`proactive_switch_mode / threshold / groups`）**：
+   - 支持配置 `proactive_switch_mode`（`off` / `free_only` / `paid_only` / `all` / `groups`）、`proactive_switch_threshold`（默认 `15` 次）以及自定义账号分组过滤 `proactive_switch_groups`；
+   - 当某健康槽位空闲（`active_requests == 0`）且当前绑定账号连续成功调用次数达到阈值时，系统在下一批请求调度前主动平缓轮换至冷却最久（LRU）的下一个健康账号，避免单账号长期连续承压触发限流或风控；单轮退场仅重置连续计数，不锁死账号。
+2. **`begin()` 死槽自愈（`_heal_unavailable_instances`）**：
+   - `RoutingPipeline.begin()` 在执行 `_wake` 与候选筛选之前，自动调用 `_heal_unavailable_instances` 扫描池内不可用槽位（如绑定账号已过期、被禁用、触发 `verification_required` 隔离或处于不可恢复状态）；
+   - 对符合条件的死槽，调用 `InstanceManager.reassign(..., require_idle=True)` 在槽位空闲的前提下原地换绑健康 LRU 账号，无需等待请求撞墙失败或人工逐个重启即可自动恢复池容量。
 
 ---
 
@@ -562,18 +577,18 @@ return RouteContext(route, candidates, budget, max_retries)
 |---|---|---|---|---|
 | `TierRequiredError` | 直接抛出 | — | — | `:763-764` |
 | `ValueError` | 转 `RequestError(400)` | — | — | `:765-766` |
-| `SessionExpiredError` | 记录 `session_expired`；清模板；立即 `_switch_or_raise` | 预算/候选耗尽后抛出 | 抛出，不切换 | `:769-776` |
-| `AuthError`（403） | 若候选 tier 不满足 -> `TierRequiredError`；否则记录 `auth_error`、清模板；`_refresh_auth_state` 成功后 `same_retries==0` -> `retry_same`；刷新失败直接切号/报错 | 第二次 -> `_switch_or_raise(reason="auth_error")` | 抛出，不切换 | `:778-820`、`:912-954` |
-| `UsageLimitExceeded`（429） | 记录 `rate_limited`；`same_retries==0` 且未超 max_retries -> 按 `retry_same_delay_sec`（默认 2.0s）退避后 `retry_same` | 第二次 -> `_switch_or_raise(reason="429", quota_exhausted=True)` | 抛出，不切换 | `:822-853` |
-| `RequestError(204)` | 同账号重试一次（清模板） | 仍空 -> `BrowserTransportError` | 抛出，不切换 | `:855-890` |
-| `RequestError(404)` 且 transient RPC | 同账号重试一次 | 仍失败 -> 抛出 | 抛出，不切换 | `:855-890` |
+| `SessionExpiredError` | 记录 `session_expired`（同步刷新 `last_used`）；清模板；立即 `_switch_or_raise` | 预算/候选耗尽后抛出 | 抛出，不切换 | `:769-776` |
+| `verification_required` (`verify-account`) | 识别移动设备验证风控，单账号独立标记隔离（不连坐同源兄弟号）；清模板；未 yield -> `_switch_or_raise` | 预算/候选耗尽后抛出 | 抛出，不切换 | `routing_pipeline.py`、`account_rotator.py` |
+| `AuthError`（403） | 若候选 tier 不满足 -> `TierRequiredError`；否则记录 `auth_error`（同步刷新 `last_used`）、清模板；`_refresh_auth_state` 成功后 `same_retries==0` -> `retry_same`；刷新失败直接切号/报错 | 第二次 -> `_switch_or_raise(reason="auth_error")` | 抛出，不切换 | `:778-820`、`:912-954` |
+| `UsageLimitExceeded`（429） | **首击直接退避切号（不做同账号重试）**：立即记录模型级冷却（同步刷新 `last_used`），按 `switch_backoff_sec`（默认 `4.0s` ±25% 抖动）退避后调用 `_switch_or_raise(reason="429", quota_exhausted=True)` | 预算/候选耗尽 -> 503 `SurfaceSwitchExhaustedError` | 抛出，不切换 | `routing_pipeline.py`、`account_rotator.py` |
+| `RequestError(204/404/408/5xx)`（上游瞬态错误） | `same_retries==0` 时按 `retry_same_delay_sec`（默认 `2.0s`）同账号原位重试 1 次（清模板） | 仍失败 -> 直接抛出（**绝不切号**；204 仍空 -> `BrowserTransportError`） | 抛出，不切换 | `routing_pipeline.py` |
 | 非 transient `RequestError(404)` | 直接抛出 | — | — | `:855-861` |
-| 浏览器会话挂起 | 记录、清模板；未 yield -> `_switch_or_raise(reason="session_hang")` | 预算/候选耗尽 -> 抛出 | 抛出，不切换 | `:892-899` |
+| `is_browser_session_hang_error`（传输超时，默认 300s 读取超时） | `same_retries==0` 时按 `retry_same_delay_sec`（默认 `2.0s`）同账号原位重试 1 次（清模板） | 仍超时 -> 直接抛出（**绝不切号**） | 抛出，不切换 | `routing_pipeline.py` |
 | 其他 `RequestError` | 直接抛出 | — | — | `:901-903` |
 | 其他 `AistudioError` / `BrowserTransportError` | 直接抛出 | — | — | `:905-907` |
 | 未知异常 | 记录后抛出 | — | — | `:909-910` |
 
-同账号重试使用 `budget.record_retry(...)`，不消耗 switch 预算（`:797`, `:829`, `:873`）。切换使用 `budget.record_switch(...)`（`:1102-1150`）。
+同账号重试使用 `budget.record_retry(...)`，不消耗 switch 预算。切换使用 `budget.record_switch(...)`（`:1102-1150`）。
 
 ### 7.3 `_switch_or_raise` 与 `_try_rebind`
 
@@ -604,7 +619,7 @@ return "switch"
 4. 若释放后实例仍有在途请求，跳过改绑（`:1013-1018`）。
 5. 循环调用 `select_rebind_account`：
    - 传入 lane、model、surface、排除集合、only/min/max、required_tiers。
-   - 选择器按 `(tier_rank, total_requests, model_requests_total, last_used)` 取最小（`account_rotator.py:648-710`）。
+   - 选择器按 **`(last_used, tier_rank, total_requests, model_requests_total)`** 取最小（`last_used` 升序第一位主导全池 LRU 大循环，且 `record_rate_limited` / `record_auth_error` 会同步刷新 `last_used`）（`account_rotator.py:648-710`）。
 6. `reassign(instance_id, target_id)`；失败则把目标账号加入 `failed_accounts` 和排除集合后继续（`:1040-1053`）。
 7. 成功后用新 `Instance` 更新 `RouteContext.candidates` 中同 instance_id 的候选（`:1055-1068`）。
 8. 单槽 `reuse=True` 时从 `attempted_instances` 移除该实例，使 `next_candidate` 能再次选中它（`:1069-1072`）。
@@ -623,14 +638,14 @@ return "switch"
 
 | 场景 | `reuse` | 行为 |
 |---|---|---|
-| 只有一个槽位，429/401/二次 403 | True | 释放句柄 -> 原地改绑到同 lane 的另一个健康账号 -> 从 `attempted_instances` 移除 -> 当前请求重新 acquire 同一槽位 |
+| 只有一个槽位，429/401/二次 403/`verify-account` | True | 释放句柄 -> 原地改绑到同 lane 的另一个健康 LRU 账号 -> 从 `attempted_instances` 移除 -> 当前请求重新 acquire 同一槽位 |
 | 多个槽位，某个槽位失效 | False | 释放句柄 -> 原地改绑该槽位 -> 当前请求继续走 `next_candidate()` 的其他槽位；被改绑槽位供后续请求使用 |
 | 没有其他候选账号 | — | `_try_rebind` 返回 False；按原错误/503 路径抛出 |
 
 补充：
 
 - 单槽改绑没有“每槽最多一次”的硬上限；一个槽位可以 A -> B -> C，但受 `attempted_accounts`/`failed_accounts` 和 `max_switches` 约束（`:760-765`）。
-- 429 的第二次处理才会进入改绑；401 首次即进入改绑；403 首次同账号重签，第二次进入改绑（见 7.2）。
+- 429 首击即经 `switch_backoff_sec` 退避后进入切号/改绑（不做同账号重试）；401 与 `verify-account` 首次即进入切号/改绑；403 首次同账号重签，第二次进入改绑；上游瞬态错误（204/404/408/5xx）与传输超时只按 `retry_same_delay_sec` 同账号重试 1 次后直接抛出，绝不切号（见 7.2）。
 - 改绑是请求内同步完成的，不创建后台任务（`:745-755`）。
 
 ### 7.5 429 耗尽错误
@@ -647,6 +662,14 @@ return "switch"
 
 `account_rotator.record_success` 会累加请求/成功/Token，并清空该模型冷却（`account_rotator.py:284-319`）。
 
+### 7.7 `verification_required` 单账号隔离
+
+当上游响应或重定向触发 Google `verify-account`（移动设备验证风控）时，路由层与账号轮转器执行以下隔离策略：
+
+- **单账号独立标记**：将触发账号独立标记为 `verification_required`（属于 `is_auth_locked` 锁定态），`account_available` 与 `select_rebind_account` 即刻排除该账号；
+- **不连坐同源兄弟号**：即使该账号属于同源多登组（`u/0..u/N`），`verify-account` 风控**绝不扩散隔离同源其他兄弟子账号**（仅根会话全局失效才整组同步隔离）；
+- **安全切换与自愈**：当前请求未 yield 数据时清模板并立即进入 `_switch_or_raise` 切至下一健康 LRU 账号；后续请求在 `RoutingPipeline.begin()` 阶段由 `_heal_unavailable_instances` 通过 `reassign(require_idle=True)` 自动换绑清理死槽；后台刷新与 `/RotateCookies` 任务跳过 `is_auth_locked` 账号防止误洗白。
+
 ---
 
 ## 8. `quota_scope` 双模式记账
@@ -658,7 +681,7 @@ return "switch"
 - `"account"`（默认）：同一账号的 chat/build 共用同一模型键。
 - `"account_surface"`：按 `surface::model` 分开记账。
 
-配置解析（`model_defaults.py:1593-1605`）：非法值 warning 并回退 `"account"`。默认配置 `defaults/config.yaml:73-80` 写 `quota_scope: account`。
+配置解析（`model_defaults.py:1593-1605`）：非法值 warning 并回退 `"account"`。默认配置 `defaults/config.yaml:106-113` 写 `quota_scope: account`。
 
 ### 8.2 键构造
 
@@ -701,8 +724,9 @@ return (primary,) if primary == legacy else (primary, legacy)
 - 超过 2 次：进入 `drip_mode`，使用 `rate_limited_drip`。
 - drip 模式超过 4 次：使用 `rate_limited_drip_extended`。
 - 冷却上限为该模型到美西午夜的剩余秒数（至少 60s）。
+- 同步刷新账号 `last_used`，使触发 429 的账号退居 LRU 队列尾部。
 
-`record_auth_error` 明确不设置 auth 冷却（`auth_cooldown=0.0`），只累加 `auth_errors` 计数；调度准入不读取 `auth_errors`，不存在动态避让；首次 403 原位重签，二次 403 才切号（`account_rotator.py:371-388`）。
+`record_auth_error` 明确不设置 auth 冷却（`auth_cooldown=0.0`），只累加 `auth_errors` 计数并同步刷新 `last_used`；调度准入不读取 `auth_errors`，不存在动态避让；首次 403 原位重签，二次 403 才切号（`account_rotator.py:371-388`）。
 
 `record_session_expired` 设置 24h `auth_cooldown` 并标记 `session_expired`（`:390-404`）。
 
@@ -829,23 +853,20 @@ generation_service.generate/stream_generation
 ```text
 attempt A (slot-1, account A)
   -> 429 UsageLimitExceeded
-  -> handle_error: same_retries=0
-  -> budget.record_retry("429")
-  -> "retry_same"
-attempt A again
-  -> 429
-  -> handle_error: same_retries=1
-  -> _switch_or_raise(reason="429", quota_exhausted=True)
-       -> failed_accounts.add(A)
-       -> can_continue? (attempts<max_retries && switches<max_switches)
-       -> reuse = next_candidate() is None  # 多槽 -> False
-       -> _try_rebind:
-            release(A handle)
-            select_rebind_account(lane, exclude A/attempted/bound)
-            reassign(slot-1, account B)  # 原地关闭旧 Page/Context，激活 B
-            context.candidates 更新 slot-1 -> B
-            budget.record_switch("429")
-       -> "switch"
+  -> handle_error:
+       record_rate_limited(A)  # 记录模型级冷却 + 刷新 last_used
+       sleep switch_backoff_sec (默认 4.0s ±25% 抖动；不做同账号重试)
+       _switch_or_raise(reason="429", quota_exhausted=True)
+         -> failed_accounts.add(A)
+         -> can_continue? (attempts<max_retries && switches<max_switches)
+         -> reuse = next_candidate() is None  # 多槽 -> False
+         -> _try_rebind:
+              release(A handle)
+              select_rebind_account(lane, exclude A/attempted/bound)  # last_used LRU 优先
+              reassign(slot-1, account B)  # 原地关闭旧运行态，激活 B
+              context.candidates 更新 slot-1 -> B
+              budget.record_switch("429")
+         -> "switch"
   -> acquire next_candidate() -> slot-2 (account C)
   -> 成功 -> release
 后续请求可使用已修复的 slot-1(B)
@@ -856,20 +877,21 @@ attempt A again
 ```text
 attempt (only slot, account A)
   case 429:
-    first 429 -> retry_same (same account)
-    second 429 -> _switch_or_raise
-  case 401 SessionExpired:
-    first 401 -> _switch_or_raise (无同账号重试)
+    first 429 -> record_rate_limited(A) -> sleep switch_backoff_sec -> _switch_or_raise (不做同账号重试)
+  case 401 SessionExpired / verify-account:
+    first hit -> _switch_or_raise (无同账号重试)
   case 403 AuthError:
     first 403 -> retry_same (同账号重签)
     second 403 -> _switch_or_raise
+  case 瞬态错误 (204/404/408/5xx) / 传输超时:
+    first hit -> sleep retry_same_delay_sec (2.0s) -> retry_same (1 次后仍失败直接抛出，绝不切号)
 
 _switch_or_raise:
   failed_accounts.add(A)
   reuse = next_candidate() is None  # 单槽 -> True
   _try_rebind(reuse=True):
     release(A handle)
-    select_rebind_account(lane, exclude A/attempted/bound)
+    select_rebind_account(lane, exclude A/attempted/bound)  # last_used LRU 优先
     reassign(slot, account B)
     context.candidates[slot] = B
     attempted_instances.discard(slot)   # 允许当前请求重新取同一槽
@@ -939,7 +961,7 @@ begin(paid_model)
 | 预算 | `src/aistudio_api/application/routing_safety.py:14-50` |
 | quota_scope | `src/aistudio_api/application/account_rotator.py:70-101`, `:215-282`, `:544-552`; `model_defaults.py:1593-1605` |
 | 403 契约 | `src/aistudio_api/domain/errors.py:24-62`; `src/aistudio_api/api/error_mapping.py:125-150`; `src/aistudio_api/api/gemini_service.py:185-200` |
-| 默认配置 | `defaults/config.yaml:28-37`, `:73-89` |
+| 默认配置 | `defaults/config.yaml:61-67`, `:106-113`, `:128-134` |
 
 ---
 
@@ -978,8 +1000,7 @@ begin(paid_model)
 5. 该刷新同时把 `_force_snapshot_warmup=True`，下一次快照先走本地预热。
 6. Paid tier 不足的 403 仍直接转 `TierRequiredError`，不触发切号。
 
-### 13.4 429 默认 2.0s 退避
+### 13.4 429 首击退避切号与瞬态/超时原位重试
 
-`features.routing.retry_same_delay_sec` 默认 `2.0`，范围 `0..30`，可用 `AISTUDIO_RETRY_SAME_DELAY_SEC` 覆盖
-（`defaults/config.yaml:85-89`、`model_defaults.py:989-1051`、`routing_pipeline.py:59`、`:445-454`）。
-首次 429 同账号重试前按该值 `asyncio.sleep` 退避（`routing_pipeline.py:822-846`）；第二次 429 才进入切号/改绑，预算耗尽返回 503。
+- **429 首击直接退避切号**：`features.routing.switch_backoff_sec` 默认 `4.0`（±25% 随机抖动）。遇到 `UsageLimitExceeded` (429) 时，首击立即记录模型级冷却并刷新 `last_used`，经 `switch_backoff_sec` 退避等待后直接进入切号/改绑，**不做同账号重试**；预算耗尽返回 503 `SurfaceSwitchExhaustedError`。
+- **瞬态错误与传输超时原位重试**：`features.routing.retry_same_delay_sec` 默认 `2.0`，范围 `0..30`，可用 `AISTUDIO_RETRY_SAME_DELAY_SEC` 覆盖（`defaults/config.yaml:128-134`、`model_defaults.py:989-1051`）。该参数**仅用于上游瞬态错误（204/404/408/5xx）与传输超时（`is_browser_session_hang_error`，默认 300s 读取超时）的同账号原位重试 1 次**，且重试后仍失败直接抛出，绝不触发切号。

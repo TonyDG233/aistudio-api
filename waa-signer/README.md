@@ -19,28 +19,12 @@
 ## 跨平台一键编译
 
 ### 前置要求
-- **Go 工具链**：本模块 `go.mod` 声明 `go 1.23`（本仓库自身代码的语法基线）。但上游传输依赖当前声明了更高版本：
-  - `github.com/Mag1cFall/uquic v0.0.6-firefox.6` → `go 1.27`
-  - `github.com/Mag1cFall/utls v1.8.2-firefox.3` → `go 1.27`
-  - `golang.org/x/net v0.59.0` → `go 1.26.0`
-
-  实测证据（Go 1.26.4，`GOTOOLCHAIN=local`）：
-
-  ```text
-  go: github.com/Mag1cFall/uquic@v0.0.6-firefox.6 requires go >= 1.27
-      (running go 1.26.4; GOTOOLCHAIN=local)
-  ```
-
-  因此**实际编译必须使用 Go 1.27 工具链**。`go.mod` 已把主 `go` 指令降到 `1.23` 并用独立的 `toolchain go1.27.0` 指令记录实际所需工具链：主指令只表达本模块自身代码的语法基线，无法绕过依赖模块自身的最低版本要求；在保留上述上游固定版本的前提下不存在降级路径。
-
-  构建/测试请显式指定工具链：
+- **Go 工具链**：本模块 `go.mod` 正式声明 `go 1.27`（配合 `GOTOOLCHAIN=auto`），以满足上游传输依赖（`uquic`、`utls`、`x/net`）的版本要求。构建与测试直接使用原生 `go.mod`，无需任何临时 `.modfile` 桥接：
 
   ```bash
   cd waa-signer
-  GOTOOLCHAIN=go1.27.0 go test ./internal/poolstate ./internal/upstreamguard ./internal/signerapi
+  GOTOOLCHAIN=auto go test ./internal/poolstate ./internal/upstreamguard ./internal/signerapi
   ```
-
-  补充证据：若使用 `GOFLAGS=-mod=mod` 执行构建，Go 会因依赖的更高版本要求自动把主 `go` 指令改写回 `1.27`。本仓库刻意保留 `go 1.23` + `toolchain go1.27.0` 以同时表达“本模块基线”和“实际构建工具链”，不把依赖要求伪装成本模块要求。请不要把本项目描述为“Go 1.22+ 可直接构建”。
 - C/C++ 编译器：强烈推荐 `zig`（免配置支持静态交叉链接），亦可使用 `clang` 或 `gcc` / `MinGW-w64`
 
 ### 编译命令
@@ -48,9 +32,13 @@
 #### Linux / macOS / Android (Termux)
 在 `waa-signer/` 目录下执行：
 ```bash
+# 编译当前平台二进制
 bash build.sh
+
+# 交叉编译 Android ARM64 静态二进制（可用于 Termux）
+bash build.sh --target android-arm64
 ```
-脚本会自动识别 CPU 架构与操作系统（Linux x64/arm64、macOS arm64/amd64），自动拉取对应的官方静态 `spidermonkey-v152.0.4` 依赖，并产出单一无外部依赖的二进制文件 `bin/waa-signer`。
+脚本会自动识别 CPU 架构与操作系统（Linux x64/arm64、macOS arm64/amd64、Android ARM64），自动拉取对应的官方静态 `spidermonkey-v152.0.4` 依赖，并产出单一无外部依赖的二进制文件 `bin/waa-signer`。
 
 #### Windows (CMD / PowerShell)
 在 `waa-signer\` 目录下直接运行：
@@ -59,15 +47,19 @@ build.bat
 ```
 或在 PowerShell 中执行：
 ```powershell
+# 编译当前平台二进制 bin\waa-signer.exe
 .\build.ps1
+
+# 交叉编译 Android ARM64 静态二进制（可部署至 Termux）
+.\build.ps1 -Target android-arm64
 ```
-脚本会自动完成依赖下载与编译，产出 `bin\waa-signer.exe`。
+脚本会自动完成依赖下载与编译（Windows 默认产出 `bin\waa-signer.exe`）。
 > **Windows 编译小贴士**：推荐使用轻量免配置的 Zig 编译器（执行 `winget install zig.zig` 即可一键就绪）。
 
 #### Docker（单镜像内置）
 主 `Dockerfile` 现在包含独立的 `waa-signer` 多阶段构建，`docker build -t aistudio-api .` 会与 CloakBrowser 一起产出单镜像双引擎：
 
-- 构建阶段使用 `golang:1.27-bookworm` 与 `GOTOOLCHAIN=local`，满足 `go.mod` 的 `toolchain go1.27.0`；按目标架构获取对应的 SpiderMonkey 静态库，并用 Zig 交叉编译为静态二进制。
+- 构建阶段使用 `golang:1.27-bookworm` 与 `GOTOOLCHAIN=local`，直接使用原生 `go.mod`（声明 `go 1.27`，无需临时 `.modfile` 桥接）；按目标架构获取对应的 SpiderMonkey 静态库，并用 Zig 交叉编译为静态二进制。
 - 产物写入最终镜像 `/app/waa-signer/bin/waa-signer`，与 `defaults/config.yaml` 的 `engine.browserless.signer.binary_path` 默认值一致。
 - 默认 `engine.browserless.signer.mode: local_subprocess` 且 `auto_start: true`，切换到 browserless 引擎时由主服务自动拉起，无需额外容器或 volume 挂载。
 - 仍支持独立部署：把 `mode` 改为 `remote_http` 并显式设置 `endpoint`，主服务不会拉起本地进程。

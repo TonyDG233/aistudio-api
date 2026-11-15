@@ -42,6 +42,7 @@
   - [5.6 非流式还原](#56-非流式还原)
   - [5.7 流式还原](#57-流式还原)
   - [5.8 参数修复](#58-参数修复)
+  - [5.9 2.1.3 双独立开关、图文双轨分流与可编辑模板](#59-213-双独立开关图文双轨分流与可编辑模板)
 - [6. PG-01..PG-04 门](#6-pg-01pg-04-门)
   - [6.1 PG-01：历史 model functionCall 缺签名](#61-pg-01历史-model-functioncall-缺签名)
   - [6.2 PG-02：首事件前不得伪装成 200 SSE](#62-pg-02首事件前不得伪装成-200-sse)
@@ -92,7 +93,7 @@ Responses route ─┘        └─ ATG wrap/unwrap、空响应重试、签名�
 - `src/aistudio_api/api/routes_openai.py:99-221`：OpenAI Chat Completions 入口。
 - `src/aistudio_api/api/routes_claude.py:175-252`：Claude Messages 入口。
 - `src/aistudio_api/api/routes_responses.py:96-249`：OpenAI Responses 入口。
-- `defaults/config.yaml:108-117`：`formats.openai/claude/responses` 默认 `true`，Gemini 常驻。
+- `defaults/config.yaml:157-162`：`formats.openai/claude/responses` 默认 `true`，Gemini 常驻。
 
 ---
 
@@ -259,7 +260,7 @@ Responses route ─┘        └─ ATG wrap/unwrap、空响应重试、签名�
 - `decode_data_url` 拆出 mime/base64。
 - 输出 `{"inlineData":{"mimeType":..., "data":...}}`。
 
-`features.formats.media.allow_private_urls` 控制私有地址是否允许（`defaults/config.yaml:110-117`），由 `format_media_allow_private()` 读取（`routes_openai.py:97`）。
+`features.formats.media.allow_private_urls` 控制私有地址是否允许（`defaults/config.yaml:161-162`），由 `format_media_allow_private()` 读取（`routes_openai.py:97`）。
 
 ### 3.7 响应渲染（非流式）
 
@@ -488,7 +489,7 @@ finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`application/finish_reasons.py::W
 `AtgProcessor`（`atg/__init__.py:38-90`）：
 
 - `enabled = cfg.mode != "off"`。
-- `wrap`：先 `purge_synthetic_history`，再 `inject_gemini`。
+- `wrap`：先 `purge_synthetic_history`，再按 `wrap_input` / `wrap_output` 双独立开关分别调用 `input_wrapper`（输入文本历史封装）与 `inject_gemini`（输出合成工具注入）。
 - `unwrap_response`：非流式还原。
 - `create_stream_unwrapper`：流式还原。
 - `create_atg_processor` 每次构造都重新读取 features，支持热重载。
@@ -498,17 +499,21 @@ finish 映射 `WIRE_TO_GEMINI_FINISH_REASON`（`application/finish_reasons.py::W
 | 字段 | 默认 | 作用 |
 |---|---|---|
 | `mode` | `off` | `off/prefer/required` |
+| `wrap_input` | `false` | 独立开关：是否将文本历史封装为 `atg_ctx_*` `functionResponse` Struct |
+| `wrap_output` | `true` | 独立开关：是否注入 `atg_emit_*` 输出合成工具通道 |
 | `tool_prefix` | `atg_emit_` | 合成工具名前缀 |
 | `control_position` | `tail` | 控制消息插入位置 |
+| `control_template` | 内置默认模板 | 可编辑的输出控制提示词模板 |
+| `input_context_instruction` | 内置默认模板 | 可编辑的输入上下文封装指令模板 |
 | `strict` | `false` | 声明加 `additionalProperties:false` |
 | `empty_retries` | `2` | 空响应重试次数（0-5） |
 | `recovery` | `repair` | 参数解码失败时修复或失败 |
 | `side_buffer_bytes` | `0` | 流式正文缓冲阈值 |
 | `client_synthetic_guard` | `true` | 客户端已有合成通道时跳过本地 wrap |
-| `max_response_bytes` | 16 MiB | 参数/响应上限 |
+| `max_response_bytes` | `16 MiB` | 参数/响应上限 |
 | `model_filter` | 默认文本过滤器 | 非文本模型直通 |
 
-`resolve_atg_mode(api_format)`（`atg/config.py:43-58`）：`features.atg.mode_by_format.<format>` 显式指定 `off/prefer/required` 时优先，否则继承 `features.atg.mode`。默认配置 `defaults/config.yaml:134-150` 为 `mode: "off"`，四个 format（gemini/openai/claude/responses）均为 `inherit`。
+`resolve_atg_mode(api_format)`（`atg/config.py:43-58`）：`features.atg.mode_by_format.<format>` 显式指定 `off/prefer/required` 时优先，否则继承 `features.atg.mode`。默认配置 `defaults/config.yaml:184-204` 为 `mode: "off"`，四个 format（gemini/openai/claude/responses）均为 `inherit`。
 
 ### 5.2 wrap 流程
 
@@ -655,6 +660,19 @@ guard 命中（客户端已有合成通道）
 7. 仍失败 -> 错误。
 
 `ARGUMENT_KEYS = content/text/answer/response/result/output/message`（`:17`）。
+
+### 5.9 2.1.3 双独立开关、图文双轨分流与可编辑模板
+
+2.1.3 起 ATG 拆分为输入封装与输出包裹两条独立能力，支持细粒度开关与自定义模板：
+
+1. **输入 / 输出双独立开关**：
+   - `wrap_output: bool = True`：控制是否向请求注入 `atg_emit_*` 合成工具通道及输出还原（默认开启，当总开关 `mode != "off"` 时生效）；
+   - `wrap_input: bool = False`：控制是否启用输入历史封装（默认关闭，可独立开启，不与 `wrap_output` 绑定）。
+2. **`input_wrapper.py` 图文双轨分流机制**：
+   - 当 `wrap_input=True` 时，`application/atg/input_wrapper.py` 将历史多轮文本对话封装为带 `atg_ctx_*` 前缀的 `functionResponse` Struct 载荷，把长上下文/角色设定与当前指令隔离在结构化工具结果中；
+   - 对于同一 Turn 中的多模态图片（`inlineData`），不将其塞入结构化文本工具槽，而是原样保留在同 Turn 原生视觉槽位 `[2]`，实现“文本结构化防截断/防越狱 + 视觉原生直通”的图文双轨分流。
+3. **可编辑提示词模板**：
+   - 配置支持自定义 `control_template`（控制输出合成通道的提示词模板）与 `input_context_instruction`（控制输入上下文封装的引导指令），允许用户在不改动代码的前提下调优不同模型下的指令遵循效果。
 
 ---
 
@@ -959,6 +977,7 @@ upstream response [200, 1234] -> totalTokens=1234
 | 首事件预读 | `src/aistudio_api/api/gemini_service.py::_build_gemini_streaming_response`; `src/aistudio_api/api/routes_openai.py::chat_completions` |
 | 工具流终止 | `src/aistudio_api/infrastructure/gateway/streaming.py:34-37`, `:118-136`, `:242-248`; `wire_parser.py:437-541` |
 | ATG 配置/门面 | `src/aistudio_api/application/atg/__init__.py:38-90`; `atg/config.py:43-110` |
+| ATG 输入双轨封装 | `src/aistudio_api/application/atg/input_wrapper.py` |
 | ATG 注入 | `src/aistudio_api/application/atg/injector.py:104-216` |
 | 五信号 | `src/aistudio_api/application/atg/client_patterns.py:9-18`, `:91-227` |
 | ATG 非流式还原 | `src/aistudio_api/application/atg/extractor.py:95-197` |
@@ -966,7 +985,7 @@ upstream response [200, 1234] -> totalTokens=1234
 | ATG 参数修复 | `src/aistudio_api/application/atg/repair.py:17`, `:189-226` |
 | 签名缓存 | `src/aistudio_api/application/signature_cache.py:27-83`, `:161-180` |
 | countTokens | `src/aistudio_api/application/token_counter.py:1-8`, `:76-237`; `instance_client.py:178-220` |
-| 默认 ATG/格式配置 | `defaults/config.yaml:108-150` |
+| 默认 ATG/格式配置 | `defaults/config.yaml:157-204` |
 | `[toolshape]` | `src/aistudio_api/application/chat_service.py:567-704`, `:1033-1040` |
 
 ---
@@ -976,7 +995,7 @@ upstream response [200, 1234] -> totalTokens=1234
 ### 12.1 Claude Messages
 
 **入口**：`POST /v1/messages` 与 `POST /v1/messages/count_tokens`（`routes_claude.py:175-252`），依赖 `require_claude` + `require_api_key`。
-`require_claude` 读取 `features.formats.claude`，默认 `true`（`routes_claude.py:58-59`、`format_errors.py:81-126`、`defaults/config.yaml:112-115`）。
+`require_claude` 读取 `features.formats.claude`，默认 `true`（`routes_claude.py:58-59`、`format_errors.py:81-126`、`defaults/config.yaml:157-162`）。
 
 **请求契约**：`application/contracts/claude.py:13-40` 的 `ClaudeMessagesRequest` / `ClaudeCountTokensRequest`。
 
@@ -1004,7 +1023,7 @@ upstream response [200, 1234] -> totalTokens=1234
 
 ### 12.2 OpenAI Responses
 
-**入口**：`POST /v1/responses` 与 `POST /v1/responses/input_tokens`（`routes_responses.py:96-249`），默认启用（`features.formats.responses=true`，`defaults/config.yaml:115`）。
+**入口**：`POST /v1/responses` 与 `POST /v1/responses/input_tokens`（`routes_responses.py:96-249`），默认启用（`features.formats.responses=true`，`defaults/config.yaml:160`）。
 
 **请求契约**：`contracts/responses.py:14-36` 的 `ResponsesRequest`。
 

@@ -27,11 +27,13 @@
   - [3.5 按槽位成功记账](#35-按槽位成功记账)
   - [3.6 可选的 active_activity](#36-可选的-active_activity)
   - [3.7 时序图：auth_update](#37-时序图auth_update)
+  - [3.8 `/RotateCookies` 滚动续期与同源多登同步](#38-rotatecookies-滚动续期与同源多登同步)
 - [4. 24h 元数据刷新与 3 天 tier 跳过](#4-24h-元数据刷新与-3-天-tier-跳过)
   - [4.1 调度层](#41-调度层)
   - [4.2 3 天 tier 新鲜度](#42-3-天-tier-新鲜度)
   - [4.3 启动时的两层协调](#43-启动时的两层协调)
   - [4.4 时序图：metadata_refresh](#44-时序图metadata_refresh)
+  - [4.5 Auth 锁定跳过与 `Firefox/152.0` 请求头对齐](#45-auth-锁定跳过与-firefox1520-请求头对齐)
 - [5. B4 三 sink：环形缓冲、归档、SSE](#5-b4-三-sink环形缓冲归档sse)
   - [5.1 三 sink 装配](#51-三-sink-装配)
   - [5.2 环形缓冲（5000）](#52-环形缓冲5000)
@@ -66,6 +68,7 @@
 | 组件 | 职责 | 证据 |
 |---|---|---|
 | `AccountKeepaliveService` | 单循环调度 metadata/auth/activity 三个 job；共用一把 job 锁 | `src/aistudio_api/application/account_keepalive.py:112-547` |
+| `CookieRotator` | `/RotateCookies` HTTP 滚动续期、同源多登凭据同步（`expires` 防回灌）与根会话失效整组隔离 | `src/aistudio_api/infrastructure/account/cookie_rotator.py` |
 | `AccountInfoRefresher` | 无浏览器直连探测 tier/登录态/邮箱；并发限流；进程内互斥 | `src/aistudio_api/infrastructure/account/account_info_refresher.py:191-398` |
 | `AccountStore` | 持久化 `auth_saved_at`、`last_refresh_attempt_at`、`last_refresh_error`、`tier_checked_at` | `src/aistudio_api/infrastructure/account/account_store.py:718-778` |
 | `PooledSession` | 提供 `save_current_cookies()` | `src/aistudio_api/infrastructure/gateway/pooled_session.py:321-322` |
@@ -77,7 +80,7 @@
 
 ### 1.2 默认配置
 
-`defaults/config.yaml:91-100`：
+`defaults/config.yaml:138-145`：
 
 ```yaml
 features:
@@ -91,7 +94,7 @@ features:
     active_activity_seconds: 60
 ```
 
-`defaults/config.yaml:54-64`：
+`defaults/config.yaml:93-97`：
 
 ```yaml
 logging:
@@ -346,7 +349,7 @@ for account in saved_accounts:
 - `page.evaluate("() => { window.scrollBy(0, 2); return true; }")`。
 - 成功 -> `{ok:True, reason:"activity"}`。
 
-默认关闭（`defaults/config.yaml:99`）。没有 idle 回收/重建逻辑；它只是可选的控制页活动。
+默认关闭（`defaults/config.yaml:144`）。没有 idle 回收/重建逻辑；它只是可选的控制页活动。
 
 ### 3.7 时序图：auth_update
 
@@ -370,6 +373,19 @@ Scheduler tick
      -> _last_results["auth_update"] = result
      -> next_due["auth_update"] = now + (24h 或 60s/300s 重试)
 ```
+
+### 3.8 `/RotateCookies` 滚动续期与同源多登同步
+
+`src/aistudio_api/infrastructure/account/cookie_rotator.py` 补充了基于 Google `/RotateCookies` HTTP 端点的轻量滚动续期与同源多登凭据同步能力：
+
+1. **HTTP 滚动续期**：
+   - 在不拉起额外浏览器页面的前提下，使用账号当前 Cookie 与 `Firefox/152.0` 对齐的请求头向 Google `/RotateCookies` 发起主动续期，更新短周期认证 Cookie（如 `__Secure-1PSIDTS` / `__Secure-3PSIDTS` 等），降低跨天或长时间运行后的静默掉线概率。
+2. **运行期同源多登子账号（`u/0..u/N`）凭据同步**：
+   - 同一根会话下挂载的多个同源子账号（`u/0..u/N`）在任意账号发生 Cookie 续期或刷新回写时，按同源组同步最新公共/会话认证 Cookie；
+   - **防旧回灌校验**：合并写入前逐项比对 Cookie 的 `expires` 时间戳，仅当新 Cookie 晚于现存 Cookie 时才执行覆盖，防止低频或未刷新槽位用旧凭据覆盖已续期的新凭据。
+3. **根会话失效整组同步隔离**：
+   - 若某同源多登组的根会话凭据被 Google 确认为全局失效，系统将该同源组下所有共享根会话的子账号同步标记失效隔离；
+   - **单账号风控不连坐**：该整组隔离仅针对底层根会话失效；若是单一子账号触发 `verify-account`（Google 移动设备验证风控），则仅隔离该触发账号，不连坐同源其他兄弟子账号。
 
 ---
 
@@ -505,6 +521,13 @@ Scheduler tick
      -> _last_results["metadata_refresh"]
      -> next_due = now + (24h 或 60s/300s 重试)
 ```
+
+### 4.5 Auth 锁定跳过与 `Firefox/152.0` 请求头对齐
+
+1. **后台跳过 `is_auth_locked` 账号防误洗白**：
+   - `metadata_refresh` 与 `cookie_rotator` 等后台刷新/续期任务在构建待检查列表时，跳过已处于 `is_auth_locked`（如 `expired` / `verification_required` 等需人工介入重新导入或验证的锁定状态）的账号，避免后台探测误覆盖或误洗白人工/风控锁定标记。
+2. **`Firefox/152.0` 请求头统一对齐**：
+   - `account_info_refresher.py`（账号 tier/邮箱探测）与 `model_discovery.py`（`live_http` 模型发现兜底）的 HTTP 请求头统一对齐 `Firefox/152.0` User-Agent 与配套客户端头，与 `browserless` 宿主机（SpiderMonkey 152 + Firefox 152）指纹保持一致，减少跨指纹并发请求风险。
 
 ---
 
@@ -914,11 +937,13 @@ while len(entries) > capacity:
 
 | 主题 | 主要证据 |
 |---|---|
-| 保活配置 | `defaults/config.yaml:91-100`; `model_defaults.py:1535-1555`; `account_keepalive.py:55-90` |
+| 保活配置 | `defaults/config.yaml:138-145`; `model_defaults.py:1535-1555`; `account_keepalive.py:55-90` |
 | 调度循环/锁 | `account_keepalive.py:112-139`, `:162-251`, `:253-296` |
 | auth_update | `account_keepalive.py:409-503`; `pooled_session.py:321-322`; `instance_manager.py:676-680` |
+| `/RotateCookies` 续期与同源同步 | `src/aistudio_api/infrastructure/account/cookie_rotator.py` |
 | 成功记账 | `account_store.py:761-777` |
 | metadata_refresh | `account_keepalive.py:307-355`; `account_info_refresher.py:131-158`, `:232-380`, `:382-502` |
+| `Firefox/152.0` 头对齐 | `account_info_refresher.py`; `src/aistudio_api/infrastructure/gateway/model_discovery.py` |
 | 启动协调 | `api/app.py:194-301`, `:504-534` |
 | 三 sink | `logger.py:310-350`; `log_broadcast.py:288-311`, `:368-441` |
 | 环形缓冲 | `log_broadcast.py:23-28`, `:126-286` |
@@ -963,7 +988,7 @@ while len(entries) > capacity:
 
 - **Attempt**：每次真实上游执行。`RuntimeState.record`（`state.py:844-854`）由 `RoutingPipeline.record_success` / `_record_error` 调用；字段 `attempts/success/rate_limited/errors`（`state.py:203-241`）。
 - **Client**：每个客户端生成请求只记一次终态。`RuntimeState.record_client`（`state.py:856-880`）由 `RoutingPipeline.record_client`（`routing_pipeline.py:718-739`）调用；字段 `requests/success/errors/aborted/rate_limited/rescued_requests`（`state.py:142-200`）。
-- 429 同号重试或切号成功后，Client 只记 1 次成功且 `rescued_requests += 1`；Attempt 记录失败尝试和最终成功两条。
+- 429 切号或 403/瞬态错误重试成功后，Client 只记 1 次成功且 `rescued_requests += 1`；Attempt 记录失败尝试和最终成功两条。
 - `countTokens` 独立进入 `count_tokens` 台账（`state.py:243-269`、`:882-898`），不进入生成成功率分母，也不计入生成 Token 总量。
 
 ### 11.2 持久化与 90 天 daily

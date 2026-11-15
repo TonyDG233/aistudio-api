@@ -358,7 +358,7 @@ Gemini 要求历史模型 `functionCall` Part 携带 `thoughtSignature`。客户
 - 缓存特性：读取不消费，可被后续轮次重复使用；TTL 默认 30 天，最多 4096 条；原子写入 `data/signature_cache.json`，代理重启后仍可用（`signature_cache.py:29-146`、`api/app.py:391`）。
 - 真实缓存签名优先于 DUMMY；DUMMY 只是上游可接受的占位符，不替代真实签名缓存。
 
-B6 实机验收记录：原生工具调用后 `signature_cache_entries_before=0`、`after=1`（`docs/dev/evidence/B6/results.json`）。
+实机验证表现：原生工具调用后，`signature_cache` 自动捕获并持久化 `thoughtSignature`（条目从 `0` 增至 `1`），供后续多轮对话复用。
 
 ### 7.7 流式截断修复与终态兜底
 
@@ -451,7 +451,7 @@ paid = (access_tier == 2) or (3 in accessModes) or (4 in accessModes)
 
 快照写入 `data/models_cache.json` 时保留 `_discovery_source=snapshot`。`set_paid_models` 按传入记录逐条更新进程内 Paid 集合：记录中 `paid=True` 的模型加入，否则移除；live/snapshot 刷新时以真实记录覆盖，fallback 仅在无快照冷启动时作为初始种子（`model_access.py:265-283`、`model_discovery.py:584-600`）。不在传入列表中的模型保留旧状态，避免已知 Paid 模型因部分快照缺失而静默变 Free。路由的 live truth 判定只认 `_discovery_source` ∈ live/snapshot，不把 fallback 当真值。
 
-B6 实机证据：`model_source=live_page`、31 个模型；`gemini-3.8-flash` 为 live Free（`access_tier=null`、`accessModes=[]`、`required_tiers=[]`），`antigravity-preview-09-2026` 等为 live Paid（`access_tier=2`）（`docs/dev/evidence/B6/model_discovery_fix.json`）。
+实机运行示例：当 `model_source=live_page` 时，如 `gemini-3.8-flash` 解析为 live Free（`access_tier=null`、`accessModes=[]`、`required_tiers=[]`），而 `antigravity-preview-09-2026` 等解析为 live Paid（`access_tier=2`）。
 
 ---
 
