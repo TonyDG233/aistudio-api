@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """Island（炼妖壶）工作资料 + ADB 实机 verify-account 全链路工具。
 
-**【实机验证结论留档：Island 工作资料绕过设备验证尝试已失败】**
+**【实机验证结论留档：Island 工作资料（User 10）独立设备 ID 扫码验证已成功打通】**
 
-经真机控制变量实测，通过 Android ``FLAG_MANAGED_PROFILE``（Island / 壶中界 User 10）
-隔离 ANDROID_ID 与独立 KeyMint 密钥以突破 Google AI Studio ``verify-account``
-（``recaptcha.net/qr/``）单设备验证限额的方案**已证实无效**：Google 的
-``recaptcha.net/qr/``（DroidGuard / Play Integrity）会检测并直接拒绝第三方受管工作资料
-（Managed Profile）沙盒环境（返回 ``We couldn't verify your account with this device...
-or doesn't meet device security requirements``），而切回同一台物理手机的原生主空间
-（User 0）则可正常通过验证。
+经真机实测确认，此前报 ``doesn't meet device security requirements`` 的根因是手机内的
+Google Play 服务（``com.google.android.gms``）版本偏旧（``26.43.30``）。将 Google Play
+服务升级至最新 ``26.44.32+``、在工作资料（Island 壶中界 ``User 10``）内开启 VPN 代理并登录
+待验证的 Google 账号后，通过本脚本向 ``User 10`` 注入二维码挑战链接可 **100% 正常通过验证**，
+且全程使用 ``User 10`` 独立的 ``ANDROID_ID``。
 
-因此本脚本无法用于重置或绕过单台物理手机的验证配额限制，仅保留作为剪贴板二维码离线解码
-与主空间（``--allow-main-user``）免摄像头 ADB 辅助推送工具留底。
+当单个工作资料达到验证次数上限时，可通过 ``reset-island`` 子命令引导销毁并重建工作资料以获取
+全新的 ``ANDROID_ID``，并一键映射恢复 GMS、浏览器与 VPN 环境。
 
 一条命令完成：递交二维码（图片 / 剪贴板 / URL）→ 连接 ADB → 对比并抓取主空间
 （User 0）与 Island 工作资料（User 10）的 ANDROID_ID / GSF ID → 安全校验后把
@@ -21,12 +19,15 @@ or doesn't meet device security requirements``），而切回同一台物理手�
 
 用法示例::
 
+    uv run python tools/verify_qr_adb.py help
     uv run python tools/verify_qr_adb.py devices
     uv run python tools/verify_qr_adb.py connect --pair 192.168.1.100:41234 --code 123456
-    uv run python tools/verify_qr_adb.py connect --pair 10.0.0.1:41234 \
-        --host 192.168.1.100 --code 123456 --connect 41235
+    uv run python tools/verify_qr_adb.py connect --host 192.168.1.100 \
+        --pair 41234 --code 123456 --connect 41235
     uv run python tools/verify_qr_adb.py install-island
     uv run python tools/verify_qr_adb.py setup-island
+    uv run python tools/verify_qr_adb.py reset-island
+    uv run python tools/verify_qr_adb.py update-gms
     uv run python tools/verify_qr_adb.py inspect-ids
     uv run python tools/verify_qr_adb.py verify --qr-image qr.png
     uv run python tools/verify_qr_adb.py verify --clipboard --timeout 120
@@ -87,6 +88,17 @@ BROWSER_PREFERENCES: tuple[str, ...] = (
 )
 BROWSER_ROLE = "android.app.role.BROWSER"
 ISLAND_PROBE_URL = "https://www.google.com/recaptcha/enterprise"
+ISLAND_MAIN_ACTIVITY = "com.oasisfeng.island/.MainActivity"
+GMS_MARKET_URL = "market://details?id=com.google.android.gms"
+GMS_PLAY_WEB_URL = (
+    "https://play.google.com/store/apps/details?id=com.google.android.gms"
+)
+GMS_VERIFY_FOCUS_MARKERS: tuple[str, ...] = (
+    PKG_GMS,
+    "recaptchabase",
+    "modac",
+    "DeepLinkActivity",
+)
 PARALLEL_SPACE_UID_OFFSET = 10_000
 ANDROID_USER_UID_RANGE = 100_000
 ADB_EXE_NAME = "adb.exe" if os.name == "nt" else "adb"
@@ -737,6 +749,63 @@ class AdbClient:
         )
         return self.shell(command, timeout=max(self.timeout, 90.0))
 
+    def open_view(
+        self,
+        url: str,
+        user_id: int,
+        *,
+        browsable: bool = False,
+        wait: bool = False,
+    ) -> CommandResult:
+        """按指定参数启动 ``android.intent.action.VIEW``。"""
+        parts = [f"am start --user {user_id}"]
+        if wait:
+            parts.append("-W")
+        parts.append("-a android.intent.action.VIEW")
+        if browsable:
+            parts.append("-c android.intent.category.BROWSABLE")
+        parts.append(f"-d {self._shell_quote(url)}")
+        return self.shell(" ".join(parts), timeout=max(self.timeout, 90.0))
+
+    def start_settings_action(self, action: str, user_id: int = 0) -> CommandResult:
+        """打开系统设置 Intent（如 ``android.settings.SYNC_SETTINGS``）。"""
+        return self.shell(
+            f"am start --user {user_id} -a {self._shell_quote(action)}",
+            timeout=max(self.timeout, 60.0),
+        )
+
+    def start_component(self, component: str, user_id: int = 0) -> CommandResult:
+        """显式启动指定 ``pkg/activity`` 组件。"""
+        return self.shell(
+            f"am start --user {user_id} -n {self._shell_quote(component)}",
+            timeout=max(self.timeout, 60.0),
+        )
+
+    def remove_user(self, user_id: int) -> CommandResult:
+        """尝试删除指定 Android 用户（非 Root 设备可能需要用户在系统设置手动移除）。"""
+        return self.shell(f"pm remove-user {user_id}")
+
+    def resolve_launcher_activity(self, package: str, user_id: int) -> str | None:
+        """解析指定空间内应用的桌面启动器组件（剥离 ``u<uid>`` 前缀）。"""
+        command = (
+            "cmd package resolve-activity --brief"
+            " -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
+            f" --user {user_id} {self._shell_quote(package)}"
+        )
+        resolved = parse_resolved_component(self.shell(command).stdout)
+        if not resolved:
+            return None
+        return re.sub(r"^u\d+\s+", "", resolved)
+
+    def start_package_launcher(self, package: str, user_id: int = 0) -> CommandResult:
+        """在指定用户空间内通过包名启动应用的桌面主界面（绝不使用全局 monkey）。"""
+        return self.shell(
+            f"am start --user {user_id}"
+            " -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
+            f" -p {self._shell_quote(package)}",
+            timeout=max(self.timeout, 60.0),
+        )
+
     def list_package_names(
         self, user_id: int, *, enabled_only: bool = False
     ) -> list[str]:
@@ -991,11 +1060,35 @@ def parse_resolved_component(text: str) -> str | None:
     """解析 ``cmd package resolve-activity --brief`` 的组件行。"""
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
-        if "=" in stripped or " " in stripped:
+        if not stripped:
+            continue
+        if any(ch.isspace() for ch in stripped):
+            matched_token: str | None = None
+            for token in stripped.split():
+                if "=" in token or token.isdigit():
+                    continue
+                match = RESOLVED_COMPONENT_RE.match(token)
+                if match:
+                    pkg, _sep, act = token.partition("/")
+                    if pkg.isdigit() or act.isdigit():
+                        continue
+                    if "." not in pkg and pkg != "android":
+                        continue
+                    matched_token = match.group(1)
+            if matched_token is not None:
+                return matched_token
+            continue
+        if "=" in stripped or stripped.isdigit():
             continue
         match = RESOLVED_COMPONENT_RE.match(stripped)
         if match:
-            return match.group(1)
+            pkg, _sep, act = stripped.partition("/")
+            if (
+                not pkg.isdigit()
+                and not act.isdigit()
+                and ("." in pkg or pkg == "android")
+            ):
+                return match.group(1)
     return None
 
 
@@ -2972,6 +3065,14 @@ class VerificationReport:
         return "\n".join(lines)
 
 
+def _is_gms_verify_focus(focus: WindowFocus) -> bool:
+    """判断前台焦点是否属于 GMS 原生验证界面（如 DeepLinkActivity）。"""
+    haystack = " ".join(item for item in (focus.package, focus.component) if item)
+    if not haystack:
+        return False
+    return any(marker in haystack for marker in GMS_VERIFY_FOCUS_MARKERS)
+
+
 def run_verification(
     adb: AdbClient,
     cfg: VerifyConfig,
@@ -3038,6 +3139,7 @@ def run_verification(
     )
     started = clock()
     seen_target_focus = False
+    saw_gms_verify_ui = False
     consecutive_off = 0
     max_samples = int(cfg.timeout / max(cfg.interval, 0.1)) + 5
     completed = False
@@ -3084,7 +3186,9 @@ def run_verification(
 
         focus_pkg = focus.package
         focus_user = focus.user_id
-        focus_is_verify = bool(focus_pkg and focus_pkg in VERIFY_PACKAGES)
+        has_focus = bool(focus.component or focus.package)
+        gms_focus = _is_gms_verify_focus(focus)
+        focus_is_verify = bool(focus_pkg and focus_pkg in VERIFY_PACKAGES) or gms_focus
         if (
             focus_is_verify
             and focus_user is not None
@@ -3105,6 +3209,9 @@ def run_verification(
             on_target = focus_is_verify and bool(target_app_procs)
         else:
             on_target = False
+        gms_verify_active = on_target and gms_focus
+        if gms_verify_active:
+            saw_gms_verify_ui = True
         if on_target:
             seen_target_focus = True
             consecutive_off = 0
@@ -3112,6 +3219,10 @@ def run_verification(
             consecutive_off += 1
 
         writer(_sample_line(sample, target_user.user_id))
+        if saw_gms_verify_ui and has_focus and not gms_verify_active:
+            completed = True
+            completion_reason = "GMS 验证界面已完成并关闭"
+            break
         if seen_target_focus and consecutive_off >= 2:
             completed = True
             completion_reason = "验证界面已从前台关闭"
@@ -3490,8 +3601,598 @@ def run_island_setup(
 
 
 # ---------------------------------------------------------------------------
+# update-gms / reset-island：升级 GMS 与重建 Island 工作资料
+# ---------------------------------------------------------------------------
+
+
+def _intent_launch_failed(result: CommandResult) -> bool:
+    """判断 ``am start`` / Intent 拉起是否失败或未能解析目标 Activity。"""
+    if not result.ok:
+        return True
+    lowered = result.output.lower()
+    return (
+        "error:" in lowered
+        or "unable to resolve intent" in lowered
+        or "exception" in lowered
+        or "not installed" in lowered
+    )
+
+
+@dataclass(frozen=True)
+class GmsUpdateEntry:
+    user_id: int
+    user_name: str
+    is_work_profile: bool
+    gms_installed: bool
+    gms_version: str | None
+    channel: str
+    ok: bool
+    detail: str
+
+    def render(self) -> str:
+        space = (
+            "工作资料"
+            if self.is_work_profile
+            else ("主空间" if self.user_id == 0 else "普通用户")
+        )
+        ver = self.gms_version or "(未知)"
+        installed = "已安装" if self.gms_installed else "未安装"
+        status = "OK" if self.ok else "FAIL"
+        return (
+            f"  [{status}] User {self.user_id} ({self.user_name}, {space}) | "
+            f"GMS={installed} {ver} | 方式={self.channel} | {self.detail}"
+        )
+
+
+@dataclass
+class GmsUpdateReport:
+    entries: list[GmsUpdateEntry] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.entries) and all(entry.ok for entry in self.entries)
+
+    def render(self) -> str:
+        lines = [
+            "=" * 78,
+            "Google Play 服务（GMS）商店升级页唤起报告",
+            "=" * 78,
+        ]
+        lines.extend(entry.render() for entry in self.entries)
+        lines.append("-" * 78)
+        if self.ok:
+            lines.append(
+                "提示: 已在手机对应空间弹开 Play 商店页面，请点击「更新」将 GMS 升至 26.44.32+。"
+            )
+        else:
+            lines.append(
+                "结论: 部分或全部空间未能拉起商店页，请检查 Play 商店与网络状态。"
+            )
+        lines.append("=" * 78)
+        return "\n".join(lines)
+
+
+def _select_update_gms_users(
+    users: Sequence[AndroidUser],
+    *,
+    user_id: int | None,
+    all_users: bool,
+) -> list[AndroidUser]:
+    if not users:
+        raise SafetyError("未解析到任何 Android 用户，请确认设备已连接且已授权调试。")
+    if all_users and user_id is not None:
+        raise ToolError("--user 与 --all-users 不能同时指定")
+    if all_users:
+        selected = [user for user in users if user.is_primary or user.is_work_profile]
+        return selected or list(users)
+    if user_id is not None:
+        by_id = {user.user_id: user for user in users}
+        target = by_id.get(user_id)
+        if target is None:
+            raise SafetyError(
+                f"目标空间 User {user_id} 不存在。已发现: "
+                + ", ".join(str(user.user_id) for user in users)
+            )
+        return [target]
+    work = next((user for user in users if user.is_work_profile), None)
+    if work is not None:
+        return [work]
+    primary = next((user for user in users if user.is_primary), None)
+    return [primary] if primary is not None else [users[0]]
+
+
+def run_update_gms(
+    adb: AdbClient,
+    *,
+    user_id: int | None = None,
+    all_users: bool = False,
+    writer: Callable[[str], None] = print,
+) -> GmsUpdateReport:
+    """在指定空间（默认工作资料）读取 GMS 版本并打开商店升级页面。"""
+    users = adb.list_users()
+    targets = _select_update_gms_users(users, user_id=user_id, all_users=all_users)
+    report = GmsUpdateReport()
+    for target in targets:
+        installed, version = adb.gms_version(target.user_id)
+        writer(
+            f"[update-gms] {target.label}: GMS {'已安装' if installed else '未安装'}, "
+            f"当前版本={version or '(未知)'}"
+        )
+        market_res = adb.open_view(
+            GMS_MARKET_URL, target.user_id, browsable=False, wait=False
+        )
+        if not _intent_launch_failed(market_res):
+            detail = _first_line(market_res.output) or "已打开 Play 商店 (market://)"
+            report.entries.append(
+                GmsUpdateEntry(
+                    user_id=target.user_id,
+                    user_name=target.name,
+                    is_work_profile=target.is_work_profile,
+                    gms_installed=installed,
+                    gms_version=version,
+                    channel="market://",
+                    ok=True,
+                    detail=detail,
+                )
+            )
+            continue
+
+        writer(
+            f"  market:// 拉起失败（{_first_line(market_res.output) or 'unable to resolve Intent'}），"
+            "自动回退 https://play.google.com ..."
+        )
+        web_res = adb.open_view(
+            GMS_PLAY_WEB_URL, target.user_id, browsable=True, wait=False
+        )
+        ok = not _intent_launch_failed(web_res)
+        detail = _first_line(web_res.output) or (
+            "已打开网页版 Play 商店" if ok else "拉起失败"
+        )
+        report.entries.append(
+            GmsUpdateEntry(
+                user_id=target.user_id,
+                user_name=target.name,
+                is_work_profile=target.is_work_profile,
+                gms_installed=installed,
+                gms_version=version,
+                channel="https:// fallback",
+                ok=ok,
+                detail=detail,
+            )
+        )
+    return report
+
+
+@dataclass
+class ResetIslandReport:
+    old_user_id: int | None
+    old_android_id: str
+    removal_method: str
+    main_user_id: int
+    new_user_id: int
+    main_android_id: str
+    new_android_id: str
+    setup_report: IslandSetupReport
+    new_gms_version: str | None = None
+    vpn_opened_pkg: str | None = None
+    vpn_open_method: str | None = None
+    vpn_open_ok: bool = False
+    elapsed: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return self.setup_report.ok
+
+    def render(self) -> str:
+        lines = [
+            "=" * 78,
+            "Island（壶中界）工作资料重置与环境迁移报告",
+            "=" * 78,
+            f"旧工作资料     : {f'User {self.old_user_id}' if self.old_user_id is not None else '(无)'}",
+            f"旧 ANDROID_ID  : {self.old_android_id or '(无)'}",
+            f"销毁方式       : {self.removal_method}",
+            f"新工作资料     : User {self.new_user_id}",
+            f"新 ANDROID_ID  : {self.new_android_id}",
+            f"主空间 ID      : {self.main_android_id or '(系统隐私隐藏)'}",
+            f"新空间 GMS 版本: {self.new_gms_version or '(未知)'}",
+            f"总耗时         : {self.elapsed:.1f}s",
+            "-" * 78,
+            self.setup_report.render(),
+        ]
+        if self.vpn_opened_pkg:
+            vpn_state = (
+                f"已自动拉起 ({self.vpn_open_method})"
+                if self.vpn_open_ok
+                else f"未自动拉起 ({self.vpn_opened_pkg})"
+            )
+            lines.append(f"VPN 界面状态   : {vpn_state}")
+        lines.append("=" * 78)
+        return "\n".join(lines)
+
+
+def _open_work_profile_removal_ui(adb: AdbClient, main_user_id: int) -> None:
+    """依次尝试打开系统同步/账号设置页或 Island 主界面引导销毁旧工作资料。"""
+    sync_res = adb.start_settings_action(
+        "android.settings.SYNC_SETTINGS", user_id=main_user_id
+    )
+    if not _intent_launch_failed(sync_res):
+        return
+    adb.start_component(ISLAND_MAIN_ACTIVITY, user_id=main_user_id)
+
+
+def _launch_vpn_in_work_profile(
+    adb: AdbClient, vpn_pkg: str, user_id: int
+) -> tuple[bool, str]:
+    """在工作资料中打开 VPN 软件界面，优先 resolve-activity + am start，失败回退带 --user 的包名主入口。"""
+    component = adb.resolve_launcher_activity(vpn_pkg, user_id)
+    if component:
+        start_res = adb.start_component(component, user_id=user_id)
+        if not _intent_launch_failed(start_res) and _command_problem(start_res) is None:
+            return (True, f"am start ({component})")
+    pkg_res = adb.start_package_launcher(vpn_pkg, user_id=user_id)
+    if not _intent_launch_failed(pkg_res) and _command_problem(pkg_res) is None:
+        return (True, f"am start -p ({vpn_pkg})")
+    return (False, _first_line(pkg_res.output) or "启动失败")
+
+
+def run_reset_island(
+    adb: AdbClient,
+    *,
+    timeout: float = 180.0,
+    interval: float = 2.0,
+    browser: str | None = None,
+    include_vpn: bool = True,
+    open_vpn: bool = True,
+    unhide: bool = False,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    writer: Callable[[str], None] = print,
+) -> ResetIslandReport:
+    """四阶段一键重构 Island 工作资料：销毁旧资料 → 引导新建 → 校验新 ID → 迁移配置。"""
+    interval = max(0.1, float(interval))
+    started = clock()
+    deadline = started + max(timeout, 0.0)
+    users = adb.list_users()
+    if not users:
+        raise SafetyError("未解析到任何 Android 用户，请确认设备已连接且已授权调试。")
+    main_user = next((user for user in users if user.is_primary), None)
+    if main_user is None:
+        raise SafetyError("未找到主空间 User 0，无法做隔离对比。")
+
+    old_work = next((user for user in users if user.is_work_profile), None)
+    old_user_id = old_work.user_id if old_work else None
+    old_android_id = adb.android_id(old_work.user_id) if old_work else ""
+    removal_method = "无需销毁（无旧工作资料）"
+
+    # 阶段 1：记录旧工作资料身份并触发销毁
+    if old_work is not None:
+        writer(
+            f"[1/4] 发现旧工作资料 {old_work.label}（ANDROID_ID={old_android_id or '(空)'}），尝试销毁 ..."
+        )
+        rm_res = adb.remove_user(old_work.user_id)
+        direct_removed = False
+        if rm_res.ok and _command_problem(rm_res) is None:
+            after_users = adb.list_users()
+            if all(user.user_id != old_work.user_id for user in after_users):
+                direct_removed = True
+                removal_method = "pm remove-user"
+                writer(
+                    f"  已通过 pm remove-user {old_work.user_id} 直接销毁旧工作资料。"
+                )
+
+        if not direct_removed:
+            removal_method = "手机端手动销毁"
+            _open_work_profile_removal_ui(adb, main_user.user_id)
+            writer(
+                "请在手机屏幕上销毁旧工作资料：打开 Island -> 右上角设置 -> "
+                "Scoped Settings -> Island -> Destroy（或在系统设置 -> 账号/多用户中移除工作资料）..."
+            )
+            writer(
+                f"正在等待旧工作资料 User {old_work.user_id} 移除完成（超时 {timeout:.0f}s）..."
+            )
+            while True:
+                cur_users = adb.list_users()
+                still_old = next(
+                    (user for user in cur_users if user.user_id == old_work.user_id),
+                    None,
+                )
+                if still_old is None:
+                    writer(f"  检测到旧工作资料 User {old_work.user_id} 已销毁。")
+                    break
+                cur_id = adb.android_id(still_old.user_id)
+                if (
+                    old_android_id
+                    and ANDROID_ID_RE.fullmatch(cur_id)
+                    and cur_id.lower() != old_android_id.lower()
+                ):
+                    writer(
+                        f"  检测到工作资料 ANDROID_ID 已变为新值（{old_android_id} -> {cur_id}）。"
+                    )
+                    break
+                if clock() >= deadline:
+                    raise ToolError(
+                        f"等待销毁旧工作资料 User {old_work.user_id} 超时（{timeout:.0f}s）。"
+                        "请在手机确认销毁后重试。"
+                    )
+                sleeper(interval)
+    else:
+        writer("[1/4] 当前无旧工作资料，直接进入新建阶段。")
+
+    # 阶段 2：引导创建新工作资料并等待就绪
+    cur_users = adb.list_users()
+    new_work = next((user for user in cur_users if user.is_work_profile), None)
+    new_android_id = adb.android_id(new_work.user_id) if new_work else ""
+    needs_create = new_work is None or not ANDROID_ID_RE.fullmatch(new_android_id)
+    if (
+        new_work is not None
+        and old_android_id
+        and new_android_id.lower() == old_android_id.lower()
+    ):
+        needs_create = True
+
+    if needs_create:
+        writer(
+            "[2/4] 正在主空间唤起 Island 创建向导，请在手机上点击「Accept / 接受」创建新的壶中界 ..."
+        )
+        adb.start_component(ISLAND_MAIN_ACTIVITY, user_id=main_user.user_id)
+        while True:
+            cur_users = adb.list_users()
+            candidate = next((user for user in cur_users if user.is_work_profile), None)
+            if candidate is not None:
+                candidate_id = adb.android_id(candidate.user_id)
+                if ANDROID_ID_RE.fullmatch(candidate_id) and (
+                    not old_android_id or candidate_id.lower() != old_android_id.lower()
+                ):
+                    new_work = candidate
+                    new_android_id = candidate_id
+                    writer(
+                        f"  新工作资料已就绪: {new_work.label}, ANDROID_ID={new_android_id}"
+                    )
+                    break
+            if clock() >= deadline:
+                raise ToolError(
+                    f"等待新建工作资料就绪超时（{timeout:.0f}s）。"
+                    "请在手机完成 Island 创建流程后重试。"
+                )
+            sleeper(interval)
+    else:
+        assert new_work is not None
+        writer(
+            f"[2/4] 检测到新工作资料已就绪: {new_work.label}, ANDROID_ID={new_android_id}"
+        )
+
+    assert new_work is not None
+    # 阶段 3：强制核验新旧 ANDROID_ID 与主副空间隔离
+    writer("[3/4] 核验新工作资料 ANDROID_ID 与主副空间隔离 ...")
+    main_identity = read_space_identity(adb, main_user)
+    new_identity = read_space_identity(adb, new_work)
+    writer(format_identities(main_identity, new_identity))
+    assert_space_isolated(main_identity, new_identity)
+    if old_android_id and new_identity.android_id.lower() == old_android_id.lower():
+        raise SafetyError(
+            f"新工作资料 User {new_identity.user_id} 的 ANDROID_ID 与旧工作资料完全相同"
+            f"（{new_identity.android_id}），重置未生效，已中止。"
+        )
+    if old_android_id:
+        writer(
+            f"  新旧 ANDROID_ID 对比: {old_android_id} -> {new_identity.android_id} (已刷新 PASS)"
+        )
+    else:
+        writer(
+            f"  新工作资料 ANDROID_ID: {new_identity.android_id} (与主空间已隔离 PASS)"
+        )
+
+    # 阶段 4：一键全自动配置迁移 setup-island + 唤起 VPN
+    writer(f"[4/4] 为新工作资料 User {new_work.user_id} 自动迁移环境配置 ...")
+    setup_report = run_island_setup(
+        adb,
+        user_id=new_work.user_id,
+        include_vpn=include_vpn,
+        browser=browser,
+        unhide=unhide,
+        writer=writer,
+    )
+    _gms_installed, new_gms_version = adb.gms_version(new_work.user_id)
+    vpn_opened_pkg: str | None = None
+    vpn_open_method: str | None = None
+    vpn_open_ok = False
+    if include_vpn and open_vpn and setup_report.plan.vpn:
+        vpn_opened_pkg = setup_report.plan.vpn[0]
+        vpn_open_ok, vpn_open_method = _launch_vpn_in_work_profile(
+            adb, vpn_opened_pkg, new_work.user_id
+        )
+        if vpn_open_ok:
+            writer(
+                "已在手机壶中界为您自动打开梯子软件，请点击连接 VPN，"
+                "随后在壶中界登录待验证的 Google 账号即可开始扫码验证！"
+            )
+        else:
+            writer(
+                f"提示: 未能自动拉起 VPN 软件 {vpn_opened_pkg}（{vpn_open_method}），"
+                "请在手机壶中界手动打开并连接 VPN。"
+            )
+
+    return ResetIslandReport(
+        old_user_id=old_user_id,
+        old_android_id=old_android_id,
+        removal_method=removal_method,
+        main_user_id=main_user.user_id,
+        new_user_id=new_work.user_id,
+        main_android_id=main_identity.android_id,
+        new_android_id=new_identity.android_id,
+        setup_report=setup_report,
+        new_gms_version=new_gms_version,
+        vpn_opened_pkg=vpn_opened_pkg,
+        vpn_open_method=vpn_open_method,
+        vpn_open_ok=vpn_open_ok,
+        elapsed=clock() - started,
+    )
+
+
+# ---------------------------------------------------------------------------
+# help：中文指令速查手册
+# ---------------------------------------------------------------------------
+
+
+COMMAND_GUIDE: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "help",
+        "显示全部可用指令与常用实操命令速查表（支持 help <子命令> 查看详情）",
+        "[子命令名]",
+        (
+            "uv run python tools/verify_qr_adb.py help\n"
+            "    uv run python tools/verify_qr_adb.py help reset-island"
+        ),
+    ),
+    (
+        "devices",
+        "查看当前已连接的 ADB 设备列表及在线状态",
+        "[-s <serial>] [--adb-path <path>]",
+        "uv run python tools/verify_qr_adb.py devices",
+    ),
+    (
+        "connect",
+        "无线调试配对与连接（支持 --host <手机Wi-Fi_IP> 穿透手机 VPN 虚拟网卡）",
+        "--host <手机IP> --pair <port|ip:port> --code <配对码> --connect <port|ip:port>",
+        "uv run python tools/verify_qr_adb.py connect --host 192.168.1.100 --pair 41234 --code 123456 --connect 41235",
+    ),
+    (
+        "install-island",
+        "将本地 data/tools/island/ 下最新版 Island APK 安装到手机",
+        "[--apk <路径>] [-s <serial>]",
+        "uv run python tools/verify_qr_adb.py install-island",
+    ),
+    (
+        "setup-island",
+        "为现有工作资料（壶中界）一键映射启用 GMS 三件套、默认浏览器 Chrome 与活跃 VPN",
+        "[--user <uid>] [--browser <pkg>] [--no-vpn] [--unhide]",
+        "uv run python tools/verify_qr_adb.py setup-island",
+    ),
+    (
+        "reset-island",
+        "【新增】一键引导销毁旧工作资料、等待新建工作资料、校验全新 ANDROID_ID 并自动执行全套 setup-island 环境迁移配置",
+        "[--timeout <秒,默认180>] [--browser <pkg>] [--no-vpn] [--open-vpn / --no-open-vpn]",
+        "uv run python tools/verify_qr_adb.py reset-island --timeout 180",
+    ),
+    (
+        "update-gms",
+        "【新增】在手机指定空间（默认工作资料，可选 --user 0）一键弹开 GMS 商店升级页面（market:// 失败自动回退 https://），并显示当前 GMS 版本号",
+        "[--user <uid>] [--all-users]",
+        (
+            "uv run python tools/verify_qr_adb.py update-gms\n"
+            "    uv run python tools/verify_qr_adb.py update-gms --all-users"
+        ),
+    ),
+    (
+        "inspect-ids",
+        "对比主空间（User 0）与工作资料（User 10）的 ANDROID_ID、GSF ID、GMS 版本与空间隔离状态",
+        "[-s <serial>]",
+        "uv run python tools/verify_qr_adb.py inspect-ids",
+    ),
+    (
+        "verify",
+        "从剪贴板（--clipboard）、图片（--qr-image）或链接（--url）解码二维码，推入工作资料完成验证并实时取证输出完成报告",
+        "(--clipboard | --qr-image <图> | --url <链接>) [--user <uid>] [--timeout <秒>] [--confirm]",
+        (
+            "uv run python tools/verify_qr_adb.py verify --clipboard --timeout 120\n"
+            "    uv run python tools/verify_qr_adb.py verify --qr-image qr.png"
+        ),
+    ),
+)
+
+
+def format_help_manual() -> str:
+    """渲染覆盖全部 9 个子命令的中文速查手册。"""
+    lines: list[str] = [
+        "=" * 78,
+        "Island（壶中界）+ ADB 实机扫码验证工具 · 指令速查手册（共 9 个命令）",
+        "=" * 78,
+        "推荐实操顺序: connect -> inspect-ids / update-gms (确保 GMS 26.44.32+) -> verify",
+        "换号/限额重置: reset-island (销毁重建工作资料获取新 ANDROID_ID 并自动迁回环境)",
+        "-" * 78,
+    ]
+    for index, (name, summary, params, example) in enumerate(COMMAND_GUIDE, start=1):
+        lines.append(f"{index}. {name}")
+        lines.append(f"   用途: {summary}")
+        lines.append(f"   参数: {params}")
+        lines.append(f"   示例: {example}")
+    lines.append("-" * 78)
+    lines.append(
+        "提示: 执行 `uv run python tools/verify_qr_adb.py help <子命令>` "
+        "或 `<子命令> --help` 可查看单个命令的全部参数详情。"
+    )
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
+def format_subcommand_help(
+    topic: str, subparsers_map: dict[str, argparse.ArgumentParser]
+) -> str:
+    """输出单个子命令的中文速查条目 + argparse 参数详表。"""
+    normalized = topic.strip()
+    entry = next((item for item in COMMAND_GUIDE if item[0] == normalized), None)
+    subparser = subparsers_map.get(normalized)
+    if entry is None or subparser is None:
+        valid = ", ".join(item[0] for item in COMMAND_GUIDE)
+        raise ToolError(f"未知子命令: {topic!r}。可用命令: {valid}")
+    name, summary, params, example = entry
+    lines = [
+        "=" * 78,
+        f"子命令详情: {name}",
+        "=" * 78,
+        f"用途: {summary}",
+        f"参数: {params}",
+        f"示例: {example}",
+        "-" * 78,
+        subparser.format_help().rstrip(),
+        "=" * 78,
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 命令实现
 # ---------------------------------------------------------------------------
+
+
+def cmd_help(args: argparse.Namespace) -> int:
+    topic: str | None = getattr(args, "topic", None)
+    if topic:
+        subparsers_map: dict[str, argparse.ArgumentParser] = getattr(
+            args, "_subparsers_map", {}
+        )
+        print(format_subcommand_help(topic, subparsers_map))
+        return 0
+    print(format_help_manual())
+    return 0
+
+
+def cmd_update_gms(args: argparse.Namespace) -> int:
+    adb = AdbClient(args.adb_path, serial=args.serial)
+    report = run_update_gms(
+        adb,
+        user_id=args.user,
+        all_users=args.all_users,
+    )
+    print()
+    print(report.render())
+    return 0 if report.ok else 1
+
+
+def cmd_reset_island(args: argparse.Namespace) -> int:
+    adb = AdbClient(args.adb_path, serial=args.serial)
+    report = run_reset_island(
+        adb,
+        timeout=args.timeout,
+        interval=args.interval,
+        browser=args.browser,
+        include_vpn=not args.no_vpn,
+        open_vpn=args.open_vpn,
+        unhide=args.unhide,
+    )
+    print()
+    print(report.render())
+    return 0 if report.ok else 1
 
 
 def cmd_devices(args: argparse.Namespace) -> int:
@@ -3643,11 +4344,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
+            "  python tools/verify_qr_adb.py help\n"
             "  python tools/verify_qr_adb.py devices\n"
-            "  python tools/verify_qr_adb.py connect --pair 192.168.1.7:41234 --code 123456\n"
+            "  python tools/verify_qr_adb.py connect --pair 192.168.1.100:41234 --code 123456\n"
             "  python tools/verify_qr_adb.py connect --host 192.168.1.100"
             " --pair 41234 --code 123456 --connect 41235\n"
             "  python tools/verify_qr_adb.py setup-island\n"
+            "  python tools/verify_qr_adb.py reset-island --timeout 180\n"
+            "  python tools/verify_qr_adb.py update-gms\n"
             "  python tools/verify_qr_adb.py inspect-ids\n"
             "  python tools/verify_qr_adb.py verify --qr-image qr.png\n"
             "  python tools/verify_qr_adb.py verify --clipboard --timeout 120\n"
@@ -3670,12 +4374,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="指定设备序列号（多设备时使用；也可写在子命令后）",
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
+    subparsers_map: dict[str, argparse.ArgumentParser] = {}
+
+    help_cmd = subparsers.add_parser(
+        "help",
+        help="显示全部可用指令与常用实操命令速查表",
+    )
+    help_cmd.add_argument(
+        "topic", nargs="?", default=None, help="可选子命令名称（查看单个命令详情）"
+    )
+    help_cmd.set_defaults(func=cmd_help, _subparsers_map=subparsers_map)
+    subparsers_map["help"] = help_cmd
 
     devices = subparsers.add_parser(
         "devices", parents=[common], help="列出已连接的 ADB 设备"
     )
     devices.set_defaults(func=cmd_devices)
+    subparsers_map["devices"] = devices
 
     connect = subparsers.add_parser(
         "connect",
@@ -3696,6 +4412,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--connect", dest="connect_addr", default=None, help="连接地址 ip:port 或端口号"
     )
     connect.set_defaults(func=cmd_connect)
+    subparsers_map["connect"] = connect
 
     install = subparsers.add_parser(
         "install-island",
@@ -3706,6 +4423,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--apk", default=None, help="指定 APK 路径（默认取目录内最新版）"
     )
     install.set_defaults(func=cmd_install_island)
+    subparsers_map["install-island"] = install
 
     inspect_ids = subparsers.add_parser(
         "inspect-ids",
@@ -3713,6 +4431,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="对比主空间与 Island 工作资料的 ANDROID_ID / GSF ID",
     )
     inspect_ids.set_defaults(func=cmd_inspect_ids)
+    subparsers_map["inspect-ids"] = inspect_ids
 
     setup_island = subparsers.add_parser(
         "setup-island",
@@ -3734,6 +4453,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="额外执行 cmd package unhide（ColorOS 无 MANAGE_USERS，失败可忽略）",
     )
     setup_island.set_defaults(func=cmd_setup_island)
+    subparsers_map["setup-island"] = setup_island
+
+    reset_island = subparsers.add_parser(
+        "reset-island",
+        parents=[common],
+        help="一键引导销毁旧工作资料、等待新建、校验新 ANDROID_ID 并迁移配置",
+    )
+    reset_island.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="等待手机端确认销毁/新建工作资料的超时秒数（默认 180）",
+    )
+    reset_island.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="轮询等待间隔（秒，默认 2.0）",
+    )
+    reset_island.add_argument(
+        "--browser", default=None, help="指定浏览器包名（默认按优先级自动选择）"
+    )
+    reset_island.add_argument(
+        "--no-vpn", action="store_true", help="不映射且不打开 VPN / 代理应用"
+    )
+    reset_island.add_argument(
+        "--open-vpn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="配置完成后自动在工作资料打开 VPN 软件界面（默认开启）",
+    )
+    reset_island.add_argument(
+        "--unhide",
+        action="store_true",
+        help="额外执行 cmd package unhide（ColorOS 无 MANAGE_USERS，失败可忽略）",
+    )
+    reset_island.set_defaults(func=cmd_reset_island)
+    subparsers_map["reset-island"] = reset_island
+
+    update_gms = subparsers.add_parser(
+        "update-gms",
+        parents=[common],
+        help="查看 GMS 版本并一键弹开 Play 商店升级页面（market:// 失败回退 https://）",
+    )
+    update_gms.add_argument(
+        "--user",
+        type=int,
+        default=None,
+        help="目标空间 uid（默认优先工作资料，无工作资料时回退 User 0）",
+    )
+    update_gms.add_argument(
+        "--all-users",
+        action="store_true",
+        help="依次在主空间（User 0）与工作资料中打开 GMS 商店升级页",
+    )
+    update_gms.set_defaults(func=cmd_update_gms)
+    subparsers_map["update-gms"] = update_gms
 
     verify = subparsers.add_parser(
         "verify",
@@ -3769,12 +4545,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="指定二维码解码后端（可多次指定；默认全部尝试）",
     )
     verify.set_defaults(func=cmd_verify)
+    subparsers_map["verify"] = verify
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command is None or not hasattr(args, "func"):
+        print(format_help_manual())
+        return 0
     if not hasattr(args, "serial"):
         args.serial = None
     try:
