@@ -34,6 +34,7 @@ TASKS = ("metadata_refresh", "auth_update", "active_activity")
 NO_ACTIVE_PAGE_RETRY_SECONDS = 60.0
 FAILURE_RETRY_SECONDS = 300.0
 REFRESH_IN_PROGRESS_RETRY_SECONDS = 60.0
+MAX_AUTH_CONSECUTIVE_FAILURES = 3
 
 DEFAULT_AUTH_UPDATE_HOURS = 24.0
 DEFAULT_METADATA_REFRESH_HOURS = 24.0
@@ -141,6 +142,9 @@ class AccountKeepaliveService:
         self._last_results: dict[str, dict[str, object]] = {}
         self._last_error: str | None = None
         self._next_due: dict[str, float] = {}
+        self._auth_saved_at: dict[str, float] = {}
+        self._account_auth_failures: dict[str, int] = {}
+        self._auth_partial_failures: int = 0
         self._paused = False
 
     @property
@@ -279,13 +283,24 @@ class AccountKeepaliveService:
         self, task: str, result: dict[str, object], interval: float
     ) -> float:
         if result.get("ok"):
+            if task == "auth_update":
+                self._auth_partial_failures = 0
             return interval
         if task == "metadata_refresh":
             if result.get("reason") == "refresh_in_progress":
                 return REFRESH_IN_PROGRESS_RETRY_SECONDS
             return FAILURE_RETRY_SECONDS
         if task == "auth_update":
-            return NO_ACTIVE_PAGE_RETRY_SECONDS
+            if result.get("reason") == "no_active_page":
+                self._auth_partial_failures = 0
+                return min(NO_ACTIVE_PAGE_RETRY_SECONDS, interval)
+            if bool(result.get("cycle_exhausted")):
+                self._auth_partial_failures = 0
+                return interval
+            failure_count = self._auth_partial_failures
+            self._auth_partial_failures = failure_count + 1
+            delay = FAILURE_RETRY_SECONDS * (2 ** min(failure_count, 10))
+            return min(delay, interval)
         return min(NO_ACTIVE_PAGE_RETRY_SECONDS, interval)
 
     async def _run_due(self, settings: KeepaliveSettings) -> None:
@@ -375,7 +390,7 @@ class AccountKeepaliveService:
         if task == "metadata_refresh":
             return await self._metadata_refresh(settings, trigger)
         if task == "auth_update":
-            return await self._auth_update(trigger)
+            return await self._auth_update(trigger, settings=settings)
         return await self._active_activity(trigger)
 
     async def _metadata_refresh(
@@ -434,12 +449,12 @@ class AccountKeepaliveService:
             "accounts": [result.account_id for result in results],
         }
 
-    async def _save_slot(self, slot: Any) -> tuple[str | None, str, bool]:
+    async def _save_slot(self, slot: Any) -> tuple[str | None, str, bool, bool]:
         slot_id = str(getattr(slot, "slot_id", "") or "")
         account_id = str(getattr(slot, "account_id", "") or "")
         session = getattr(slot, "session", None)
         if not account_id or session is None:
-            return None, slot_id, False
+            return None, slot_id, False, False
         try:
             lifecycle_lock = getattr(slot, "lifecycle_lock", None)
             if lifecycle_lock is not None:
@@ -454,8 +469,23 @@ class AccountKeepaliveService:
                 account_id,
                 exc,
             )
-            return account_id, slot_id, False
-        return account_id, slot_id, saved
+            return account_id, slot_id, False, True
+        return account_id, slot_id, saved, False
+
+    def _is_account_auth_due(
+        self,
+        account_id: str,
+        *,
+        trigger: str,
+        now: float,
+        interval: float,
+    ) -> bool:
+        if trigger != "schedule":
+            return True
+        saved_at = self._auth_saved_at.get(account_id)
+        if saved_at is None:
+            return True
+        return (now - saved_at) >= interval
 
     async def _save_control_session(self) -> tuple[str | None, bool, bool]:
         session = getattr(self._client, "session", None)
@@ -486,24 +516,111 @@ class AccountKeepaliveService:
             account_id = account.id if account is not None else None
         return account_id, saved, True
 
-    async def _auth_update(self, trigger: str) -> dict[str, object]:
-        attempts: dict[str, list[bool]] = {}
-        failed_slots: list[str] = []
-        for slot in self._pool_slots():
-            account_id, slot_id, saved = await self._save_slot(slot)
+    async def _auth_update(
+        self, trigger: str, settings: KeepaliveSettings | None = None
+    ) -> dict[str, object]:
+        current_settings = settings or self._settings()
+        now = self._clock()
+        interval = float(current_settings.auth_update_seconds)
+        accounts = self._store.list_accounts()
+        slots = self._pool_slots()
+
+        candidate_ids = {
+            account.id
+            for account in accounts
+            if account.enabled
+            and not account.expired
+            and not self._is_auth_locked(account.id)
+        }
+        for slot in slots:
+            slot_acc_id = str(getattr(slot, "account_id", "") or "")
+            if slot_acc_id:
+                acc = self._store.get_account(slot_acc_id)
+                if acc is None or (
+                    acc.enabled
+                    and not acc.expired
+                    and not self._is_auth_locked(slot_acc_id)
+                ):
+                    candidate_ids.add(slot_acc_id)
+
+        if (
+            trigger == "schedule"
+            and candidate_ids
+            and not any(
+                self._is_account_auth_due(
+                    acc_id, trigger=trigger, now=now, interval=interval
+                )
+                for acc_id in candidate_ids
+            )
+        ):
+            return {
+                "ok": True,
+                "reason": "saved",
+                "count": 0,
+                "accounts": [],
+            }
+
+        account_order: list[str] = []
+
+        def _ensure_acc(acc_id: str) -> None:
+            if acc_id not in account_order:
+                account_order.append(acc_id)
+
+        slot_results: dict[str, list[bool]] = {}
+        slot_errored: set[str] = set()
+        slot_failures: list[tuple[str, str]] = []
+        browserless_clean_eligible: dict[str, bool] = {}
+        control_results: dict[str, list[bool]] = {}
+        rotate_results: dict[str, list[bool]] = {}
+        browserless_disk_ok: set[str] = set()
+
+        for slot in slots:
+            slot_acc_id = str(getattr(slot, "account_id", "") or "")
+            if slot_acc_id and not self._is_account_auth_due(
+                slot_acc_id, trigger=trigger, now=now, interval=interval
+            ):
+                continue
+            account_id, slot_id, saved, raised = await self._save_slot(slot)
             if account_id is None:
                 continue
-            attempts.setdefault(account_id, []).append(saved)
+            _ensure_acc(account_id)
+            slot_results.setdefault(account_id, []).append(saved)
+            if raised:
+                slot_errored.add(account_id)
             if not saved and slot_id:
-                failed_slots.append(slot_id)
+                slot_failures.append((account_id, slot_id))
+            sess = getattr(slot, "session", None)
+            is_clean_browserless = (
+                not saved
+                and not raised
+                and getattr(sess, "engine", None) == "browserless"
+                and not getattr(sess, "_cookie_dirty", False)
+                and not getattr(sess, "_mint_updates", None)
+                and not getattr(sess, "_rpc_set_cookies", None)
+            )
+            if account_id not in browserless_clean_eligible:
+                browserless_clean_eligible[account_id] = is_clean_browserless
+            elif not is_clean_browserless:
+                browserless_clean_eligible[account_id] = False
 
         (
             control_account,
             control_saved,
             control_attempted,
         ) = await self._save_control_session()
-        if control_attempted and control_account is not None:
-            attempts.setdefault(control_account, []).append(control_saved)
+        control_active_saved = False
+        if control_attempted:
+            if control_account is not None:
+                if self._is_account_auth_due(
+                    control_account, trigger=trigger, now=now, interval=interval
+                ):
+                    _ensure_acc(control_account)
+                    control_results.setdefault(control_account, []).append(
+                        control_saved
+                    )
+                    control_active_saved = control_saved
+            else:
+                control_active_saved = control_saved
 
         # 对启用中的账号（特别是持有轮换种子或活动槽位的账号）尝试主动轮换短效 Cookie
         from aistudio_api.application.account_service import AccountService
@@ -515,15 +632,18 @@ class AccountKeepaliveService:
             else AccountService(self._store)
         )
         slot_sessions: dict[str, Any] = {}
-        for slot in self._pool_slots():
+        for slot in slots:
             acc_id = getattr(slot, "account_id", None)
             sess = getattr(slot, "session", None)
             if acc_id and sess:
                 slot_sessions[str(acc_id)] = sess
 
-        rotated_accounts: list[str] = []
-        for account in self._store.list_accounts():
+        for account in accounts:
             if not account.enabled or account.expired:
+                continue
+            if not self._is_account_auth_due(
+                account.id, trigger=trigger, now=now, interval=interval
+            ):
                 continue
             if self._is_auth_locked(account.id):
                 log.debug(
@@ -534,49 +654,72 @@ class AccountKeepaliveService:
             try:
                 rot_res = await svc.rotate_account_cookies(account.id, session=acc_sess)
                 if rot_res.get("ok"):
-                    rotated_accounts.append(account.id)
-                    attempts.setdefault(account.id, []).append(True)
+                    _ensure_acc(account.id)
+                    rotate_results.setdefault(account.id, []).append(True)
+                elif rot_res.get("skipped") == "missing_seed":
+                    if (
+                        browserless_clean_eligible.get(account.id, False)
+                        and account.id not in slot_errored
+                        and self._store.get_auth_path(account.id) is not None
+                    ):
+                        browserless_disk_ok.add(account.id)
+                elif (
+                    rot_res.get("status") != 0
+                    or "error" in rot_res
+                    or "status" not in rot_res
+                ):
+                    _ensure_acc(account.id)
+                    rotate_results.setdefault(account.id, []).append(False)
             except Exception as exc:
                 log.debug("[Keepalive] 账号 %s 轮换 Cookie 异常: %s", account.id, exc)
+                _ensure_acc(account.id)
+                rotate_results.setdefault(account.id, []).append(False)
 
-        saved_accounts = [
-            account_id
-            for account_id, results in attempts.items()
-            if results and all(results)
+        saved_accounts: list[str] = []
+        failed_accounts: list[str] = []
+        for account_id in account_order:
+            channel_outcomes: list[bool] = []
+            if account_id in slot_results:
+                channel_outcomes.append(all(slot_results[account_id]))
+            if account_id in control_results:
+                channel_outcomes.append(any(control_results[account_id]))
+            if account_id in rotate_results:
+                channel_outcomes.append(any(rotate_results[account_id]))
+            if any(channel_outcomes) or account_id in browserless_disk_ok:
+                saved_accounts.append(account_id)
+            else:
+                failed_accounts.append(account_id)
+
+        failed_set = set(failed_accounts)
+        failed_slots = [
+            slot_id for acc_id, slot_id in slot_failures if acc_id in failed_set
         ]
-        failed_accounts = [
-            account_id
-            for account_id, results in attempts.items()
-            if not results or not all(results)
-        ]
+
         for account_id in saved_accounts:
             self._store.mark_auth_saved(account_id)
+            self._auth_saved_at[account_id] = now
+            self._account_auth_failures.pop(account_id, None)
 
-        if not saved_accounts and not (control_attempted and control_saved):
-            any_slot_saved = any(any(values) for values in attempts.values())
-            if failed_accounts and any_slot_saved:
-                result = {
-                    "ok": False,
-                    "reason": "partial",
-                    "count": 0,
-                    "accounts": [],
-                    "failed_accounts": failed_accounts,
-                    "failed_slots": failed_slots,
-                }
-                log.warning(
-                    "[Keepalive] auth update trigger=%s partial saved=[] failed=%s",
-                    trigger,
-                    failed_accounts,
-                )
-                return result
-            return {
-                "ok": False,
-                "reason": "no_active_page",
-                "count": 0,
-                "failed_slots": failed_slots,
-            }
+        exhausted_accounts: set[str] = set()
+        if trigger == "schedule":
+            for account_id in failed_accounts:
+                failures = self._account_auth_failures.get(account_id, 0) + 1
+                if failures >= MAX_AUTH_CONSECUTIVE_FAILURES:
+                    self._auth_saved_at[account_id] = now
+                    self._account_auth_failures.pop(account_id, None)
+                    exhausted_accounts.add(account_id)
+                    log.warning(
+                        "[Keepalive] auth update account=%s reached %d consecutive failures; skipping until next cycle",
+                        account_id,
+                        failures,
+                    )
+                else:
+                    self._account_auth_failures[account_id] = failures
 
         if failed_accounts:
+            cycle_exhausted = trigger == "schedule" and len(exhausted_accounts) == len(
+                failed_accounts
+            )
             result: dict[str, object] = {
                 "ok": False,
                 "reason": "partial",
@@ -585,6 +728,8 @@ class AccountKeepaliveService:
                 "failed_accounts": failed_accounts,
                 "failed_slots": failed_slots,
             }
+            if cycle_exhausted:
+                result["cycle_exhausted"] = True
             log.warning(
                 "[Keepalive] auth update trigger=%s partial saved=%s failed=%s",
                 trigger,
@@ -593,7 +738,15 @@ class AccountKeepaliveService:
             )
             return result
 
-        if not saved_accounts and control_saved:
+        if not saved_accounts and not control_active_saved:
+            return {
+                "ok": False,
+                "reason": "no_active_page",
+                "count": 0,
+                "failed_slots": failed_slots,
+            }
+
+        if not saved_accounts and control_active_saved:
             result = {
                 "ok": True,
                 "reason": "saved",

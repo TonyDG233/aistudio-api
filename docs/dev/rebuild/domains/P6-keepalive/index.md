@@ -13,9 +13,11 @@
 |---|---|---|---|
 | **B3 P6/D08 24h 保活闭环** | `AccountKeepaliveService` 生命周期、逐 slot 回写、`RefreshInProgressError` 互斥、单全局 job 锁、手动路由、旧配置键警告迁移 | 已完成（PASS） | `reviews/REV-B3-p6-keepalive.md` |
 | **Stage 2.1.1 保活自动 Cookie 轮换** | `_auth_update` 阶段集成 `rotate_account_cookies` 与同源兄弟同步，增强浏览器外长效凭据保活 | 已完成（PASS） | 见 `P8-api-ui/reviews/REV-2.1.1.md` §2.4 |
+| **Stage 2.1.4.3 `auth_update` 防刷屏与退避收敛** | 跨通道合并免误判 `partial`、24h 按账号跳过已成功账号、`300→600→1200s` 指数退避与 3 次失败单周期熔断 | 已完成（PASS） | [`reviews/REV-2.1.4.3-keepalive-auth-update-anti-spam.md`](reviews/REV-2.1.4.3-keepalive-auth-update-anti-spam.md) |
 | **后续演进：控制面会话归属与禁用态展示（P6-Q6）** | 保持 `active_activity` 默认关闭、无 idle 浏览器回收 | 稳定运行中 | — |
 
 ## `reviews/` 审查报告与截图索引
 
 - [`reviews/REV-B3-p6-keepalive.md`](reviews/REV-B3-p6-keepalive.md) — B3 24h Cookie 保活、元数据刷新、job 锁与手动触发审查（2026-10-29，PASS）
+- [`reviews/REV-2.1.4.3-keepalive-auth-update-anti-spam.md`](reviews/REV-2.1.4.3-keepalive-auth-update-anti-spam.md) — `auth_update` 防刷屏、跨通道合并与指数退避审查（2026-11-18，PASS）
 - 截图资产：无（保活栏 UI 截图归档于 `P8-api-ui/reviews/assets/`）。
