@@ -812,3 +812,332 @@ async def test_pause_race_rechecked_after_job_lock(tmp_path) -> None:
     assert result["reason"] == "paused"
     assert executed == []
     assert service._job_lock is fake_lock
+
+
+@pytest.mark.asyncio
+async def test_auth_update_slot_not_dirty_but_rotate_ok_succeeds_and_reschedules_24h(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_slot", "slot@example.com")
+    slot_session = FakeSlotSession(saved=False)
+    manager = FakeManager([FakeSlot("inst-1", "acc_slot", session=slot_session)])
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated.append(account_id)
+        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    clock = FakeClock(10_000.0)
+    service = _service(
+        store, manager=manager, account_service=account_service, clock=clock
+    )
+    service._next_due = {
+        "auth_update": 10_000.0,
+        "metadata_refresh": 10_000_000.0,
+        "active_activity": 10_000_000.0,
+    }
+
+    await service._run_due(_settings(metadata_refresh=False))
+
+    last = _status(service)["last_results"]["auth_update"]
+    assert last["ok"] is True
+    assert last["reason"] == "saved"
+    assert last["accounts"] == ["acc_slot"]
+    assert last["failed_slots"] == []
+    assert "failed_accounts" not in last
+    assert rotated == ["acc_slot"]
+    assert _status(service)["next_due"]["auth_update"] == _iso(10_000.0 + 86_400.0)
+    saved = store.get_account("acc_slot")
+    assert saved is not None and saved.auth_saved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_auth_update_browserless_clean_slot_with_missing_seed_not_marked_failed(
+    tmp_path,
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_clean", "clean@example.com")
+
+    class _CleanBrowserlessSession(FakeSlotSession):
+        engine = "browserless"
+        _cookie_dirty = False
+
+    slot_session = _CleanBrowserlessSession(saved=False)
+    manager = FakeManager([FakeSlot("inst-1", "acc_clean", session=slot_session)])
+    service = _service(store, manager=manager)
+
+    result = await service.run_now(
+        "auth_update", trigger="schedule", settings=_settings()
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "saved"
+    assert result["accounts"] == ["acc_clean"]
+    assert result["failed_slots"] == []
+    saved = store.get_account("acc_clean")
+    assert saved is not None and saved.auth_saved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_auth_update_partial_retries_after_300s_without_reprocessing_saved_accounts(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    _account(store, "acc_b", "b@example.com")
+    slot_a_session = FakeSlotSession(saved=True)
+    slot_b_session = FakeSlotSession(saved=False)
+    manager = FakeManager(
+        [
+            FakeSlot("slot-a", "acc_a", session=slot_a_session),
+            FakeSlot("slot-b", "acc_b", session=slot_b_session),
+        ]
+    )
+    account_service = AccountService(store)
+    rotated_calls: list[str] = []
+    rotate_results: dict[str, dict[str, object]] = {
+        "acc_a": {"ok": True},
+        "acc_b": {"ok": False, "status": 500},
+    }
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated_calls.append(account_id)
+        return rotate_results[account_id]
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    clock = FakeClock(20_000.0)
+    service = _service(
+        store, manager=manager, account_service=account_service, clock=clock
+    )
+    service._next_due = {
+        "auth_update": 20_000.0,
+        "metadata_refresh": 10_000_000.0,
+        "active_activity": 10_000_000.0,
+    }
+
+    await service._run_due(_settings(metadata_refresh=False))
+
+    last = _status(service)["last_results"]["auth_update"]
+    assert last["ok"] is False
+    assert last["reason"] == "partial"
+    assert last["accounts"] == ["acc_a"]
+    assert last["failed_accounts"] == ["acc_b"]
+    assert last["failed_slots"] == ["slot-b"]
+    assert _status(service)["next_due"]["auth_update"] == _iso(20_300.0)
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 1
+    assert rotated_calls == ["acc_a", "acc_b"]
+
+    rotated_calls.clear()
+    slot_b_session._saved = True
+    rotate_results["acc_b"] = {"ok": True}
+    clock.now = 20_300.0
+
+    await service._run_due(_settings(metadata_refresh=False))
+
+    last_retry = _status(service)["last_results"]["auth_update"]
+    assert last_retry["ok"] is True
+    assert last_retry["reason"] == "saved"
+    assert last_retry["accounts"] == ["acc_b"]
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 2
+    assert rotated_calls == ["acc_b"]
+    assert _status(service)["next_due"]["auth_update"] == _iso(20_300.0 + 86_400.0)
+
+
+@pytest.mark.asyncio
+async def test_auth_update_stops_retrying_account_after_three_consecutive_failures_in_cycle(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    _account(store, "acc_b", "b@example.com")
+    slot_a_session = FakeSlotSession(saved=True)
+    slot_b_session = FakeSlotSession(saved=False)
+    manager = FakeManager(
+        [
+            FakeSlot("slot-a", "acc_a", session=slot_a_session),
+            FakeSlot("slot-b", "acc_b", session=slot_b_session),
+        ]
+    )
+    account_service = AccountService(store)
+    rotated_calls: list[str] = []
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated_calls.append(account_id)
+        if account_id == "acc_a":
+            return {"ok": True}
+        return {"ok": False, "status": 500}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    clock = FakeClock(30_000.0)
+    service = _service(
+        store, manager=manager, account_service=account_service, clock=clock
+    )
+    service._next_due = {
+        "auth_update": 30_000.0,
+        "metadata_refresh": 10_000_000.0,
+        "active_activity": 10_000_000.0,
+    }
+
+    await service._run_due(_settings(metadata_refresh=False))
+    assert _status(service)["next_due"]["auth_update"] == _iso(30_300.0)
+
+    clock.now = 30_300.0
+    await service._run_due(_settings(metadata_refresh=False))
+    assert _status(service)["next_due"]["auth_update"] == _iso(30_900.0)
+
+    clock.now = 30_900.0
+    await service._run_due(_settings(metadata_refresh=False))
+    last_third = _status(service)["last_results"]["auth_update"]
+    assert last_third["ok"] is False
+    assert last_third["reason"] == "partial"
+    assert last_third["failed_accounts"] == ["acc_b"]
+    assert last_third["cycle_exhausted"] is True
+    assert _status(service)["next_due"]["auth_update"] == _iso(30_900.0 + 86_400.0)
+    assert service._auth_partial_failures == 0
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 3
+
+    # At t=32_100 (where a 4th 1200s retry would have occurred), no idle wakeup runs.
+    rotated_calls.clear()
+    clock.now = 32_100.0
+    await service._run_due(_settings(metadata_refresh=False))
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 3
+    assert rotated_calls == []
+    assert _status(service)["next_due"]["auth_update"] == _iso(30_900.0 + 86_400.0)
+
+    # Next 24h cycle resumes attempting both accounts.
+    clock.now = 30_900.0 + 86_400.0
+    await service._run_due(_settings(metadata_refresh=False))
+    assert slot_a_session.calls == 2
+    assert slot_b_session.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_auth_update_manual_trigger_runs_all_accounts_within_24h_window(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    _account(store, "acc_b", "b@example.com")
+    slot_a_session = FakeSlotSession(saved=True)
+    slot_b_session = FakeSlotSession(saved=True)
+    manager = FakeManager(
+        [
+            FakeSlot("slot-a", "acc_a", session=slot_a_session),
+            FakeSlot("slot-b", "acc_b", session=slot_b_session),
+        ]
+    )
+    account_service = AccountService(store)
+    rotated_calls: list[str] = []
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated_calls.append(account_id)
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    clock = FakeClock(40_000.0)
+    service = _service(
+        store, manager=manager, account_service=account_service, clock=clock
+    )
+    service._next_due = {
+        "auth_update": 40_000.0,
+        "metadata_refresh": 10_000_000.0,
+        "active_activity": 10_000_000.0,
+    }
+
+    await service._run_due(_settings(metadata_refresh=False))
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 1
+    assert rotated_calls == ["acc_a", "acc_b"]
+
+    # Within the 24h window, schedule trigger skips already-saved accounts,
+    # while manual trigger must still run all accounts regardless of _auth_saved_at.
+    rotated_calls.clear()
+    clock.now = 41_000.0
+    scheduled_res = await service.run_now(
+        "auth_update", trigger="schedule", settings=_settings(metadata_refresh=False)
+    )
+    assert scheduled_res["count"] == 0
+    assert scheduled_res["accounts"] == []
+    assert slot_a_session.calls == 1
+    assert slot_b_session.calls == 1
+    assert rotated_calls == []
+
+    manual_res = await service.run_now(
+        "auth_update", trigger="manual", settings=_settings(metadata_refresh=False)
+    )
+    assert manual_res["ok"] is True
+    assert manual_res["reason"] == "saved"
+    assert manual_res["count"] == 2
+    assert manual_res["accounts"] == ["acc_a", "acc_b"]
+    assert slot_a_session.calls == 2
+    assert slot_b_session.calls == 2
+    assert rotated_calls == ["acc_a", "acc_b"]
+
+
+@pytest.mark.asyncio
+async def test_auth_update_manual_and_api_failures_do_not_consume_schedule_retries(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_a", "a@example.com")
+    slot_a_session = FakeSlotSession(saved=False)
+    manager = FakeManager([FakeSlot("slot-a", "acc_a", session=slot_a_session)])
+    account_service = AccountService(store)
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del account_id, session
+        return {"ok": False, "status": 500}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    clock = FakeClock(50_000.0)
+    service = _service(
+        store, manager=manager, account_service=account_service, clock=clock
+    )
+
+    for trig in ("manual", "api", "manual"):
+        res = await service.run_now("auth_update", trigger=trig, settings=_settings())
+        assert res["ok"] is False
+        assert res["reason"] == "partial"
+        assert "cycle_exhausted" not in res
+    assert service._account_auth_failures == {}
+    assert "acc_a" not in service._auth_saved_at
+
+    # Schedule still gets full 3 consecutive attempts before circuit-breaking.
+    for expected_failures in (1, 2):
+        res = await service.run_now(
+            "auth_update", trigger="schedule", settings=_settings()
+        )
+        assert res["ok"] is False
+        assert "cycle_exhausted" not in res
+        assert service._account_auth_failures == {"acc_a": expected_failures}
+
+    # A manual success in between clears failure count and records _auth_saved_at.
+    slot_a_session._saved = True
+    manual_ok = await service.run_now(
+        "auth_update", trigger="manual", settings=_settings()
+    )
+    assert manual_ok["ok"] is True
+    assert service._account_auth_failures == {}
+    assert service._auth_saved_at["acc_a"] == 50_000.0
+
+
+def test_retry_delay_caps_exponent_for_auth_partial_failures(tmp_path):
+    store = AccountStore(tmp_path)
+    service = _service(store)
+    service._auth_partial_failures = 1_000
+    delay = service._retry_delay(
+        "auth_update", {"ok": False, "reason": "partial"}, 86_400.0
+    )
+    assert delay == 86_400.0
+    assert service._auth_partial_failures == 1_001
