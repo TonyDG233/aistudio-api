@@ -1491,7 +1491,7 @@ function handleSave() {
               <div class="flex-1 min-w-0">
                 <ConfigInput
                   :model-value="asNumber(modelDiscovery.live_refresh_interval_sec, 86400)"
-                  label="真实页面发现成功后的刷新间隔"
+                  label="真实页面 / signer 通道成功后的刷新间隔"
                   type="number"
                   @update:model-value="updateFeature('model_discovery', 'live_refresh_interval_sec', Math.max(1, asNumber($event, 86400)))"
                 />

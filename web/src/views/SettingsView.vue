@@ -276,7 +276,11 @@ async function refreshModels() {
     const label = MODEL_SOURCE_LABELS[res.source] ?? res.source
     if (res.error) {
       toast.error(`模型列表刷新失败：${res.error}`)
-    } else if (res.source === 'live_page' || res.source === 'live_signer') {
+    } else if (
+      res.source === 'live_page' ||
+      res.source === 'live_signer' ||
+      res.source === 'live_http'
+    ) {
       toast.success(`模型列表已刷新：来源 ${label}，共 ${res.model_count} 个模型`)
     } else {
       toast.warning(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -46,6 +47,8 @@ public_router = APIRouter()
 protected_router = APIRouter()
 
 _MODEL_REFRESH_TIMEOUT_SECONDS = 30.0
+_MODEL_REFRESH_MIN_INTERVAL_SECONDS = 60.0
+_last_manual_refresh_started_at: float | None = None
 
 
 def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
@@ -362,8 +365,13 @@ async def refresh_models(
     Management-only (web password) so the API-key model routes stay read-only.
     ``reset_backoff`` clears the failed-round gate under the model-discovery
     lock, letting an operator retry immediately after the upstream risk signal
-    clears.  ``ui_debug`` answers from the offline sandbox, never the network.
+    clears.  Manual refreshes are rate-limited to one per
+    ``_MODEL_REFRESH_MIN_INTERVAL_SECONDS`` so repeated clicks cannot hammer the
+    upstream risk-control gate; a throttled call leaves the backoff state
+    untouched.  ``ui_debug`` answers from the offline sandbox, never the network.
     """
+    global _last_manual_refresh_started_at
+
     sandbox = (
         getattr(runtime_state, "ui_sandbox", None)
         if getattr(runtime_state, "ui_debug", False)
@@ -377,6 +385,18 @@ async def refresh_models(
 
     from aistudio_api.api.state import discovery_sessions_for
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    now = time.monotonic()
+    if _last_manual_refresh_started_at is not None:
+        elapsed = now - _last_manual_refresh_started_at
+        if elapsed < _MODEL_REFRESH_MIN_INTERVAL_SECONDS:
+            remaining = math.ceil(_MODEL_REFRESH_MIN_INTERVAL_SECONDS - elapsed)
+            return {
+                "source": model_discovery.last_source,
+                "model_count": model_discovery.model_count,
+                "error": f"手动刷新过于频繁，请 {remaining} 秒后再试",
+            }
+    _last_manual_refresh_started_at = now
 
     sessions = discovery_sessions_for(runtime_state)
     try:

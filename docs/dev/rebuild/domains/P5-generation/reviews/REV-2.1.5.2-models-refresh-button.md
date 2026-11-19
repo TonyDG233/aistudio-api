@@ -275,3 +275,116 @@ web/src/views/SettingsView.vue
 - 实跑 `bun run build` 会重写 `src/aistudio_api/static/`；其中 `SettingsView.js` 与 `index.js` 产物与 Worker 版本一致（numstat 不变），`index.html` 因 Windows 换行被重写为 CRLF，已用 `git checkout HEAD -- src/aistudio_api/static/index.html` 还原，最终 `git diff` 与审查开始时一致。
 - 实机服务仅以 `--ui-debug` 沙盒启动（端口 18371/18372），仅访问 `127.0.0.1`；结束时均已 `stop`，端口 `Test-NetConnection` 失败、无进程残留，未访问真实 Google / 真实账号 / 外网。
 - 报告未预先填入任何证据：上述门禁输出、测试统计、几何尺寸与 toast 文案均为本轮实跑/实采结果。
+
+---
+
+## 二轮复审（返工核验）
+
+- **复审角色**：100% 独立只读 Reviewer（与 Worker 零上下文共享，全部结论以本轮亲眼核验为准）
+- **复审对象**：基线 `0e65b32` 之后的未提交返工 diff；其中暂存区 11 张截图 `git rm` 属主控有意的截图裁剪，不计入 Worker 代码改动
+- **复审环境**：Windows / pwsh 7 / Python 3.13 / Ruff 0.17.1；Vite + Vue 3 + bun（`PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`）
+- **复审时间**：2026-11-20
+- **结论**：**PASS**（0 × P0 / 0 × P1 / 0 × 新增可裁决 P2；新 P2-1/P2-2/P2-3/P2-4 与 Q-4 全部闭环；旧 P2-5/P2-6、Q-1/Q-2/Q-3、ruff format 存量均属明确延后或依赖外部）
+
+### 1. 改动集合与全量 diff 审计
+
+复审开始时 `git status --short` 共 23 条 = **12 个修改文件**（`git diff --stat`：190 insertions / 20 deletions）+ **11 个已暂存删除的 PNG**；追加本章后为 24 条，多出的即本报告文件本身。`git diff --numstat` 实测逐文件如下，与 Worker 声称集合逐一对应，无多余文件：
+
+```
+1	1	defaults/config.schema.json
+2	2	defaults/config.yaml
+21	1	src/aistudio_api/api/routes_system.py
+3	3	src/aistudio_api/infrastructure/gateway/model_defaults.py
+6	3	src/aistudio_api/infrastructure/gateway/model_discovery.py
+3	3	src/aistudio_api/static/assets/SettingsView.js
+17	0	tests/unit/test_model_discovery_live_wiring.py
+101	0	tests/unit/test_routes_system.py
+26	1	tests/unit/test_ui_sandbox_stats_consistency.py
+4	4	web/src/components/config/schema.ts
+1	1	web/src/components/settings/SchedulingCard.vue
+5	1	web/src/views/SettingsView.vue
+```
+
+- **零 `docs/**` 被 Worker 触碰**：`git status` 中 docs 下仅有 11 条 `D`（截图裁剪），Worker 未改动任何 `REV-*.md`/文档内容（docs 下唯一的 `M` 即本报告的二轮追加）；`git ls-files --others` 为空，无未跟踪残留。
+- **无调试残留**：对全部新增行扫描 `console.log|print(|breakpoint|pdb|debugger|TODO|FIXME|XXX`，0 命中。
+- **`git diff --check`**：还原 `index.html` 后退出码 0，无空白错误。
+
+### 2. 「零契约变更」逐字核验（5 处口径同步）
+
+| 文件 | diff 实际内容 | 键名/类型/默认值/逻辑 |
+|---|---|---|
+| `defaults/config.yaml:147-148` | 仅 2 行注释改写为「真实页面（live_page）与 signer 通道（live_signer）」 | 键 `live_refresh_interval_sec: 86400`、`fallback_refresh_interval_sec: 600`（`:150-151`）不变 ✅ |
+| `defaults/config.schema.json:352` | 仅 `description` 字符串改写 | `live_refresh_interval_sec`/`fallback_refresh_interval_sec` 的 `type`/`minimum` 等约束（`:354-361`）不变 ✅ |
+| `model_defaults.py:2102-2104` | 仅 docstring 两处措辞（并入 `live_signer`） | 函数签名与实现 0 变化 ✅ |
+| `web/src/components/config/schema.ts:1012,1015,1016,1027` | 仅 `title`/`description`/`explanation` 文本 | `defaultValue: 86400`/`recommendedValue: 86400`（`:1017-1018`）、`defaultValue: 600`（`:1028`）、`type: 'number'` 与 `key` 全部不变 ✅ |
+| `web/src/components/settings/SchedulingCard.vue:1494` | 仅 `label` 文案 | `ConfigInput` 的 `:model-value`/`updateFeature(...)` 与 `Math.max(1, ...)` 逻辑不变 ✅ |
+
+结论：「零契约变更」声明**成立**，五处均为纯注释/描述/文案。
+
+### 3. 四项 P 修复正确性
+
+| 项 | 核验证据 | 判定 |
+|---|---|---|
+| **P2-1** | `SettingsView.vue:279-283` 成功分支为 `live_page \|\| live_signer \|\| live_http`，与后端真值集合 `LIVE_SOURCES = {live_page, live_signer, live_http}`（`model_discovery.py:649`）**逐元素一致**；降级分支只剩 snapshot/fallback；`MODEL_SOURCE_LABELS` 的 `live_http: '实时接口（直连兜底）'`（`:266`）保持不变，成功 toast 因此语义自洽 | ✅ 闭环，Q-4 随之关闭 |
+| **P2-2** | `model_discovery.py:50` `_SIGNER_FETCH_TIMEOUT_SECONDS = 20.0`（< 端点预算）；`routes_system.py:48` 整轮预算仍为 30.0；`:47-50` 与 `:1338-1339` 注释改为如实描述「单候选 20s / 整轮 30s / 首个分类 403 提前终止」。实测 20/30 配比给单候选留出 10s 端点余量，注释未夸大为「必然小于 30s」（见 N-2.2） | ✅ 闭环 |
+| **P2-4** | `routes_system.py:49-50` 新增 `_MODEL_REFRESH_MIN_INTERVAL_SECONDS = 60.0` 与模块级 `_last_manual_refresh_started_at`；`:389-399` 在 `get_models` 之前（即 discovery 锁外）先判，`elapsed < 60` 时直接 `return` 且**不调用 `get_models`**；仅允许路径在 `:399` 写时间戳，`:405` 才传 `reset_backoff=True`。`math.ceil` 保证 `remaining >= 1`，不会出现「请 0 秒后再试」；沙盒分支在 `:375-384` 提前返回，不消耗该窗口 | ✅ 闭环 |
+| **P2-3** | 4 个新增用例：`test_model_discovery_live_wiring.py:252-266`（空缓存 + 未来闸门 → 物化内置表并全量打 `fallback` 标记）、`test_ui_sandbox_stats_consistency.py:84-107`（三场景 payload）、`test_routes_system.py:370-413`（二次请求只调 1 次 `get_models`，`_next_retry_at == retry_at` 原值不变，文案含「手动刷新过于频繁/秒后再试」）、`:416-460`（`ui_debug=True` 只走沙盒且 `get_models.await_count == 0`；`ui_debug=False` 走真实路径且沙盒调用计数不增） | ✅ 闭环（1713 → 1717，+4 与用例数一致） |
+
+### 4. 旧口径残留独立检索
+
+在 `web/src`、`defaults/`、`src/` 全域自行检索 `真实页面发现|最高可信|live_page 成功|只用于.*live_page`：仅命中 `model_defaults.py:2102` 的**新**措辞（「只用于真实页面（live_page）与 signer 通道」），旧口径 **0 残留**；`web/src` 下再无「真实页面发现成功后的刷新间隔」「最高可信来源」字样。Worker「0 残留」声明成立。
+
+### 5. 截图裁剪核验
+
+- `git diff --cached --name-status` = **11 条 `D`**，全部位于 `docs/dev/rebuild/domains/P5-generation/reviews/assets/`，与主控声称的 11 张一致；无其他暂存改动。
+- 磁盘保留 **恰为 2 张** 2.1.5.2 代表图：`rev-2.1.5.2-fullpage-1440.png`（实测 **1440×7852**，真实全页）与 `rev-2.1.5.2-success-toast-1440x900.png`（**1440×900**）。
+- 目检：全页图确为设置页完整页面；特写图在「模型规则与安全策略」标题栏内清晰可读「**刷新模型列表**」按钮（左）与「保存模型规则」（右）。**但**该特写图画面内不含 toast 气泡本体（右上角为此前已淡出的空白区域），文件名「success-toast」与内容略有出入，记 **N-2.1**；不阻塞，本步骤按要求不新增截图，成功三态行为已由一轮 §7.2 实测文案与本轮三态单测共同兜底。
+
+### 6. 门禁真实输出（本轮独立实跑）
+
+| 门禁 | 命令 | 实测输出 | 判定 |
+|---|---|---|---|
+| 依赖同步 | `uv sync --extra dev` | `Resolved 47 packages` / `Audited 47 packages`，exit 0 | ✅ |
+| Ruff Lint | `uv run ruff check .` | `All checks passed!`，exit 0 | ✅ 0 error |
+| Ruff 格式 | `uv run ruff format --check .` | `62 files would be reformatted, 330 files already formatted` | ⚠️ 存量红；本轮 6 个 Python 改动文件单独检查为 `6 files already formatted` |
+| Pyright | `uv run pyright src tests` | `0 errors, 0 warnings, 0 informations` | ✅ |
+| 全量测试 | `$env:PYTHONUTF8='1'; uv run pytest -q` | `1717 passed in 46.12s`，exit 0 | ✅ 与声称一致 |
+| 定向测试 | 6 个受影响模块中的 3 个测试文件 | `43 passed in 4.67s` | ✅ |
+| 前端 Lint | `cd web; bun run lint`（`eslint src --max-warnings 0`） | exit 0，无告警输出 | ✅ |
+| 前端类型 | `cd web; bun run type-check`（`vue-tsc -b`） | exit 0 | ✅ |
+| 前端构建 | `cd web; bun run build` | `✓ built in 2.71s`，exit 0 | ✅ |
+| Diff 空白 | `git diff --check` | 无输出，exit 0（还原 `index.html` 后） | ✅ |
+
+- **构建产物一致性**：`SettingsView.js` 构建前后 SHA-256 均为 `9B6902ED…CF309E`，且产物内含 `Pe={live_page:"真实页面",live_signer:"实时接口",live_http:"实时接口（直连兜底）",…}` 与 `V.source==="live_page"||V.source==="live_signer"||V.source==="live_http"`，与源码一致。
+- **N-4 复现**：Windows `bun run build` 再次把 `static/index.html` 重写为 CRLF，已用 `git checkout HEAD -- src/aistudio_api/static/index.html` 还原；最终 `git status` 中 static 仅剩 `SettingsView.js`（3/3），与审查开始时一致。
+
+### 7. 台账二轮状态
+
+| 项 | 二轮状态 | 依据 |
+|---|---|---|
+| 新 P2-1 | ✅ 已闭环 | `SettingsView.vue:279-283` ↔ `model_discovery.py:649` |
+| 新 P2-2 | ✅ 已闭环（见 N-2.2） | `model_discovery.py:50`、`routes_system.py:48`、`:1338-1339` |
+| 新 P2-3 | ✅ 已闭环 | 4 个新用例，1717 passed |
+| 新 P2-4 | ✅ 已闭环（见 N-2.4/N-2.5） | `routes_system.py:389-405` |
+| Q-4 | ✅ 已闭环 | `live_http` 纳入成功分支；按钮标签保持「实时接口（直连兜底）」 |
+| P2-7（口径滞后） | ✅ 已闭环 | 5 处文案同步，零契约变更 |
+| 旧 P2-5（signer 并发争用） | ⏸ 明确延后 | `instance_manager.py:800-804` 仍只做空闲优先排序，未排除 busy；依存于 Q-3 的 signer 并发语义，本轮不扩范围 |
+| 旧 P2-6（磁盘兜底旧指纹） | ⏸ 依赖外部 | `model_discovery.py:1398`（伪造 visit-id）、`:1412`（裸 `httpx.AsyncClient`）仍在，待 VPS 实测 403 根因确诊 |
+| Q-1（退避不持久化） | ⏸ 明确延后 | `_next_retry_at` 仍仅内存（`:723`、`:1102`），快照仍只写 models |
+| Q-2（闸门连带挡 live_page） | ⏸ 设计取舍待定 | 闸门仍在候选选择之前（`:837-845`） |
+| Q-3（signer 并发语义） | ⏸ 依赖外部 | `waa-signer/.../main.go` 不在本仓本轮审查范围 |
+| P2-8（ruff format 存量） | ⏸ 明确延后 | 仍为 62 个文件，本 diff 未新增 |
+
+**重点判定：本轮之后不存在「可自行裁决却未修」的 P2。** 20s/30s 配比、60s 节流阈值、`math.ceil` 取整均为已落地的明确裁决；剩余项均受外部条件或既有架构约束，不属本轮可自裁范围。
+
+### 8. 新增备注
+
+- **N-2.1** 保留的 `rev-2.1.5.2-success-toast-1440x900.png` 实为「按钮 + 设置卡片」特写，画面内无 toast 气泡（存在命名与内容的小出入，非编造）；按钮清晰可见，满足代表性证据要求，不阻塞。
+- **N-2.2** 20s 单候选 / 30s 整轮：若同时存在 ≥2 个卡死候选，整轮仍可能触达端点 30s 超时并返回明确 error；注释已如实写「usually」，未夸大为必然收敛，作为已知边界登记。
+- **N-2.3** Windows `bun run build` 的 `index.html` CRLF 重写为平台现象，本轮已复现并还原，最终 diff 不含该文件。
+- **N-2.4** 节流时间戳为进程级全局，且在「允许」路径的请求开始时即写入：失败/超时同样消耗 60s 窗口（符合防连点本意）；`ui_debug` 沙盒路径不写时间戳。
+- **N-2.5** `remaining = math.ceil(60 - elapsed)` 在拒绝分支恒 ≥ 1，杜绝「请 0 秒后再试」的边界文案。
+
+### 9. 二轮只读声明
+
+本次二轮复审为 100% 只读。除在本文末追加本「二轮复审（返工核验）」章节外，未修改任何源码、测试、配置、文档或截图；未新增/删除任何截图。实跑 `bun run build` 会重写 `src/aistudio_api/static/`，其中 `SettingsView.js` 产物与 Worker 版本字节一致（SHA-256 前后相同），`index.html` 因 Windows CRLF 被重写后已用 `git checkout HEAD --` 还原；最终工作树与复审开始时一致。未启动任何服务、未发起任何真实网络请求、未使用真实 Cookie。

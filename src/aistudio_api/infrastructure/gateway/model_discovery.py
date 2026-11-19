@@ -44,9 +44,10 @@ ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 MAX_HTTP_ACCOUNT_CANDIDATES = 2
 
 # One signer ListModels attempt must not hang the discovery round: the admin
-# refresh endpoint bounds the whole refresh, this bound lets a stuck transport
-# fall through to the next candidate instead of consuming the full 30s budget.
-_SIGNER_FETCH_TIMEOUT_SECONDS = 30.0
+# refresh endpoint bounds the whole refresh at 30s, so a single candidate is
+# capped at 20s.  The round stops on the first classified 403, so a real round
+# usually finishes far below the endpoint budget.
+_SIGNER_FETCH_TIMEOUT_SECONDS = 20.0
 
 # 防风控指数退避封顶 24h：连续失败时按 base=cache_ttl 翻倍，最多等 24h 再试，
 # 避免每轮被动调用都让多个候选反复撞同一个 Google 风控闸门。
@@ -1334,6 +1335,8 @@ class ModelDiscoveryService:
         if not callable(sender):
             raise RuntimeError("browserless session has no signer transport")
         pending = sender(body="[]", url=LIST_MODELS_URL)
+        # Single candidate cap is 20s while the admin endpoint budgets the whole
+        # round at 30s; the first classified 403 stops the round early.
         try:
             status, body = await asyncio.wait_for(
                 cast("Any", pending), timeout=_SIGNER_FETCH_TIMEOUT_SECONDS

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,6 +30,7 @@ from aistudio_api.infrastructure.gateway.instance_pool import InstanceSlot, Slot
 from aistudio_api.infrastructure.gateway.model_discovery import (
     _FALLBACK_MODELS,
     ModelDiscoveryService,
+    discovery_entry_source,
     mark_discovery_source,
 )
 
@@ -244,6 +246,21 @@ def test_every_fallback_entry_has_explicit_paid_flag():
         assert isinstance(item.get("paid"), bool), item["id"]
     gemini_35 = next(m for m in _FALLBACK_MODELS if m["id"] == "gemini-3.5-flash")
     assert gemini_35["paid"] is False
+
+
+@pytest.mark.asyncio
+async def test_backoff_gate_with_empty_cache_materializes_builtin_fallback():
+    service = ModelDiscoveryService()
+    service._next_retry_at = time.time() + 3600
+    service._failure_streak = 2
+
+    models = await service.get_models(force_refresh=True)
+
+    assert models
+    assert len(models) == len(_FALLBACK_MODELS) >= 30
+    assert service.last_source == "fallback"
+    assert {m["id"] for m in models} == {m["id"] for m in _FALLBACK_MODELS}
+    assert all(discovery_entry_source(entry) == "fallback" for entry in models)
 
 
 def _install_evidence_snapshot() -> list[dict[str, object]]:

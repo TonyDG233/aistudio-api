@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 from aistudio_api.api.state import ModelStatsItem, daily_key
-from aistudio_api.api.ui_sandbox import UISandbox
+from aistudio_api.api.ui_sandbox import UISandbox, sandbox_model_catalog
 
 
 def _assert_bucket(bucket: dict[str, Any]) -> None:
@@ -77,6 +77,31 @@ def test_seeded_daily_ledgers_are_arithmetically_consistent(scenario: str) -> No
         _assert_payload(payload)
         for item in sandbox.model_stats.values():
             _assert_item(item)
+    finally:
+        sandbox.close()
+
+
+def test_models_refresh_payload_covers_all_three_toast_states() -> None:
+    catalog_size = len(sandbox_model_catalog())
+    sandbox = UISandbox()
+    try:
+        sandbox.reset("all_states")
+        assert sandbox.models_refresh_payload() == {
+            "source": "live_signer",
+            "model_count": catalog_size,
+        }
+
+        sandbox.reset("narrow_edge")
+        assert sandbox.models_refresh_payload() == {
+            "source": "snapshot",
+            "model_count": catalog_size,
+        }
+
+        sandbox.reset("empty")
+        empty_payload = sandbox.models_refresh_payload()
+        assert empty_payload["source"] == "fallback"
+        assert empty_payload["model_count"] == catalog_size
+        assert "error" in empty_payload
     finally:
         sandbox.close()
 
