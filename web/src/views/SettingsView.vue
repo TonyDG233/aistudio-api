@@ -42,6 +42,7 @@ import {
   Undo2,
   RotateCcw,
   Save,
+  RefreshCw,
 } from 'lucide-vue-next'
 
 const toast = useToastStore()
@@ -57,6 +58,7 @@ const activeMode = ref<SettingsMode>('visual')
 const loading = ref(true)
 const savingGlobal = ref(false)
 const resetting = ref(false)
+const refreshingModels = ref(false)
 const savingSections = ref<Record<string, boolean>>({})
 const dictModalOpen = ref(false)
 
@@ -255,6 +257,37 @@ async function saveGlobal() {
     toast.error(msg)
   } finally {
     savingGlobal.value = false
+  }
+}
+
+const MODEL_SOURCE_LABELS: Record<string, string> = {
+  live_page: '真实页面',
+  live_signer: '实时接口',
+  live_http: '实时接口（直连兜底）',
+  snapshot: '本地快照',
+  fallback: '内置兜底',
+}
+
+async function refreshModels() {
+  if (refreshingModels.value) return
+  refreshingModels.value = true
+  try {
+    const res = await systemApi.refreshModels()
+    const label = MODEL_SOURCE_LABELS[res.source] ?? res.source
+    if (res.error) {
+      toast.error(`模型列表刷新失败：${res.error}`)
+    } else if (res.source === 'live_page' || res.source === 'live_signer') {
+      toast.success(`模型列表已刷新：来源 ${label}，共 ${res.model_count} 个模型`)
+    } else {
+      toast.warning(
+        `模型列表已更新，但未拿到实时数据：当前来源 ${label}，共 ${res.model_count} 个模型`,
+      )
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '未知错误'
+    toast.error(`模型列表刷新失败：${msg}`)
+  } finally {
+    refreshingModels.value = false
   }
 }
 
@@ -593,18 +626,34 @@ onBeforeRouteLeave((_to, _from, next) => {
               </h3>
             </div>
 
-            <Button
-              variant="primary"
-              size="sm"
-              :loading="isSaving('model')"
-              @click="saveSection('model')"
-            >
-              <Save
-                v-if="!isSaving('model')"
-                class="w-3.5 h-3.5"
-              />
-              <span>保存模型规则</span>
-            </Button>
+            <div class="flex items-center gap-2 flex-wrap">
+              <Button
+                variant="secondary"
+                size="sm"
+                :loading="refreshingModels"
+                title="立即重新拉取上游模型目录并清除失败退避（最长约 30 秒）"
+                @click="refreshModels"
+              >
+                <RefreshCw
+                  v-if="!refreshingModels"
+                  class="w-3.5 h-3.5"
+                />
+                <span>{{ refreshingModels ? '刷新中...' : '刷新模型列表' }}</span>
+              </Button>
+
+              <Button
+                variant="primary"
+                size="sm"
+                :loading="isSaving('model')"
+                @click="saveSection('model')"
+              >
+                <Save
+                  v-if="!isSaving('model')"
+                  class="w-3.5 h-3.5"
+                />
+                <span>保存模型规则</span>
+              </Button>
+            </div>
           </div>
 
           <ModelRulesPanel

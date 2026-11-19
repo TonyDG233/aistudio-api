@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -209,6 +211,109 @@ async def test_rotation_status_and_clear_cooldown(monkeypatch):
         )
         assert resp_clear.status_code == 200
         mock_rotator.clear_cooldown.assert_called_once_with("acc_1", model=None)
+
+
+@pytest.mark.asyncio
+async def test_models_refresh_requires_web_auth(monkeypatch):
+    from aistudio_api.config import settings
+
+    monkeypatch.setattr(settings, "web_password", "route-secret")
+
+    async with _client() as client:
+        resp = await client.post("/api/models/refresh")
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_models_refresh_returns_source_and_count(monkeypatch):
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
+
+    monkeypatch.setattr(settings, "web_password", "route-secret")
+    monkeypatch.setattr(discovery_module.model_discovery, "last_source", "live_signer")
+    monkeypatch.setattr(discovery_module.model_discovery, "last_error", None)
+    seen: dict[str, object] = {}
+
+    async def _fake_get_models(**kwargs: object) -> list[dict[str, object]]:
+        seen.update(kwargs)
+        return [{"id": "model-a"}, {"id": "model-b"}]
+
+    monkeypatch.setattr(
+        discovery_module.model_discovery, "get_models", _fake_get_models
+    )
+
+    async with _client() as client:
+        resp = await client.post(
+            "/api/models/refresh",
+            headers={"Authorization": "Bearer route-secret"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source"] == "live_signer"
+    assert data["model_count"] == 2
+    assert "error" not in data
+    assert seen["force_refresh"] is True
+    assert seen["reset_backoff"] is True
+
+
+@pytest.mark.asyncio
+async def test_models_refresh_timeout_returns_error_field(monkeypatch):
+    from aistudio_api.api import routes_system
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
+
+    monkeypatch.setattr(settings, "web_password", "route-secret")
+    monkeypatch.setattr(routes_system, "_MODEL_REFRESH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(discovery_module.model_discovery, "last_source", "snapshot")
+
+    async def _hang(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        await asyncio.sleep(5)
+        return []
+
+    monkeypatch.setattr(discovery_module.model_discovery, "get_models", _hang)
+
+    async with _client() as client:
+        resp = await client.post(
+            "/api/models/refresh",
+            headers={"Authorization": "Bearer route-secret"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source"] == "snapshot"
+    assert isinstance(data["model_count"], int)
+    assert "超时" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_models_refresh_failure_returns_error_field_not_500(monkeypatch):
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
+
+    monkeypatch.setattr(settings, "web_password", "route-secret")
+    monkeypatch.setattr(discovery_module.model_discovery, "last_source", "fallback")
+
+    async def _boom(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        raise RuntimeError("upstream exploded")
+
+    monkeypatch.setattr(discovery_module.model_discovery, "get_models", _boom)
+
+    async with _client() as client:
+        resp = await client.post(
+            "/api/models/refresh",
+            headers={"Authorization": "Bearer route-secret"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source"] == "fallback"
+    assert isinstance(data["model_count"], int)
+    assert "RuntimeError" in data["error"]
+    assert "upstream exploded" in data["error"]
 
 
 @pytest.mark.asyncio

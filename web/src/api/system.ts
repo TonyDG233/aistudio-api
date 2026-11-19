@@ -13,6 +13,7 @@ import type {
   HealthCheckResponse,
   SystemStatusResponse,
   EngineHealthResponse,
+  ModelsRefreshResponse,
 } from '@/types'
 
 
@@ -49,6 +50,12 @@ export const systemApi = {
 
   engineHealthCheck(): Promise<EngineHealthResponse> {
     return request<EngineHealthResponse>('/api/engine/health-check', {
+      method: 'POST',
+    })
+  },
+
+  refreshModels(): Promise<ModelsRefreshResponse> {
+    return request<ModelsRefreshResponse>('/api/models/refresh', {
       method: 'POST',
     })
   },

@@ -360,17 +360,30 @@ async def refresh_models(
     """Force one bounded ListModels refresh for the admin console.
 
     Management-only (web password) so the API-key model routes stay read-only.
-    The failed-round backoff gate is cleared first, letting an operator retry
-    immediately after the upstream risk signal clears.
+    ``reset_backoff`` clears the failed-round gate under the model-discovery
+    lock, letting an operator retry immediately after the upstream risk signal
+    clears.  ``ui_debug`` answers from the offline sandbox, never the network.
     """
+    sandbox = (
+        getattr(runtime_state, "ui_sandbox", None)
+        if getattr(runtime_state, "ui_debug", False)
+        else None
+    )
+    sandbox_payload = getattr(sandbox, "models_refresh_payload", None)
+    if callable(sandbox_payload):
+        payload = sandbox_payload()
+        if isinstance(payload, dict):
+            return {str(key): value for key, value in payload.items()}
+
     from aistudio_api.api.state import discovery_sessions_for
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    model_discovery.reset_backoff()
     sessions = discovery_sessions_for(runtime_state)
     try:
         models = await asyncio.wait_for(
-            model_discovery.get_models(sessions=sessions, force_refresh=True),
+            model_discovery.get_models(
+                sessions=sessions, force_refresh=True, reset_backoff=True
+            ),
             timeout=_MODEL_REFRESH_TIMEOUT_SECONDS,
         )
         error = model_discovery.last_error
