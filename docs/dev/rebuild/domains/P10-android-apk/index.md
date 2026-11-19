@@ -3,6 +3,7 @@
 - 域标识：`P10-android-apk`
 - 目标阶段：Stage 2.2.0（前置条件：Stage 2.1.0 双引擎 `waa-signer` / `browserless` 稳定并完成实机验收后启动）
 - 关联模块：`android/`、`waa-signer/`、`src/aistudio_api/`（嵌入式网关与配置锁定）
+- 完整施工蓝图：[**`STAGE-2.2.0-APK-BLUEPRINT.md`**](STAGE-2.2.0-APK-BLUEPRINT.md)（含 M1~M4 详细架构规范、Web 移动端复用方案、4 条防风控警示卡片文案与 Post-M4 真机/CI 验收计划）
 
 ## 1. 域职责边界与架构红线
 
@@ -34,7 +35,7 @@
 | `tests/unit/test_verify_qr_adb.py` | 116 个离线用例：解析器、防串味拦截、`--allow-main-user` 基线、内置解码器、shell 转义、verify 状态机、`DeepLinkActivity -> Chrome`（含空焦点过渡帧防抖）、9 命令 `help`、`update-gms`、`reset-island` 四阶段及 CLI | 116/116 通过 |
 | `data/tools/island/Island.v6.2.1.apk` | Island 安装包（`3,499,707` 字节，SHA-256 `374e5d23…f611`，被 `.gitignore:12:/data/` 忽略、不入库） | 就绪 |
 
-> **【实机验证结论留档：Island 工作资料（User 10）独立设备 ID 扫码验证已成功打通】** 经真机实测确认，此前报 `doesn't meet device security requirements` 的根因是手机内的 Google Play 服务（`com.google.android.gms`）版本偏旧（`26.43.30`）。将 Google Play 服务升级至最新 `26.44.32+`、在工作资料（Island 壶中界 `User 10`）内开启 VPN 代理并登录待验证的 Google 账号后，通过 `tools/verify_qr_adb.py` 向 `User 10` 注入二维码挑战链接可 **100% 正常通过验证**，且全程使用 `User 10` 独立的 `ANDROID_ID`。当单个工作资料达到验证次数上限时，可通过 `reset-island` 子命令引导销毁并重建工作资料以获取全新的 `ANDROID_ID`，并一键映射恢复 GMS、浏览器与 VPN 环境。
+> **【实机验证最终结论留档：验证配额绑定物理设备主板 TEE，单设备滚动上限约 5 个账号】** 经真机控制变量实测确认：① 将手机 Google Play 服务（`com.google.android.gms`）升级至 `26.44.32+` 后，可在工作资料（Island 壶中界 `User 10`）或主空间（`User 0`）通过 `tools/verify_qr_adb.py` 免摄像头推送二维码链接完成 `DeepLinkActivity` 验证；② 但当整台物理手机累计验证达 **5 个账号** 后，即使销毁并重建工作资料（更换 `ANDROID_ID`）仍会触发设备上限拦截，且相隔 1~3 天未刷新（Google 服务端配额绑定物理设备主板硬件证明，滚动恢复窗口预计为 7~30 天；iOS/iPadOS 同样通过 `com.google.Recaptcha.VerifyClip` 轻 App 走 Apple `DCAppAttestService` 硬件证明并受 30 天滚动窗口约束，切勿手动删除 iPad 轻 App 缓存以免增加硬件密钥重建风险计数）。因此日常防风控核心必须依靠「预防性主动轮换 (`proactive_switch`) + 429 首击退避不二次撞墙 + 宿主机定时/按流量轮换独立 IPv6 + 杜绝后台 Keepalive 异常高频重刷」。
 
 ## 3. `reviews/` 审查报告与成果索引
 
