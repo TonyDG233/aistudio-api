@@ -29,6 +29,12 @@ export interface EngineHealthResponse {
   error?: string | null
 }
 
+export interface ModelsRefreshResponse {
+  source: string
+  model_count: number
+  error?: string
+}
+
 export interface EngineSwitchResult {
   switched?: boolean
   engine?: string

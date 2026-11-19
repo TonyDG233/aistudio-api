@@ -143,15 +143,18 @@ def _model_warmup_interval_seconds(
     source: str,
     settings: dict[str, int] | None = None,
 ) -> int:
-    """Live page success refreshes daily; every other source retries sooner."""
+    """Real live success (page or signer) refreshes daily; others retry sooner."""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_model_discovery_settings,
+    )
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        LIVE_REFRESH_SOURCES,
     )
 
     resolved = (
         settings if settings is not None else get_configured_model_discovery_settings()
     )
-    if source == "live_page":
+    if source in LIVE_REFRESH_SOURCES:
         return int(resolved.get("live_refresh_interval_sec", 86400))
     return int(resolved.get("fallback_refresh_interval_sec", 600))
 
@@ -179,6 +182,24 @@ async def _model_warmup_cycle(
     interval = _model_warmup_interval_seconds(source, settings)
     await sleep(interval)
     return interval
+
+
+async def _model_warmup_loop(
+    state: RuntimeState,
+    *,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> None:
+    """Run refresh cycles forever; one bad cycle never kills the task."""
+    while True:
+        try:
+            await _model_warmup_cycle(state, sleep=sleep)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The discovery backoff gate already blocks network retries; keep
+            # the loop alive and fall back to the short retry cadence.
+            logger.warning("模型发现预热循环异常，继续下一轮: %s", exc)
+            await sleep(_model_warmup_interval_seconds("fallback"))
 
 
 TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
@@ -612,16 +633,7 @@ async def lifespan(_app: FastAPI):
                 await startup_task
             except Exception as exc:
                 logger.debug("模型发现预热前实例启动失败: %s", exc)
-        while True:
-            try:
-                await _model_warmup_cycle(runtime_state)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Never let one bad cycle kill the warmup task silently; the
-                # discovery backoff gate already blocks network retries.
-                logger.warning("模型发现预热循环异常，继续下一轮: %s", exc)
-                await asyncio.sleep(_model_warmup_interval_seconds("fallback"))
+        await _model_warmup_loop(runtime_state)
 
     model_warmup_task = asyncio.create_task(_model_warmup())
 

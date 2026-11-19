@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -181,7 +182,7 @@ async def test_browserless_uses_signer_transport_and_never_touches_a_page(
         models = await service.get_models(sessions=(session,), force_refresh=True)
 
     assert _ids(models) == _ids(expected)
-    assert service.last_source == "live_http"
+    assert service.last_source == "live_signer"
     assert seen["body"] == "[]"
     assert str(seen["url"]).endswith("ListModels")
     assert "no page" not in caplog.text
@@ -574,13 +575,9 @@ async def test_manual_refresh_endpoint_resets_backoff_and_forces_refresh(
 
     async def _fake_get_models(**kwargs: object) -> list[dict[str, object]]:
         seen.update(kwargs)
-        seen["streak"] = model_discovery._failure_streak
-        seen["next_retry_at"] = model_discovery._next_retry_at
         return [{"id": "model-a"}, {"id": "model-b"}]
 
     monkeypatch.setattr(model_discovery, "get_models", _fake_get_models)
-    monkeypatch.setattr(model_discovery, "_failure_streak", 4)
-    monkeypatch.setattr(model_discovery, "_next_retry_at", time.time() + 3600.0)
     monkeypatch.setattr(model_discovery, "last_source", "fallback")
     monkeypatch.setattr(model_discovery, "last_error", None)
 
@@ -589,9 +586,8 @@ async def test_manual_refresh_endpoint_resets_backoff_and_forces_refresh(
     )
 
     assert seen["force_refresh"] is True
+    assert seen["reset_backoff"] is True
     assert seen["sessions"] == ()
-    assert seen["streak"] == 0
-    assert seen["next_retry_at"] is None
     assert result == {"source": "fallback", "model_count": 2}
 
 
@@ -619,3 +615,83 @@ async def test_success_clears_backoff_state(
     assert _ids(models) == _ids(expected)
     assert service._failure_streak == 0
     assert service._next_retry_at is None
+
+
+@pytest.mark.asyncio
+async def test_reset_backoff_bypasses_gate_and_recounts_failed_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_path = _point_cache(monkeypatch, tmp_path)
+    cached = _models(6)
+    _write_snapshot(cache_path, cached)
+    _install_store(monkeypatch, _FakeAccountStore())
+    service = ModelDiscoveryService()
+    assert _ids(service._cached_models) == _ids(cached)
+    service._failure_streak = 4
+    service._next_retry_at = time.time() + 3600.0
+
+    models = await service.get_models(force_refresh=True, reset_backoff=True)
+
+    assert _ids(models) == _ids(cached)
+    assert service.last_source == "snapshot"
+    # The gate was bypassed, the round ran and failed (no candidates), so the
+    # operator-forced reset lands on a fresh streak of 1 instead of staying 4.
+    assert service._failure_streak == 1
+    assert service._next_retry_at is not None
+
+
+@pytest.mark.asyncio
+async def test_no_candidate_round_records_failure_and_gates_next_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _point_cache(monkeypatch, tmp_path)
+    _install_store(monkeypatch, _FakeAccountStore())
+    service = ModelDiscoveryService()
+
+    await service.get_models(force_refresh=True)
+
+    assert service._failure_streak == 1
+    assert service._next_retry_at is not None
+
+    with caplog.at_level(logging.DEBUG):
+        await service.get_models(force_refresh=True)
+
+    assert service._failure_streak == 1
+    assert "退避期" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_signer_timeout_falls_through_to_next_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
+
+    _point_cache(monkeypatch, tmp_path)
+    _install_store(monkeypatch, _FakeAccountStore())
+    monkeypatch.setattr(discovery_module, "_SIGNER_FETCH_TIMEOUT_SECONDS", 0.01)
+    first_auth = _write_auth(tmp_path / "auth-hang.json", sapisid="h", sid="h")
+    second_auth = _write_auth(tmp_path / "auth-ok.json", sapisid="o", sid="o")
+    expected = _models()
+
+    async def _hang(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        await asyncio.sleep(60)
+        raise AssertionError("timed-out signer must be cancelled")
+
+    async def _ok(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        return 200, _raw_models_payload(expected)
+
+    service = ModelDiscoveryService()
+    sessions = (
+        _signer_session(first_auth, _hang),
+        _signer_session(second_auth, _ok),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        models = await service.get_models(sessions=sessions, force_refresh=True)
+
+    assert _ids(models) == _ids(expected)
+    assert service.last_source == "live_signer"
+    assert service.last_error is None
+    assert "signer 请求超时" in caplog.text

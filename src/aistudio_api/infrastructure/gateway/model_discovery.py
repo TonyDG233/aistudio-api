@@ -43,6 +43,11 @@ BROWSER_USER_AGENT = (
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 MAX_HTTP_ACCOUNT_CANDIDATES = 2
 
+# One signer ListModels attempt must not hang the discovery round: the admin
+# refresh endpoint bounds the whole refresh, this bound lets a stuck transport
+# fall through to the next candidate instead of consuming the full 30s budget.
+_SIGNER_FETCH_TIMEOUT_SECONDS = 30.0
+
 # 防风控指数退避封顶 24h：连续失败时按 base=cache_ttl 翻倍，最多等 24h 再试，
 # 避免每轮被动调用都让多个候选反复撞同一个 Google 风控闸门。
 _FAILURE_BACKOFF_CAP_SECONDS = 86400.0
@@ -236,7 +241,7 @@ def _session_page(session: object | None) -> CDPPage | None:
 
 
 def _session_is_browserless(session: object | None) -> bool:
-    """Browserless sessions have no Page; they must use the HTTP path."""
+    """Browserless sessions have no Page; discovery uses their signer transport."""
     return (
         _session_engine(session) == "browserless"
         or type(session).__name__ == "BrowserlessSession"
@@ -640,12 +645,19 @@ def _snapshot_is_dirty(models: list[dict[str, object]]) -> bool:
     return any(_is_fake_model_id(model_id) for model_id in valid_ids)
 
 
-LIVE_SOURCES = frozenset({"live_page", "live_http"})
+LIVE_SOURCES = frozenset({"live_page", "live_signer", "live_http"})
+
+# Live sources whose success may slow the warmup loop to the long
+# ``live_refresh_interval_sec`` cadence.  The disk auth.json fallback
+# (``live_http``) keeps the shorter retry cadence.
+LIVE_REFRESH_SOURCES = frozenset({"live_page", "live_signer"})
 
 # A "truth" record is a real discovery result (live fetch or persisted live
 # snapshot), never the static cold-start fallback.  Routing uses this marker to
 # tell an authoritative live Free result apart from `_FALLBACK_MODELS`.
-DISCOVERY_TRUTH_SOURCES = frozenset({"live_page", "live_http", "snapshot"})
+DISCOVERY_TRUTH_SOURCES = frozenset(
+    {"live_page", "live_signer", "live_http", "snapshot"}
+)
 _DISCOVERY_SOURCE_KEY = "_discovery_source"
 
 
@@ -718,10 +730,16 @@ class ModelDiscoveryService:
     def model_count(self) -> int:
         return len(self._cached_models)
 
-    def reset_backoff(self) -> None:
-        """Clear the failed-round backoff so an operator can force a retry."""
-        self._failure_streak = 0
-        self._next_retry_at = None
+    def _ensure_fallback_cache(self, now: float) -> list[dict[str, object]]:
+        """A gated round must answer with the builtin catalog, never an empty list."""
+        if not self._cached_models:
+            self._cached_models = mark_discovery_source(
+                [dict(model) for model in _FALLBACK_MODELS], "fallback"
+            )
+            set_paid_models(self._cached_models)
+            self._last_fetched_at = now
+            self.last_source = "fallback"
+        return self._cached_models
 
     def _snapshot_path(self) -> Path:
         from aistudio_api.config import settings
@@ -787,12 +805,18 @@ class ModelDiscoveryService:
         self,
         *,
         force_refresh: bool = False,
+        reset_backoff: bool = False,
         cookies: dict[str, str] | None = None,
         auth_user: str = "0",
         session: Any | None = None,
         sessions: Any | None = None,
     ) -> list[dict[str, object]]:
-        """获取可用模型列表。"""
+        """获取可用模型列表。
+
+        ``reset_backoff`` is the operator-forced path: it clears the failed-round
+        gate under the service lock before attempting, so a manual refresh is
+        never silently short-circuited by the risk-control cooldown.
+        """
         if _ui_debug_active():
             from aistudio_api.api.ui_sandbox import sandbox_model_catalog
 
@@ -808,15 +832,21 @@ class ModelDiscoveryService:
         # Failure backoff gate: even a forced warmup/refresh must respect the
         # risk-control cooldown, so no passive caller can re-trigger a full
         # candidate fan-out while upstream is still rejecting ListModels.
-        if self._next_retry_at is not None and now < self._next_retry_at:
+        # The operator-forced reset bypasses it and clears state under the lock.
+        if not reset_backoff and (
+            self._next_retry_at is not None and now < self._next_retry_at
+        ):
             logger.debug(
                 "模型发现处于退避期，直接返回缓存 (source=%s, retry_in=%.0fs)",
                 self.last_source,
                 self._next_retry_at - now,
             )
-            return self._cached_models
+            return self._ensure_fallback_cache(now)
 
         async with self._lock:
+            if reset_backoff:
+                self._failure_streak = 0
+                self._next_retry_at = None
             # 双重检查
             if (
                 not force_refresh
@@ -825,7 +855,7 @@ class ModelDiscoveryService:
             ):
                 return self._cached_models
             if self._next_retry_at is not None and time.time() < self._next_retry_at:
-                return self._cached_models
+                return self._ensure_fallback_cache(time.time())
 
             # The attempt error is kept for honest logging when we fall back.
             self.last_error = None
@@ -923,29 +953,27 @@ class ModelDiscoveryService:
                     self.last_error or "no discovery credentials available"
                 )
 
-            attempted_any = False
             abort_round = False
 
             # 3a. 池会话 signer 通道：首个分类 403 立即终止本轮。
             for session_candidate in signer_sessions:
                 if not _session_is_alive(session_candidate):
-                    self.last_error = "live_http: browserless session is closed"
+                    self.last_error = "live_signer: browserless session is closed"
                     continue
-                attempted_any = True
                 try:
                     models = await self._fetch_via_signer(session_candidate)
-                    self._accept_live(models, source="live_http")
+                    self._accept_live(models, source="live_signer")
                     return models
                 except asyncio.CancelledError:
                     raise
                 except ListModelsHttpError as exc:
-                    self.last_error = f"live_http: {exc}"
+                    self.last_error = f"live_signer: {exc}"
                     self._log_fetch_error(exc, "browserless signer")
                     if exc.status == 403:
                         abort_round = True
                         break
                 except Exception as exc:
-                    self.last_error = f"live_http: {exc}"
+                    self.last_error = f"live_signer: {exc}"
                     logger.debug(
                         "signer 模型发现候选失败 (%s): %s",
                         type(session_candidate).__name__,
@@ -955,7 +983,6 @@ class ModelDiscoveryService:
             # 3b. 磁盘 auth.json 兜底：401/403/登录态失效只跳过当前账号。
             if not abort_round:
                 for candidate in http_candidates:
-                    attempted_any = True
                     try:
                         models = await self._fetch_via_http(
                             candidate.cookies,
@@ -991,8 +1018,10 @@ class ModelDiscoveryService:
                         total_candidates,
                         self.last_error or "unknown",
                     )
-            if attempted_any:
-                self._record_failure()
+            # Any round that produced no live result counts as a failed round,
+            # including "no credentials/candidates at all", so the exponential
+            # backoff also suppresses the endless every-round warning.
+            self._record_failure()
 
             # 4. 保底返回本地默认模型列表（仅冷启动；已有快照则保留快照来源）
             if not self._cached_models:
@@ -1305,7 +1334,18 @@ class ModelDiscoveryService:
         if not callable(sender):
             raise RuntimeError("browserless session has no signer transport")
         pending = sender(body="[]", url=LIST_MODELS_URL)
-        status, body = await cast("Any", pending)
+        try:
+            status, body = await asyncio.wait_for(
+                cast("Any", pending), timeout=_SIGNER_FETCH_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            logger.warning(
+                "模型发现 signer 请求超时 (%.0fs)",
+                _SIGNER_FETCH_TIMEOUT_SECONDS,
+            )
+            raise RuntimeError(
+                f"signer request timed out after {_SIGNER_FETCH_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
         text = (
             body.decode("utf-8", errors="replace")
             if isinstance(body, (bytes, bytearray))

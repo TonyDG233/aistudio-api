@@ -1328,6 +1328,24 @@ class UISandbox:
 
         return DEFAULT_TEXT_MODEL
 
+    def models_refresh_payload(self) -> dict[str, object]:
+        """Offline ``POST /api/models/refresh`` response for the settings button.
+
+        Deterministic per scenario so all three toast states can be exercised
+        without any network: default = live success, ``narrow_edge`` = stale
+        source warning, ``empty`` = failure carrying an ``error`` summary.
+        """
+        count = len(_SANDBOX_MODEL_CATALOG)
+        if self.scenario == "empty":
+            return {
+                "source": "fallback",
+                "model_count": count,
+                "error": "sandbox scenario: 无可用账号候选",
+            }
+        if self.scenario == "narrow_edge":
+            return {"source": "snapshot", "model_count": count}
+        return {"source": "live_signer", "model_count": count}
+
     def stats_payload(self, days: int | None = None) -> dict[str, object]:
         """Contract-shaped stats (all-time or ``days`` window) for ui_debug."""
         from aistudio_api.domain.model_access import is_paid_model

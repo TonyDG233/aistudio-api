@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
@@ -18,10 +19,11 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
 from aistudio_api.infrastructure.gateway.model_discovery import ModelDiscoveryService
 
 
-def test_live_page_source_uses_daily_interval() -> None:
+@pytest.mark.parametrize("source", ["live_page", "live_signer"])
+def test_live_sources_use_daily_interval(source: str) -> None:
     assert (
         app_module._model_warmup_interval_seconds(
-            "live_page",
+            source,
             {"live_refresh_interval_sec": 86400, "fallback_refresh_interval_sec": 600},
         )
         == 86400
@@ -179,6 +181,34 @@ async def test_warmup_cycles_never_use_ten_minute_live_loop(monkeypatch) -> None
 
     assert sleeps == [1234, 1234]
     assert 600 not in sleeps
+
+
+@pytest.mark.asyncio
+async def test_warmup_loop_survives_cycle_exception(caplog, monkeypatch) -> None:
+    sleeps: list[float] = []
+    calls: list[int] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_cycle(_state: RuntimeState, *, sleep: object) -> int:
+        del sleep
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_module, "_model_warmup_cycle", fake_cycle)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="aistudio.server"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await app_module._model_warmup_loop(RuntimeState(), sleep=fake_sleep)
+
+    assert len(calls) == 2
+    assert sleeps == [600]
+    assert any("预热循环异常" in record.getMessage() for record in caplog.records)
 
 
 def test_identical_consecutive_refresh_logs_only_one_info(caplog, monkeypatch) -> None:
