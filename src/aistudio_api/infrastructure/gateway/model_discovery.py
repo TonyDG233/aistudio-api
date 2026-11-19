@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from aistudio_api.infrastructure.browser.cdp_client import CDPPage
@@ -42,6 +42,42 @@ BROWSER_USER_AGENT = (
 )
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 MAX_HTTP_ACCOUNT_CANDIDATES = 2
+
+# 防风控指数退避封顶 24h：连续失败时按 base=cache_ttl 翻倍，最多等 24h 再试，
+# 避免每轮被动调用都让多个候选反复撞同一个 Google 风控闸门。
+_FAILURE_BACKOFF_CAP_SECONDS = 86400.0
+
+# ListModels 403 响应体分类（错误体形如 [7, "Region not supported."]，
+# 不包含 Cookie/请求头等敏感信息）。
+REGION_RESTRICTED = "region_restricted"
+VERIFICATION_REQUIRED = "verification_required"
+SERVICE_RESTRICTED = "service_restricted"
+UNKNOWN_403 = "unknown_403"
+
+
+class ListModelsHttpError(RuntimeError):
+    """Non-200 ListModels response carrying a bounded 403 classification."""
+
+    def __init__(self, status: int, category: str, summary: str) -> None:
+        self.status = status
+        self.category = category
+        self.summary = summary[:120]
+        super().__init__(f"ListModels HTTP status {status} [{category}] {self.summary}")
+
+
+def _error_snippet(text: str) -> str:
+    return " ".join(str(text or "").split())[:120]
+
+
+def _classify_list_models_error(text: str) -> str:
+    lowered = str(text or "").lower()
+    if "region not supported" in lowered or "available-regions" in lowered:
+        return REGION_RESTRICTED
+    if "verify-account" in lowered or "must be verified" in lowered:
+        return VERIFICATION_REQUIRED
+    if "servicerestricted" in lowered or "myaccount.google.com/restrictions" in lowered:
+        return SERVICE_RESTRICTED
+    return UNKNOWN_403
 
 
 def _ui_debug_active() -> bool:
@@ -670,11 +706,22 @@ class ModelDiscoveryService:
         self.last_source: str = "fallback"
         self.last_error: str | None = None
         self._last_refresh_info: str | None = None
+        self._failure_streak = 0
+        self._next_retry_at: float | None = None
         self._load_snapshot()
 
     @property
     def cache_ttl(self) -> int:
         return self._cache_ttl
+
+    @property
+    def model_count(self) -> int:
+        return len(self._cached_models)
+
+    def reset_backoff(self) -> None:
+        """Clear the failed-round backoff so an operator can force a retry."""
+        self._failure_streak = 0
+        self._next_retry_at = None
 
     def _snapshot_path(self) -> Path:
         from aistudio_api.config import settings
@@ -758,6 +805,17 @@ class ModelDiscoveryService:
         ):
             return self._cached_models
 
+        # Failure backoff gate: even a forced warmup/refresh must respect the
+        # risk-control cooldown, so no passive caller can re-trigger a full
+        # candidate fan-out while upstream is still rejecting ListModels.
+        if self._next_retry_at is not None and now < self._next_retry_at:
+            logger.debug(
+                "模型发现处于退避期，直接返回缓存 (source=%s, retry_in=%.0fs)",
+                self.last_source,
+                self._next_retry_at - now,
+            )
+            return self._cached_models
+
         async with self._lock:
             # 双重检查
             if (
@@ -766,13 +824,15 @@ class ModelDiscoveryService:
                 and (time.time() - self._last_fetched_at < self._cache_ttl)
             ):
                 return self._cached_models
+            if self._next_retry_at is not None and time.time() < self._next_retry_at:
+                return self._cached_models
 
             # The attempt error is kept for honest logging when we fall back.
             self.last_error = None
             cached_before = list(self._cached_models)
 
-            # 1. 汇总 HTTP 候选：调用方 Cookies → READY 池会话（paid 先）→
-            #    所有 enabled/未过期账号（paid 先、Free 后），按账号去重。
+            # 1. 汇总候选：调用方 Cookies → READY 池会话（paid 先）→
+            #    磁盘 auth.json 兜底（paid 先、Free 后），按账号去重。
             candidates: list[Any] = []
             if sessions is not None:
                 try:
@@ -782,6 +842,7 @@ class ModelDiscoveryService:
             elif session is not None:
                 candidates.append(session)
 
+            signer_sessions: list[Any] = []
             http_candidates: list[_HttpCandidate] = []
             seen_candidate_keys: set[str] = set()
 
@@ -804,8 +865,12 @@ class ModelDiscoveryService:
                     )
                 )
 
-            # 2. 浏览器页 XHR：browserless / 无 page 会话静默跳过（无 Page 不是错误）。
+            # 2. 浏览器页 XHR；browserless 会话改走 signer 通道（完整 Cookie
+            #    jar + Firefox 152 指纹），不再用裸 httpx 直连池会话。
             for candidate in candidates:
+                if _session_is_browserless(candidate):
+                    signer_sessions.append(candidate)
+                    continue
                 _add_http_candidate(
                     _HttpCandidate(
                         cookies=_session_cookies(candidate),
@@ -815,8 +880,6 @@ class ModelDiscoveryService:
                         auth_file=_session_auth_file(candidate),
                     )
                 )
-                if _session_is_browserless(candidate):
-                    continue
                 page = _session_page(candidate)
                 if page is None:
                     continue
@@ -855,32 +918,81 @@ class ModelDiscoveryService:
             for account_candidate in _account_http_candidates():
                 _add_http_candidate(account_candidate)
 
-            if not http_candidates:
+            if not http_candidates and not signer_sessions:
                 self.last_error = (
                     self.last_error or "no discovery credentials available"
                 )
 
-            # 3. HTTP 协议拉取：逐个候选尝试，401/403/登录态失效只跳过当前账号。
-            for candidate in http_candidates:
+            attempted_any = False
+            abort_round = False
+
+            # 3a. 池会话 signer 通道：首个分类 403 立即终止本轮。
+            for session_candidate in signer_sessions:
+                if not _session_is_alive(session_candidate):
+                    self.last_error = "live_http: browserless session is closed"
+                    continue
+                attempted_any = True
                 try:
-                    models = await self._fetch_via_http(
-                        candidate.cookies,
-                        candidate.auth_user,
-                        tier=candidate.tier,
-                    )
+                    models = await self._fetch_via_signer(session_candidate)
                     self._accept_live(models, source="live_http")
                     return models
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
-                    self.last_error = f"live_http: {e}"
-                    logger.debug("HTTP 模型发现候选失败 (%s): %s", candidate.label, e)
-            if http_candidates:
-                logger.warning(
-                    "所有 HTTP 模型发现候选均失败 (%d 个): %s",
-                    len(http_candidates),
-                    self.last_error or "unknown",
-                )
+                except ListModelsHttpError as exc:
+                    self.last_error = f"live_http: {exc}"
+                    self._log_fetch_error(exc, "browserless signer")
+                    if exc.status == 403:
+                        abort_round = True
+                        break
+                except Exception as exc:
+                    self.last_error = f"live_http: {exc}"
+                    logger.debug(
+                        "signer 模型发现候选失败 (%s): %s",
+                        type(session_candidate).__name__,
+                        exc,
+                    )
+
+            # 3b. 磁盘 auth.json 兜底：401/403/登录态失效只跳过当前账号。
+            if not abort_round:
+                for candidate in http_candidates:
+                    attempted_any = True
+                    try:
+                        models = await self._fetch_via_http(
+                            candidate.cookies,
+                            candidate.auth_user,
+                            tier=candidate.tier,
+                        )
+                        self._accept_live(models, source="live_http")
+                        return models
+                    except asyncio.CancelledError:
+                        raise
+                    except ListModelsHttpError as exc:
+                        self.last_error = f"live_http: {exc}"
+                        self._log_fetch_error(exc, candidate.label)
+                        if exc.status == 403:
+                            abort_round = True
+                            break
+                    except Exception as exc:
+                        self.last_error = f"live_http: {exc}"
+                        logger.debug(
+                            "HTTP 模型发现候选失败 (%s): %s", candidate.label, exc
+                        )
+
+            total_candidates = len(signer_sessions) + len(http_candidates)
+            if total_candidates:
+                if abort_round:
+                    logger.warning(
+                        "模型发现本轮首个 403 即停，未继续尝试其余候选: %s",
+                        self.last_error or "unknown",
+                    )
+                else:
+                    logger.warning(
+                        "所有模型发现候选均失败 (%d 个): %s",
+                        total_candidates,
+                        self.last_error or "unknown",
+                    )
+            if attempted_any:
+                self._record_failure()
 
             # 4. 保底返回本地默认模型列表（仅冷启动；已有快照则保留快照来源）
             if not self._cached_models:
@@ -942,9 +1054,33 @@ class ModelDiscoveryService:
         self._last_fetched_at = time.time()
         self.last_source = source
         self.last_error = None
+        self._failure_streak = 0
+        self._next_retry_at = None
         self._log_refresh_summary(
             source=source, models=self._cached_models, changed=changed
         )
+
+    def _record_failure(self, now: float | None = None) -> None:
+        """Advance the exponential risk-control backoff after a failed round."""
+        self._failure_streak += 1
+        # Cap the exponent before float math so a long outage never overflows.
+        exponent = min(self._failure_streak - 1, 20)
+        delay = min(
+            float(self._cache_ttl) * (2**exponent),
+            _FAILURE_BACKOFF_CAP_SECONDS,
+        )
+        self._next_retry_at = (now if now is not None else time.time()) + delay
+
+    def _log_fetch_error(self, exc: ListModelsHttpError, label: str) -> None:
+        if exc.status == 403:
+            logger.warning(
+                "模型发现 ListModels 403 分类=%s (%s): %s",
+                exc.category,
+                label,
+                exc.summary,
+            )
+        else:
+            logger.debug("模型发现候选失败 (%s): %s", label, exc)
 
     async def get_model_by_id(
         self,
@@ -1158,6 +1294,39 @@ class ModelDiscoveryService:
             raise RuntimeError("ListModels XHR returned no parseable models")
         return models
 
+    async def _fetch_via_signer(self, session: Any) -> list[dict[str, object]]:
+        """Fetch ListModels through the browserless session's signer transport.
+
+        Reuses ``BrowserlessSession.send_hooked_request`` so the request carries
+        the signer's complete cookie jar, Firefox 152 fingerprint, server-issued
+        visit-id/ext headers and proxy egress instead of a naked httpx client.
+        """
+        sender = getattr(session, "send_hooked_request", None)
+        if not callable(sender):
+            raise RuntimeError("browserless session has no signer transport")
+        pending = sender(body="[]", url=LIST_MODELS_URL)
+        status, body = await cast("Any", pending)
+        text = (
+            body.decode("utf-8", errors="replace")
+            if isinstance(body, (bytes, bytearray))
+            else str(body or "")
+        )
+        if status != 200:
+            snippet = text[:512]
+            raise ListModelsHttpError(
+                status,
+                _classify_list_models_error(snippet),
+                _error_snippet(snippet),
+            )
+        try:
+            raw_data = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("ListModels signer returned non-JSON") from exc
+        models = self._parse_raw_models(raw_data)
+        if not models:
+            raise RuntimeError("ListModels signer returned no parseable models")
+        return models
+
     async def _fetch_via_http(
         self,
         cookies: dict[str, str],
@@ -1165,7 +1334,7 @@ class ModelDiscoveryService:
         *,
         tier: str = "Free",
     ) -> list[dict[str, object]]:
-        """通过 HTTP 客户端携带 SAPISIDHASH 拉取。"""
+        """通过 HTTP 客户端携带 SAPISIDHASH 拉取（无 READY 会话时的兜底）。"""
         import httpx
 
         minimal_cookies = filter_minimal_cookies(cookies)
@@ -1200,7 +1369,15 @@ class ModelDiscoveryService:
         async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
             resp = await client.post(url, headers=headers, content="[]")
             if resp.status_code != 200:
-                raise RuntimeError(f"ListModels HTTP status {resp.status_code}")
+                try:
+                    snippet = resp.text[:512]
+                except Exception:
+                    snippet = ""
+                raise ListModelsHttpError(
+                    resp.status_code,
+                    _classify_list_models_error(snippet),
+                    _error_snippet(snippet),
+                )
             models = self._parse_raw_models(resp.json())
             if not models:
                 raise RuntimeError("ListModels HTTP returned no parseable models")

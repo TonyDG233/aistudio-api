@@ -613,7 +613,15 @@ async def lifespan(_app: FastAPI):
             except Exception as exc:
                 logger.debug("模型发现预热前实例启动失败: %s", exc)
         while True:
-            await _model_warmup_cycle(runtime_state)
+            try:
+                await _model_warmup_cycle(runtime_state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never let one bad cycle kill the warmup task silently; the
+                # discovery backoff gate already blocks network retries.
+                logger.warning("模型发现预热循环异常，继续下一轮: %s", exc)
+                await asyncio.sleep(_model_warmup_interval_seconds("fallback"))
 
     model_warmup_task = asyncio.create_task(_model_warmup())
 

@@ -7,6 +7,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -14,7 +15,12 @@ from aistudio_api.config import settings
 from aistudio_api.infrastructure.account import account_store as account_store_module
 from aistudio_api.infrastructure.gateway.model_discovery import (
     _FALLBACK_MODELS,
+    REGION_RESTRICTED,
+    SERVICE_RESTRICTED,
+    UNKNOWN_403,
+    VERIFICATION_REQUIRED,
     ModelDiscoveryService,
+    _classify_list_models_error,
 )
 
 
@@ -52,7 +58,9 @@ def _write_auth(path: Path, *, sapisid: str, sid: str) -> Path:
     return path
 
 
-def _browserless_session(auth_file: Path, *, tier: str = "Free") -> SimpleNamespace:
+def _browserless_session(
+    auth_file: Path, *, tier: str = "Free", sender: object | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         engine="browserless",
         page=None,
@@ -66,7 +74,28 @@ def _browserless_session(auth_file: Path, *, tier: str = "Free") -> SimpleNamesp
         get_current_auth_user=lambda: "0",
         get_current_tier=lambda: tier,
         is_alive=lambda: True,
+        send_hooked_request=sender,
     )
+
+
+def _signer_session(
+    auth_file: Path, sender: object, *, tier: str = "Free"
+) -> SimpleNamespace:
+    return _browserless_session(auth_file, tier=tier, sender=sender)
+
+
+def _raw_models_payload(models: list[dict[str, object]]) -> bytes:
+    items: list[list[object]] = []
+    for model in models:
+        item: list[object] = [None] * 84
+        item[0] = f"models/{model['id']}"
+        item[3] = str(model.get("displayName") or model["id"])
+        item[4] = ""
+        item[5] = 1
+        item[6] = 1
+        item[7] = ["generateContent"]
+        items.append(item)
+    return json.dumps([items]).encode("utf-8")
 
 
 def _account(
@@ -102,7 +131,7 @@ def _point_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return cache_path
 
 
-def _install_store(monkeypatch: pytest.MonkeyPatch, store: _FakeAccountStore) -> None:
+def _install_store(monkeypatch: pytest.MonkeyPatch, store: object) -> None:
     monkeypatch.setattr(
         account_store_module, "AccountStore", lambda *args, **kwargs: store
     )
@@ -122,26 +151,28 @@ def _write_snapshot(path: Path, models: list[dict[str, object]]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_browserless_skips_page_xhr_and_never_logs_no_page(
+async def test_browserless_uses_signer_transport_and_never_touches_a_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _point_cache(monkeypatch, tmp_path)
     _install_store(monkeypatch, _FakeAccountStore())
     auth_file = _write_auth(tmp_path / "auth-a.json", sapisid="a", sid="a")
-    session = _browserless_session(auth_file)
-    service = ModelDiscoveryService()
     expected = _models()
+    seen: dict[str, object] = {}
+
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        seen["body"] = body
+        seen["url"] = url
+        return 200, _raw_models_payload(expected)
+
+    session = _signer_session(auth_file, _sender)
+    service = ModelDiscoveryService()
 
     async def _page_path(*args: object, **kwargs: object) -> list[dict[str, object]]:
         raise AssertionError("page/XHR path must not run for browserless sessions")
 
-    async def _http_path(
-        cookies: dict[str, str], auth_user: str, *, tier: str = "Free"
-    ) -> list[dict[str, object]]:
-        assert cookies["SAPISID"] == "sapisid-auth-a"
-        assert auth_user == "0"
-        assert tier == "Free"
-        return expected
+    async def _http_path(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        raise AssertionError("naked httpx must not run for browserless sessions")
 
     monkeypatch.setattr(service, "_fetch_via_page", _page_path)
     monkeypatch.setattr(service, "_fetch_via_http", _http_path)
@@ -151,18 +182,27 @@ async def test_browserless_skips_page_xhr_and_never_logs_no_page(
 
     assert _ids(models) == _ids(expected)
     assert service.last_source == "live_http"
+    assert seen["body"] == "[]"
+    assert str(seen["url"]).endswith("ListModels")
     assert "no page" not in caplog.text
     assert "browserless session has no page" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_http_candidates_skip_401_and_use_next_healthy_account(
+async def test_signer_401_falls_back_to_next_healthy_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _point_cache(monkeypatch, tmp_path)
     bad_auth = _write_auth(tmp_path / "auth-bad.json", sapisid="bad", sid="bad")
     good_auth = _write_auth(tmp_path / "auth-good.json", sapisid="good", sid="good")
-    session = _browserless_session(bad_auth)
+    signer_calls: list[int] = []
+
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        signer_calls.append(1)
+        return 401, b"unauthorized"
+
+    session = _signer_session(bad_auth, _sender)
     account = _account("acc_good", tier="Pro")
     _install_store(
         monkeypatch,
@@ -179,9 +219,6 @@ async def test_http_candidates_skip_401_and_use_next_healthy_account(
         cookies: dict[str, str], auth_user: str, *, tier: str = "Free"
     ) -> list[dict[str, object]]:
         calls.append(cookies["SAPISID"])
-        if cookies["SAPISID"] == "sapisid-auth-bad":
-            raise RuntimeError("ListModels HTTP status 401")
-        assert cookies["SAPISID"] == "good"
         assert auth_user == "0"
         assert tier == "Pro"
         return expected
@@ -190,7 +227,8 @@ async def test_http_candidates_skip_401_and_use_next_healthy_account(
 
     models = await service.get_models(sessions=(session,), force_refresh=True)
 
-    assert calls == ["sapisid-auth-bad", "good"]
+    assert signer_calls == [1]
+    assert calls == ["good"]
     assert _ids(models) == _ids(expected)
     assert service.last_source == "live_http"
     assert service.last_error is None
@@ -203,16 +241,14 @@ async def test_live_http_success_atomically_writes_cache(
     cache_path = _point_cache(monkeypatch, tmp_path)
     _install_store(monkeypatch, _FakeAccountStore())
     auth_file = _write_auth(tmp_path / "auth-write.json", sapisid="write", sid="write")
-    session = _browserless_session(auth_file)
     service = ModelDiscoveryService()
     expected = _models(7)
 
-    async def _http_path(
-        cookies: dict[str, str], auth_user: str, *, tier: str = "Free"
-    ) -> list[dict[str, object]]:
-        return expected
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        return 200, _raw_models_payload(expected)
 
-    monkeypatch.setattr(service, "_fetch_via_http", _http_path)
+    session = _signer_session(auth_file, _sender)
 
     await service.get_models(sessions=(session,), force_refresh=True)
 
@@ -388,7 +424,14 @@ async def test_all_candidates_fail_keeps_previous_valid_cache(
     _write_snapshot(cache_path, previous)
     auth_bad = _write_auth(tmp_path / "auth-x.json", sapisid="x", sid="x")
     auth_other = _write_auth(tmp_path / "auth-y.json", sapisid="y", sid="y")
-    session = _browserless_session(auth_bad)
+    signer_calls: list[int] = []
+
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        signer_calls.append(1)
+        return 401, b"unauthorized"
+
+    session = _signer_session(auth_bad, _sender)
     account = _account("acc_other", tier="Ultra")
     _install_store(
         monkeypatch,
@@ -412,8 +455,167 @@ async def test_all_candidates_fail_keeps_previous_valid_cache(
 
     models = await service.get_models(sessions=(session,), force_refresh=True)
 
-    assert len(attempts) == 2
+    assert signer_calls == [1]
+    assert len(attempts) == 1
     assert _ids(models) == _ids(previous)
     assert service.last_source == "snapshot"
     assert "401" in (service.last_error or "")
+    assert service._failure_streak == 1
+    assert service._next_retry_at is not None
     assert cache_path.read_text(encoding="utf-8") == cache_before
+
+
+def test_failure_backoff_grows_exponentially_and_caps_at_one_day() -> None:
+    service = ModelDiscoveryService()
+    service._record_failure(now=100.0)
+    assert service._failure_streak == 1
+    assert service._next_retry_at == pytest.approx(100.0 + service.cache_ttl)
+
+    service._record_failure(now=100.0)
+    assert service._failure_streak == 2
+    assert service._next_retry_at == pytest.approx(100.0 + service.cache_ttl * 2)
+
+    for _ in range(28):
+        service._record_failure(now=100.0)
+    assert service._failure_streak == 30
+    assert service._next_retry_at == pytest.approx(100.0 + 86400.0)
+
+
+@pytest.mark.asyncio
+async def test_backoff_gate_returns_cache_without_any_network_even_when_forced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cache_path = _point_cache(monkeypatch, tmp_path)
+    cached = _models(6)
+    _write_snapshot(cache_path, cached)
+
+    class _BombStore:
+        def list_accounts(self) -> list[object]:
+            raise AssertionError("backoff gate must not read accounts")
+
+    _install_store(monkeypatch, _BombStore())
+    auth_file = _write_auth(tmp_path / "auth-gate.json", sapisid="g", sid="g")
+
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        raise AssertionError("backoff gate must not call the signer")
+
+    session = _signer_session(auth_file, _sender)
+    service = ModelDiscoveryService()
+    assert _ids(service._cached_models) == _ids(cached)
+    service._failure_streak = 3
+    service._next_retry_at = time.time() + 3600.0
+
+    with caplog.at_level(logging.DEBUG):
+        models = await service.get_models(sessions=(session,), force_refresh=True)
+
+    assert _ids(models) == _ids(cached)
+    assert "退避期" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_classified_403_stops_round_before_next_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_cache(monkeypatch, tmp_path)
+    _install_store(monkeypatch, _FakeAccountStore())
+    first_auth = _write_auth(tmp_path / "auth-1.json", sapisid="1", sid="1")
+    second_auth = _write_auth(tmp_path / "auth-2.json", sapisid="2", sid="2")
+    calls: list[str] = []
+
+    async def _first_sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        calls.append("first")
+        return 403, b'[7,"Region not supported."]'
+
+    async def _second_sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        calls.append("second")
+        return 200, _raw_models_payload(_models())
+
+    service = ModelDiscoveryService()
+    sessions = (
+        _signer_session(first_auth, _first_sender),
+        _signer_session(second_auth, _second_sender),
+    )
+
+    models = await service.get_models(sessions=sessions, force_refresh=True)
+
+    assert calls == ["first"]
+    assert service.last_source == "fallback"
+    assert REGION_RESTRICTED in (service.last_error or "")
+    assert service._failure_streak == 1
+    assert len(models) >= 30
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('[7,"Region not supported."]', REGION_RESTRICTED),
+        ('{"error":"see available-regions"}', REGION_RESTRICTED),
+        ("https://accounts.google.com/signin/verify-account", VERIFICATION_REQUIRED),
+        ("account must be verified", VERIFICATION_REQUIRED),
+        ("servicerestricted", SERVICE_RESTRICTED),
+        ("https://myaccount.google.com/restrictions", SERVICE_RESTRICTED),
+        ("unexpected failure", UNKNOWN_403),
+    ],
+)
+def test_classify_list_models_403_body(body: str, expected: str) -> None:
+    assert _classify_list_models_error(body) == expected
+
+
+@pytest.mark.asyncio
+async def test_manual_refresh_endpoint_resets_backoff_and_forces_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aistudio_api.api import routes_system
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    seen: dict[str, object] = {}
+
+    async def _fake_get_models(**kwargs: object) -> list[dict[str, object]]:
+        seen.update(kwargs)
+        seen["streak"] = model_discovery._failure_streak
+        seen["next_retry_at"] = model_discovery._next_retry_at
+        return [{"id": "model-a"}, {"id": "model-b"}]
+
+    monkeypatch.setattr(model_discovery, "get_models", _fake_get_models)
+    monkeypatch.setattr(model_discovery, "_failure_streak", 4)
+    monkeypatch.setattr(model_discovery, "_next_retry_at", time.time() + 3600.0)
+    monkeypatch.setattr(model_discovery, "last_source", "fallback")
+    monkeypatch.setattr(model_discovery, "last_error", None)
+
+    result = await routes_system.refresh_models(
+        runtime_state=cast(Any, SimpleNamespace(instance_manager=None))
+    )
+
+    assert seen["force_refresh"] is True
+    assert seen["sessions"] == ()
+    assert seen["streak"] == 0
+    assert seen["next_retry_at"] is None
+    assert result == {"source": "fallback", "model_count": 2}
+
+
+@pytest.mark.asyncio
+async def test_success_clears_backoff_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_cache(monkeypatch, tmp_path)
+    _install_store(monkeypatch, _FakeAccountStore())
+    auth_file = _write_auth(tmp_path / "auth-ok.json", sapisid="ok", sid="ok")
+    expected = _models()
+
+    async def _sender(*, body: str, url: str) -> tuple[int, bytes]:
+        del body, url
+        return 200, _raw_models_payload(expected)
+
+    service = ModelDiscoveryService()
+    service._failure_streak = 5
+    service._next_retry_at = 0.0
+
+    models = await service.get_models(
+        sessions=(_signer_session(auth_file, _sender),), force_refresh=True
+    )
+
+    assert _ids(models) == _ids(expected)
+    assert service._failure_streak == 0
+    assert service._next_retry_at is None
