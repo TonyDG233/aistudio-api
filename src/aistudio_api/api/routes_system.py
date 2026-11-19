@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
 from pathlib import Path
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 
 public_router = APIRouter()
 protected_router = APIRouter()
+
+_MODEL_REFRESH_TIMEOUT_SECONDS = 30.0
 
 
 def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
@@ -348,6 +351,45 @@ async def engine_health_check(
     payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
     payload.setdefault("error", None)
     return payload
+
+
+@protected_router.post("/api/models/refresh")
+async def refresh_models(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """Force one bounded ListModels refresh for the admin console.
+
+    Management-only (web password) so the API-key model routes stay read-only.
+    The failed-round backoff gate is cleared first, letting an operator retry
+    immediately after the upstream risk signal clears.
+    """
+    from aistudio_api.api.state import discovery_sessions_for
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    model_discovery.reset_backoff()
+    sessions = discovery_sessions_for(runtime_state)
+    try:
+        models = await asyncio.wait_for(
+            model_discovery.get_models(sessions=sessions, force_refresh=True),
+            timeout=_MODEL_REFRESH_TIMEOUT_SECONDS,
+        )
+        error = model_discovery.last_error
+        count = len(models)
+    except TimeoutError:
+        error = f"模型发现刷新超时 (>{_MODEL_REFRESH_TIMEOUT_SECONDS:.0f}s)"
+        count = model_discovery.model_count
+        logger.warning(error)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        count = model_discovery.model_count
+        logger.warning("模型发现手动刷新失败: %s", exc)
+    result: dict[str, object] = {
+        "source": model_discovery.last_source,
+        "model_count": count,
+    }
+    if error:
+        result["error"] = error
+    return result
 
 
 @protected_router.post("/config/waa/health-check")

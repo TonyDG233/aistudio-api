@@ -137,17 +137,23 @@ def _isolated_discovery(tmp_path, monkeypatch):
         discovery_module.model_discovery._last_fetched_at,
         discovery_module.model_discovery.last_source,
         discovery_module.model_discovery.last_error,
+        discovery_module.model_discovery._failure_streak,
+        discovery_module.model_discovery._next_retry_at,
     )
     discovery_module.model_discovery._cached_models = []
     discovery_module.model_discovery._last_fetched_at = 0.0
     discovery_module.model_discovery.last_source = "fallback"
     discovery_module.model_discovery.last_error = None
+    discovery_module.model_discovery._failure_streak = 0
+    discovery_module.model_discovery._next_retry_at = None
     yield
     (
         discovery_module.model_discovery._cached_models,
         discovery_module.model_discovery._last_fetched_at,
         discovery_module.model_discovery.last_source,
         discovery_module.model_discovery.last_error,
+        discovery_module.model_discovery._failure_streak,
+        discovery_module.model_discovery._next_retry_at,
     ) = saved
     clear_paid_models()
 
@@ -434,6 +440,7 @@ async def test_browserless_discovery_never_touches_a_page(
         encoding="utf-8",
     )
     page_access: list[int] = []
+    raw = [[_raw_model("gemini-9-free-demo", access_tier=1)]]
 
     class _BrowserlessSession:
         engine = "browserless"
@@ -447,14 +454,23 @@ async def test_browserless_discovery_never_touches_a_page(
             page_access.append(1)
             raise AssertionError("browserless page must never be touched")
 
+        async def send_hooked_request(
+            self, *, body: str, url: str
+        ) -> tuple[int, bytes]:
+            del body, url
+            return 200, json.dumps(raw).encode("utf-8")
+
     service = ModelDiscoveryService()
     page_fetch = AsyncMock(side_effect=AssertionError("live_page must not run"))
-    http_fetch = AsyncMock(return_value=[])
+    http_fetch = AsyncMock(side_effect=AssertionError("naked httpx must not run"))
     monkeypatch.setattr(service, "_fetch_via_page", page_fetch)
     monkeypatch.setattr(service, "_fetch_via_http", http_fetch)
 
-    await service.get_models(force_refresh=True, sessions=[_BrowserlessSession()])
+    models = await service.get_models(
+        force_refresh=True, sessions=[_BrowserlessSession()]
+    )
 
+    assert [model["id"] for model in models] == ["gemini-9-free-demo"]
     assert page_access == []
     assert page_fetch.await_count == 0
-    assert http_fetch.await_count >= 1
+    assert http_fetch.await_count == 0
