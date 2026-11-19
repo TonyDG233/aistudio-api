@@ -349,7 +349,7 @@
         },
         "model_discovery": {
           "type": "object",
-          "description": "模型发现刷新节奏：live_page 成功用长间隔，其他来源用短重试间隔。",
+          "description": "模型发现刷新节奏：真实页面（live_page）与 signer 通道（live_signer）成功走每日长间隔，其他来源走短重试间隔。",
           "properties": {
             "live_refresh_interval_sec": {
               "type": "integer",
