@@ -479,9 +479,7 @@ async def test_browserless_discovery_never_touches_a_page(
 
     service = ModelDiscoveryService()
     page_fetch = AsyncMock(side_effect=AssertionError("live_page must not run"))
-    http_fetch = AsyncMock(side_effect=AssertionError("naked httpx must not run"))
     monkeypatch.setattr(service, "_fetch_via_page", page_fetch)
-    monkeypatch.setattr(service, "_fetch_via_http", http_fetch)
 
     models = await service.get_models(
         force_refresh=True, sessions=[_BrowserlessSession()]
@@ -490,4 +488,4 @@ async def test_browserless_discovery_never_touches_a_page(
     assert [model["id"] for model in models] == ["gemini-9-free-demo"]
     assert page_access == []
     assert page_fetch.await_count == 0
-    assert http_fetch.await_count == 0
+    assert not hasattr(ModelDiscoveryService, "_fetch_via_http")

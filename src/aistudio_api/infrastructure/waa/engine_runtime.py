@@ -34,6 +34,9 @@ from aistudio_api.infrastructure.waa.signer_client import (
 
 log = get_logger("engine-runtime")
 
+# Process-wide once-only guard for the direct_http risk warning.
+_direct_http_warned = False
+
 
 @dataclass
 class SessionBuild:
@@ -131,8 +134,10 @@ class BrowserlessEngineRuntime:
         signer_client: SignerClient | None = None,
         daemon: LocalSignerDaemon | None = None,
     ) -> None:
-        signer = engine_settings.get("signer")
-        transport = engine_settings.get("transport")
+        browserless = engine_settings.get("browserless")
+        block = dict(browserless) if isinstance(browserless, dict) else {}
+        signer = block.get("signer")
+        transport = block.get("transport")
         self._signer_settings = dict(signer) if isinstance(signer, dict) else {}
         self._transport_settings = (
             dict(transport) if isinstance(transport, dict) else {}
@@ -192,7 +197,7 @@ class BrowserlessEngineRuntime:
             locale=str(self._signer_settings.get("locale") or settings.locale),
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             max_workers=int(self._signer_settings.get("max_workers", 8) or 8),
-            idle_ttl_s=float(self._signer_settings.get("idle_ttl_s", 900) or 900),
+            idle_ttl_s=float(self._signer_settings.get("idle_ttl_s", 3600) or 3600),
             proxy=settings.proxy_url,
         )
         return self._daemon
@@ -206,6 +211,14 @@ class BrowserlessEngineRuntime:
                 "[engine] 使用远程 waa-signer endpoint=%s；本地进程不会作为静默回退",
                 self._endpoint(),
             )
+        if str(self._transport_settings.get("mode") or "signer_rpc") == "direct_http":
+            global _direct_http_warned
+            if not _direct_http_warned:
+                _direct_http_warned = True
+                log.warning(
+                    "[engine] transport.mode=direct_http：使用 Python TLS 裸直连降级，"
+                    "存在浏览器指纹暴露与上游风控风险，建议改用 signer_rpc"
+                )
         try:
             health = await client.health()
         except SignerError as exc:

@@ -444,7 +444,7 @@ async def test_models_refresh_uses_sandbox_payload_only_in_ui_debug(monkeypatch)
         del kwargs
         return [{"id": "real-a"}]
 
-    monkeypatch.setattr(discovery_module.model_discovery, "last_source", "live_http")
+    monkeypatch.setattr(discovery_module.model_discovery, "last_source", "live_signer")
     monkeypatch.setattr(discovery_module.model_discovery, "last_error", None)
     monkeypatch.setattr(
         discovery_module.model_discovery, "get_models", _fake_get_models
@@ -455,4 +455,4 @@ async def test_models_refresh_uses_sandbox_payload_only_in_ui_debug(monkeypatch)
     )
 
     assert sandbox_calls == [1]
-    assert prod_result == {"source": "live_http", "model_count": 1}
+    assert prod_result == {"source": "live_signer", "model_count": 1}

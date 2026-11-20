@@ -113,7 +113,7 @@
                 "idle_ttl_s": {
                   "type": "number",
                   "minimum": 1,
-                  "default": 900
+                  "default": 3600
                 },
                 "locale": { "type": "string", "default": "en-US" },
                 "timezone": {

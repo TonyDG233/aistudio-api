@@ -43,8 +43,9 @@ const signerVersion = "2.1.4"
 const (
 	// defaultMaxWorkers 是同时存活的 WAA Worker 数量上限
 	defaultMaxWorkers = 8
-	// defaultIdleTTL 是空闲 Worker 被后台回收前的保留时长
-	defaultIdleTTL = 900 * time.Second
+	// defaultIdleTTL 是空闲 Worker 被后台回收前的保留时长。
+	// 延长保温可降低冷启动风暴频率；max_workers 上调需先实测每 Worker RSS。
+	defaultIdleTTL = 3600 * time.Second
 	// maxSetCookieHeaderBytes 限制 X-WAA-Set-Cookies 响应头大小，超限时只返回截断标记
 	maxSetCookieHeaderBytes = 32 * 1024
 	// maxRPCBodyBytes 限制 /v1/rpc/send 请求体大小，阻断超大请求拖垮进程
@@ -896,7 +897,7 @@ func discoverProxy() string {
 	return ""
 }
 
-const defaultFallbackDNSServers = "8.8.8.8:53,1.1.1.1:53,223.5.5.5:53"
+const defaultFallbackDNSServers = "8.8.8.8:53,1.1.1.1:53"
 
 var androidCACertDirs = []string{
 	"/apex/com.android.conscrypt/cacerts",
@@ -1159,7 +1160,7 @@ func main() {
 	timezone := flag.String("timezone", defaultTZ, "Browser profile IANA timezone")
 	dnsFlag := flag.String("dns", defaultDNS, "Comma/whitespace-separated DNS servers (host or host:port)")
 	maxWorkers := flag.Int("max-workers", envInt("WAA_MAX_WORKERS", defaultMaxWorkers), "Maximum concurrent WAA workers")
-	idleTTL := flag.Duration("idle-ttl", envDuration("WAA_IDLE_TTL", defaultIdleTTL), "Idle worker TTL before reclamation (e.g. 900s)")
+	idleTTL := flag.Duration("idle-ttl", envDuration("WAA_IDLE_TTL", defaultIdleTTL), "Idle worker TTL before reclamation (e.g. 3600s)")
 	flag.Parse()
 
 	configureRuntimeNetwork(*dnsFlag)

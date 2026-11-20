@@ -66,15 +66,18 @@ def _browserless_settings(
 ) -> dict[str, object]:
     return {
         "mode": "browserless",
-        "signer": {
-            "mode": mode,
-            "endpoint": endpoint,
-            "binary_path": "waa-signer/bin/waa-signer",
-            "auto_start": True,
-            "max_workers": 8,
-            "request_timeout_s": 300,
+        "browserless": {
+            "signer": {
+                "mode": mode,
+                "endpoint": endpoint,
+                "binary_path": "waa-signer/bin/waa-signer",
+                "auto_start": True,
+                "max_workers": 8,
+                "idle_ttl_s": 3600,
+                "request_timeout_s": 300,
+            },
+            "transport": {"mode": "signer_rpc", "read_timeout_s": 300},
         },
-        "transport": {"mode": "signer_rpc", "read_timeout_s": 300},
     }
 
 
@@ -92,7 +95,7 @@ async def test_browserless_runtime_defaults_to_300s_timeouts(
 
     monkeypatch.setattr(engine_runtime_module, "SignerClient", _CapturingSigner)
     runtime = BrowserlessEngineRuntime(
-        {"mode": "browserless", "signer": {}, "transport": {}}
+        {"mode": "browserless", "browserless": {"signer": {}, "transport": {}}}
     )
 
     build = await runtime.create_session(
@@ -136,8 +139,10 @@ async def test_browserless_runtime_read_timeout_never_below_request_timeout(
     runtime = BrowserlessEngineRuntime(
         {
             "mode": "browserless",
-            "signer": {"request_timeout_s": request_timeout_s},
-            "transport": {"read_timeout_s": read_timeout_s},
+            "browserless": {
+                "signer": {"request_timeout_s": request_timeout_s},
+                "transport": {"read_timeout_s": read_timeout_s},
+            },
         }
     )
 
@@ -190,6 +195,73 @@ async def test_browserless_remote_mode_runs_without_local_daemon(caplog) -> None
     assert health.ready is True
     assert daemon.starts == 0
     assert any("远程 waa-signer" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_direct_http_transport_warns_once_per_process(
+    caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_runtime_module, "_direct_http_warned", False)
+    settings = _browserless_settings()
+    settings["browserless"]["transport"] = {  # type: ignore[index]
+        "mode": "direct_http",
+        "read_timeout_s": 300,
+    }
+    signer = FakeSigner()
+    first = BrowserlessEngineRuntime(
+        settings,
+        signer_client=cast(Any, signer),
+        daemon=cast(Any, FakeDaemon()),
+    )
+    second = BrowserlessEngineRuntime(
+        settings,
+        signer_client=cast(Any, signer),
+        daemon=cast(Any, FakeDaemon()),
+    )
+    with caplog.at_level("WARNING"):
+        await first.preflight()
+        await second.preflight()
+
+    warnings = [record for record in caplog.records if "direct_http" in record.message]
+    assert len(warnings) == 1
+    assert "signer_rpc" in warnings[0].message
+
+
+@pytest.mark.asyncio
+async def test_normalized_engine_settings_reach_daemon_and_direct_http_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        validate_engine_settings,
+    )
+
+    normalized = validate_engine_settings(
+        {
+            "mode": "browserless",
+            "browserless": {
+                "signer": {"auto_start": True, "idle_ttl_s": 3600},
+                "transport": {"mode": "direct_http", "read_timeout_s": 300},
+            },
+        }
+    )
+    monkeypatch.setattr(engine_runtime_module, "_direct_http_warned", False)
+    runtime = BrowserlessEngineRuntime(
+        normalized, signer_client=cast(Any, FakeSigner())
+    )
+
+    daemon = runtime._ensure_daemon()
+    assert daemon is not None
+    assert daemon.idle_ttl_s == 3600.0
+    command = daemon._command()
+    assert command[command.index("-idle-ttl") + 1] == "3600s"
+    assert runtime._endpoint() == "http://127.0.0.1:8081"
+    assert runtime._signer_settings["request_timeout_s"] == 300.0
+    assert runtime._transport_settings["mode"] == "direct_http"
+    assert runtime._transport_settings["read_timeout_s"] == 300.0
+
+    with caplog.at_level("WARNING"):
+        await runtime.preflight()
+    assert any("direct_http" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -313,11 +385,13 @@ async def test_same_endpoint_browserless_switch_revives_shared_daemon() -> None:
         config_writer=lambda text: None,
     )
 
+    target_settings = _browserless_settings()
+    target_browserless = cast("dict[str, object]", target_settings["browserless"])
+    target_signer = cast("dict[str, object]", target_browserless["signer"])
+    target_signer["max_workers"] = 9
+
     result = await switcher.switch(
-        {
-            **_browserless_settings(),
-            "signer": {**_browserless_settings()["signer"], "max_workers": 9},  # type: ignore[index]
-        },
+        target_settings,
         target_config_text="engine:\n  mode: browserless\n",
     )
 

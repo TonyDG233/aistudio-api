@@ -30,7 +30,7 @@ def test_live_sources_use_daily_interval(source: str) -> None:
     )
 
 
-@pytest.mark.parametrize("source", ["fallback", "snapshot", "live_http"])
+@pytest.mark.parametrize("source", ["fallback", "snapshot"])
 def test_non_live_sources_use_short_retry_interval(source: str) -> None:
     assert (
         app_module._model_warmup_interval_seconds(

@@ -1023,7 +1023,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     title: '兜底来源重试间隔',
     category: 'keepalive',
     type: 'number',
-    description: 'fallback/snapshot/live_http 等来源的刷新重试间隔（秒）。',
+    description: 'fallback/snapshot 等来源的刷新重试间隔（秒）。',
     explanation: '默认 600（10 分钟）；这些来源可信度较低，需要更频繁重试以尽快恢复到真实页面或 signer 通道发现。',
     defaultValue: 600,
     recommendedValue: 600,

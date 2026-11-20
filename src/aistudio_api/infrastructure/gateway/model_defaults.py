@@ -744,7 +744,7 @@ def _normalize_engine_settings(
         integer=True,
     )
     idle_ttl_s = _engine_number(
-        signer.get("idle_ttl_s", 900),
+        signer.get("idle_ttl_s", 3600),
         "browserless.signer.idle_ttl_s",
         minimum=1,
     )
@@ -2100,7 +2100,7 @@ def get_configured_model_discovery_settings(
     """返回 features.model_discovery 刷新节奏；非法值回退 24h/10min 默认。
 
     ``live_refresh_interval_sec`` 只用于真实页面（``live_page``）与 signer
-    通道（``live_signer``）的成功刷新；其他来源（fallback/snapshot/live_http）
+    通道（``live_signer``）的成功刷新；其他来源（fallback/snapshot）
     走较短的 ``fallback_refresh_interval_sec`` 重试。
     """
     resolved_path = _resolve_config_path(config_path)

@@ -3,6 +3,8 @@ package aistudio
 import (
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -41,6 +43,56 @@ func TestCaptureStartupResponseIsBounded(t *testing.T) {
 	capture := runtime.StartupCapture()
 	if len(capture.ModelsRaw) != startupCaptureLimit {
 		t.Fatalf("ModelsRaw length = %d, want %d", len(capture.ModelsRaw), startupCaptureLimit)
+	}
+}
+
+func TestLoadOrCreateVisitIDReusesSidecar(t *testing.T) {
+	accountDir := filepath.Join(t.TempDir(), "acc")
+	if err := os.MkdirAll(accountDir, 0o755); err != nil {
+		t.Fatalf("mkdir account dir: %v", err)
+	}
+	storageState := filepath.Join(accountDir, "storage-state.json")
+	if err := os.WriteFile(filepath.Join(accountDir, "visit-id"), []byte("v1_existing\n"), 0o600); err != nil {
+		t.Fatalf("write visit-id: %v", err)
+	}
+
+	got, err := loadOrCreateVisitID(storageState)
+	if err != nil {
+		t.Fatalf("loadOrCreateVisitID: %v", err)
+	}
+	if got != "v1_existing" {
+		t.Fatalf("visit id = %q, want %q", got, "v1_existing")
+	}
+}
+
+func TestLoadOrCreateVisitIDGeneratesAndPersists(t *testing.T) {
+	accountDir := filepath.Join(t.TempDir(), "acc")
+	if err := os.MkdirAll(accountDir, 0o755); err != nil {
+		t.Fatalf("mkdir account dir: %v", err)
+	}
+	storageState := filepath.Join(accountDir, "storage-state.json")
+
+	first, err := loadOrCreateVisitID(storageState)
+	if err != nil {
+		t.Fatalf("loadOrCreateVisitID: %v", err)
+	}
+	if !strings.HasPrefix(first, "v1_") {
+		t.Fatalf("visit id = %q, want v1_ prefix", first)
+	}
+	raw, err := os.ReadFile(filepath.Join(accountDir, "visit-id"))
+	if err != nil {
+		t.Fatalf("read visit-id: %v", err)
+	}
+	if string(raw) != first {
+		t.Fatalf("sidecar = %q, want %q", string(raw), first)
+	}
+
+	second, err := loadOrCreateVisitID(storageState)
+	if err != nil {
+		t.Fatalf("reload visit id: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second visit id = %q, want %q", second, first)
 	}
 }
 

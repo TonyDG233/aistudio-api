@@ -36,7 +36,7 @@ engine:
       request_timeout_s: 300
       state_dir: data/waa/workers
       max_workers: 8
-      idle_ttl_s: 900
+      idle_ttl_s: 3600
       locale: en-US
       timezone: America/Los_Angeles
     transport:
@@ -145,7 +145,7 @@ features:
     active_activity_seconds: 60
 
   # 模型发现刷新节奏：真实页面（live_page）与 signer 通道（live_signer）成功后默认
-  # 24h 刷新一次；其他来源（fallback/snapshot/live_http）按较短间隔重试，默认 600s。
+  # 24h 刷新一次；其他来源（fallback/snapshot）按较短间隔重试，默认 600s。
   model_discovery:
     live_refresh_interval_sec: 86400
     fallback_refresh_interval_sec: 600
