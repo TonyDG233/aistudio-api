@@ -602,6 +602,7 @@ class _FakeRefresher(AccountInfoRefresher):
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> list[RefreshResult]:
         if self._raises is not None:
             raise self._raises

@@ -146,6 +146,13 @@ class AccountKeepaliveService:
         self._account_auth_failures: dict[str, int] = {}
         self._auth_partial_failures: int = 0
         self._paused = False
+        self._attach_tier_slot_provider()
+
+    def _attach_tier_slot_provider(self) -> None:
+        """Let the refresher reuse live pool sessions for engine-correct probes."""
+        setter = getattr(self._refresher, "set_slot_provider", None)
+        if callable(setter):
+            setter(self._pool_slots)
 
     @property
     def running(self) -> str | None:
@@ -422,6 +429,7 @@ class AccountKeepaliveService:
                 due,
                 refresh_email=False,
                 skip_fresh_free_tier=True,
+                respect_backoff=True,
             )
         except RefreshInProgressError:
             log.info("[Keepalive] metadata refresh skipped: already running")

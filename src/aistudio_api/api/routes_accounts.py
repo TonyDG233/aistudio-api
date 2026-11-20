@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,8 +24,14 @@ from aistudio_api.application.instance_manager import (
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
     RefreshInProgressError,
+    SlotProvider,
+    find_account_session,
+    probe_tier_over_session,
 )
 from aistudio_api.infrastructure.account.account_store import AccountMeta
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
+)
 from aistudio_api.infrastructure.account.cookie_parser import (
     parse_cookie_string,
     probe_account_benefit_tier,
@@ -54,10 +60,17 @@ def get_account_info_refresher(
     global _refresher_singleton
     shared = runtime_state.account_refresher
     if shared is not None and callable(getattr(shared, "refresh_accounts", None)):
-        return cast(AccountInfoRefresher, shared)
-    if _refresher_singleton is None:
-        _refresher_singleton = AccountInfoRefresher(account_service.store)
-    return _refresher_singleton
+        refresher = cast(AccountInfoRefresher, shared)
+    else:
+        if _refresher_singleton is None:
+            _refresher_singleton = AccountInfoRefresher(account_service.store)
+        refresher = _refresher_singleton
+    provider = getattr(
+        getattr(runtime_state, "instance_manager", None), "pool_slots", None
+    )
+    if callable(provider):
+        refresher.set_slot_provider(cast("SlotProvider", provider))
+    return refresher
 
 
 def get_ui_sandbox(runtime_state: RuntimeState) -> UISandbox | None:
@@ -739,6 +752,13 @@ async def detect_account_tier(
         with contextlib.suppress(Exception):
             slot = ready_getter(account_id)
     session = getattr(slot, "session", None) if slot is not None else None
+    if session is None and instance_manager is not None:
+        provider = getattr(instance_manager, "pool_slots", None)
+        if callable(provider):
+            with contextlib.suppress(Exception):
+                session = find_account_session(
+                    cast("Sequence[object]", provider()), account_id
+                )
     page = getattr(session, "page", None) if session is not None else None
     session_extractor = getattr(session, "extract_account_tier", None)
     if callable(session_extractor):
@@ -790,7 +810,31 @@ async def detect_account_tier(
                 if isinstance(c, dict) and c.get("name")
             }
 
-    if detected_tier is None and cookie_dict:
+    probe_error: str | None = None
+    engine_attempted = False
+    if detected_tier is None and session is not None:
+        session_response = await probe_tier_over_session(
+            session, cookies=cookie_dict, auth_user=auth_user
+        )
+        if session_response is not None:
+            engine_attempted = True
+            envelope = parse_benefit_tier_envelope(session_response.body)
+            if session_response.status == 200:
+                detected_tier = envelope.strict_tier()
+            if detected_tier is None:
+                probe_error = f"HTTP {session_response.status}" + (
+                    f": {envelope.message}" if envelope.message else ""
+                )
+                log.warning(
+                    "账号 %s 引擎通道 tier 探测失败: %s", account_id, probe_error
+                )
+
+    if detected_tier is None and cookie_dict and not engine_attempted:
+        log.warning(
+            "账号 %s 无可用引擎会话，tier 探测回退裸 httpx"
+            "（可能被上游判 region not supported）",
+            account_id,
+        )
         detected_tier = await probe_account_benefit_tier(
             cookie_dict, auth_user=auth_user
         )
@@ -801,13 +845,13 @@ async def detect_account_tier(
                 status_code=400,
                 detail="缺少可探测该账号的 Cookie，请先导入或刷新 cookies",
             )
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "订阅等级探测失败：网络/代理异常、上游非 200 或响应不可解析；"
-                "账号原等级保持不变"
-            ),
+        detail = (
+            "订阅等级探测失败：网络/代理异常、上游非 200 或响应不可解析；"
+            "账号原等级保持不变"
         )
+        if probe_error:
+            detail = f"{detail} ({probe_error})"
+        raise HTTPException(status_code=502, detail=detail)
 
     account_service.update_account_tier(
         account_id,
