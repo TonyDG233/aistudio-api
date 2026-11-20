@@ -156,7 +156,10 @@ async def test_shutdown_cancels_and_gathers_unfinished_background_tasks():
 
 
 @pytest.mark.asyncio
-async def test_startup_metadata_and_app_probe_do_not_double_probe(tmp_path, monkeypatch):
+async def test_startup_metadata_reads_cache_only_and_never_probes(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
     from datetime import UTC, datetime, timedelta
 
     from aistudio_api.application.account_keepalive import (
@@ -234,11 +237,17 @@ async def test_startup_metadata_and_app_probe_do_not_double_probe(tmp_path, monk
     )
     monkeypatch.setattr(cookie_parser, "probe_account_email", _fake_email)
 
-    await app_module._refresh_startup_account_metadata(
-        store, covered_ids=covered
-    )
-    assert calls == []
+    with caplog.at_level(logging.INFO):
+        summary = app_module._startup_account_metadata_snapshot(store)
 
-    await app_module._refresh_startup_account_metadata(store)
-    assert calls == ["email"]
+    # 启动路径只读缓存：没有任何裸探测，INFO 指明补齐已并入保活周期。
+    assert calls == []
     assert transport.posts == 1
+    assert summary == {
+        "accounts": 1,
+        "cached_email": 0,
+        "missing_email": 1,
+        "known_tier": 1,
+        "checked_tier": 1,
+    }
+    assert "启动账号元数据探测已并入保活周期" in caplog.text

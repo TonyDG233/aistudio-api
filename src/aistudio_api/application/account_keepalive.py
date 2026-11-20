@@ -417,10 +417,14 @@ class AccountKeepaliveService:
             and not self._is_auth_locked(account.id)
         ]
         now = self._clock()
+        # 缺少邮箱的账号即使 tier 刚校验过也必须进入本轮批次：
+        # ``refresh_account`` 的 ``wants_email = refresh_email or not
+        # account.email`` 才会回填邮箱（启动期裸探测已并入本周期）。
         due = [
             account
             for account in accounts
-            if (checked := _parse_ts(account.tier_checked_at)) is None
+            if not getattr(account, "email", "")
+            or (checked := _parse_ts(account.tier_checked_at)) is None
             or now - checked >= settings.metadata_refresh_seconds
         ]
         if not due:

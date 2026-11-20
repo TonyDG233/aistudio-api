@@ -396,7 +396,9 @@ async def test_probe_google_accounts_infinite_does_not_fabricate_free(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_startup_probe_failure_keeps_existing_tier(tmp_path, monkeypatch):
+async def test_startup_metadata_deferred_to_keepalive_keeps_existing_tier(
+    tmp_path, monkeypatch
+):
     from datetime import timedelta
 
     from aistudio_api.api import app as app_module
@@ -409,17 +411,17 @@ async def test_startup_probe_failure_keeps_existing_tier(tmp_path, monkeypatch):
         tier="Pro",
         tier_checked_at=(datetime.now(UTC) - timedelta(days=4)).isoformat(),
     )
-    monkeypatch.setattr(
-        cookie_parser,
-        "probe_account_benefit_tier",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        cookie_parser, "probe_account_email", AsyncMock(return_value=None)
-    )
+    tier_probe = AsyncMock(return_value=None)
+    email_probe = AsyncMock(return_value=None)
+    monkeypatch.setattr(cookie_parser, "probe_account_benefit_tier", tier_probe)
+    monkeypatch.setattr(cookie_parser, "probe_account_email", email_probe)
 
-    await app_module._refresh_startup_account_metadata(store)
+    summary = app_module._startup_account_metadata_snapshot(store)
 
+    # 启动不再裸探测：等级/邮箱探测留给 keepalive 周期，原 tier 保持不变。
+    assert tier_probe.await_count == 0
+    assert email_probe.await_count == 0
+    assert summary["accounts"] == 1
     assert store.get_account(account.id).tier == "Pro"  # type: ignore[union-attr]
 
 
