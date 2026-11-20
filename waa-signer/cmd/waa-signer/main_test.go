@@ -101,7 +101,7 @@ func TestResolveRuntimeDNSServers(t *testing.T) {
 	t.Setenv("WAA_DNS_SERVERS", "")
 	t.Setenv("AISTUDIO_DNS_SERVERS", "")
 
-	wantDefault := []string{"8.8.8.8:53", "1.1.1.1:53", "223.5.5.5:53"}
+	wantDefault := []string{"8.8.8.8:53", "1.1.1.1:53"}
 	for _, goos := range []string{"linux", "android"} {
 		if got := resolveRuntimeDNSServers(goos, "", missingResolv); !reflect.DeepEqual(got, wantDefault) {
 			t.Fatalf("%s missing resolv.conf = %#v, want %#v", goos, got, wantDefault)

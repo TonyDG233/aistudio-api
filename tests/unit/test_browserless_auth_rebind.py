@@ -447,8 +447,10 @@ async def _manager(
     runtime = BrowserlessEngineRuntime(
         {
             "mode": "browserless",
-            "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
-            "transport": {"mode": "signer_rpc"},
+            "browserless": {
+                "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
+                "transport": {"mode": "signer_rpc"},
+            },
         },
         signer_client=cast("Any", signer),
     )
@@ -706,8 +708,10 @@ async def _group_manager(
     runtime = BrowserlessEngineRuntime(
         {
             "mode": "browserless",
-            "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
-            "transport": {"mode": "signer_rpc"},
+            "browserless": {
+                "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
+                "transport": {"mode": "signer_rpc"},
+            },
         },
         signer_client=cast("Any", signer),
     )

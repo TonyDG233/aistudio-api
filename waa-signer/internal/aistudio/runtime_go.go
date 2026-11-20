@@ -170,6 +170,49 @@ func NewSpiderMonkeyWorker(ctx context.Context, accountID string, options camouf
 	}, nil
 }
 
+// loadOrCreateVisitID reuses the per-account visit id persisted beside the
+// storage-state file so Worker cold starts keep one AI Studio visit identity.
+// Only a missing or empty sidecar mints a new id and writes it back atomically;
+// a write failure is debug-only and never blocks the cold start.
+func loadOrCreateVisitID(storageStatePath string) (string, error) {
+	if storageStatePath == "" {
+		return newVisitID()
+	}
+	path := filepath.Join(filepath.Dir(storageStatePath), "visit-id")
+	if raw, err := os.ReadFile(path); err == nil {
+		if value := strings.TrimSpace(string(raw)); value != "" {
+			return value, nil
+		}
+	}
+	value, err := newVisitID()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "visit-id.*")
+	if err != nil {
+		slog.Debug("写入 visit-id 侧车文件失败", "path", path, "error", err)
+		return value, nil
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.WriteString(value); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		slog.Debug("写入 visit-id 侧车文件失败", "path", path, "error", err)
+		return value, nil
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		slog.Debug("写入 visit-id 侧车文件失败", "path", path, "error", err)
+		return value, nil
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		slog.Debug("写入 visit-id 侧车文件失败", "path", path, "error", err)
+	}
+	return value, nil
+}
+
 func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWAARuntime, error) {
 	if options.Model == "" {
 		return nil, errors.New("WAA bootstrap 缺少实时目录聊天模型")
@@ -205,7 +248,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	if err != nil {
 		return nil, err
 	}
-	visitID, err := newVisitID()
+	visitID, err := loadOrCreateVisitID(options.StorageStatePath)
 	if err != nil {
 		return nil, err
 	}

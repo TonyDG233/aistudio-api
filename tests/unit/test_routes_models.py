@@ -163,50 +163,34 @@ async def test_get_single_model_not_found_returns_404(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeypatch):
-    """测试当页面未就绪时，model_discovery 从 auth.json 读取凭据进行 HTTP 探测降级。"""
-    import json
-    from unittest.mock import AsyncMock, MagicMock
+async def test_model_discovery_never_uses_naked_httpx_disk_fallback(
+    tmp_path, monkeypatch
+):
+    """页面未就绪且无 signer 会话时只允许快照/内置降级，绝不裸 httpx 探测。"""
+    import inspect
+    from types import SimpleNamespace
 
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
     from aistudio_api.infrastructure.gateway.model_discovery import (
         ModelDiscoveryService,
     )
 
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text(
-        json.dumps(
-            {
-                "cookies": [
-                    {"name": "SAPISID", "value": "test_sapisid"},
-                    {"name": "SID", "value": "test_sid"},
-                ]
-            }
-        ),
-        encoding="utf-8",
+    monkeypatch.setattr(
+        settings, "model_cache_file", str(tmp_path / "models_cache.json")
     )
 
     service = ModelDiscoveryService()
-    mock_session = MagicMock()
-    mock_session.page = None  # 页面尚未初始化
-    mock_session._auth_file = str(auth_file)
-    mock_session.get_current_auth_user = MagicMock(return_value="0")
-
-    # Mock HTTP 探测返回
-    fake_http_models = [
-        {
-            "id": "dynamic-gemini-test",
-            "displayName": "Dynamic Gemini Test",
-            "supportedGenerationMethods": ["generateContent"],
-        }
-    ]
-    service._fetch_via_http = AsyncMock(return_value=fake_http_models)
+    mock_session = SimpleNamespace(page=None, engine="browser", _page=None)
 
     models = await service.get_models(session=mock_session, force_refresh=True)
-    assert models == fake_http_models
-    assert service._fetch_via_http.called
-    call_cookies, call_auth_user = service._fetch_via_http.call_args[0]
-    assert call_cookies["SAPISID"] == "test_sapisid"
-    assert call_auth_user == "0"
+
+    assert service.last_source == "fallback"
+    assert len(models) >= 30
+    assert not hasattr(ModelDiscoveryService, "_fetch_via_http")
+    assert not hasattr(discovery_module, "_account_http_candidates")
+    source = inspect.getsource(discovery_module)
+    assert "import httpx" not in source
+    assert "httpx.AsyncClient" not in source
 
 
 @pytest.mark.asyncio

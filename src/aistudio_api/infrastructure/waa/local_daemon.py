@@ -57,7 +57,7 @@ class LocalSignerDaemon:
         locale: str = "en-US",
         timezone: str = "America/Los_Angeles",
         max_workers: int = 8,
-        idle_ttl_s: float = 900.0,
+        idle_ttl_s: float = 3600.0,
         proxy: str | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")

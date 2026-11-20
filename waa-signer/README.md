@@ -81,7 +81,9 @@ build.bat
 | `-locale` | `WAA_LOCALE` | `en-US` | 浏览器环境语言 |
 | `-timezone` | `AISTUDIO_TIMEZONE` | `America/Los_Angeles` | 浏览器环境时区 |
 | `-max-workers` | `WAA_MAX_WORKERS` | `8` | 同时存活的 Worker 上限；满额时按 LRU 淘汰空闲 Worker |
-| `-idle-ttl` | `WAA_IDLE_TTL` | `900s` | 空闲 Worker 保留时长，支持 `900`/`900s`/`15m` |
+| `-idle-ttl` | `WAA_IDLE_TTL` | `3600s` | 空闲 Worker 保留时长，支持 `3600`/`3600s`/`60m`；延长保温以降低冷启动风暴频率 |
+
+> `max_workers` 仍保持 `8`：上调前需先实测每个 Worker 的 RSS，避免 VPS 内存被冷启动保温挤爆。
 
 ### 后台守护启动示例
 ```bash

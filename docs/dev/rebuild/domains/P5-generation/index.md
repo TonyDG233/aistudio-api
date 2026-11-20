@@ -7,7 +7,7 @@
 - **四协议统一接入与转换**：原生 Gemini（`routes_gemini.py`/`gemini_service.py`）、OpenAI Chat（`routes_openai.py`）、Claude Messages（`routes_claude.py`）、OpenAI Responses（`routes_responses.py`），经 `application/contracts/` 与 `application/format_converters/` 归一为协议中立 `NormalizedGeminiRequest` 进入 `generation_service.py`。
 - **WIRE / 工具调用硬门槛（PG-01..PG-08）**：`signature_cache.py` + `DUMMY_THOUGHT_SIGNATURE`、`sse_keepalive.py` 首窗预读与 15s keepalive、2s 工具流空闲 STOP、`wire_types.py`/`wire_codec.py` Struct 强制、`[toolshape]` 脱敏摘要（DEBUG 级别）、PG-08 宽松工具历史。
 - **ATG（防截断合成工具网关）**：`application/atg/`（`off`/`prefer`/`required`、`mode_by_format`、五信号 guard、history purge、stream unwrapper），`text_model_pattern`/`non_text_model_pattern` 过滤。
-- **模型发现与 `countTokens`**：`model_discovery.py`（pool-aware、`live_page`→`live_http` 依次重试、脏快照防护）、`token_counter.py`。
+- **模型发现与 `countTokens`**：`model_discovery.py`（pool-aware、`live_page`/`live_signer` 双通道、脏快照防护）、`token_counter.py`。
 
 ## 2. 任务计划与里程碑看板
 

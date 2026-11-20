@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import time
-import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,15 +16,12 @@ from aistudio_api.domain.model_access import (
     is_paid_model as _is_paid_model,
     set_paid_models,
     tier_header_value,
-    tier_rank,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
     filter_minimal_cookies,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
-    AI_STUDIO_HOME_URL,
-    AI_STUDIO_ORIGIN,
     EXT_BIN,
     GRPC_WEB_USER_AGENT,
     LIST_MODELS_URL,
@@ -36,12 +30,6 @@ from aistudio_api.infrastructure.gateway.public_web_constants import (
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("model_discovery")
-
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
-)
-ACCEPT_LANGUAGE = "en-US,en;q=0.9"
-MAX_HTTP_ACCOUNT_CANDIDATES = 2
 
 # One signer ListModels attempt must not hang the discovery round: the admin
 # refresh endpoint bounds the whole refresh at 30s, so a single candidate is
@@ -271,106 +259,6 @@ def _session_cookies(session: object | None) -> dict[str, str]:
         if cookies:
             return cookies
     return _cookies_from_auth_file(_session_auth_file(session))
-
-
-@dataclass(frozen=True)
-class _HttpCandidate:
-    cookies: dict[str, str]
-    auth_user: str
-    tier: str
-    label: str
-    auth_file: str | None = None
-
-
-def _http_candidate_key(candidate: _HttpCandidate) -> str:
-    if candidate.auth_file:
-        try:
-            return str(Path(candidate.auth_file).resolve())
-        except OSError:
-            return candidate.auth_file
-    minimal = filter_minimal_cookies(candidate.cookies)
-    return "cookies:" + "|".join(
-        f"{name}={value}" for name, value in sorted(minimal.items())
-    )
-
-
-def _active_rotator() -> object | None:
-    """Resolve the process-wide rotator without an infrastructure -> application import.
-
-    The rotator is created by the application layer during startup.  Looking it
-    up through ``sys.modules`` keeps this module's import graph boundary clean
-    (infrastructure must not import application) while still honoring the
-    global auth-lock state when the app is running.
-    """
-    module = sys.modules.get("aistudio_api.application.account_rotator")
-    return getattr(module, "_rotator", None) if module is not None else None
-
-
-def _auth_locked(rotator: object | None, account_id: str) -> bool:
-    """True when the global rotator has locked this account (dead login/verify)."""
-    if rotator is None or not account_id:
-        return False
-    checker = getattr(rotator, "is_auth_locked", None)
-    if not callable(checker):
-        return False
-    try:
-        return bool(checker(account_id))
-    except Exception:
-        return False
-
-
-def _account_http_candidates() -> list[_HttpCandidate]:
-    """Return healthy enabled accounts ordered paid-first for ListModels HTTP."""
-    try:
-        from aistudio_api.infrastructure.account.account_store import AccountStore
-
-        store = AccountStore()
-        accounts = list(store.list_accounts())
-    except Exception as exc:
-        logger.debug("读取账号列表用于模型发现失败: %s", exc)
-        return []
-
-    rotator = _active_rotator()
-    healthy = [
-        account
-        for account in accounts
-        if getattr(account, "enabled", True)
-        and not getattr(account, "expired", False)
-        and not _auth_locked(rotator, str(getattr(account, "id", "") or ""))
-    ]
-    healthy.sort(
-        key=lambda account: (
-            -tier_rank(getattr(account, "tier", "Free")),
-            str(getattr(account, "id", "") or ""),
-        )
-    )
-
-    candidates: list[_HttpCandidate] = []
-    for account in healthy:
-        account_id = str(getattr(account, "id", "") or "")
-        if not account_id:
-            continue
-        try:
-            auth_path = store.get_auth_path_optional(account_id, require_exists=True)
-        except Exception:
-            continue
-        if auth_path is None:
-            continue
-        cookies = _cookies_from_auth_file(str(auth_path))
-        if not cookies:
-            continue
-        candidates.append(
-            _HttpCandidate(
-                cookies=cookies,
-                auth_user=str(getattr(account, "auth_user", "0") or "0"),
-                tier=str(getattr(account, "tier", "Free") or "Free"),
-                label=f"account {account_id}",
-                auth_file=str(auth_path),
-            )
-        )
-    # Never fan out a failed discovery across the whole account pool: two
-    # paid-first healthy candidates are enough, the rest stay untouched.
-    return candidates[:MAX_HTTP_ACCOUNT_CANDIDATES]
 
 
 def _model_identity(models: list[dict[str, object]]) -> list[tuple[str, str]]:
@@ -646,19 +534,17 @@ def _snapshot_is_dirty(models: list[dict[str, object]]) -> bool:
     return any(_is_fake_model_id(model_id) for model_id in valid_ids)
 
 
-LIVE_SOURCES = frozenset({"live_page", "live_signer", "live_http"})
+LIVE_SOURCES = frozenset({"live_page", "live_signer"})
 
 # Live sources whose success may slow the warmup loop to the long
-# ``live_refresh_interval_sec`` cadence.  The disk auth.json fallback
-# (``live_http``) keeps the shorter retry cadence.
+# ``live_refresh_interval_sec`` cadence.  Snapshot/fallback keep the shorter
+# retry cadence.
 LIVE_REFRESH_SOURCES = frozenset({"live_page", "live_signer"})
 
 # A "truth" record is a real discovery result (live fetch or persisted live
 # snapshot), never the static cold-start fallback.  Routing uses this marker to
 # tell an authoritative live Free result apart from `_FALLBACK_MODELS`.
-DISCOVERY_TRUTH_SOURCES = frozenset(
-    {"live_page", "live_signer", "live_http", "snapshot"}
-)
+DISCOVERY_TRUTH_SOURCES = frozenset({"live_page", "live_signer", "snapshot"})
 _DISCOVERY_SOURCE_KEY = "_discovery_source"
 
 
@@ -807,8 +693,6 @@ class ModelDiscoveryService:
         *,
         force_refresh: bool = False,
         reset_backoff: bool = False,
-        cookies: dict[str, str] | None = None,
-        auth_user: str = "0",
         session: Any | None = None,
         sessions: Any | None = None,
     ) -> list[dict[str, object]]:
@@ -862,8 +746,8 @@ class ModelDiscoveryService:
             self.last_error = None
             cached_before = list(self._cached_models)
 
-            # 1. 汇总候选：调用方 Cookies → READY 池会话（paid 先）→
-            #    磁盘 auth.json 兜底（paid 先、Free 后），按账号去重。
+            # 1. 汇总候选：READY 池会话（paid 先）。浏览器页会话走 page XHR，
+            #    browserless 会话改走 signer 通道；不存在磁盘 auth.json 兜底。
             candidates: list[Any] = []
             if sessions is not None:
                 try:
@@ -874,27 +758,6 @@ class ModelDiscoveryService:
                 candidates.append(session)
 
             signer_sessions: list[Any] = []
-            http_candidates: list[_HttpCandidate] = []
-            seen_candidate_keys: set[str] = set()
-
-            def _add_http_candidate(candidate: _HttpCandidate) -> None:
-                if not candidate.cookies:
-                    return
-                key = _http_candidate_key(candidate)
-                if key in seen_candidate_keys:
-                    return
-                seen_candidate_keys.add(key)
-                http_candidates.append(candidate)
-
-            if cookies:
-                _add_http_candidate(
-                    _HttpCandidate(
-                        cookies=dict(cookies),
-                        auth_user=auth_user or "0",
-                        tier="Free",
-                        label="request cookies",
-                    )
-                )
 
             # 2. 浏览器页 XHR；browserless 会话改走 signer 通道（完整 Cookie
             #    jar + Firefox 152 指纹），不再用裸 httpx 直连池会话。
@@ -902,15 +765,6 @@ class ModelDiscoveryService:
                 if _session_is_browserless(candidate):
                     signer_sessions.append(candidate)
                     continue
-                _add_http_candidate(
-                    _HttpCandidate(
-                        cookies=_session_cookies(candidate),
-                        auth_user=_session_auth_user(candidate),
-                        tier=_session_tier(candidate),
-                        label=f"{type(candidate).__name__} session",
-                        auth_file=_session_auth_file(candidate),
-                    )
-                )
                 page = _session_page(candidate)
                 if page is None:
                     continue
@@ -946,17 +800,14 @@ class ModelDiscoveryService:
                         e,
                     )
 
-            for account_candidate in _account_http_candidates():
-                _add_http_candidate(account_candidate)
-
-            if not http_candidates and not signer_sessions:
+            if not signer_sessions:
                 self.last_error = (
                     self.last_error or "no discovery credentials available"
                 )
 
             abort_round = False
 
-            # 3a. 池会话 signer 通道：首个分类 403 立即终止本轮。
+            # 3. 池会话 signer 通道：首个分类 403 立即终止本轮。
             for session_candidate in signer_sessions:
                 if not _session_is_alive(session_candidate):
                     self.last_error = "live_signer: browserless session is closed"
@@ -981,32 +832,7 @@ class ModelDiscoveryService:
                         exc,
                     )
 
-            # 3b. 磁盘 auth.json 兜底：401/403/登录态失效只跳过当前账号。
-            if not abort_round:
-                for candidate in http_candidates:
-                    try:
-                        models = await self._fetch_via_http(
-                            candidate.cookies,
-                            candidate.auth_user,
-                            tier=candidate.tier,
-                        )
-                        self._accept_live(models, source="live_http")
-                        return models
-                    except asyncio.CancelledError:
-                        raise
-                    except ListModelsHttpError as exc:
-                        self.last_error = f"live_http: {exc}"
-                        self._log_fetch_error(exc, candidate.label)
-                        if exc.status == 403:
-                            abort_round = True
-                            break
-                    except Exception as exc:
-                        self.last_error = f"live_http: {exc}"
-                        logger.debug(
-                            "HTTP 模型发现候选失败 (%s): %s", candidate.label, exc
-                        )
-
-            total_candidates = len(signer_sessions) + len(http_candidates)
+            total_candidates = len(signer_sessions)
             if total_candidates:
                 if abort_round:
                     logger.warning(
@@ -1402,62 +1228,6 @@ class ModelDiscoveryService:
         if not models:
             raise RuntimeError("ListModels signer returned no parseable models")
         return models
-
-    async def _fetch_via_http(
-        self,
-        cookies: dict[str, str],
-        auth_user: str,
-        *,
-        tier: str = "Free",
-    ) -> list[dict[str, object]]:
-        """通过 HTTP 客户端携带 SAPISIDHASH 拉取（无 READY 会话时的兜底）。"""
-        import httpx
-
-        minimal_cookies = filter_minimal_cookies(cookies)
-        auth_header = calculate_sapisid_hash(minimal_cookies)
-        cookie_header = "; ".join(f"{k}={v}" for k, v in minimal_cookies.items())
-        headers = {
-            "accept": "*/*",
-            "accept-language": ACCEPT_LANGUAGE,
-            "content-type": "application/json+protobuf",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "user-agent": BROWSER_USER_AGENT,
-            "X-User-Agent": GRPC_WEB_USER_AGENT,
-            "X-Goog-Api-Key": WEB_API_KEY,
-            "X-Goog-AuthUser": auth_user or "0",
-            "X-Goog-Ext-519733851-bin": EXT_BIN,
-            "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-            "Origin": AI_STUDIO_ORIGIN,
-            "Referer": AI_STUDIO_HOME_URL,
-            "Cookie": cookie_header,
-        }
-        if auth_header:
-            headers["Authorization"] = auth_header
-        tier_header = tier_header_value(tier)
-        if tier_header:
-            headers["X-AIStudio-G1-Tier"] = tier_header
-
-        from aistudio_api.config import settings
-
-        url = LIST_MODELS_URL
-        async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
-            resp = await client.post(url, headers=headers, content="[]")
-            if resp.status_code != 200:
-                try:
-                    snippet = resp.text[:512]
-                except Exception:
-                    snippet = ""
-                raise ListModelsHttpError(
-                    resp.status_code,
-                    _classify_list_models_error(snippet),
-                    _error_snippet(snippet),
-                )
-            models = self._parse_raw_models(resp.json())
-            if not models:
-                raise RuntimeError("ListModels HTTP returned no parseable models")
-            return models
 
     def _parse_raw_models(self, raw_data: object) -> list[dict[str, object]]:
         """解析 Google ListModels 的原始 protobuf 数组结构。"""

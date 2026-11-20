@@ -484,15 +484,11 @@ async def test_ui_debug_model_routes_are_offline_free_and_paid(ui_debug, monkeyp
     headers = {"Authorization": "Bearer secret"}
     async with ui_debug, _client() as client:
         # The sandbox AccountStore already exists; any later construction is a leak.
-        monkeypatch.setattr(
-            account_store_mod.AccountStore, "__init__", _disk_boom
-        )
-        monkeypatch.setattr(
-            discovery_mod.ModelDiscoveryService, "_fetch_via_http", _network_boom
-        )
+        monkeypatch.setattr(account_store_mod.AccountStore, "__init__", _disk_boom)
         monkeypatch.setattr(
             discovery_mod.ModelDiscoveryService, "_fetch_via_page", _network_boom
         )
+        assert not hasattr(discovery_mod.ModelDiscoveryService, "_fetch_via_http")
 
         gemini = await client.get("/v1beta/models", headers=headers)
         assert gemini.status_code == 200, gemini.text
@@ -513,9 +509,7 @@ async def test_ui_debug_model_routes_are_offline_free_and_paid(ui_debug, monkeyp
         openai_ids = {item["id"] for item in openai.json()["data"]}
         assert {"gemini-3.7-flash", "gemini-4-argon"} <= openai_ids
 
-        one_gemini = await client.get(
-            "/v1beta/models/gemini-4-argon", headers=headers
-        )
+        one_gemini = await client.get("/v1beta/models/gemini-4-argon", headers=headers)
         assert one_gemini.status_code == 200
         assert one_gemini.json()["name"] == "models/gemini-4-argon"
 
@@ -633,9 +627,7 @@ async def test_reassign_drains_inflight_and_binds_idle_slots(ui_debug):
 async def test_empty_scenario_and_quick_actions(ui_debug):
     async with ui_debug, _client() as client:
         empty = (
-            await client.post(
-                "/api/debug/ui-scenario", json={"scenario": "empty"}
-            )
+            await client.post("/api/debug/ui-scenario", json={"scenario": "empty"})
         ).json()
         assert empty["accounts"] == []
         assert empty["instances"]["instances"] == []
@@ -646,9 +638,7 @@ async def test_empty_scenario_and_quick_actions(ui_debug):
         assert invalid.status_code == 400
 
         restored = (
-            await client.post(
-                "/api/debug/ui-scenario", json={"scenario": "all_states"}
-            )
+            await client.post("/api/debug/ui-scenario", json={"scenario": "all_states"})
         ).json()
         assert restored["accounts"]
         acted = (
