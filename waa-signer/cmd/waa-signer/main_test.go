@@ -245,3 +245,24 @@ func TestConfigureRuntimeNetworkSetsDefaultResolver(t *testing.T) {
 		t.Fatalf("expected custom PreferGo net.DefaultResolver, got %#v", net.DefaultResolver)
 	}
 }
+
+func TestWorkerStateDistinguishesBusyFromMissing(t *testing.T) {
+	pool := &WorkerPool{entries: map[string]*workerEntry{}}
+
+	if _, found, busy := pool.WorkerState("missing"); found || busy {
+		t.Fatalf("missing key: found=%v busy=%v, want false/false", found, busy)
+	}
+
+	entry := &workerEntry{key: "busy"}
+	entry.mu.Lock()
+	pool.entries["busy"] = entry
+	if _, found, busy := pool.WorkerState("busy"); found || !busy {
+		entry.mu.Unlock()
+		t.Fatalf("locked entry: found=%v busy=%v, want false/true", found, busy)
+	}
+	entry.mu.Unlock()
+
+	if _, found, busy := pool.WorkerState("busy"); found || busy {
+		t.Fatalf("entry without worker: found=%v busy=%v, want false/false", found, busy)
+	}
+}

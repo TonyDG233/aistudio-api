@@ -23,18 +23,6 @@ from aistudio_api.infrastructure.waa.signer_client import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _offline_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep BrowserlessSession.refresh_auth_state offline by default."""
-    from aistudio_api.infrastructure.waa import browserless_session as module
-
-    async def _skip(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
-        del cookies, kwargs
-        return {"ok": False, "status": 0, "updated": []}
-
-    monkeypatch.setattr(module, "rotate_google_cookies", _skip)
-
-
 class FakeSigner:
     def __init__(self) -> None:
         self.mints: list[dict[str, object]] = []
@@ -123,6 +111,12 @@ def _write_auth(tmp_path: Path, name: str, value: str) -> Path:
                         "name": "SID",
                         "value": f"sid-{value}",
                         "domain": ".google.com",
+                        "path": "/",
+                    },
+                    {
+                        "name": "LSID",
+                        "value": f"lsid-{value}",
+                        "domain": "accounts.google.com",
                         "path": "/",
                     },
                 ],
@@ -304,32 +298,87 @@ async def test_refresh_auth_state_persists_pending_rpc_cookies(
 
 
 @pytest.mark.asyncio
-async def test_refresh_auth_state_rotates_persists_and_rebuilds_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_refresh_auth_state_rotates_via_signer_and_persists(
+    tmp_path: Path,
 ) -> None:
-    from aistudio_api.infrastructure.waa import browserless_session as module
-
-    seen: list[dict[str, str]] = []
-
-    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
-        del kwargs
-        seen.append(dict(cookies))
-        cookies["__Secure-1PSIDTS"] = "fresh-ts"
-        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
-
-    monkeypatch.setattr(module, "rotate_google_cookies", rotate)
     signer = FakeSigner()
+    signer.rpc_set_cookies = [
+        {
+            "name": "__Secure-1PSIDTS",
+            "value": "fresh-ts",
+            "domain": ".google.com",
+            "path": "/",
+        }
+    ]
     auth = _write_auth(tmp_path, "a", "cookie-a")
     session = _session(signer, auth)
 
     assert await session.refresh_auth_state() is True
 
-    assert seen and seen[0]["SAPISID"] == "cookie-a"
+    rotate_calls = [
+        call
+        for call in signer.rpc_calls
+        if call.get("url") == "https://accounts.google.com/RotateCookies"
+    ]
+    assert len(rotate_calls) == 1
+    assert rotate_calls[0]["body"] == '[null,"-1234567890",0]'
     assert _auth_cookies(auth)["__Secure-1PSIDTS"] == "fresh-ts"
     # The Go worker is released before the fresh proof is minted.
     assert signer.events[:2] == ["release", "mint"]
     assert signer.released == ["a"]
     assert "fresh-ts" in str(signer.mints[-1]["cookies"])
+
+
+@pytest.mark.asyncio
+async def test_rotate_cookies_via_signer_shape_and_delta(tmp_path: Path) -> None:
+    signer = FakeSigner()
+    auth = _write_auth(tmp_path, "a", "cookie-a")
+    session = _session(signer, auth)
+    signer.rpc_set_cookies = [
+        {
+            "name": "__Secure-1PSIDTS",
+            "value": "signer-ts",
+            "domain": ".google.com",
+            "path": "/",
+        }
+    ]
+
+    result = await session.rotate_cookies_via_signer()
+
+    assert result["ok"] is True
+    call = signer.rpc_calls[0]
+    assert call["url"] == "https://accounts.google.com/RotateCookies"
+    assert call["body"] == '[null,"-1234567890",0]'
+    assert result["updated"] == ["__Secure-1PSIDTS"]
+    assert _auth_cookies(auth)["__Secure-1PSIDTS"] == "signer-ts"
+
+
+@pytest.mark.asyncio
+async def test_rotate_cookies_via_signer_missing_seed_skips(tmp_path: Path) -> None:
+    signer = FakeSigner()
+    auth = tmp_path / "no-seed.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "SAPISID",
+                        "value": "cookie-a",
+                        "domain": ".google.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = _session(signer, auth)
+
+    result = await session.rotate_cookies_via_signer()
+
+    assert result["skipped"] == "missing_seed"
+    assert signer.rpc_calls == []
 
 
 @pytest.mark.asyncio

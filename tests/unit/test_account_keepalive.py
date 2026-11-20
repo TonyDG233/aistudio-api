@@ -1147,3 +1147,107 @@ def test_retry_delay_caps_exponent_for_auth_partial_failures(tmp_path):
     )
     assert delay == 86_400.0
     assert service._auth_partial_failures == 1_001
+
+
+class StartupCaptureSession(FakeSlotSession):
+    def __init__(self, state: dict[str, object]) -> None:
+        super().__init__(saved=True)
+        self._state = state
+        self.fetch_calls = 0
+
+    async def fetch_worker_state(self) -> dict[str, object]:
+        self.fetch_calls += 1
+        return dict(self._state)
+
+
+@pytest.mark.asyncio
+async def test_auth_update_consumes_signer_startup_capture_once(tmp_path, monkeypatch):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_cold", "cold@example.com")
+    state: dict[str, object] = {
+        "accountKey": "acc_cold",
+        "visitId": "v1_cold",
+        "capturedAt": "2026-11-20T08:00:00Z",
+        "startupTierRaw": "[2]",
+        "startupModelsRaw": '[["ok"]]',
+    }
+    session = StartupCaptureSession(state)
+    manager = FakeManager([FakeSlot("slot-1", "acc_cold", session=session)])
+    account_service = AccountService(store)
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del account_id, session
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    from aistudio_api.infrastructure.gateway import model_discovery as discovery_module
+
+    accepted: list[tuple[object, str]] = []
+
+    def fake_accept(raw: object, source: str = "live_signer") -> bool:
+        accepted.append((raw, source))
+        return True
+
+    monkeypatch.setattr(
+        discovery_module.model_discovery, "accept_startup_models", fake_accept
+    )
+
+    service = _service(
+        store,
+        manager=manager,
+        account_service=account_service,
+        clock=FakeClock(4_000.0),
+    )
+    await service.run_now(
+        "auth_update",
+        trigger="manual",
+        settings=_settings(metadata_refresh=False),
+    )
+    await service.run_now(
+        "auth_update",
+        trigger="manual",
+        settings=_settings(metadata_refresh=False),
+    )
+
+    assert session.fetch_calls == 2
+    assert accepted == [(state["startupModelsRaw"], "live_signer")]
+    account = store.get_account("acc_cold")
+    assert account is not None
+    assert account.tier == "Ultra"
+    assert account.tier_checked_at == _iso(4_000.0)
+
+
+@pytest.mark.asyncio
+async def test_auth_update_ignores_unparseable_startup_tier(tmp_path, monkeypatch):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_cold", "cold@example.com")
+    state: dict[str, object] = {
+        "capturedAt": "2026-11-20T09:00:00Z",
+        "startupTierRaw": "not-json",
+        "startupModelsRaw": "",
+    }
+    session = StartupCaptureSession(state)
+    manager = FakeManager([FakeSlot("slot-1", "acc_cold", session=session)])
+    account_service = AccountService(store)
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del account_id, session
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        manager=manager,
+        account_service=account_service,
+        clock=FakeClock(4_000.0),
+    )
+
+    await service.run_now(
+        "auth_update",
+        trigger="manual",
+        settings=_settings(metadata_refresh=False),
+    )
+
+    account = store.get_account("acc_cold")
+    assert account is not None
+    assert account.tier == "Free"

@@ -25,6 +25,7 @@ log = get_logger("waa-signer-client")
 MINT_PATH = "/v1/proof/mint"
 RPC_PATH = "/v1/rpc/send"
 RELEASE_PATH = "/v1/worker/release"
+WORKER_STATE_PATH = "/v1/worker/state"
 HEALTH_PATH = "/health"
 
 
@@ -302,6 +303,44 @@ class SignerClient:
             engine=str(payload.get("engine") or ""),
         )
 
+    async def fetch_worker_state(self, account_key: str) -> dict[str, object] | None:
+        """Read one worker's bounded startup capture (tier/model raw bodies).
+
+        Returns ``None`` when the signer has no resident worker for the key.
+        The payload never carries cookies, headers or authorization material.
+        """
+        if not account_key:
+            return None
+        try:
+            resp = await self._client.get(
+                self._url(WORKER_STATE_PATH),
+                params={"accountKey": account_key},
+            )
+        except Exception as exc:
+            raise self._map_exception(exc) from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 503:
+            try:
+                busy_payload = resp.json()
+            except ValueError:
+                busy_payload = None
+            if isinstance(busy_payload, dict) and busy_payload.get("busy") is True:
+                log.debug(
+                    "waa-signer worker busy for %s; skipping harvest", account_key
+                )
+                return None
+            raise SignerError(
+                f"waa-signer worker state 失败 (status={resp.status_code})",
+                status_code=resp.status_code,
+            )
+        if resp.status_code != 200:
+            raise SignerError(
+                f"waa-signer worker state 失败 (status={resp.status_code})",
+                status_code=resp.status_code,
+            )
+        return _json_object(resp, "worker state")
+
     async def mint_proof(
         self,
         *,
@@ -562,6 +601,7 @@ def _monotonic() -> float:
 
 __all__ = [
     "HEALTH_PATH",
+    "WORKER_STATE_PATH",
     "MintProofResult",
     "RpcResult",
     "SignerAuthError",

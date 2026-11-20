@@ -261,8 +261,11 @@ async def test_cookie_rotation_and_sibling_sync_and_deletion_safety(
 
     try:
         # 1. 模拟 Google /RotateCookies 响应
+        seen_headers: list[httpx.Headers] = []
+
         def mock_handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/RotateCookies":
+                seen_headers.append(request.headers)
                 return httpx.Response(
                     200,
                     headers=[
@@ -290,6 +293,11 @@ async def test_cookie_rotation_and_sibling_sync_and_deletion_safety(
             }
             rot_res = await rotate_google_cookies(cookie_jar, client=mock_client)
             assert rot_res["ok"] is True
+            assert seen_headers[0]["user-agent"] == (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) "
+                "Gecko/20100101 Firefox/152.0"
+            )
+            assert seen_headers[0]["accept-language"] == "en-US,en;q=0.9"
             updated_names = rot_res.get("updated")
             assert (
                 isinstance(updated_names, list) and "__Secure-1PSIDTS" in updated_names
@@ -476,3 +484,214 @@ async def test_cookie_rotation_and_sibling_sync_and_deletion_safety(
         runtime_state.account_service = orig_service
         runtime_state.ui_debug = orig_debug
         runtime_state.ui_sandbox = orig_sandbox
+
+
+def _seed_storage(name: str) -> dict[str, object]:
+    return {
+        "cookies": [
+            {"name": "SAPISID", "value": f"sap-{name}", "domain": ".google.com"},
+            {"name": "SID", "value": f"sid-{name}", "domain": ".google.com"},
+            {
+                "name": "LSID",
+                "value": f"lsid-{name}",
+                "domain": "accounts.google.com",
+            },
+            {
+                "name": "__Secure-1PSIDTS",
+                "value": f"ts-{name}",
+                "domain": ".google.com",
+            },
+        ]
+    }
+
+
+class FakeLiveBrowserlessSession:
+    engine = "browserless"
+
+    def __init__(self, account_id: str, *, transport: str = "signer_rpc") -> None:
+        self.account_id = account_id
+        self.transport_state = transport
+        self.calls = 0
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def rotate_cookies_via_signer(self) -> dict[str, object]:
+        self.calls += 1
+        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
+
+
+@pytest.mark.asyncio
+async def test_account_service_routes_live_browserless_session_to_signer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    service = AccountService(store)
+    acc = store.save_account(
+        name="Signer User",
+        email="signer@example.com",
+        storage_state=_seed_storage("signer"),
+        account_id="acc_signer",
+        cookie_id="cid_signer",
+    )
+
+    async def forbidden(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("naked rotate must not run for a live session")
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        forbidden,
+    )
+    session = FakeLiveBrowserlessSession(acc.id)
+
+    result = await service.rotate_account_cookies(acc.id, session=session)
+
+    assert result["ok"] is True
+    assert session.calls == 1
+    meta = store.get_account(acc.id)
+    assert meta is not None and meta.last_rotated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_cross_account_session_falls_back_to_naked_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = AccountStore(tmp_path)
+    service = AccountService(store)
+    acc = store.save_account(
+        name="Target",
+        email="target@example.com",
+        storage_state=_seed_storage("target"),
+        account_id="acc_target",
+        cookie_id="cid_target",
+    )
+    calls: list[dict[str, str]] = []
+
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del kwargs
+        calls.append(dict(cookies))
+        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        rotate,
+    )
+    foreign = FakeLiveBrowserlessSession("acc_other")
+
+    result = await service.rotate_account_cookies(acc.id, session=foreign)
+
+    assert result["ok"] is True
+    assert foreign.calls == 0
+    assert len(calls) == 1
+    assert any("归属不匹配" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_direct_http_session_falls_back_to_naked_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    service = AccountService(store)
+    acc = store.save_account(
+        name="Direct",
+        email="direct@example.com",
+        storage_state=_seed_storage("direct"),
+        account_id="acc_direct",
+        cookie_id="cid_direct",
+    )
+    calls: list[dict[str, str]] = []
+
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del kwargs
+        calls.append(dict(cookies))
+        return {"ok": True, "status": 200, "updated": ["__Secure-1PSIDTS"]}
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        rotate,
+    )
+    direct = FakeLiveBrowserlessSession(acc.id, transport="direct_http")
+
+    result = await service.rotate_account_cookies(acc.id, session=direct)
+
+    assert result["ok"] is True
+    assert direct.calls == 0
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_seed_skips_sibling_fanout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    service = AccountService(store)
+    target = store.save_account(
+        name="Target",
+        email="target@example.com",
+        storage_state=_seed_storage("target"),
+        account_id="acc_target",
+        cookie_id="cid_shared",
+    )
+    store.save_account(
+        name="Sibling",
+        email="sibling@example.com",
+        storage_state=_seed_storage("sibling"),
+        account_id="acc_sibling",
+        cookie_id="cid_shared",
+    )
+    calls: list[dict[str, str]] = []
+
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del kwargs
+        calls.append(dict(cookies))
+        return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        rotate,
+    )
+
+    result = await service.rotate_account_cookies(target.id)
+
+    assert result["skipped"] == "missing_seed"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_sibling_fanout_attempts_at_most_one_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = AccountStore(tmp_path)
+    service = AccountService(store)
+    target = store.save_account(
+        name="Target",
+        email="target@example.com",
+        storage_state=_seed_storage("target"),
+        account_id="acc_target",
+        cookie_id="cid_shared",
+    )
+    for index in range(3):
+        store.save_account(
+            name=f"Sibling {index}",
+            email=f"sibling{index}@example.com",
+            storage_state=_seed_storage(f"sibling{index}"),
+            account_id=f"acc_sibling_{index}",
+            cookie_id="cid_shared",
+        )
+    calls: list[dict[str, str]] = []
+
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del kwargs
+        calls.append(dict(cookies))
+        return {"ok": False, "status": 403, "updated": []}
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        rotate,
+    )
+
+    result = await service.rotate_account_cookies(target.id)
+
+    assert result["ok"] is False
+    assert len(calls) == 2
+    assert any("至多 1 个兄弟" in record.message for record in caplog.records)

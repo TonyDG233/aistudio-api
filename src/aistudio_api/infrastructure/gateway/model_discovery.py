@@ -1071,6 +1071,39 @@ class ModelDiscoveryService:
         self._last_refresh_info = summary
         logger.info(summary)
 
+    def accept_startup_models(
+        self, raw_payload: object, source: str = "live_signer"
+    ) -> bool:
+        """Accept a login-state startup ``ListModels`` body captured by the signer.
+
+        This is a zero-request refresh: the signer already fetched the page's
+        own startup RPC, so the body is parsed and committed through the same
+        ``_parse_raw_models`` + ``_accept_live`` path as a live fetch (including
+        clearing the failure backoff). Invalid or empty bodies leave the cache
+        untouched and never advance the failure streak.
+        """
+        if _ui_debug_active():
+            return False
+        payload = raw_payload
+        if isinstance(payload, (bytes, bytearray)):
+            try:
+                payload = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                return False
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                return False
+        models = self._parse_raw_models(payload)
+        if not models:
+            return False
+        self._accept_live(models, source=source)
+        return True
+
     def _accept_live(self, models: list[dict[str, object]], *, source: str) -> None:
         """Commit a live parse result and persist it with paid metadata."""
         if not models:

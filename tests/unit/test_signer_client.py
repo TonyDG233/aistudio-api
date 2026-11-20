@@ -297,3 +297,41 @@ async def test_request_and_read_timeouts_are_applied() -> None:
     assert client._client.timeout.read == 11
     assert client._client.timeout.connect == 3
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_worker_state_round_trip_404_and_busy() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/worker/state"
+        key = request.url.params.get("accountKey")
+        if key == "missing":
+            return httpx.Response(404, json={"ok": False, "error": "worker not found"})
+        if key == "busy":
+            return httpx.Response(503, json={"busy": True, "error": "worker busy"})
+        assert key == "acc_1"
+        return httpx.Response(
+            200,
+            json={
+                "accountKey": "acc_1",
+                "visitId": "v1_abc",
+                "capturedAt": "2026-11-20T08:00:00Z",
+                "startupTierRaw": "[2]",
+                "startupModelsRaw": "[]",
+            },
+        )
+
+    client, calls = _client(handler)
+
+    state = await client.fetch_worker_state("acc_1")
+    assert state is not None
+    assert state["accountKey"] == "acc_1"
+    assert state["visitId"] == "v1_abc"
+    assert state["startupTierRaw"] == "[2]"
+    assert await client.fetch_worker_state("missing") is None
+    assert await client.fetch_worker_state("busy") is None
+    assert await client.fetch_worker_state("") is None
+    assert calls == [
+        "http://127.0.0.1:8081/v1/worker/state?accountKey=acc_1",
+        "http://127.0.0.1:8081/v1/worker/state?accountKey=missing",
+        "http://127.0.0.1:8081/v1/worker/state?accountKey=busy",
+    ]
