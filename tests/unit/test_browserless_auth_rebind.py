@@ -44,18 +44,6 @@ _OLD = "acc_old"
 _HEALTHY = "acc_healthy"
 
 
-@pytest.fixture(autouse=True)
-def _offline_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the 403 refresh path offline: no /RotateCookies network call."""
-    from aistudio_api.infrastructure.waa import browserless_session as module
-
-    async def _skip(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
-        del cookies, kwargs
-        return {"ok": False, "status": 0, "updated": []}
-
-    monkeypatch.setattr(module, "rotate_google_cookies", _skip)
-
-
 # --------------------------------------------------------------------- signer
 
 

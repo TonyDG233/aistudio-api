@@ -32,10 +32,9 @@ from aistudio_api.infrastructure.account.account_store import (
     write_storage_state,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
-    apply_set_cookies,
     calculate_sapisid_hash,
     filter_minimal_cookies,
-    rotate_google_cookies,
+    has_rotation_seed,
 )
 from aistudio_api.infrastructure.gateway.capture import RequestCaptureService
 from aistudio_api.infrastructure.gateway.public_web_constants import (
@@ -73,6 +72,14 @@ _BASE_HEADERS: dict[str, str] = {
 
 _COOKIE_DROP_HEADERS = frozenset({"host", "content-length", "cookie", "authorization"})
 _ACCOUNT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+_ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies"
+_ROTATE_COOKIES_BODY = '[null,"-1234567890",0]'
+_ROTATE_COOKIES_HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://accounts.google.com",
+    "Referer": "https://accounts.google.com/RotateCookiesPage",
+}
 
 _EXPIRED_REASON_MARKERS: tuple[str, ...] = (
     "隔离登录态失效",
@@ -203,39 +210,6 @@ def _merge_cookies(
     return merged
 
 
-def _rotation_updates(
-    current: list[dict[str, object]], rotated: dict[str, str]
-) -> list[dict[str, object]]:
-    """Diff a rotated cookie map against the live jar, preserving metadata."""
-    existing = {
-        str(cookie.get("name") or ""): cookie
-        for cookie in current
-        if cookie.get("name")
-    }
-    updates: list[dict[str, object]] = []
-    for name, value in rotated.items():
-        if not name or not value:
-            continue
-        previous = existing.get(name)
-        if previous is None:
-            updates.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".google.com",
-                    "path": "/",
-                    "expires": -1,
-                }
-            )
-            continue
-        if str(previous.get("value") or "") == value:
-            continue
-        updated = dict(previous)
-        updated["value"] = value
-        updates.append(updated)
-    return updates
-
-
 class BrowserlessSession:
     """``EngineSession`` implementation backed by waa-signer (no Chromium)."""
 
@@ -347,6 +321,11 @@ class BrowserlessSession:
             "engine": "waa",
             "summary": "Firefox 152 (WAA)",
         }
+
+    @property
+    def account_id(self) -> str:
+        """Stable account id this session was built for (read-only)."""
+        return self._account_id
 
     @property
     def stable_account_key(self) -> str:
@@ -672,43 +651,55 @@ class BrowserlessSession:
             await self.save_current_cookies()
         return True
 
-    async def _rotate_cookies(self) -> None:
-        """Roll short-lived Google credentials and persist the result.
+    async def _rotate_cookies(self) -> dict[str, object]:
+        """Roll short-lived Google credentials through the signer transport.
 
-        ``rotate_google_cookies`` mutates the passed map in place for the
-        whitelisted rotating cookies; any ``set_cookies`` payload is merged as
-        well so a future signer-side rotation is not dropped. Failures are
-        logged and never abort the 403 refresh path.
+        The request shape mirrors the official account page
+        (``POST /RotateCookies`` with ``[null,"-1234567890",0]``); the signer
+        supplies the bound worker's cookie jar, Firefox fingerprint and
+        server-issued headers, and returns ``Set-Cookie`` deltas through
+        ``X-WAA-Set-Cookies`` which ``send_hooked_request`` applies through the
+        existing ``_apply_cookie_payload`` path. Failures are logged and never
+        abort the 403 refresh path.
         """
         cookie_map = _cookie_map(self._cookies)
         if not cookie_map:
-            return
+            return {"ok": False, "status": 0, "updated": []}
+        if not has_rotation_seed(cookie_map):
+            return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
+        before = dict(cookie_map)
         try:
-            rotation = await rotate_google_cookies(cookie_map)
+            status, _ = await self.send_hooked_request(
+                body=_ROTATE_COOKIES_BODY,
+                url=_ROTATE_COOKIES_URL,
+                headers=dict(_ROTATE_COOKIES_HEADERS),
+            )
         except Exception as exc:
             log.warning(
                 "browserless RotateCookies 失败 realm=%s: %s", self._realm_id, exc
             )
-            return
-        raw_set = rotation.get("set_cookies")
-        if isinstance(raw_set, list):
-            headers = [item for item in raw_set if isinstance(item, str)]
-            if headers:
-                apply_set_cookies(cookie_map, headers)
-            for item in raw_set:
-                if isinstance(item, dict):
-                    name = str(item.get("name") or "")
-                    value = str(item.get("value") or "")
-                    if name and value:
-                        cookie_map[name] = value
-        if not rotation.get("ok"):
-            return
-        updates = _rotation_updates(self._cookies, cookie_map)
-        if not updates:
-            return
-        self._cookies = _merge_cookies(self._cookies, updates)
-        self._cookie_dirty = True
-        await self.save_current_cookies()
+            return {"ok": False, "status": 0, "updated": [], "error": str(exc)}
+        if self._cookie_dirty:
+            await self.save_current_cookies()
+        after = _cookie_map(self._cookies)
+        updated = [name for name, value in after.items() if before.get(name) != value]
+        return {"ok": status == 200, "status": status, "updated": updated}
+
+    async def rotate_cookies_via_signer(self) -> dict[str, object]:
+        """Public rotation entry for AccountService (browserless engine path)."""
+        return await self._rotate_cookies()
+
+    async def fetch_worker_state(self) -> dict[str, object] | None:
+        """Read this worker's bounded startup capture from the signer."""
+        try:
+            return await self._signer.fetch_worker_state(self.stable_account_key)
+        except SignerError as exc:
+            log.debug(
+                "browserless 读取 worker 冷启动状态失败 realm=%s: %s",
+                self._realm_id,
+                exc,
+            )
+            return None
 
     async def send_hooked_request(
         self,

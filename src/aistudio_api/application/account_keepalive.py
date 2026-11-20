@@ -10,14 +10,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshInProgressError,
+)
+from aistudio_api.infrastructure.account.benefit_tier import (
+    parse_benefit_tier_envelope,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_keepalive_settings,
@@ -145,6 +148,9 @@ class AccountKeepaliveService:
         self._auth_saved_at: dict[str, float] = {}
         self._account_auth_failures: dict[str, int] = {}
         self._auth_partial_failures: int = 0
+        # account_id -> startup capture marker (capturedAt or raw digest), so a
+        # hot-reused worker's identical capture is parsed at most once.
+        self._startup_capture_consumed: dict[str, str] = {}
         self._paused = False
         self._attach_tier_slot_provider()
 
@@ -524,6 +530,56 @@ class AccountKeepaliveService:
             account_id = account.id if account is not None else None
         return account_id, saved, True
 
+    async def _harvest_worker_startup(self, account_id: str, session: Any) -> None:
+        """Consume the signer's cold-start tier/model capture (zero new requests).
+
+        A hot-reused worker reports the same ``capturedAt`` and is skipped; a
+        cold rebuild (boot, rebind, 403 rebuild, slot rotation) yields a new
+        stamp and is consumed exactly once. A busy (503) or missing (404)
+        worker both skip this cycle without touching the tier/model stores.
+        """
+        fetch = getattr(session, "fetch_worker_state", None)
+        if not callable(fetch):
+            return
+        try:
+            state = await cast("Callable[[], Awaitable[object]]", fetch)()
+        except Exception as exc:
+            log.debug(
+                "[Keepalive] 读取 worker 冷启动状态失败 account=%s: %s",
+                account_id,
+                exc,
+            )
+            return
+        if not isinstance(state, dict):
+            return
+        stamp = str(state.get("capturedAt") or "")
+        tier_raw = state.get("startupTierRaw")
+        models_raw = state.get("startupModelsRaw")
+        has_tier = isinstance(tier_raw, str) and bool(tier_raw)
+        has_models = isinstance(models_raw, str) and bool(models_raw)
+        if not has_tier and not has_models:
+            return
+        marker = stamp or f"{tier_raw!r}|{models_raw!r}"
+        if self._startup_capture_consumed.get(account_id) == marker:
+            return
+        self._startup_capture_consumed[account_id] = marker
+        if has_tier:
+            tier = parse_benefit_tier_envelope(tier_raw).strict_tier()
+            if tier:
+                self._store.update_account_tier(
+                    account_id, tier, checked_at=_iso(self._clock())
+                )
+                log.info(
+                    "[Keepalive] 冷启动收获 tier account=%s tier=%s", account_id, tier
+                )
+        if has_models:
+            from aistudio_api.infrastructure.gateway.model_discovery import (
+                model_discovery,
+            )
+
+            if model_discovery.accept_startup_models(models_raw, source="live_signer"):
+                log.info("[Keepalive] 冷启动收获模型目录 account=%s", account_id)
+
     async def _auth_update(
         self, trigger: str, settings: KeepaliveSettings | None = None
     ) -> dict[str, object]:
@@ -682,6 +738,8 @@ class AccountKeepaliveService:
                 log.debug("[Keepalive] 账号 %s 轮换 Cookie 异常: %s", account.id, exc)
                 _ensure_acc(account.id)
                 rotate_results.setdefault(account.id, []).append(False)
+            if acc_sess is not None:
+                await self._harvest_worker_startup(account.id, acc_sess)
 
         saved_accounts: list[str] = []
         failed_accounts: list[str] = []

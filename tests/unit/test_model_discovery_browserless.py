@@ -695,3 +695,48 @@ async def test_signer_timeout_falls_through_to_next_candidate(
     assert service.last_source == "live_signer"
     assert service.last_error is None
     assert "signer 请求超时" in caplog.text
+
+
+def test_accept_startup_models_commits_signer_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_cache(monkeypatch, tmp_path)
+    service = ModelDiscoveryService()
+    service._failure_streak = 4
+    service._next_retry_at = time.time() + 3600.0
+    raw = json.dumps(
+        [
+            [
+                [
+                    "models/gemini-startup-flash",
+                    None,
+                    "001",
+                    "Gemini Startup Flash",
+                    "startup capture",
+                    0,
+                    0,
+                    ["generateContent"],
+                ]
+            ]
+        ]
+    )
+
+    assert service.accept_startup_models(raw, source="live_signer") is True
+
+    assert _ids(service._cached_models) == ["gemini-startup-flash"]
+    assert service.last_source == "live_signer"
+    assert service._failure_streak == 0
+    assert service._next_retry_at is None
+
+
+def test_accept_startup_models_rejects_invalid_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_cache(monkeypatch, tmp_path)
+    service = ModelDiscoveryService()
+    before = _ids(service._cached_models)
+
+    assert service.accept_startup_models("not-json") is False
+    assert service.accept_startup_models("[]") is False
+    assert service.accept_startup_models("") is False
+    assert _ids(service._cached_models) == before

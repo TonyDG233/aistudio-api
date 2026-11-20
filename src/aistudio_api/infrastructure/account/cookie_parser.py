@@ -727,7 +727,23 @@ async def probe_account_benefit_tier(
         return None
 
 
-DEFAULT_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+)
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+_ROTATION_SEED_COOKIES = (
+    "LSID",
+    "__Host-1PLSID",
+    "__Host-3PLSID",
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+)
+
+
+def has_rotation_seed(cookies: dict[str, str]) -> bool:
+    """True when the jar still carries a cookie that can seed RotateCookies."""
+    return any(cookies.get(name) for name in _ROTATION_SEED_COOKIES)
 
 
 async def rotate_google_cookies(
@@ -744,17 +760,7 @@ async def rotate_google_cookies(
     if not cookies:
         return {"ok": False, "status": 0, "updated": []}
 
-    has_rotation_seed = any(
-        cookies.get(k)
-        for k in (
-            "LSID",
-            "__Host-1PLSID",
-            "__Host-3PLSID",
-            "__Secure-1PSIDTS",
-            "__Secure-3PSIDTS",
-        )
-    )
-    if not has_rotation_seed:
+    if not has_rotation_seed(cookies):
         return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
 
     import httpx
@@ -771,6 +777,7 @@ async def rotate_google_cookies(
     headers = {
         "Cookie": cookie_header,
         "User-Agent": effective_ua,
+        "accept-language": DEFAULT_ACCEPT_LANGUAGE,
         "Content-Type": "application/json",
         "Origin": "https://accounts.google.com",
         "Referer": "https://accounts.google.com/RotateCookiesPage",

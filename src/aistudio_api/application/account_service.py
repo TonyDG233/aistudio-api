@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     import httpx
@@ -115,6 +116,35 @@ class AccountService:
             rotated_at=rotated_at,
         )
 
+    @staticmethod
+    def _session_can_rotate(session: object | None, account_id: str) -> bool:
+        """True only for the target account's live browserless signer session."""
+        if session is None or str(getattr(session, "engine", "")) != "browserless":
+            return False
+        session_account = str(getattr(session, "account_id", "") or "")
+        if not session_account or session_account != account_id:
+            logger.warning(
+                "账号 %s 传入的 browserless 会话归属不匹配 (session=%s)，按无可用 signer 会话走裸路径",
+                account_id,
+                session_account or "<unknown>",
+            )
+            return False
+        if str(getattr(session, "transport_state", "") or "") != "signer_rpc":
+            logger.debug(
+                "账号 %s 的 browserless 会话 transport=%s，不使用 signer 轮换",
+                account_id,
+                getattr(session, "transport_state", ""),
+            )
+            return False
+        rotate = getattr(session, "rotate_cookies_via_signer", None)
+        alive = getattr(session, "is_alive", None)
+        if not callable(rotate) or not callable(alive):
+            return False
+        try:
+            return bool(alive())
+        except Exception:
+            return False
+
     async def rotate_account_cookies(
         self,
         account_id: str,
@@ -139,9 +169,36 @@ class AccountService:
         if not cookies:
             return {"ok": False, "status": 0, "updated": []}
 
-        result = await rotate_google_cookies(cookies, client=client)
-        if not result.get("ok"):
-            # 若当前子账号缺少最新滚动种子，尝试合并同会话兄弟账号的 Cookie 重试
+        result: dict[str, object]
+        rotate_via_signer = getattr(session, "rotate_cookies_via_signer", None)
+        if self._session_can_rotate(session, account_id) and callable(
+            rotate_via_signer
+        ):
+            try:
+                raw = await cast(
+                    "Callable[[], Awaitable[dict[str, object]]]", rotate_via_signer
+                )()
+            except Exception as exc:
+                logger.warning(
+                    "账号 %s 经 signer 轮换 Cookie 失败: %s", account_id, exc
+                )
+                raw = {
+                    "ok": False,
+                    "status": 0,
+                    "updated": [],
+                    "error": str(exc),
+                }
+            result = raw if isinstance(raw, dict) else {}
+            cookies = load_cookies_from_auth_file(auth_path) or cookies
+        else:
+            result = await rotate_google_cookies(cookies, client=client)
+
+        if not result.get("ok") and result.get("skipped") != "missing_seed":
+            # A missing rotation seed means no sibling merge can help (the
+            # combined jar still lacks LSID/PSIDTS), so skip the fan-out
+            # entirely. Otherwise try at most one qualifying sibling and stop:
+            # the old "walk every sibling until one hits" pattern multiplied
+            # naked upstream requests per failed account.
             anchor = compute_session_anchor(cookies)
             target_acc = self._store.get_account(account_id)
             target_cid = target_acc.cookie_id if target_acc else None
@@ -165,7 +222,12 @@ class AccountService:
                 if sib_res.get("ok"):
                     cookies = merged_sib
                     result = sib_res
-                    break
+                else:
+                    logger.warning(
+                        "账号 %s 同源兄弟轮换仍失败，已停止扇出（至多 1 个兄弟）",
+                        account_id,
+                    )
+                break
 
         if result.get("ok"):
             now_ts = datetime.now(UTC).isoformat()

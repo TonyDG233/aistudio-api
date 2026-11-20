@@ -390,6 +390,43 @@ func (p *WorkerPool) entryInFlight(entry *workerEntry) int {
 	return entry.inFlight
 }
 
+// WorkerState 返回指定账户 Worker 的只读冷启动收获快照。
+//
+// found=false 表示该账户不存在（或池已关闭）；busy=true 表示 Worker 存在但
+// 正在构建/重建（entry.mu 被占用），调用方应把 busy 与不存在区分开。
+// 快照绝不包含 Cookie 或请求头。
+func (p *WorkerPool) WorkerState(accountKey string) (state signerapi.WorkerStateResponse, found bool, busy bool) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return signerapi.WorkerStateResponse{}, false, false
+	}
+	entry := p.entries[accountKey]
+	p.mu.Unlock()
+	if entry == nil {
+		return signerapi.WorkerStateResponse{}, false, false
+	}
+	if !entry.mu.TryLock() {
+		return signerapi.WorkerStateResponse{}, false, true
+	}
+	defer entry.mu.Unlock()
+	worker := entry.worker
+	if worker == nil {
+		return signerapi.WorkerStateResponse{}, false, false
+	}
+	capture := worker.StartupCapture()
+	response := signerapi.WorkerStateResponse{
+		AccountKey:       accountKey,
+		VisitID:          capture.VisitID,
+		StartupTierRaw:   capture.TierRaw,
+		StartupModelsRaw: capture.ModelsRaw,
+	}
+	if !capture.CapturedAt.IsZero() {
+		response.CapturedAt = capture.CapturedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return response, true, false
+}
+
 // markRecreatePending 标记需要重建并推进代数，返回本次代数快照
 func (p *WorkerPool) markRecreatePending(entry *workerEntry) uint64 {
 	p.mu.Lock()
@@ -1157,6 +1194,29 @@ func main() {
 			Version:     signerVersion,
 			Ready:       stats.Ready,
 		})
+	})
+
+	// GET /v1/worker/state: 只读暴露单个 Worker 的冷启动收获快照（无 Cookie/请求头）
+	mux.HandleFunc("GET /v1/worker/state", func(w http.ResponseWriter, r *http.Request) {
+		accountKey := strings.TrimSpace(r.URL.Query().Get("accountKey"))
+		if accountKey == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "accountKey is required"})
+			return
+		}
+		if err := validateExplicitAccountKey(accountKey); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		state, found, busy := pool.WorkerState(accountKey)
+		if busy {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"busy": true, "error": "worker busy"})
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "worker not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
 	})
 
 	mux.HandleFunc("POST /v1/proof/mint", func(w http.ResponseWriter, r *http.Request) {

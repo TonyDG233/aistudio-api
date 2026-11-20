@@ -76,6 +76,19 @@ type ReleaseResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// WorkerStateResponse 是 GET /v1/worker/state 的只读响应体。
+//
+// StartupTierRaw / StartupModelsRaw 是 Worker 冷启动时官网页面自身发出的
+// GetAiStudioBenefitTier / ListModels 响应体（各 ≤64KB），绝不包含 Cookie、
+// 请求头或授权材料；为空表示该 Worker 本次启动未捕获到对应响应。
+type WorkerStateResponse struct {
+	AccountKey       string `json:"accountKey"`
+	VisitID          string `json:"visitId,omitempty"`
+	CapturedAt       string `json:"capturedAt,omitempty"`
+	StartupTierRaw   string `json:"startupTierRaw"`
+	StartupModelsRaw string `json:"startupModelsRaw"`
+}
+
 // HealthResponse 是 GET /health 的响应体，绝不包含 Cookie。
 //
 // ready 表示"服务进程健康且 Worker 池还能接收新请求"；当池已满且没有空闲

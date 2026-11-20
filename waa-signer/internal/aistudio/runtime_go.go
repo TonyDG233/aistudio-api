@@ -40,8 +40,20 @@ type workerRuntime interface {
 	ProtocolHeaders(context.Context) (http.Header, error)
 	SendProtected(context.Context, string, http.Header, []byte) (*camoufoxnative.ProtectedResponse, error)
 	StorageCookies(context.Context) ([]byte, error)
+	StartupCapture() WorkerStartupCapture
 	State() camoufoxnative.State
 	Close() error
+}
+
+// startupCaptureLimit 限制冷启动 RPC 响应体的只读捕获大小，避免把大响应留在内存。
+const startupCaptureLimit = 64 << 10
+
+// WorkerStartupCapture 是官网页面启动 RPC 的有界只读捕获快照，不含 Cookie/请求头。
+type WorkerStartupCapture struct {
+	VisitID    string
+	CapturedAt time.Time
+	TierRaw    string
+	ModelsRaw  string
 }
 
 // waaInterpreterHashes 记录本进程已执行过的解释器版本
@@ -56,8 +68,14 @@ type goWAARuntime struct {
 	acceptLanguage string
 	pageURL        string
 	pageLoaded     time.Time
+	visitID        string
 	headers        http.Header
 	cacheDirectory string
+
+	startupMu         sync.Mutex
+	startupTierRaw    string
+	startupModelsRaw  string
+	startupCapturedAt time.Time
 
 	storageMu sync.Mutex
 	storage   StorageState
@@ -191,6 +209,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	if err != nil {
 		return nil, err
 	}
+	runtime.visitID = visitID
 	reportGoStartup(options, camoufoxnative.StartupLocatingWAA)
 	type loggingContext struct {
 		extension string
@@ -522,7 +541,10 @@ func (runtime *goWAARuntime) loggingContextHeader(ctx context.Context, apiKey st
 	return base64.StdEncoding.EncodeToString(encoded), nil
 }
 
-// sendPageRPCs 以官网页面的请求头并发发出页面自身的 MakerSuite 请求，与页面一样不依赖其结果
+// sendPageRPCs 以官网页面的请求头并发发出页面自身的 MakerSuite 请求，与页面一样不依赖其结果。
+//
+// GetAiStudioBenefitTier 与 ListModels 的响应体顺带有界捕获（各 ≤64KB），供
+// Python 侧零新增请求地刷新 tier 与模型目录；其余启动 RPC 仍直接 drain。
 func (runtime *goWAARuntime) sendPageRPCs(ctx context.Context, apiKey string, visitID string, rpcs []pageRPC) {
 	var group sync.WaitGroup
 	for _, rpc := range rpcs {
@@ -532,10 +554,55 @@ func (runtime *goWAARuntime) sendPageRPCs(ctx context.Context, apiKey string, vi
 				return
 			}
 			headers.Set("X-AIStudio-Visit-Id", visitID)
-			runtime.drain(runtime.do(ctx, http.MethodPost, makerSuiteRPCURL+rpc.method, []byte(rpc.body), headers))
+			response, err := runtime.do(ctx, http.MethodPost, makerSuiteRPCURL+rpc.method, []byte(rpc.body), headers)
+			if err != nil {
+				return
+			}
+			if rpc.method == "GetAiStudioBenefitTier" || rpc.method == "ListModels" {
+				runtime.captureStartupResponse(rpc.method, response)
+				return
+			}
+			runtime.drain(response, nil)
 		})
 	}
 	group.Wait()
+}
+
+// captureStartupResponse 在读响应处顺带保存有界启动 RPC 响应体，不新增请求。
+func (runtime *goWAARuntime) captureStartupResponse(method string, response *http.Response) {
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, startupCaptureLimit))
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	runtime.startupMu.Lock()
+	defer runtime.startupMu.Unlock()
+	switch method {
+	case "GetAiStudioBenefitTier":
+		runtime.startupTierRaw = string(body)
+	case "ListModels":
+		runtime.startupModelsRaw = string(body)
+	default:
+		return
+	}
+	runtime.startupCapturedAt = time.Now()
+}
+
+// StartupCapture 返回冷启动 RPC 的有界只读快照。
+func (runtime *goWAARuntime) StartupCapture() WorkerStartupCapture {
+	runtime.startupMu.Lock()
+	defer runtime.startupMu.Unlock()
+	return WorkerStartupCapture{
+		VisitID:    runtime.visitID,
+		CapturedAt: runtime.startupCapturedAt,
+		TierRaw:    runtime.startupTierRaw,
+		ModelsRaw:  runtime.startupModelsRaw,
+	}
 }
 
 // drain 读完并关闭页面自身请求的响应

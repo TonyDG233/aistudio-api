@@ -182,6 +182,11 @@ func (worker *NativeWorker) State() WorkerState {
 	return worker.state
 }
 
+// StartupCapture 返回冷启动 RPC 的有界只读快照（无 Cookie/请求头）。
+func (worker *NativeWorker) StartupCapture() WorkerStartupCapture {
+	return worker.runtime.StartupCapture()
+}
+
 // Close 关闭账户 WAA runtime
 func (worker *NativeWorker) Close() error {
 	worker.operationMu.Lock()
