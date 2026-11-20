@@ -11,6 +11,7 @@ import type {
   ProbeAndImportRequest,
   ImportBundleRequest,
   AccountPreset,
+  RefreshAccountsResponse,
 } from '@/types'
 import { useToastStore } from './toast.ts'
 
@@ -298,15 +299,36 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  function notifyRefreshOutcome(
+    toast: ReturnType<typeof useToastStore>,
+    res: RefreshAccountsResponse,
+  ) {
+    const failures = res.results.filter((item) => item.ok !== true)
+    const okCount = res.results.length
+      ? res.results.filter((item) => item.ok === true).length
+      : res.refreshed_count
+    const expiredNote = res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''
+    if (failures.length === 0) {
+      toast.success(`已刷新 ${okCount} 个账号${expiredNote}`)
+      return
+    }
+    const firstError = failures[0]?.error || '未知错误'
+    if (okCount === 0) {
+      toast.error(`刷新失败 ${failures.length} 个账号${expiredNote}：${firstError}`)
+      return
+    }
+    toast.warning(
+      `已刷新 ${okCount} 个账号${expiredNote}，${failures.length} 个失败：${firstError}`,
+    )
+  }
+
   async function refreshAll() {
     const toast = useToastStore()
     if (refreshingAll.value) return null
     refreshingAll.value = true
     try {
       const res = await accountsApi.refresh({ all: true })
-      toast.success(
-        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
-      )
+      notifyRefreshOutcome(toast, res)
       await fetchAll()
       return res
     } catch (err: unknown) {
@@ -330,9 +352,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     refreshingIds.value = next
     try {
       const res = await accountsApi.refresh({ account_ids: targets })
-      toast.success(
-        `已刷新 ${res.refreshed_count} 个账号${res.expired_count > 0 ? `，${res.expired_count} 个登录态失效` : ''}`,
-      )
+      notifyRefreshOutcome(toast, res)
       await fetchAll()
       return res
     } catch (err: unknown) {

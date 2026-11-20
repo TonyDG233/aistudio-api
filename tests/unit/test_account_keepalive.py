@@ -168,6 +168,7 @@ class FakeRefresher:
         self.calls: list[list[str]] = []
         self.skip_flags: list[bool] = []
         self.email_flags: list[bool] = []
+        self.backoff_flags: list[bool] = []
         self._ok = ok
 
     async def refresh_accounts(
@@ -176,10 +177,12 @@ class FakeRefresher:
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> list[SimpleNamespace]:
         self.calls.append([account.id for account in accounts])
         self.skip_flags.append(skip_fresh_free_tier)
         self.email_flags.append(refresh_email)
+        self.backoff_flags.append(respect_backoff)
         return [
             SimpleNamespace(
                 account_id=account.id,
@@ -202,6 +205,7 @@ class GateRefresher:
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> list[SimpleNamespace]:
         self.started.set()
         await self.release.wait()
@@ -223,6 +227,7 @@ class BusyRefresher:
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> list[SimpleNamespace]:
         raise RefreshInProgressError("already running")
 
@@ -598,6 +603,7 @@ async def test_metadata_refresh_only_targets_due_healthy_accounts(tmp_path):
     assert refresher.calls == [["acc_stale"]]
     assert refresher.skip_flags == [True]
     assert refresher.email_flags == [False]
+    assert refresher.backoff_flags == [True]
     stale_after = store.get_account("acc_stale")
     expired_after = store.get_account("acc_expired")
     assert stale_after is not None

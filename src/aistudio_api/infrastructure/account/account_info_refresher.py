@@ -19,9 +19,10 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 
@@ -132,6 +133,28 @@ class _CookieJar:
 
 TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
 
+# 单次 signer/page tier 探测的有界超时，避免一次挂起的传输拖住整轮调度。
+TIER_PROBE_SIGNER_TIMEOUT_SECONDS = 30.0
+
+# 周期 tier 探测失败退避：以 300s 为基数，连续失败 ×2（300→600→1200→2400→4800），
+# 封顶 21600s（6h）。Google 对裸请求打 403 时绝不允许同一账号每约 5 分钟重撞。
+TIER_PROBE_FAILURE_BASE_SECONDS = 300.0
+TIER_PROBE_BACKOFF_CAP_SECONDS = 6 * 3600.0
+
+# 池槽位提供者：返回带 ``account_id`` / ``session`` 的槽位序列（鸭子类型）。
+SlotProvider = Callable[[], Sequence[object]]
+
+
+class PageEvaluator(Protocol):
+    """Minimal CDP page surface used by the in-page tier XHR."""
+
+    async def evaluate(
+        self,
+        script: str,
+        args: dict[str, object] | None = None,
+        timeout_s: float = 0.0,
+    ) -> object: ...
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -144,6 +167,182 @@ def _parse_checked_at(value: object) -> float | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return None
+
+
+def _session_engine(session: object) -> str:
+    return str(getattr(session, "engine", "") or "")
+
+
+def _session_is_browserless(session: object) -> bool:
+    """Browserless sessions own a signer transport and never a Chromium Page."""
+    return (
+        _session_engine(session) == "browserless"
+        or type(session).__name__ == "BrowserlessSession"
+    )
+
+
+def _session_page(session: object) -> object | None:
+    return getattr(session, "page", None)
+
+
+def _page_is_open(page: object) -> bool:
+    checker = getattr(page, "is_closed", None)
+    if not callable(checker):
+        return True
+    try:
+        return not bool(checker())
+    except Exception:
+        return False
+
+
+def find_account_session(slots: Sequence[object], account_id: str) -> object | None:
+    """Return the live pooled session bound to ``account_id`` (read-only)."""
+    if not account_id:
+        return None
+    for slot in slots or ():
+        if str(getattr(slot, "account_id", "") or "") != account_id:
+            continue
+        session = getattr(slot, "session", None)
+        if session is None:
+            continue
+        checker = getattr(session, "is_alive", None)
+        if callable(checker):
+            try:
+                if not bool(checker()):
+                    continue
+            except Exception:
+                continue
+        return session
+    return None
+
+
+def _probe_failure_response(summary: str) -> TransportResponse:
+    """Engine-transport failure as a bounded, credential-free envelope body."""
+    message = " ".join(str(summary or "").split())[:120]
+    return TransportResponse(status=502, body=json.dumps([None, message]))
+
+
+def _normalize_cookie_jar(cookies: _CookieJar | dict[str, str]) -> _CookieJar:
+    if isinstance(cookies, _CookieJar):
+        return cookies
+    jar = {str(name): str(value) for name, value in cookies.items()}
+    header = "; ".join(f"{name}={value}" for name, value in jar.items())
+    return _CookieJar(header=header, jar=jar)
+
+
+TIER_PAGE_XHR_SCRIPT = """
+(opts) => {
+    return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', opts.url);
+        xhr.setRequestHeader('Content-Type', 'application/json+protobuf');
+        xhr.setRequestHeader('X-User-Agent', opts.userAgent);
+        xhr.setRequestHeader('X-Goog-Api-Key', opts.apiKey);
+        xhr.setRequestHeader('X-Goog-Ext-519733851-bin', opts.extBin);
+        if (opts.authUser) {
+            xhr.setRequestHeader('X-Goog-AuthUser', String(opts.authUser));
+        }
+        if (opts.authorization) {
+            xhr.setRequestHeader('Authorization', String(opts.authorization));
+        }
+        xhr.withCredentials = true;
+        xhr.timeout = 10000;
+        xhr.onload = () => resolve({status: xhr.status, text: xhr.responseText || ''});
+        xhr.onerror = () => resolve({status: 0, text: 'network_error'});
+        xhr.ontimeout = () => resolve({status: 0, text: 'timeout'});
+        xhr.send('[]');
+    });
+}
+"""
+
+
+async def probe_tier_over_session(
+    session: object | None,
+    *,
+    cookies: _CookieJar | dict[str, str],
+    auth_user: str = "0",
+    web_api_key: str | None = None,
+) -> TransportResponse | None:
+    """Probe ``GetAiStudioBenefitTier`` over a live engine session.
+
+    Browserless sessions go through ``send_hooked_request`` (signer transport:
+    complete cookie jar + Firefox 152 fingerprint + server-issued visit id).
+    Browser sessions use an in-page XHR carrying the page's own credentials.
+    ``None`` means no engine transport is usable and the caller must decide on
+    its documented degraded fallback.
+    """
+    if session is None:
+        return None
+    jar = _normalize_cookie_jar(cookies)
+    api_key = web_api_key or WEB_API_KEY
+    if _session_is_browserless(session):
+        sender = getattr(session, "send_hooked_request", None)
+        if not callable(sender):
+            logger.warning(
+                "[Refresh] browserless session exposes no signer transport; "
+                "tier probe cannot use the signer channel"
+            )
+            return None
+        headers = {"accept": "*/*", "accept-language": ACCEPT_LANGUAGE}
+        try:
+            pending = sender(body="[]", url=BENEFIT_TIER_URL, headers=headers)
+            status, body = await asyncio.wait_for(
+                cast("Awaitable[tuple[int, bytes]]", pending),
+                timeout=TIER_PROBE_SIGNER_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "[Refresh] signer tier probe timed out (%.0fs)",
+                TIER_PROBE_SIGNER_TIMEOUT_SECONDS,
+            )
+            return _probe_failure_response(
+                f"signer tier probe timed out after "
+                f"{TIER_PROBE_SIGNER_TIMEOUT_SECONDS:.0f}s"
+            )
+        except Exception as exc:
+            logger.warning("[Refresh] signer tier probe failed: %s", exc)
+            return _probe_failure_response(f"signer tier probe failed: {exc}")
+        text = (
+            body.decode("utf-8", errors="replace")
+            if isinstance(body, (bytes, bytearray))
+            else str(body or "")
+        )
+        return TransportResponse(status=int(status), body=text)
+
+    page = _session_page(session)
+    if page is None or not _page_is_open(page):
+        logger.warning(
+            "[Refresh] tier probe session has no live page (engine=%s); "
+            "falling back to raw httpx which Google may reject as "
+            "region-restricted",
+            _session_engine(session) or "browser",
+        )
+        return None
+    authorization = calculate_sapisid_hash(
+        filter_minimal_cookies(jar.jar), origin=AI_STUDIO_ORIGIN
+    )
+    evaluator = cast("PageEvaluator", page)
+    try:
+        result = await evaluator.evaluate(
+            TIER_PAGE_XHR_SCRIPT,
+            args={
+                "url": BENEFIT_TIER_URL,
+                "apiKey": api_key,
+                "userAgent": GRPC_WEB_USER_AGENT,
+                "extBin": EXT_BIN,
+                "authUser": str(auth_user or "0"),
+                "authorization": authorization,
+            },
+            timeout_s=12.0,
+        )
+    except Exception as exc:
+        logger.warning("[Refresh] tier probe page XHR failed: %s", exc)
+        return _probe_failure_response(f"tier probe page XHR failed: {exc}")
+    if not isinstance(result, dict):
+        return _probe_failure_response("tier probe page XHR returned non-object")
+    raw_status = result.get("status")
+    status = int(raw_status) if isinstance(raw_status, (int, float)) else 0
+    return TransportResponse(status=status, body=str(result.get("text") or ""))
 
 
 def is_verified_free_tier_fresh(account: object, *, now: float | None = None) -> bool:
@@ -204,6 +403,7 @@ class AccountInfoRefresher:
         web_api_key: str | None = None,
         concurrency: int | None = None,
         app_id: str | None = None,
+        slot_provider: SlotProvider | None = None,
     ) -> None:
         self._store = account_store
         self._transport: HttpTransport = transport or HttpxTransport()
@@ -220,7 +420,58 @@ class AccountInfoRefresher:
             )
         self._concurrency = max(1, concurrency)
         self._app_id = app_id or resolve_app_id()
+        self._slot_provider: SlotProvider | None = slot_provider
         self._active_run = False
+        # 仅内存的逐账号 tier 探测失败退避状态：键为账号 id，不动持久化 schema。
+        self._tier_failure_counts: dict[str, int] = {}
+        self._tier_retry_at: dict[str, float] = {}
+
+    def set_slot_provider(self, provider: SlotProvider | None) -> None:
+        """Attach a pool-slot provider so tier probes reuse live engine sessions."""
+        self._slot_provider = provider
+
+    def tier_failure_count(self, account_id: str) -> int:
+        return self._tier_failure_counts.get(account_id, 0)
+
+    def tier_backoff_seconds(
+        self, account_id: str, *, now: float | None = None
+    ) -> float:
+        """Remaining scheduled-probe backoff for one account (0.0 when due)."""
+        retry_at = self._tier_retry_at.get(account_id)
+        if retry_at is None:
+            return 0.0
+        current = time.time() if now is None else now
+        return max(0.0, retry_at - current)
+
+    def _record_tier_probe(
+        self, account_id: str, *, ok: bool, now: float | None = None
+    ) -> None:
+        if not account_id:
+            return
+        if ok:
+            self._tier_failure_counts.pop(account_id, None)
+            self._tier_retry_at.pop(account_id, None)
+            return
+        count = self._tier_failure_counts.get(account_id, 0) + 1
+        exponent = min(count - 1, 10)
+        delay = min(
+            TIER_PROBE_FAILURE_BASE_SECONDS * (2**exponent),
+            TIER_PROBE_BACKOFF_CAP_SECONDS,
+        )
+        current = time.time() if now is None else now
+        self._tier_failure_counts[account_id] = count
+        self._tier_retry_at[account_id] = current + delay
+
+    def _resolve_account_session(self, account_id: str) -> object | None:
+        provider = self._slot_provider
+        if provider is None or not account_id:
+            return None
+        try:
+            slots = provider()
+        except Exception as exc:
+            logger.debug("[Refresh] pool slot inspection failed: %s", exc)
+            return None
+        return find_account_session(slots, account_id)
 
     def is_refreshing(self) -> bool:
         return self._active_run
@@ -235,8 +486,13 @@ class AccountInfoRefresher:
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> RefreshResult:
-        """刷新单账号：凭据有效性 + 档位（可选邮箱回填）。"""
+        """刷新单账号：凭据有效性 + 档位（可选邮箱回填）。
+
+        ``respect_backoff`` 仅由周期调度传入：失败探测过的账号在其指数退避窗口
+        内直接跳过，不再重撞上游。手动刷新（用户主动操作）保持 ``False``。
+        """
         cookies = self._load_cookies(account)
         if cookies is None:
             return RefreshResult(
@@ -249,6 +505,20 @@ class AccountInfoRefresher:
             )
 
         checked_at = _now_iso()
+        if respect_backoff:
+            remaining = self.tier_backoff_seconds(account.id)
+            if remaining > 0:
+                logger.info(
+                    "[Refresh] %s tier probe skipped: failure backoff %.0fs remaining",
+                    account.id,
+                    remaining,
+                )
+                return RefreshResult(
+                    account_id=account.id,
+                    ok=False,
+                    error=f"tier probe backoff active ({remaining:.0f}s remaining)",
+                    checked_at=checked_at,
+                )
         if skip_fresh_free_tier and is_verified_free_tier_fresh(account):
             email: str | None = None
             email_error: str | None = None
@@ -275,9 +545,15 @@ class AccountInfoRefresher:
                 checked_at=checked_at,
             )
 
-        response = await self._post_tier_request(cookies, auth_user=account.auth_user)
+        response = await self._post_tier_request(
+            cookies, auth_user=account.auth_user, account_id=account.id
+        )
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
+        self._record_tier_probe(
+            account.id,
+            ok=response.status == 200 and envelope.strict_tier() is not None,
+        )
 
         if response.status == 200:
             tier = envelope.strict_tier()
@@ -385,6 +661,7 @@ class AccountInfoRefresher:
         *,
         refresh_email: bool = True,
         skip_fresh_free_tier: bool = False,
+        respect_backoff: bool = False,
     ) -> list[RefreshResult]:
         """并发刷新一批账号（``Semaphore`` 限流，结果顺序与输入一致）。
 
@@ -407,6 +684,7 @@ class AccountInfoRefresher:
                     account,
                     refresh_email=refresh_email,
                     skip_fresh_free_tier=skip_fresh_free_tier,
+                    respect_backoff=respect_backoff,
                 )
 
         try:
@@ -433,9 +711,15 @@ class AccountInfoRefresher:
             }
 
         checked_at = _now_iso()
-        response = await self._post_tier_request(cookies, auth_user=account.auth_user)
+        response = await self._post_tier_request(
+            cookies, auth_user=account.auth_user, account_id=account.id
+        )
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
+        self._record_tier_probe(
+            account.id,
+            ok=response.status == 200 and envelope.strict_tier() is not None,
+        )
 
         if response.status == 200:
             tier = envelope.strict_tier()
@@ -567,6 +851,33 @@ class AccountInfoRefresher:
         return headers
 
     async def _post_tier_request(
+        self,
+        cookies: _CookieJar,
+        *,
+        auth_user: str = "0",
+        account_id: str = "",
+    ) -> TransportResponse:
+        """Route the tier RPC by engine: signer → page XHR → raw httpx fallback."""
+        session = self._resolve_account_session(account_id)
+        if session is not None:
+            response = await probe_tier_over_session(
+                session,
+                cookies=cookies,
+                auth_user=auth_user,
+                web_api_key=self._web_api_key,
+            )
+            if response is not None:
+                return response
+        elif account_id and self._slot_provider is not None:
+            logger.warning(
+                "[Refresh] %s tier probe has no pooled engine session; "
+                "falling back to raw httpx which Google may reject as "
+                "region-restricted",
+                account_id,
+            )
+        return await self._post_tier_via_http(cookies, auth_user=auth_user)
+
+    async def _post_tier_via_http(
         self, cookies: _CookieJar, *, auth_user: str = "0"
     ) -> TransportResponse:
         headers = self._rpc_headers(cookies, auth_user=auth_user)
@@ -660,12 +971,18 @@ class AccountInfoRefresher:
 
 
 __all__ = [
+    "TIER_PROBE_BACKOFF_CAP_SECONDS",
+    "TIER_PROBE_FAILURE_BASE_SECONDS",
     "TIER_PROBE_FRESHNESS_SECONDS",
+    "TIER_PROBE_SIGNER_TIMEOUT_SECONDS",
     "AccountInfoRefresher",
     "HttpTransport",
     "HttpxTransport",
     "RefreshInProgressError",
     "RefreshResult",
+    "SlotProvider",
     "TransportResponse",
+    "find_account_session",
+    "probe_tier_over_session",
     "resolve_app_id",
 ]
