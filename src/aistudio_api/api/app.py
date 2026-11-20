@@ -8,7 +8,6 @@ import inspect
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -202,125 +201,33 @@ async def _model_warmup_loop(
             await sleep(_model_warmup_interval_seconds("fallback"))
 
 
-TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
+def _startup_account_metadata_snapshot(account_store: AccountStore) -> dict[str, int]:
+    """启动时只读缓存的 email / tier / tier_checked_at，绝不探测上游。
 
-
-def _checked_at_ts(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
-async def _refresh_startup_account_metadata(
-    account_store: AccountStore,
-    *,
-    covered_ids: set[str] | None = None,
-) -> None:
-    """Probe startup tier/email, skipping keepalive-covered and fresh Free accounts.
-
-    ``covered_ids`` are accounts already handled by the keepalive startup
-    metadata refresh. A verified Free tier whose ``tier_checked_at`` is within
-    three days skips the benefit-tier HTTP probe; a missing email is still
-    refreshed.
+    裸 HTTP 的邮箱/等级探测已并入保活 ``metadata_refresh`` 周期（复用 signer
+    会话，24h 内完成补齐），启动路径不再发起任何串行探测。
     """
-    import json
-
-    from aistudio_api.infrastructure.account.account_info_refresher import (
-        is_verified_free_tier_fresh,
-    )
-    from aistudio_api.infrastructure.account.cookie_parser import (
-        probe_account_benefit_tier,
-        probe_account_email,
-    )
-
-    covered = covered_ids or set()
-    now_ts = time.time()
-    accounts_to_check = [
-        account
-        for account in account_store.list_accounts()
-        if account.id not in covered
-        and (
-            not account.email
-            or (checked := _checked_at_ts(account.tier_checked_at)) is None
-            or (now_ts - checked > TIER_PROBE_FRESHNESS_SECONDS)
-        )
-    ]
-    if not accounts_to_check:
-        logger.debug("启动探测：账号已被 keepalive 覆盖或最近已校验，跳过")
-        return
-
+    accounts = account_store.list_accounts()
+    missing_email = sum(1 for account in accounts if not account.email)
+    cached_email = len(accounts) - missing_email
+    known_tier = sum(1 for account in accounts if account.tier)
+    checked_tier = sum(1 for account in accounts if account.tier_checked_at)
     logger.info(
-        "开始自动校验账号订阅等级与邮箱 (共 %d 个账号待检测)...",
-        len(accounts_to_check),
+        "启动账号元数据探测已并入保活周期（24h 内完成补齐）: "
+        "账号=%d, 已缓存邮箱=%d, 待补齐邮箱=%d, 已知等级=%d, 已校验等级=%d",
+        len(accounts),
+        cached_email,
+        missing_email,
+        known_tier,
+        checked_tier,
     )
-    upgraded_count = 0
-    checked_count = 0
-    skipped_tier_count = 0
-
-    for account in accounts_to_check:
-        auth_path = account_store.get_auth_path(account.id)
-        if auth_path is None or not auth_path.is_file():
-            continue
-        try:
-            auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
-            raw_cookies = auth_data.get("cookies") or []
-            cookie_dict = {
-                str(cookie.get("name") or ""): str(cookie.get("value") or "")
-                for cookie in raw_cookies
-                if isinstance(cookie, dict) and cookie.get("name")
-            }
-            if not cookie_dict:
-                continue
-            checked_count += 1
-            if not account.email:
-                email = await probe_account_email(
-                    cookie_dict, auth_user=account.auth_user or "0"
-                )
-                if email:
-                    account_store.update_account_email(account.id, email)
-            if is_verified_free_tier_fresh(account, now=now_ts):
-                skipped_tier_count += 1
-                logger.debug(
-                    "订阅等级 3 天内已校验且为 Free，跳过启动 tier 探测: id=%s",
-                    account.id,
-                )
-                continue
-            probed_tier = await probe_account_benefit_tier(
-                cookie_dict, auth_user=account.auth_user or "0"
-            )
-            if probed_tier is None:
-                logger.debug(
-                    "启动 tier 探测失败/不可解析，保留原等级: id=%s (u/%s, tier=%s)",
-                    account.id,
-                    account.auth_user,
-                    account.tier,
-                )
-                continue
-            account_store.update_account_tier(
-                account.id,
-                probed_tier,
-                checked_at=datetime.now(UTC).isoformat(),
-            )
-            if probed_tier != "Free" and account.tier == "Free":
-                upgraded_count += 1
-                logger.info(
-                    "账号订阅等级自动升级: id=%s (u/%s) -> %s",
-                    account.id,
-                    account.auth_user,
-                    probed_tier,
-                )
-        except Exception as exc:
-            logger.debug("账号 %s 订阅检测异常: %s", account.id, exc)
-
-    logger.info(
-        "账号订阅校验完成: 检测=%d 个, 跳过 tier=%d 个, 发现付费订阅=%d 个",
-        checked_count,
-        skipped_tier_count,
-        upgraded_count,
-    )
+    return {
+        "accounts": len(accounts),
+        "cached_email": cached_email,
+        "missing_email": missing_email,
+        "known_tier": known_tier,
+        "checked_tier": checked_tier,
+    }
 
 
 async def _shutdown_runtime(
@@ -592,34 +499,28 @@ async def lifespan(_app: FastAPI):
         rotator=rotator,
     )
     runtime_state.keepalive = keepalive
-    # App owns the first metadata refresh below so the two startup probes can
-    # coordinate: keepalive reports covered accounts and app-side skips them.
+    # 启动期只读缓存快照；邮箱/等级探测全部由下方的保活 metadata_refresh
+    # 周期承接（首轮显式触发，之后按 24h 周期补齐）。
     await keepalive.start(startup_metadata_done=True)
 
     startup_task: asyncio.Task[object] | None = None
     startup_task = asyncio.create_task(_startup_instances(runtime_state, warmup_task))
 
-    # 启动订阅/邮箱自检：先跑 keepalive metadata refresh，再对未被覆盖的账号
-    # 做应用侧探测；3 天内已验证 Free 的账号跳过 benefit-tier 探测。
-    tier_task: asyncio.Task[object] | None = None
+    # 启动期只读缓存：邮箱/等级探测并入 keepalive metadata_refresh 周期。
+    startup_metadata_task: asyncio.Task[object] | None = None
 
-    async def _startup_metadata_and_tiers() -> None:
-        covered_ids: set[str] = set()
+    async def _startup_metadata_refresh() -> None:
+        _startup_account_metadata_snapshot(account_store)
         settings = KeepaliveSettings.from_config()
         if settings.metadata_refresh and settings.metadata_refresh_on_startup:
             result = await keepalive.run_startup_metadata_refresh()
-            raw_accounts = result.get("accounts")
-            if result.get("reason") in ("checked", "no_due_accounts"):
-                if isinstance(raw_accounts, (list, tuple)):
-                    covered_ids = {str(account_id) for account_id in raw_accounts}
-            else:
-                logger.debug(
-                    "keepalive 启动 metadata 刷新未覆盖批次: reason=%s",
-                    result.get("reason"),
-                )
-        await _refresh_startup_account_metadata(account_store, covered_ids=covered_ids)
+            logger.debug(
+                "keepalive 启动 metadata 刷新: reason=%s count=%s",
+                result.get("reason"),
+                result.get("count"),
+            )
 
-    tier_task = asyncio.create_task(_startup_metadata_and_tiers())
+    startup_metadata_task = asyncio.create_task(_startup_metadata_refresh())
 
     # Model discovery warmup: wait until the instance pool has a READY session
     # (preferring the Pro/paid lane), then refresh the live ListModels catalog
@@ -642,7 +543,13 @@ async def lifespan(_app: FastAPI):
     finally:
         logger.info("服务正在关闭")
         await _shutdown_runtime(
-            runtime_state, (warmup_task, startup_task, tier_task, model_warmup_task)
+            runtime_state,
+            (
+                warmup_task,
+                startup_task,
+                startup_metadata_task,
+                model_warmup_task,
+            ),
         )
 
 

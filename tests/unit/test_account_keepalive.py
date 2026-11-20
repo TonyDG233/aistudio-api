@@ -775,6 +775,55 @@ async def test_metadata_refresh_probes_free_tier_older_than_three_days(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_metadata_refresh_backfills_missing_email_when_tier_is_fresh(tmp_path):
+    """启动期裸探测并入保活后，缺邮箱账号即使 tier 新鲜也必须进批次。"""
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    account = _account(store, "acc_no_email", "")
+    store.update_account_refresh(
+        account.id,
+        tier="Free",
+        tier_checked_at=(now - timedelta(hours=1)).isoformat(),
+    )
+
+    class _EmailTransport:
+        def __init__(self) -> None:
+            self.posts = 0
+            self.gets = 0
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            content: str = "",
+        ) -> TransportResponse:
+            if method == "POST":
+                self.posts += 1
+                return TransportResponse(status=200, body="[]")
+            self.gets += 1
+            return TransportResponse(
+                status=200, body='{"oPEP7c":"backfilled@example.com"}'
+            )
+
+    transport = _EmailTransport()
+    refresher = AccountInfoRefresher(store, transport=transport)
+    service = _service(store, refresher=refresher, clock=FakeClock(now.timestamp()))
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["ok"] is True
+    assert result["accounts"] == [account.id]
+    after = store.get_account(account.id)
+    assert after is not None
+    assert after.email == "backfilled@example.com"
+    # 3 天内已验证 Free：只回填邮箱，不重复打 benefit-tier。
+    assert transport.posts == 0
+    assert transport.gets == 1
+
+
+@pytest.mark.asyncio
 async def test_pause_race_rechecked_after_job_lock(tmp_path) -> None:
     store = AccountStore(tmp_path)
     _account(store, "acc_a", "a@example.com")

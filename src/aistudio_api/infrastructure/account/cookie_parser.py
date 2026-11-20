@@ -624,7 +624,8 @@ async def probe_account_emails_map(
     u_index = str(auth_user or "0")
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+        "accept-language": DEFAULT_ACCEPT_LANGUAGE,
         "Cookie": cookie_header,
     }
 
@@ -700,6 +701,8 @@ async def probe_account_benefit_tier(
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     headers = {
         "Content-Type": "application/json+protobuf",
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+        "accept-language": DEFAULT_ACCEPT_LANGUAGE,
         "X-User-Agent": GRPC_WEB_USER_AGENT,
         "X-Goog-Api-Key": WEB_API_KEY,
         "X-Goog-AuthUser": u_index,
@@ -842,6 +845,8 @@ async def probe_google_accounts_infinite(
             auth_header = calculate_sapisid_hash(cookie_dict)
             headers = {
                 "Content-Type": "application/json+protobuf",
+                "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+                "accept-language": DEFAULT_ACCEPT_LANGUAGE,
                 "X-User-Agent": GRPC_WEB_USER_AGENT,
                 "X-Goog-Api-Key": WEB_API_KEY,
                 "X-Goog-AuthUser": u_index,

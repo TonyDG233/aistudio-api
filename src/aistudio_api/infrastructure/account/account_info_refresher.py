@@ -927,6 +927,12 @@ class AccountInfoRefresher:
     async def _fetch_app_html(
         self, cookies: _CookieJar, *, auth_user: str = "0"
     ) -> str:
+        """裸 httpx 路径抓取 AI Studio apps 页 HTML。
+
+        UA / accept-language 已与全站一致的 Firefox 152 身份对齐（``USER_AGENT``
+        / ``ACCEPT_LANGUAGE``），但 TLS 指纹仍是 Python httpx，风控残留已知；
+        迁移依赖 signer GET 页面通道（留档，不在本批范围）。
+        """
         headers = {
             "accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
