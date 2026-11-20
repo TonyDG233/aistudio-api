@@ -229,17 +229,25 @@ async def test_direct_http_transport_warns_once_per_process(
 
 @pytest.mark.asyncio
 async def test_normalized_engine_settings_reach_daemon_and_direct_http_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     from aistudio_api.infrastructure.gateway.model_defaults import (
         validate_engine_settings,
     )
 
+    placeholder_binary = tmp_path / "waa-signer"
+    placeholder_binary.write_bytes(b"")
     normalized = validate_engine_settings(
         {
             "mode": "browserless",
             "browserless": {
-                "signer": {"auto_start": True, "idle_ttl_s": 3600},
+                "signer": {
+                    "auto_start": True,
+                    "idle_ttl_s": 3600,
+                    "binary_path": str(placeholder_binary),
+                },
                 "transport": {"mode": "direct_http", "read_timeout_s": 300},
             },
         }
