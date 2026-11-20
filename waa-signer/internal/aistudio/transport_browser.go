@@ -634,7 +634,22 @@ func orderedHeaderNames(headers fhttp.Header, host string) []string {
 	return append(slices.Clone(order), remaining...)
 }
 
-// firefox152ClientHello 返回以 tls-client 的 Firefox 148 档案为底、密码套件按 Firefox 152 排列的 ClientHello
+// firefox152ClientHello 返回以 tls-client 的 Firefox 148 档案为底、密码套件按 Firefox 152 排列的 ClientHello。
+//
+// 出处与正确性依据：
+//   - 结构来源：bogdanfinn/tls-client 的 profiles.Firefox_148 为底；该库与 refraction uTLS 全生态均无原生
+//     Firefox 152 规格，现有最高档位仅到 148。
+//   - 线上形状：uTLS 中 Version 字符串只是标签、不产生任何线上字节；线上 ClientHello 的密码套件完全由下方
+//     手写的 16 条 cipher 列表决定。
+//   - 正确性依据：Mozilla Bug 2035801 将 Firefox 150/151/152 均标记为 fixed（自 151 起实际移除
+//     TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA / 0xC009）；本列表不含该套件，与 Firefox 152 行为一致。相对
+//     Firefox_148 底版另移除了 DHE 套件 0x0033/0x0039（与 Firefox 152 源码一致）。16 条 cipher 与扩展顺序
+//     已用 Camoufox 152.0.4（真实 Firefox 152 构建）第三方实抓逐字段比对一致。
+//   - 传承链：Mag1cFall/AIStudio2API e0d6f08 → DeconstructedCube/aistudio-api feat/browserless-waa-engine
+//     9000d1b → 本仓 69904e3，16 条 cipher 序列三代逐字一致（e0d6f08 原函数整体返回 ClientProfile，与本实现
+//     函数形态不同）。
+//   - 未来基线：如需真机复核，用 Parroteer 的 gen-spec + replay-verify 流程（github.com/SaamoCha/parroteer）
+//     留 JA3/JA4 基线。
 func firefox152ClientHello() tls.ClientHelloID {
 	base := profiles.Firefox_148
 	hello := base.GetClientHelloId()
