@@ -269,3 +269,55 @@ Q 级补充：未覆盖“侧车目录不可写/重命名失败仍返回新 ID�
 - **P0/P1 已清零，最终判定 PASS**。剩余 P2-4（静态 index 空行）与 Q-1..Q-4 均为非阻断延后项；建议提交前顺手清理 P2-4，但不需要再开复审轮次。
 
 > **二轮只读声明**：除本报告追加段落外，未修改任何仓库文件；临时构建目录已删除；未启动服务、未联网、未执行提交或推送。
+
+---
+
+# 三轮补记（CI 环境依赖修复）— 2026-11-20
+
+- **补记对象**：二轮通过的 `test_normalized_engine_settings_reach_daemon_and_direct_http_warning` 在 GitHub Actions Linux 暴露环境依赖缺陷后的修复
+- **复审角色**：同一独立只读 Reviewer
+- **复审环境**：Windows / pwsh；pytest 设置 UTF-8；未联网、未 ssh、未启动生产服务
+- **最终判定**：**PASS**（无新增阻断项）
+
+> **三轮只读声明**：仅读取文件并执行离线测试，除本报告追加内容外未修改任何仓库文件；未执行提交或推送。
+
+## 13. 缺陷成因（本地审查盲区）
+
+- 旧用例只传 `idle_ttl_s`/`transport.mode`，未显式指定 `binary_path`；`validate_engine_settings` 对 `local_subprocess + auto_start` 会走 `resolve_binary_path("waa-signer/bin/waa-signer")` 并检查 `is_file()`（`model_defaults.py:800-810`）。
+- 本地审查环境存在已构建的 `waa-signer/bin/waa-signer`，因此用例误通过；GitHub Actions Linux 无该二进制，归一化阶段直接抛 `ConfigValidationError`。二轮审查未识别该隐患，属于本地环境与被测前提同构造成的盲区。
+- 全测试面静态扫描 `waa-signer/bin`、`/opt/cloakbrowser`、`shutil.which`/`which(` 无其他测试引用，未发现同类“依赖本机存在物”残留。
+
+## 14. 修复方式核验
+
+当前业务/测试未提交 diff 仅为 `tests/unit/test_engine_runtime_lifecycle.py`（`10 insertions(+), 2 deletions(-)`；本报告追加不属业务 diff）：
+
+- `test_engine_runtime_lifecycle.py:240-241`：`tmp_path / "waa-signer"` 创建空占位文件，模拟可执行文件存在性。
+- `:246-250`：配置显式传入 `binary_path: str(placeholder_binary)`，走 `validate_engine_settings` 公共校验契约；不再依赖仓库内真实构建产物。
+- 未 monkeypatch `resolve_binary_path`、`validate_engine_settings` 或其他内部函数；环境依赖已从“本机文件存在”转为“测试自建临时文件”。
+- **表述精确性说明（Q-5，非阻断）**：用例仍保留 `monkeypatch.setattr(engine_runtime_module, "_direct_http_warned", False)`（`:255`），仅用于重置进程级警示去重标志，避免测试顺序依赖；它不模拟二进制存在性、不绕过环境校验。因此“零 monkeypatch”应理解为“零二进制/内部校验函数 monkeypatch”，而非字面上完全没有 `monkeypatch` 调用。
+
+## 15. 断言强度与验证结论
+
+关键断言逐条保留，未弱化：
+
+- `:262` `daemon.idle_ttl_s == 3600.0`；
+- `:263-264` `daemon._command()` 中 `-idle-ttl` 后紧邻 `3600s`；
+- `:265` 归一化 endpoint 直达；
+- `:266` `request_timeout_s == 300.0`；
+- `:267-268` `transport.mode == "direct_http"` 且 `read_timeout_s == 300.0`；
+- `:270-272` `preflight()` 触发 direct_http WARNING。
+
+独立实跑：
+
+| 门禁 | 结果 |
+|---|---|
+| 目标用例 `pytest ...::test_normalized_engine_settings_reach_daemon_and_direct_http_warning -vv` | `1 passed` |
+| 全量 `uv run pytest -q`（UTF-8） | `1746 passed in 58.47s`（exit 0） |
+| 当前业务/测试 diff 范围 | 仅 `tests/unit/test_engine_runtime_lifecycle.py`，无其他业务文件 |
+| 同类本机依赖扫描 | 0 命中 |
+
+## 16. 三轮结论
+
+- CI 缺陷成因明确：旧用例隐式依赖仓库内已构建的 signer 二进制；修复以 `tmp_path` 占位文件 + 显式 `binary_path` 走公共校验契约，目标用例与全量套件均通过，关键断言未削弱。
+- 无新增 P0/P1/P2 可裁决项；仅 Q-5（“零 monkeypatch”表述精确性）作为说明记录。二轮遗留 P2-4（静态 `index.html` 空行）与 Q-1..Q-4 继续按非阻断延后处理。
+- **三轮最终判定：PASS**。
