@@ -91,7 +91,11 @@ CHROME_UA = (
 )
 
 DEFAULT_TTL_SECONDS = 300.0
-DEFAULT_CODE_TIMEOUT_SECONDS = 20.0
+# Real-device observation: the reCAPTCHA QR only lands at +22~24s on a weak
+# host (bframe 200 at +22s, reload at +24s), so a 20s budget produced a fake
+# ``qr_timeout`` for a QR that was about to appear.  45s leaves margin inside
+# the 300s session TTL.  There is no env override for this budget.
+DEFAULT_CODE_TIMEOUT_SECONDS = 45.0
 PASSED_RETENTION_SECONDS = 10.0
 TERMINAL_RETENTION_SECONDS = 10.0
 CLICK_RETRY_INTERVAL_SECONDS = 2.0
@@ -131,11 +135,15 @@ NET_INTERESTING_TOKENS = (
     "verify-account",
 )
 # Response-body capture is limited to the requests that decide why the scan
-# failed: the ``VerifyUser`` 403 body, the ``GetUserVerificationStatus``
-# callback and the reCAPTCHA confirmation endpoints.  A per-session cap keeps a
-# weak host from being dragged down by ``Network.getResponseBody`` round-trips.
+# failed: the ``VerifyUser`` 403 body, the ``GenerateAccessToken`` 401 body
+# (missing prerequisite credential), the ``Waa/Create`` body that gates the
+# mobile verification hand-off, the ``GetUserVerificationStatus`` callback and
+# the reCAPTCHA confirmation endpoints.  A per-session cap keeps a weak host
+# from being dragged down by ``Network.getResponseBody`` round-trips.
 NET_BODY_URL_TOKENS = (
     "VerifyUser",
+    "GenerateAccessToken",
+    "Waa/Create",
     "GetUserVerificationStatus",
     "recaptcha/enterprise/userverify",
     "recaptcha/enterprise/reload",
@@ -2004,9 +2012,20 @@ class CdpVerifyBrowserDriver:
                 preview = _sanitize_body_preview(body)
                 entry.body_preview = preview
                 self._net_bodies[request_id] = preview
-                if "verifyuser" in (entry.url_path or "").lower():
+                lowered_path = (entry.url_path or "").lower()
+                if "verifyuser" in lowered_path:
                     log.info(
                         "[Verify] VerifyUser 响应 status=%s len=%d body=%s",
+                        "-" if status is None else status,
+                        len(body),
+                        preview or "-",
+                    )
+                elif "generateaccesstoken" in lowered_path:
+                    # Debugging the recurring ``POST GenerateAccessToken -> 401``:
+                    # the body names the missing credential, so surface it the
+                    # moment the response arrives instead of only in the dump.
+                    log.info(
+                        "[Verify] GenerateAccessToken 响应 status=%s len=%d body=%s",
                         "-" if status is None else status,
                         len(body),
                         preview or "-",
@@ -2301,7 +2320,7 @@ class CdpVerifyBrowserDriver:
                 return challenge
             if now - last_click_at >= CLICK_RETRY_INTERVAL_SECONDS:
                 # Only enabled elements are clicked.  A disabled button returns
-                # false and the loop keeps retrying inside the same 20s budget;
+                # false and the loop keeps retrying inside the same 45s budget;
                 # success is only declared once the bframe actually yields a QR.
                 clicked = False
                 with contextlib.suppress(Exception):

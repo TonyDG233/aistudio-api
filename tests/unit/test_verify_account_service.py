@@ -1170,6 +1170,25 @@ def test_default_ttl_is_300_seconds() -> None:
     assert verify_module.DEFAULT_TTL_SECONDS == 300.0
 
 
+def test_default_code_timeout_is_45_seconds(tmp_path: Path) -> None:
+    # A 45s budget covers the observed +22~24s QR arrival on a weak host.
+    # There is no env override for this value: only the constructor argument.
+    assert verify_module.DEFAULT_CODE_TIMEOUT_SECONDS == 45.0
+
+    driver = CdpVerifyBrowserDriver(auth_file=tmp_path / "auth.json")
+    assert driver._code_timeout == 45.0
+
+    store = AccountStore(tmp_path / "accounts")
+    service = VerifyAccountService(store, None)
+    assert service._code_timeout == 45.0
+
+    # Explicit constructor override still wins (no env layer involved).
+    overridden = CdpVerifyBrowserDriver(
+        auth_file=tmp_path / "auth.json", code_timeout_seconds=3.0
+    )
+    assert overridden._code_timeout == 3.0
+
+
 @pytest.mark.asyncio
 async def test_new_session_expires_after_default_ttl(tmp_path: Path) -> None:
     store = AccountStore(tmp_path / "accounts")
@@ -2111,6 +2130,12 @@ _VERIFY_USER_URL = (
 )
 _USERVERIFY_URL = "https://www.google.com/recaptcha/enterprise/userverify"
 _CLR_URL = "https://www.google.com/recaptcha/enterprise/clr"
+_GENERATE_ACCESS_TOKEN_URL = (
+    "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+    "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
+    "GenerateAccessToken"
+)
+_WAA_CREATE_URL = "https://waa-pa.clients6.google.com/waa/Waa/Create"
 
 
 class _BodyFakePage(_NetFakePage):
@@ -2296,3 +2321,49 @@ async def test_net_trace_summary_includes_verify_user_status(
         if "网络记录 reason=summary_status" in record.getMessage()
     ]
     assert summary and "verify_user=yes(403)" in summary[-1]
+
+
+@pytest.mark.asyncio
+async def test_generate_access_token_401_body_is_captured_with_immediate_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    assert verify_module._net_body_url_interesting("GenerateAccessToken") is True
+
+    page = _BodyFakePage('[7,"..."]', shape="tuple")
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-gat", _GENERATE_ACCESS_TOKEN_URL, status=401)
+    await _flush_net_bodies(driver)
+
+    # No ``_dump_net_trace`` call: the line must come from the capture itself.
+    immediate = [
+        record.getMessage()
+        for record in caplog.records
+        if "GenerateAccessToken 响应" in record.getMessage()
+    ]
+    assert immediate, "GenerateAccessToken body must be logged on arrival"
+    assert "status=401" in immediate[-1]
+    assert "body=" in immediate[-1]
+    assert '[7,"..."]' in immediate[-1]
+    assert next(iter(driver._net_trace)).body_preview == '[7,"..."]'
+
+
+@pytest.mark.asyncio
+async def test_waa_create_is_whitelisted_and_records_body_preview() -> None:
+    assert verify_module._net_body_url_interesting("Waa/Create") is True
+
+    page = _BodyFakePage('{"ok":1}')
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-waa", _WAA_CREATE_URL, status=200)
+    await _flush_net_bodies(driver)
+
+    entry = next(iter(driver._net_trace))
+    assert entry.url_path == "waa/Waa/Create"
+    assert entry.body_preview == '{"ok":1}'
+    assert page.body_request_ids == ["req-waa"]
