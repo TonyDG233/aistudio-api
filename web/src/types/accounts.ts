@@ -118,6 +118,15 @@ export interface VerifyCancelResponse {
   state: VerifyState
 }
 
+export type VerifyCheckState = 'passed' | 'pending' | 'error'
+
+export interface VerifyAccountCheckResponse {
+  state: VerifyCheckState
+  message: string
+  upstream_status: number | null
+  verify_required: boolean
+}
+
 export interface BatchDeleteResponse {
   deleted: number
 }

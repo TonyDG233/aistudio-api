@@ -1289,6 +1289,44 @@ class SandboxVerifyService:
             session.cleanup_at = time.time() + 10.0
         return {"state": session.state.value}
 
+    async def check(
+        self, account_id: str, *, simulate: str | None = None
+    ) -> dict[str, object]:
+        """Offline ``POST .../verify/check`` fake (passed/pending/error).
+
+        ``simulate`` is a sandbox-only deterministic selector; the real service
+        never receives it.  ``simulate=passed`` clears the sandbox verify flag so
+        the account card returns to ``available`` exactly like the real path.
+        """
+        account = self._sandbox.account_service.get_account(account_id)
+        if account is None:
+            raise VerifyAccountNotFound(account_id)
+        flags = self._sandbox.flags(account_id)
+        if simulate == "passed":
+            self._sandbox._store.update_account_refresh(
+                account_id, verify_required=False
+            )
+            flags["verify_required"] = False
+            return {
+                "state": "passed",
+                "message": "verified",
+                "upstream_status": 2,
+                "verify_required": False,
+            }
+        if simulate == "error":
+            return {
+                "state": "error",
+                "message": "sandbox: 上游验证状态查询失败",
+                "upstream_status": None,
+                "verify_required": bool(flags["verify_required"]),
+            }
+        return {
+            "state": "pending",
+            "message": "still_pending",
+            "upstream_status": 1,
+            "verify_required": bool(flags["verify_required"]),
+        }
+
     def _mark_passed(self, session: VerifySession) -> None:
         self._sandbox._store.update_account_refresh(
             session.account_id, verify_required=False

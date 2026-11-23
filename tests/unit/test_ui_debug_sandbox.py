@@ -862,6 +862,55 @@ async def test_verify_account_sandbox_flow(ui_debug):
 
 
 @pytest.mark.asyncio
+async def test_verify_check_sandbox_flow(ui_debug):
+    async with ui_debug, _client() as client:
+        sandbox = cast("UISandbox", runtime_state.ui_sandbox)
+        assert sandbox is not None
+        # The check endpoint is independent of start/session: no QR session yet.
+        assert sandbox.verify_service._session is None
+
+        before = (await client.get("/api/accounts")).json()
+        account = next(a for a in before if a["id"] == "acc_free_verify")
+        assert account["verify_required"] is True
+
+        pending = await client.post("/api/accounts/acc_free_verify/verify/check")
+        assert pending.status_code == 200
+        assert pending.json() == {
+            "state": "pending",
+            "message": "still_pending",
+            "upstream_status": 1,
+            "verify_required": True,
+        }
+
+        errored = await client.post(
+            "/api/accounts/acc_free_verify/verify/check",
+            params={"simulate": "error"},
+        )
+        assert errored.status_code == 200
+        assert errored.json()["state"] == "error"
+        assert errored.json()["upstream_status"] is None
+        assert errored.json()["verify_required"] is True
+
+        passed = await client.post(
+            "/api/accounts/acc_free_verify/verify/check",
+            params={"simulate": "passed"},
+        )
+        assert passed.status_code == 200
+        assert passed.json() == {
+            "state": "passed",
+            "message": "verified",
+            "upstream_status": 2,
+            "verify_required": False,
+        }
+
+        after = (await client.get("/api/accounts")).json()
+        cleared = next(a for a in after if a["id"] == "acc_free_verify")
+        assert cleared["verify_required"] is False
+        assert cleared["is_available"] is True
+        assert sandbox.verify_service._session is None
+
+
+@pytest.mark.asyncio
 async def test_config_proxy_status_sandbox_query_only_in_ui_debug(ui_debug):
     async with ui_debug, _client() as client:
         default = (await client.get("/config")).json()

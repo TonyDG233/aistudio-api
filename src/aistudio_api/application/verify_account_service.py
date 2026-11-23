@@ -70,6 +70,7 @@ from aistudio_api.infrastructure.gateway.session_auth import (
     is_login_page_url,
     load_cookies_to_page,
 )
+from aistudio_api.infrastructure.utils.log_broadcast import sanitize_log_message
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -102,6 +103,8 @@ PAGE_CLOSE_TIMEOUT_SECONDS = 2.0
 CLIENT_CLOSE_TIMEOUT_SECONDS = 2.0
 
 _SHORT_CODE_RE = re.compile(r"recaptcha\.net/qr/([A-Za-z0-9_-]{6,32})")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_PAGE_TEXT_LOG_LIMIT = 200
 _VERIFY_RPC_URL = rpc_url("GetUserVerificationStatus")
 _SUCCESS_MARKERS = (
     "your account was verified",
@@ -200,6 +203,44 @@ _PAGE_SNAPSHOT_JS = """
 })()
 """
 
+# Read-only diagnostics probe.  It never clicks, navigates or refreshes, so it is
+# safe to run while the reCAPTCHA QR is on screen.  ``text`` is cached only long
+# enough to build a masked log preview.
+_DESCRIBE_PAGE_JS = """
+(() => {
+  const body = document.body;
+  const text = body && body.innerText ? String(body.innerText) : '';
+  const lowered = text.toLowerCase();
+  const has = (selector) => !!document.querySelector(selector);
+  return {
+    url: String(window.location.href || ''),
+    title: String(document.title || ''),
+    text: text.slice(0, 4000),
+    verify_button:
+      has('[data-test-verify-button]') || lowered.includes('verify device'),
+    qr_canvas: has('canvas.recaptchaJavascriptChallengeQrCanvas'),
+    region_blocked:
+      lowered.includes('available-regions') ||
+      lowered.includes('not available in your country'),
+    login_form: has('input[type="email"], input[type="password"]'),
+  };
+})()
+"""
+
+
+def _safe_page_text(text: object, *, limit: int = _PAGE_TEXT_LOG_LIMIT) -> str:
+    """Collapse and mask page text for logs (no e-mail/cookie/token leakage)."""
+    raw = str(text or "")
+    raw = _EMAIL_RE.sub("***@***", raw)
+    raw = sanitize_log_message(raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:limit]
+
+
+def _safe_error_detail(error: object) -> str:
+    """Mask an exception message before it reaches an ERROR record."""
+    return _safe_page_text(str(error), limit=300) or "-"
+
 
 class VerifySessionState(StrEnum):
     STARTING = "starting"
@@ -275,6 +316,7 @@ class PageProbe:
     page_url: str
     success: bool
     failed: bool = False
+    error: str | None = None
 
 
 class VerifyBrowserSession(Protocol):
@@ -287,7 +329,14 @@ class VerifyBrowserSession(Protocol):
     async def close(self) -> None: ...
 
 
+class VerifyStatusProbe(Protocol):
+    """Minimal driver used by the session-less ``POST .../verify/check`` path."""
+
+    async def confirm_verified(self, auth_user: str) -> int | None: ...
+
+
 VerifyDriverFactory = Callable[["VerifySession", Path], VerifyBrowserSession]
+StatusDriverFactory = Callable[[Path, str], VerifyStatusProbe]
 
 
 @dataclass
@@ -330,6 +379,8 @@ class VerifyAccountController(Protocol):
         simulate: str | None = None,
         force: bool = False,
     ) -> dict[str, object]: ...
+
+    async def check(self, account_id: str) -> dict[str, object]: ...
 
     async def cancel(self, account_id: str) -> dict[str, object]: ...
 
@@ -388,6 +439,7 @@ class VerifyAccountService:
         rotator: AccountRotator | None,
         *,
         driver_factory: VerifyDriverFactory | None = None,
+        status_driver_factory: StatusDriverFactory | None = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         code_timeout_seconds: float = DEFAULT_CODE_TIMEOUT_SECONDS,
         passed_retention_seconds: float = PASSED_RETENTION_SECONDS,
@@ -396,6 +448,9 @@ class VerifyAccountService:
         self._store = account_store
         self._rotator = rotator
         self._driver_factory = driver_factory or _default_driver_factory
+        self._status_driver_factory = (
+            status_driver_factory or _default_status_driver_factory
+        )
         self._ttl = max(1.0, ttl_seconds)
         self._code_timeout = max(0.1, code_timeout_seconds)
         self._passed_retention = max(0.0, passed_retention_seconds)
@@ -411,6 +466,9 @@ class VerifyAccountService:
         self._session_lock: asyncio.Lock | None = None
         self._timer_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        # Per-account in-flight future for the session-less check endpoint so
+        # concurrent polls share one upstream RPC instead of stacking.
+        self._check_futures: dict[str, asyncio.Future[dict[str, object]]] = {}
         self._closed = False
 
     @property
@@ -486,6 +544,12 @@ class VerifyAccountService:
 
                     auth_file = self._store.get_auth_path_optional(account_id)
                     if auth_file is None or not auth_file.is_file():
+                        log.error(
+                            "验证会话启动失败: session=%s account=%s "
+                            "error_type=CredentialsMissing error=凭据文件缺失",
+                            session.session_id,
+                            session.account_id,
+                        )
                         self._finish_locked(
                             session, VerifySessionState.ERROR, "credentials_missing"
                         )
@@ -494,7 +558,14 @@ class VerifyAccountService:
 
                     try:
                         driver = self._driver_factory(session, auth_file)
-                    except VerifyBrowserUnavailable:
+                    except VerifyBrowserUnavailable as exc:
+                        log.error(
+                            "验证会话驱动不可用: session=%s account=%s error=%s",
+                            session.session_id,
+                            session.account_id,
+                            _safe_error_detail(exc),
+                            exc_info=exc,
+                        )
                         # Let a waiting duplicate observe an explicit error
                         # snapshot instead of hanging on the future.
                         session.state = VerifySessionState.ERROR
@@ -503,11 +574,14 @@ class VerifyAccountService:
                         final = session.to_public()
                         raise
                     except Exception as exc:
-                        log.warning(
-                            "验证会话驱动创建失败: session=%s account=%s error=%s",
+                        log.error(
+                            "验证会话驱动创建失败: session=%s account=%s "
+                            "error_type=%s error=%s",
                             session.session_id,
                             session.account_id,
                             type(exc).__name__,
+                            _safe_error_detail(exc),
+                            exc_info=exc,
                         )
                         self._finish_locked(
                             session, VerifySessionState.ERROR, "browser_error"
@@ -597,6 +671,18 @@ class VerifyAccountService:
                     final = session.to_public()
                     return final
 
+                if start_error is not None:
+                    # Emit the reason before the state mapping so the log keeps
+                    # the real exception type/message, not just ``state=error``.
+                    log.error(
+                        "验证会话启动失败: session=%s account=%s error_type=%s "
+                        "error=%s",
+                        session.session_id,
+                        session.account_id,
+                        type(start_error).__name__,
+                        _safe_error_detail(start_error),
+                        exc_info=start_error,
+                    )
                 if isinstance(start_error, VerifyBrowserUnavailable):
                     session.state = VerifySessionState.ERROR
                     session.message = "browser_error"
@@ -617,13 +703,6 @@ class VerifyAccountService:
                     )
                 elif isinstance(start_error, (VerifyChallengeTimeout, TimeoutError)):
                     state, message = VerifySessionState.ERROR, "qr_timeout"
-                elif start_error is not None:
-                    log.warning(
-                        "验证会话启动失败: session=%s account=%s error=%s",
-                        session.session_id,
-                        session.account_id,
-                        type(start_error).__name__,
-                    )
                 self._finish_locked(session, state, message)
                 final = session.to_public()
                 return final
@@ -753,6 +832,193 @@ class VerifyAccountService:
             self._schedule_driver_close(driver, session)
         return result
 
+    async def check(self, account_id: str) -> dict[str, object]:
+        """Query upstream verification truth without any QR/browser session.
+
+        This is the recovery path for "Google says verified but the panel still
+        waits": it only builds a status-only driver (``confirm_verified``) and
+        never creates a ``VerifySession``, launches Chromium or takes a pool
+        slot.  Concurrent checks for the same account share one in-flight
+        future, so repeated UI polls collapse into a single upstream RPC.
+        """
+        if self._store.get_account(account_id) is None:
+            raise VerifyAccountNotFound(account_id)
+        inflight = self._check_futures.get(account_id)
+        if inflight is not None:
+            return await asyncio.shield(inflight)
+        future: asyncio.Future[dict[str, object]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._check_futures[account_id] = future
+        try:
+            result = await self._perform_check(account_id)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.set_result(
+                    self._check_payload(
+                        account_id,
+                        "error",
+                        "检查被取消，请重试",
+                        None,
+                    )
+                )
+            raise
+        except Exception as exc:
+            # Defensive: the probe path classifies its own errors, but a bug
+            # here must still produce a readable payload instead of a 500.
+            log.error(
+                "独立验证检查异常: account=%s error_type=%s error=%s",
+                account_id,
+                type(exc).__name__,
+                _safe_error_detail(exc),
+                exc_info=exc,
+            )
+            result = self._check_payload(
+                account_id,
+                "error",
+                f"查询上游验证状态失败：{type(exc).__name__}",
+                None,
+            )
+        finally:
+            self._check_futures.pop(account_id, None)
+        if not future.done():
+            future.set_result(result)
+        return result
+
+    async def _perform_check(self, account_id: str) -> dict[str, object]:
+        account = self._store.get_account(account_id)
+        if account is None:
+            return self._check_payload(account_id, "error", "账号不存在", None)
+        auth_file = self._store.get_auth_path_optional(account_id)
+        if auth_file is None or not auth_file.is_file():
+            log.warning(
+                "独立验证检查跳过: account=%s reason=credentials_missing",
+                account_id,
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                "凭据文件缺失，请重新导入 Cookie 后再检查",
+                None,
+            )
+        cookies = _read_auth_cookies(auth_file)
+        if not cookies:
+            log.warning(
+                "独立验证检查跳过: account=%s reason=cookies_unreadable",
+                account_id,
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                "无法读取该账号的 Google Cookie，请重新导入",
+                None,
+            )
+        if not calculate_sapisid_hash(cookies):
+            log.warning(
+                "独立验证检查跳过: account=%s reason=missing_sapisid",
+                account_id,
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                "凭据缺少 SAPISID，无法查询上游验证状态",
+                None,
+            )
+        auth_user = str(getattr(account, "auth_user", "0") or "0")
+        log.info(
+            "独立验证检查开始: account=%s auth_user=%s manual=true",
+            account_id,
+            auth_user,
+        )
+        try:
+            probe = self._status_driver_factory(auth_file, auth_user)
+        except Exception as exc:
+            log.error(
+                "独立验证检查驱动创建失败: account=%s error_type=%s error=%s",
+                account_id,
+                type(exc).__name__,
+                _safe_error_detail(exc),
+                exc_info=exc,
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                f"无法初始化验证状态查询：{type(exc).__name__}",
+                None,
+            )
+        try:
+            status_value = await probe.confirm_verified(auth_user)
+        except VerifySessionInvalid:
+            log.warning(
+                "独立验证检查失败: account=%s reason=session_invalid", account_id
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                "上游会话已失效，请重新登录后再检查",
+                None,
+            )
+        except VerifyRegionBlocked:
+            log.warning(
+                "独立验证检查失败: account=%s reason=region_blocked", account_id
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                "当前网络地区不支持验证查询，请更换出口后重试",
+                None,
+            )
+        except Exception as exc:
+            log.error(
+                "独立验证检查失败: account=%s error_type=%s error=%s",
+                account_id,
+                type(exc).__name__,
+                _safe_error_detail(exc),
+                exc_info=exc,
+            )
+            return self._check_payload(
+                account_id,
+                "error",
+                f"查询上游验证状态失败：{type(exc).__name__}",
+                None,
+            )
+        upstream_status = (
+            status_value
+            if isinstance(status_value, int) and not isinstance(status_value, bool)
+            else None
+        )
+        if upstream_status in (2, 3):
+            self._clear_verify_required(account_id)
+            message = "verified" if upstream_status == 2 else "not_required"
+            log.info(
+                "独立验证检查通过: account=%s upstream_status=%s",
+                account_id,
+                upstream_status,
+            )
+            return self._check_payload(account_id, "passed", message, upstream_status)
+        message = "still_pending" if upstream_status == 1 else "upstream_pending"
+        log.info(
+            "独立验证检查保持待验证: account=%s upstream_status=%s",
+            account_id,
+            upstream_status,
+        )
+        return self._check_payload(account_id, "pending", message, upstream_status)
+
+    def _check_payload(
+        self,
+        account_id: str,
+        state: str,
+        message: str,
+        upstream_status: int | None,
+    ) -> dict[str, object]:
+        account = self._store.get_account(account_id)
+        return {
+            "state": state,
+            "message": message,
+            "upstream_status": upstream_status,
+            "verify_required": bool(getattr(account, "verify_required", False)),
+        }
+
     async def close(self) -> None:
         async with self._lock:
             self._closed = True
@@ -864,16 +1130,43 @@ class VerifyAccountService:
             done, probe = await self._await_or_cancel(driver.poll(), cancel_event)
         except Exception as exc:
             log.warning(
-                "验证会话页面探测失败: session=%s account=%s error=%s",
+                "验证会话页面探测失败: session=%s account=%s error_type=%s error=%s",
                 session.session_id,
                 session.account_id,
                 type(exc).__name__,
+                _safe_error_detail(exc),
             )
             await self._finish(session, VerifySessionState.ERROR, "browser_poll_failed")
             return
         if not done:
             return
         assert isinstance(probe, PageProbe)
+
+        # Read-only page diagnostics: URL/title/masked text and whether the key
+        # controls are present.  ``describe_page`` never clicks or reloads, so
+        # the pending QR keeps rendering while this runs.
+        page_info = await self._describe_page_for_log(driver)
+        page_url = str(page_info.get("url") or probe.page_url or "")
+        page_title = str(page_info.get("title") or "-")
+        probe_error = str(probe.error or page_info.get("error") or "-")
+        log.info(
+            "验证会话页面状态: session=%s account=%s manual=%s page_url=%s "
+            "page_title=%s probe_success=%s probe_failed=%s probe_error=%s "
+            "verify_button=%s qr_canvas=%s region_blocked=%s login_form=%s text=%s",
+            session.session_id,
+            session.account_id,
+            force,
+            page_url or "-",
+            page_title,
+            probe.success,
+            probe.failed,
+            probe_error,
+            page_info.get("verify_button", "-"),
+            page_info.get("qr_canvas", "-"),
+            page_info.get("region_blocked", "-"),
+            page_info.get("login_form", "-"),
+            _safe_page_text(page_info.get("text")) or "-",
+        )
 
         if is_login_page_url(probe.page_url):
             await self._finish(
@@ -920,18 +1213,16 @@ class VerifyAccountService:
             # Bounded: the direct RPC has its own short timeout; any transport
             # error stays pending and is retried by the next status call.
             log.warning(
-                "验证会话状态确认失败: session=%s account=%s error=%s",
+                "验证会话状态确认失败: session=%s account=%s manual=%s "
+                "page_url=%s error_type=%s error=%s upstream_status=None",
                 session.session_id,
                 session.account_id,
+                force,
+                page_url or "-",
                 type(exc).__name__,
+                _safe_error_detail(exc),
             )
             session.message = "rpc_pending"
-            if force:
-                log.info(
-                    "验证会话手动检查: session=%s probe_success=%s status=None",
-                    session.session_id,
-                    probe.success,
-                )
             return
         if not done:
             return
@@ -940,15 +1231,22 @@ class VerifyAccountService:
 
         if force:
             log.info(
-                "验证会话手动检查: session=%s probe_success=%s status=%s",
+                "验证会话手动检查: session=%s account=%s manual=true "
+                "page_url=%s page_title=%s probe_success=%s upstream_status=%s",
                 session.session_id,
+                session.account_id,
+                page_url or "-",
+                page_title,
                 probe.success,
                 status_value,
             )
         else:
             log.debug(
-                "验证会话自动检查: session=%s probe_success=%s status=%s",
+                "验证会话自动检查: session=%s account=%s page_url=%s "
+                "probe_success=%s upstream_status=%s",
                 session.session_id,
+                session.account_id,
+                page_url or "-",
                 probe.success,
                 status_value,
             )
@@ -963,6 +1261,25 @@ class VerifyAccountService:
             return
         # 1 / None: upstream still pending.
         session.message = "still_pending"
+
+    async def _describe_page_for_log(
+        self, driver: VerifyBrowserSession
+    ) -> dict[str, object]:
+        """Best-effort read-only page diagnostics; never fails the poll."""
+        describe = getattr(driver, "describe_page", None)
+        if not callable(describe):
+            return {}
+        try:
+            value = await asyncio.wait_for(
+                cast("Awaitable[object]", describe()), timeout=5.0
+            )
+        except Exception as exc:
+            return {"error": type(exc).__name__}
+        return (
+            {str(key): item for key, item in value.items()}
+            if isinstance(value, dict)
+            else {}
+        )
 
     def _clear_verify_required(self, account_id: str) -> None:
         self._store.update_account_refresh(account_id, verify_required=False)
@@ -1016,10 +1333,11 @@ class VerifyAccountService:
         self._driver = None
         duration = max(0.0, session.finished_at - session.created_at)
         log.info(
-            "验证会话结束: session=%s account=%s state=%s duration=%.1fs",
+            "验证会话结束: session=%s account=%s state=%s message=%s duration=%.1fs",
             session.session_id,
             session.account_id,
             state.value,
+            message,
             duration,
         )
         self._schedule_timer_locked(session.cleanup_at, session.session_id)
@@ -1165,6 +1483,12 @@ class CdpVerifyBrowserDriver:
             page = await client.connect_page(block_assets=False)
             self._page = page
         except Exception as exc:
+            log.error(
+                "验证浏览器进程启动失败: error_type=%s error=%s",
+                type(exc).__name__,
+                _safe_error_detail(exc),
+                exc_info=exc,
+            )
             await self.close()
             raise VerifyBrowserUnavailable(
                 "验证浏览器启动失败，请检查 AISTUDIO_VERIFY_CHROME_PATH 与运行用户权限"
@@ -1180,13 +1504,37 @@ class CdpVerifyBrowserDriver:
             await self._raise_on_redirect(page)
             return await self._wait_for_qr(page)
         except BaseException:
+            # Capture where the page actually stopped (URL/title/masked text)
+            # before closing the profile; this is what makes ``state=error``
+            # diagnosable from the log alone.
+            await self._log_page_state("验证浏览器启动异常时的页面状态")
             await self.close()
             raise
+
+    async def describe_page(self) -> dict[str, object]:
+        """Read-only page snapshot (URL/title/text/key controls) for logs."""
+        return await _describe_page_snapshot(self._page)
+
+    async def _log_page_state(self, tag: str, page: CDPPage | None = None) -> None:
+        info = await _describe_page_snapshot(self._page if page is None else page)
+        log.info(
+            "%s: page_url=%s page_title=%s verify_button=%s qr_canvas=%s "
+            "region_blocked=%s login_form=%s page_error=%s text=%s",
+            tag,
+            info.get("url") or "-",
+            info.get("title") or "-",
+            info.get("verify_button", "-"),
+            info.get("qr_canvas", "-"),
+            info.get("region_blocked", "-"),
+            info.get("login_form", "-"),
+            info.get("error") or "-",
+            _safe_page_text(info.get("text")) or "-",
+        )
 
     async def poll(self) -> PageProbe:
         page = self._page
         if page is None or page.is_closed():
-            return PageProbe(page_url="", success=False)
+            return PageProbe(page_url="", success=False, error="page_closed")
         snapshot = await _page_snapshot(page)
         url = str(snapshot.get("url") or page.url or "")
         text = str(snapshot.get("text") or "")
@@ -1194,6 +1542,7 @@ class CdpVerifyBrowserDriver:
             page_url=url,
             success=_is_success_page(url, text),
             failed=_is_failure_page(url, text),
+            error=None if snapshot else "snapshot_failed",
         )
 
     async def confirm_verified(self, auth_user: str) -> int | None:
@@ -1312,16 +1661,24 @@ class CdpVerifyBrowserDriver:
     async def _wait_for_qr(self, page: CDPPage) -> QrChallenge:
         deadline = time.monotonic() + self._code_timeout
         last_click_at = 0.0
+        last_log_at = 0.0
         while time.monotonic() < deadline:
             url = await _current_url(page)
             if is_login_page_url(url):
                 raise VerifySessionInvalid("login_redirect")
             if "available-regions" in url:
                 raise VerifyRegionBlocked("available_regions")
+            now = time.monotonic()
+            if now - last_log_at >= CLICK_RETRY_INTERVAL_SECONDS:
+                # Periodic, read-only wait diagnostics: show which page the
+                # headless browser is stuck on (URL/title/controls/text) without
+                # touching the reCAPTCHA challenge.
+                await self._log_page_state("扫码等待中", page)
+                last_log_at = now
             challenge = await self._read_bframe_qr(page)
             if challenge is not None:
+                log.info("扫码二维码已就绪: qr_ready=true")
                 return challenge
-            now = time.monotonic()
             if now - last_click_at >= CLICK_RETRY_INTERVAL_SECONDS:
                 # Only enabled elements are clicked.  A disabled button returns
                 # false and the loop keeps retrying inside the same 20s budget;
@@ -1332,6 +1689,7 @@ class CdpVerifyBrowserDriver:
                 if clicked:
                     last_click_at = now
             await asyncio.sleep(0.5)
+        log.warning("扫码等待超时: deadline=%.1fs", self._code_timeout)
         raise VerifyChallengeTimeout("qr_timeout")
 
     async def _read_bframe_qr(self, page: CDPPage) -> QrChallenge | None:
@@ -1508,6 +1866,29 @@ async def _page_snapshot(page: CDPPage) -> dict[str, object]:
     return cast(dict[str, object], value) if isinstance(value, dict) else {}
 
 
+async def _describe_page_snapshot(page: CDPPage | None) -> dict[str, object]:
+    """Read-only URL/title/text/control probe shared by logs and ``describe_page``."""
+    if page is None:
+        return {"url": "", "title": "", "text": "", "page_closed": True}
+    is_closed = getattr(page, "is_closed", None)
+    if callable(is_closed) and is_closed():
+        return {"url": "", "title": "", "text": "", "page_closed": True}
+    try:
+        value = await page.evaluate(_DESCRIBE_PAGE_JS, timeout_s=5.0)
+    except Exception as exc:
+        return {
+            "url": str(getattr(page, "url", "") or ""),
+            "title": "",
+            "text": "",
+            "error": type(exc).__name__,
+        }
+    return (
+        {str(key): item for key, item in value.items()}
+        if isinstance(value, dict)
+        else {}
+    )
+
+
 async def _taskkill_tree_windows(pid: int) -> None:
     """Kill a Windows process tree while the parent-child links still exist."""
     with contextlib.suppress(Exception):
@@ -1579,6 +1960,13 @@ def _default_driver_factory(
     )
 
 
+def _default_status_driver_factory(
+    auth_file: Path, auth_user: str
+) -> VerifyStatusProbe:
+    """Status-only driver: no process/page is created until ``confirm_verified``."""
+    return CdpVerifyBrowserDriver(auth_file=auth_file, auth_user=auth_user)
+
+
 _verify_service: VerifyAccountService | None = None
 
 
@@ -1587,6 +1975,7 @@ async def init_verify_account_service(
     rotator: AccountRotator | None,
     *,
     driver_factory: VerifyDriverFactory | None = None,
+    status_driver_factory: StatusDriverFactory | None = None,
 ) -> VerifyAccountService:
     global _verify_service
     await shutdown_verify_account_service()
@@ -1594,6 +1983,7 @@ async def init_verify_account_service(
         account_store,
         rotator,
         driver_factory=driver_factory,
+        status_driver_factory=status_driver_factory,
     )
     return _verify_service
 
@@ -1620,6 +2010,7 @@ __all__ = [
     "CdpVerifyBrowserDriver",
     "PageProbe",
     "QrChallenge",
+    "StatusDriverFactory",
     "VerifyAccountController",
     "VerifyAccountError",
     "VerifyAccountNotFound",
@@ -1634,6 +2025,7 @@ __all__ = [
     "VerifySessionInvalid",
     "VerifySessionNotFound",
     "VerifySessionState",
+    "VerifyStatusProbe",
     "get_verify_account_service",
     "init_verify_account_service",
     "set_verify_account_service",

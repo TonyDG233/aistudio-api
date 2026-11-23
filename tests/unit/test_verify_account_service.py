@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import platform
 import tempfile
 import time
@@ -23,6 +24,7 @@ from aistudio_api.application.verify_account_service import (
     CdpVerifyBrowserDriver,
     PageProbe,
     QrChallenge,
+    VerifyAccountNotFound,
     VerifyAccountService,
     VerifyBrowserUnavailable,
     VerifyChallengeTimeout,
@@ -1320,3 +1322,381 @@ async def test_non_force_status_throttles_upstream_rpc(tmp_path: Path) -> None:
         assert len(driver.confirm_calls) == 2
     finally:
         await service.close()
+
+
+# ---------------------------------------------------------------------------
+# Session-less ``check`` (POST /verify/check) coverage
+# ---------------------------------------------------------------------------
+
+
+def _add_check_account(
+    store: AccountStore,
+    account_id: str,
+    *,
+    verify_required: bool = True,
+    cookies: list[dict[str, object]] | None = None,
+) -> None:
+    store.save_account(
+        name=account_id,
+        email=f"{account_id}@example.com",
+        storage_state={
+            "cookies": cookies
+            if cookies is not None
+            else [
+                {
+                    "name": "SAPISID",
+                    "value": "sapisid-value",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+                {
+                    "name": "SID",
+                    "value": "sid-value",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+            ],
+            "origins": [],
+        },
+        account_id=account_id,
+        auth_user="3",
+        tier="Free",
+        enabled=True,
+    )
+    if verify_required:
+        store.update_account_refresh(account_id, verify_required=True)
+
+
+class FakeStatusDriver:
+    """Status-only probe: records confirm calls, never starts a browser."""
+
+    def __init__(
+        self,
+        status: int | None = 2,
+        *,
+        error: BaseException | None = None,
+        delay: float = 0.0,
+    ) -> None:
+        self.status = status
+        self.error = error
+        self.delay = delay
+        self.confirm_calls: list[str] = []
+
+    async def confirm_verified(self, auth_user: str) -> int | None:
+        self.confirm_calls.append(auth_user)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.status
+
+
+def _check_service(
+    store: AccountStore,
+    status_driver: FakeStatusDriver,
+    *,
+    rotator: FakeRotator | None = None,
+    **kwargs: Any,
+) -> VerifyAccountService:
+    def unused_start_factory(_session: Any, _auth_file: Path) -> Any:
+        raise AssertionError("check must never create a QR/浏览器会话")
+
+    return VerifyAccountService(
+        store,
+        cast(Any, rotator),
+        driver_factory=unused_start_factory,
+        status_driver_factory=lambda _auth_file, _auth_user: status_driver,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "message"), [(2, "verified"), (3, "not_required")])
+async def test_check_passed_status_clears_verify_lock_without_session(
+    tmp_path: Path, status: int, message: str
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1", verify_required=True)
+    rotator = FakeRotator()
+    driver = FakeStatusDriver(status=status)
+    service = _check_service(store, driver, rotator=rotator)
+    try:
+        result = await service.check("acc_1")
+
+        assert result == {
+            "state": "passed",
+            "message": message,
+            "upstream_status": status,
+            "verify_required": False,
+        }
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is False
+        # Same rotator path as a real pass: memory flag is cleared too.
+        assert rotator.stats["acc_1"].verify_required is False
+        assert driver.confirm_calls == ["3"]
+        # No QR session, no instance, no browser launch.
+        assert service.session is None
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(1, "still_pending"), (None, "upstream_pending")],
+)
+async def test_check_pending_status_keeps_verify_lock(
+    tmp_path: Path, status: int | None, message: str
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1", verify_required=True)
+    driver = FakeStatusDriver(status=status)
+    service = _check_service(store, driver)
+    try:
+        result = await service.check("acc_1")
+
+        assert result["state"] == "pending"
+        assert result["message"] == message
+        assert result["upstream_status"] == status
+        assert result["verify_required"] is True
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is True
+        assert service.session is None
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_check_missing_sapisid_returns_error_without_upstream_call(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(
+        store,
+        "acc_1",
+        cookies=[
+            {"name": "SID", "value": "sid-only", "domain": ".google.com", "path": "/"}
+        ],
+    )
+    driver = FakeStatusDriver(status=2)
+    service = _check_service(store, driver)
+    try:
+        result = await service.check("acc_1")
+    finally:
+        await service.close()
+
+    assert result["state"] == "error"
+    assert "SAPISID" in str(result["message"])
+    assert result["upstream_status"] is None
+    assert driver.confirm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_check_missing_auth_file_returns_readable_error(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1")
+    auth_file = store.get_auth_path_optional("acc_1")
+    assert auth_file is not None
+    auth_file.unlink()
+    driver = FakeStatusDriver(status=2)
+    service = _check_service(store, driver)
+    try:
+        result = await service.check("acc_1")
+    finally:
+        await service.close()
+
+    assert result["state"] == "error"
+    assert "凭据文件缺失" in str(result["message"])
+    assert driver.confirm_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (VerifySessionInvalid("session_invalid"), "会话已失效"),
+        (VerifyRegionBlocked("region_blocked"), "地区不支持"),
+        (RuntimeError("SID=abc boom"), "RuntimeError"),
+    ],
+)
+async def test_check_upstream_failures_map_to_error(
+    tmp_path: Path, error: BaseException, expected: str
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1", verify_required=True)
+    driver = FakeStatusDriver(error=error)
+    service = _check_service(store, driver)
+    try:
+        result = await service.check("acc_1")
+    finally:
+        await service.close()
+
+    assert result["state"] == "error"
+    assert expected in str(result["message"])
+    assert result["upstream_status"] is None
+    account = store.get_account("acc_1")
+    assert account is not None and account.verify_required is True
+
+
+@pytest.mark.asyncio
+async def test_check_unknown_account_raises(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    service = _check_service(store, FakeStatusDriver())
+    try:
+        with pytest.raises(VerifyAccountNotFound):
+            await service.check("acc_missing")
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_checks_share_one_upstream_call(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1", verify_required=True)
+    driver = FakeStatusDriver(status=2, delay=0.05)
+    service = _check_service(store, driver)
+    try:
+        first, second = await asyncio.gather(
+            service.check("acc_1"), service.check("acc_1")
+        )
+    finally:
+        await service.close()
+
+    assert first == second
+    assert first["state"] == "passed"
+    assert len(driver.confirm_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_is_idempotent_after_pass(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_check_account(store, "acc_1", verify_required=True)
+    driver = FakeStatusDriver(status=2)
+    service = _check_service(store, driver)
+    try:
+        first = await service.check("acc_1")
+        second = await service.check("acc_1")
+    finally:
+        await service.close()
+
+    assert first["state"] == second["state"] == "passed"
+    assert second["verify_required"] is False
+    # Both checks are harmless upstream confirmations; the lock stays cleared.
+    assert len(driver.confirm_calls) == 2
+
+
+class _DescribingDriver(FakeDriver):
+    async def describe_page(self) -> dict[str, object]:
+        return {
+            "url": _VERIFY_URL,
+            "title": "Verify your account",
+            "text": "Verify device for user@example.com SID=abc123",
+            "verify_button": True,
+            "qr_canvas": True,
+        }
+
+
+@pytest.mark.asyncio
+async def test_refresh_logs_page_state_and_upstream_status_without_secrets(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = _DescribingDriver(
+        poll_results=[PageProbe(_VERIFY_URL, False)],
+        confirm_status=1,
+    )
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        started = await service.start("acc_1")
+        await service.status("acc_1", str(started["session_id"]), force=True)
+    finally:
+        await service.close()
+
+    page_records = [
+        r.getMessage() for r in caplog.records if "验证会话页面状态" in r.getMessage()
+    ]
+    assert page_records, "page state must be logged on every poll"
+    page_log = page_records[-1]
+    assert "page_url=https://aistudio.google.com/verify-account" in page_log
+    assert "page_title=Verify your account" in page_log
+    assert "probe_success=False" in page_log
+    assert "user@example.com" not in page_log
+    assert "***@***" in page_log
+    assert "SID=***" in page_log
+
+    manual = [
+        r.getMessage() for r in caplog.records if "验证会话手动检查" in r.getMessage()
+    ]
+    assert manual and "upstream_status=1" in manual[-1]
+    assert "manual=true" in manual[-1]
+
+
+@pytest.mark.asyncio
+async def test_start_failure_logs_exception_type_and_masked_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1")
+    driver = FakeDriver(start_error=RuntimeError("launch boom SID=secretvalue"))
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        started = await service.start("acc_1")
+    finally:
+        await service.close()
+
+    assert started["state"] == VerifySessionState.ERROR.value
+    errors = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "验证会话启动失败" in r.getMessage()
+    ]
+    assert errors, "start failure must emit an ERROR record"
+    message = errors[-1].getMessage()
+    assert "account=acc_1" in message
+    assert "error_type=RuntimeError" in message
+    assert "SID=***" in message
+    assert "secretvalue" not in message
+    assert errors[-1].exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_describe_page_handles_closed_and_live_pages(tmp_path: Path) -> None:
+    driver = CdpVerifyBrowserDriver(auth_file=tmp_path / "auth.json")
+    closed = await driver.describe_page()
+    assert closed["page_closed"] is True
+
+    class _Page:
+        url = _VERIFY_URL
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def evaluate(self, expression: str, **kwargs: Any) -> object:
+            assert "window.location.href" in expression
+            assert "verify device" in expression
+            return {
+                "url": _VERIFY_URL,
+                "title": "Verify",
+                "text": "hello",
+                "verify_button": True,
+                "qr_canvas": False,
+            }
+
+    driver._page = cast(Any, _Page())
+    live = await driver.describe_page()
+    assert live["url"] == _VERIFY_URL
+    assert live["title"] == "Verify"
+    assert live["verify_button"] is True
+
+
+def test_safe_page_text_masks_email_and_tokens() -> None:
+    preview = verify_module._safe_page_text(
+        "Contact dev@example.com cookie SID=abcdef " + "x" * 400
+    )
+    assert "dev@example.com" not in preview
+    assert "***@***" in preview
+    assert "SID=***" in preview
+    assert len(preview) <= verify_module._PAGE_TEXT_LOG_LIMIT

@@ -14,6 +14,7 @@ import {
   Loader2,
   QrCode,
   RefreshCw,
+  ShieldCheck,
   X,
 } from 'lucide-vue-next'
 
@@ -60,6 +61,14 @@ const nowTs = ref(Date.now())
 const lastCheckedAt = ref(0)
 const flowStartedAt = ref(0)
 
+// 账号真实状态查询（独立于扫码会话，随时可用）
+type AccountCheckState = '' | 'passed' | 'pending' | 'error'
+const checkingAccount = ref(false)
+const accountCheckState = ref<AccountCheckState>('')
+const accountCheckMessage = ref('')
+const accountCheckStatus = ref<number | null>(null)
+const accountCheckAt = ref(0)
+
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let tickTimer: ReturnType<typeof setInterval> | null = null
 let autoCloseTimer: ReturnType<typeof setTimeout> | null = null
@@ -81,11 +90,37 @@ const startingElapsed = computed(() => {
   return Math.max(0, Math.floor((nowTs.value - flowStartedAt.value) / 1000))
 })
 
-const lastCheckedLabel = computed(() => {
-  if (!lastCheckedAt.value) return ''
-  const d = new Date(lastCheckedAt.value)
+function formatClock(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
   const pad = (n: number): string => String(n).padStart(2, '0')
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+const lastCheckedLabel = computed(() => formatClock(lastCheckedAt.value))
+
+const accountCheckAtLabel = computed(() => formatClock(accountCheckAt.value))
+
+const accountCheckToneClass = computed(() => {
+  if (checkingAccount.value) return 'text-gray-700 bg-gray-50 border-gray-200'
+  switch (accountCheckState.value) {
+    case 'passed':
+      return 'text-emerald-800 bg-emerald-50 border-emerald-200'
+    case 'pending':
+      return 'text-amber-800 bg-amber-50 border-amber-200'
+    case 'error':
+      return 'text-rose-800 bg-rose-50 border-rose-200'
+    default:
+      return 'text-gray-600 bg-gray-50 border-gray-200'
+  }
+})
+
+const accountCheckPendingDetail = computed(() => {
+  const status = accountCheckStatus.value === null ? '未知' : String(accountCheckStatus.value)
+  const msg = accountCheckMessage.value.trim()
+  return msg
+    ? `上游仍要求验证（status=${status}）：${msg}`
+    : `上游仍要求验证（status=${status}）`
 })
 
 function resolveMessageLabel(raw: string): string {
@@ -296,6 +331,14 @@ function resetSession(): void {
   cancelSettled = false
 }
 
+function resetAccountCheck(): void {
+  checkingAccount.value = false
+  accountCheckState.value = ''
+  accountCheckMessage.value = ''
+  accountCheckStatus.value = null
+  accountCheckAt.value = 0
+}
+
 function describeError(err: unknown): string {
   if (err instanceof ApiError) {
     return err.detail
@@ -446,6 +489,40 @@ async function finalStatusCheck(): Promise<void> {
   }
 }
 
+async function checkAccountVerify(): Promise<void> {
+  if (!props.account || checkingAccount.value) return
+  checkingAccount.value = true
+  accountCheckState.value = ''
+  accountCheckMessage.value = ''
+  accountCheckStatus.value = null
+  const accountId = props.account.id
+  try {
+    const res = await accountsApi.checkVerifyAccount(accountId)
+    if (!props.modelValue || props.account?.id !== accountId) return
+    accountCheckState.value = res.state
+    accountCheckMessage.value = res.message || ''
+    accountCheckStatus.value = res.upstream_status
+    accountCheckAt.value = Date.now()
+    if (res.state === 'passed') {
+      toast.success('账号已验证，已恢复调度')
+      emit('verified')
+      void accountsStore.fetchAll()
+      // 账号真实状态已恢复：停止扫码轮询并关闭弹窗，由 watcher 负责取消残留会话。
+      stopTimers()
+      flowToken += 1
+      emit('update:modelValue', false)
+    }
+  } catch (err) {
+    if (!props.modelValue || props.account?.id !== accountId) return
+    accountCheckState.value = 'error'
+    accountCheckStatus.value = null
+    accountCheckMessage.value = describeError(err) || '账号状态查询失败，请稍后重试'
+    accountCheckAt.value = Date.now()
+  } finally {
+    if (props.account?.id === accountId) checkingAccount.value = false
+  }
+}
+
 async function closeModal(): Promise<void> {
   stopTimers()
   flowToken += 1
@@ -496,6 +573,7 @@ async function refreshQr(): Promise<void> {
 
 async function openFlow(): Promise<void> {
   stopTimers()
+  resetAccountCheck()
   resetSession()
   startTicker()
   await startSession()
@@ -528,6 +606,7 @@ watch(
       }
       closeHandled = false
       phase.value = 'idle'
+      resetAccountCheck()
       return
     }
     if (!accountId) return
@@ -538,6 +617,7 @@ watch(
       // Account switch while open: tear down the previous session first.
       stopTimers()
       flowToken += 1
+      resetAccountCheck()
       void cancelSession(openedFor)
     }
     openedFor = accountId
@@ -630,6 +710,62 @@ onBeforeUnmount(() => {
         >
           上次检查 {{ lastCheckedLabel }} · {{ statusHint }}
         </p>
+
+        <!-- 账号真实状态（独立于扫码会话，无需二维码） -->
+        <div
+          class="rounded-xl border px-3 py-2 space-y-1 text-xs"
+          :class="accountCheckToneClass"
+        >
+          <div class="flex items-center justify-between gap-2">
+            <span class="inline-flex items-center gap-1.5 font-semibold">
+              <Loader2
+                v-if="checkingAccount"
+                class="w-3.5 h-3.5 animate-spin"
+              />
+              <ShieldCheck
+                v-else
+                class="w-3.5 h-3.5"
+              />
+              <span>账号真实状态</span>
+            </span>
+            <span
+              v-if="accountCheckAtLabel && !checkingAccount"
+              class="font-mono text-[11px] opacity-80"
+            >
+              {{ accountCheckAtLabel }}
+            </span>
+          </div>
+          <p
+            v-if="checkingAccount"
+            class="leading-relaxed"
+          >
+            查询中…
+          </p>
+          <p
+            v-else-if="accountCheckState === 'passed'"
+            class="leading-relaxed"
+          >
+            账号已验证，已恢复调度。
+          </p>
+          <p
+            v-else-if="accountCheckState === 'pending'"
+            class="leading-relaxed"
+          >
+            {{ accountCheckPendingDetail }}
+          </p>
+          <p
+            v-else-if="accountCheckState === 'error'"
+            class="leading-relaxed break-words"
+          >
+            查询失败：{{ accountCheckMessage }}
+          </p>
+          <p
+            v-else
+            class="leading-relaxed opacity-80"
+          >
+            尚未查询。点击「查询账号状态」可直接获取账号在 Google 上游的真实状态，无需二维码。
+          </p>
+        </div>
 
         <!-- QR / skeleton -->
         <div
@@ -725,6 +861,8 @@ onBeforeUnmount(() => {
         <p class="text-[11px] text-gray-400 leading-relaxed">
           ⓘ 验证成功后账号会自动恢复调度；二维码过期或失效时请点击「刷新二维码」。
           弹窗打开且处于等待状态时会每 2.5 秒自动查询一次结果。
+          「检查扫码状态」只看当前扫码会话；「查询账号状态」直接查账号在 Google 上游的真实状态，
+          无需二维码，扫码会话报错或尚未生成二维码时同样可用。
         </p>
       </div>
 
@@ -745,7 +883,25 @@ onBeforeUnmount(() => {
         </button>
         <button
           type="button"
+          class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-brand-800 bg-brand-50 hover:bg-brand-100 border border-brand-300 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+          title="直接查询账号在 Google 上游的真实验证状态并清锁，不需要二维码会话"
+          :disabled="checkingAccount"
+          @click="checkAccountVerify"
+        >
+          <Loader2
+            v-if="checkingAccount"
+            class="w-3.5 h-3.5 animate-spin"
+          />
+          <ShieldCheck
+            v-else
+            class="w-3.5 h-3.5"
+          />
+          <span>{{ checkingAccount ? '查询中…' : '查询账号状态' }}</span>
+        </button>
+        <button
+          type="button"
           class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+          title="仅检查当前扫码会话的验证结果，需要二维码会话已创建"
           :disabled="!isPending || checking || busy"
           @click="pollStatus(true)"
         >
@@ -757,7 +913,7 @@ onBeforeUnmount(() => {
             v-else
             class="w-3.5 h-3.5"
           />
-          <span>{{ phase === 'starting' ? '启动中…' : checking ? '检查中…' : '检查状态' }}</span>
+          <span>{{ phase === 'starting' ? '启动中…' : checking ? '检查中…' : '检查扫码状态' }}</span>
         </button>
         <button
           type="button"

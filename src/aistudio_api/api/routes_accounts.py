@@ -582,6 +582,13 @@ class VerifyCancelResponse(BaseModel):
     state: str
 
 
+class VerifyCheckResponse(BaseModel):
+    state: str
+    message: str
+    upstream_status: int | None = None
+    verify_required: bool = False
+
+
 class RefreshAccountsRequest(BaseModel):
     account_ids: list[str] | None = None
     all: bool = False
@@ -1327,6 +1334,41 @@ async def cancel_account_verification(
     state = str(payload.get("state") or "")
     log.info("账号验证会话取消: id=%s, state=%s", account_id, state)
     return VerifyCancelResponse(state=state)
+
+
+@router.post("/{account_id}/verify/check", response_model=VerifyCheckResponse)
+async def check_account_verification(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    simulate: str | None = Query(default=None),
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+    controller: VerifyAccountController = Depends(get_verify_account_controller),
+) -> VerifyCheckResponse:
+    """独立查询账号验证状态（不依赖二维码会话/浏览器/实例）。
+
+    实际登录账号扫码通过后若面板仍停在“待验证”，此接口只读取该账号
+    auth.json 并调用上游 ``GetUserVerificationStatus``：2/3 立即清
+    ``verify_required`` 并返回 ``passed``，1/None 保持 ``pending``。
+    ``simulate`` 仅用于 ui-debug 沙盒的确定性 passed/pending/error 演示，
+    生产路径不会把它交给真实服务。
+    """
+    if account_service.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    sandbox = get_ui_sandbox(runtime_state)
+    try:
+        if sandbox is not None:
+            payload = await sandbox.verify_service.check(account_id, simulate=simulate)
+        else:
+            payload = await controller.check(account_id)
+    except VerifyAccountNotFound as exc:
+        raise HTTPException(status_code=404, detail="账号不存在") from exc
+    log.info(
+        "账号验证状态独立检查: id=%s, state=%s, upstream_status=%s",
+        account_id,
+        payload.get("state"),
+        payload.get("upstream_status"),
+    )
+    return VerifyCheckResponse.model_validate(payload)
 
 
 @router.delete("/{account_id}")

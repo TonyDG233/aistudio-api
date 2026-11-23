@@ -15,6 +15,7 @@ import type {
   RefreshAccountsResponse,
   VerifySessionResponse,
   VerifyCancelResponse,
+  VerifyAccountCheckResponse,
   BatchDeleteResponse,
   BatchToggleResponse,
 } from '@/types'
@@ -176,5 +177,12 @@ export const accountsApi = {
     return request<VerifyCancelResponse>(`/api/accounts/${encodeURIComponent(id)}/verify/cancel`, {
       method: 'POST',
     })
+  },
+
+  checkVerifyAccount(id: string): Promise<VerifyAccountCheckResponse> {
+    return request<VerifyAccountCheckResponse>(
+      `/api/accounts/${encodeURIComponent(id)}/verify/check`,
+      { method: 'POST' },
+    )
   },
 }

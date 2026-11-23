@@ -68,7 +68,23 @@ def _add_account(store: AccountStore, account_id: str, *, enabled: bool = True) 
     store.save_account(
         name=account_id,
         email=f"{account_id}@example.com",
-        storage_state={"cookies": [], "origins": []},
+        storage_state={
+            "cookies": [
+                {
+                    "name": "SAPISID",
+                    "value": "sapisid-value",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+                {
+                    "name": "SID",
+                    "value": "sid-value",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+            ],
+            "origins": [],
+        },
         account_id=account_id,
         auth_user="0",
         tier="Free",
@@ -318,3 +334,108 @@ async def test_delete_account_cancels_active_verify_session(
     session = verify_route_env.service.session
     assert session is not None
     assert session.state.value == "cancelled"
+
+
+class RouteStatusDriver:
+    """Status-only fake driver for ``POST /verify/check``."""
+
+    def __init__(self, status: int | None = 2) -> None:
+        self.status = status
+        self.confirm_calls: list[str] = []
+
+    async def confirm_verified(self, auth_user: str) -> int | None:
+        self.confirm_calls.append(auth_user)
+        return self.status
+
+
+def _install_check_service(
+    store: AccountStore, driver: RouteStatusDriver
+) -> VerifyAccountService:
+    service = VerifyAccountService(
+        store,
+        None,
+        status_driver_factory=lambda _auth_file, _auth_user: driver,
+    )
+    set_verify_account_service(service)
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "state", "message"),
+    [
+        (2, "passed", "verified"),
+        (3, "passed", "not_required"),
+        (1, "pending", "still_pending"),
+    ],
+)
+async def test_verify_check_route_returns_actionable_state(
+    verify_route_env: RouteEnv, status: int, state: str, message: str
+) -> None:
+    verify_route_env.store.update_account_refresh("acc_1", verify_required=True)
+    driver = RouteStatusDriver(status)
+    check_service = _install_check_service(verify_route_env.store, driver)
+    try:
+        async with _client() as client:
+            # ``simulate`` is a sandbox-only query: production must ignore it.
+            resp = await client.post(
+                "/api/accounts/acc_1/verify/check",
+                params={"simulate": "error"},
+            )
+    finally:
+        await check_service.close()
+        set_verify_account_service(verify_route_env.service)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["state"] == state
+    assert payload["message"] == message
+    assert payload["upstream_status"] == status
+    assert payload["verify_required"] is (state != "passed")
+    assert driver.confirm_calls == ["0"]
+    assert check_service.session is None
+
+
+@pytest.mark.asyncio
+async def test_verify_check_route_error_when_credentials_lack_sapisid(
+    verify_route_env: RouteEnv,
+) -> None:
+    auth_file = verify_route_env.store.get_auth_path_optional("acc_1")
+    assert auth_file is not None
+    auth_file.write_text(
+        '{"cookies":[{"name":"SID","value":"sid","domain":".google.com","path":"/"}],'
+        '"origins":[]}',
+        encoding="utf-8",
+    )
+    driver = RouteStatusDriver(2)
+    check_service = _install_check_service(verify_route_env.store, driver)
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/accounts/acc_1/verify/check")
+    finally:
+        await check_service.close()
+        set_verify_account_service(verify_route_env.service)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["state"] == "error"
+    assert "SAPISID" in payload["message"]
+    assert payload["upstream_status"] is None
+    assert driver.confirm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_verify_check_route_missing_account(verify_route_env: RouteEnv) -> None:
+    async with _client() as client:
+        resp = await client.post("/api/accounts/acc_missing/verify/check")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_verify_check_route_requires_web_auth(
+    verify_route_env: RouteEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "web_password", "secret")
+    async with _client() as client:
+        resp = await client.post("/api/accounts/acc_1/verify/check")
+    assert resp.status_code == 401
