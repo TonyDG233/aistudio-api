@@ -1,2 +1,4 @@
 # 研究用公开静态资源（可从公开 CDN 重拉，不入库）
 bundle/
+# 抓取的原始页面（含 Google 公共 Web API Key，禁止入库）
+page*.html
