@@ -152,6 +152,16 @@ NET_BODY_URL_TOKENS = (
 )
 NET_BODY_MAX_PER_SESSION = 20
 NET_BODY_PREVIEW_LIMIT = 400
+# Request fingerprint for the two RPCs that decide the QR flow.  Exactly one
+# INFO line per matching request, capped per session; the ``post`` preview is
+# truncated and long credential-shaped runs are redacted, so no Cookie,
+# Authorization or access-token value can reach the log.
+RPC_FINGERPRINT_TOKENS = ("GenerateAccessToken", "VerifyUser")
+RPC_FINGERPRINT_MAX_PER_SESSION = 10
+RPC_FINGERPRINT_POST_LIMIT = 300
+RPC_FINGERPRINT_API_KEY_PREFIX = 10
+_RPC_FINGERPRINT_LONG_RUN_RE = re.compile(r"[A-Za-z0-9_\-\.=]{32,}")
+_RPC_FINGERPRINT_JWT_HEAD_RE = re.compile(r"eyJ[A-Za-z0-9_\-\.=]+")
 # QR frame diagnostics are logged at most once per interval (per round of frame
 # scanning), so the 0.5s polling loop does not double the log volume.
 QR_DIAG_INTERVAL_SECONDS = 2.0
@@ -458,6 +468,65 @@ def _sanitize_body_preview(body: str) -> str:
     if len(text) > NET_BODY_PREVIEW_LIMIT:
         text = text[:NET_BODY_PREVIEW_LIMIT] + "…"
     return text
+
+
+def _rpc_fingerprint_name(url_path: str) -> str | None:
+    """Return the whitelisted RPC name addressed by ``url_path`` (or ``None``)."""
+    lowered = str(url_path or "").lower()
+    for token in RPC_FINGERPRINT_TOKENS:
+        if token.lower() in lowered:
+            return token
+    return None
+
+
+def _header_value(headers: object, name: str) -> str:
+    """Case-insensitive header lookup; never raises on odd header containers."""
+    if not isinstance(headers, dict):
+        return ""
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return str(value or "")
+    return ""
+
+
+def _classify_auth(headers: object) -> str:
+    """Bucket the ``authorization`` header without exposing its value."""
+    value = _header_value(headers, "authorization").strip().lower()
+    if not value:
+        return "none"
+    if value.startswith("sapisidhash"):
+        return "sapisidhash"
+    if value.startswith("bearer"):
+        return "bearer"
+    return "other"
+
+
+def _mask_api_key(value: str) -> str:
+    """First 10 characters + ellipsis, or ``-`` when absent."""
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return text[:RPC_FINGERPRINT_API_KEY_PREFIX] + "…"
+
+
+def _cookie_segment_count(value: str) -> int:
+    """Number of ``;``-separated cookie pairs (count only, never content)."""
+    return len([part for part in str(value or "").split(";") if part.strip()])
+
+
+def _sanitize_post_preview(post_data: object) -> str:
+    """Masked, bounded preview of a request body.
+
+    Truncation happens first so the length budget is deterministic; then every
+    run of >=32 credential-shaped characters (JWT / access token / signed blob)
+    collapses to ``…``, and any residual ``eyJ`` JWT header run is masked too.
+    """
+    text = str(post_data or "")
+    if len(text) > RPC_FINGERPRINT_POST_LIMIT:
+        text = text[:RPC_FINGERPRINT_POST_LIMIT] + "…"
+    text = _RPC_FINGERPRINT_LONG_RUN_RE.sub("…", text)
+    return _RPC_FINGERPRINT_JWT_HEAD_RE.sub("…", text)
 
 
 def _qr_code_sources(payload: dict[str, object]) -> list[tuple[str, str]]:
@@ -1718,6 +1787,9 @@ class CdpVerifyBrowserDriver:
         self._net_body_fetches = 0
         self._net_bodies: dict[str, str] = {}
         self._net_body_tasks: set[asyncio.Task[None]] = set()
+        # Per-session cap for the masked GenerateAccessToken/VerifyUser
+        # request-fingerprint INFO lines (anti log-flood).
+        self._rpc_fingerprint_count = 0
         self._frame_navs: deque[tuple[float, str]] = deque(maxlen=NET_FRAME_NAV_MAXLEN)
         self._frame_nav_last_log_at = 0.0
         # "page" (on_frame_navigated), "cdp" (Page.frameNavigated) or "none".
@@ -1975,6 +2047,39 @@ class CdpVerifyBrowserDriver:
             )
         except Exception:
             log.debug("验证会话网络请求记录失败")
+            return
+        self._log_rpc_request_fingerprint(data)
+
+    def _log_rpc_request_fingerprint(self, data: dict[str, object]) -> None:
+        """One masked INFO fingerprint per GenerateAccessToken/VerifyUser request.
+
+        Only the whitelisted fields (method/auth badge/authuser/api-key prefix/
+        cookie count/post length/post preview) are printed; header values and the
+        raw body never reach the log.  Best-effort: a failure is one debug line.
+        """
+        try:
+            rpc = _rpc_fingerprint_name(str(data.get("url") or ""))
+            if rpc is None:
+                return
+            if self._rpc_fingerprint_count >= RPC_FINGERPRINT_MAX_PER_SESSION:
+                return
+            headers = data.get("headers")
+            post_data = str(data.get("post_data") or "")
+            log.info(
+                "[Verify] RPC 请求指纹 %s method=%s auth=%s authuser=%s "
+                "apikey=%s cookies=%d post_len=%d post=%s",
+                rpc,
+                str(data.get("method") or "GET")[:8],
+                _classify_auth(headers),
+                _header_value(headers, "x-goog-authuser") or "-",
+                _mask_api_key(_header_value(headers, "x-goog-api-key")),
+                _cookie_segment_count(_header_value(headers, "cookie")),
+                len(post_data),
+                _sanitize_post_preview(post_data) or "-",
+            )
+            self._rpc_fingerprint_count += 1
+        except Exception:
+            log.debug("验证会话 RPC 请求指纹记录失败")
 
     def _on_net_response(self, data: dict[str, object]) -> None:
         try:

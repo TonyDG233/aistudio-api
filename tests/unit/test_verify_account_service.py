@@ -2543,6 +2543,106 @@ async def test_start_logs_cookie_names_without_values(
         assert secret not in caplog.text
 
 
+# ---------------------------------------------------------------------------
+# RPC request fingerprint: GenerateAccessToken / VerifyUser masked INFO line
+# ---------------------------------------------------------------------------
+
+_RPC_FP_URL = (
+    "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+    "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
+)
+
+
+def test_post_preview_masks_long_token_and_jwt() -> None:
+    token = base64.b64encode(b"x" * 45).decode("ascii")  # 60 opaque chars
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    out = verify_module._sanitize_post_preview(json.dumps({"tok": token, "jwt": jwt}))
+    assert token not in out
+    assert jwt not in out
+    assert "eyJ" not in out
+    assert "…" in out
+
+
+def test_post_preview_truncates_to_budget() -> None:
+    out = verify_module._sanitize_post_preview("x " * 200)
+    assert len(out) <= verify_module.RPC_FINGERPRINT_POST_LIMIT + 1
+    assert out.endswith("…")
+
+
+def test_classify_auth_buckets_without_leaking() -> None:
+    assert verify_module._classify_auth({"authorization": "SAPISIDHASH 1_2"}) == (
+        "sapisidhash"
+    )
+    assert verify_module._classify_auth({"Authorization": "Bearer abc"}) == "bearer"
+    assert verify_module._classify_auth({}) == "none"
+    assert verify_module._classify_auth({"authorization": "Basic zzz"}) == "other"
+
+
+def test_rpc_request_fingerprint_line_is_masked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    page.request_cb(
+        {
+            "request_id": "req-fp",
+            "url": _RPC_FP_URL + "GenerateAccessToken",
+            "method": "POST",
+            "headers": {
+                "authorization": "SAPISIDHASH 123_abc",
+                "x-goog-authuser": "0",
+                "x-goog-api-key": "AIzaSyDdP816MREB3abcdefghijklmnop",
+                "cookie": "a=1; b=2; c=3",
+            },
+            "post_data": '["https://www.googleapis.com/auth/cloud-platform"]',
+        }
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    line = next(m for m in messages if "RPC 请求指纹 GenerateAccessToken" in m)
+    assert (
+        "method=POST auth=sapisidhash authuser=0 apikey=AIzaSyDdP8… cookies=3" in line
+    )
+    assert 'post=["https://www.googleapis.com/auth/cloud-platform"]' in line
+    assert "123_abc" not in line
+    assert "AIzaSyDdP816MREB3abcdefghijklmnop" not in line
+    for value in ("a=1", "b=2", "c=3"):
+        assert value not in line
+        assert value not in caplog.text
+
+
+def test_rpc_request_fingerprint_is_capped_per_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    for index in range(1, 12):
+        page.request_cb(
+            {
+                "request_id": f"req-{index}",
+                "url": _RPC_FP_URL + "VerifyUser",
+                "method": "POST",
+                "headers": {},
+                "post_data": "",
+            }
+        )
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "RPC 请求指纹 VerifyUser" in record.getMessage()
+    ]
+    assert len(lines) == verify_module.RPC_FINGERPRINT_MAX_PER_SESSION == 10
+
+
 @pytest.mark.asyncio
 async def test_start_logs_cookie_names_at_both_stages_in_order(
     monkeypatch: pytest.MonkeyPatch,
