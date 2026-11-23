@@ -299,6 +299,7 @@ def _service(
     account_service: Any | None = None,
     rotator: Any | None = None,
     clock: FakeClock | None = None,
+    region_arbiter: Any | None = None,
 ) -> AccountKeepaliveService:
     client_obj: Any = client or FakeClient()
     return AccountKeepaliveService(
@@ -308,6 +309,7 @@ def _service(
         instance_manager=manager,
         account_service=account_service,
         rotator=rotator if rotator is not None else FakeRotator(),
+        region_arbiter=region_arbiter,
         clock=clock or FakeClock(),
         tick_seconds=3600.0,
     )
@@ -1541,3 +1543,120 @@ async def test_auth_update_batches_and_leaves_remaining_accounts_due(
     for account in accounts[6:]:
         after = store.get_account(account.id)
         assert after is not None and after.auth_saved_at is None
+
+
+class RecordingRegionArbiter:
+    def __init__(self, outcome: str = "exit_bad") -> None:
+        self.outcome = outcome
+        self.calls: list[str] = []
+
+    async def adjudicate(
+        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+    ) -> str:
+        del kind, account_bad_event_kind
+        self.calls.append(account_id)
+        return self.outcome
+
+
+class RecordingRotator(FakeRotator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.verify_recorded: list[str] = []
+
+    def record_verify_required(
+        self, account_id: str, model: str | None = None, *, reason: str | None = None
+    ) -> None:
+        del model, reason
+        self.verify_recorded.append(account_id)
+
+
+class RegionOutcomeRefresher(FakeRefresher):
+    """External refresher double: every account comes back account_bad."""
+
+    external_mode = True
+
+    def set_region_arbiter(self, arbiter: Any | None) -> None:
+        del arbiter
+
+    async def refresh_accounts(
+        self, accounts: list[AccountMeta], **kwargs: object
+    ) -> list[SimpleNamespace]:
+        del kwargs
+        now = datetime.now(UTC).isoformat()
+        self.calls.append([account.id for account in accounts])
+        return [
+            SimpleNamespace(
+                account_id=account.id,
+                ok=False,
+                error=None,
+                checked_at=now,
+                deferred=True,
+                skip_reason="account_bad",
+                region_outcome="account_bad",
+                retry_after_s=300.0,
+            )
+            for account in accounts
+        ]
+
+
+@pytest.mark.asyncio
+async def test_auth_update_rotate_region_403_triggers_canary_and_defers(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    _stale_accounts(store, 3)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    account_service = AccountService(store)
+    arbiter = RecordingRegionArbiter("exit_bad")
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> dict[str, object]:
+        del account_id, session, client
+        return {"ok": False, "status": 403, "updated": []}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        refresher=refresher,
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["deferred"] is True
+    assert arbiter.calls == ["acc01", "acc02", "acc03"]
+    assert len(set(arbiter.calls)) == 3
+    for account_id in ("acc01", "acc02", "acc03"):
+        stored = store.get_account(account_id)
+        assert stored is not None
+        assert stored.auth_saved_at is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_account_bad_updates_registry_and_rotator(tmp_path):
+    store = AccountStore(tmp_path)
+    account = _account(store, "acc_bad", "bad@example.com")
+    rotator = RecordingRotator()
+    refresher = RegionOutcomeRefresher()
+    service = _service(
+        store,
+        refresher=refresher,
+        rotator=rotator,
+        clock=FakeClock(4_000.0),
+    )
+
+    await service.run_now("metadata_refresh", settings=_settings())
+
+    stored = store.get_account(account.id)
+    assert stored is not None
+    assert stored.verify_required is True
+    assert stored.expired is False
+    assert rotator.verify_recorded == ["acc_bad"]

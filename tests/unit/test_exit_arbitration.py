@@ -12,6 +12,8 @@ from aistudio_api.application.exit_arbitration import (
     CanaryVerdict,
     ExitArbitration,
     build_exit_arbitration,
+    get_default_exit_arbitration,
+    reset_default_exit_arbitration,
 )
 from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.domain.errors import (
@@ -297,6 +299,40 @@ async def test_exit_bad_reports_invalidates_and_rebuilds_slot() -> None:
     assert "inst-1" not in context.attempted_instances
     assert context.failed_accounts == set()
     assert client.clear_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_account_bad_event_kind_override_reports_verify_account() -> None:
+    probe = _FakeProbe("account_bad")
+    arbitration, resolver = _arbitration(probe)
+
+    outcome = await arbitration.adjudicate(
+        account_id="acc-1",
+        kind="chat",
+        account_bad_event_kind="verify_account",
+    )
+
+    assert outcome == "account_bad"
+    assert resolver.events == [
+        {
+            "account": "acc-1",
+            "exit_id": "exit-1",
+            "kind": "verify_account",
+            "canary": "account_bad",
+        }
+    ]
+    assert resolver.invalidated_exits == []
+
+
+def test_default_arbitration_registry_resets() -> None:
+    reset_default_exit_arbitration()
+    assert get_default_exit_arbitration() is None
+
+    resolver = SimpleNamespace(config=SimpleNamespace(canary_account=""))
+    built = build_exit_arbitration(resolver=cast(Any, resolver))
+    assert built is not None
+    # Explicit-resolver builds never replace the process-wide instance.
+    assert get_default_exit_arbitration() is None
 
 
 @pytest.mark.asyncio

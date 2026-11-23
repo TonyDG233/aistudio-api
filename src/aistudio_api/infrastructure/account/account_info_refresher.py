@@ -22,12 +22,15 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 
 from aistudio_api.config import settings
-from aistudio_api.domain.errors import ExitBudgetWaitError
+from aistudio_api.domain.errors import (
+    ExitBudgetWaitError,
+    is_region_restricted_message,
+)
 from aistudio_api.infrastructure.account.benefit_tier import (
     parse_benefit_tier_envelope,
 )
@@ -97,6 +100,15 @@ class RefreshInProgressError(RuntimeError):
     """已有一次账号信息刷新正在进行（用于端点返回 409 互斥）。"""
 
 
+class RegionRestrictedError(RuntimeError):
+    """凭据页请求返回 403 且报文命中区域封锁特征（出口级嫌疑）。"""
+
+
+# A maintenance region 403 is not an account failure: defer the account and
+# retry after the short keepalive window instead of a full 24h/6h backoff.
+REGION_DEFER_RETRY_SECONDS = 300.0
+
+
 # Fail-closed skip logging is throttled per (account, reason) so a sustained
 # manager outage does not emit two warnings per account per refresh round.
 SKIP_LOG_INTERVAL_SECONDS = 60.0
@@ -162,6 +174,9 @@ class RefreshResult:
     # never a completed refresh, a skip or an account failure/cooldown.
     deferred: bool = False
     retry_after_s: float = 0.0
+    # Canary verdict for a maintenance region 403 (exit_bad/account_bad/
+    # inconclusive); keepalive applies the account-level verify lock.
+    region_outcome: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -176,6 +191,7 @@ class RefreshResult:
             "skip_reason": self.skip_reason,
             "deferred": self.deferred,
             "retry_after_s": self.retry_after_s,
+            "region_outcome": self.region_outcome,
         }
 
 
@@ -478,6 +494,7 @@ class AccountInfoRefresher:
         concurrency: int | None = None,
         app_id: str | None = None,
         slot_provider: SlotProvider | None = None,
+        region_arbiter: object | None = None,
     ) -> None:
         self._store = account_store
         # ``transport`` is kept for callers/tests that inspect it, but the actual
@@ -505,6 +522,7 @@ class AccountInfoRefresher:
         self._concurrency = max(1, concurrency)
         self._app_id = app_id or resolve_app_id()
         self._slot_provider: SlotProvider | None = slot_provider
+        self._region_arbiter = region_arbiter
         self._active_run = False
         # 仅内存的逐账号 tier 探测失败退避状态：键为账号 id，不动持久化 schema。
         self._tier_failure_counts: dict[str, int] = {}
@@ -605,10 +623,89 @@ class AccountInfoRefresher:
         """Attach a pool-slot provider so tier probes reuse live engine sessions."""
         self._slot_provider = provider
 
+    def set_region_arbiter(self, arbiter: object | None) -> None:
+        """Attach the region-403 canary arbiter (``None`` keeps off-mode behaviour)."""
+        self._region_arbiter = arbiter
+
     @property
     def external_mode(self) -> bool:
         """True when credential probes resolve per-account exits."""
         return self._active_exit_resolver() is not None
+
+    async def _arbitrate_region_403(
+        self, account_id: str, *, once: set[str]
+    ) -> str | None:
+        """Run at most one canary arbitration for this account's refresh.
+
+        ``once`` is per ``refresh_account`` invocation so a tier probe and its
+        follow-up email probe cannot trigger two canaries for the same account
+        in the same maintenance round.
+        """
+        if not account_id or account_id in once:
+            return None
+        if self._active_exit_resolver() is None:
+            # Off mode: zero network, zero arbitration.
+            return None
+        arbiter = self._region_arbiter
+        if arbiter is None:
+            return None
+        once.add(account_id)
+        try:
+            outcome = await cast("Any", arbiter).adjudicate(
+                account_id=account_id,
+                kind="chat",
+                account_bad_event_kind="verify_account",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[Refresh] region 403 canary 仲裁异常 account=%s error=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            return "inconclusive"
+        if outcome == "account_bad":
+            # Registry is authoritative; keepalive also refreshes rotator stats.
+            try:
+                self._store.update_account_refresh(
+                    account_id, verify_required=True, expired=False
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Refresh] 持久化 verify_required 失败 account=%s: %s",
+                    account_id,
+                    exc,
+                )
+        logger.info(
+            "[Refresh] region 403 canary 仲裁 account=%s outcome=%s",
+            account_id,
+            outcome,
+        )
+        return str(outcome)
+
+    def _region_deferral(
+        self,
+        account: AccountMeta,
+        checked_at: str | None,
+        outcome: str,
+    ) -> RefreshResult:
+        """Defer a maintenance account after a region 403 (never an auth cooldown)."""
+        logger.info(
+            "[Refresh] %s region 403 出口仲裁 outcome=%s，本轮 defer",
+            account.id,
+            outcome,
+        )
+        return RefreshResult(
+            account_id=account.id,
+            ok=False,
+            error=None,
+            checked_at=checked_at,
+            deferred=True,
+            retry_after_s=REGION_DEFER_RETRY_SECONDS,
+            skip_reason=outcome,
+            region_outcome=outcome,
+        )
 
     def tier_failure_count(self, account_id: str) -> int:
         return self._tier_failure_counts.get(account_id, 0)
@@ -685,6 +782,7 @@ class AccountInfoRefresher:
             )
 
         checked_at = _now_iso()
+        region_once: set[str] = set()
         if respect_backoff:
             remaining = self.tier_backoff_seconds(account.id)
             if remaining > 0:
@@ -717,6 +815,13 @@ class AccountInfoRefresher:
                             proxy=decision.proxy,
                             allow_bare=True,
                         )
+                    except RegionRestrictedError as exc:
+                        outcome = await self._arbitrate_region_403(
+                            account.id, once=region_once
+                        )
+                        if outcome is not None:
+                            return self._region_deferral(account, checked_at, outcome)
+                        email_error = str(exc)
                     except Exception as e:
                         email_error = str(e)
                 else:
@@ -800,6 +905,10 @@ class AccountInfoRefresher:
                     "skip", reason="probe_unavailable", external=True
                 )
             return self._skipped_result(account, decision, checked_at)
+        if response.status == 403 and is_region_restricted_message(response.body):
+            outcome = await self._arbitrate_region_403(account.id, once=region_once)
+            if outcome is not None:
+                return self._region_deferral(account, checked_at, outcome)
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
         self._record_tier_probe(
@@ -858,6 +967,13 @@ class AccountInfoRefresher:
                             proxy=email_decision.proxy,
                             allow_bare=email_decision.allowed,
                         )
+                    except RegionRestrictedError as exc:
+                        outcome = await self._arbitrate_region_403(
+                            account.id, once=region_once
+                        )
+                        if outcome is not None:
+                            return self._region_deferral(account, checked_at, outcome)
+                        email_error = str(exc)
                     except Exception as e:
                         email_error = str(e)
 
@@ -1076,6 +1192,19 @@ class AccountInfoRefresher:
                 "checked_at": None,
                 "skipped": True,
             }
+        if response.status == 403 and is_region_restricted_message(response.body):
+            outcome = await self._arbitrate_region_403(account.id, once=set())
+            if outcome is not None:
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": None,
+                    "checked_at": None,
+                    "deferred": True,
+                    "retry_after_s": REGION_DEFER_RETRY_SECONDS,
+                    "skip_reason": outcome,
+                    "region_outcome": outcome,
+                }
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
         self._record_tier_probe(
@@ -1163,6 +1292,14 @@ class AccountInfoRefresher:
                 proxy=decision.proxy,
                 allow_bare=True,
             )
+        except RegionRestrictedError:
+            outcome = await self._arbitrate_region_403(account.id, once=set())
+            logger.info(
+                "[Refresh] %s 邮箱探测 region 403 outcome=%s，本轮 defer",
+                account.id,
+                outcome or "off",
+            )
+            return None
         except Exception as e:
             logger.warning("账号 %s 邮箱回填失败: %s", account.id, e)
             return None
@@ -1366,6 +1503,8 @@ class AccountInfoRefresher:
         transport = self._make_transport(proxy)
         url = aistudio_app_url(self._app_id, auth_user=auth_user)
         response = await transport.request("GET", url, headers=headers)
+        if response.status == 403 and is_region_restricted_message(response.body):
+            raise RegionRestrictedError("page fetch HTTP 403 region-restricted")
         if response.status != 200:
             raise RuntimeError(f"page fetch HTTP {response.status}")
         return response.body
@@ -1402,6 +1541,7 @@ class AccountInfoRefresher:
 
 __all__ = [
     "EXTERNAL_BATCH_PACING_SECONDS",
+    "REGION_DEFER_RETRY_SECONDS",
     "TIER_PROBE_BACKOFF_CAP_SECONDS",
     "TIER_PROBE_FAILURE_BASE_SECONDS",
     "TIER_PROBE_FRESHNESS_SECONDS",
@@ -1411,6 +1551,7 @@ __all__ = [
     "HttpxTransport",
     "RefreshInProgressError",
     "RefreshResult",
+    "RegionRestrictedError",
     "SleepFunc",
     "SlotProvider",
     "TransportFactory",

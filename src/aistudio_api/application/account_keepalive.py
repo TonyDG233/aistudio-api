@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from aistudio_api.domain.errors import is_region_restricted_message
 from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshInProgressError,
     skip_log_due,
@@ -46,6 +47,8 @@ MAX_AUTH_CONSECUTIVE_FAILURES = 3
 DEFAULT_METADATA_ATTEMPT_LIMIT = 12
 DEFAULT_AUTH_ATTEMPT_LIMIT = 8
 CONSECUTIVE_NO_CAPACITY_LIMIT = 3
+REGION_403_STATUS = 403
+REGION_DEFER_RETRY_SECONDS = 300.0
 
 DEFAULT_AUTH_UPDATE_HOURS = 24.0
 DEFAULT_METADATA_REFRESH_HOURS = 24.0
@@ -158,6 +161,7 @@ class AccountKeepaliveService:
         instance_manager: Any | None = None,
         account_service: Any | None = None,
         rotator: Any | None = None,
+        region_arbiter: Any | None = None,
         metadata_attempt_limit: int | None = None,
         auth_attempt_limit: int | None = None,
         consecutive_no_capacity_limit: int | None = None,
@@ -170,6 +174,7 @@ class AccountKeepaliveService:
         self._instance_manager = instance_manager
         self._account_service = account_service
         self._rotator = rotator
+        self._region_arbiter = region_arbiter
         self._metadata_attempt_limit = max(
             1,
             int(
@@ -211,8 +216,11 @@ class AccountKeepaliveService:
         # account_id -> startup capture marker (capturedAt or raw digest), so a
         # hot-reused worker's identical capture is parsed at most once.
         self._startup_capture_consumed: dict[str, str] = {}
+        # One canary arbitration per account per keepalive round.
+        self._region_arbitrated_round: set[str] = set()
         self._paused = False
         self._attach_tier_slot_provider()
+        self._attach_region_arbiter()
 
     def _attach_tier_slot_provider(self) -> None:
         """Let the refresher reuse live pool sessions for engine-correct probes."""
@@ -220,12 +228,115 @@ class AccountKeepaliveService:
         if callable(setter):
             setter(self._pool_slots)
 
+    def _region_arbiter_handle(self) -> Any | None:
+        """Injected arbiter first, then the process-wide one (None when off)."""
+        if self._region_arbiter is not None:
+            return self._region_arbiter
+        try:
+            from aistudio_api.application.exit_arbitration import (
+                get_default_exit_arbitration,
+            )
+
+            return get_default_exit_arbitration()
+        except Exception:
+            return None
+
+    def _attach_region_arbiter(self) -> None:
+        """Hand the (possibly process-wide) arbiter to the metadata refresher."""
+        setter = getattr(self._refresher, "set_region_arbiter", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self._region_arbiter_handle())
+        except Exception as exc:
+            log.debug("[Keepalive] region arbiter wiring failed: %s", exc)
+
     def _external_runtime(self) -> bool:
         """True when the refresher runs against the external exit pool."""
         try:
             return bool(getattr(self._refresher, "external_mode", False))
         except Exception:
             return False
+
+    async def _arbitrate_region_once(self, account_id: str, source: str) -> str | None:
+        """Run at most one region-403 canary per account per keepalive round."""
+        if not account_id or account_id in self._region_arbitrated_round:
+            return None
+        arbiter = self._region_arbiter_handle()
+        if arbiter is None:
+            return None
+        self._region_arbitrated_round.add(account_id)
+        try:
+            outcome = await arbiter.adjudicate(
+                account_id=account_id,
+                kind="chat",
+                account_bad_event_kind="verify_account",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[Keepalive] region 403 canary 仲裁异常 account=%s source=%s error=%s",
+                account_id,
+                source,
+                type(exc).__name__,
+            )
+            return "inconclusive"
+        if outcome == "account_bad":
+            self._persist_account_bad(account_id)
+        log.info(
+            "[Keepalive] region 403 canary 仲裁 account=%s source=%s outcome=%s",
+            account_id,
+            source,
+            outcome,
+        )
+        return str(outcome)
+
+    def _persist_account_bad(self, account_id: str) -> None:
+        """Registry is authoritative: verify_required=true and expired=false."""
+        try:
+            self._store.update_account_refresh(
+                account_id, verify_required=True, expired=False
+            )
+        except Exception as exc:
+            log.warning(
+                "[Keepalive] 持久化 verify_required 失败 account=%s: %s",
+                account_id,
+                exc,
+            )
+        rotator = self._rotator_handle()
+        recorder = getattr(rotator, "record_verify_required", None)
+        if callable(recorder):
+            try:
+                recorder(account_id, reason="region_403_account_bad")
+            except Exception as exc:
+                log.warning(
+                    "[Keepalive] 更新 rotator verify 统计失败 account=%s: %s",
+                    account_id,
+                    exc,
+                )
+
+    @staticmethod
+    def _rotation_is_region_403(result: dict[str, object]) -> bool:
+        """RotateCookies returned 403: treat as an exit-region suspicion.
+
+        The rotation client does not expose the response body, so any 403 is
+        passed to the canary; the arbiter decides whether the exit is bad, the
+        account is bad, or the signal is inconclusive.
+        """
+        if bool(result.get("deferred")):
+            return False
+        raw_status = result.get("status")
+        if isinstance(raw_status, bool) or not isinstance(raw_status, (int, str)):
+            return False
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            return False
+        if status != REGION_403_STATUS:
+            return False
+        text = str(result.get("body") or result.get("error") or "")
+        return not text or is_region_restricted_message(text)
 
     @property
     def running(self) -> str | None:
@@ -441,6 +552,7 @@ class AccountKeepaliveService:
                 return {"ok": False, "task": task, "reason": "paused"}
             self._idle_event.clear()
             self._running = task
+            self._region_arbitrated_round.clear()
             current = settings or self._settings()
             try:
                 result = await self._execute(task, current, trigger)
@@ -505,6 +617,7 @@ class AccountKeepaliveService:
             return {"ok": True, "reason": "no_due_accounts", "count": 0}
 
         if self._external_runtime():
+            self._attach_region_arbiter()
             try:
                 results = await self._refresh_metadata_batched(due)
             except RefreshInProgressError:
@@ -542,6 +655,8 @@ class AccountKeepaliveService:
         }
         for result in results:
             deferred = _is_deferred_result(result)
+            if getattr(result, "region_outcome", None) == "account_bad":
+                self._persist_account_bad(str(result.account_id))
             self._store.mark_refresh_attempt(
                 str(result.account_id),
                 # 429 no_capacity must not be recorded as an account failure, and
@@ -851,6 +966,7 @@ class AccountKeepaliveService:
         rotate_results: dict[str, list[bool]] = {}
         browserless_disk_ok: set[str] = set()
         deferred_accounts: dict[str, float] = {}
+        region_deferred_accounts: set[str] = set()
 
         for slot in slots:
             slot_acc_id = str(getattr(slot, "account_id", "") or "")
@@ -917,6 +1033,8 @@ class AccountKeepaliveService:
                 slot_sessions[str(acc_id)] = sess
 
         external = self._external_runtime()
+        if external:
+            self._attach_region_arbiter()
         auth_attempts = 0
         no_capacity_streak = 0
         stop_after_account = False
@@ -951,6 +1069,19 @@ class AccountKeepaliveService:
                         rot_res.get("retry_after_s"), 0.0
                     )
                     account_deferred = True
+                elif self._rotation_is_region_403(rot_res):
+                    outcome = await self._arbitrate_region_once(
+                        account.id, "auth_update"
+                    )
+                    if outcome is None:
+                        # No arbiter (off mode): keep the legacy failure path.
+                        _ensure_acc(account.id)
+                        rotate_results.setdefault(account.id, []).append(False)
+                    else:
+                        _ensure_acc(account.id)
+                        deferred_accounts[account.id] = REGION_DEFER_RETRY_SECONDS
+                        region_deferred_accounts.add(account.id)
+                        account_deferred = True
                 elif rot_res.get("ok"):
                     _ensure_acc(account.id)
                     rotate_results.setdefault(account.id, []).append(True)
@@ -1015,7 +1146,7 @@ class AccountKeepaliveService:
             slot_id for acc_id, slot_id in slot_failures if acc_id in failed_set
         ]
         deferred_retry = max(deferred_accounts.values(), default=0.0)
-        no_capacity_deferred = len(deferred_accounts)
+        no_capacity_deferred = len(deferred_accounts) - len(region_deferred_accounts)
 
         if deferred_accounts:
             # One aggregate warning per round; per-account defers stay INFO.

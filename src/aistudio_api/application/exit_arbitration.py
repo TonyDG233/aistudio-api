@@ -270,7 +270,13 @@ class ExitArbitration:
         until = self._cooldowns.get(exit_id)
         return until is not None and until > self._clock()
 
-    async def adjudicate(self, *, account_id: str, kind: str) -> CanaryOutcome:
+    async def adjudicate(
+        self,
+        *,
+        account_id: str,
+        kind: str,
+        account_bad_event_kind: str = "region_403",
+    ) -> CanaryOutcome:
         """Classify one region 403 for an account's currently bound exit."""
         assignment = self._resolver.assignment_for(
             account_id, kind=kind, include_expired=True
@@ -316,6 +322,7 @@ class ExitArbitration:
             kind=kind,
             assignment=assignment,
             verdict=verdict,
+            account_bad_event_kind=account_bad_event_kind,
         )
 
     async def _apply(
@@ -325,6 +332,7 @@ class ExitArbitration:
         kind: str,
         assignment: ExitAssignment,
         verdict: CanaryVerdict,
+        account_bad_event_kind: str = "region_403",
     ) -> CanaryOutcome:
         logger.warning(
             "[exit] canary 仲裁结果=%s exit=%s kind=%s detail=%s",
@@ -350,7 +358,7 @@ class ExitArbitration:
             self._resolver.report_event_nowait(
                 account_id=account_id,
                 exit_id=assignment.exit_id,
-                event_kind="region_403",
+                event_kind=account_bad_event_kind,
                 canary="account_bad",
             )
             return "account_bad"
@@ -381,6 +389,20 @@ def _slot_account_ids(
     return {str(item) for item in raw if item}
 
 
+_default_arbitration: ExitArbitration | None = None
+
+
+def get_default_exit_arbitration() -> ExitArbitration | None:
+    """Process-wide arbiter built for the external exit pool (``None`` when off)."""
+    return _default_arbitration
+
+
+def reset_default_exit_arbitration() -> None:
+    """Clear the process-wide arbiter (tests/teardown)."""
+    global _default_arbitration
+    _default_arbitration = None
+
+
 def build_exit_arbitration(
     *,
     runtime_getter: Callable[[], object | None] | None = None,
@@ -389,8 +411,10 @@ def build_exit_arbitration(
     slot_account_ids_getter: Callable[[], Iterable[str]] | None = None,
 ) -> ExitArbitration | None:
     """Build the arbitration service, or ``None`` when the mode is off."""
+    global _default_arbitration
     active = resolver if resolver is not None else get_exit_resolver()
     if active is None:
+        _default_arbitration = None
         return None
     probe: SignerCanaryProbe | None = None
     canary_account = active.config.canary_account
@@ -415,7 +439,13 @@ def build_exit_arbitration(
             canary_account=canary_account,
             slot_account_ids_getter=slot_account_ids_getter,
         )
-    return ExitArbitration(resolver=active, canary_probe=probe)
+    service = ExitArbitration(resolver=active, canary_probe=probe)
+    if resolver is None:
+        # Production wiring may look this up lazily (keepalive/maintenance)
+        # without touching app.py.  Explicit-resolver callers (tests) never
+        # replace the process-wide instance.
+        _default_arbitration = service
+    return service
 
 
 __all__ = [
@@ -425,4 +455,6 @@ __all__ = [
     "ExitArbitration",
     "SignerCanaryProbe",
     "build_exit_arbitration",
+    "get_default_exit_arbitration",
+    "reset_default_exit_arbitration",
 ]

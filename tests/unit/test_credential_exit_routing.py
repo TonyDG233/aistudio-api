@@ -37,6 +37,10 @@ from aistudio_api.application.account_keepalive import (
     KeepaliveSettings,
 )
 from aistudio_api.application.account_service import AccountService
+from aistudio_api.application.exit_arbitration import (
+    CanaryVerdict,
+    ExitArbitration,
+)
 from aistudio_api.application.instance_manager import InstanceManager
 from aistudio_api.config import settings
 from aistudio_api.domain.errors import ExitBudgetWaitError, RoutingError
@@ -58,7 +62,7 @@ from aistudio_api.infrastructure.exit_pool import (
     reset_exit_resolver,
     resolve_credential_exit,
 )
-from aistudio_api.infrastructure.exit_pool.resolver import LeaseResult
+from aistudio_api.infrastructure.exit_pool.resolver import ExitAssignment, LeaseResult
 from aistudio_api.infrastructure.gateway.instance_pool import InstancePool, InstanceSpec
 from aistudio_api.infrastructure.waa.browserless_session import BrowserlessSession
 from aistudio_api.infrastructure.waa.engine_runtime import (
@@ -2654,3 +2658,208 @@ def test_keepalive_defers_when_email_subprobe_hits_no_capacity(
     assert stored.tier == "Pro"
     assert stored.tier_checked_at is not None
     assert stored.email is None
+
+
+# --------------------------------------------------------------------------- #
+# Maintenance region 403 -> canary arbitration (metadata / cookie rotation)
+# --------------------------------------------------------------------------- #
+
+REGION_403_BODY = '{"error":{"message":"Region not supported."}}'
+
+
+class _RegionTransport:
+    """Bare httpx double: the tier probe always returns a region 403."""
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: str = "",
+    ) -> TransportResponse:
+        del method, url, headers, content
+        return TransportResponse(status=403, body=REGION_403_BODY)
+
+
+class _FixedCanary:
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+
+    async def probe(self, *, socks_url: str, exit_id: str) -> CanaryVerdict:
+        del socks_url, exit_id
+        return CanaryVerdict(cast(Any, self.outcome))
+
+
+class _ArbitrationResolver(_LeaseResolver):
+    """Manager double exposing the arbitration surface plus lease."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.assignment = ExitAssignment(exit_id="exit-1", socks_url=EXIT_ONE, ttl_s=60)
+        self.events: list[tuple[str, str, str, str]] = []
+        self.invalidated: list[str] = []
+
+    def assignment_for(
+        self, account_id: str, *, kind: str = "chat", include_expired: bool = False
+    ) -> ExitAssignment:
+        del account_id, kind, include_expired
+        return self.assignment
+
+    async def report_event(
+        self,
+        *,
+        account_id: str,
+        exit_id: str,
+        event_kind: str,
+        canary: str,
+    ) -> bool:
+        self.events.append((account_id, exit_id, event_kind, canary))
+        return True
+
+    def report_event_nowait(
+        self,
+        *,
+        account_id: str,
+        exit_id: str,
+        event_kind: str,
+        canary: str,
+    ) -> None:
+        self.events.append((account_id, exit_id, event_kind, canary))
+
+    def invalidate_exit(self, exit_id: str) -> None:
+        self.invalidated.append(exit_id)
+
+
+class _RecordingArbiter:
+    def __init__(self, outcome: str = "inconclusive") -> None:
+        self.outcome = outcome
+        self.calls: list[str] = []
+
+    async def adjudicate(
+        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+    ) -> str:
+        del kind, account_bad_event_kind
+        self.calls.append(account_id)
+        return self.outcome
+
+
+def _region_refresher(
+    store: AccountStore,
+    resolver: _ArbitrationResolver,
+    canary: _FixedCanary,
+) -> tuple[AccountInfoRefresher, _ArbitrationResolver]:
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(
+        ExitArbitration(
+            resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+        )
+    )
+    return refresher, resolver
+
+
+@pytest.mark.parametrize(
+    ("outcome", "event", "invalidated", "verify"),
+    [
+        ("exit_bad", ("acc1", "exit-1", "region_403", "exit_bad"), ["exit-1"], False),
+        (
+            "account_bad",
+            ("acc1", "exit-1", "verify_account", "account_bad"),
+            [],
+            True,
+        ),
+        (
+            "inconclusive",
+            ("acc1", "exit-1", "region_403", "inconclusive"),
+            [],
+            False,
+        ),
+    ],
+)
+def test_metadata_region_403_arbitration_outcomes(
+    tmp_path: Any,
+    outcome: str,
+    event: tuple[str, str, str, str],
+    invalidated: list[str],
+    verify: bool,
+) -> None:
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    canary = _FixedCanary(outcome)
+    refresher, resolver = _region_refresher(store, _ArbitrationResolver(), canary)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.retry_after_s == pytest.approx(300.0)
+    assert result.region_outcome == outcome
+    assert resolver.events == [event]
+    assert resolver.invalidated == invalidated
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is verify
+    assert stored.expired is False
+
+    if verify:
+        # Registry is authoritative and meta.json must agree.
+        accounts_dir = tmp_path / "accounts"
+        registry = json.loads((accounts_dir / "registry.json").read_text("utf-8"))
+        meta = json.loads((accounts_dir / "acc1" / "meta.json").read_text("utf-8"))
+        assert registry["accounts"]["acc1"]["verify_required"] is True
+        assert meta["verify_required"] is True
+        reloaded = AccountStore(accounts_dir).get_account("acc1")
+        assert reloaded is not None and reloaded.verify_required is True
+
+
+def test_off_mode_region_403_does_not_arbitrate(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reset_skip_log_throttle()
+    for name in (
+        "AISTUDIO_EXIT_MODE",
+        "AISTUDIO_EXIT_ENDPOINT",
+        "AISTUDIO_EXIT_TOKEN",
+        "AISTUDIO_EXIT_HMAC_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    reset_exit_resolver()
+    store, accounts = _make_store(tmp_path)
+    arbiter = _RecordingArbiter("exit_bad")
+    refresher = AccountInfoRefresher(store, transport=_RegionTransport())
+    refresher.set_region_arbiter(arbiter)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert arbiter.calls == []
+    assert result.deferred is False
+    assert result.region_outcome is None
+    assert result.error is not None and "HTTP 403" in result.error
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.expired is False
+
+
+def test_region_canary_fires_once_per_account_per_round(tmp_path: Any) -> None:
+    reset_skip_log_throttle()
+    store, _accounts = _make_store(tmp_path)
+    arbiter = _RecordingArbiter("inconclusive")
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, _ArbitrationResolver()),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(arbiter)
+    once: set[str] = set()
+
+    first = asyncio.run(refresher._arbitrate_region_403("acc1", once=once))
+    second = asyncio.run(refresher._arbitrate_region_403("acc1", once=once))
+
+    assert first == "inconclusive"
+    assert second is None
+    assert arbiter.calls == ["acc1"]
