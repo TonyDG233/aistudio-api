@@ -288,6 +288,17 @@ class ExitArbitration:
         An empty string means the probe exit could not be proven to match the
         binding and is therefore always inconclusive.
         """
+        if probe_exit_id == "":
+            # A bare httpx probe has no signer fingerprint/request shape, so its
+            # exit can never be proven.  Running a canary here would blame the
+            # account or the bound exit for a host-egress region 403; short
+            # circuit before the assignment lookup, the probe and the report.
+            logger.info(
+                "[exit] region 403 探针传输不可信，出口未证明匹配，按 inconclusive 处理 "
+                "kind=%s reason=untrusted_probe_transport",
+                kind,
+            )
+            return "inconclusive"
         assignment = self._resolver.assignment_for(
             account_id, kind=kind, include_expired=True
         )

@@ -235,6 +235,21 @@ class _CookieJar:
     jar: dict[str, str]
 
 
+@dataclass
+class _TierProbeOutcome:
+    """Tier RPC result plus the transport that actually produced it.
+
+    ``signer_transport`` is True only when the response came from
+    ``probe_tier_over_session`` (a pooled engine session: signer fingerprint and
+    request shape).  A response from the raw httpx fallback is ``False``: the
+    bare request carries no signer shape, so a Google region 403 there must
+    never be attributed to the account.
+    """
+
+    response: TransportResponse | None
+    signer_transport: bool = False
+
+
 TIER_PROBE_FRESHNESS_SECONDS = 3 * 86400
 
 # 单次 signer/page tier 探测的有界超时，避免一次挂起的传输拖住整轮调度。
@@ -717,6 +732,8 @@ class AccountInfoRefresher:
         account_id: str,
         decision: ExitDecision | None,
         session: object | None = None,
+        *,
+        raw_transport: bool = False,
     ) -> str | None:
         """Exit actually used by this probe, for canary consistency checks.
 
@@ -726,7 +743,20 @@ class AccountInfoRefresher:
         binding.  ``""`` means "the probe exit cannot be proven to match the
         binding" and must force an inconclusive verdict; ``None`` means there
         is nothing to compare (legacy/caller did not supply an exit).
+
+        ``raw_transport=True`` marks a bare httpx probe (no signer fingerprint
+        or request shape).  In external mode such a probe can never prove its
+        exit, so ``""`` is returned *before* any ``decision.exit_id`` shortcut:
+        a region 403 on a bare request says nothing about the account.
         """
+        if raw_transport and self.external_mode:
+            if skip_log_due(account_id, "untrusted_probe_transport"):
+                logger.info(
+                    "[Refresh] %s region 403 来自裸 httpx 探针（raw_transport），"
+                    "出口无法证明匹配，按 inconclusive 处理，不进行 canary 归因",
+                    account_id or "-",
+                )
+            return ""
         if decision is not None and decision.external and decision.exit_id:
             return decision.exit_id
         resolver = self._active_exit_resolver()
@@ -983,7 +1013,9 @@ class AccountInfoRefresher:
                         outcome = await self._arbitrate_region_403(
                             account.id,
                             once=region_once,
-                            probe_exit_id=self._probe_exit_id(account.id, decision),
+                            probe_exit_id=self._probe_exit_id(
+                                account.id, decision, raw_transport=True
+                            ),
                         )
                         if outcome is not None:
                             return self._region_deferral(account, checked_at, outcome)
@@ -1065,7 +1097,7 @@ class AccountInfoRefresher:
             )
 
         try:
-            response = await self._post_tier_request(
+            probe = await self._post_tier_request(
                 cookies,
                 auth_user=account.auth_user,
                 account_id=account.id,
@@ -1086,6 +1118,7 @@ class AccountInfoRefresher:
                 ),
                 checked_at,
             )
+        response = probe.response
         if response is None:
             if decision is None:
                 decision = ExitDecision(
@@ -1096,7 +1129,12 @@ class AccountInfoRefresher:
             outcome = await self._arbitrate_region_403(
                 account.id,
                 once=region_once,
-                probe_exit_id=self._probe_exit_id(account.id, decision, session),
+                probe_exit_id=self._probe_exit_id(
+                    account.id,
+                    decision,
+                    session,
+                    raw_transport=not probe.signer_transport,
+                ),
             )
             if outcome is not None:
                 return self._region_deferral(account, checked_at, outcome)
@@ -1163,7 +1201,7 @@ class AccountInfoRefresher:
                             account.id,
                             once=region_once,
                             probe_exit_id=self._probe_exit_id(
-                                account.id, email_decision
+                                account.id, email_decision, raw_transport=True
                             ),
                         )
                         if outcome is not None:
@@ -1384,7 +1422,7 @@ class AccountInfoRefresher:
                 "skip_reason": "no_pooled_exit",
             }
         try:
-            response = await self._post_tier_request(
+            probe = await self._post_tier_request(
                 cookies,
                 auth_user=account.auth_user,
                 account_id=account.id,
@@ -1404,6 +1442,7 @@ class AccountInfoRefresher:
                 "retry_after_s": float(exc.retry_after),
                 "skip_reason": exc.code,
             }
+        response = probe.response
         if response is None:
             return {
                 "tier": None,
@@ -1420,7 +1459,12 @@ class AccountInfoRefresher:
             outcome = await self._arbitrate_region_403(
                 account.id,
                 once=set(),
-                probe_exit_id=self._probe_exit_id(account.id, decision, session),
+                probe_exit_id=self._probe_exit_id(
+                    account.id,
+                    decision,
+                    session,
+                    raw_transport=not probe.signer_transport,
+                ),
             )
             if outcome is not None:
                 return {
@@ -1530,7 +1574,9 @@ class AccountInfoRefresher:
             outcome = await self._arbitrate_region_403(
                 account.id,
                 once=set(),
-                probe_exit_id=self._probe_exit_id(account.id, decision),
+                probe_exit_id=self._probe_exit_id(
+                    account.id, decision, raw_transport=True
+                ),
             )
             logger.info(
                 "[Refresh] %s 邮箱探测 region 403 outcome=%s，本轮 defer",
@@ -1621,8 +1667,13 @@ class AccountInfoRefresher:
         session: object | None = None,
         proxy: str | None = None,
         allow_bare: bool = True,
-    ) -> TransportResponse | None:
+    ) -> _TierProbeOutcome:
         """Route the tier RPC by engine: signer → page XHR → leased raw httpx.
+
+        Returns the response together with the transport that produced it so
+        the caller can mark a bare (non-signer) probe when attributing a region
+        403.  ``signer_transport`` is only True for a response from
+        ``probe_tier_over_session``; every raw httpx response is ``False``.
 
         ``allow_bare=False`` (external mode with no account exit) forbids the
         raw httpx fallback and returns ``None`` so the caller reports a skip.
@@ -1640,7 +1691,7 @@ class AccountInfoRefresher:
                 web_api_key=self._web_api_key,
             )
             if response is not None:
-                return response
+                return _TierProbeOutcome(response, signer_transport=True)
         elif account_id and self._slot_provider is not None and allow_bare:
             logger.warning(
                 "[Refresh] %s tier probe has no pooled engine session; "
@@ -1649,7 +1700,7 @@ class AccountInfoRefresher:
                 account_id,
             )
         if not allow_bare:
-            return None
+            return _TierProbeOutcome(None)
         if self.external_mode and proxy is None:
             # Defensive: external mode never probes bare without an exit.
             if account_id:
@@ -1658,8 +1709,10 @@ class AccountInfoRefresher:
                     "reason=no_pooled_exit",
                     account_id,
                 )
-            return None
-        return await self._post_tier_via_http(cookies, auth_user=auth_user, proxy=proxy)
+            return _TierProbeOutcome(None)
+        return _TierProbeOutcome(
+            await self._post_tier_via_http(cookies, auth_user=auth_user, proxy=proxy)
+        )
 
     async def _post_tier_via_http(
         self, cookies: _CookieJar, *, auth_user: str = "0", proxy: str | None = None

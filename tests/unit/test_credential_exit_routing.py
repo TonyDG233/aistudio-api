@@ -3020,11 +3020,19 @@ def _region_refresher(
     store: AccountStore,
     resolver: _ArbitrationResolver,
     canary: _FixedCanary,
+    *,
+    session: object | None = None,
 ) -> tuple[AccountInfoRefresher, _ArbitrationResolver]:
+    slot_provider = (
+        (lambda: (SimpleNamespace(account_id="acc1", session=session),))
+        if session is not None
+        else None
+    )
     refresher = AccountInfoRefresher(
         store,
         transport=_RegionTransport(),
         exit_resolver=cast(Any, resolver),
+        slot_provider=slot_provider,
         pacing_seconds=0.0,
     )
     refresher.set_region_arbiter(
@@ -3063,7 +3071,12 @@ def test_metadata_region_403_arbitration_outcomes(
     reset_skip_log_throttle()
     store, accounts = _make_store(tmp_path)
     canary = _FixedCanary(outcome)
-    refresher, resolver = _region_refresher(store, _ArbitrationResolver(), canary)
+    # A trusted probe transport (pooled signer session) is what makes the canary
+    # verdict attributable to the account; a bare httpx probe is covered by
+    # ``test_bare_tier_probe_*`` and never reaches the canary.
+    refresher, resolver = _region_refresher(
+        store, _ArbitrationResolver(), canary, session=_BoundSignerSession()
+    )
 
     result = asyncio.run(refresher.refresh_account(accounts[0]))
 
@@ -3086,6 +3099,48 @@ def test_metadata_region_403_arbitration_outcomes(
         assert meta["verify_required"] is True
         reloaded = AccountStore(accounts_dir).get_account("acc1")
         assert reloaded is not None and reloaded.verify_required is True
+
+
+def test_bare_tier_probe_account_bad_stays_inconclusive(tmp_path: Any) -> None:
+    """A bare region 403 on the matching exit still must not write verify.
+
+    The bare httpx probe has no signer shape, so a canary ``account_bad`` result
+    proves nothing about the account.  The refresh defers inconclusively and the
+    registry keeps ``verify_required`` False.
+    """
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    canary = _FixedCanary("account_bad")
+    refresher, resolver = _region_refresher(store, _ArbitrationResolver(), canary)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "inconclusive"
+    assert resolver.events == []
+    assert resolver.invalidated == []
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
+
+
+def test_bare_tier_probe_exit_bad_does_not_burn_exit(tmp_path: Any) -> None:
+    """A bare region 403 must not run the canary, so no exit is invalidated."""
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    canary = _FixedCanary("exit_bad")
+    refresher, resolver = _region_refresher(store, _ArbitrationResolver(), canary)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "inconclusive"
+    assert resolver.events == []
+    assert resolver.invalidated == []
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is False
 
 
 def test_off_mode_region_403_does_not_arbitrate(
@@ -3310,7 +3365,10 @@ def test_account_bad_keeps_an_existing_expiry(tmp_path: Any) -> None:
     store, accounts = _make_store(tmp_path)
     store.update_account_refresh("acc1", expired=True)
     refresher, resolver = _region_refresher(
-        store, _ArbitrationResolver(), _FixedCanary("account_bad")
+        store,
+        _ArbitrationResolver(),
+        _FixedCanary("account_bad"),
+        session=_BoundSignerSession(),
     )
 
     result = asyncio.run(refresher.refresh_account(accounts[0]))

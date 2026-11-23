@@ -362,6 +362,41 @@ async def test_probe_exit_empty_string_stays_inconclusive() -> None:
     assert resolver.invalidated_exits == []
 
 
+class _UntouchedResolver:
+    """Resolver double that fails loudly if the untrusted short-circuit leaks."""
+
+    def assignment_for(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("assignment_for must not run for an untrusted probe")
+
+    async def report_event(self, **kwargs: Any) -> bool:
+        raise AssertionError("report_event must not run")
+
+    def report_event_nowait(self, **kwargs: Any) -> None:
+        raise AssertionError("report_event_nowait must not run")
+
+    def invalidate_exit(self, exit_id: str) -> None:
+        raise AssertionError("invalidate_exit must not run")
+
+
+@pytest.mark.asyncio
+async def test_probe_exit_empty_string_short_circuits_before_canary() -> None:
+    """``probe_exit_id=""`` returns before assignment lookup, canary and report."""
+    probe = _FakeProbe("account_bad")
+    arbitration = ExitArbitration(
+        resolver=cast(Any, _UntouchedResolver()), canary_probe=probe
+    )
+
+    outcome = await arbitration.adjudicate(
+        account_id="acc-1",
+        kind="chat",
+        account_bad_event_kind="verify_account",
+        probe_exit_id="",
+    )
+
+    assert outcome == "inconclusive"
+    assert probe.calls == []
+
+
 @pytest.mark.asyncio
 async def test_probe_exit_match_allows_account_bad() -> None:
     probe = _FakeProbe("account_bad")
