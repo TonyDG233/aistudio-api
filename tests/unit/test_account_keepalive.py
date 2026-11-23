@@ -25,6 +25,7 @@ from aistudio_api.infrastructure.account.account_store import (
     AccountMeta,
     AccountStore,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import LeaseResult
 
 
 def _settings(**overrides: object) -> KeepaliveSettings:
@@ -1363,3 +1364,180 @@ async def test_auth_update_ignores_unparseable_startup_tier(tmp_path, monkeypatc
     account = store.get_account("acc_cold")
     assert account is not None
     assert account.tier == "Free"
+
+
+class FirstNLeaseResolver:
+    """External manager double: ok for the first N leases, then no_capacity."""
+
+    def __init__(self, ok_count: int, *, retry_after_s: float = 30.0) -> None:
+        self.ok_count = ok_count
+        self.retry_after_s = retry_after_s
+        self.calls: list[str] = []
+
+    async def lease(
+        self,
+        account_id: str,
+        *,
+        lane: str = "free",
+        cls: str = "generation",
+        calls: int = 1,
+        kind: str = "chat",
+        use_cache: bool = False,
+    ) -> LeaseResult:
+        del lane, cls, calls, kind, use_cache
+        self.calls.append(account_id)
+        if len(self.calls) > self.ok_count:
+            return LeaseResult(
+                "no_capacity",
+                retry_after_s=self.retry_after_s,
+                reason="no_capacity",
+            )
+        return LeaseResult(
+            "ok",
+            exit_id="exit-1",
+            socks_url="socks5h://127.0.0.1:40001",
+            generation=1,
+            ttl_s=60,
+            budget_left=10,
+        )
+
+    async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None:
+        del account_id, kind
+        return "socks5h://127.0.0.1:40001"
+
+
+class TierOkTransport:
+    def __init__(self) -> None:
+        self.posts = 0
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: str = "",
+    ) -> TransportResponse:
+        del url, headers, content
+        if method == "POST":
+            self.posts += 1
+            return TransportResponse(status=200, body="[1]")
+        return TransportResponse(status=200, body="[]")
+
+
+def _stale_accounts(store: AccountStore, count: int) -> list[AccountMeta]:
+    return [
+        _account(store, f"acc{i:02d}", f"acc{i:02d}@example.com")
+        for i in range(1, count + 1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_batches_and_stops_on_consecutive_no_capacity(
+    tmp_path, caplog
+):
+    store = AccountStore(tmp_path)
+    accounts = _stale_accounts(store, 43)
+    resolver = FirstNLeaseResolver(ok_count=3)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=resolver,
+        pacing_seconds=0.0,
+    )
+    service = _service(store, refresher=refresher, clock=FakeClock(4_000.0))
+
+    with caplog.at_level("WARNING"):
+        result = await service.run_now("metadata_refresh", settings=_settings())
+
+    # 3 ok then a 3-account no_capacity chunk: the round stops early.
+    assert resolver.calls == [f"acc{i:02d}" for i in range(1, 7)]
+    assert result["attempted"] == 6
+    assert result["succeeded"] == 3
+    assert result["deferred"] == 3
+    assert result["no_capacity"] == 3
+
+    for account in accounts[:3]:
+        after = store.get_account(account.id)
+        assert after is not None and after.tier_checked_at is not None
+    for account in accounts[3:]:
+        after = store.get_account(account.id)
+        assert after is not None and after.tier_checked_at is None
+
+    summaries = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING"
+        and "[Keepalive] metadata refresh capacity summary" in record.getMessage()
+    ]
+    assert len(summaries) == 1
+    assert not any(
+        "tier/邮箱探测延迟" in record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    )
+
+    # The next round resumes with the remaining due accounts (acc01..03 are
+    # now fresh) instead of restarting from the first account.
+    resolver.calls.clear()
+    await service.run_now("metadata_refresh", settings=_settings())
+    assert resolver.calls[:3] == ["acc04", "acc05", "acc06"]
+    assert "acc01" not in resolver.calls
+
+
+@pytest.mark.asyncio
+async def test_off_mode_metadata_refresh_still_attempts_every_account(tmp_path):
+    store = AccountStore(tmp_path)
+    accounts = _stale_accounts(store, 43)
+    refresher = FakeRefresher()
+    service = _service(store, refresher=refresher, clock=FakeClock(4_000.0))
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["attempted"] == 43
+    assert refresher.calls == [[account.id for account in accounts]]
+
+
+@pytest.mark.asyncio
+async def test_auth_update_batches_and_leaves_remaining_accounts_due(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    accounts = _stale_accounts(store, 20)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> dict[str, object]:
+        del session, client
+        rotated.append(account_id)
+        if len(rotated) > 3:
+            return {"ok": False, "status": 0, "updated": [], "deferred": True}
+        return {"ok": True, "status": 200, "updated": ["SID"]}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        refresher=refresher,
+        account_service=account_service,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert rotated == [f"acc{i:02d}" for i in range(1, 7)]
+    assert result["deferred"] is True
+    assert result["deferred_accounts"] == ["acc04", "acc05", "acc06"]
+    for account in accounts[:3]:
+        after = store.get_account(account.id)
+        assert after is not None and after.auth_saved_at is not None
+    for account in accounts[6:]:
+        after = store.get_account(account.id)
+        assert after is not None and after.auth_saved_at is None

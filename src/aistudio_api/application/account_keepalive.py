@@ -40,6 +40,13 @@ FAILURE_RETRY_SECONDS = 300.0
 REFRESH_IN_PROGRESS_RETRY_SECONDS = 60.0
 MAX_AUTH_CONSECUTIVE_FAILURES = 3
 
+# External exit mode: maintenance calls share a small per-exit budget, so one
+# keepalive round must not attempt every due account at once.  These caps stop
+# a round early and leave the rest due for the next 300s retry.
+DEFAULT_METADATA_ATTEMPT_LIMIT = 12
+DEFAULT_AUTH_ATTEMPT_LIMIT = 8
+CONSECUTIVE_NO_CAPACITY_LIMIT = 3
+
 DEFAULT_AUTH_UPDATE_HOURS = 24.0
 DEFAULT_METADATA_REFRESH_HOURS = 24.0
 DEFAULT_ACTIVE_ACTIVITY_SECONDS = 60.0
@@ -65,6 +72,17 @@ _DEFERRED_EMAIL_PREFIX = "deferred_no_capacity"
 
 def _is_deferred_result(result: object) -> bool:
     if bool(getattr(result, "deferred", False)):
+        return True
+    error = getattr(result, "error", None)
+    return isinstance(error, str) and error.startswith(_DEFERRED_EMAIL_PREFIX)
+
+
+def _is_no_capacity_result(result: object) -> bool:
+    """True when a deferred result is an exit-budget ``no_capacity`` deferral."""
+    if not _is_deferred_result(result):
+        return False
+    reason = str(getattr(result, "skip_reason", "") or "")
+    if reason == "no_capacity":
         return True
     error = getattr(result, "error", None)
     return isinstance(error, str) and error.startswith(_DEFERRED_EMAIL_PREFIX)
@@ -140,6 +158,9 @@ class AccountKeepaliveService:
         instance_manager: Any | None = None,
         account_service: Any | None = None,
         rotator: Any | None = None,
+        metadata_attempt_limit: int | None = None,
+        auth_attempt_limit: int | None = None,
+        consecutive_no_capacity_limit: int | None = None,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = 1.0,
     ) -> None:
@@ -149,6 +170,30 @@ class AccountKeepaliveService:
         self._instance_manager = instance_manager
         self._account_service = account_service
         self._rotator = rotator
+        self._metadata_attempt_limit = max(
+            1,
+            int(
+                metadata_attempt_limit
+                if metadata_attempt_limit is not None
+                else DEFAULT_METADATA_ATTEMPT_LIMIT
+            ),
+        )
+        self._auth_attempt_limit = max(
+            1,
+            int(
+                auth_attempt_limit
+                if auth_attempt_limit is not None
+                else DEFAULT_AUTH_ATTEMPT_LIMIT
+            ),
+        )
+        self._consecutive_no_capacity_limit = max(
+            1,
+            int(
+                consecutive_no_capacity_limit
+                if consecutive_no_capacity_limit is not None
+                else CONSECUTIVE_NO_CAPACITY_LIMIT
+            ),
+        )
         self._clock = clock
         self._tick_seconds = max(0.01, tick_seconds)
         self._task: asyncio.Task[None] | None = None
@@ -174,6 +219,13 @@ class AccountKeepaliveService:
         setter = getattr(self._refresher, "set_slot_provider", None)
         if callable(setter):
             setter(self._pool_slots)
+
+    def _external_runtime(self) -> bool:
+        """True when the refresher runs against the external exit pool."""
+        try:
+            return bool(getattr(self._refresher, "external_mode", False))
+        except Exception:
+            return False
 
     @property
     def running(self) -> str | None:
@@ -452,20 +504,27 @@ class AccountKeepaliveService:
         if not due:
             return {"ok": True, "reason": "no_due_accounts", "count": 0}
 
-        try:
-            # Background metadata refresh must not re-fetch the apps HTML for
-            # accounts that already have an email.  ``refresh_email=False``
-            # still backfills a genuinely missing email because the refresher
-            # treats ``not account.email`` as an automatic override.
-            results = await self._refresher.refresh_accounts(
-                due,
-                refresh_email=False,
-                skip_fresh_free_tier=True,
-                respect_backoff=True,
-            )
-        except RefreshInProgressError:
-            log.info("[Keepalive] metadata refresh skipped: already running")
-            return {"ok": False, "reason": "refresh_in_progress", "count": 0}
+        if self._external_runtime():
+            try:
+                results = await self._refresh_metadata_batched(due)
+            except RefreshInProgressError:
+                log.info("[Keepalive] metadata refresh skipped: already running")
+                return {"ok": False, "reason": "refresh_in_progress", "count": 0}
+        else:
+            try:
+                # Background metadata refresh must not re-fetch the apps HTML
+                # for accounts that already have an email.  ``refresh_email``
+                # =False still backfills a genuinely missing email because the
+                # refresher treats ``not account.email`` as an override.
+                results = await self._refresher.refresh_accounts(
+                    due,
+                    refresh_email=False,
+                    skip_fresh_free_tier=True,
+                    respect_backoff=True,
+                )
+            except RefreshInProgressError:
+                log.info("[Keepalive] metadata refresh skipped: already running")
+                return {"ok": False, "reason": "refresh_in_progress", "count": 0}
 
         checked_at = _iso(now)
         deferred_results = [result for result in results if _is_deferred_result(result)]
@@ -498,6 +557,14 @@ class AccountKeepaliveService:
         failed = sum(
             1 for result in results if not result.ok and not _is_deferred_result(result)
         )
+        succeeded = sum(
+            1
+            for result in results
+            if bool(getattr(result, "ok", False)) and not _is_deferred_result(result)
+        )
+        no_capacity = sum(
+            1 for result in deferred_results if _is_no_capacity_result(result)
+        )
         # Skipped accounts were not probed at all (no exit): they must stay due
         # so the next keepalive round retries instead of waiting a full 24h.
         skipped_results = [
@@ -521,25 +588,93 @@ class AccountKeepaliveService:
                 unlogged,
             )
         log.info(
-            "[Keepalive] metadata refresh trigger=%s checked=%d failed=%d "
-            "skipped=%d deferred=%d",
+            "[Keepalive] metadata refresh trigger=%s attempted=%d succeeded=%d "
+            "failed=%d skipped=%d deferred=%d no_capacity=%d",
             trigger,
             len(results),
+            succeeded,
             failed,
             len(skipped_ids),
             len(deferred_ids),
+            no_capacity,
         )
+        if deferred_ids:
+            # One aggregate warning per round; per-account defers stay INFO.
+            log.warning(
+                "[Keepalive] metadata refresh capacity summary trigger=%s "
+                "attempted=%d succeeded=%d deferred=%d no_capacity=%d",
+                trigger,
+                len(results),
+                succeeded,
+                len(deferred_ids),
+                no_capacity,
+            )
         return {
             "ok": failed == 0,
             "reason": "checked",
             "count": len(results),
+            "attempted": len(results),
+            "succeeded": succeeded,
             "failed": failed,
             "skipped": len(skipped_ids),
             "deferred": len(deferred_ids),
+            "no_capacity": no_capacity,
             "deferred_accounts": deferred_ids,
             "retry_after_s": deferred_retry,
             "accounts": [result.account_id for result in results],
         }
+
+    async def _refresh_metadata_batched(self, due: list[Any]) -> list[Any]:
+        """Attempt a bounded metadata batch, stopping on repeated no_capacity.
+
+        External-mode maintenance shares a small per-exit budget.  Accounts are
+        processed in small chunks so three consecutive ``no_capacity`` results
+        stop the round immediately; anything not attempted stays due for the
+        next 300s round instead of advancing its 24h clock.
+        """
+        limit = self._metadata_attempt_limit
+        stop_after = self._consecutive_no_capacity_limit
+        batch = due[:limit]
+        chunk_size = max(1, min(stop_after, limit))
+        results: list[Any] = []
+        streak = 0
+        for start in range(0, len(batch), chunk_size):
+            chunk = batch[start : start + chunk_size]
+            try:
+                chunk_results = await self._refresher.refresh_accounts(
+                    chunk,
+                    refresh_email=False,
+                    skip_fresh_free_tier=True,
+                    respect_backoff=True,
+                )
+            except RefreshInProgressError:
+                if not results:
+                    raise
+                log.info(
+                    "[Keepalive] metadata refresh stopped after %d account(s): "
+                    "another refresh started",
+                    len(results),
+                )
+                break
+            results.extend(chunk_results)
+            stop = False
+            for result in chunk_results:
+                if _is_deferred_result(result):
+                    streak += 1
+                    if streak >= stop_after:
+                        stop = True
+                        break
+                else:
+                    streak = 0
+            if stop:
+                log.info(
+                    "[Keepalive] metadata refresh stopped early after %d "
+                    "account(s): %d consecutive no_capacity",
+                    len(results),
+                    streak,
+                )
+                break
+        return results
 
     async def _save_slot(self, slot: Any) -> tuple[str | None, str, bool, bool]:
         slot_id = str(getattr(slot, "slot_id", "") or "")
@@ -781,6 +916,11 @@ class AccountKeepaliveService:
             if acc_id and sess:
                 slot_sessions[str(acc_id)] = sess
 
+        external = self._external_runtime()
+        auth_attempts = 0
+        no_capacity_streak = 0
+        stop_after_account = False
+
         for account in accounts:
             if not account.enabled or account.expired:
                 continue
@@ -793,7 +933,16 @@ class AccountKeepaliveService:
                     "[Keepalive] 跳过已锁定账号的 Cookie 轮换 account=%s", account.id
                 )
                 continue
+            if external and auth_attempts >= self._auth_attempt_limit:
+                log.info(
+                    "[Keepalive] auth update stopped at attempt limit %d; "
+                    "remaining accounts stay due",
+                    self._auth_attempt_limit,
+                )
+                break
             acc_sess = slot_sessions.get(account.id)
+            account_deferred = False
+            auth_attempts += 1
             try:
                 rot_res = await svc.rotate_account_cookies(account.id, session=acc_sess)
                 if rot_res.get("deferred"):
@@ -801,6 +950,7 @@ class AccountKeepaliveService:
                     deferred_accounts[account.id] = _as_float(
                         rot_res.get("retry_after_s"), 0.0
                     )
+                    account_deferred = True
                 elif rot_res.get("ok"):
                     _ensure_acc(account.id)
                     rotate_results.setdefault(account.id, []).append(True)
@@ -824,6 +974,23 @@ class AccountKeepaliveService:
                 rotate_results.setdefault(account.id, []).append(False)
             if acc_sess is not None:
                 await self._harvest_worker_startup(account.id, acc_sess)
+            if account_deferred:
+                no_capacity_streak += 1
+                if (
+                    external
+                    and no_capacity_streak >= self._consecutive_no_capacity_limit
+                ):
+                    stop_after_account = True
+            else:
+                no_capacity_streak = 0
+            if stop_after_account:
+                log.info(
+                    "[Keepalive] auth update stopped early after %d account(s): "
+                    "%d consecutive no_capacity/deferred",
+                    auth_attempts,
+                    no_capacity_streak,
+                )
+                break
 
         saved_accounts: list[str] = []
         failed_accounts: list[str] = []
@@ -848,6 +1015,19 @@ class AccountKeepaliveService:
             slot_id for acc_id, slot_id in slot_failures if acc_id in failed_set
         ]
         deferred_retry = max(deferred_accounts.values(), default=0.0)
+        no_capacity_deferred = len(deferred_accounts)
+
+        if deferred_accounts:
+            # One aggregate warning per round; per-account defers stay INFO.
+            log.warning(
+                "[Keepalive] auth update capacity summary trigger=%s "
+                "attempted=%d succeeded=%d deferred=%d no_capacity=%d",
+                trigger,
+                auth_attempts,
+                len(saved_accounts),
+                len(deferred_accounts),
+                no_capacity_deferred,
+            )
 
         for account_id in saved_accounts:
             self._store.mark_auth_saved(account_id)

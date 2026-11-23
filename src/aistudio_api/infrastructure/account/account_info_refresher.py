@@ -559,7 +559,7 @@ class AccountInfoRefresher:
     ) -> RefreshResult:
         reason = decision.reason or "no_capacity"
         if skip_log_due(account.id, reason):
-            logger.warning(
+            logger.info(
                 "[Refresh] %s tier/邮箱探测延迟（出口调用预算不足，稍后重试）"
                 "reason=%s retry_after=%.0fs email=%s",
                 account.id,
@@ -604,6 +604,11 @@ class AccountInfoRefresher:
     def set_slot_provider(self, provider: SlotProvider | None) -> None:
         """Attach a pool-slot provider so tier probes reuse live engine sessions."""
         self._slot_provider = provider
+
+    @property
+    def external_mode(self) -> bool:
+        """True when credential probes resolve per-account exits."""
+        return self._active_exit_resolver() is not None
 
     def tier_failure_count(self, account_id: str) -> int:
         return self._tier_failure_counts.get(account_id, 0)
@@ -1008,7 +1013,7 @@ class AccountInfoRefresher:
             if decision.deferred:
                 reason = decision.reason or "no_capacity"
                 if skip_log_due(account.id, reason):
-                    logger.warning(
+                    logger.info(
                         "[Refresh] %s tier probe deferred (exit budget) reason=%s "
                         "retry_after=%.0fs",
                         account.id,
@@ -1133,7 +1138,7 @@ class AccountInfoRefresher:
         if decision.deferred:
             reason = decision.reason or "no_capacity"
             if skip_log_due(account.id, reason):
-                logger.warning(
+                logger.info(
                     "[Refresh] %s 邮箱探测延迟（出口调用预算不足，稍后重试）"
                     "reason=%s retry_after=%.0fs",
                     account.id,
