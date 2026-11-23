@@ -188,3 +188,97 @@ uv run pytest -q
 
 - **不建议在 P1-1 处理前直接 push/部署**。P1-1 的最小修复（streak 只计 `no_capacity` + 可选轮转游标 / slot 重建）改动很小，建议本轮闭环。
 - 若产品明确接受“exit 异常也停止本轮、接受条件性饥饿”的设计取舍，则需同步修改日志措辞与决策记录，P1-1 可降级为 P2，其余 P2/Q 不阻塞。
+
+---
+
+# 二轮复审（修复提交 `cf96f03`）
+
+- 复审日期：2026-11-23
+- 复审角色：独立只读 Reviewer（延续 REV-2.1.5.16）
+- 复审对象：`cf96f03` fix(keepalive): 修复分批饥饿、仲裁 kind 与汇总口径
+  - `src/aistudio_api/application/account_keepalive.py`
+  - `src/aistudio_api/infrastructure/account/account_info_refresher.py`
+  - `tests/conftest.py`
+  - `tests/unit/test_account_keepalive.py`、`tests/unit/test_credential_exit_routing.py`、`tests/unit/test_exit_arbitration.py`
+- 依据：一轮报告 P1-1/P2-1..4/Q1/Q3、`AGENT.md` 分层约束、`06/08-09` 决策、本次源码与实跑门禁。
+- **二轮结论：PASS（0 P0 / 0 P1 / 0 P2）— 可 push/部署**。一轮 1 P1 + 4 P2 + Q1/Q3 全部闭环，无回归；1999 测试 + ruff + pyright 全绿。
+
+## 1. 复核点逐条结论
+
+### 1. P1-1：streak 仅计 no_capacity + 跨轮轮转游标（PASS）
+
+- **streak 仅计 no_capacity**：metadata 分块循环改为 `if _is_no_capacity_result(result)`，region defer/成功均走 `else: streak = 0`（`account_keepalive.py:865-877`）；auth 用 `account_no_capacity`（仅 `rot_res.get("deferred")` 置 True，`account_keepalive.py:1162,1172`），region 分支不再置位（`:1173-1184`），streak 只在该标志为真时自增（`:1208-1216`）。日志改为 “consecutive no_capacity”（`:1219-1223`），与规格一致。
+- **region defer 只 reset**：region 结果落入 `else` → streak 归零，不触发停止（metadata `:870-871`；auth `:1217-1218`）。
+- **跨轮轮转游标**：新增 `_rotate_after`（`account_keepalive.py:95-131`）与两个实例游标 `_metadata_cursor`/`_auth_cursor`（`:257-258`）。metadata 每轮 `_rotate_after(due, cursor, order_ids)[:limit]`（`:840`），轮末把最后一个结果账号写回游标（`:879-883`）；auth 每轮 `_rotate_after(list(accounts), cursor)`（`:1139`），轮末写 `last_attempted`（`:1228-1229`）。游标指向“上次结束位置”，下一轮从其后开始；未知/缺失游标回退原顺序（`:113-115`），不会跳过未尝试账号（仅重排）。
+- **前 3 个 region defer 不饿死后续**：metadata 测试 `test_metadata_region_deferrals_do_not_stop_round_and_rotate_cursor`（`test_account_keepalive.py:1767-1813`）断言首轮仍走完 6 个、`deferred=3/no_capacity=0`、无 capacity WARNING、第二轮首块从 `acc07` 开始且不含 `acc01`；auth 测试 `test_auth_region_deferrals_do_not_stop_round_and_rotate_cursor`（`:1855-1922`）断言 `rotated == acc01..acc06`、`deferred_accounts == [acc01,02,03]`、第二轮 `rotated[0] == acc07`。均非空转。
+- **off 不轮转**：auth `iteration = ... if external else accounts`（`:1136-1140`），游标仅在 `external` 时写回（`:1228-1229`）；metadata 分批仅在 external 分支调用（`:680-686`）。off 全量测试 `test_off_mode_metadata_refresh_still_attempts_every_account` 仍绿（`:1491-1503`）。
+- **说明（N）**：游标为进程内内存态，重启后从 store 头开始；属“跨轮”而非“跨重启”，符合本轮要求。
+
+### 2. P2-1：仲裁 kind 取绑定/槽位 surface，chat→build 兜底（PASS）
+
+- 新增 `resolve_arbitration_kind(resolver, account_id)`：按 `chat`、`build` 顺序查 `assignment_for(include_expired=True)`，命中即返回，否则兜底 `chat`（`account_info_refresher.py:113-143`）。
+- keepalive：`_slot_surface_for` 先读池槽 surface（`account_keepalive.py:299-309`），`_arbitration_kind` 再回退到 arbiter.resolver（`:311-318`）；`_arbitrate_region_once` 传 `kind=self._arbitration_kind(...)`（`:330`）。refresher 侧同样先槽位后 resolver（`account_info_refresher.py:667-690`），`_arbitrate_region_403` 使用该 kind（`:713`）。
+- 生产：keepalive 构造时把 `_pool_slots` 注入 refresher 的 slot provider（`account_keepalive.py:263-267`），故 metadata 也能读到 build 槽 surface。
+- 测试真实：`test_region_arbitration_uses_bound_build_surface_kind`（`test_credential_exit_routing.py:2891-2910`，build-only resolver 断言 `kinds == ["build"]`）与 `test_auth_region_arbitration_uses_bound_build_surface`（`test_account_keepalive.py:1965-2000`，build 槽断言 `kinds == ["build"]`）。
+
+### 3. P2-2：metadata failed 不含 skipped；auth attempted/succeeded 同口径；region-only 不打 no_capacity=0 WARNING（PASS）
+
+- metadata `failed` 增加 `and not getattr(result, "skipped", False)`（`account_keepalive.py:736-742`）；`ok` 改为 `failed == 0 and not skipped_ids`，skip 仍保持 300s 重试（`:807-810`）。
+- auth `attempted_accounts = len(account_order)`（`:1231`），与 `saved/failed/deferred` 同一分母（`account_order` 去重，`:1049-1051`），汇总 WARNING 用该值（`:1262-1267`）。
+- WARNING 仅在真实 no_capacity 时打印：metadata `if no_capacity:` 否则 `elif deferred_ids:` 打 INFO region 汇总（`:783-804`）；auth `if no_capacity_deferred:` 否则 `elif deferred_accounts:` 打 INFO（`:1258-1282`）。
+- 测试真实：`test_metadata_failed_excludes_skipped_accounts`（`test_account_keepalive.py:1837-1853`，断言 failed=1/skipped=1/ok=False）；`test_metadata_region_deferrals...` 与 `test_auth_region_deferrals...` 断言 region-only 时无 capacity WARNING、仅一条 region INFO 汇总（`:1795-1810`、`:1906-1918`）。
+
+### 4. P2-3：conftest 前后 reset `_default_arbitration`（PASS）
+
+- autouse fixture 在 yield 前后均调用 `reset_default_exit_arbitration()`（`tests/conftest.py:24-41`），与 `reset_exit_resolver()` 对称；消除跨测试的旧 resolver/跨 loop `asyncio.Lock` 残留。全量套件 1999 绿，未出现相关回归。
+
+### 5. P2-4：12/8 截断用例 + 默认登记正向用例（PASS）
+
+- `test_metadata_attempt_limit_stops_at_twelve_and_leaves_rest_due`（`test_account_keepalive.py:1815-1835`）：43 账号断言 `attempted=12/succeeded=12/no_capacity=0`，`accounts[12:]` 的 `tier_checked_at is None`。
+- `test_auth_attempt_limit_stops_at_eight_and_leaves_rest_due`（`:1924-1963`）：断言 `rotated == acc01..acc08`、`ok is True`、`accounts[8:]` 的 `auth_saved_at is None`。
+- `test_default_arbitration_registered_when_built_without_resolver`（`test_exit_arbitration.py:338-354`）：monkeypatch `get_exit_resolver` 后 `build_exit_arbitration()`（resolver=None）返回非空且 `get_default_exit_arbitration() is built`，正向覆盖生产登记路径。
+
+### 6. Q1：account_bad 只写 verify_required，不清 expired（PASS）
+
+- keepalive `_persist_account_bad` 改为 `update_account_refresh(account_id, verify_required=True)`（`account_keepalive.py:353-372`）；refresher account_bad 同样只写 verify（`account_info_refresher.py:728-735`）。`expired` 保持原值。
+- 测试真实：`test_persist_account_bad_keeps_existing_expired_flag`（`test_account_keepalive.py:2002-2012`，先置 expired=True，断言 verify=True 且 expired=True）；`test_account_bad_keeps_an_existing_expiry`（`test_credential_exit_routing.py:2912-2934`，端到端断言 expired 保留）。原 `account_bad` 用例（新账号 expired=False）仍绿。
+
+### 7. Q3：常量单份 + 分层导入方向（PASS）
+
+- `REGION_DEFER_RETRY_SECONDS` 只在 `account_info_refresher.py:110` 定义（`__all__` 导出 `:1602`），`account_keepalive.py:21` 导入使用；全仓无第二份定义（grep 确认）。
+- 方向：application（keepalive）→ infrastructure（refresher）为既有允许方向；`account_info_refresher.py` 无任何 `aistudio_api.application` 导入（grep 计数 0），未违反“infrastructure 严禁反向 import application”。`rg` 计数：application→infrastructure 58 处、infrastructure→application 0 处。
+
+### 8. 回归（PASS）
+
+- `uv run pytest -q` → **1999 passed**（较一轮 1989 +10，新增用例真实）。
+- `uv run ruff check .` → All checks passed；`uv run pyright src tests` → 0 errors/0 warnings。
+- 改动 6 个代码/测试文件格式化通过；`git show --stat cf96f03` 仅 7 个文件（含本报告），无新依赖（`pyproject.toml`/`uv.lock` 未动）。
+- D-05/`active_requests`：仅重排遍历顺序与游标，未触碰并发账本/排空；off 模式走原全量路径（`account_keepalive.py:1136-1140`、`:680-686`）。
+
+## 2. 残留问题
+
+- **P0/P1/P2：0**。
+- **Q（沿用，不阻塞）**：Q2（RotateCookies 空体 403 一律按出口嫌疑 → 真失效号可能标 account_bad→verify 而非 expired）仍为既定取舍，本轮未改，符合必查项 6；如需区分需上游响应体，非本轮范围。
+- **N**：① 游标为内存态，重启从 store 头开始；② 全局 no_capacity 持续时轮转使单账号重试间隔约 `(N/limit)×300s`（如 43/3 ≈ 70min），属“公平性优先”的既定取舍；③ `_slot_surface_for` 对同账号同时存在 chat/build 槽时取首个匹配（AGENTS 约定同账号不并存，属防御性观察）。
+
+## 3. 门禁输出（原样）
+
+```
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check src/aistudio_api/application/account_keepalive.py src/aistudio_api/infrastructure/account/account_info_refresher.py tests/conftest.py tests/unit/test_account_keepalive.py tests/unit/test_credential_exit_routing.py tests/unit/test_exit_arbitration.py
+6 files already formatted
+
+uv run pyright src tests
+0 errors, 0 warnings, 0 informations
+
+uv run pytest -q
+1999 passed in 67.77s (0:01:07)
+```
+
+- 未运行前端 `bun run build`（按要求“不跑 build”）。
+
+## 4. 只读声明
+
+二轮复审同样为 **100% 只读**：未修改任何代码/配置/测试/契约，未 commit/push，未启动服务或浏览器，未访问 VPS/外网/真实账号/真实 Google。唯一写操作是把本节追加到本文件。
