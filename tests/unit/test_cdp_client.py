@@ -204,8 +204,14 @@ async def test_cdp_page_set_cookies_normalization():
 
     await page.set_cookies(cookies)
 
-    conn.send.assert_called()
-    payload = conn.send.call_args[0][1]["cookies"]
+    # ``set_cookies`` now also queries ``Network.getCookies`` for the missing
+    # name audit, so pick the injection call explicitly.
+    set_call = next(
+        call
+        for call in conn.send.call_args_list
+        if call.args and call.args[0] == "Network.setCookies"
+    )
+    payload = set_call.args[1]["cookies"]
     assert len(payload) == 2
 
     sid = next(c for c in payload if c["name"] == "SID")
@@ -298,3 +304,148 @@ async def test_cdp_client_connect_page_success_and_prune():
                 "t2",
                 "t3",
             ]
+
+
+def _set_cookies_payload(conn: MagicMock) -> list[dict[str, object]]:
+    set_call = next(
+        call
+        for call in conn.send.call_args_list
+        if call.args and call.args[0] == "Network.setCookies"
+    )
+    return set_call.args[1]["cookies"]
+
+
+@pytest.mark.asyncio
+async def test_set_cookies_forces_secure_for_samesite_none():
+    """A: SameSite=None + secure=False must be legalized to secure=True."""
+    conn = MagicMock(spec=CDPConnection)
+    conn.send = AsyncMock(return_value={})
+    page = CDPPage(conn, target_id="target-1")
+
+    await page.set_cookies(
+        [
+            {
+                "name": "SID",
+                "value": "sid123",
+                "domain": ".google.com",
+                "path": "/",
+                "secure": False,
+                "sameSite": "None",
+            }
+        ]
+    )
+
+    sid = next(c for c in _set_cookies_payload(conn) if c["name"] == "SID")
+    assert sid["sameSite"] == "None"
+    assert sid["secure"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_cookies_enforces_prefix_rules():
+    """B: __Secure- forces Secure; __Host- forces Secure + path=/ and url-only."""
+    conn = MagicMock(spec=CDPConnection)
+    conn.send = AsyncMock(return_value={})
+    page = CDPPage(conn, target_id="target-1")
+
+    await page.set_cookies(
+        [
+            {
+                "name": "__Secure-OSID",
+                "value": "a",
+                "domain": ".google.com",
+                "path": "/",
+                "secure": False,
+                "sameSite": "None",
+            },
+            {
+                "name": "__Host-1PLSID",
+                "value": "b",
+                "domain": ".accounts.google.com",
+                "path": "/u/1",
+                "secure": False,
+            },
+        ]
+    )
+
+    payload = _set_cookies_payload(conn)
+    secure = next(c for c in payload if c["name"] == "__Secure-OSID")
+    assert secure["secure"] is True
+    assert secure["path"] == "/"
+
+    host = next(c for c in payload if c["name"] == "__Host-1PLSID")
+    assert host["secure"] is True
+    assert host["path"] == "/"
+    assert "domain" not in host
+    assert host["url"] == "https://accounts.google.com/"
+
+
+@pytest.mark.asyncio
+async def test_set_cookies_never_sends_insecure_samesite_none():
+    """C: no formatted cookie may combine SameSite=None with secure=False."""
+    conn = MagicMock(spec=CDPConnection)
+    conn.send = AsyncMock(return_value={})
+    page = CDPPage(conn, target_id="target-1")
+
+    await page.set_cookies(
+        [
+            {"name": "SID", "value": "v1", "sameSite": "None", "secure": False},
+            {"name": "SAPISID", "value": "v2", "sameSite": "none"},
+            {"name": "__Secure-3PSID", "value": "v3", "secure": False},
+            {"name": "NID", "value": "v4", "sameSite": "Lax", "secure": False},
+        ]
+    )
+
+    for item in _set_cookies_payload(conn):
+        assert not (item.get("sameSite") == "None" and item.get("secure") is False), (
+            item
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_cookies_warns_missing_names_without_values(
+    caplog: pytest.LogCaptureFixture,
+):
+    """D: post-injection audit lists dropped names only, never values."""
+    caplog.set_level("WARNING", logger="aistudio.cdp")
+    conn = MagicMock(spec=CDPConnection)
+
+    async def fake_send(method: str, params: object = None, **_kwargs: object):
+        if method == "Network.getCookies":
+            return {
+                "cookies": [
+                    {"name": "SID", "value": "kept"},
+                    {"name": "OSID", "value": "kept"},
+                ]
+            }
+        return {}
+
+    conn.send = AsyncMock(side_effect=fake_send)
+    page = CDPPage(conn, target_id="target-1")
+
+    await page.set_cookies(
+        [
+            {"name": "SID", "value": "SECRET-SID-VALUE"},
+            {"name": "OSID", "value": "SECRET-OSID-VALUE"},
+            {"name": "__Secure-OSID", "value": "SECRET-SECURE-OSID-VALUE"},
+            {"name": "__Host-GAPS", "value": "SECRET-GAPS-VALUE"},
+        ]
+    )
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= 30 and "Cookie 注入后缺失" in record.getMessage()
+    ]
+    assert warnings, caplog.text
+    line = warnings[-1]
+    assert "2 项" in line
+    assert "__Secure-OSID" in line
+    assert "__Host-GAPS" in line
+    for secret in (
+        "SECRET-SID-VALUE",
+        "SECRET-OSID-VALUE",
+        "SECRET-SECURE-OSID-VALUE",
+        "SECRET-GAPS-VALUE",
+    ):
+        assert secret not in line
+        assert secret not in caplog.text

@@ -2541,3 +2541,37 @@ async def test_start_logs_cookie_names_without_values(
     for secret in (secret_osid, secret_sidcc, secret_sid):
         assert secret not in line
         assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_start_logs_cookie_names_at_both_stages_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """E: the post-injection census runs before the post-bootstrap one."""
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _VerifyStartPage(
+        calls=[],
+        cookies=[
+            {"name": "SID", "value": "SECRET-SID"},
+            {"name": "OSID", "value": "SECRET-OSID"},
+        ],
+    )
+    driver = _drive_verify_start(monkeypatch, tmp_path, page=page)
+
+    await driver.start()
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "[Verify]" in record.getMessage() and "Cookie: total=" in record.getMessage()
+    ]
+    injection = next(line for line in lines if "[Verify] Cookie 注入后 Cookie:" in line)
+    bootstrap = next(line for line in lines if "[Verify] 会话引导后 Cookie:" in line)
+    assert "sid=yes" in injection
+    assert "osid=yes" in injection
+    assert "sid=yes" in bootstrap
+    assert lines.index(injection) < lines.index(bootstrap)
+    assert "SECRET-SID" not in caplog.text
+    assert "SECRET-OSID" not in caplog.text

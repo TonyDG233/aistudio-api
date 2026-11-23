@@ -691,6 +691,20 @@ class CDPPage:
             if "expires" in c and c["expires"] is not None:
                 item["expires"] = float(str(c["expires"]))
 
+            # Chrome silently drops ``SameSite=None`` cookies without ``Secure``
+            # and rejects ``__Secure-`` / ``__Host-`` cookies missing the flag
+            # they name.  A rejected ``SID`` breaks the whole
+            # ``accounts.google.com`` session, so legalize the combination here
+            # instead of injecting a value the browser will throw away.
+            # Nothing else is inferred.
+            if c_name.startswith("__Secure-"):
+                item["secure"] = True
+            if c_name.startswith("__Host-"):
+                item["secure"] = True
+                item["path"] = "/"
+            if item.get("sameSite") == "None" and item["secure"] is False:
+                item["secure"] = True
+
             formatted.append(item)
 
         try:
@@ -704,11 +718,36 @@ class CDPPage:
                 except Exception as ind_e:
                     log.debug("设置 Cookie %s 失败: %s", item.get("name"), ind_e)
 
+        await self._log_missing_cookie_names(formatted)
+
         self._cached_cookies = {
             str(c.get("name") or ""): str(c.get("value") or "")
             for c in cookies
             if c.get("name")
         }
+
+    async def _log_missing_cookie_names(
+        self, injected: list[dict[str, object]]
+    ) -> None:
+        """Warn about injected Cookie *names* Chromium did not keep (never values)."""
+        expected = {str(item.get("name") or "") for item in injected} - {""}
+        if not expected:
+            return
+        try:
+            rows = await self.get_cookies()
+        except Exception as exc:
+            log.debug("Cookie 注入后缺失检查失败: %s", exc)
+            return
+        present = {
+            str(cookie.get("name") or "") for cookie in rows if isinstance(cookie, dict)
+        }
+        missing = sorted(expected - present)
+        if not missing:
+            return
+        shown = ",".join(missing[:20])
+        if len(missing) > 20:
+            shown += "…"
+        log.warning("Cookie 注入后缺失 %d 项: %s", len(missing), shown)
 
     async def clear_cookies(self) -> None:
         """Clear all browser cookies."""

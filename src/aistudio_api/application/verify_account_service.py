@@ -214,6 +214,7 @@ _VERIFY_COOKIE_NAME_CHECKS = (
     ("secure_osid", "__Secure-OSID"),
     ("gaps", "__Host-GAPS"),
     ("sidcc", "SIDCC"),
+    ("sid", "SID"),
 )
 
 
@@ -1788,6 +1789,7 @@ class CdpVerifyBrowserDriver:
             loaded = await load_cookies_to_page(page, str(self._auth_file))
             if not loaded:
                 raise VerifyAccountError("credentials_missing")
+            await self._log_cookie_names(page, "Cookie 注入后")
             # The pooled session consumes the same bootstrap before landing on
             # AI Studio: it negotiates the ``accounts.google.com`` side (OSID
             # and friends) that the verify RPCs need as caller identity.  The
@@ -1802,7 +1804,7 @@ class CdpVerifyBrowserDriver:
                     type(exc).__name__,
                     _safe_error_detail(exc),
                 )
-            await self._log_cookie_names(page)
+            await self._log_cookie_names(page, "会话引导后")
             await page.goto(
                 VERIFY_ACCOUNT_URL, timeout_s=30.0, wait_until="domcontentloaded"
             )
@@ -1836,7 +1838,7 @@ class CdpVerifyBrowserDriver:
             _safe_page_text(info.get("text")) or "-",
         )
 
-    async def _log_cookie_names(self, page: object) -> None:
+    async def _log_cookie_names(self, page: object, stage: str = "会话引导后") -> None:
         """Log Cookie *name* presence only; never values or the list itself."""
         getter = getattr(page, "get_cookies", None)
         if not callable(getter):
@@ -1845,7 +1847,8 @@ class CdpVerifyBrowserDriver:
             cookies = await cast("Awaitable[object]", getter())
         except Exception as exc:
             log.debug(
-                "[Verify] 会话引导后 Cookie 读取失败: error_type=%s",
+                "[Verify] %s Cookie 读取失败: error_type=%s",
+                stage,
                 type(exc).__name__,
             )
             return
@@ -1857,7 +1860,7 @@ class CdpVerifyBrowserDriver:
             f"{label}={'yes' if name in names else 'no'}"
             for label, name in _VERIFY_COOKIE_NAME_CHECKS
         )
-        log.info("[Verify] 会话引导后 Cookie: total=%d %s", len(rows), flags)
+        log.info("[Verify] %s Cookie: total=%d %s", stage, len(rows), flags)
 
     # -- CDP network record (observation only) ------------------------------
 
