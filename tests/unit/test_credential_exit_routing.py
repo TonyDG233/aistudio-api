@@ -1919,6 +1919,225 @@ def test_leased_session_raises_429_budget_wait() -> None:
     assert rotate["skipped"] == "no_exit"
 
 
+def _leased_probe_session(
+    resolver: _LeaseResolver, *, account_id: str, body: bytes = b"[1]"
+) -> Any:
+    from aistudio_api.infrastructure.waa.engine_runtime import (
+        _LeasedBrowserlessSession,
+    )
+
+    class _Delegate:
+        engine = "browserless"
+
+        def is_alive(self) -> bool:
+            return True
+
+        async def send_hooked_request(self, **kwargs: object):
+            del kwargs
+            return 200, body
+
+    return _LeasedBrowserlessSession(
+        cast(Any, _Delegate()),
+        resolver=cast(Any, resolver),
+        account_id=account_id,
+        lane="free",
+        kind="chat",
+        bound_socks=EXIT_ONE,
+    )
+
+
+def test_slotted_session_tier_probe_leases_maintenance_once(tmp_path: Any) -> None:
+    """P2-1: a pooled-session tier probe must not pre-lease + session-lease twice."""
+    store = AccountStore(tmp_path / "accounts_slotted_lease")
+    account = store.save_account(
+        name="Slotted",
+        email="slotted@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_slotted",
+        tier="Free",
+    )
+    resolver = _LeaseResolver()
+    session = _leased_probe_session(resolver, account_id=account.id)
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=account.id, session=session),
+        ),
+    )
+
+    result = asyncio.run(refresher.refresh_account(account, refresh_email=False))
+
+    assert result.ok is True
+    assert result.tier == "Pro"
+    # Exactly one maintenance lease for the whole probe: the pre-session
+    # ``_credential_exit`` lease is gone and only the session counts.
+    assert resolver.calls == [(account.id, "free", "maintenance", 1, "chat")]
+
+
+def test_slotted_session_tier_probe_defer_comes_from_session(tmp_path: Any) -> None:
+    store = AccountStore(tmp_path / "accounts_slotted_defer")
+    account = store.save_account(
+        name="Slotted defer",
+        email="slotted-defer@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_slotted_defer",
+        tier="Free",
+    )
+    resolver = _LeaseResolver(no_capacity=True, retry_after_s=33.0)
+    session = _leased_probe_session(resolver, account_id=account.id)
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=account.id, session=session),
+        ),
+    )
+
+    result = asyncio.run(refresher.refresh_account(account, refresh_email=False))
+
+    assert result.deferred is True
+    assert result.retry_after_s == pytest.approx(33.0)
+    assert resolver.calls == [(account.id, "free", "maintenance", 1, "chat")]
+
+
+def test_slotted_session_refresh_tier_leases_maintenance_once(
+    tmp_path: Any,
+) -> None:
+    """P2-1: ``refresh_tier`` also counts a pooled probe exactly once."""
+    store = AccountStore(tmp_path / "accounts_slotted_tier")
+    account = store.save_account(
+        name="Slotted tier",
+        email="slotted-tier@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_slotted_tier",
+        tier="Free",
+    )
+    resolver = _LeaseResolver()
+    session = _leased_probe_session(resolver, account_id=account.id)
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=account.id, session=session),
+        ),
+    )
+
+    result = asyncio.run(refresher.refresh_tier(account))
+
+    assert result["error"] is None
+    assert result["tier"] == "Pro"
+    assert resolver.calls == [(account.id, "free", "maintenance", 1, "chat")]
+
+
+def test_cold_start_session_reuses_creation_lease_for_first_request() -> None:
+    """P2-2: create_session + first request leases generation exactly once."""
+    resolver = _LeaseResolver()
+    runtime = BrowserlessEngineRuntime(
+        {
+            "mode": "browserless",
+            "browserless": {
+                "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
+                "transport": {"mode": "signer_rpc"},
+            },
+        },
+        signer_client=cast(Any, MagicMock()),
+        exit_resolver=cast(Any, resolver),
+    )
+
+    async def _run() -> None:
+        build = await runtime.create_session(
+            slot_id="slot-1",
+            auth_file=None,
+            auth_user="0",
+            tier="Free",
+            account_id="acc_cold",
+            realm_id="realm-cold",
+            surface="chat",
+        )
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        assert generation == [("acc_cold", "free", "generation", 1, "chat")]
+
+        async with build.session.request_scope():
+            pass
+        # The first request consumed the creation lease; nothing new was leased.
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        assert len(generation) == 1
+
+        async with build.session.request_scope():
+            pass
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        assert len(generation) == 2
+
+    asyncio.run(_run())
+
+
+def test_request_scope_is_per_task_not_a_shared_session_flag() -> None:
+    """P2-3: A leaving its scope must not drop B's still-open scope."""
+    from contextlib import asynccontextmanager
+
+    from aistudio_api.infrastructure.waa.engine_runtime import (
+        _LeasedBrowserlessSession,
+    )
+
+    class _Delegate:
+        engine = "browserless"
+        active_context = object()
+
+        @asynccontextmanager
+        async def request_scope(self):
+            yield self.active_context
+
+        async def send_hooked_request(self, **kwargs: object):
+            del kwargs
+            return 200, b"[]"
+
+    resolver = _LeaseResolver()
+    session = _LeasedBrowserlessSession(
+        cast(Any, _Delegate()),
+        resolver=cast(Any, resolver),
+        account_id="acc_concurrent",
+        lane="free",
+        kind="chat",
+        bound_socks=EXIT_ONE,
+    )
+
+    async def _run() -> None:
+        a_entered = asyncio.Event()
+        b_entered = asyncio.Event()
+        a_may_exit = asyncio.Event()
+        b_may_send = asyncio.Event()
+
+        async def _request_a() -> None:
+            async with session.request_scope():
+                a_entered.set()
+                await a_may_exit.wait()
+
+        async def _request_b() -> None:
+            await a_entered.wait()
+            async with session.request_scope():
+                b_entered.set()
+                await b_may_send.wait()
+                # B is still inside its own scope: this must not lease
+                # maintenance just because A already exited.
+                await session.send_hooked_request(body="b")
+
+        task_a = asyncio.create_task(_request_a())
+        task_b = asyncio.create_task(_request_b())
+        await a_entered.wait()
+        await b_entered.wait()
+        a_may_exit.set()
+        await task_a
+        b_may_send.set()
+        await task_b
+
+    asyncio.run(_run())
+
+    calls = resolver.calls
+    assert [call[2] for call in calls] == ["generation", "generation"]
+    assert all(call[2] != "maintenance" for call in calls)
+
+
 def test_generation_no_capacity_surfaces_429_and_keeps_slot_retryable(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2040,6 +2259,58 @@ def test_keepalive_metadata_deferred_does_not_advance_due(tmp_path: Any) -> None
     assert stored.last_refresh_error is None
     last = service._last_results["metadata_refresh"]
     assert last["deferred"] == 1
+
+
+def test_keepalive_deferred_preserves_previous_refresh_error(tmp_path: Any) -> None:
+    """Q-9: a deferred 429 advances only the attempt time, not last_refresh_error."""
+    store = AccountStore(tmp_path / "accounts_metadata_defer_error")
+    account = store.save_account(
+        name="Deferred with error",
+        email="deferred-error@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_deferred_error",
+    )
+    stale_at = (datetime.now(UTC) - timedelta(days=5)).isoformat()
+    store.update_account_refresh(
+        account.id, tier="Free", tier_checked_at=stale_at, expired=False
+    )
+    store.mark_refresh_attempt(account.id, error="earlier upstream 403")
+
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        exit_resolver=cast(Any, _LeaseResolver(no_capacity=True, retry_after_s=45.0)),
+    )
+
+    class _Clock:
+        now = datetime.now(UTC).timestamp()
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    service = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        refresher,
+        clock=clock,
+        tick_seconds=3600.0,
+    )
+    service._next_due = {"metadata_refresh": clock.now}
+    settings_block = KeepaliveSettings(
+        auth_update=False,
+        metadata_refresh=True,
+        active_activity=False,
+    )
+
+    asyncio.run(service._run_due(settings_block))
+
+    stored = store.get_account(account.id)
+    assert stored is not None
+    assert stored.tier_checked_at == stale_at
+    # The deferred probe must not clear a real error from an earlier attempt.
+    assert stored.last_refresh_error == "earlier upstream 403"
+    assert stored.last_refresh_attempt_at is not None
 
 
 def test_manual_refresh_reports_per_account_deferred() -> None:

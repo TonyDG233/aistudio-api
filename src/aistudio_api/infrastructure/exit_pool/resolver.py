@@ -2,7 +2,7 @@
 
 The resolver talks to a host-side manager that owns account -> exit stickiness:
 
-* ``GET  {endpoint}/v1/assign?account=<hmac>&kind=chat|build``
+* ``POST {endpoint}/v1/lease`` (JSON: account/lane/class/calls)
 * ``POST {endpoint}/v1/events``
 
 Only the irreversible ``HMAC-SHA256(hmac_key, account_id)`` identifier ever
@@ -37,7 +37,6 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("exit-pool")
 
-ASSIGN_PATH = "/v1/assign"
 LEASE_PATH = "/v1/lease"
 EVENTS_PATH = "/v1/events"
 STATUS_PATH = "/v1/status"
@@ -870,7 +869,6 @@ def reset_exit_resolver(resolver: ExitResolver | None = None) -> None:
 
 
 __all__ = [
-    "ASSIGN_PATH",
     "DIRECT_FALLBACK_LOG_INTERVAL_S",
     "EVENTS_PATH",
     "SKIP_LOG_INTERVAL_S",

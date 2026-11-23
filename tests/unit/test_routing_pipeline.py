@@ -14,6 +14,7 @@ from aistudio_api.application.routing_pipeline import RoutingPipeline
 from aistudio_api.domain.errors import (
     AuthError,
     BrowserTransportError,
+    ExitBudgetWaitError,
     RequestError,
     SessionExpiredError,
     SurfaceCapacityError,
@@ -1116,6 +1117,33 @@ async def test_auth_error_then_429_switches_without_same_retry() -> None:
         )
     assert second.same_retries == 0
     await pipeline.release(second)
+
+
+@pytest.mark.asyncio
+async def test_exit_budget_429_at_request_time_does_not_switch() -> None:
+    """Q-4: a READY slot's request-time no_capacity 429 surfaces without rebind."""
+    from tests.unit.routing_fakes import RebindFakeManager
+
+    manager = RebindFakeManager(
+        [
+            make_instance("inst-1", account_id="acc-1", tier="Pro", number=1),
+            make_instance("inst-2", account_id="acc-2", tier="Pro", number=2),
+        ]
+    )
+    pipeline = _pipeline(manager)
+    context = await pipeline.begin(model_path="gemini-4-argon")
+    attempt = await pipeline.acquire(context)
+    assert attempt is not None
+    error = ExitBudgetWaitError("exit budget exhausted", retry_after=9.0)
+
+    with pytest.raises(ExitBudgetWaitError):
+        await pipeline.handle_error(context, attempt, error, has_yielded_data=False)
+
+    assert attempt.same_retries == 0
+    assert context.budget.switches == 0
+    assert context.failed_accounts == set()
+    assert manager.reassign_calls == []
+    await pipeline.release(attempt)
 
 
 @pytest.mark.asyncio

@@ -465,11 +465,22 @@ class AccountKeepaliveService:
             ),
             default=0.0,
         )
+        previous_errors = {
+            str(account.id): getattr(account, "last_refresh_error", None)
+            for account in due
+        }
         for result in results:
+            deferred = bool(getattr(result, "deferred", False))
             self._store.mark_refresh_attempt(
                 str(result.account_id),
-                # 429 no_capacity must not be recorded as an account failure.
-                error=(None if getattr(result, "deferred", False) else result.error),
+                # 429 no_capacity must not be recorded as an account failure, and
+                # it must not erase a real error from an earlier attempt either:
+                # only the attempt timestamp advances for a deferred account.
+                error=(
+                    previous_errors.get(str(result.account_id))
+                    if deferred
+                    else result.error
+                ),
                 at=result.checked_at or checked_at,
             )
         failed = sum(

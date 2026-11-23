@@ -353,6 +353,10 @@ async def probe_tier_over_session(
                 f"signer tier probe timed out after "
                 f"{TIER_PROBE_SIGNER_TIMEOUT_SECONDS:.0f}s"
             )
+        except ExitBudgetWaitError:
+            # 429 no_capacity from the session lease must reach the caller so it
+            # can defer (retry after Retry-After), never degrade into a 502 skip.
+            raise
         except Exception as exc:
             logger.warning("[Refresh] signer tier probe failed: %s", exc)
             return _probe_failure_response(f"signer tier probe failed: {exc}")
@@ -752,11 +756,18 @@ class AccountInfoRefresher:
             )
 
         session = self._resolve_account_session(account.id)
-        decision = await self._credential_exit(account.id, account.tier)
-        if decision.deferred:
-            return self._deferred_result(account, decision, checked_at)
-        if session is None and not decision.allowed:
-            return self._skipped_result(account, decision, checked_at)
+        # P2-1: on a pooled/slotted session the lease is taken once by the
+        # session's own ``send_hooked_request`` (maintenance).  Resolving the
+        # exit here as well would charge two maintenance calls for one probe.
+        # A deferred 429 still surfaces as ``ExitBudgetWaitError`` from the
+        # session and is caught below.
+        decision: ExitDecision | None = None
+        if session is None or not _session_is_browserless(session):
+            decision = await self._credential_exit(account.id, account.tier)
+            if decision.deferred:
+                return self._deferred_result(account, decision, checked_at)
+            if not decision.allowed:
+                return self._skipped_result(account, decision, checked_at)
 
         try:
             response = await self._post_tier_request(
@@ -764,8 +775,8 @@ class AccountInfoRefresher:
                 auth_user=account.auth_user,
                 account_id=account.id,
                 session=session,
-                proxy=decision.proxy,
-                allow_bare=decision.allowed,
+                proxy=decision.proxy if decision is not None else None,
+                allow_bare=decision.allowed if decision is not None else False,
             )
         except ExitBudgetWaitError as exc:
             return self._deferred_result(
@@ -779,6 +790,10 @@ class AccountInfoRefresher:
                 checked_at,
             )
         if response is None:
+            if decision is None:
+                decision = ExitDecision(
+                    "skip", reason="probe_unavailable", external=True
+                )
             return self._skipped_result(account, decision, checked_at)
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
@@ -812,16 +827,34 @@ class AccountInfoRefresher:
             email_error: str | None = None
             wants_email = refresh_email or not account.email
             if wants_email:
-                try:
-                    email = await self._fetch_account_email(
-                        cookies,
-                        account.email,
-                        auth_user=account.auth_user,
-                        proxy=decision.proxy,
-                        allow_bare=decision.allowed,
+                # The email probe is a separate credential-bearing call, so it
+                # resolves/leases its own exit when the tier probe reused a
+                # pooled session (``decision`` is None there).
+                email_decision = decision
+                if email_decision is None:
+                    email_decision = await self._credential_exit(
+                        account.id, account.tier
                     )
-                except Exception as e:
-                    email_error = str(e)
+                if email_decision.deferred:
+                    email_error = (
+                        "deferred_no_capacity: "
+                        f"{email_decision.reason or 'no_capacity'}"
+                    )
+                elif not email_decision.allowed:
+                    email_error = (
+                        f"skipped_no_exit: {email_decision.reason or 'no_exit'}"
+                    )
+                else:
+                    try:
+                        email = await self._fetch_account_email(
+                            cookies,
+                            account.email,
+                            auth_user=account.auth_user,
+                            proxy=email_decision.proxy,
+                            allow_bare=email_decision.allowed,
+                        )
+                    except Exception as e:
+                        email_error = str(e)
 
             if email:
                 self._store.update_account_refresh(
@@ -967,49 +1000,54 @@ class AccountInfoRefresher:
 
         checked_at = _now_iso()
         session = self._resolve_account_session(account.id)
-        decision = await self._credential_exit(account.id, account.tier)
-        if decision.deferred:
-            reason = decision.reason or "no_capacity"
-            if skip_log_due(account.id, reason):
-                logger.warning(
-                    "[Refresh] %s tier probe deferred (exit budget) reason=%s "
-                    "retry_after=%.0fs",
-                    account.id,
-                    reason,
-                    decision.retry_after_s,
-                )
-            return {
-                "tier": None,
-                "expired": None,
-                "error": None,
-                "checked_at": None,
-                "deferred": True,
-                "retry_after_s": decision.retry_after_s,
-                "skip_reason": reason,
-            }
-        if session is None and not decision.allowed:
-            skip_reason = decision.reason or "no_exit"
-            if skip_log_due(account.id, skip_reason):
-                logger.warning(
-                    "[Refresh] %s tier probe skipped (no exit, fail-closed) reason=%s",
-                    account.id,
-                    skip_reason,
-                )
-            return {
-                "tier": None,
-                "expired": None,
-                "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
-                "checked_at": None,
-                "skipped": True,
-            }
+        # P2-1: a pooled session leases this probe once through its own
+        # ``send_hooked_request``; only the raw-httpx path needs a pre-lease.
+        decision: ExitDecision | None = None
+        if session is None or not _session_is_browserless(session):
+            decision = await self._credential_exit(account.id, account.tier)
+            if decision.deferred:
+                reason = decision.reason or "no_capacity"
+                if skip_log_due(account.id, reason):
+                    logger.warning(
+                        "[Refresh] %s tier probe deferred (exit budget) reason=%s "
+                        "retry_after=%.0fs",
+                        account.id,
+                        reason,
+                        decision.retry_after_s,
+                    )
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": None,
+                    "checked_at": None,
+                    "deferred": True,
+                    "retry_after_s": decision.retry_after_s,
+                    "skip_reason": reason,
+                }
+            if not decision.allowed:
+                skip_reason = decision.reason or "no_exit"
+                if skip_log_due(account.id, skip_reason):
+                    logger.warning(
+                        "[Refresh] %s tier probe skipped (no exit, fail-closed) "
+                        "reason=%s",
+                        account.id,
+                        skip_reason,
+                    )
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
+                    "checked_at": None,
+                    "skipped": True,
+                }
         try:
             response = await self._post_tier_request(
                 cookies,
                 auth_user=account.auth_user,
                 account_id=account.id,
                 session=session,
-                proxy=decision.proxy,
-                allow_bare=decision.allowed,
+                proxy=decision.proxy if decision is not None else None,
+                allow_bare=decision.allowed if decision is not None else False,
             )
         except ExitBudgetWaitError as exc:
             return {
@@ -1025,7 +1063,11 @@ class AccountInfoRefresher:
             return {
                 "tier": None,
                 "expired": None,
-                "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
+                "error": (
+                    f"skipped_no_exit: {decision.reason or 'no_exit'}"
+                    if decision is not None
+                    else "skipped_no_exit: probe_unavailable"
+                ),
                 "checked_at": None,
                 "skipped": True,
             }

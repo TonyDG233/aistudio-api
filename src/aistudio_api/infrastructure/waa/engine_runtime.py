@@ -9,6 +9,7 @@ for both engines.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import os
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from aistudio_api.infrastructure.browser.browser_engine import (
     find_chromium_executable,
 )
 from aistudio_api.infrastructure.exit_pool import (
+    ExitDecision,
     ExitResolver,
     get_exit_resolver,
     resolve_credential_exit,
@@ -76,6 +78,10 @@ class _LeasedBrowserlessSession:
     is taken once per request (covers template capture + RPC).  Maintenance
     probes call ``send_hooked_request`` without a scope and lease the
     ``maintenance`` category instead.  Off mode never builds this wrapper.
+
+    The scope flag is a per-task :class:`contextvars.ContextVar`, never a shared
+    bool: concurrent requests on the same slot (or a keepalive probe running
+    alongside a generation request) must not clear each other's scope.
     """
 
     def __init__(
@@ -87,6 +93,7 @@ class _LeasedBrowserlessSession:
         lane: str,
         kind: str,
         bound_socks: str | None,
+        cold_start_lease: bool = False,
     ) -> None:
         self._delegate = delegate
         self._resolver = resolver
@@ -94,7 +101,13 @@ class _LeasedBrowserlessSession:
         self._lane = lane
         self._kind = kind
         self._bound_socks = bound_socks or ""
-        self._scope_leased = False
+        self._scope_leased: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            f"leased-scope-{account_id or 'anonymous'}", default=False
+        )
+        # P2-2: ``create_session`` already leased one generation call to bind
+        # the exit.  The first ``request_scope`` consumes that credit instead of
+        # leasing a second time; later scopes lease normally.
+        self._cold_start_lease = cold_start_lease
 
     @property
     def engine(self) -> str:
@@ -109,13 +122,18 @@ class _LeasedBrowserlessSession:
 
     @asynccontextmanager
     async def request_scope(self) -> AsyncGenerator[Any, None]:
-        await self._lease("generation")
-        self._scope_leased = True
+        if self._cold_start_lease:
+            # Consume the lease taken by ``create_session`` (no await before the
+            # flag flips, so a concurrent first request cannot double-consume).
+            self._cold_start_lease = False
+        else:
+            await self._lease("generation")
+        token = self._scope_leased.set(True)
         try:
             async with self._delegate.request_scope() as ctx:
                 yield ctx
         finally:
-            self._scope_leased = False
+            self._scope_leased.reset(token)
 
     async def _lease(self, cls: str) -> None:
         lease_fn = getattr(self._resolver, "lease", None)
@@ -162,7 +180,7 @@ class _LeasedBrowserlessSession:
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes]:
-        if not self._scope_leased:
+        if not self._scope_leased.get():
             await self._lease("maintenance")
         return await self._delegate.send_hooked_request(
             body=body, url=url, headers=headers
@@ -175,7 +193,7 @@ class _LeasedBrowserlessSession:
         url: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
-        if not self._scope_leased:
+        if not self._scope_leased.get():
             await self._lease("maintenance")
         async for event in self._delegate.send_streaming_request(
             body=body, url=url, headers=headers
@@ -463,11 +481,12 @@ class BrowserlessEngineRuntime:
         external = self._exit_resolver is not None
         lane = lane_for_tier(tier)
         kind = surface if surface in ("chat", "build") else "chat"
-        proxy = (
+        decision = (
             await self._resolve_exit_proxy(account_id, surface, tier)
             if external
-            else settings.proxy_url
+            else None
         )
+        proxy = decision.proxy if decision is not None else settings.proxy_url
         session: Any = BrowserlessSession(
             signer=client,
             auth_file=auth_file,
@@ -487,6 +506,11 @@ class BrowserlessEngineRuntime:
             ),
         )
         if external and self._exit_resolver is not None:
+            cold_start_lease = (
+                decision is not None
+                and decision.action == "proxy"
+                and callable(getattr(self._exit_resolver, "lease", None))
+            )
             session = cast(
                 EngineSession,
                 _LeasedBrowserlessSession(
@@ -496,21 +520,23 @@ class BrowserlessEngineRuntime:
                     lane=lane,
                     kind=kind,
                     bound_socks=proxy,
+                    cold_start_lease=cold_start_lease,
                 ),
             )
         return SessionBuild(session=session)
 
     async def _resolve_exit_proxy(
         self, account_id: str, surface: str, tier: str = ""
-    ) -> str | None:
+    ) -> ExitDecision:
         """Resolve one account's exit, or fail closed (never the global proxy).
 
-        Returns the bound socks URL, or ``None`` only for an explicit emergency
-        direct fallback.  Raises :class:`ExitBudgetWaitError` (HTTP 429
-        ``no_capacity`` + Retry-After) when the manager has no call budget, and
-        :class:`RoutingError` (HTTP 503) when no exit is available and
-        ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is off, so a credential-bearing
-        generation request never leaks onto WARP and never masks a 429 as 503.
+        Returns the lease decision whose ``proxy`` is the bound socks URL (or
+        ``None`` only for an explicit emergency direct fallback).  Raises
+        :class:`ExitBudgetWaitError` (HTTP 429 ``no_capacity`` + Retry-After)
+        when the manager has no call budget, and :class:`RoutingError` (HTTP
+        503) when no exit is available and ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is
+        off, so a credential-bearing generation request never leaks onto WARP
+        and never masks a 429 as 503.
         """
         kind = surface if surface in ("chat", "build") else "chat"
         decision = await resolve_credential_exit(
@@ -536,7 +562,7 @@ class BrowserlessEngineRuntime:
         if decision.action == "proxy" and decision.proxy:
             # Never log the socks URL itself: it may carry credentials.
             log.info("[engine] 使用外部出口 surface=%s", kind)
-        return decision.proxy
+        return decision
 
     async def create_canary_session(
         self,

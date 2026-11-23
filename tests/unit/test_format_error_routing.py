@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from aistudio_api.api.error_mapping import error_payload
 from aistudio_api.api.gemini_service import format_sse_error
 from aistudio_api.domain.errors import (
+    ExitBudgetWaitError,
     SurfaceCapacityError,
     SurfaceSwitchExhaustedError,
     TierRequiredError,
@@ -123,3 +126,40 @@ def test_engine_switching_503_carries_retry_after(api_format: str) -> None:
     response = format_error_response(EngineSwitchingError("switch"), api_format)  # type: ignore[arg-type]
     assert response.status_code == 503
     assert response.headers["retry-after"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("api_format", "expected_type"),
+    [
+        ("gemini", "RESOURCE_EXHAUSTED"),
+        ("openai", "rate_limit_exceeded"),
+        ("responses", "rate_limit_exceeded"),
+        ("claude", "rate_limit_error"),
+    ],
+)
+def test_exit_budget_429_body_and_retry_after(
+    api_format: str, expected_type: str
+) -> None:
+    """Q-4: four protocols render the no_capacity 429 with Retry-After."""
+    from aistudio_api.api.format_errors import format_error_response
+
+    response = format_error_response(
+        ExitBudgetWaitError("exit budget exhausted", retry_after=17.2),
+        api_format,  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "18"
+    body = json.loads(bytes(response.body))
+    error = body["error"]
+    if api_format == "gemini":
+        assert error["code"] == 429
+        assert error["status"] == expected_type
+        assert error["reason"] == "no_capacity"
+    elif api_format == "claude":
+        assert body["type"] == "error"
+        assert error["type"] == expected_type
+        assert error["code"] == "no_capacity"
+    else:
+        assert error["type"] == expected_type
+        assert error["code"] == "no_capacity"
