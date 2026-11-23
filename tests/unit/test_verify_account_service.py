@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import platform
@@ -1768,6 +1769,7 @@ def test_net_trace_records_only_whitelisted_fields() -> None:
         "mime",
         "request_id",
         "failed",
+        "body_preview",
     }
     assert entry.method == "POST"
     assert entry.url_path == "verify-account"
@@ -2097,3 +2099,200 @@ def test_read_qr_js_extension_keeps_short_code_extraction() -> None:
     assert (
         extract({"href": "", "title": "", "fallback": "", "dataImageCount": 4}) is None
     )
+
+
+# ---------------------------------------------------------------------------
+# verify-account observation: bounded response-body capture (VerifyUser 403)
+# ---------------------------------------------------------------------------
+
+_VERIFY_USER_URL = (
+    "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+    "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/VerifyUser"
+)
+_USERVERIFY_URL = "https://www.google.com/recaptcha/enterprise/userverify"
+_CLR_URL = "https://www.google.com/recaptcha/enterprise/clr"
+
+
+class _BodyFakePage(_NetFakePage):
+    """Fake page exposing both net hooks and a response-body getter."""
+
+    def __init__(
+        self,
+        body: str = "",
+        *,
+        base64_encoded: bool = False,
+        shape: str = "str",
+    ) -> None:
+        super().__init__()
+        self.body = body
+        self.base64_encoded = base64_encoded
+        self.shape = shape
+        self.body_calls = 0
+        self.body_request_ids: list[str] = []
+
+    async def get_response_body(self, request_id: str) -> object:
+        self.body_request_ids.append(request_id)
+        self.body_calls += 1
+        if self.shape == "tuple":
+            return (self.body, self.base64_encoded)
+        if self.shape == "dict":
+            return {"body": self.body, "base64Encoded": self.base64_encoded}
+        return self.body
+
+
+def _feed_net_pair(
+    page: _NetFakePage,
+    request_id: str,
+    url: str,
+    *,
+    status: int = 403,
+    mime: str = "application/json",
+) -> None:
+    page.request_cb({"request_id": request_id, "url": url, "method": "POST"})
+    page.response_cb(
+        {
+            "request_id": request_id,
+            "url": url,
+            "status": status,
+            "headers": {},
+            "mime_type": mime,
+        }
+    )
+
+
+async def _flush_net_bodies(driver: CdpVerifyBrowserDriver) -> None:
+    for _ in range(3):
+        tasks = list(driver._net_body_tasks)
+        if not tasks:
+            return
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_net_body_preview_is_recorded_and_dumped_as_indented_subline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _BodyFakePage('{"x":1}')
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-a", _VERIFY_USER_URL)
+    await _flush_net_bodies(driver)
+
+    entries = list(driver._net_trace)
+    assert len(entries) == 1
+    assert entries[0].body_preview == '{"x":1}'
+    assert page.body_request_ids == ["req-a"]
+
+    driver._dump_net_trace("body_test")
+    messages = [record.getMessage() for record in caplog.records]
+    assert any('body={"x":1}' in message for message in messages)
+    assert any(message.startswith("      body=") for message in messages)
+    assert any("[Verify] VerifyUser 响应 status=403" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_net_body_preview_decodes_base64_tuple_and_dict() -> None:
+    encoded = base64.b64encode(b'{"ok":true}').decode("ascii")
+    for shape in ("tuple", "dict"):
+        page = _BodyFakePage(encoded, base64_encoded=True, shape=shape)
+        driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+        driver._page = cast(Any, page)
+        driver._register_net_trace(page)
+        _feed_net_pair(page, "req-b", _USERVERIFY_URL, status=200)
+        await _flush_net_bodies(driver)
+        assert next(iter(driver._net_trace)).body_preview == '{"ok":true}', shape
+
+
+@pytest.mark.asyncio
+async def test_net_body_preview_truncates_to_budget() -> None:
+    page = _BodyFakePage("a" * 500)
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-c", _USERVERIFY_URL, status=200)
+    await _flush_net_bodies(driver)
+
+    preview = next(iter(driver._net_trace)).body_preview
+    assert preview == "a" * verify_module.NET_BODY_PREVIEW_LIMIT + "…"
+    assert len(preview) <= verify_module.NET_BODY_PREVIEW_LIMIT + 1
+
+
+@pytest.mark.asyncio
+async def test_net_body_preview_masks_long_tokens_and_cookie() -> None:
+    long_token = "A" * 40
+    body = '{"token":"' + long_token + '","note":"Cookie: SID=abcdefghijklmnop"}'
+    page = _BodyFakePage(body)
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-d", _USERVERIFY_URL, status=200)
+    await _flush_net_bodies(driver)
+
+    preview = next(iter(driver._net_trace)).body_preview
+    assert long_token not in preview
+    assert "SID=abcdefghijklmnop" not in preview
+
+
+@pytest.mark.asyncio
+async def test_net_body_binary_records_only_length(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    content = "PDF-1.4-binary-content"
+    page = _BodyFakePage(content)
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-e", _CLR_URL, status=200, mime="application/binary")
+    await _flush_net_bodies(driver)
+    driver._dump_net_trace("binary_test")
+
+    entry = next(iter(driver._net_trace))
+    assert entry.body_preview == f"len={len(content)}"
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "body=len=" in joined
+    assert content not in joined
+
+
+@pytest.mark.asyncio
+async def test_net_body_capture_is_capped_per_session() -> None:
+    page = _BodyFakePage('{"ok":1}')
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    for index in range(verify_module.NET_BODY_MAX_PER_SESSION + 1):
+        _feed_net_pair(page, f"req-{index}", _USERVERIFY_URL, status=200)
+    await _flush_net_bodies(driver)
+
+    assert driver._net_body_fetches == verify_module.NET_BODY_MAX_PER_SESSION
+    assert page.body_calls == verify_module.NET_BODY_MAX_PER_SESSION
+    assert len(driver._net_bodies) <= verify_module.NET_BODY_MAX_PER_SESSION
+
+
+@pytest.mark.asyncio
+async def test_net_trace_summary_includes_verify_user_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _BodyFakePage('{"error":"denied"}')
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-g", _VERIFY_USER_URL, status=403)
+    await _flush_net_bodies(driver)
+    driver._dump_net_trace("summary_status")
+
+    summary = [
+        record.getMessage()
+        for record in caplog.records
+        if "网络记录 reason=summary_status" in record.getMessage()
+    ]
+    assert summary and "verify_user=yes(403)" in summary[-1]

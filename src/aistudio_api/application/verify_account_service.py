@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import inspect
 import json
 import os
 import platform
@@ -128,6 +130,19 @@ NET_INTERESTING_TOKENS = (
     "GetUserVerificationStatus",
     "verify-account",
 )
+# Response-body capture is limited to the requests that decide why the scan
+# failed: the ``VerifyUser`` 403 body, the ``GetUserVerificationStatus``
+# callback and the reCAPTCHA confirmation endpoints.  A per-session cap keeps a
+# weak host from being dragged down by ``Network.getResponseBody`` round-trips.
+NET_BODY_URL_TOKENS = (
+    "VerifyUser",
+    "GetUserVerificationStatus",
+    "recaptcha/enterprise/userverify",
+    "recaptcha/enterprise/reload",
+    "recaptcha/enterprise/clr",
+)
+NET_BODY_MAX_PER_SESSION = 20
+NET_BODY_PREVIEW_LIMIT = 400
 # QR frame diagnostics are logged at most once per interval (per round of frame
 # scanning), so the 0.5s polling loop does not double the log volume.
 QR_DIAG_INTERVAL_SECONDS = 2.0
@@ -302,6 +317,7 @@ class _NetTraceEntry:
     mime: str
     request_id: str
     failed: str = ""
+    body_preview: str = ""
 
 
 _SECRET_SEGMENT_RE = re.compile(r"[A-Za-z0-9_\-]+")
@@ -365,6 +381,62 @@ def _sanitize_url_for_log(url: str) -> tuple[str, str]:
 def _net_url_interesting(url_path: str) -> bool:
     lowered = url_path.lower()
     return any(token.lower() in lowered for token in NET_INTERESTING_TOKENS)
+
+
+_NET_BODY_TEXT_MIME_PREFIXES = ("application/json", "text/")
+_NET_BODY_BINARY_MIME_PREFIXES = ("application/binary", "application/octet-stream")
+# Credential-shaped ``key: value`` / ``"key":"value"`` fragments whose value is a
+# long opaque token; the value collapses to ``…`` so a response body can be
+# logged without leaking session material.
+_BODY_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(sapisidhash|sapisid|cookie|authorization|token|access_token|"
+    r"id_token|refresh_token|client_secret)"
+    r"([\"']?\s*[:=]\s*[\"']?)"
+    r"([A-Za-z0-9._~+/=\-]{24,})"
+)
+
+
+def _net_body_url_interesting(url_path: str) -> bool:
+    lowered = url_path.lower()
+    return any(token.lower() in lowered for token in NET_BODY_URL_TOKENS)
+
+
+def _net_body_is_text(mime: str) -> bool:
+    return any(mime.startswith(prefix) for prefix in _NET_BODY_TEXT_MIME_PREFIXES)
+
+
+def _net_body_is_binary(mime: str) -> bool:
+    return any(mime.startswith(prefix) for prefix in _NET_BODY_BINARY_MIME_PREFIXES)
+
+
+def _decode_base64_body(value: str) -> str:
+    try:
+        return base64.b64decode(value, validate=False).decode("utf-8", errors="replace")
+    except Exception:
+        return value
+
+
+def _normalize_body_result(value: object) -> tuple[str, bool]:
+    """Return ``(body, base64_encoded)`` from a driver's response-body result."""
+    if isinstance(value, tuple) and len(value) == 2:
+        body, encoded = value
+        return str(body or ""), bool(encoded)
+    if isinstance(value, dict):
+        body = value.get("body")
+        encoded = value.get("base64Encoded", value.get("base64_encoded", False))
+        return str(body or ""), bool(encoded)
+    return str(value or ""), False
+
+
+def _sanitize_body_preview(body: str) -> str:
+    """Mask credential-like fragments, then truncate to the preview budget."""
+    text = sanitize_log_message(str(body or ""))
+    text = _BODY_SECRET_ASSIGN_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}…", text
+    )
+    if len(text) > NET_BODY_PREVIEW_LIMIT:
+        text = text[:NET_BODY_PREVIEW_LIMIT] + "…"
+    return text
 
 
 def _qr_code_sources(payload: dict[str, object]) -> list[tuple[str, str]]:
@@ -1620,6 +1692,11 @@ class CdpVerifyBrowserDriver:
         self._net_started_at: float | None = None
         self._net_unsubscribers: list[Callable[[], None]] = []
         self._net_failed_count = 0
+        # Bounded response-body capture (VerifyUser 403 diagnosis): instance-level
+        # counter, per-request preview store and in-flight tasks, never globals.
+        self._net_body_fetches = 0
+        self._net_bodies: dict[str, str] = {}
+        self._net_body_tasks: set[asyncio.Task[None]] = set()
         self._frame_navs: deque[tuple[float, str]] = deque(maxlen=NET_FRAME_NAV_MAXLEN)
         self._frame_nav_last_log_at = 0.0
         # "page" (on_frame_navigated), "cdp" (Page.frameNavigated) or "none".
@@ -1848,13 +1925,145 @@ class CdpVerifyBrowserDriver:
                 else None
             )
             mime = str(data.get("mime_type") or "").split(";", 1)[0].strip()[:40]
-            for entry in reversed(self._net_trace):
-                if entry.request_id == request_id and entry.status is None:
-                    entry.status = status
-                    entry.mime = mime
-                    return
+            entry: _NetTraceEntry | None = None
+            for candidate in reversed(self._net_trace):
+                if candidate.request_id == request_id and candidate.status is None:
+                    candidate.status = status
+                    candidate.mime = mime
+                    entry = candidate
+                    break
+            if entry is not None:
+                self._maybe_capture_net_body(entry, request_id, status, mime)
         except Exception:
             log.debug("验证会话网络响应记录失败")
+
+    def _maybe_capture_net_body(
+        self,
+        entry: _NetTraceEntry,
+        request_id: str,
+        status: int | None,
+        mime: str,
+    ) -> None:
+        """Schedule a bounded, best-effort response-body capture."""
+        if not request_id or not _net_body_url_interesting(entry.url_path):
+            return
+        is_text = _net_body_is_text(mime)
+        is_binary = _net_body_is_binary(mime)
+        if not (is_text or is_binary):
+            return
+        self._schedule_net_body_capture(
+            entry, request_id, is_text=is_text, status=status
+        )
+
+    def _schedule_net_body_capture(
+        self,
+        entry: _NetTraceEntry,
+        request_id: str,
+        *,
+        is_text: bool,
+        status: int | None,
+    ) -> None:
+        """Fire-and-forget the fetch so a CDP callback never blocks."""
+        if self._net_body_fetches >= NET_BODY_MAX_PER_SESSION:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._net_body_fetches += 1
+        task = loop.create_task(
+            self._capture_net_body(entry, request_id, is_text=is_text, status=status)
+        )
+        self._net_body_tasks.add(task)
+        task.add_done_callback(self._net_body_tasks.discard)
+
+    async def _capture_net_body(
+        self,
+        entry: _NetTraceEntry,
+        request_id: str,
+        *,
+        is_text: bool,
+        status: int | None,
+    ) -> None:
+        """Fetch one whitelisted response body and store a masked preview.
+
+        Textual bodies keep a masked preview; binary bodies (e.g. the reCAPTCHA
+        ``clr`` endpoint) only record ``len=``, never their content.
+        """
+        try:
+            page = self._page
+            if page is None:
+                return
+            raw = await self._fetch_net_body_value(page, request_id)
+            if raw is None:
+                return
+            body, encoded = _normalize_body_result(raw)
+            if encoded:
+                body = _decode_base64_body(body)
+            if is_text:
+                preview = _sanitize_body_preview(body)
+                entry.body_preview = preview
+                self._net_bodies[request_id] = preview
+                if "verifyuser" in (entry.url_path or "").lower():
+                    log.info(
+                        "[Verify] VerifyUser 响应 status=%s len=%d body=%s",
+                        "-" if status is None else status,
+                        len(body),
+                        preview or "-",
+                    )
+            else:
+                preview = f"len={len(body)}"
+                entry.body_preview = preview
+                self._net_bodies[request_id] = preview
+        except Exception:
+            log.debug("验证会话响应体抓取失败")
+
+    async def _fetch_net_body_value(
+        self, page: object, request_id: str
+    ) -> object | None:
+        """Call ``page.get_response_body`` when present and signature-compatible."""
+        getter = getattr(page, "get_response_body", None)
+        if not callable(getter):
+            return None
+        args: tuple[object, ...] = ()
+        kwargs: dict[str, object] = {}
+        signature: inspect.Signature | None
+        try:
+            signature = inspect.signature(getter)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None:
+            parameters = signature.parameters
+            target = parameters.get("request_id")
+            if target is not None:
+                if target.kind is inspect.Parameter.POSITIONAL_ONLY:
+                    args = (request_id,)
+                elif target.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    kwargs["request_id"] = request_id
+                else:
+                    return None
+            else:
+                positional = [
+                    param
+                    for param in parameters.values()
+                    if param.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                if not positional:
+                    return None
+                args = (request_id,)
+        else:
+            args = (request_id,)
+        result = getter(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     def _on_net_failed(self, params: dict[str, object]) -> None:
         try:
@@ -1879,11 +2088,23 @@ class CdpVerifyBrowserDriver:
             hosts = " ".join(
                 f'"{host}":{count}' for host, count in self._net_hosts.most_common(6)
             )
-            verify_user = (
-                "yes"
-                if any("verifyuser" in e.url_path.lower() for e in entries)
-                else "no"
-            )
+            verify_entries = [
+                entry for entry in entries if "verifyuser" in entry.url_path.lower()
+            ]
+            if verify_entries:
+                verify_status = next(
+                    (
+                        entry.status
+                        for entry in reversed(verify_entries)
+                        if entry.status is not None
+                    ),
+                    None,
+                )
+                verify_user = (
+                    "yes" if verify_status is None else f"yes({verify_status})"
+                )
+            else:
+                verify_user = "no"
             log.info(
                 "[Verify] 网络记录 reason=%s total=%d interesting=%d "
                 "verify_user=%s navigations=%d failed=%d 主域名={%s}",
@@ -1917,6 +2138,8 @@ class CdpVerifyBrowserDriver:
                     entry.mime or "-",
                     suffix,
                 )
+                if entry.body_preview:
+                    log.info("      body=%s", entry.body_preview)
         except Exception:
             log.debug("验证会话网络记录导出失败: reason=%s", reason)
 
