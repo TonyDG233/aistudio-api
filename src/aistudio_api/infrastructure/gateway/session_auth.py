@@ -291,13 +291,22 @@ async def verify_account_identity(page: CDPPage, auth_file: str | None) -> bool:
                         probe_account_benefit_tier,
                     )
 
+                    # P1-1: pass the real account id so external exit mode can
+                    # bind this credential probe to the account's exit instead of
+                    # failing closed with ``no_account``.
                     http_tier = await probe_account_benefit_tier(
-                        cookie_dict, auth_user=auth_user
+                        cookie_dict,
+                        auth_user=auth_user,
+                        account_id=(
+                            str(account_id)
+                            if account_id and account_id != "unknown"
+                            else None
+                        ),
                     )
                     if http_tier and http_tier != "Free":
                         discovered_tier = http_tier
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("裸 tier 探测失败/跳过 account=%s: %s", account_id, e)
 
         if discovered_tier:
             meta["tier"] = discovered_tier

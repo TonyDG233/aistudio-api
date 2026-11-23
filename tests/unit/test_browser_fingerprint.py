@@ -130,7 +130,12 @@ async def test_pooled_session_injects_fingerprint_before_cookies_and_navigation(
     session, page = await _bootstrap_pooled("account-A")
 
     try:
-        assert page.events == ["fingerprint.script", "fingerprint.metrics", "cookies", "navigate"]
+        assert page.events == [
+            "fingerprint.script",
+            "fingerprint.metrics",
+            "cookies",
+            "navigate",
+        ]
         methods = [method for method, _ in page.cdp.calls]
         assert methods[0] == "Page.addScriptToEvaluateOnNewDocument"
         assert methods[1] == "Emulation.setDeviceMetricsOverride"
@@ -164,8 +169,14 @@ async def test_same_account_is_stable_and_account_swap_changes_payload(
         other_source = cast(str, other_page.cdp.calls[0][1]["source"])
         assert first_source == second_source
         assert first_source != other_source
-        assert build_fingerprint_profile(account_id="account-A").fingerprint_id in first_source
-        assert build_fingerprint_profile(account_id="account-B").fingerprint_id in other_source
+        assert (
+            build_fingerprint_profile(account_id="account-A").fingerprint_id
+            in first_source
+        )
+        assert (
+            build_fingerprint_profile(account_id="account-B").fingerprint_id
+            in other_source
+        )
     finally:
         await first.close()
         await second.close()
@@ -274,9 +285,7 @@ def test_defaults_and_schema_declare_fingerprint_switch() -> None:
     schema = json.loads(
         (PROJECT_ROOT / "defaults" / "config.schema.json").read_text(encoding="utf-8")
     )
-    switch = schema["properties"]["browser"]["properties"][
-        "fingerprint_spoof_enabled"
-    ]
+    switch = schema["properties"]["browser"]["properties"]["fingerprint_spoof_enabled"]
     assert switch["type"] == "boolean"
     assert switch["default"] is True
 
@@ -314,7 +323,9 @@ def test_profiles_never_expose_software_renderers() -> None:
         assert profile.hardware_concurrency in {8, 12, 16, 24}
         assert profile.device_memory in {8, 16, 32}
         assert profile.platform == "Win32"
-        assert profile.user_agent.startswith("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        assert profile.user_agent.startswith(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        )
 
 
 @pytest.mark.asyncio
@@ -568,7 +579,9 @@ async def test_import_cookies_applies_fingerprint_before_google_navigation(
     monkeypatch.setattr(session_module, "save_browser_cookies", _fake_save)
     monkeypatch.setattr(
         "aistudio_api.infrastructure.account.cookie_refresher.load_cookies_from_string",
-        lambda _raw: [{"name": "SID", "value": "sid", "domain": ".google.com"}],
+        lambda _raw, **_kwargs: [
+            {"name": "SID", "value": "sid", "domain": ".google.com"}
+        ],
     )
 
     auth_file = str(tmp_path / "imported-account" / "auth.json")

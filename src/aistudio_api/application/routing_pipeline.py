@@ -49,6 +49,7 @@ from aistudio_api.domain.errors import (
     TierRequiredError,
     UsageLimitExceeded,
     is_browser_session_hang_error,
+    is_exit_unavailable_error,
     is_transient_rpc_error,
 )
 from aistudio_api.domain.instances import Instance, InstanceState
@@ -777,6 +778,14 @@ class RoutingPipeline:
             if inspect.isawaitable(result):
                 await result
         except Exception as exc:
+            if is_exit_unavailable_error(exc):
+                # The explicit 503 is raised again by acquire(); logging it on
+                # every wake attempt would only flood during a manager outage.
+                logger.debug(
+                    "[routing] 唤醒前出口不可用（fail-closed），槽位保持可重试: %s",
+                    exc,
+                )
+                return
             logger.warning("[routing] 唤醒休眠实例失败: %s", exc)
 
     # -------------------------------------------------------------- execution
@@ -822,6 +831,10 @@ class RoutingPipeline:
                 )
                 return RouteAttempt(candidate=candidate, handle=handle, client=client)
             except (RoutingError, TierRequiredError):
+                # Fail-closed rejections (tier 403, exit_unavailable 503) are
+                # terminal for this request: never swallow them as "try the
+                # next candidate", otherwise a manager outage would be masked
+                # by a generic surface capacity error.
                 raise
             except Exception as exc:
                 last_error = exc

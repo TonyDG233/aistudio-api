@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 from aistudio_api.infrastructure.account.benefit_tier import (
     parse_benefit_tier_envelope,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import (
+    ExitDecision,
+    resolve_credential_exit,
+)
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
     AI_STUDIO_ORIGIN,
@@ -31,6 +35,23 @@ from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("cookie_parser")
+
+# Sentinel distinguishing "no explicit proxy" (off mode keeps settings.proxy_url)
+# from an explicit ``None`` (direct, e.g. the emergency valve).
+_UNSET_PROXY: object = object()
+
+
+async def _resolve_probe_proxy(account_id: str | None, proxy: object) -> ExitDecision:
+    """Resolve the outbound proxy for one bare credential probe.
+
+    Only a non-empty proxy string counts as "already resolved".  Anything else
+    (the sentinel, ``None`` or an empty string) re-runs the env-gated resolver,
+    so a caller that accidentally passes ``None`` can no longer bypass
+    fail-closed and send a credential request without an account exit.
+    """
+    if isinstance(proxy, str) and proxy.strip():
+        return ExitDecision("proxy", proxy=proxy)
+    return await resolve_credential_exit(account_id or "", kind="chat")
 
 
 def parse_benefit_tier_response(raw_data: object) -> str:
@@ -606,6 +627,8 @@ async def probe_account_emails_map(
     auth_user: str = "0",
     *,
     client: httpx.AsyncClient | None = None,
+    account_id: str | None = None,
+    proxy: object = _UNSET_PROXY,
 ) -> dict[str, str]:
     """通过 Google OneGoogleWidget / AI Studio 页面探测全部已登录子账号的邮箱映射。"""
     cookie_dict = (
@@ -619,7 +642,12 @@ async def probe_account_emails_map(
 
     import httpx
 
-    from aistudio_api.config import settings
+    effective_proxy: str | None = None
+    if client is None:
+        decision = await _resolve_probe_proxy(account_id, proxy)
+        if not decision.allowed:
+            return {}
+        effective_proxy = decision.proxy
 
     u_index = str(auth_user or "0")
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
@@ -650,7 +678,7 @@ async def probe_account_emails_map(
         if client is not None:
             return await _do_fetch(client)
         async with httpx.AsyncClient(
-            timeout=8.0, proxy=settings.proxy_url, follow_redirects=True
+            timeout=8.0, proxy=effective_proxy, follow_redirects=True
         ) as new_client:
             return await _do_fetch(new_client)
     except Exception as e:
@@ -661,14 +689,24 @@ async def probe_account_emails_map(
 async def probe_account_email(
     raw_or_dict: object,
     auth_user: str = "0",
+    *,
+    account_id: str | None = None,
+    proxy: object = _UNSET_PROXY,
 ) -> str | None:
     """探测单个指定 auth_user 的登录邮箱。"""
+    decision = await _resolve_probe_proxy(account_id, proxy)
+    if not decision.allowed:
+        return None
     u_index = str(auth_user or "0")
-    emails_map = await probe_account_emails_map(raw_or_dict, auth_user=u_index)
+    emails_map = await probe_account_emails_map(
+        raw_or_dict, auth_user=u_index, proxy=decision.proxy
+    )
     if u_index in emails_map:
         return emails_map[u_index]
     if u_index != "0":
-        root_map = await probe_account_emails_map(raw_or_dict, auth_user="0")
+        root_map = await probe_account_emails_map(
+            raw_or_dict, auth_user="0", proxy=decision.proxy
+        )
         if u_index in root_map:
             return root_map[u_index]
     return None
@@ -677,11 +715,17 @@ async def probe_account_email(
 async def probe_account_benefit_tier(
     raw_or_dict: object,
     auth_user: str = "0",
+    *,
+    account_id: str | None = None,
+    proxy: object = _UNSET_PROXY,
 ) -> str | None:
     """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。
 
     只有上游明确返回可解析的等级时才返回字符串；无 Cookie、网络/代理异常、
     非 200 或响应体不可解析时返回 ``None``，调用方不得将其降级为 Free。
+
+    ``proxy`` 未显式提供时由出口解析器决定；external 模式下无出口则 fail-closed
+    直接返回 ``None``，绝不回退全局代理。
     """
     cookie_dict = (
         raw_or_dict
@@ -694,7 +738,9 @@ async def probe_account_benefit_tier(
 
     import httpx
 
-    from aistudio_api.config import settings
+    decision = await _resolve_probe_proxy(account_id, proxy)
+    if not decision.allowed:
+        return None
 
     u_index = str(auth_user or "0")
     auth_header = calculate_sapisid_hash(cookie_dict)
@@ -717,7 +763,7 @@ async def probe_account_benefit_tier(
 
     tier_url = BENEFIT_TIER_URL
     try:
-        async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as client:
+        async with httpx.AsyncClient(timeout=8.0, proxy=decision.proxy) as client:
             resp = await client.post(tier_url, headers=headers, content="[]")
             if resp.status_code != 200:
                 logger.debug(
@@ -755,10 +801,14 @@ async def rotate_google_cookies(
     client: httpx.AsyncClient | None = None,
     user_agent: str | None = None,
     timeout: float = 15.0,
+    account_id: str | None = None,
+    proxy: object = _UNSET_PROXY,
 ) -> dict[str, object]:
     """调用 accounts.google.com/RotateCookies 刷新短效滚动凭据 (__Secure-1PSIDTS / SIDCC)。
 
     若调用成功，原地更新传入的 cookies 字典并返回 {"ok": True, "status": 200, "updated": [...]}。
+    ``client`` 由池化 signer/session 路径传入时原样使用；裸路径在 external 模式下
+    无出口则返回 ``skipped=no_exit``，绝不回退全局代理。
     """
     if not cookies:
         return {"ok": False, "status": 0, "updated": []}
@@ -768,7 +818,18 @@ async def rotate_google_cookies(
 
     import httpx
 
-    from aistudio_api.config import settings
+    effective_proxy: str | None = None
+    if client is None:
+        decision = await _resolve_probe_proxy(account_id, proxy)
+        if not decision.allowed:
+            return {
+                "ok": False,
+                "status": 0,
+                "updated": [],
+                "skipped": "no_exit",
+                "reason": decision.reason or "no_exit",
+            }
+        effective_proxy = decision.proxy
 
     rotate_cookies_map = filter_minimal_cookies(cookies, include_account_host=True)
     cookie_header = "; ".join(f"{k}={v}" for k, v in rotate_cookies_map.items())
@@ -805,7 +866,7 @@ async def rotate_google_cookies(
         if client is not None:
             return await _do_rotate(client)
         async with httpx.AsyncClient(
-            timeout=timeout, proxy=settings.proxy_url
+            timeout=timeout, proxy=effective_proxy
         ) as new_client:
             return await _do_rotate(new_client)
     except Exception as e:
@@ -817,6 +878,8 @@ async def probe_google_accounts_infinite(
     raw_or_dict: object,
     *,
     max_fails_in_a_row: int = 1,
+    account_id: str | None = None,
+    proxy: object = _UNSET_PROXY,
 ) -> list[dict[str, object]]:
     """一路向下探测多账号登录索引（u/0, u/1, u/2...），直到探测失败为止。
 
@@ -829,14 +892,16 @@ async def probe_google_accounts_infinite(
 
     import httpx
 
-    from aistudio_api.config import settings
+    decision = await _resolve_probe_proxy(account_id, proxy)
+    if not decision.allowed:
+        return []
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     valid_accounts: list[dict[str, object]] = []
 
     auth_user_idx = 0
     consecutive_failures = 0
-    async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
+    async with httpx.AsyncClient(timeout=10.0, proxy=decision.proxy) as client:
         emails_map = await probe_account_emails_map(
             cookie_dict, auth_user="0", client=client
         )

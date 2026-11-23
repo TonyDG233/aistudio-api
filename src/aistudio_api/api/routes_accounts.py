@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -52,6 +54,11 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     probe_account_benefit_tier,
     probe_account_email,
 )
+from aistudio_api.infrastructure.account.cookie_refresher import UNSET_PROXY
+from aistudio_api.infrastructure.exit_pool import (
+    get_exit_resolver,
+    resolve_credential_exit,
+)
 from aistudio_api.infrastructure.utils.common import mask_email
 
 if TYPE_CHECKING:
@@ -65,6 +72,15 @@ router = APIRouter(prefix="/accounts")
 
 # 账号信息刷新器单例（进程内互斥标志由刷新器自身持有）。
 _refresher_singleton: AccountInfoRefresher | None = None
+
+# External exit mode: tiny gap between per-account import probes so a batch does
+# not burst through the same exit.
+IMPORT_PROBE_PACING_SECONDS = 0.3
+
+
+def _external_exits_active() -> bool:
+    """True when the external exit pool is enabled (resolver constructed)."""
+    return get_exit_resolver() is not None
 
 
 def get_account_info_refresher(
@@ -142,6 +158,164 @@ def _reconcile_verify_after_import(rotator: object, account_id: str) -> None:
     reconcile = getattr(rotator, "reconcile_verify_cleared", None)
     if callable(reconcile):
         reconcile(account_id)
+
+
+def _cookie_dict_from_storage(storage_state: dict[str, object]) -> dict[str, str]:
+    """Flatten a storage-state cookie list into a name->value map."""
+    raw = storage_state.get("cookies")
+    if not isinstance(raw, list):
+        return {}
+    return {
+        str(cookie.get("name") or ""): str(cookie.get("value") or "")
+        for cookie in raw
+        if isinstance(cookie, dict) and cookie.get("name")
+    }
+
+
+async def _post_save_identity_probe(
+    account_service: AccountService,
+    account: AccountMeta,
+    storage_state: dict[str, object],
+    *,
+    auth_user: str,
+) -> AccountMeta:
+    """Probe email/tier with the *real* account id after the account is saved.
+
+    The exit manager binds exits to the account id, so probing before the id
+    exists would create an orphan binding (P2-1).  This helper is used only in
+    external mode after ``save_account``: it resolves the account's own exit and
+    writes back any discovered email/tier.  A missing exit or a failed probe
+    simply leaves the imported credentials intact but records the reason on the
+    account (``last_refresh_error``) so the operator/keepalive can retry.
+    """
+    if account.email and account.tier and account.tier != "Free":
+        return account
+    cookie_dict = _cookie_dict_from_storage(storage_state)
+    if not cookie_dict:
+        return account
+    decision = await resolve_credential_exit(account.id, kind="chat")
+    if not decision.allowed:
+        reason = decision.reason or "no_exit"
+        log.warning(
+            "账号 %s 导入后探测跳过：无可用出口 reason=%s（账号已保存）",
+            account.id,
+            reason,
+        )
+        _mark_probe_reason(account_service, account.id, f"skipped_no_exit: {reason}")
+        return account
+    problems: list[str] = []
+    if not account.email:
+        try:
+            probed_email = await probe_account_email(
+                cookie_dict,
+                auth_user=auth_user,
+                account_id=account.id,
+                proxy=decision.proxy,
+            )
+        except Exception as exc:
+            problems.append(f"email probe failed: {exc}")
+        else:
+            if probed_email:
+                account_service.store.update_account_email(account.id, probed_email)
+            else:
+                problems.append("email probe returned no result")
+    if not account.tier or account.tier == "Free":
+        try:
+            probed_tier = await probe_account_benefit_tier(
+                cookie_dict,
+                auth_user=auth_user,
+                account_id=account.id,
+                proxy=decision.proxy,
+            )
+        except Exception as exc:
+            problems.append(f"tier probe failed: {exc}")
+        else:
+            if probed_tier:
+                account_service.store.update_account_tier(
+                    account.id,
+                    probed_tier,
+                    checked_at=datetime.now(UTC).isoformat(),
+                )
+            else:
+                problems.append("tier probe returned no result")
+    if problems:
+        log.warning(
+            "账号 %s 导入后探测未完成: %s（账号已保存）",
+            account.id,
+            "; ".join(problems),
+        )
+        _mark_probe_reason(account_service, account.id, "; ".join(problems))
+    return account_service.get_account(account.id) or account
+
+
+def _mark_probe_reason(
+    account_service: AccountService, account_id: str, reason: str
+) -> None:
+    """Persist a probe skip/failure reason without touching tier freshness."""
+    marker = getattr(account_service.store, "mark_refresh_attempt", None)
+    if not callable(marker):
+        return
+    with contextlib.suppress(Exception):
+        marker(account_id, error=reason)
+
+
+# Deterministic import-anchor prefix.  External probe-import saves one stable
+# placeholder per cookie jar so that re-importing the same jar is idempotent
+# (P2-A) instead of stacking ``email=None`` duplicates.
+IMPORT_ANCHOR_PREFIX = "acc_import_"
+
+# Stable session-identity cookies, most specific first.  Rolling tokens such as
+# ``__Secure-1PSIDTS``/``SIDCC`` rotate and are deliberately excluded: hashing
+# them would change the anchor id on every import and defeat idempotency.
+_ANCHOR_IDENTITY_COOKIES: tuple[str, ...] = ("SAPISID", "APISID", "SID")
+
+
+def _stable_import_anchor_id(storage_state: dict[str, object]) -> str | None:
+    """Derive a deterministic placeholder id from stable identity cookies.
+
+    Uses ``provider + stable cookie value`` so re-importing the same cookie jar
+    lands on the same record.  Never hashes ``1PSIDTS``/``SIDCC`` or the whole
+    jar, whose values change per import.
+    """
+    cookie_dict = _cookie_dict_from_storage(storage_state)
+    for name in _ANCHOR_IDENTITY_COOKIES:
+        value = cookie_dict.get(name)
+        if value:
+            digest = hashlib.sha256(f"google:{value}".encode()).hexdigest()[:12]
+            return f"{IMPORT_ANCHOR_PREFIX}{digest}"
+    # No identity cookie: fall back to cookie name/domain names (not values) so
+    # a malformed jar still resolves to one placeholder.  Such a jar cannot be
+    # probed as a real account anyway.
+    raw = storage_state.get("cookies")
+    if not isinstance(raw, list):
+        return None
+    fingerprint = sorted(
+        f"{cookie.get('name')}@{cookie.get('domain')}"
+        for cookie in raw
+        if isinstance(cookie, dict) and cookie.get("name")
+    )
+    if not fingerprint:
+        return None
+    digest = hashlib.sha256("|".join(fingerprint).encode()).hexdigest()[:12]
+    return f"{IMPORT_ANCHOR_PREFIX}{digest}"
+
+
+def _find_identity_account(
+    account_service: AccountService,
+    *,
+    email: str | None,
+    auth_user: str,
+    exclude_id: str | None = None,
+) -> AccountMeta | None:
+    """Find an existing account by ``email + auth_user`` (excluding the anchor)."""
+    if not email:
+        return None
+    for account in account_service.list_accounts():
+        if exclude_id is not None and account.id == exclude_id:
+            continue
+        if account.email == email and (account.auth_user or "0") == auth_user:
+            return account
+    return None
 
 
 def _browserless_engine(runtime_state: RuntimeState) -> bool:
@@ -400,6 +574,8 @@ class RefreshAccountResult(BaseModel):
     email: str | None = None
     error: str | None = None
     checked_at: str | None = None
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 class RefreshAccountsResponse(BaseModel):
@@ -511,6 +687,12 @@ class ProbeAndImportRequest(BaseModel):
 class ProbeAndImportResponse(BaseModel):
     imported_count: int
     accounts: list[AccountResponse]
+    # External exit mode may import accounts whose identity probe was skipped
+    # (no exit yet) or failed; they are kept and their reason is persisted on
+    # the account.  These fields surface that outcome without failing the batch.
+    skipped: list[str] = Field(default_factory=list)
+    skip_reason: str | None = None
+    probe_failed: dict[str, str] = Field(default_factory=dict)
 
 
 class BundleAccountItem(BaseModel):
@@ -626,6 +808,8 @@ async def refresh_accounts(
                     email=result.email,
                     error=result.error,
                     checked_at=result.checked_at,
+                    skipped=result.skipped,
+                    skip_reason=result.skip_reason,
                 )
             )
 
@@ -745,6 +929,7 @@ async def detect_account_email(
         and target_auth
         and target_auth.is_file()
     ):
+        decision = await resolve_credential_exit(account_id, kind="chat")
         try:
             auth_data = json.loads(target_auth.read_text(encoding="utf-8"))
             raw_cookies = auth_data.get("cookies") or []
@@ -753,14 +938,26 @@ async def detect_account_email(
                 for c in raw_cookies
                 if isinstance(c, dict) and c.get("name")
             }
-            if cookie_dict:
+            if cookie_dict and not decision.allowed:
+                log.warning(
+                    "账号 %s 邮箱/等级 HTTP 探测跳过：无可用出口 reason=%s",
+                    account_id,
+                    decision.reason or "no_exit",
+                )
+            if cookie_dict and decision.allowed:
                 if not email:
                     email = await probe_account_email(
-                        cookie_dict, auth_user=acc.auth_user or "0"
+                        cookie_dict,
+                        auth_user=acc.auth_user or "0",
+                        account_id=account_id,
+                        proxy=decision.proxy,
                     )
                 if not detected_tier or detected_tier == "Free":
                     http_tier = await probe_account_benefit_tier(
-                        cookie_dict, auth_user=acc.auth_user or "0"
+                        cookie_dict,
+                        auth_user=acc.auth_user or "0",
+                        account_id=account_id,
+                        proxy=decision.proxy,
                     )
                     if (http_tier and http_tier != "Free") or not detected_tier:
                         detected_tier = http_tier
@@ -808,8 +1005,9 @@ async def detect_account_tier(
     """强制探测并更新指定账号的订阅权益等级 (Free / Pro / Ultra / Plus)。
 
     这是人工/支持侧动作，必须绕过启动期“3 天内已验证 Free 则跳过”的缓存策略。
-    只有上游明确给出可解析等级时才写库；探测失败返回 400（缺少 Cookie）或
-    502（网络/代理/上游异常、响应不可解析），绝不把已有 Pro/Ultra 降级为 Free。
+    只有上游明确给出可解析等级时才写库；探测失败返回 400（缺少 Cookie）、
+    503（该账号无可用出口，fail-closed，与生成侧 ``exit_unavailable`` 一致）
+    或 502（网络/代理/上游异常、响应不可解析），绝不把已有 Pro/Ultra 降级为 Free。
     """
     import inspect
     import json
@@ -918,13 +1116,26 @@ async def detect_account_tier(
                 )
 
     if detected_tier is None and cookie_dict and not engine_attempted:
+        decision = await resolve_credential_exit(account_id, kind="chat")
+        if not decision.allowed:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "订阅等级探测跳过：该账号当前无可用出口"
+                    f"（{decision.reason or 'no_exit'}），已按 fail-closed 处理；"
+                    "账号原等级保持不变"
+                ),
+            )
         log.warning(
             "账号 %s 无可用引擎会话，tier 探测回退裸 httpx"
             "（可能被上游判 region not supported）",
             account_id,
         )
         detected_tier = await probe_account_benefit_tier(
-            cookie_dict, auth_user=auth_user
+            cookie_dict,
+            auth_user=auth_user,
+            account_id=account_id,
+            proxy=decision.proxy,
         )
 
     if detected_tier is None:
@@ -1483,27 +1694,45 @@ async def import_cookies(
     detected_email = req.email
     detected_tier = req.tier
     sandbox = get_ui_sandbox(runtime_state)
-    if sandbox is None and (not detected_email or not detected_tier):
-        raw_cookies_list = storage_state.get("cookies")
-        if isinstance(raw_cookies_list, list):
-            cookie_dict = {
-                str(c.get("name") or ""): str(c.get("value") or "")
-                for c in raw_cookies_list
-                if isinstance(c, dict) and c.get("name")
-            }
-            if cookie_dict:
-                if not detected_email:
-                    with contextlib.suppress(Exception):
-                        detected_email = await probe_account_email(
-                            cookie_dict, auth_user=req.auth_user or "0"
-                        )
-                if not detected_tier:
-                    with contextlib.suppress(Exception):
-                        probed = await probe_account_benefit_tier(
-                            cookie_dict, auth_user=req.auth_user or "0"
-                        )
-                        if probed and probed != "Free":
-                            detected_tier = probed
+    external = _external_exits_active()
+    cookie_dict = _cookie_dict_from_storage(storage_state)
+
+    # P2-1: never key the exit manager by a synthetic ``cookie_<hex>`` id.  In
+    # external mode a pre-save probe is only allowed when the caller supplied a
+    # real account id; otherwise it is deferred until after save, so the real
+    # id receives the long-term binding and no orphan binding is created.
+    if (
+        sandbox is None
+        and cookie_dict
+        and (not detected_email or not detected_tier)
+        and (not external or req.account_id)
+    ):
+        decision = await resolve_credential_exit(req.account_id or "", kind="chat")
+        if not decision.allowed:
+            log.warning(
+                "导入探测跳过 account=%s：无可用出口 reason=%s（仍继续导入账号）",
+                req.account_id or cid,
+                decision.reason or "no_exit",
+            )
+        else:
+            if not detected_email:
+                with contextlib.suppress(Exception):
+                    detected_email = await probe_account_email(
+                        cookie_dict,
+                        auth_user=req.auth_user or "0",
+                        account_id=req.account_id,
+                        proxy=decision.proxy,
+                    )
+            if not detected_tier:
+                with contextlib.suppress(Exception):
+                    probed = await probe_account_benefit_tier(
+                        cookie_dict,
+                        auth_user=req.auth_user or "0",
+                        account_id=req.account_id,
+                        proxy=decision.proxy,
+                    )
+                    if probed and probed != "Free":
+                        detected_tier = probed
     detected_tier = detected_tier or "Free"
     account = account_service.save_account_from_cookies(
         name=name,
@@ -1514,6 +1743,10 @@ async def import_cookies(
         cookie_id=cid,
         tier=detected_tier,
     )
+    if sandbox is None and external and not req.account_id and cookie_dict:
+        account = await _post_save_identity_probe(
+            account_service, account, storage_state, auth_user=req.auth_user or "0"
+        )
     if runtime_state.rotator:
         runtime_state.rotator.add_account(account.id)
         runtime_state.rotator.clear_cooldown(account.id)
@@ -1524,11 +1757,31 @@ async def import_cookies(
         )
         if browser_session and not _browserless_engine(runtime_state):
             auth_path = account_service.get_account_auth_path(account.id)
-            count = await browser_session.import_cookies(
-                req.cookies,
-                auth_file=str(auth_path) if auth_path else None,
-            )
-            log.info("已导入 Cookie 并保存文件: 数量=%d, 账号=%s", count, account.name)
+            do_refresh = True
+            proxy_arg: object = UNSET_PROXY
+            if external:
+                # P1-2: the import-time credential refresh must use the
+                # account's own exit.  Without one, skip the refresh (the
+                # account is already saved) instead of leaking to WARP.
+                decision = await resolve_credential_exit(account.id, kind="chat")
+                if decision.allowed:
+                    proxy_arg = decision.proxy
+                else:
+                    do_refresh = False
+                    log.warning(
+                        "导入预刷新跳过 account=%s：无可用出口 reason=%s（仍继续导入）",
+                        account.id,
+                        decision.reason or "no_exit",
+                    )
+            if do_refresh:
+                count = await browser_session.import_cookies(
+                    req.cookies,
+                    auth_file=str(auth_path) if auth_path else None,
+                    proxy=proxy_arg,
+                )
+                log.info(
+                    "已导入 Cookie 并保存文件: 数量=%d, 账号=%s", count, account.name
+                )
     except Exception as e:
         log.warning("为 %s 注入浏览器 Cookie 失败: %s", account.name, e)
     return ImportCookiesResponse(
@@ -1580,15 +1833,158 @@ async def probe_and_import(
         )
 
     had_active_account = account_service.get_active_account() is not None
-    probed = await probe_google_accounts_infinite(req.cookies)
-    if not probed:
-        raise HTTPException(status_code=400, detail="未探测到有效已登录 Google 账号")
-
     storage_state = parse_cookie_string(req.cookies)
     prefix = req.name_prefix.strip() if req.name_prefix else "Google Account"
     import secrets
 
     cid = f"cookie_{secrets.token_hex(4)}"
+    external = _external_exits_active()
+    skipped_ids: list[str] = []
+    skip_reason: str | None = None
+    probe_failed: dict[str, str] = {}
+
+    if external:
+        # P2-R2/P2-A: never 503 the whole batch and never stack duplicate
+        # anchors.  The anchor id is deterministic (stable identity cookie) so
+        # re-importing the same jar reuses one record; the exit manager binds
+        # ``HMAC(real anchor id)`` (never a synthetic ``cookie_<hex>``), the
+        # multi-account probe runs through the anchor's exit, and the result is
+        # merged/split into real accounts.
+        anchor_id = _stable_import_anchor_id(storage_state) or (
+            f"{IMPORT_ANCHOR_PREFIX}{secrets.token_hex(6)}"
+        )
+        existing_anchor = account_service.get_account(anchor_id)
+        anchor = account_service.save_account_from_cookies(
+            name=prefix,
+            # Preserve a previously discovered identity when re-running a probe
+            # that may fail again (do not wipe email on a retry).
+            email=existing_anchor.email if existing_anchor is not None else None,
+            storage_state=storage_state,
+            account_id=anchor_id,
+            auth_user="0",
+            cookie_id=cid,
+            tier="Free",
+        )
+        decision = await resolve_credential_exit(anchor.id, kind="chat")
+        probed: list[dict[str, object]] = []
+        if decision.allowed:
+            try:
+                probed = await probe_google_accounts_infinite(
+                    req.cookies, account_id=anchor.id, proxy=decision.proxy
+                )
+            except Exception as exc:
+                log.warning("多账号探活失败 account=%s: %s", anchor.id, exc)
+                skip_reason = f"probe_error: {exc}"
+        else:
+            skip_reason = decision.reason or "no_exit"
+
+        metas: list[AccountMeta] = []
+        if not probed:
+            # No exit (or probe failed): keep exactly one retryable placeholder,
+            # record the reason on it and return 200 instead of failing the
+            # batch.  The deterministic id means retries never accumulate.
+            metas = [anchor]
+            skipped_ids.append(anchor.id)
+            skip_reason = skip_reason or "probe_failed"
+            _mark_probe_reason(account_service, anchor.id, skip_reason)
+            probe_failed[anchor.id] = skip_reason
+        else:
+            checked_at = datetime.now(UTC).isoformat()
+            anchor_claimed = False
+            for entry in probed:
+                u_idx = str(entry.get("auth_user") or "0")
+                email_val = str(entry["email"]) if entry.get("email") else None
+                tier_val = str(entry.get("tier") or "Free")
+                if u_idx == "0":
+                    anchor_claimed = True
+                    existing = _find_identity_account(
+                        account_service,
+                        email=email_val,
+                        auth_user="0",
+                        exclude_id=anchor.id,
+                    )
+                    if existing is not None:
+                        # The same account already exists under its real id:
+                        # merge this re-import into it and drop the placeholder.
+                        meta = account_service.save_account_from_cookies(
+                            name=existing.name or prefix,
+                            email=email_val,
+                            storage_state=storage_state,
+                            account_id=existing.id,
+                            auth_user="0",
+                            cookie_id=cid,
+                            tier=tier_val,
+                        )
+                        if meta.tier == tier_val:
+                            account_service.update_account_tier(
+                                meta.id, tier_val, checked_at=checked_at
+                            )
+                        account_service.delete_account(anchor.id)
+                    else:
+                        # u/0 claims the deterministic anchor as its real record.
+                        if email_val:
+                            account_service.store.update_account_email(
+                                anchor.id, email_val
+                            )
+                        account_service.store.update_account_tier(
+                            anchor.id, tier_val, checked_at=checked_at
+                        )
+                        meta = account_service.get_account(anchor.id) or anchor
+                else:
+                    meta = account_service.save_account_from_cookies(
+                        name=f"{prefix} (u/{u_idx})",
+                        email=email_val,
+                        storage_state=storage_state,
+                        auth_user=u_idx,
+                        cookie_id=cid,
+                        tier=tier_val,
+                    )
+                if not meta.email or not meta.tier or meta.tier == "Free":
+                    # Per-account identity probe keyed by the real account id.
+                    meta = await _post_save_identity_probe(
+                        account_service, meta, storage_state, auth_user=u_idx
+                    )
+                if meta.last_refresh_error:
+                    probe_failed[meta.id] = meta.last_refresh_error
+                metas.append(meta)
+            if not anchor_claimed:
+                # Probe succeeded without a u/0 owner: the placeholder is an
+                # orphan, so remove it instead of leaving a half-baked account.
+                account_service.delete_account(anchor.id)
+
+        rotator = getattr(runtime_state, "rotator", None)
+        if rotator:
+            for meta in metas:
+                rotator.add_account(meta.id)
+                rotator.clear_cooldown(meta.id)
+                _reconcile_verify_after_import(rotator, meta.id)
+        imported_accounts = [
+            to_account_response(meta, status=_account_status(runtime_state, meta.id))
+            for meta in metas
+        ]
+        client_obj = getattr(runtime_state, "client", None)
+        if not had_active_account and metas and client_obj is not None:
+            browser_session = client_obj._session
+            if browser_session is not None:
+                await account_service.activate_account(metas[0].id, browser_session)
+        log.info(
+            "Cookie 探活完成: 导入账号数=%d skipped=%d probe_failed=%d",
+            len(imported_accounts),
+            len(skipped_ids),
+            len(probe_failed),
+        )
+        return ProbeAndImportResponse(
+            imported_count=len(imported_accounts),
+            accounts=imported_accounts,
+            skipped=skipped_ids,
+            skip_reason=skip_reason,
+            probe_failed=probe_failed,
+        )
+
+    probed = await probe_google_accounts_infinite(req.cookies)
+    if not probed:
+        raise HTTPException(status_code=400, detail="未探测到有效已登录 Google 账号")
+
     metas = account_service.batch_import_accounts(
         probed_list=probed,
         storage_state=storage_state,
@@ -1715,7 +2111,10 @@ async def import_bundle(
 
     imported_accounts: list[AccountResponse] = []
     sandbox = get_ui_sandbox(runtime_state)
+    external_exits = _external_exits_active()
     for idx, item in enumerate(items_to_import):
+        if external_exits and idx > 0 and IMPORT_PROBE_PACING_SECONDS > 0:
+            await asyncio.sleep(IMPORT_PROBE_PACING_SECONDS)
         storage_state: dict[str, object] | None = None
         cookie_objects = item.get("cookieObjects")
         cookies_val = item.get("cookies")
@@ -1739,6 +2138,7 @@ async def import_bundle(
 
         if not storage_state or not storage_state.get("cookies"):
             continue
+        cid = f"cookie_{secrets.token_hex(4)}"
 
         acc_email = str(item["email"]) if item.get("email") else None
         account_name_val = str(item.get("accountName") or "").strip()
@@ -1765,29 +2165,32 @@ async def import_bundle(
         if not acc_tier and item.get("tier"):
             acc_tier = str(item["tier"])
 
-        if sandbox is None and (not acc_email or not acc_tier):
-            raw_cookies_list = storage_state.get("cookies")
-            if isinstance(raw_cookies_list, list):
-                cookie_dict = {
-                    str(c.get("name") or ""): str(c.get("value") or "")
-                    for c in raw_cookies_list
-                    if isinstance(c, dict) and c.get("name")
-                }
-                if cookie_dict:
-                    if not acc_email:
-                        with contextlib.suppress(Exception):
-                            acc_email = await probe_account_email(
-                                cookie_dict, auth_user=acc_auth_user
-                            )
-                    if not acc_tier:
-                        with contextlib.suppress(Exception):
-                            probed = await probe_account_benefit_tier(
-                                cookie_dict, auth_user=acc_auth_user
-                            )
-                            if probed and probed != "Free":
-                                acc_tier = probed
+        if sandbox is None and not external_exits and (not acc_email or not acc_tier):
+            # P2-1: external mode never keys the manager by a synthetic cookie
+            # id; it probes after save with the real account id.  Off mode keeps
+            # the legacy pre-save probe (the global proxy involves no binding).
+            decision = await resolve_credential_exit("", kind="chat")
+            cookie_dict = _cookie_dict_from_storage(storage_state)
+            if cookie_dict and decision.allowed:
+                if not acc_email:
+                    with contextlib.suppress(Exception):
+                        acc_email = await probe_account_email(
+                            cookie_dict,
+                            auth_user=acc_auth_user,
+                            account_id=None,
+                            proxy=decision.proxy,
+                        )
+                if not acc_tier:
+                    with contextlib.suppress(Exception):
+                        probed = await probe_account_benefit_tier(
+                            cookie_dict,
+                            auth_user=acc_auth_user,
+                            account_id=None,
+                            proxy=decision.proxy,
+                        )
+                        if probed and probed != "Free":
+                            acc_tier = probed
         acc_tier = acc_tier or "Free"
-        cid = f"cookie_{secrets.token_hex(4)}"
 
         account = account_service.save_account_from_cookies(
             name=acc_name,
@@ -1797,6 +2200,14 @@ async def import_bundle(
             cookie_id=cid,
             tier=acc_tier,
         )
+        if (
+            sandbox is None
+            and external_exits
+            and (not account.email or not account.tier or account.tier == "Free")
+        ):
+            account = await _post_save_identity_probe(
+                account_service, account, storage_state, auth_user=acc_auth_user
+            )
         rotator = getattr(runtime_state, "rotator", None)
         if rotator:
             rotator.add_account(account.id)

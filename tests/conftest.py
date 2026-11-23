@@ -13,19 +13,25 @@ _EXIT_POOL_ENV_NAMES = (
     "AISTUDIO_EXIT_HTTP_TIMEOUT",
     "AISTUDIO_EXIT_TTL",
     "AISTUDIO_EXIT_CANARY_ACCOUNT",
+    "AISTUDIO_EXIT_DIRECT_FALLBACK",
 )
 
 
 @pytest.fixture(autouse=True)
 def isolate_exit_pool_env(monkeypatch):
     """Keep the env-gated exit pool off unless a test opts in."""
+    from aistudio_api.infrastructure.account.account_info_refresher import (
+        reset_skip_log_throttle,
+    )
     from aistudio_api.infrastructure.exit_pool import reset_exit_resolver
 
     for name in _EXIT_POOL_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     reset_exit_resolver()
+    reset_skip_log_throttle()
     yield
     reset_exit_resolver()
+    reset_skip_log_throttle()
 
 
 _TEST_DEFAULT_CONFIG = """

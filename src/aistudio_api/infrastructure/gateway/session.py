@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from aistudio_api.config import resolve_fingerprint_spoof_enabled, settings
+from aistudio_api.infrastructure.account.cookie_refresher import UNSET_PROXY
 from aistudio_api.infrastructure.browser.browser_engine import (
     ChromiumProcess,
     launch_chromium_process,
@@ -601,13 +602,21 @@ class BrowserSession:
                 gc.collect()
 
     async def import_cookies(
-        self, cookie_string: str, auth_file: str | None = None
+        self,
+        cookie_string: str,
+        auth_file: str | None = None,
+        *,
+        proxy: object = UNSET_PROXY,
     ) -> int:
         from aistudio_api.infrastructure.account.cookie_refresher import (
             load_cookies_from_string,
         )
 
-        pw_cookies = load_cookies_from_string(cookie_string)
+        # ``proxy`` is the caller-resolved per-account exit.  The sentinel keeps
+        # the legacy off-mode global proxy; an explicit ``None`` means direct
+        # (external emergency valve) and must never fall back to the global
+        # proxy inside the refresher.
+        pw_cookies = load_cookies_from_string(cookie_string, proxy=proxy)
         target_auth = auth_file or self._auth_file
         if not target_auth:
             return len(pw_cookies)

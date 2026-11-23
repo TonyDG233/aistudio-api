@@ -28,6 +28,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/poolstate"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxydefault"
 	"github.com/Mag1cFall/AIStudio2API/internal/signerapi"
 	"github.com/Mag1cFall/AIStudio2API/internal/upstreamguard"
 )
@@ -880,6 +881,16 @@ func mintError(message string) signerapi.MintResponse {
 	}
 }
 
+// resolveProxy 决定最终生效的进程级默认代理：
+//   - 显式传入 -proxy（含显式空串）优先，绝不触发自动发现；
+//   - 未显式传入且开启 -no-proxy-discovery 时返回空，绝不触发自动发现；
+//   - 其余情况回退到 discover 的环境变量/端口探测结果（保持历史默认）。
+//
+// 具体决策逻辑位于 internal/proxydefault，便于在无 cgo 环境下测试。
+func resolveProxy(explicit bool, proxyValue string, noProxyDiscovery bool, discover func() string) string {
+	return proxydefault.Resolve(explicit, proxyValue, noProxyDiscovery, discover)
+}
+
 func discoverProxy() string {
 	for _, envName := range []string{"AISTUDIO_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
 		if val := strings.TrimSpace(os.Getenv(envName)); val != "" {
@@ -1154,7 +1165,8 @@ func main() {
 	defaultDNS := firstNonEmptyEnv("WAA_DNS_SERVERS", "AISTUDIO_DNS_SERVERS")
 
 	listenAddr := flag.String("listen", defaultListen, "HTTP listen address")
-	proxyURL := flag.String("proxy", discoverProxy(), "Upstream HTTP/HTTPS/SOCKS5 proxy URL")
+	proxyURL := flag.String("proxy", "", "Upstream HTTP/HTTPS/SOCKS5 proxy URL (default: auto-discovered unless -no-proxy-discovery)")
+	noProxyDiscovery := flag.Bool("no-proxy-discovery", false, "Disable env/port proxy auto-discovery; the effective default proxy stays empty")
 	stateDir := flag.String("state-dir", defaultStateDir, "Directory for worker fingerprints and interpreter cache")
 	locale := flag.String("locale", defaultLocale, "Browser profile locale")
 	timezone := flag.String("timezone", defaultTZ, "Browser profile IANA timezone")
@@ -1162,6 +1174,14 @@ func main() {
 	maxWorkers := flag.Int("max-workers", envInt("WAA_MAX_WORKERS", defaultMaxWorkers), "Maximum concurrent WAA workers")
 	idleTTL := flag.Duration("idle-ttl", envDuration("WAA_IDLE_TTL", defaultIdleTTL), "Idle worker TTL before reclamation (e.g. 3600s)")
 	flag.Parse()
+
+	proxyExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "proxy" {
+			proxyExplicit = true
+		}
+	})
+	*proxyURL = resolveProxy(proxyExplicit, *proxyURL, *noProxyDiscovery, discoverProxy)
 
 	configureRuntimeNetwork(*dnsFlag)
 

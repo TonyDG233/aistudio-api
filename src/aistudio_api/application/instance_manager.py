@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from aistudio_api.domain.errors import is_exit_unavailable_error
 from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.domain.model_access import (
     canonical_tier,
@@ -290,6 +291,21 @@ class InstanceManager:
                         )
                         record.state = InstanceState.INVALID
                         record.last_error = str(exc)
+                    except Exception as exc:
+                        if not is_exit_unavailable_error(exc):
+                            raise
+                        # Fail-closed exit resolution must not abort startup:
+                        # leave the slot retryable so the first request either
+                        # succeeds once the manager recovers or returns the
+                        # explicit 503 ``exit_unavailable``.
+                        log.warning(
+                            "[instances] startup deferred (no exit) account=%s "
+                            "slot=%s; slot left UNSTARTED",
+                            account.id,
+                            slot.slot_id,
+                        )
+                        record.state = InstanceState.UNSTARTED
+                        record.last_error = str(exc)
                 else:
                     continue
                 break
@@ -510,11 +526,7 @@ class InstanceManager:
         async with self._lifecycle_lock:
             record = self._record(instance_id)
             slot = self._pool.get(record.slot_id)
-            if (
-                require_idle
-                and slot is not None
-                and int(slot.active_requests) > 0
-            ):
+            if require_idle and slot is not None and int(slot.active_requests) > 0:
                 return self._view(record)
             if record.account_id == account.id:
                 return self._view(record)
@@ -1057,6 +1069,13 @@ class InstanceManager:
                     )
                 except Exception as exc:
                     record.account_id = account.id
+                    if is_exit_unavailable_error(exc):
+                        # Same as startup: an outage during an engine rebuild
+                        # must leave the slot retryable, not latched INVALID.
+                        record.state = InstanceState.UNSTARTED
+                        record.last_error = str(exc)
+                        errors.append(f"{record.id}: {exc}")
+                        return
                     record.state = InstanceState.INVALID
                     record.last_error = str(exc)
                     errors.append(f"{record.id}: {exc}")
@@ -1140,9 +1159,7 @@ class InstanceManager:
         try:
             streak = resetter(record.slot_id)
         except Exception as exc:
-            log.debug(
-                "[instances] 重置实例连续成功次数失败 %s: %s", instance_id, exc
-            )
+            log.debug("[instances] 重置实例连续成功次数失败 %s: %s", instance_id, exc)
             return 0
         return int(streak) if isinstance(streak, (int, float)) else 0
 
@@ -1347,6 +1364,15 @@ class InstanceManager:
             record.last_error = str(exc)
             raise InstanceNotReadyError(str(exc)) from exc
         except Exception as exc:
+            if is_exit_unavailable_error(exc):
+                # P1-R1: a missing account exit is fail-closed and transient.
+                # Re-raise the original 503 so routing/API surface
+                # ``exit_unavailable`` instead of a 409 instance error, and
+                # leave the binding retryable (no sticky INVALID).
+                record.account_id = account.id
+                record.state = InstanceState.UNSTARTED
+                record.last_error = str(exc)
+                raise
             record.state = InstanceState.INVALID
             record.last_error = str(exc)
             raise InstanceNotReadyError(str(exc)) from exc

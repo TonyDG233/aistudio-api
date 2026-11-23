@@ -21,9 +21,10 @@
 - **监听面**：管理器仅允许 `127.0.0.1` / `::1` / `localhost` / `172.17.0.1`。
 - **方法**：只读接口只接受 `GET`；事件只接受 `POST`。
 - **超时**：app 侧控制面超时由 `AISTUDIO_EXIT_HTTP_TIMEOUT` 控制（默认 2s）。
-- **失败非致命**：任何超时 / 非 200 / 非 JSON / 非法载荷都只在 app 侧降级，
-  **绝不抛出到请求路径**；分配失败回退 `AISTUDIO_PROXY`（未配置即直连），
-  状态失败仅让只读卡片显示“管理器状态不可用”。
+- **失败非致命（fail-closed）**：任何超时 / 非 200 / 非 JSON / 非法载荷都只在 app 侧降级，
+  **绝不抛出到请求路径管理层之外**；**分配失败一律 fail-closed：跳过本次带凭据请求，
+  绝不回退全局 `AISTUDIO_PROXY`**（唯一例外是显式开启的应急阀
+  `AISTUDIO_EXIT_DIRECT_FALLBACK`，见 §7.1）；状态失败仅让只读卡片显示“管理器状态不可用”。
 - **远端部署**：`AISTUDIO_EXIT_ENDPOINT` 指向非 loopback / 非 docker 桥地址时必须使用
   `https://`，Bearer token 不得以明文 HTTP 跨主机传输。
 
@@ -122,7 +123,8 @@ Authorization: Bearer <token>
 失败与降级：
 
 - 无可用出口 / 容量满 / 迁移失败 → `503 {"error":"no_healthy_exit",...}`；
-  app 回退全局 `AISTUDIO_PROXY`，不缓存失败结果。
+  app **fail-closed**：不缓存失败结果，跳过该账号本次带凭据请求；
+  **绝不回退全局 `AISTUDIO_PROXY`**（应急阀见 §7.1）。
 - `socks_url` 必须为 `socks5://` / `socks5h://`，主机在
   `AISTUDIO_EXIT_ALLOWED_HOSTS`（默认 `127.0.0.1,172.17.0.1`）内且端口合法；
   否则 app 视为非法并回退。
@@ -190,7 +192,89 @@ Content-Type: application/json
 
 ---
 
-## 6. 兼容性与回滚
+## 6. app 侧出口使用语义（fail-closed）
+
+### 6.1 应急阀 `AISTUDIO_EXIT_DIRECT_FALLBACK`
+
+- **默认关闭**；仅 `1` / `true` / `yes` / `on`（大小写不敏感）视为开启。
+- 开启后，external 模式拿不到账号出口的带凭据请求**改为直连**（`proxy=None`），
+  **绝不回退 `settings.proxy_url`**；WARNING 按账号 60s 限频。
+- 未开启时同一情形一律 `skip`，不构造传输、不发起任何上游请求。
+- `skip` 日志按 `(账号, 原因)` 60s 限频，但当前是**两层各自独立限频**：
+  `resolver._log_skip` 一条，`account_info_refresher` / `account_keepalive`
+  共用 `skip_log_due` 一条。因此首次 skip 最多产生 **2 条** WARNING
+  （resolver 与 refresher 各最多一条 / 60s），而不是“单次只产出一条”。
+  本轮选择保留双层、文档如实（Q-2：不把跨层日志耦合进单一字典）。
+
+### 6.2 引擎范围
+
+- external 模式**仅支持 `browserless` 引擎**；`mode=browser` + external 在
+  `build_engine_runtime` 阶段直接 fail-fast（`RuntimeError`），不会用进程级全局代理跑凭据流量。
+- off 模式（未配置 `AISTUDIO_EXIT_MODE=external`）行为与改造前完全一致：
+  仍使用 `settings.proxy_url`，`get_exit_resolver()` 返回 `None`，零管理器请求。
+
+### 6.3 生成主链
+
+- `engine_runtime.create_session` 按 `account_id` 解析出口；无出口/管理器不可达时抛
+  `RoutingError(code="exit_unavailable", status=503)`，**不建立会话、不发送任何上游请求**。
+- 该 503 必须端到端原样到达协议层（Gemini `UNAVAILABLE` / OpenAI `service_unavailable`）。
+  实例层（`instance_pool.activate` / `instance_manager._activate`）对
+  `exit_unavailable` **显式 re-raise**，不得包装成 409 `instance_not_ready`，也不得把槽位
+  置 `INVALID`；槽位保持 `UNSTARTED`，管理器恢复后下一次请求可直接重建会话。
+- `routing_pipeline.acquire` 对 `exit_unavailable` **直接终止候选循环**，不得当作
+  “试下一个候选” 吞掉，也不得最终降级为 `surface_capacity`。
+
+### 6.4 批量探活导入（`POST /accounts/probe-import`）
+
+- external 下**不再整体 503**。流程固定为：
+  1. 先用 Cookie jar 落库一个**真实账号 id 的锚点账号**（`auth_user=0`）；
+  2. 用该真实 id 解析一次出口；
+  3. 通过该出口调用 `probe_google_accounts_infinite(account_id=<真实 id>)` 探测
+     `u/0,u/1,...`；
+  4. 按 `auth_user` 拆分：`u/0` 回写锚点账号，其余各建**真实 id** 新账号；
+  5. 缺 email/tier 的账号用各自的真实 id 再做一次导入后探测。
+- **禁止**把合成 `cookie_<hex>` 作为管理器账号键；合成值只可存为 `cookie_id`。
+- 锚点 id 由**稳定身份 Cookie**（`SAPISID` → `APISID` → `SID` 取值哈希）派生，
+  形如 `acc_import_<hash>`；**不得**使用每次变化的 `__Secure-1PSIDTS`/`SIDCC`
+  或整包 Cookie 哈希。这样重复导入同一 Cookie 落到同一条记录，天然幂等。
+- 探测成功时：`u/0` 认领该锚点并回写 email/tier；若已存在同
+  `email + auth_user` 的真实账号，则把本次导入合并进该账号并删除锚点；
+  探活结果中**没有 `u/0`** 时删除锚点，避免留下孤儿半成品。
+- 探测失败（无出口 / 探活异常）时：只保留**恰好一条**可重试的占位记录
+  （同一 Cookie 反复导入仍是同一条，不会堆积），原因写入
+  `last_refresh_error`（`no_exit` / `probe_error: ...`），响应附带
+  `skipped` / `skip_reason` / `probe_failed` 字段。
+- 同一请求多条目时，条目之间按 `IMPORT_PROBE_PACING_SECONDS=0.3` 串行间隔。
+
+### 6.5 元数据刷新与保活
+
+- `refresh_accounts` / keepalive 在 external 无出口时返回
+  `ok=False, skipped=True, skip_reason=<no_exit|no_account>`；
+  keepalive 按 300s 短周期重试，不推进 24h due，也不改写 `tier_checked_at`。
+- API 响应同时给出 `skipped` 与 `skip_reason`，便于区分“探测失败”与“无出口跳过”。
+
+### 6.6 signer daemon 的 `-proxy` 语义（代理发现修复已落地）
+
+- Python 侧在 external 下**不向 daemon 传 `-proxy`**，并显式追加
+  `-no-proxy-discovery`；同时大小写不敏感地剥离子进程环境中的
+  `AISTUDIO_PROXY/HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`。
+- waa-signer 侧代理发现修复已落地：`proxydefault.Resolve` 的语义是“显式
+  `-proxy`（含空串 `""`）优先；否则 `-no-proxy-discovery` 下不探测；仅默认
+  情况才调用 `discoverProxy()`”。因此 external 下省略 proxy 的 signer 请求
+  真正直连，应急阀（`proxy=None`）在 signer 传输下同样不会回落到环境代理。
+- 旧版 `waa-signer` 二进制不认识 `-no-proxy-discovery`（会报 flag 未定义）；
+  external 部署前必须用 cgo/SpiderMonkey 工具链**重建** signer 可执行文件。
+
+### 6.7 Cookie 轮换（RotateCookies）
+
+- 有池会话时优先走 `rotate_cookies_via_signer`（会话已绑定账号出口）。
+- 无池会话时走裸路径：按 `account_id` 解析出口，凭据 RPC 使用该出口；
+  `no_exit` 直接返回 `skipped="no_exit"`，**不扇出兄弟账号、不写 Cookie**，
+  绝不回退全局代理。
+
+---
+
+## 7. 兼容性与回滚
 
 - 删除/清空 `AISTUDIO_EXIT_*` 后重启 app：resolver 不联网、`proxy_mode` 回落
   `single`/`direct`、`exit_pool` 为 `null`，行为与改造前一致。

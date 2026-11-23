@@ -10,7 +10,9 @@ leaves the process.  Cookies, emails and tokens for the manager are never sent.
 
 Failures are never fatal: a timeout, 5xx, malformed payload or a proxy URL that
 fails the scheme/host/port whitelist makes :meth:`ExitResolver.resolve` return
-``None`` so the caller falls back to the global ``settings.proxy_url``.
+``None``.  Callers must treat ``None`` as "no exit" and fail closed (or use the
+explicit emergency direct valve in :func:`resolve_credential_exit`); they must
+never fall back to the global ``settings.proxy_url``.
 """
 
 from __future__ import annotations
@@ -21,12 +23,15 @@ import hmac
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import httpx
 
-from aistudio_api.infrastructure.exit_pool.config import ExitPoolConfig
+from aistudio_api.infrastructure.exit_pool.config import (
+    ExitPoolConfig,
+    direct_fallback_enabled,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("exit-pool")
@@ -38,7 +43,137 @@ STATUS_TIMEOUT_S = 2.0
 STATUS_CACHE_TTL_S = 15.0
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"socks5", "socks5h"})
 
+# Emergency-valve log throttle: one WARNING per account per window so a
+# sustained manager outage never floods the log.
+DIRECT_FALLBACK_LOG_INTERVAL_S = 60.0
+
+# Ordinary fail-closed skip throttle: one WARNING per account+reason per window.
+# During a manager-wide outage every account skips on every refresh round; this
+# keeps the log actionable instead of emitting two lines per account per round.
+SKIP_LOG_INTERVAL_S = 60.0
+
 ClientFactory = Callable[[], httpx.AsyncClient]
+
+
+class ExitAssignmentResolver(Protocol):
+    """Minimal resolver surface shared by the real resolver and test doubles."""
+
+    async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None: ...
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    """Explicit outbound-proxy decision for one credential-bearing call.
+
+    ``action`` is one of:
+
+    * ``"proxy"`` — send through ``proxy`` (which may be ``None`` = direct when
+      the global mode is off or the emergency valve produced it).
+    * ``"skip"`` — do not send the request at all (fail-closed).
+    * ``"direct_fallback"`` — emergency valve: send without any proxy.
+    """
+
+    action: str
+    proxy: str | None = None
+    reason: str | None = None
+    external: bool = False
+
+    @property
+    def allowed(self) -> bool:
+        """True when the caller may issue the upstream request."""
+        return self.action != "skip"
+
+
+_direct_fallback_log_at: dict[str, float] = {}
+_skip_log_at: dict[tuple[str, str], float] = {}
+
+
+def reset_direct_fallback_log() -> None:
+    """Clear the emergency-valve log throttle (tests/teardown)."""
+    _direct_fallback_log_at.clear()
+
+
+def reset_skip_log() -> None:
+    """Clear the fail-closed skip log throttle (tests/teardown)."""
+    _skip_log_at.clear()
+
+
+def _log_skip(account_id: str, *, kind: str, reason: str) -> None:
+    """Throttled fail-closed skip warning (one per account+reason per window)."""
+    key = (account_id or "<none>", reason)
+    now = time.monotonic()
+    last = _skip_log_at.get(key, 0.0)
+    if now - last < SKIP_LOG_INTERVAL_S:
+        return
+    _skip_log_at[key] = now
+    log.warning(
+        "[exit-pool] 账号 %s 无可用出口，跳过带凭据请求（fail-closed）"
+        "reason=%s kind=%s",
+        account_id or "<none>",
+        reason,
+        kind,
+    )
+
+
+def _global_proxy() -> str | None:
+    from aistudio_api.config import settings
+
+    return settings.proxy_url
+
+
+def _log_direct_fallback(account_id: str, *, kind: str) -> None:
+    now = time.monotonic()
+    last = _direct_fallback_log_at.get(account_id, 0.0)
+    if now - last < DIRECT_FALLBACK_LOG_INTERVAL_S:
+        return
+    _direct_fallback_log_at[account_id] = now
+    log.warning(
+        "[exit-pool] 应急阀已开启：账号 %s 无可用出口，本次带凭据请求改为直连"
+        "（不走全局代理）kind=%s",
+        account_id,
+        kind,
+    )
+
+
+async def resolve_credential_exit(
+    account_id: str,
+    *,
+    kind: str = "chat",
+    resolver: ExitAssignmentResolver | None = None,
+) -> ExitDecision:
+    """Decide the outbound proxy for one credential-bearing upstream call.
+
+    * off mode (no resolver): return the existing global proxy, which may be
+      ``None`` to keep the current direct behaviour.
+    * external mode: ask the manager for this account's exit; a missing exit or
+      an unreachable manager yields ``skip`` (fail-closed) unless the operator
+      explicitly enabled ``AISTUDIO_EXIT_DIRECT_FALLBACK``.
+    """
+    active = resolver if resolver is not None else get_exit_resolver()
+    if active is None:
+        return ExitDecision("proxy", proxy=_global_proxy(), external=False)
+    if not account_id:
+        _log_skip(account_id, kind=kind, reason="no_account")
+        return ExitDecision("skip", reason="no_account", external=True)
+    try:
+        proxy = await active.resolve(account_id, kind=kind)
+    except Exception as exc:  # pragma: no cover - resolver never raises
+        log.warning(
+            "[exit-pool] 出口解析异常（fail-closed）account=%s kind=%s error=%s",
+            account_id,
+            kind,
+            type(exc).__name__,
+        )
+        proxy = None
+    if proxy:
+        return ExitDecision("proxy", proxy=proxy, external=True)
+    if direct_fallback_enabled():
+        _log_direct_fallback(account_id, kind=kind)
+        return ExitDecision(
+            "direct_fallback", proxy=None, reason="no_exit", external=True
+        )
+    _log_skip(account_id, kind=kind, reason="no_exit")
+    return ExitDecision("skip", reason="no_exit", external=True)
 
 
 def hmac_account_id(hmac_key: str, account_id: str) -> str:
@@ -245,7 +380,11 @@ class ExitResolver:
             self._last_known.pop(key, None)
 
     async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None:
-        """Resolve the socks URL for one account, or ``None`` to use global."""
+        """Resolve the socks URL for one account, or ``None`` when unavailable.
+
+        ``None`` means "no usable exit": callers must fail closed, never fall
+        back to the global proxy.
+        """
         if not account_id:
             return None
         cached = self.assignment_for(account_id, kind=kind)
@@ -261,7 +400,7 @@ class ExitResolver:
                 raise
             except Exception as exc:
                 log.warning(
-                    "[exit-pool] 出口分配异常，回退全局代理 kind=%s error=%s",
+                    "[exit-pool] 出口分配异常（无可用出口）kind=%s error=%s",
                     kind,
                     type(exc).__name__,
                 )
@@ -349,14 +488,14 @@ class ExitResolver:
             )
         except httpx.HTTPError as exc:
             log.warning(
-                "[exit-pool] 出口分配请求失败（degraded 回退全局代理）kind=%s error=%s",
+                "[exit-pool] 出口分配请求失败（无可用出口）kind=%s error=%s",
                 kind,
                 type(exc).__name__,
             )
             return None
         if response.status_code != 200:
             log.warning(
-                "[exit-pool] 出口分配不可用（degraded 回退全局代理）kind=%s status=%s",
+                "[exit-pool] 出口分配不可用（无可用出口）kind=%s status=%s",
                 kind,
                 response.status_code,
             )
@@ -364,13 +503,13 @@ class ExitResolver:
         try:
             payload: Any = response.json()
         except ValueError:
-            log.warning("[exit-pool] 出口分配响应非 JSON，回退全局代理 kind=%s", kind)
+            log.warning("[exit-pool] 出口分配响应非 JSON（无可用出口）kind=%s", kind)
             return None
         assignment = self._parse_assignment(payload, kind)
         if assignment is None:
             log.warning(
                 "[exit-pool] 出口分配响应非法（socks_url 未通过白名单），"
-                "回退全局代理 kind=%s",
+                "无可用出口 kind=%s",
                 kind,
             )
         return assignment
@@ -390,9 +529,11 @@ class ExitResolver:
             # Treat anything but an explicit ``true`` as unusable: the manager
             # contract always carries ``healthy``, and a missing/false flag means
             # the exit is known (or assumed) bad.  Returning ``None`` makes the
-            # caller fall back to the global proxy and never caches it.
+            # caller fail closed (or use the explicit direct-fallback valve);
+            # it never caches the bad exit and never falls back to the global
+            # proxy.
             log.warning(
-                "[exit-pool] 分配到的出口未标记健康（回退全局代理）exit=%s kind=%s",
+                "[exit-pool] 分配到的出口未标记健康（无可用出口）exit=%s kind=%s",
                 exit_id,
                 kind,
             )
@@ -533,21 +674,34 @@ def get_exit_resolver() -> ExitResolver | None:
 
 
 def reset_exit_resolver(resolver: ExitResolver | None = None) -> None:
-    """Replace/clear the process-wide resolver (tests and teardown)."""
+    """Replace/clear the process-wide resolver (tests and teardown).
+
+    Also clears the per-account log throttles so a fresh resolver never inherits
+    a previous run's suppression window.
+    """
     global _resolver
     _resolver = resolver
+    reset_direct_fallback_log()
+    reset_skip_log()
 
 
 __all__ = [
     "ASSIGN_PATH",
+    "DIRECT_FALLBACK_LOG_INTERVAL_S",
     "EVENTS_PATH",
+    "SKIP_LOG_INTERVAL_S",
     "STATUS_CACHE_TTL_S",
     "STATUS_PATH",
     "STATUS_TIMEOUT_S",
     "ExitAssignment",
+    "ExitAssignmentResolver",
+    "ExitDecision",
     "ExitResolver",
     "get_exit_resolver",
     "hmac_account_id",
     "parse_socks_url",
+    "reset_direct_fallback_log",
     "reset_exit_resolver",
+    "reset_skip_log",
+    "resolve_credential_exit",
 ]

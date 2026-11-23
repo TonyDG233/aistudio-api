@@ -27,6 +27,20 @@ log = get_logger("waa-daemon")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
+# External exit mode must not leak a host-level proxy into the signer process:
+# ``waa-signer`` auto-discovers proxies from these variables (any case) and from
+# well-known local ports when no ``-proxy`` is supplied.  Stripping them, plus
+# passing ``-no-proxy-discovery``, keeps proxyless requests truly direct.
+_PROXY_ENV_NAMES = frozenset(
+    {
+        "AISTUDIO_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    }
+)
+
 
 def resolve_binary_path(binary_path: str) -> Path:
     """Resolve a configured signer binary, including the Windows ``.exe`` form."""
@@ -59,6 +73,7 @@ class LocalSignerDaemon:
         max_workers: int = 8,
         idle_ttl_s: float = 3600.0,
         proxy: str | None = None,
+        external_exits: bool = False,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.binary_path = resolve_binary_path(binary_path)
@@ -69,6 +84,10 @@ class LocalSignerDaemon:
         self.max_workers = max(1, int(max_workers))
         self.idle_ttl_s = max(1.0, float(idle_ttl_s))
         self.proxy = proxy
+        # External exit mode resolves a proxy per request.  The daemon must not
+        # receive a process-level ``-proxy`` (which would silently route
+        # default/proxyless requests through the global WARP egress).
+        self.external_exits = external_exits
         self._proc: asyncio.subprocess.Process | None = None
         self._started_by_us = False
         self._atexit_registered = False
@@ -106,9 +125,27 @@ class LocalSignerDaemon:
             "-idle-ttl",
             f"{self.idle_ttl_s:.0f}s",
         ]
-        if self.proxy:
+        if self.proxy and not self.external_exits:
             command.extend(["-proxy", self.proxy])
+        if self.external_exits:
+            # Belt and braces alongside the stripped env: never auto-discover a
+            # process-level proxy in external exit mode.
+            command.append("-no-proxy-discovery")
         return command
+
+    def _child_env(self) -> dict[str, str]:
+        """Return the signer child environment.
+
+        External exit mode strips every proxy-related variable (case-insensitive)
+        so ``discoverProxy()`` cannot resurrect a host proxy.  Other modes keep
+        the inherited environment untouched.
+        """
+        env = os.environ.copy()
+        if not self.external_exits:
+            return env
+        for key in [name for name in env if name.upper() in _PROXY_ENV_NAMES]:
+            env.pop(key, None)
+        return env
 
     async def start(self, *, health_client: SignerClient) -> None:
         """Spawn the signer and wait until an initial ``/health`` succeeds."""
@@ -122,7 +159,7 @@ class LocalSignerDaemon:
                 *self._command(),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                env=os.environ.copy(),
+                env=self._child_env(),
             )
         except OSError as exc:
             raise SignerUnavailableError(f"无法启动 waa-signer: {exc}") from exc

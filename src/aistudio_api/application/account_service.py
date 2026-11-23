@@ -191,7 +191,18 @@ class AccountService:
             result = raw if isinstance(raw, dict) else {}
             cookies = load_cookies_from_auth_file(auth_path) or cookies
         else:
-            result = await rotate_google_cookies(cookies, client=client)
+            result = await rotate_google_cookies(
+                cookies, client=client, account_id=account_id
+            )
+
+        if result.get("skipped") == "no_exit":
+            # External exit mode with no assigned exit: fail closed.  Do not
+            # fan out to siblings (that would multiply skipped probes) and do
+            # not touch persisted cookies.
+            logger.warning(
+                "账号 %s RotateCookies 跳过：无可用出口（fail-closed）", account_id
+            )
+            return {**result, "cookies": cookies}
 
         if not result.get("ok") and result.get("skipped") != "missing_seed":
             # A missing rotation seed means no sibling merge can help (the
@@ -218,7 +229,9 @@ class AccountService:
                 if not (same_anchor or same_cid):
                     continue
                 merged_sib = {**cookies, **sib_cookies}
-                sib_res = await rotate_google_cookies(merged_sib, client=client)
+                sib_res = await rotate_google_cookies(
+                    merged_sib, client=client, account_id=sib.id
+                )
                 if sib_res.get("ok"):
                     cookies = merged_sib
                     result = sib_res

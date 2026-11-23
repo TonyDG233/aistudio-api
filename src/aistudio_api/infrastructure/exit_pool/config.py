@@ -23,8 +23,14 @@ EXIT_ALLOWED_HOSTS_ENV = "AISTUDIO_EXIT_ALLOWED_HOSTS"
 EXIT_HTTP_TIMEOUT_ENV = "AISTUDIO_EXIT_HTTP_TIMEOUT"
 EXIT_TTL_ENV = "AISTUDIO_EXIT_TTL"
 EXIT_CANARY_ACCOUNT_ENV = "AISTUDIO_EXIT_CANARY_ACCOUNT"
+EXIT_DIRECT_FALLBACK_ENV = "AISTUDIO_EXIT_DIRECT_FALLBACK"
 
 EXTERNAL_MODE = "external"
+
+# Emergency valve (default off): only an explicit truthy value lets a
+# credential-bearing call run without any proxy when the manager is unreachable
+# or has no exit for the account.  It never falls back to the global proxy.
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 # The manager normally runs on the docker bridge (or loopback for a host
 # process); anything else must be explicitly whitelisted by the operator.
@@ -51,6 +57,12 @@ def _float_env(name: str, default: float) -> float:
         log.warning("[exit-pool] 忽略非正数 %s=%r，使用默认值 %s", name, raw, default)
         return default
     return value
+
+
+def direct_fallback_enabled() -> bool:
+    """True only when the operator explicitly enabled the emergency valve."""
+    raw = _env_value(EXIT_DIRECT_FALLBACK_ENV)
+    return raw.lower() in _TRUTHY_ENV_VALUES
 
 
 def _allowed_hosts() -> frozenset[str]:
@@ -156,6 +168,8 @@ __all__ = [
     "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_HTTP_TIMEOUT_S",
     "DEFAULT_TTL_S",
+    "EXIT_DIRECT_FALLBACK_ENV",
     "EXTERNAL_MODE",
     "ExitPoolConfig",
+    "direct_fallback_enabled",
 ]

@@ -687,10 +687,14 @@ async def test_external_runtime_injects_resolved_exit(
 
 
 @pytest.mark.asyncio
-async def test_external_runtime_falls_back_on_resolver_error(
+async def test_external_runtime_fails_closed_on_resolver_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """P1-3: a manager error must never fall back to the global proxy."""
+    import pytest
+
     from aistudio_api.config import settings
+    from aistudio_api.domain.errors import RoutingError
 
     monkeypatch.setattr(settings, "proxy_url", "socks5://172.17.0.1:40001")
     fake = _FakeExitResolver(error=RuntimeError("manager down"))
@@ -700,15 +704,17 @@ async def test_external_runtime_falls_back_on_resolver_error(
         exit_resolver=cast(Any, fake),
     )
 
-    build = await runtime.create_session(
-        slot_id="slot-1",
-        auth_file=None,
-        auth_user="0",
-        tier="Free",
-        account_id="acc-1",
-        realm_id="realm-1",
-    )
-    assert build.session._proxy == "socks5://172.17.0.1:40001"  # type: ignore[attr-defined]
+    with pytest.raises(RoutingError) as excinfo:
+        await runtime.create_session(
+            slot_id="slot-1",
+            auth_file=None,
+            auth_user="0",
+            tier="Free",
+            account_id="acc-1",
+            realm_id="realm-1",
+        )
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "exit_unavailable"
 
 
 @pytest.mark.asyncio

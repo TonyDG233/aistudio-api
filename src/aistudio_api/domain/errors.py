@@ -137,6 +137,24 @@ class RoutingError(AistudioError):
         return fields
 
 
+EXIT_UNAVAILABLE_CODE = "exit_unavailable"
+
+
+def is_exit_unavailable_error(exc: BaseException | None) -> bool:
+    """True when ``exc`` is the fail-closed "no account exit" routing rejection.
+
+    External exit mode raises :class:`RoutingError` with
+    ``code="exit_unavailable"`` (HTTP 503) before any credential-bearing request
+    is sent.  Instance lifecycle layers must re-raise it untouched instead of
+    wrapping it into an ``InstanceNotReadyError`` (409), otherwise the API can
+    never surface the fail-closed contract and the slot would be poisoned.
+    """
+    return (
+        isinstance(exc, RoutingError)
+        and getattr(exc, "code", "") == EXIT_UNAVAILABLE_CODE
+    )
+
+
 class EngineSwitchingError(RoutingError):
     """A transactional engine hot-switch is in progress; retry later.
 

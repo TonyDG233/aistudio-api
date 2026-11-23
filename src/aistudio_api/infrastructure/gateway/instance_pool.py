@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from aistudio_api.domain.errors import EngineSwitchingError
+from aistudio_api.domain.errors import EngineSwitchingError, is_exit_unavailable_error
 from aistudio_api.domain.model_access import (
     TierSelector,
     canonical_tier,
@@ -644,6 +644,20 @@ class InstancePool:
                 raise
             except BaseException as exc:
                 await self._close_runtime(slot)
+                if is_exit_unavailable_error(exc):
+                    # Fail-closed exit resolution is a transient infrastructure
+                    # condition (manager unreachable / account not assigned an
+                    # exit yet), not a broken slot.  Keep the slot retryable
+                    # instead of latching INVALID, and let the 503 propagate.
+                    slot.state = SlotState.UNSTARTED
+                    slot.last_error = str(exc)
+                    log.warning(
+                        "[pool] activate blocked by missing exit slot=%s "
+                        "account=%s; slot left UNSTARTED for retry",
+                        slot.slot_id,
+                        account_id,
+                    )
+                    raise
                 slot.state = SlotState.INVALID
                 slot.last_error = str(exc)
                 log.warning(
@@ -692,6 +706,11 @@ class InstancePool:
                     raise
                 except BaseException as exc:
                     last_error = exc
+                    if is_exit_unavailable_error(exc):
+                        # No exit is a deterministic fail-closed decision for
+                        # this account right now: retrying the same creation in
+                        # a tight loop only multiplies manager calls.
+                        raise
                     if attempt + 1 < self._load_attempts and self._retry_delay_s:
                         await asyncio.sleep(self._retry_delay_s)
                     continue

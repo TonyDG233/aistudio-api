@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshInProgressError,
+    skip_log_due,
 )
 from aistudio_api.infrastructure.account.benefit_tier import (
     parse_benefit_tier_envelope,
@@ -453,17 +454,41 @@ class AccountKeepaliveService:
                 at=result.checked_at or checked_at,
             )
         failed = sum(1 for result in results if not result.ok)
+        # Skipped accounts were not probed at all (no exit): they must stay due
+        # so the next keepalive round retries instead of waiting a full 24h.
+        skipped_results = [
+            result for result in results if getattr(result, "skipped", False)
+        ]
+        skipped_ids = [str(result.account_id) for result in skipped_results]
+        # Reuse the refresher's (account, reason) 60s throttle: a skip that the
+        # refresher already warned about must not produce a second line here.
+        unlogged = [
+            str(result.account_id)
+            for result in skipped_results
+            if skip_log_due(
+                str(result.account_id),
+                str(getattr(result, "skip_reason", "") or "no_exit"),
+            )
+        ]
+        if unlogged:
+            log.warning(
+                "[Keepalive] metadata refresh skipped %d account(s) without exit: %s",
+                len(unlogged),
+                unlogged,
+            )
         log.info(
-            "[Keepalive] metadata refresh trigger=%s checked=%d failed=%d",
+            "[Keepalive] metadata refresh trigger=%s checked=%d failed=%d skipped=%d",
             trigger,
             len(results),
             failed,
+            len(skipped_ids),
         )
         return {
             "ok": failed == 0,
             "reason": "checked",
             "count": len(results),
             "failed": failed,
+            "skipped": len(skipped_ids),
             "accounts": [result.account_id for result in results],
         }
 

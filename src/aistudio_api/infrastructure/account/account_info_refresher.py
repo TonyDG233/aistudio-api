@@ -34,6 +34,12 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     calculate_sapisid_hash,
     filter_minimal_cookies,
 )
+from aistudio_api.infrastructure.exit_pool import get_exit_resolver
+from aistudio_api.infrastructure.exit_pool.resolver import (
+    ExitAssignmentResolver,
+    ExitDecision,
+    resolve_credential_exit,
+)
 from aistudio_api.infrastructure.gateway.public_web_constants import (
     AI_STUDIO_HOME_URL,
     AI_STUDIO_ORIGIN,
@@ -64,6 +70,16 @@ ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DEFAULT_REFRESH_CONCURRENCY = 3
 REQUEST_TIMEOUT_SECONDS = 30.0
 
+# External exit mode probes accounts one at a time with a tiny gap so a batch
+# never bursts through the same exit (each account still resolves its own exit).
+EXTERNAL_BATCH_PACING_SECONDS = 0.3
+
+# Injected transport factory: builds the HTTP transport for one resolved proxy
+# (``None`` means direct).  Tests use it to assert which proxy every bare
+# credential request would use.
+TransportFactory = Callable[[str | None], "HttpTransport"]
+SleepFunc = Callable[[float], Awaitable[None]]
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _STRICT_EMAIL_RE = re.compile(
     r'"oPEP7c":"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"'
@@ -77,6 +93,32 @@ _NOISE_EMAIL_DOMAIN_RE = re.compile(
 
 class RefreshInProgressError(RuntimeError):
     """已有一次账号信息刷新正在进行（用于端点返回 409 互斥）。"""
+
+
+# Fail-closed skip logging is throttled per (account, reason) so a sustained
+# manager outage does not emit two warnings per account per refresh round.
+SKIP_LOG_INTERVAL_SECONDS = 60.0
+_skip_log_at: dict[tuple[str, str], float] = {}
+
+
+def reset_skip_log_throttle() -> None:
+    """Clear the per-account skip-log throttle (tests/teardown)."""
+    _skip_log_at.clear()
+
+
+def skip_log_due(account_id: str, reason: str, *, now: float | None = None) -> bool:
+    """True when this (account, reason) skip may be logged now.
+
+    Records the attempt so the caller can log exactly once per window; keepalive
+    reuses the same throttle so a single skip never produces two warnings.
+    """
+    key = (account_id or "<none>", reason or "no_exit")
+    current = time.monotonic() if now is None else now
+    last = _skip_log_at.get(key, 0.0)
+    if current - last < SKIP_LOG_INTERVAL_SECONDS:
+        return False
+    _skip_log_at[key] = current
+    return True
 
 
 @dataclass
@@ -112,6 +154,8 @@ class RefreshResult:
     email: str | None = None
     error: str | None = None
     checked_at: str | None = None
+    skipped: bool = False
+    skip_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -122,6 +166,8 @@ class RefreshResult:
             "email": self.email,
             "error": self.error,
             "checked_at": self.checked_at,
+            "skipped": self.skipped,
+            "skip_reason": self.skip_reason,
         }
 
 
@@ -367,11 +413,23 @@ def resolve_app_id() -> str:
 
 
 class HttpxTransport:
-    """默认 HTTP 传输实现（httpx，尊重 ``settings.proxy_url``）。"""
+    """默认 HTTP 传输实现（httpx）。
 
-    def __init__(self, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
+    ``use_global_proxy=True`` keeps the legacy behaviour (read
+    ``settings.proxy_url``).  The per-account exit path always passes an explicit
+    ``proxy`` with ``use_global_proxy=False`` so it can never silently fall back
+    to the global proxy.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+        proxy: str | None = None,
+        use_global_proxy: bool = True,
+    ) -> None:
         self._timeout = timeout
-        self._proxy = settings.proxy_url
+        self._proxy = settings.proxy_url if use_global_proxy else proxy
 
     async def request(
         self,
@@ -400,13 +458,27 @@ class AccountInfoRefresher:
         account_store: AccountStore,
         *,
         transport: HttpTransport | None = None,
+        transport_factory: TransportFactory | None = None,
+        exit_resolver: ExitAssignmentResolver | None = None,
+        pacing_seconds: float = EXTERNAL_BATCH_PACING_SECONDS,
+        sleep: SleepFunc | None = None,
         web_api_key: str | None = None,
         concurrency: int | None = None,
         app_id: str | None = None,
         slot_provider: SlotProvider | None = None,
     ) -> None:
         self._store = account_store
-        self._transport: HttpTransport = transport or HttpxTransport()
+        # ``transport`` is kept for callers/tests that inspect it, but the actual
+        # request path always goes through ``_transport_factory``.  No transport
+        # is built eagerly, so an external run never constructs one bound to the
+        # global proxy.
+        self._transport = transport
+        self._transport_factory = self._build_transport_factory(
+            transport, transport_factory
+        )
+        self._exit_resolver = exit_resolver
+        self._pacing_seconds = max(0.0, float(pacing_seconds))
+        self._sleep: SleepFunc = sleep or asyncio.sleep
         override = (web_api_key or "").strip()
         self._web_api_key = (
             override
@@ -425,6 +497,65 @@ class AccountInfoRefresher:
         # 仅内存的逐账号 tier 探测失败退避状态：键为账号 id，不动持久化 schema。
         self._tier_failure_counts: dict[str, int] = {}
         self._tier_retry_at: dict[str, float] = {}
+
+    @staticmethod
+    def _build_transport_factory(
+        transport: HttpTransport | None,
+        transport_factory: TransportFactory | None,
+    ) -> TransportFactory:
+        if transport_factory is not None:
+            return transport_factory
+        if transport is not None:
+            injected = transport
+
+            def _fixed(_proxy: str | None) -> HttpTransport:
+                return injected
+
+            return _fixed
+
+        def _per_account(proxy: str | None) -> HttpTransport:
+            return HttpxTransport(proxy=proxy, use_global_proxy=False)
+
+        return _per_account
+
+    def _make_transport(self, proxy: str | None) -> HttpTransport:
+        return self._transport_factory(proxy)
+
+    def _active_exit_resolver(self) -> ExitAssignmentResolver | None:
+        """Injected resolver (tests) or the process-wide env-gated one."""
+        if self._exit_resolver is not None:
+            return self._exit_resolver
+        return get_exit_resolver()
+
+    async def _credential_exit(self, account_id: str) -> ExitDecision:
+        """Resolve the exit for one account's bare credential requests."""
+        return await resolve_credential_exit(
+            account_id, kind="chat", resolver=self._active_exit_resolver()
+        )
+
+    def _skipped_result(
+        self,
+        account: AccountMeta,
+        decision: ExitDecision,
+        checked_at: str | None,
+    ) -> RefreshResult:
+        reason = decision.reason or "no_exit"
+        if skip_log_due(account.id, reason):
+            logger.warning(
+                "[Refresh] %s 跳过 tier/邮箱探测（无可用出口，fail-closed）"
+                "reason=%s has_cookies=true email=%s",
+                account.id,
+                reason,
+                mask_email(account.email) or "-",
+            )
+        return RefreshResult(
+            account_id=account.id,
+            ok=False,
+            error=f"skipped_no_exit: {reason}",
+            checked_at=checked_at,
+            skipped=True,
+            skip_reason=reason,
+        )
 
     def set_slot_provider(self, provider: SlotProvider | None) -> None:
         """Attach a pool-slot provider so tier probes reuse live engine sessions."""
@@ -522,19 +653,52 @@ class AccountInfoRefresher:
         if skip_fresh_free_tier and is_verified_free_tier_fresh(account):
             email: str | None = None
             email_error: str | None = None
-            if refresh_email or not account.email:
-                try:
-                    email = await self._fetch_account_email(
-                        cookies, account.email, auth_user=account.auth_user
-                    )
-                except Exception as e:
-                    email_error = str(e)
+            email_skip_reason: str | None = None
+            wants_email = refresh_email or not account.email
+            if wants_email:
+                decision = await self._credential_exit(account.id)
+                if decision.allowed:
+                    try:
+                        email = await self._fetch_account_email(
+                            cookies,
+                            account.email,
+                            auth_user=account.auth_user,
+                            proxy=decision.proxy,
+                            allow_bare=True,
+                        )
+                    except Exception as e:
+                        email_error = str(e)
+                else:
+                    # P2-2: a skipped email probe is NOT a completed refresh.
+                    # Mark it skipped/not-ok so keepalive retries in 300s instead
+                    # of pushing the next metadata refresh out to 24h.
+                    email_skip_reason = decision.reason or "no_exit"
+                    email_error = f"skipped_no_exit: {email_skip_reason}"
             if email:
                 self._store.update_account_refresh(account.id, email=email)
             logger.info(
                 "[Refresh] %s verified Free within 3 days; tier probe skipped",
                 account.id,
             )
+            if email_skip_reason is not None:
+                if skip_log_due(account.id, email_skip_reason):
+                    logger.warning(
+                        "[Refresh] %s free-fresh 邮箱探测跳过（无可用出口，"
+                        "fail-closed）reason=%s",
+                        account.id,
+                        email_skip_reason,
+                    )
+                return RefreshResult(
+                    account_id=account.id,
+                    ok=False,
+                    tier=str(account.tier or "Free"),
+                    expired=False,
+                    email=account.email,
+                    error=email_error,
+                    checked_at=checked_at,
+                    skipped=True,
+                    skip_reason=email_skip_reason,
+                )
             return RefreshResult(
                 account_id=account.id,
                 ok=True,
@@ -545,9 +709,21 @@ class AccountInfoRefresher:
                 checked_at=checked_at,
             )
 
+        session = self._resolve_account_session(account.id)
+        decision = await self._credential_exit(account.id)
+        if session is None and not decision.allowed:
+            return self._skipped_result(account, decision, checked_at)
+
         response = await self._post_tier_request(
-            cookies, auth_user=account.auth_user, account_id=account.id
+            cookies,
+            auth_user=account.auth_user,
+            account_id=account.id,
+            session=session,
+            proxy=decision.proxy,
+            allow_bare=decision.allowed,
         )
+        if response is None:
+            return self._skipped_result(account, decision, checked_at)
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
         self._record_tier_probe(
@@ -582,7 +758,11 @@ class AccountInfoRefresher:
             if wants_email:
                 try:
                     email = await self._fetch_account_email(
-                        cookies, account.email, auth_user=account.auth_user
+                        cookies,
+                        account.email,
+                        auth_user=account.auth_user,
+                        proxy=decision.proxy,
+                        allow_bare=decision.allowed,
                     )
                 except Exception as e:
                     email_error = str(e)
@@ -676,19 +856,38 @@ class AccountInfoRefresher:
             return []
 
         self._active_run = True
-        semaphore = asyncio.Semaphore(self._concurrency)
-
-        async def _run(account: AccountMeta) -> RefreshResult:
-            async with semaphore:
-                return await self.refresh_account(
-                    account,
-                    refresh_email=refresh_email,
-                    skip_fresh_free_tier=skip_fresh_free_tier,
-                    respect_backoff=respect_backoff,
-                )
-
         try:
-            results = await asyncio.gather(*(_run(account) for account in accounts))
+            if self._active_exit_resolver() is not None:
+                # External exit mode: probe accounts one at a time with a small
+                # gap so a batch never bursts through the same exit.  Each call
+                # still resolves the account's own exit.
+                results: list[RefreshResult] = []
+                for index, account in enumerate(accounts):
+                    if index > 0 and self._pacing_seconds > 0:
+                        await self._sleep(self._pacing_seconds)
+                    results.append(
+                        await self.refresh_account(
+                            account,
+                            refresh_email=refresh_email,
+                            skip_fresh_free_tier=skip_fresh_free_tier,
+                            respect_backoff=respect_backoff,
+                        )
+                    )
+            else:
+                semaphore = asyncio.Semaphore(self._concurrency)
+
+                async def _run(account: AccountMeta) -> RefreshResult:
+                    async with semaphore:
+                        return await self.refresh_account(
+                            account,
+                            refresh_email=refresh_email,
+                            skip_fresh_free_tier=skip_fresh_free_tier,
+                            respect_backoff=respect_backoff,
+                        )
+
+                results = list(
+                    await asyncio.gather(*(_run(account) for account in accounts))
+                )
         finally:
             self._active_run = False
         duplicated = self._store.refresh_duplicate_flags()
@@ -697,7 +896,7 @@ class AccountInfoRefresher:
                 "[Refresh] 检测到 %d 个重复账号（同一邮箱多条），已在账号列表标记",
                 duplicated,
             )
-        return list(results)
+        return results
 
     async def refresh_tier(self, account: AccountMeta) -> dict[str, object]:
         """仅探测档位与凭据有效性并落库，返回 ``{tier, expired, error, checked_at}``。"""
@@ -711,9 +910,39 @@ class AccountInfoRefresher:
             }
 
         checked_at = _now_iso()
+        session = self._resolve_account_session(account.id)
+        decision = await self._credential_exit(account.id)
+        if session is None and not decision.allowed:
+            skip_reason = decision.reason or "no_exit"
+            if skip_log_due(account.id, skip_reason):
+                logger.warning(
+                    "[Refresh] %s tier probe skipped (no exit, fail-closed) reason=%s",
+                    account.id,
+                    skip_reason,
+                )
+            return {
+                "tier": None,
+                "expired": None,
+                "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
+                "checked_at": None,
+                "skipped": True,
+            }
         response = await self._post_tier_request(
-            cookies, auth_user=account.auth_user, account_id=account.id
+            cookies,
+            auth_user=account.auth_user,
+            account_id=account.id,
+            session=session,
+            proxy=decision.proxy,
+            allow_bare=decision.allowed,
         )
+        if response is None:
+            return {
+                "tier": None,
+                "expired": None,
+                "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
+                "checked_at": None,
+                "skipped": True,
+            }
         envelope = parse_benefit_tier_envelope(response.body)
         message = envelope.message
         self._record_tier_probe(
@@ -772,9 +1001,23 @@ class AccountInfoRefresher:
         cookies = self._load_cookies(account)
         if cookies is None:
             return None
+        decision = await self._credential_exit(account.id)
+        if not decision.allowed:
+            reason = decision.reason or "no_exit"
+            if skip_log_due(account.id, reason):
+                logger.warning(
+                    "[Refresh] %s 邮箱探测跳过（无可用出口，fail-closed）reason=%s",
+                    account.id,
+                    reason,
+                )
+            return None
         try:
             email = await self._fetch_account_email(
-                cookies, account.email, auth_user=account.auth_user
+                cookies,
+                account.email,
+                auth_user=account.auth_user,
+                proxy=decision.proxy,
+                allow_bare=True,
             )
         except Exception as e:
             logger.warning("账号 %s 邮箱回填失败: %s", account.id, e)
@@ -856,9 +1099,17 @@ class AccountInfoRefresher:
         *,
         auth_user: str = "0",
         account_id: str = "",
-    ) -> TransportResponse:
-        """Route the tier RPC by engine: signer → page XHR → raw httpx fallback."""
-        session = self._resolve_account_session(account_id)
+        session: object | None = None,
+        proxy: str | None = None,
+        allow_bare: bool = True,
+    ) -> TransportResponse | None:
+        """Route the tier RPC by engine: signer → page XHR → raw httpx fallback.
+
+        ``allow_bare=False`` (external mode with no account exit) forbids the
+        raw httpx fallback and returns ``None`` so the caller reports a skip.
+        """
+        if session is None:
+            session = self._resolve_account_session(account_id)
         if session is not None:
             response = await probe_tier_over_session(
                 session,
@@ -868,24 +1119,29 @@ class AccountInfoRefresher:
             )
             if response is not None:
                 return response
-        elif account_id and self._slot_provider is not None:
+        elif account_id and self._slot_provider is not None and allow_bare:
             logger.warning(
                 "[Refresh] %s tier probe has no pooled engine session; "
                 "falling back to raw httpx which Google may reject as "
                 "region-restricted",
                 account_id,
             )
-        return await self._post_tier_via_http(cookies, auth_user=auth_user)
+        if not allow_bare:
+            return None
+        return await self._post_tier_via_http(cookies, auth_user=auth_user, proxy=proxy)
 
     async def _post_tier_via_http(
-        self, cookies: _CookieJar, *, auth_user: str = "0"
+        self, cookies: _CookieJar, *, auth_user: str = "0", proxy: str | None = None
     ) -> TransportResponse:
+        transport = self._make_transport(proxy)
         headers = self._rpc_headers(cookies, auth_user=auth_user)
-        response = await self._transport.request(
+        response = await transport.request(
             "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
         )
         if response.status == 403 and self._is_key_problem(response.body):
-            rotated = await self._recover_web_api_key(cookies, auth_user=auth_user)
+            rotated = await self._recover_web_api_key(
+                cookies, auth_user=auth_user, proxy=proxy
+            )
             if rotated and rotated != self._web_api_key:
                 self._web_api_key = rotated
                 headers["x-goog-api-key"] = rotated
@@ -893,7 +1149,7 @@ class AccountInfoRefresher:
                     "[Refresh] Web API key was rejected; retrying with a "
                     "re-extracted key."
                 )
-                response = await self._transport.request(
+                response = await transport.request(
                     "POST", BENEFIT_TIER_URL, headers=headers, content="[]"
                 )
         return response
@@ -904,11 +1160,17 @@ class AccountInfoRefresher:
         return "API_KEY_SERVICE_BLOCKED" in text or "unregistered callers" in text
 
     async def _recover_web_api_key(
-        self, cookies: _CookieJar, *, auth_user: str = "0"
+        self,
+        cookies: _CookieJar,
+        *,
+        auth_user: str = "0",
+        proxy: str | None = None,
     ) -> str | None:
         """从 apps 页 HTML 回收 web API key（只返回，不在此处改写当前 key）。"""
         try:
-            html = await self._fetch_app_html(cookies, auth_user=auth_user)
+            html = await self._fetch_app_html(
+                cookies, auth_user=auth_user, proxy=proxy, allow_bare=True
+            )
         except Exception as e:
             logger.warning("[Refresh] Unable to re-extract the web API key: %s", e)
             return None
@@ -925,14 +1187,25 @@ class AccountInfoRefresher:
         )
 
     async def _fetch_app_html(
-        self, cookies: _CookieJar, *, auth_user: str = "0"
+        self,
+        cookies: _CookieJar,
+        *,
+        auth_user: str = "0",
+        proxy: str | None = None,
+        allow_bare: bool = True,
     ) -> str:
         """裸 httpx 路径抓取 AI Studio apps 页 HTML。
 
         UA / accept-language 已与全站一致的 Firefox 152 身份对齐（``USER_AGENT``
         / ``ACCEPT_LANGUAGE``），但 TLS 指纹仍是 Python httpx，风控残留已知；
         迁移依赖 signer GET 页面通道（留档，不在本批范围）。
+
+        ``allow_bare=False`` forbids the request entirely (external mode with no
+        account exit) so this credential path never falls back to the global
+        proxy.
         """
+        if not allow_bare:
+            raise RuntimeError("skipped_no_exit")
         headers = {
             "accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -946,8 +1219,9 @@ class AccountInfoRefresher:
         }
         if cookies.header:
             headers["cookie"] = cookies.header
+        transport = self._make_transport(proxy)
         url = aistudio_app_url(self._app_id, auth_user=auth_user)
-        response = await self._transport.request("GET", url, headers=headers)
+        response = await transport.request("GET", url, headers=headers)
         if response.status != 200:
             raise RuntimeError(f"page fetch HTTP {response.status}")
         return response.body
@@ -958,8 +1232,14 @@ class AccountInfoRefresher:
         existing_name: str | None,
         *,
         auth_user: str = "0",
+        proxy: str | None = None,
+        allow_bare: bool = True,
     ) -> str | None:
-        html = await self._fetch_app_html(cookies, auth_user=auth_user)
+        if not allow_bare:
+            raise RuntimeError("skipped_no_exit")
+        html = await self._fetch_app_html(
+            cookies, auth_user=auth_user, proxy=proxy, allow_bare=True
+        )
         # WIZ_global_data 的 "oPEP7c" 字段携带已登录账号邮箱。
         config_match = _STRICT_EMAIL_RE.search(html)
         if config_match:
@@ -977,6 +1257,7 @@ class AccountInfoRefresher:
 
 
 __all__ = [
+    "EXTERNAL_BATCH_PACING_SECONDS",
     "TIER_PROBE_BACKOFF_CAP_SECONDS",
     "TIER_PROBE_FAILURE_BASE_SECONDS",
     "TIER_PROBE_FRESHNESS_SECONDS",
@@ -986,7 +1267,9 @@ __all__ = [
     "HttpxTransport",
     "RefreshInProgressError",
     "RefreshResult",
+    "SleepFunc",
     "SlotProvider",
+    "TransportFactory",
     "TransportResponse",
     "find_account_session",
     "probe_tier_over_session",

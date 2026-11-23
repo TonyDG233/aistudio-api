@@ -8,7 +8,6 @@ for both engines.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import os
 from dataclasses import dataclass
@@ -16,10 +15,15 @@ from pathlib import Path
 from typing import Any
 
 from aistudio_api.config import settings
+from aistudio_api.domain.errors import RoutingError
 from aistudio_api.infrastructure.browser.browser_engine import (
     find_chromium_executable,
 )
-from aistudio_api.infrastructure.exit_pool import ExitResolver, get_exit_resolver
+from aistudio_api.infrastructure.exit_pool import (
+    ExitResolver,
+    get_exit_resolver,
+    resolve_credential_exit,
+)
 from aistudio_api.infrastructure.gateway.browser_engine_session import (
     BrowserEngineSession,
 )
@@ -207,7 +211,11 @@ class BrowserlessEngineRuntime:
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             max_workers=int(self._signer_settings.get("max_workers", 8) or 8),
             idle_ttl_s=float(self._signer_settings.get("idle_ttl_s", 3600) or 3600),
-            proxy=settings.proxy_url,
+            # External exit mode must never hand the daemon the global socks
+            # proxy: requests without a per-account exit would silently fall
+            # back to WARP.  Per-request exits are still sent by the session.
+            proxy=(None if self._exit_resolver is not None else settings.proxy_url),
+            external_exits=self._exit_resolver is not None,
         )
         return self._daemon
 
@@ -270,9 +278,12 @@ class BrowserlessEngineRuntime:
     ) -> SessionBuild:
         del slot_id
         client = self._ensure_client()
-        proxy = settings.proxy_url
-        if self._exit_resolver is not None:
-            proxy = await self._resolve_exit_proxy(account_id, surface) or proxy
+        external = self._exit_resolver is not None
+        proxy = (
+            await self._resolve_exit_proxy(account_id, surface)
+            if external
+            else settings.proxy_url
+        )
         session = BrowserlessSession(
             signer=client,
             auth_file=auth_file,
@@ -282,6 +293,7 @@ class BrowserlessEngineRuntime:
             realm_id=realm_id,
             transport_mode=str(self._transport_settings.get("mode") or "signer_rpc"),
             proxy=proxy,
+            external_exits=external,
             locale=str(self._signer_settings.get("locale") or settings.locale),
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             http2=bool(self._transport_settings.get("http2", True)),
@@ -293,26 +305,28 @@ class BrowserlessEngineRuntime:
         return SessionBuild(session=session)
 
     async def _resolve_exit_proxy(self, account_id: str, surface: str) -> str | None:
-        """Resolve this account's exit; failures fall back to the global proxy."""
-        resolver = self._exit_resolver
-        if resolver is None or not account_id:
-            return None
+        """Resolve one account's exit, or fail closed (never the global proxy).
+
+        Returns the bound socks URL, or ``None`` only for an explicit emergency
+        direct fallback.  Raises :class:`RoutingError` (HTTP 503) when the
+        manager has no usable exit and ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is off,
+        so a credential-bearing generation request never leaks onto WARP.
+        """
         kind = surface if surface in ("chat", "build") else "chat"
-        try:
-            assigned = await resolver.resolve(account_id, kind=kind)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning(
-                "[engine] 外部出口解析异常，回退全局代理 surface=%s error=%s",
-                kind,
-                type(exc).__name__,
+        decision = await resolve_credential_exit(
+            account_id or "", kind=kind, resolver=self._exit_resolver
+        )
+        if not decision.allowed:
+            raise RoutingError(
+                "账号出口不可用，已拒绝本次生成请求（fail-closed）；"
+                "请检查出口池管理器或稍后重试。",
+                code="exit_unavailable",
+                surface=kind,
             )
-            return None
-        if assigned and assigned != settings.proxy_url:
+        if decision.action == "proxy" and decision.proxy:
             # Never log the socks URL itself: it may carry credentials.
             log.info("[engine] 使用外部出口 surface=%s", kind)
-        return assigned
+        return decision.proxy
 
     async def create_canary_session(
         self,
@@ -338,6 +352,7 @@ class BrowserlessEngineRuntime:
             realm_id=f"exit-canary-{account_id}",
             transport_mode=str(self._transport_settings.get("mode") or "signer_rpc"),
             proxy=proxy,
+            external_exits=self._exit_resolver is not None,
             locale=str(self._signer_settings.get("locale") or settings.locale),
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             http2=bool(self._transport_settings.get("http2", True)),
@@ -393,11 +408,13 @@ def build_engine_runtime(
     if mode == "browserless":
         return BrowserlessEngineRuntime(engine_settings, account_store=account_store)
     if get_exit_resolver() is not None:
-        # Per-account exits require per-session proxies; Chrome's proxy is a
-        # process-level flag, so the special mode stays browserless-only.
-        log.warning(
-            "[engine] AISTUDIO_EXIT_MODE=external 仅支持 browserless 引擎；"
-            "browser 引擎继续使用全局代理"
+        # P2-4: per-account exits require per-session proxies; Chrome's proxy is
+        # a process-level flag.  Continuing with the browser engine would route
+        # every browser/credential request through the global (WARP) proxy, so
+        # external mode fails fast instead of silently violating the invariant.
+        raise RuntimeError(
+            "AISTUDIO_EXIT_MODE=external 仅支持 browserless 引擎；"
+            "browser 引擎使用进程级全局代理，已拒绝启动（fail-fast）"
         )
     return BrowserEngineRuntime(client)
 

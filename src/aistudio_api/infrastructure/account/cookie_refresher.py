@@ -16,6 +16,12 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 log = get_logger("cookie_refresher")
 
+# Sentinel: "no explicit proxy".  Off mode keeps the legacy global proxy; in
+# external exit mode a sentinel means "not resolved", so the refresh fails
+# closed instead of falling back to the global socks proxy.
+UNSET_PROXY: object = object()
+_UNSET_PROXY = UNSET_PROXY
+
 AUTH_COOKIE_NAMES = {
     "SID",
     "SSID",
@@ -41,18 +47,40 @@ def _should_skip_browser_injection(name: str) -> bool:
     return name in DISCARDABLE_IMPORT_COOKIE_NAMES or name.startswith(("_ga_", "_gcl_"))
 
 
-def _refresh_session_cookies(cookies: dict[str, str]) -> dict[str, str]:
-    """Use curl_cffi to hit Google login flow and refresh session cookies."""
+def _refresh_session_cookies(
+    cookies: dict[str, str], *, proxy: object = _UNSET_PROXY
+) -> dict[str, str]:
+    """Use curl_cffi to hit Google login flow and refresh session cookies.
+
+    ``proxy`` may be an already-resolved per-account exit (``str``), an explicit
+    ``None`` for a resolved direct connection, or the sentinel for "not
+    resolved": in external exit mode the sentinel fails closed and keeps the
+    original cookies instead of ever using the global proxy.
+    """
     try:
         from curl_cffi import requests
     except ImportError:
         log.warning("未安装 curl_cffi，保留原始 Cookie")
         return dict(cookies)
-    from aistudio_api.config import settings
+
+    effective_proxy: str | None
+    if proxy is _UNSET_PROXY:
+        from aistudio_api.config import settings
+        from aistudio_api.infrastructure.exit_pool import get_exit_resolver
+
+        if get_exit_resolver() is not None:
+            log.warning(
+                "[cookie-refresher] external 出口模式下未解析到账号出口，"
+                "跳过裸 Cookie 刷新（fail-closed）"
+            )
+            return dict(cookies)
+        effective_proxy = settings.proxy_url
+    else:
+        effective_proxy = proxy if isinstance(proxy, str) else None
 
     session = (
-        requests.Session(proxy=settings.proxy_url)
-        if settings.proxy_url
+        requests.Session(proxy=effective_proxy)
+        if effective_proxy
         else requests.Session()
     )
     for name, value in cookies.items():
@@ -75,13 +103,15 @@ def _refresh_session_cookies(cookies: dict[str, str]) -> dict[str, str]:
     return all_cookies
 
 
-def load_cookies_from_string(cookie_string: str) -> list[dict[str, object]]:
+def load_cookies_from_string(
+    cookie_string: str, *, proxy: object = _UNSET_PROXY
+) -> list[dict[str, object]]:
     """Load cookies from a raw cookie string.
 
     Playwright storage-state input is injected as-is so cross-domain cookies
     (for example ``accounts.google.com`` and ``.google.com`` with the same name)
     survive the import. Plain name/value input keeps the legacy flatten+refresh
-    path.
+    path.  ``proxy`` is an explicit per-account exit (``None`` = direct).
     """
     state = parse_storage_state(cookie_string)
     if state is not None:
@@ -114,7 +144,11 @@ def load_cookies_from_string(cookie_string: str) -> list[dict[str, object]]:
                 return cookies
 
     parsed = parse_raw_cookies(cookie_string)
-    refreshed = _refresh_session_cookies(parsed)
+    refreshed = (
+        _refresh_session_cookies(parsed)
+        if proxy is _UNSET_PROXY
+        else _refresh_session_cookies(parsed, proxy=proxy)
+    )
     merged = dict(parsed)
     merged.update(refreshed)
     default_expires = int(time.time()) + 86400 * 180  # 180 天后过期

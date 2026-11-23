@@ -226,6 +226,7 @@ class BrowserlessSession:
         realm_id: str = "",
         transport_mode: str = "signer_rpc",
         proxy: str | None = None,
+        external_exits: bool = False,
         locale: str = "en-US",
         timezone: str = "America/Los_Angeles",
         http2: bool = True,
@@ -244,6 +245,10 @@ class BrowserlessSession:
             else "signer_rpc"
         )
         self._proxy = proxy
+        # External exit mode: ``proxy`` is already resolved per account (an exit
+        # URL or an explicit ``None`` for direct).  It must never fall back to
+        # ``settings.proxy_url``; the off mode keeps the legacy global default.
+        self._external_exits = external_exits
         self._locale = locale
         self._timezone = timezone
         self._http2 = bool(http2)
@@ -884,7 +889,11 @@ class BrowserlessSession:
                     read=self._read_timeout_s,
                     connect=15.0,
                 ),
-                "proxy": self._proxy or settings.proxy_url,
+                "proxy": (
+                    self._proxy
+                    if self._external_exits
+                    else (self._proxy or settings.proxy_url)
+                ),
                 "trust_env": False,
             }
             if self._http2:
