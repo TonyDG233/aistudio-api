@@ -38,6 +38,7 @@ from aistudio_api.application.account_rotator import (
 )
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.application.verify_account_service import (
+    DEFAULT_TTL_SECONDS,
     VerifyAccountNotFound,
     VerifySession,
     VerifySessionConflict,
@@ -264,9 +265,7 @@ class UiDebugIsolation:
                 "AISTUDIO_ROTATOR_STATE_FILE": str(
                     self.data_dir / "rotator_state.json"
                 ),
-                "AISTUDIO_MODEL_CACHE_FILE": str(
-                    self.data_dir / "models_cache.json"
-                ),
+                "AISTUDIO_MODEL_CACHE_FILE": str(self.data_dir / "models_cache.json"),
                 "AISTUDIO_LOG_DIR": str(self.logs_dir),
                 "AISTUDIO_DUMP_DIR": str(self.dumps_dir),
                 "AISTUDIO_DUMP_RAW_RESPONSE_DIR": str(self.dumps_dir / "raw"),
@@ -1168,20 +1167,31 @@ class SandboxKeepalive:
         }
 
 
+_SANDBOX_QR_URL = "https://recaptcha.net/qr/TESTSHORT"
+_SANDBOX_SHORT_CODE = "TESTSHORT"
+
+
 class SandboxVerifyService:
     """Offline verify-account session fake for UI debug integration.
 
-    It never launches a browser and never reads the chrome/proxy env vars.  The
-    frontend can drive ``pending -> passed`` deterministically with
-    ``GET .../verify/status?simulate=passed``.
+    It never launches a browser and never reads the chrome/proxy env vars.  A
+    fresh session starts in ``starting`` (no QR) and flips to ``pending`` with a
+    fixed fake QR about ``starting_seconds`` later so the frontend's
+    "wait for QR" path is exercised deterministically.  ``GET
+    .../verify/status?simulate=passed`` still drives ``pending -> passed``.
     """
+
+    #: Delay before a freshly started session exposes its fake QR.
+    starting_seconds: float = 2.0
 
     def __init__(self, sandbox: UISandbox) -> None:
         self._sandbox = sandbox
         self._session: VerifySession | None = None
+        self._pending_at: float | None = None
 
     def reset(self) -> None:
         self._session = None
+        self._pending_at = None
 
     def _cleanup_due(self) -> None:
         session = self._session
@@ -1191,6 +1201,7 @@ class SandboxVerifyService:
             and time.time() >= session.cleanup_at
         ):
             self._session = None
+            self._pending_at = None
 
     async def start(self, account_id: str) -> dict[str, object]:
         self._cleanup_due()
@@ -1214,19 +1225,18 @@ class SandboxVerifyService:
         if account is None:
             raise VerifyAccountNotFound(account_id)
         now = time.time()
-        suffix = secrets.token_hex(4).upper()
-        short_code = f"SANDBOX{suffix}"
         session = VerifySession(
             session_id=f"verify_sandbox_{secrets.token_hex(6)}",
             account_id=account.id,
             auth_user=str(account.auth_user or "0"),
-            state=VerifySessionState.PENDING,
+            state=VerifySessionState.STARTING,
             created_at=now,
-            expires_at=now + 180.0,
-            qr_url=f"https://recaptcha.net/qr/{short_code}",
-            short_code=short_code,
+            expires_at=now + DEFAULT_TTL_SECONDS,
+            qr_url=None,
+            short_code=None,
         )
         self._session = session
+        self._pending_at = now + self.starting_seconds
         return session.to_public()
 
     async def status(
@@ -1235,7 +1245,11 @@ class SandboxVerifyService:
         session_id: str,
         *,
         simulate: str | None = None,
+        force: bool = False,
     ) -> dict[str, object]:
+        # ``force`` is accepted for protocol parity only: the sandbox timeline
+        # is deterministic and must not be accelerated by manual checks.
+        del force
         self._cleanup_due()
         session = self._session
         if (
@@ -1244,10 +1258,15 @@ class SandboxVerifyService:
             or session.account_id != account_id
         ):
             raise VerifySessionNotFound
-        if session.state in (
-            VerifySessionState.STARTING,
-            VerifySessionState.PENDING,
-        ):
+        if session.state is VerifySessionState.STARTING:
+            pending_at = self._pending_at
+            if pending_at is not None and time.time() >= pending_at:
+                session.state = VerifySessionState.PENDING
+                session.qr_url = _SANDBOX_QR_URL
+                session.short_code = _SANDBOX_SHORT_CODE
+            else:
+                return session.to_public()
+        if session.state is VerifySessionState.PENDING:
             if simulate == "passed":
                 self._mark_passed(session)
             elif simulate == "expired" or time.time() >= session.expires_at:
@@ -1603,9 +1622,7 @@ class UISandbox:
             ]
             prompt = _distribute(item.prompt_tokens, weights, phase=phase)
             completion = _distribute(item.completion_tokens, weights, phase=phase)
-            cached = _allocate(
-                item.cached_tokens, prompt, weights, phase=phase + 2.1
-            )
+            cached = _allocate(item.cached_tokens, prompt, weights, phase=phase + 2.1)
             reasoning = _allocate(
                 item.reasoning_tokens, completion, weights, phase=phase + 3.3
             )
@@ -1627,9 +1644,7 @@ class UISandbox:
                 day_item.client = _client_from_attempts(day_item)
                 self.daily_stats[key][model] = day_item
 
-    def _seed_account_daily(
-        self, stats: dict[str, ModelStatsItem]
-    ) -> None:
+    def _seed_account_daily(self, stats: dict[str, ModelStatsItem]) -> None:
         accounts = [
             account
             for account in self.account_service.list_accounts()
@@ -1668,9 +1683,7 @@ class UISandbox:
                     stats_for_account.total_rate_limited += rate_limited
                     stats_for_account.total_errors += errors
 
-    def _account_daily(
-        self, account_id: str, model: str
-    ) -> AccountModelDailyStats:
+    def _account_daily(self, account_id: str, model: str) -> AccountModelDailyStats:
         stats = self.rotator.get_account_stats(account_id)
         if stats is None:
             return AccountModelDailyStats()
@@ -2415,7 +2428,9 @@ def _allocate(
         max(0.0, weight * (0.84 + 0.16 * math.sin(phase + index * 0.9)))
         for index, weight in enumerate(weights)
     ]
-    active = [index for index in range(count) if caps[index] > 0 and adjusted[index] > 0]
+    active = [
+        index for index in range(count) if caps[index] > 0 and adjusted[index] > 0
+    ]
     if not active:
         adjusted = [1.0] * count
         active = [index for index in range(count) if caps[index] > 0]
@@ -2425,9 +2440,7 @@ def _allocate(
         if weight_sum <= 0:
             adjusted = [1.0] * count
             weight_sum = float(len(active))
-        shares = {
-            index: remaining * adjusted[index] / weight_sum for index in active
-        }
+        shares = {index: remaining * adjusted[index] / weight_sum for index in active}
         overflow = [
             index
             for index in active

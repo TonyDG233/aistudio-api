@@ -1127,3 +1127,196 @@ async def test_reimport_entrypoints_clear_verify_lock_same_process(
     cleared = rotator.get_account_stats("acc_1")
     assert cleared is not None and cleared.verify_required is False
     assert rotator.is_auth_locked("acc_1") is False
+
+
+class _DelayedStartDriver:
+    """``start`` completes after a delay (or raises) to model a slow launch."""
+
+    def __init__(
+        self,
+        *,
+        delay: float = 0.2,
+        error: BaseException | None = None,
+    ) -> None:
+        self.delay = delay
+        self.error = error
+        self.started = asyncio.Event()
+        self.closed = False
+        self.confirm_calls: list[str] = []
+
+    async def start(self) -> QrChallenge:
+        self.started.set()
+        await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return _QR
+
+    async def poll(self) -> PageProbe:
+        return PageProbe(_VERIFY_URL, False)
+
+    async def confirm_verified(self, auth_user: str) -> int | None:
+        self.confirm_calls.append(auth_user)
+        return 1
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_default_ttl_is_300_seconds() -> None:
+    assert verify_module.DEFAULT_TTL_SECONDS == 300.0
+
+
+@pytest.mark.asyncio
+async def test_new_session_expires_after_default_ttl(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1")
+    driver = FakeDriver()
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        await service.start("acc_1")
+        session = service.session
+        assert session is not None
+        assert session.expires_at - session.created_at == pytest.approx(300.0)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_start_waits_for_in_flight_launch(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1")
+    driver = _DelayedStartDriver(delay=0.25)
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    first = asyncio.create_task(service.start("acc_1"))
+    try:
+        await asyncio.wait_for(driver.started.wait(), timeout=2.0)
+        began = time.monotonic()
+        second = await asyncio.wait_for(service.start("acc_1"), timeout=3.0)
+        elapsed = time.monotonic() - began
+        result = await asyncio.wait_for(first, timeout=2.0)
+
+        # The duplicate must observe the real outcome, never a bare ``starting``.
+        assert second["state"] == VerifySessionState.PENDING.value
+        assert second["qr_url"] == _QR.qr_url
+        assert second["session_id"] == result["session_id"]
+        assert elapsed >= 0.1
+    finally:
+        first.cancel()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_start_sees_launch_failure_without_hanging(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1")
+    driver = _DelayedStartDriver(delay=0.2, error=VerifyChallengeTimeout("qr_timeout"))
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    first = asyncio.create_task(service.start("acc_1"))
+    try:
+        await asyncio.wait_for(driver.started.wait(), timeout=2.0)
+        second = await asyncio.wait_for(service.start("acc_1"), timeout=3.0)
+        result = await asyncio.wait_for(first, timeout=2.0)
+
+        assert second["state"] == VerifySessionState.ERROR.value
+        assert second["message"] == "qr_timeout"
+        assert result["state"] == VerifySessionState.ERROR.value
+        await service.wait_for_cleanup()
+        assert driver.closed is True
+    finally:
+        first.cancel()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_start_sees_cancel_without_hanging(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1")
+    driver = _DelayedStartDriver(delay=5.0)
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    first = asyncio.create_task(service.start("acc_1"))
+    try:
+        await asyncio.wait_for(driver.started.wait(), timeout=2.0)
+        duplicate = asyncio.create_task(service.start("acc_1"))
+        # Let the duplicate acquire the lock and attach to the in-flight launch
+        # before the cancel, otherwise it would legitimately create a new session.
+        await asyncio.sleep(0.05)
+        await service.cancel("acc_1")
+
+        result = await asyncio.wait_for(first, timeout=2.0)
+        duplicate_result = await asyncio.wait_for(duplicate, timeout=2.0)
+        assert result["state"] == VerifySessionState.CANCELLED.value
+        assert duplicate_result["state"] == VerifySessionState.CANCELLED.value
+    finally:
+        first.cancel()
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirm_status", "expected_state", "expected_message", "cleared"),
+    [
+        (2, VerifySessionState.PASSED.value, "verified", True),
+        (3, VerifySessionState.PASSED.value, "not_required", True),
+        (1, VerifySessionState.PENDING.value, "still_pending", False),
+        (None, VerifySessionState.PENDING.value, "still_pending", False),
+    ],
+)
+async def test_force_status_queries_upstream_without_page_success(
+    tmp_path: Path,
+    confirm_status: int | None,
+    expected_state: str,
+    expected_message: str,
+    cleared: bool,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = FakeDriver(
+        poll_results=[PageProbe(_VERIFY_URL, False)],
+        confirm_status=confirm_status,
+    )
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        started = await service.start("acc_1")
+        status = await service.status("acc_1", str(started["session_id"]), force=True)
+        assert status["state"] == expected_state
+        assert status["message"] == expected_message
+        assert driver.confirm_calls == ["0"]
+        account = store.get_account("acc_1")
+        assert account is not None
+        assert account.verify_required is (not cleared)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_non_force_status_throttles_upstream_rpc(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = FakeDriver(
+        poll_results=[PageProbe(_VERIFY_URL, False)],
+        confirm_status=1,
+    )
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        started = await service.start("acc_1")
+        session_id = str(started["session_id"])
+
+        first = await service.status("acc_1", session_id)
+        assert first["state"] == VerifySessionState.PENDING.value
+        assert first["message"] == "still_pending"
+        assert len(driver.confirm_calls) == 1
+        session = service.session
+        assert session is not None
+        assert session.last_confirm_at > 0.0
+
+        # Inside the 10s window a plain poll must not hit upstream again.
+        await service.status("acc_1", session_id)
+        assert len(driver.confirm_calls) == 1
+
+        session.last_confirm_at = time.time() - 11.0
+        await service.status("acc_1", session_id)
+        assert len(driver.confirm_calls) == 2
+    finally:
+        await service.close()

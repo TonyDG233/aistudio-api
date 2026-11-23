@@ -7,11 +7,15 @@
   region_blocked | session_invalid``；显式取消进入 ``cancelled``。
 * 浏览器进程/临时目录必须在 ``finally`` 清理；任何路径都不记录 Cookie、
   邮箱或二维码短码。
-* 通过判定先看页面状态（离开 verify-account 或成功文案），再用
-  ``GetUserVerificationStatus`` 做二次确认，只有返回 ``2`` 才置 ``passed``。
+* 通过判定先看页面状态（离开 verify-account 或成功文案），再调用
+  ``GetUserVerificationStatus`` 确认：返回 ``2``（verified）或 ``3``
+  （notRequired）都置 ``passed``；``1``/``None`` 保持 pending。
   确认由 Python 侧直连 RPC（httpx + SAPISIDHASH + Firefox 152 UA），与验证
   浏览器使用同一出口（默认直连，配置 ``AISTUDIO_VERIFY_PROXY`` 时走该代理），
   避免依赖 ``document.cookie``（SAPISID 可能 HttpOnly）与页面 CORS 预检。
+* 手动 ``status(force=True)`` 不依赖页面 success 立即查询上游；自动查询在页面
+  success 或距上次确认满 ``CONFIRM_RPC_INTERVAL_SECONDS`` 时触发，避免页面
+  卡在 verify-account 时永远不查上游。
 * 只允许由 API 轮询驱动状态推进；服务内部除一次性过期/清理定时器外没有
   后台轮询循环。
 """
@@ -81,12 +85,15 @@ CHROME_UA = (
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
 
-DEFAULT_TTL_SECONDS = 180.0
+DEFAULT_TTL_SECONDS = 300.0
 DEFAULT_CODE_TIMEOUT_SECONDS = 20.0
 PASSED_RETENTION_SECONDS = 10.0
 TERMINAL_RETENTION_SECONDS = 10.0
 CLICK_RETRY_INTERVAL_SECONDS = 2.0
 CONFIRM_RPC_TIMEOUT_SECONDS = 8.0
+# Minimum spacing between automatic ``GetUserVerificationStatus`` RPCs driven
+# by plain (non-forced) status polls.  A manual ``force`` check bypasses it.
+CONFIRM_RPC_INTERVAL_SECONDS = 10.0
 # ``CdpVerifyBrowserDriver.close`` is bounded at ~1.5s+1.0s (process) + 2s
 # (Page.close) + 2s (client) = 6.5s worst case; keep the outer guard above it so
 # a healthy teardown is never cancelled half-way.
@@ -296,6 +303,10 @@ class VerifySession:
     message: str | None = None
     finished_at: float | None = None
     cleanup_at: float | None = None
+    # ``time.time()`` of the last confirm RPC actually issued for this session;
+    # 0.0 means "never".  Plain polls only re-query once it is older than
+    # ``CONFIRM_RPC_INTERVAL_SECONDS``.
+    last_confirm_at: float = 0.0
 
     def to_public(self) -> dict[str, object]:
         return {
@@ -317,6 +328,7 @@ class VerifyAccountController(Protocol):
         session_id: str,
         *,
         simulate: str | None = None,
+        force: bool = False,
     ) -> dict[str, object]: ...
 
     async def cancel(self, account_id: str) -> dict[str, object]: ...
@@ -391,6 +403,10 @@ class VerifyAccountService:
         self._lock = asyncio.Lock()
         self._session: VerifySession | None = None
         self._driver: VerifyBrowserSession | None = None
+        # Resolved once by the in-flight ``start`` call that owns the session;
+        # repeated ``start`` calls for the same account await this instead of
+        # returning an empty ``starting`` snapshot.
+        self._start_future: asyncio.Future[dict[str, object]] | None = None
         self._cancel_event: asyncio.Event | None = None
         self._session_lock: asyncio.Lock | None = None
         self._timer_task: asyncio.Task[None] | None = None
@@ -410,160 +426,248 @@ class VerifyAccountService:
         promptly even while ``driver.start()`` is still running, and cancelling
         while ``starting`` aborts the launch so this call returns ``cancelled``.
         """
-        session: VerifySession
-        driver: VerifyBrowserSession
-        cancel_event: asyncio.Event
-        async with self._lock:
-            await self._cleanup_due_locked()
-            existing = self._session
-            if existing is not None:
-                reusable = existing.account_id == account_id and (
-                    existing.state in _ACTIVE_STATES
-                    or existing.state is VerifySessionState.PASSED
-                )
-                if reusable:
-                    log.info(
-                        "验证会话复用: session=%s account=%s state=%s",
-                        existing.session_id,
-                        existing.account_id,
-                        existing.state.value,
-                    )
-                    return existing.to_public()
-                if existing.state in _ACTIVE_STATES:
-                    raise VerifySessionConflict(existing.account_id)
-                await self._dispose_session_locked()
-
-            account = self._store.get_account(account_id)
-            if account is None:
-                raise VerifyAccountNotFound(account_id)
-
-            now = time.time()
-            session = VerifySession(
-                session_id=f"verify_{secrets.token_hex(8)}",
-                account_id=account.id,
-                auth_user=str(getattr(account, "auth_user", "0") or "0"),
-                state=VerifySessionState.STARTING,
-                created_at=now,
-                expires_at=now + self._ttl,
-            )
-            self._session = session
-            self._closed = False
-            cancel_event = asyncio.Event()
-            self._cancel_event = cancel_event
-            self._session_lock = asyncio.Lock()
-
-            auth_file = self._store.get_auth_path_optional(account_id)
-            if auth_file is None or not auth_file.is_file():
-                self._finish_locked(
-                    session, VerifySessionState.ERROR, "credentials_missing"
-                )
-                return session.to_public()
-
-            try:
-                driver = self._driver_factory(session, auth_file)
-            except VerifyBrowserUnavailable:
-                await self._dispose_session_locked()
-                raise
-            except Exception as exc:
-                log.warning(
-                    "验证会话驱动创建失败: session=%s account=%s error=%s",
-                    session.session_id,
-                    session.account_id,
-                    type(exc).__name__,
-                )
-                self._finish_locked(session, VerifySessionState.ERROR, "browser_error")
-                return session.to_public()
-            self._driver = driver
-
-        start_task = asyncio.create_task(driver.start())
-        cancel_wait = asyncio.create_task(cancel_event.wait())
-        start_done = False
-        cancel_fired = False
+        session: VerifySession | None = None
+        driver: VerifyBrowserSession | None = None
+        cancel_event: asyncio.Event | None = None
+        future: asyncio.Future[dict[str, object]] | None = None
+        final: dict[str, object] | None = None
+        wait_future: asyncio.Future[dict[str, object]] | None = None
         try:
-            done, _pending = await asyncio.wait(
-                {start_task, cancel_wait},
-                timeout=self._code_timeout + 50.0,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            start_done = start_task in done
-            cancel_fired = cancel_wait in done or cancel_event.is_set()
-        except asyncio.CancelledError:
-            # The caller (e.g. a disconnected ASGI handler) cancelled this
-            # coroutine: never leave the placeholder stuck in STARTING.
-            start_task.cancel()
-            with contextlib.suppress(BaseException):
-                await start_task
-            with contextlib.suppress(BaseException):
-                await self._abort_start(session, driver)
-            raise
-        finally:
-            cancel_wait.cancel()
-            with contextlib.suppress(BaseException):
-                await cancel_wait
+            async with self._lock:
+                await self._cleanup_due_locked()
+                existing = self._session
+                if existing is not None:
+                    reusable = existing.account_id == account_id and (
+                        existing.state in _ACTIVE_STATES
+                        or existing.state is VerifySessionState.PASSED
+                    )
+                    if reusable:
+                        log.info(
+                            "验证会话复用: session=%s account=%s state=%s",
+                            existing.session_id,
+                            existing.account_id,
+                            existing.state.value,
+                        )
+                        if existing.state is VerifySessionState.STARTING:
+                            pending = self._start_future
+                            if pending is None:
+                                return existing.to_public()
+                            # Wait for the in-flight launch outside the lock so
+                            # this caller never gets a bare ``starting`` snapshot.
+                            wait_future = pending
+                        else:
+                            return existing.to_public()
+                    elif existing.state in _ACTIVE_STATES:
+                        raise VerifySessionConflict(existing.account_id)
+                    else:
+                        await self._dispose_session_locked()
 
-        challenge: QrChallenge | None = None
-        start_error: BaseException | None = None
-        if cancel_fired:
-            start_task.cancel()
-            with contextlib.suppress(BaseException):
-                await start_task
-        elif start_done:
+                if wait_future is None:
+                    account = self._store.get_account(account_id)
+                    if account is None:
+                        raise VerifyAccountNotFound(account_id)
+
+                    now = time.time()
+                    session = VerifySession(
+                        session_id=f"verify_{secrets.token_hex(8)}",
+                        account_id=account.id,
+                        auth_user=str(getattr(account, "auth_user", "0") or "0"),
+                        state=VerifySessionState.STARTING,
+                        created_at=now,
+                        expires_at=now + self._ttl,
+                    )
+                    future = asyncio.get_running_loop().create_future()
+                    self._start_future = future
+                    self._session = session
+                    self._closed = False
+                    cancel_event = asyncio.Event()
+                    self._cancel_event = cancel_event
+                    self._session_lock = asyncio.Lock()
+
+                    auth_file = self._store.get_auth_path_optional(account_id)
+                    if auth_file is None or not auth_file.is_file():
+                        self._finish_locked(
+                            session, VerifySessionState.ERROR, "credentials_missing"
+                        )
+                        final = session.to_public()
+                        return final
+
+                    try:
+                        driver = self._driver_factory(session, auth_file)
+                    except VerifyBrowserUnavailable:
+                        # Let a waiting duplicate observe an explicit error
+                        # snapshot instead of hanging on the future.
+                        session.state = VerifySessionState.ERROR
+                        session.message = "browser_error"
+                        await self._dispose_session_locked()
+                        final = session.to_public()
+                        raise
+                    except Exception as exc:
+                        log.warning(
+                            "验证会话驱动创建失败: session=%s account=%s error=%s",
+                            session.session_id,
+                            session.account_id,
+                            type(exc).__name__,
+                        )
+                        self._finish_locked(
+                            session, VerifySessionState.ERROR, "browser_error"
+                        )
+                        final = session.to_public()
+                        return final
+                    self._driver = driver
+
+            if wait_future is not None:
+                return await self._await_start_future(wait_future)
+
+            assert session is not None
+            assert future is not None
+            assert driver is not None
+            assert cancel_event is not None
+            start_task = asyncio.create_task(driver.start())
+            cancel_wait = asyncio.create_task(cancel_event.wait())
+            start_done = False
+            cancel_fired = False
             try:
-                challenge = start_task.result()
-            except BaseException as exc:
-                start_error = exc
-        else:
-            start_task.cancel()
-            with contextlib.suppress(BaseException):
-                await start_task
-            start_error = VerifyChallengeTimeout("qr_timeout")
-
-        async with self._lock:
-            if (
-                self._session is not session
-                or session.state is not VerifySessionState.STARTING
-            ):
-                # Cancelled (or superseded) while the browser was launching.
-                if self._driver is driver:
-                    self._driver = None
-                    self._schedule_driver_close(driver, session)
-                return session.to_public()
-            if cancel_event.is_set():
-                self._finish_locked(session, VerifySessionState.CANCELLED, "cancelled")
-                return session.to_public()
-            if challenge is not None:
-                session.qr_url = challenge.qr_url
-                session.short_code = challenge.short_code
-                session.state = VerifySessionState.PENDING
-                log.info(
-                    "验证会话就绪: session=%s account=%s ttl=%.0fs",
-                    session.session_id,
-                    session.account_id,
-                    self._ttl,
+                done, _pending = await asyncio.wait(
+                    {start_task, cancel_wait},
+                    timeout=self._code_timeout + 50.0,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                self._schedule_timer_locked(session.expires_at, session.session_id)
-                return session.to_public()
+                start_done = start_task in done
+                cancel_fired = cancel_wait in done or cancel_event.is_set()
+            except asyncio.CancelledError:
+                # The caller (e.g. a disconnected ASGI handler) cancelled this
+                # coroutine: never leave the placeholder stuck in STARTING.
+                start_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await start_task
+                with contextlib.suppress(BaseException):
+                    await self._abort_start(session, driver)
+                raise
+            finally:
+                cancel_wait.cancel()
+                with contextlib.suppress(BaseException):
+                    await cancel_wait
 
-            if isinstance(start_error, VerifyBrowserUnavailable):
-                await self._dispose_session_locked()
-                raise start_error
-            state = VerifySessionState.ERROR
-            message = "browser_error"
-            if isinstance(start_error, VerifySessionInvalid):
-                state, message = VerifySessionState.SESSION_INVALID, "login_redirect"
-            elif isinstance(start_error, VerifyRegionBlocked):
-                state, message = VerifySessionState.REGION_BLOCKED, "available_regions"
-            elif isinstance(start_error, (VerifyChallengeTimeout, TimeoutError)):
-                state, message = VerifySessionState.ERROR, "qr_timeout"
-            elif start_error is not None:
-                log.warning(
-                    "验证会话启动失败: session=%s account=%s error=%s",
-                    session.session_id,
-                    session.account_id,
-                    type(start_error).__name__,
-                )
-            self._finish_locked(session, state, message)
-            return session.to_public()
+            challenge: QrChallenge | None = None
+            start_error: BaseException | None = None
+            if cancel_fired:
+                start_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await start_task
+            elif start_done:
+                try:
+                    challenge = start_task.result()
+                except BaseException as exc:
+                    start_error = exc
+            else:
+                start_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await start_task
+                start_error = VerifyChallengeTimeout("qr_timeout")
+
+            async with self._lock:
+                if (
+                    self._session is not session
+                    or session.state is not VerifySessionState.STARTING
+                ):
+                    # Cancelled (or superseded) while the browser was launching.
+                    if self._driver is driver:
+                        self._driver = None
+                        self._schedule_driver_close(driver, session)
+                    final = session.to_public()
+                    return final
+                if cancel_event.is_set():
+                    self._finish_locked(
+                        session, VerifySessionState.CANCELLED, "cancelled"
+                    )
+                    final = session.to_public()
+                    return final
+                if challenge is not None:
+                    session.qr_url = challenge.qr_url
+                    session.short_code = challenge.short_code
+                    session.state = VerifySessionState.PENDING
+                    log.info(
+                        "验证会话就绪: session=%s account=%s ttl=%.0fs",
+                        session.session_id,
+                        session.account_id,
+                        self._ttl,
+                    )
+                    self._schedule_timer_locked(session.expires_at, session.session_id)
+                    final = session.to_public()
+                    return final
+
+                if isinstance(start_error, VerifyBrowserUnavailable):
+                    session.state = VerifySessionState.ERROR
+                    session.message = "browser_error"
+                    final = session.to_public()
+                    await self._dispose_session_locked()
+                    raise start_error
+                state = VerifySessionState.ERROR
+                message = "browser_error"
+                if isinstance(start_error, VerifySessionInvalid):
+                    state, message = (
+                        VerifySessionState.SESSION_INVALID,
+                        "login_redirect",
+                    )
+                elif isinstance(start_error, VerifyRegionBlocked):
+                    state, message = (
+                        VerifySessionState.REGION_BLOCKED,
+                        "available_regions",
+                    )
+                elif isinstance(start_error, (VerifyChallengeTimeout, TimeoutError)):
+                    state, message = VerifySessionState.ERROR, "qr_timeout"
+                elif start_error is not None:
+                    log.warning(
+                        "验证会话启动失败: session=%s account=%s error=%s",
+                        session.session_id,
+                        session.account_id,
+                        type(start_error).__name__,
+                    )
+                self._finish_locked(session, state, message)
+                final = session.to_public()
+                return final
+        finally:
+            if future is not None and not future.done():
+                # Exactly once: every return/raise path resolves the shared
+                # future so duplicate ``start`` waiters never hang.
+                if final is not None:
+                    future.set_result(final)
+                elif session is not None:
+                    future.set_result(session.to_public())
+                else:
+                    future.set_result(
+                        {
+                            "session_id": "",
+                            "state": VerifySessionState.ERROR.value,
+                            "qr_url": None,
+                            "short_code": None,
+                            "expires_at": _iso(time.time()),
+                            "message": "start_failed",
+                        }
+                    )
+
+    async def _await_start_future(
+        self, future: asyncio.Future[dict[str, object]]
+    ) -> dict[str, object]:
+        """Await an in-flight launch without letting this waiter cancel it."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._code_timeout + 50.0
+            )
+        except TimeoutError:
+            log.warning("验证会话启动等待超时，返回当前快照")
+            current = self._session
+            if current is not None:
+                return current.to_public()
+            return {
+                "session_id": "",
+                "state": VerifySessionState.ERROR.value,
+                "qr_url": None,
+                "short_code": None,
+                "expires_at": _iso(time.time()),
+                "message": "start_timeout",
+            }
 
     async def _abort_start(
         self, session: VerifySession, driver: VerifyBrowserSession
@@ -585,6 +689,7 @@ class VerifyAccountService:
         session_id: str,
         *,
         simulate: str | None = None,
+        force: bool = False,
     ) -> dict[str, object]:
         del simulate
         async with self._lock:
@@ -613,7 +718,7 @@ class VerifyAccountService:
         async with session_lock:
             if cancel_event.is_set() or session.state in _TERMINAL_STATES:
                 return session.to_public()
-            await self._refresh(session, driver, cancel_event)
+            await self._refresh(session, driver, cancel_event, force=force)
         return session.to_public()
 
     async def cancel(self, account_id: str) -> dict[str, object]:
@@ -746,6 +851,8 @@ class VerifyAccountService:
         session: VerifySession,
         driver: VerifyBrowserSession,
         cancel_event: asyncio.Event,
+        *,
+        force: bool = False,
     ) -> None:
         if session.state in _TERMINAL_STATES or cancel_event.is_set():
             return
@@ -781,11 +888,22 @@ class VerifyAccountService:
         if probe.failed:
             await self._finish(session, VerifySessionState.FAILED, "page_failed")
             return
-        if not probe.success:
+
+        # A page that never leaves verify-account must not suppress the
+        # upstream truth: a forced check queries immediately, and an automatic
+        # check queries once per interval even without page success.
+        should_confirm = (
+            probe.success
+            or force
+            or (time.time() - session.last_confirm_at >= CONFIRM_RPC_INTERVAL_SECONDS)
+        )
+        if not should_confirm:
             return
 
+        session.last_confirm_at = time.time()
+        status_value: int | None = None
         try:
-            done, status = await self._await_or_cancel(
+            done, result = await self._await_or_cancel(
                 driver.confirm_verified(session.auth_user), cancel_event
             )
         except VerifySessionInvalid:
@@ -807,12 +925,44 @@ class VerifyAccountService:
                 session.account_id,
                 type(exc).__name__,
             )
+            session.message = "rpc_pending"
+            if force:
+                log.info(
+                    "验证会话手动检查: session=%s probe_success=%s status=None",
+                    session.session_id,
+                    probe.success,
+                )
             return
         if not done:
             return
-        if status == 2:
+        if isinstance(result, int) and not isinstance(result, bool):
+            status_value = result
+
+        if force:
+            log.info(
+                "验证会话手动检查: session=%s probe_success=%s status=%s",
+                session.session_id,
+                probe.success,
+                status_value,
+            )
+        else:
+            log.debug(
+                "验证会话自动检查: session=%s probe_success=%s status=%s",
+                session.session_id,
+                probe.success,
+                status_value,
+            )
+
+        if status_value == 2:
             self._clear_verify_required(session.account_id)
             await self._finish(session, VerifySessionState.PASSED, "verified")
+            return
+        if status_value == 3:
+            self._clear_verify_required(session.account_id)
+            await self._finish(session, VerifySessionState.PASSED, "not_required")
+            return
+        # 1 / None: upstream still pending.
+        session.message = "still_pending"
 
     def _clear_verify_required(self, account_id: str) -> None:
         self._store.update_account_refresh(account_id, verify_required=False)
@@ -929,6 +1079,7 @@ class VerifyAccountService:
         driver = self._driver
         self._driver = None
         self._session = None
+        self._start_future = None
         self._cancel_event = None
         self._session_lock = None
         self._schedule_driver_close(driver, session)

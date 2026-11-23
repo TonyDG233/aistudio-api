@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -800,6 +802,11 @@ async def test_engine_config_switch_and_health_in_sandbox(ui_debug):
 @pytest.mark.asyncio
 async def test_verify_account_sandbox_flow(ui_debug):
     async with ui_debug, _client() as client:
+        sandbox = cast("UISandbox", runtime_state.ui_sandbox)
+        assert sandbox is not None
+        # Shorten the deterministic starting window so the test stays fast.
+        sandbox.verify_service.starting_seconds = 0.15
+
         before = (await client.get("/api/accounts")).json()
         verify_acc = next(a for a in before if a["id"] == "acc_free_verify")
         assert verify_acc["verify_required"] is True
@@ -808,17 +815,27 @@ async def test_verify_account_sandbox_flow(ui_debug):
         started = await client.post("/api/accounts/acc_free_verify/verify/start")
         assert started.status_code == 200
         payload = started.json()
-        assert payload["state"] == "pending"
-        assert payload["qr_url"].startswith("https://recaptcha.net/qr/")
-        assert payload["short_code"].startswith("SANDBOX")
+        assert payload["state"] == "starting"
+        assert payload["qr_url"] is None
+        assert payload["short_code"] is None
         session_id = payload["session_id"]
 
+        still_starting = await client.get(
+            "/api/accounts/acc_free_verify/verify/status",
+            params={"session_id": session_id, "force": "true"},
+        )
+        assert still_starting.status_code == 200
+        assert still_starting.json()["state"] == "starting"
+
+        await asyncio.sleep(0.2)
         pending = await client.get(
             "/api/accounts/acc_free_verify/verify/status",
             params={"session_id": session_id},
         )
         assert pending.status_code == 200
         assert pending.json()["state"] == "pending"
+        assert pending.json()["qr_url"] == "https://recaptcha.net/qr/TESTSHORT"
+        assert pending.json()["short_code"] == "TESTSHORT"
 
         cancelled = await client.post("/api/accounts/acc_free_verify/verify/cancel")
         assert cancelled.status_code == 200
@@ -828,7 +845,9 @@ async def test_verify_account_sandbox_flow(ui_debug):
         assert restarted.status_code == 200
         new_session = restarted.json()["session_id"]
         assert new_session != session_id
+        assert restarted.json()["state"] == "starting"
 
+        await asyncio.sleep(0.2)
         passed = await client.get(
             "/api/accounts/acc_free_verify/verify/status",
             params={"session_id": new_session, "simulate": "passed"},

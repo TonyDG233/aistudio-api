@@ -1284,6 +1284,7 @@ async def get_account_verification_status(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     session_id: str = Query(..., min_length=1),
     simulate: str | None = Query(default=None),
+    force: bool = Query(default=False),
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
     controller: VerifyAccountController = Depends(get_verify_account_controller),
@@ -1291,14 +1292,18 @@ async def get_account_verification_status(
     """查询验证会话状态；通过判定只在 status 被调用时推进。
 
     ``simulate`` 是 ui-debug 沙盒专用的确定性驱动参数，生产路由忽略它，
-    避免测试参数进入真实契约。
+    避免测试参数进入真实契约。``force=true`` 表示手动检查：即使页面尚未
+    success 也立即查询上游验证状态。
     """
     if account_service.get_account(account_id) is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     sandbox_simulate = simulate if get_ui_sandbox(runtime_state) is not None else None
     try:
         payload = await controller.status(
-            account_id, session_id, simulate=sandbox_simulate
+            account_id,
+            session_id,
+            simulate=sandbox_simulate,
+            force=force,
         )
     except VerifySessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

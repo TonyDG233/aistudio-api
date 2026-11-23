@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -43,7 +43,9 @@ class RouteFakeDriver:
 
     async def confirm_verified(self, auth_user: str) -> int | None:
         del auth_user
-        return 2
+        # Upstream still pending: keeps the non-forced status poll in pending
+        # even though the first query is allowed (``last_confirm_at`` is 0).
+        return 1
 
     async def close(self) -> None:
         self.closed = True
@@ -238,6 +240,68 @@ async def test_production_status_ignores_simulate(
         )
     assert status.status_code == 200
     assert status.json()["state"] == "pending"
+
+
+class _RecordingVerifyController:
+    """Minimal controller that records the ``force`` flag from the route."""
+
+    def __init__(self) -> None:
+        self.force_calls: list[bool] = []
+
+    @staticmethod
+    def _payload() -> dict[str, object]:
+        return {
+            "session_id": "verify_recording",
+            "state": "pending",
+            "qr_url": None,
+            "short_code": None,
+            "expires_at": "2026-01-01T00:00:00+00:00",
+            "message": None,
+        }
+
+    async def start(self, account_id: str) -> dict[str, object]:
+        del account_id
+        return self._payload()
+
+    async def status(
+        self,
+        account_id: str,
+        session_id: str,
+        *,
+        simulate: str | None = None,
+        force: bool = False,
+    ) -> dict[str, object]:
+        del account_id, session_id, simulate
+        self.force_calls.append(force)
+        return self._payload()
+
+    async def cancel(self, account_id: str) -> dict[str, object]:
+        del account_id
+        return {"state": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_verify_status_forwards_force_query(
+    verify_route_env: RouteEnv,
+) -> None:
+    controller = _RecordingVerifyController()
+    set_verify_account_service(cast(Any, controller))
+    try:
+        async with _client() as client:
+            forced = await client.get(
+                "/api/accounts/acc_1/verify/status",
+                params={"session_id": "verify_recording", "force": "true"},
+            )
+            plain = await client.get(
+                "/api/accounts/acc_1/verify/status",
+                params={"session_id": "verify_recording"},
+            )
+    finally:
+        set_verify_account_service(verify_route_env.service)
+
+    assert forced.status_code == 200
+    assert plain.status_code == 200
+    assert controller.force_calls == [True, False]
 
 
 @pytest.mark.asyncio

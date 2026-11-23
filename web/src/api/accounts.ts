@@ -162,8 +162,10 @@ export const accountsApi = {
     id: string,
     sessionId: string,
     signal?: AbortSignal,
+    force = false,
   ): Promise<VerifySessionResponse> {
     const query = new URLSearchParams({ session_id: sessionId })
+    if (force) query.set('force', 'true')
     return request<VerifySessionResponse>(
       `/api/accounts/${encodeURIComponent(id)}/verify/status?${query.toString()}`,
       { signal },

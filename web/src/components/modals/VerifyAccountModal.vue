@@ -36,6 +36,14 @@ const POLL_INTERVAL_MS = 2500
 const AUTO_CLOSE_MS = 2000
 const MAX_POLL_FAILURES = 3
 const FINAL_STATUS_TIMEOUT_MS = 1500
+const START_TIMEOUT_MS = 75_000
+
+const VERIFY_MESSAGE_LABELS: Record<string, string> = {
+  still_pending: '仍在等待扫码',
+  verified: '验证通过',
+  not_required: '上游未要求验证，已恢复调度',
+  rpc_pending: '上游未确认，仍在等待',
+}
 
 const phase = ref<Phase>('idle')
 const sessionId = ref('')
@@ -44,10 +52,13 @@ const shortCode = ref('')
 const expiresAt = ref('')
 const qrDataUrl = ref('')
 const errorText = ref('')
+const sessionMessage = ref('')
 const busy = ref(false)
 const checking = ref(false)
 const copied = ref(false)
 const nowTs = ref(Date.now())
+const lastCheckedAt = ref(0)
+const flowStartedAt = ref(0)
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let tickTimer: ReturnType<typeof setInterval> | null = null
@@ -57,9 +68,40 @@ let pollFailures = 0
 let passedHandled = false
 let flowToken = 0
 let pollInFlight = false
+let manualQueued = false
+let openedFor: string | null = null
 let startAbort: AbortController | null = null
+let closeHandled = false
+let cancelSettled = false
 
 const isPending = computed(() => phase.value === 'pending')
+
+const startingElapsed = computed(() => {
+  if (!flowStartedAt.value) return 0
+  return Math.max(0, Math.floor((nowTs.value - flowStartedAt.value) / 1000))
+})
+
+const lastCheckedLabel = computed(() => {
+  if (!lastCheckedAt.value) return ''
+  const d = new Date(lastCheckedAt.value)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+})
+
+function resolveMessageLabel(raw: string): string {
+  if (!raw) return ''
+  return VERIFY_MESSAGE_LABELS[raw] ?? ''
+}
+
+const statusHint = computed(() => {
+  if (phase.value === 'pending') {
+    return resolveMessageLabel(sessionMessage.value) || '仍在等待扫码'
+  }
+  if (phase.value === 'starting') {
+    return '浏览器启动中…'
+  }
+  return ''
+})
 
 const remainingMs = computed(() => {
   if (!expiresAt.value) return 0
@@ -77,7 +119,7 @@ const remainingLabel = computed(() => {
 const phaseLabel = computed(() => {
   switch (phase.value) {
     case 'starting':
-      return '正在获取二维码…'
+      return '浏览器启动中…'
     case 'pending':
       return '等待扫码'
     case 'passed':
@@ -173,7 +215,7 @@ function stopTimers(): void {
 
 function syncPolling(): void {
   clearPoll()
-  if (props.modelValue && phase.value === 'pending') {
+  if (props.modelValue && (phase.value === 'starting' || phase.value === 'pending')) {
     pollTimer = setInterval(() => {
       void pollStatus()
     }, POLL_INTERVAL_MS)
@@ -199,7 +241,11 @@ function handlePassed(): void {
   if (passedHandled) return
   passedHandled = true
   clearPoll()
-  toast.success('账号验证通过，已恢复调度')
+  if (sessionMessage.value === 'not_required') {
+    toast.success('上游未要求验证，已恢复调度')
+  } else {
+    toast.success('账号验证通过，已恢复调度')
+  }
   emit('verified')
   void accountsStore.fetchAll()
   autoCloseTimer = setTimeout(() => {
@@ -213,6 +259,7 @@ function applySession(res: VerifySessionResponse): void {
   qrUrl.value = res.qr_url || ''
   shortCode.value = res.short_code || res.qr_url?.split('/').pop() || ''
   expiresAt.value = res.expires_at || ''
+  sessionMessage.value = res.message || ''
   if (res.state !== 'error') {
     errorText.value = ''
   }
@@ -236,12 +283,17 @@ function resetSession(): void {
   expiresAt.value = ''
   qrDataUrl.value = ''
   errorText.value = ''
+  sessionMessage.value = ''
+  lastCheckedAt.value = 0
+  flowStartedAt.value = 0
   phase.value = 'starting'
   pollFailures = 0
   passedHandled = false
+  manualQueued = false
   checking.value = false
   copied.value = false
   busy.value = false
+  cancelSettled = false
 }
 
 function describeError(err: unknown): string {
@@ -259,9 +311,15 @@ async function startSession(): Promise<void> {
   const token = ++flowToken
   const accountId = props.account.id
   resetSession()
+  flowStartedAt.value = Date.now()
   busy.value = true
   const controller = new AbortController()
   startAbort = controller
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, START_TIMEOUT_MS)
   try {
     const res = await accountsApi.startVerify(accountId, controller.signal)
     if (token !== flowToken || !props.modelValue) {
@@ -272,10 +330,13 @@ async function startSession(): Promise<void> {
     }
     applySession(res)
   } catch (err) {
-    if (controller.signal.aborted) return
+    // 用户主动关闭/切换账号触发的 abort 不是超时，静默返回。
+    if (controller.signal.aborted && !timedOut) return
     if (token !== flowToken || !props.modelValue) return
     const detail = describeError(err)
-    if (err instanceof ApiError && err.status === 503) {
+    if (timedOut) {
+      errorText.value = '验证浏览器启动超时（已等待 75 秒），请点击「刷新二维码」重试'
+    } else if (err instanceof ApiError && err.status === 503) {
       errorText.value = detail || '验证浏览器不可用，请稍后重试'
     } else if (err instanceof ApiError && err.status === 409) {
       errorText.value = detail || '已有其它账号的验证会话正在进行，请先取消或等待结束'
@@ -286,6 +347,7 @@ async function startSession(): Promise<void> {
     }
     phase.value = 'error'
   } finally {
+    clearTimeout(timeout)
     if (startAbort === controller) startAbort = null
     if (token === flowToken) {
       busy.value = false
@@ -295,16 +357,30 @@ async function startSession(): Promise<void> {
 
 async function pollStatus(manual = false): Promise<void> {
   if (!props.account || !sessionId.value) return
-  // In-flight guard: the 2.5s interval must never stack status requests while
-  // the backend confirm RPC is still bounded-waiting.
-  if (pollInFlight) return
+  if (manual) {
+    // Show feedback immediately, before any in-flight guard can swallow the click.
+    checking.value = true
+    if (pollInFlight) {
+      manualQueued = true
+      return
+    }
+  } else if (pollInFlight) {
+    // In-flight guard: the 2.5s interval must never stack status requests while
+    // the backend confirm RPC is still bounded-waiting.
+    return
+  }
   pollInFlight = true
   const accountId = props.account.id
-  if (manual) checking.value = true
   try {
-    const res = await accountsApi.getVerifyStatus(accountId, sessionId.value)
+    const res = await accountsApi.getVerifyStatus(
+      accountId,
+      sessionId.value,
+      undefined,
+      manual,
+    )
     if (!props.modelValue) return
     pollFailures = 0
+    lastCheckedAt.value = Date.now()
     applySession(res)
   } catch (err) {
     if (!props.modelValue) return
@@ -317,15 +393,24 @@ async function pollStatus(manual = false): Promise<void> {
   } finally {
     pollInFlight = false
     if (manual) checking.value = false
+    if (manualQueued) {
+      manualQueued = false
+      const stillActive =
+        props.modelValue &&
+        Boolean(sessionId.value) &&
+        (phase.value === 'pending' || phase.value === 'starting')
+      if (stillActive) void pollStatus(true)
+    }
   }
 }
 
-async function cancelSession(): Promise<void> {
+async function cancelSession(accountId?: string): Promise<void> {
   abortStart()
-  const id = props.account?.id
+  const id = accountId ?? props.account?.id
   const sid = sessionId.value
   sessionId.value = ''
-  if (!id) return
+  if (!id || cancelSettled) return
+  cancelSettled = true
   if (!sid) {
     // Starting state has no session id yet; cancel still aborts the backend
     // placeholder and stops the browser launch.
@@ -368,14 +453,17 @@ async function closeModal(): Promise<void> {
   if (phase.value === 'pending' && sessionId.value) {
     await finalStatusCheck()
   }
+  closeHandled = true
   if (phase.value === 'passed') {
     // 扫码已完成但轮询尚未到达：不清锁、不取消，直接关闭弹窗。
+    cancelSettled = true
     emit('update:modelValue', false)
     return
   }
   const id = props.account?.id
   sessionId.value = ''
-  if (id) {
+  if (id && !cancelSettled) {
+    cancelSettled = true
     void accountsApi.cancelVerify(id).catch(() => {
       // fire-and-forget；关闭弹窗不等待
     })
@@ -429,25 +517,31 @@ async function copyShortCode(): Promise<void> {
 }
 
 watch(
-  () => props.modelValue,
-  (open) => {
-    if (open) {
-      void openFlow()
-    } else {
+  [() => props.modelValue, () => props.account?.id],
+  ([open, accountId]) => {
+    if (!open) {
+      openedFor = null
       stopTimers()
       flowToken += 1
-      void cancelSession()
+      if (!closeHandled) {
+        void cancelSession()
+      }
+      closeHandled = false
       phase.value = 'idle'
+      return
     }
-  },
-)
-
-watch(
-  () => props.account?.id,
-  () => {
-    if (props.modelValue) {
-      void openFlow()
+    if (!accountId) return
+    // Guard against duplicate triggers within the same open session (both props
+    // may change in one tick) so only one start request ever reaches the backend.
+    if (openedFor === accountId) return
+    if (openedFor !== null) {
+      // Account switch while open: tear down the previous session first.
+      stopTimers()
+      flowToken += 1
+      void cancelSession(openedFor)
     }
+    openedFor = accountId
+    void openFlow()
   },
 )
 
@@ -462,7 +556,7 @@ watch(qrUrl, (url) => {
 onBeforeUnmount(() => {
   stopTimers()
   if (copyTimer) clearTimeout(copyTimer)
-  void cancelSession()
+  if (!cancelSettled) void cancelSession()
 })
 </script>
 
@@ -529,13 +623,25 @@ onBeforeUnmount(() => {
           </span>
         </div>
 
+        <!-- Last check hint -->
+        <p
+          v-if="(phase === 'starting' || phase === 'pending') && lastCheckedLabel"
+          class="-mt-2 text-[11px] text-gray-500"
+        >
+          上次检查 {{ lastCheckedLabel }} · {{ statusHint }}
+        </p>
+
         <!-- QR / skeleton -->
         <div
           v-if="phase === 'starting' || busy"
-          class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-dashed border-amber-300 bg-amber-50/50 flex flex-col items-center justify-center gap-2 text-amber-700"
+          class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-dashed border-amber-300 bg-amber-50/50 flex flex-col items-center justify-center gap-2 px-4 text-center text-amber-700"
         >
           <Loader2 class="w-6 h-6 animate-spin" />
-          <span class="text-xs">正在获取二维码…</span>
+          <span class="text-xs leading-relaxed">正在启动验证浏览器（首次约 20-30 秒）…</span>
+          <span
+            v-if="startingElapsed > 0"
+            class="font-mono text-[11px] text-amber-600"
+          >已等待 {{ startingElapsed }} 秒</span>
         </div>
 
         <div
@@ -640,18 +746,18 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          :disabled="!isPending || checking"
+          :disabled="!isPending || checking || busy"
           @click="pollStatus(true)"
         >
           <Loader2
-            v-if="checking"
+            v-if="checking || phase === 'starting'"
             class="w-3.5 h-3.5 animate-spin"
           />
           <RefreshCw
             v-else
             class="w-3.5 h-3.5"
           />
-          <span>{{ checking ? '检查中…' : '检查状态' }}</span>
+          <span>{{ phase === 'starting' ? '启动中…' : checking ? '检查中…' : '检查状态' }}</span>
         </button>
         <button
           type="button"
