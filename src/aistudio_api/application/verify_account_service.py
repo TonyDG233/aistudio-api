@@ -104,7 +104,19 @@ CONFIRM_RPC_INTERVAL_SECONDS = 10.0
 # are ever stored or logged.
 NET_TRACE_MAXLEN = 300
 NET_URL_PATH_LIMIT = 200
-NET_DETAIL_LIMIT = 25
+NET_DETAIL_LIMIT = 40
+# Frame navigation record: answers "where did the page go after the scan?".
+# Only whitelisted verify/recaptcha/aistudio navigations are stored, and each
+# stored entry is a sanitized ``(session seconds, host/path)`` pair.
+NET_FRAME_NAV_MAXLEN = 50
+NET_FRAME_NAV_LOG_INTERVAL_SECONDS = 2.0
+NET_FRAME_NAV_TOKENS = (
+    "verify-account",
+    "recaptcha",
+    "bframe",
+    "anchor",
+    "aistudio.google.com",
+)
 # ``still_pending`` dumps are throttled per session so a 5 minute QR wait does
 # not flood the log with the same 100+ network entries.
 NET_DUMP_INTERVAL_SECONDS = 10.0
@@ -1607,6 +1619,11 @@ class CdpVerifyBrowserDriver:
         self._net_hosts: Counter[str] = Counter()
         self._net_started_at: float | None = None
         self._net_unsubscribers: list[Callable[[], None]] = []
+        self._net_failed_count = 0
+        self._frame_navs: deque[tuple[float, str]] = deque(maxlen=NET_FRAME_NAV_MAXLEN)
+        self._frame_nav_last_log_at = 0.0
+        # "page" (on_frame_navigated), "cdp" (Page.frameNavigated) or "none".
+        self._frame_nav_hook = "none"
         self._closed = False
 
     def _resolve_binary(self) -> Path:
@@ -1657,6 +1674,7 @@ class CdpVerifyBrowserDriver:
             # Observe only: whitelisted request/response/failure records used by
             # ``_dump_net_trace`` to answer "did Google's callback reach us?".
             self._register_net_trace(page)
+            self._register_frame_nav_trace(page)
         except Exception as exc:
             log.error(
                 "验证浏览器进程启动失败: error_type=%s error=%s",
@@ -1738,6 +1756,66 @@ class CdpVerifyBrowserDriver:
             if callable(unsubscribe):
                 self._net_unsubscribers.append(cast("Callable[[], None]", unsubscribe))
 
+    def _register_frame_nav_trace(self, page: object) -> None:
+        """Subscribe to frame navigations, tolerating pages without the hook.
+
+        Preference order: a native ``on_frame_navigated`` wrapper, then the
+        page's CDP connection (``cdp``/``connection``/``_connection``) for
+        ``Page.frameNavigated``.  If neither exists the record is simply not
+        wired up; nothing else changes.
+        """
+        handler = self._on_frame_navigated
+        try:
+            register = getattr(page, "on_frame_navigated", None)
+            if callable(register):
+                unsubscribe = register(handler)
+                self._frame_nav_hook = "page"
+            else:
+                connection = getattr(page, "cdp", None)
+                if connection is None:
+                    connection = getattr(page, "connection", None)
+                if connection is None:
+                    connection = getattr(page, "_connection", None)
+                on_event = getattr(connection, "on", None)
+                if not callable(on_event):
+                    log.debug(
+                        "验证会话帧导航未接入: page 无 on_frame_navigated/CDP 连接"
+                    )
+                    return
+                unsubscribe = on_event("Page.frameNavigated", handler)
+                self._frame_nav_hook = "cdp"
+        except Exception as exc:
+            log.debug("验证会话帧导航订阅失败: error=%s", type(exc).__name__)
+            return
+        if callable(unsubscribe):
+            self._net_unsubscribers.append(cast("Callable[[], None]", unsubscribe))
+
+    def _on_frame_navigated(self, data: dict[str, object]) -> None:
+        """Store only whitelisted navigation URL + relative timestamp."""
+        try:
+            raw_url = ""
+            if isinstance(data, dict):
+                raw_url = str(data.get("url") or "")
+                if not raw_url:
+                    frame = data.get("frame")
+                    if isinstance(frame, dict):
+                        raw_url = str(frame.get("url") or "")
+            if not raw_url:
+                return
+            lowered = raw_url.lower()
+            if not any(token in lowered for token in NET_FRAME_NAV_TOKENS):
+                return
+            host, path = _sanitize_url_for_log(raw_url)
+            display = f"{host}/{path}" if host else (path or "-")
+            elapsed = self._net_elapsed()
+            self._frame_navs.append((elapsed, display))
+            now = time.monotonic()
+            if now - self._frame_nav_last_log_at >= NET_FRAME_NAV_LOG_INTERVAL_SECONDS:
+                self._frame_nav_last_log_at = now
+                log.info("[Verify] 帧导航 +%.2fs url=%s", elapsed, display)
+        except Exception:
+            log.debug("验证会话帧导航记录失败")
+
     def _record_net_entry(self, entry: _NetTraceEntry) -> None:
         self._net_trace.append(entry)
 
@@ -1785,6 +1863,7 @@ class CdpVerifyBrowserDriver:
             reason = "canceled" if params.get("canceled") else (raw_error or "failed")
             if not request_id:
                 return
+            self._net_failed_count += 1
             for entry in reversed(self._net_trace):
                 if entry.request_id == request_id:
                     entry.failed = reason[:60]
@@ -1800,20 +1879,32 @@ class CdpVerifyBrowserDriver:
             hosts = " ".join(
                 f'"{host}":{count}' for host, count in self._net_hosts.most_common(6)
             )
+            verify_user = (
+                "yes"
+                if any("verifyuser" in e.url_path.lower() for e in entries)
+                else "no"
+            )
             log.info(
-                "[Verify] 网络记录 reason=%s total=%d interesting=%d 主域名={%s}",
+                "[Verify] 网络记录 reason=%s total=%d interesting=%d "
+                "verify_user=%s navigations=%d failed=%d 主域名={%s}",
                 reason,
                 len(entries),
                 len(interesting),
+                verify_user,
+                len(self._frame_navs),
+                self._net_failed_count,
                 hosts,
             )
-            printed = 0
-            for index, entry in enumerate(entries, 1):
-                if not _net_url_interesting(entry.url_path):
-                    continue
-                if printed >= NET_DETAIL_LIMIT:
-                    break
-                printed += 1
+            indexed = [
+                (index, entry)
+                for index, entry in enumerate(entries, 1)
+                if _net_url_interesting(entry.url_path)
+            ]
+            tail = indexed[-NET_DETAIL_LIMIT:]
+            skipped = len(indexed) - len(tail)
+            if skipped > 0:
+                log.info("  …更早 %d 条 interesting 未展示 #%d…", skipped, tail[0][0])
+            for index, entry in tail:
                 status = "-" if entry.status is None else str(entry.status)
                 suffix = f" failed={entry.failed}" if entry.failed else ""
                 log.info(
@@ -1825,10 +1916,6 @@ class CdpVerifyBrowserDriver:
                     status,
                     entry.mime or "-",
                     suffix,
-                )
-            if len(interesting) > printed:
-                log.info(
-                    "  …另有 %d 条 interesting 记录未展示", len(interesting) - printed
                 )
         except Exception:
             log.debug("验证会话网络记录导出失败: reason=%s", reason)

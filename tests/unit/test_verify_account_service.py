@@ -1832,6 +1832,139 @@ async def test_qr_timeout_dumps_net_trace(
     assert all("secret" not in m for m in messages)
 
 
+class _FrameNavFakePage(_NetFakePage):
+    """Fake page that also exposes the frame-navigation hook."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frame_cb: Any = None
+
+    def on_frame_navigated(self, callback: Any) -> Any:
+        self.frame_cb = callback
+        return lambda: self.unsubscribed.append("frame_navigated")
+
+
+def _feed_interesting_requests(page: _NetFakePage, count: int) -> None:
+    for index in range(1, count + 1):
+        page.request_cb(
+            {
+                "request_id": f"req-{index}",
+                "url": f"https://aistudio.google.com/verify-account?n={index}",
+                "method": "GET",
+            }
+        )
+
+
+def test_net_trace_dump_prints_tail_not_head(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    _feed_interesting_requests(page, 60)
+    driver._dump_net_trace("tail_test")
+
+    messages = [record.getMessage() for record in caplog.records]
+    summary = [m for m in messages if "网络记录 reason=tail_test" in m]
+    assert summary and "interesting=60" in summary[-1]
+    joined = "\n".join(messages)
+    assert "#60 " in joined, "the newest interesting entry must be printed"
+    assert "…更早 20 条 interesting 未展示 #21…" in joined
+    assert "#1 " not in joined, "the oldest entry must be dropped from the tail"
+
+
+def test_net_trace_summary_flags_verify_user(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+
+    with_user = _NetFakePage()
+    driver._register_net_trace(with_user)
+    with_user.request_cb(
+        {
+            "request_id": "req-v",
+            "url": "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+            "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
+            "VerifyUser",
+            "method": "POST",
+        }
+    )
+    driver._dump_net_trace("with_user")
+    summary = [
+        r.getMessage()
+        for r in caplog.records
+        if "网络记录 reason=with_user" in r.getMessage()
+    ]
+    assert summary and "verify_user=yes" in summary[-1]
+
+    without_user = _NetFakePage()
+    other_driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    other_driver._register_net_trace(without_user)
+    _feed_interesting_requests(without_user, 1)
+    other_driver._dump_net_trace("without_user")
+    summary = [
+        r.getMessage()
+        for r in caplog.records
+        if "网络记录 reason=without_user" in r.getMessage()
+    ]
+    assert summary and "verify_user=no" in summary[-1]
+
+
+def test_net_trace_summary_counts_failed_and_navigations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _FrameNavFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    driver._register_frame_nav_trace(page)
+    assert page.frame_cb is not None
+    assert driver._frame_nav_hook == "page"
+
+    page.request_cb(
+        {
+            "request_id": "req-f",
+            "url": "https://aistudio.google.com/verify-account?x=1",
+            "method": "GET",
+        }
+    )
+    page.failed_cb({"requestId": "req-f", "errorText": "net::ERR_FAILED"})
+    page.frame_cb({"url": "https://www.google.com/recaptcha/api2/bframe?k=1"})
+    driver._dump_net_trace("counts")
+
+    summary = [
+        r.getMessage()
+        for r in caplog.records
+        if "网络记录 reason=counts" in r.getMessage()
+    ]
+    assert summary
+    assert "failed=1" in summary[-1]
+    assert "navigations=1" in summary[-1]
+
+
+def test_frame_navigation_whitelist_and_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _FrameNavFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_frame_nav_trace(page)
+    assert page.frame_cb is not None
+
+    page.frame_cb({"url": "https://example.com/not-whitelisted"})
+    assert len(driver._frame_navs) == 0
+
+    page.frame_cb({"url": "https://www.google.com/recaptcha/api2/bframe?k=abc"})
+    assert len(driver._frame_navs) == 1
+    ts, display = driver._frame_navs[0]
+    assert isinstance(ts, float)
+    assert "bframe" in display
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("[Verify] 帧导航" in m for m in messages)
+
+
 class _NetDumpDriver(FakeDriver):
     """FakeDriver that records ``still_pending`` dump invocations."""
 
