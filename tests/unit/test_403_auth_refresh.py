@@ -694,6 +694,127 @@ async def test_same_account_exit_verify_event_is_reported_once(
 
 
 @pytest.mark.asyncio
+async def test_count_tokens_context_does_not_report_verify_account_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+    events: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/lease":
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-7",
+                    "socks_url": "socks5h://172.17.0.1:40007",
+                    "generation": 3,
+                    "ttl_s": 120,
+                },
+            )
+        if request.url.path == "/v1/events":
+            events.append(json.loads(request.content))
+            return httpx.Response(202)
+        return httpx.Response(404)
+
+    resolver = _resolver_with_transport(handler)
+    try:
+        await resolver.lease("acc-1", kind="chat")
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, manager, _rotator = _verify_pipeline()
+        context.record_attempts = False
+
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+        await resolver.wait_pending()
+    finally:
+        reset_exit_resolver()
+
+    assert outcome == "switch"
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_verify_event_skipped_when_no_bound_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+    events: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/events":
+            events.append(json.loads(request.content))
+            return httpx.Response(202)
+        return httpx.Response(404)
+
+    resolver = _resolver_with_transport(handler)
+    try:
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, manager, _rotator = _verify_pipeline()
+
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+        await resolver.wait_pending()
+    finally:
+        reset_exit_resolver()
+
+    assert outcome == "switch"
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_verify_event_exception_does_not_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/lease":
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-7",
+                    "socks_url": "socks5h://172.17.0.1:40007",
+                    "generation": 3,
+                    "ttl_s": 120,
+                },
+            )
+        return httpx.Response(202)
+
+    resolver = _resolver_with_transport(handler)
+    # A legacy/custom resolver may raise while resolving the binding.
+    monkeypatch.setattr(
+        resolver,
+        "assignment_for",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    try:
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, manager, _rotator = _verify_pipeline()
+
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+    finally:
+        reset_exit_resolver()
+
+    assert outcome == "switch"
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+
+
+@pytest.mark.asyncio
 async def test_off_mode_verification_sends_no_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

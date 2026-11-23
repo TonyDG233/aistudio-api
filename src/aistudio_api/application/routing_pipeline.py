@@ -902,35 +902,44 @@ class RoutingPipeline:
         Off mode (no resolver) is a pure no-op: zero event traffic.  External
         mode posts fire-and-forget (bounded by the client timeout, failures are
         swallowed) and is de-duplicated per (account, bound exit) so a single
-        verify occurrence can never spam the manager.
+        verify occurrence can never spam the manager.  countTokens reuses this
+        pipeline with ``record_attempts=False`` and must never emit the event,
+        and an unbound exit is skipped instead of posted with an empty id.
         """
-        resolver = get_exit_resolver()
-        if resolver is None:
+        if not context.record_attempts:
             return
-        assignment_for = getattr(resolver, "assignment_for", None)
-        assignment = (
-            assignment_for(
-                attempt.account_id,
-                kind=context.route.surface,
-                include_expired=True,
+        try:
+            resolver = get_exit_resolver()
+            if resolver is None:
+                return
+            assignment_for = getattr(resolver, "assignment_for", None)
+            assignment = (
+                assignment_for(
+                    attempt.account_id,
+                    kind=context.route.surface,
+                    include_expired=True,
+                )
+                if callable(assignment_for)
+                else None
             )
-            if callable(assignment_for)
-            else None
-        )
-        exit_id = str(getattr(assignment, "exit_id", "") or "")
-        key = (attempt.account_id, exit_id)
-        if key in context.reported_verify_exits:
-            return
-        report = getattr(resolver, "report_event_nowait", None)
-        if not callable(report):
-            return
-        context.reported_verify_exits.add(key)
-        report(
-            account_id=attempt.account_id,
-            exit_id=exit_id,
-            event_kind="verify_account",
-            canary="inconclusive",
-        )
+            exit_id = str(getattr(assignment, "exit_id", "") or "")
+            if not exit_id:
+                return
+            key = (attempt.account_id, exit_id)
+            if key in context.reported_verify_exits:
+                return
+            report = getattr(resolver, "report_event_nowait", None)
+            if not callable(report):
+                return
+            context.reported_verify_exits.add(key)
+            report(
+                account_id=attempt.account_id,
+                exit_id=exit_id,
+                event_kind="verify_account",
+                canary="inconclusive",
+            )
+        except Exception as exc:
+            logger.debug("[routing] verify-account 事件上报失败，已忽略: %s", exc)
 
     def record_empty_retry(self, context: RouteContext, attempt: RouteAttempt) -> None:
         """Record one independent attempt for an empty-response retry."""
