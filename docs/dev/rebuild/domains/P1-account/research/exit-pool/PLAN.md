@@ -338,9 +338,16 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 | app 租约客户端 / 车道 / 429 defer / 维护不跳过 | **已完成** | `REV-2.1.5.13` 二轮 PASS；1966 passed（含 429 四协议、冷启动单计、per-task scope、defer 不推进 due） |
 | verify-account 事件上报与 Q-10/Q-11 | **已完成** | `REV-2.1.5.15` PASS；1974 passed；`242fd36` 补 `record_attempts` 门控（countTokens 不上报）与无绑定 `exit_id` 跳过；fire-and-forget 有界、off 模式零网络 |
 | fanout 机器接口（`FANOUT_MACHINE_TOKEN`） | **已完成（编译级）/待 Linux 运行时** | `REV-2.1.5.12` 二轮 PASS；20 个用例 Linux 目标编译通过；本机无 Linux runtime，未执行测试二进制 |
-| PLAN/CONTRACT 同步 v2、纳入四份 REV | **当前（本次提交）** | 本文 + `CONTRACT.md`；docs-only commit |
-| Linux 运行时回归（fanout 20 用例 + 管理器 157 用例） | **下一步** | 在 Linux/Termux 或 CI 执行 `GOOS=linux go test ./...` 与 `python -m unittest discover -s data/tools/exit-manager/tests -v` |
-| VPS 部署与观察 | **下一步** | 先 `--check-config`、`/healthz`、`/v1/status`，再单账号/小批/全量；观察 24h |
+| 预算调度 v2 定稿（PLAN/CONTRACT 同步） | **已完成** | 本文 + `CONTRACT.md` 与 `data/tools/exit-manager/` v2 对齐；docs-only |
+| 保活分批与 `no_capacity` 降噪 | **已完成** | `e9081d2`；首轮 43 账号分批执行，逐账号 INFO、每轮汇总 WARNING，连续 3 个 no_capacity 停止本轮 |
+| 元数据/Cookie region 403 接 canary 出口仲裁 | **已完成** | `4493ac0`；元数据路径 region 403 触发 canary 出口仲裁，不再只记录 |
+| 分批饥饿 / 仲裁 kind / 汇总口径修复 | **已完成** | `cf96f03`；审查 `REV-2.1.5.16` |
+| VPS 部署（2.1.5） | **已完成** | 8 条健康出口（free WARP 4 / paid fanout 3 / overflow 1）、43 账号全部绑定、3 个待扫码；部署后最近 2 分钟 no_capacity/region 均为 0 |
+| 后续批次观察（43 账号轮换完成度） | **当前** | 观察分批保活能否把 43 账号全部轮换完成，无连续 no_capacity/region 堆积 |
+| 无响应体 403 标签取舍 | **下一步** | 空体 403 目前只能按出口嫌疑（Q2）；需定取舍规则，避免误烧出口或反复切号 |
+| fanout 节点掉线/热备 | **下一步** | paid 3 = 2 主力 + 1 热备；掉线检测与热备切换尚未补齐 |
+| 1 核容量评估 | **下一步** | `free -m`/`top` 实测 WARP 4 + fanout 4 + app/signer 的 RSS 与负载 |
+| Linux 运行时回归（fanout 20 用例 + 管理器 157 用例） | **下一步** | VPS 已实机部署；测试套件仍应在 Linux/Termux 或 CI 执行 `GOOS=linux go test ./...` 与 `python -m unittest discover -s data/tools/exit-manager/tests -v` |
 | 直连应急阀收窄为 maintenance-only | **下一步（防御性）** | 当前由 `AISTUDIO_EXIT_DIRECT_FALLBACK` 统一门控，未按 class 收窄；默认关闭，generation fail-closed |
 
 ---

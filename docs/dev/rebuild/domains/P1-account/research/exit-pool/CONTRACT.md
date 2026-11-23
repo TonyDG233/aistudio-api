@@ -415,3 +415,15 @@ Authorization: Bearer <readonly_token>
   - ~~`capacity` / 按账号容量~~ → 只按每出口调用预算，无按账号配额。
 - `FANOUT_MACHINE_TOKEN` 置空：`/api/machine/*` 回到 404；只读接口与管理面不受影响（只读仍用 `readonly_token`）。
 - 管理器回滚：停止 manager，恢复 `state/`/`config.json` 备份；app `AISTUDIO_EXIT_MODE` 置空即回到全局代理；不强制 WARP 轮换。
+
+---
+
+## 11. 当前部署版本 / 状态（2026-11-23）
+
+- 版本：**2.1.5**（app HEAD `cc0c734`，含 `e9081d2` 分批/降噪、`4493ac0` 元数据 403 接 canary、`cf96f03` P1/P2、`cc0c734` 文档；fanout `279fd9c`；管理器本地 git `26eb4a9`）。
+- 模式：`AISTUDIO_EXIT_MODE=external` + `browserless`；管理器 `172.17.0.1:8788`，fanout 4 出口（SOCKS 需认证），WARP `wireproxy-inst-1..4`（`40110..40113`）+ 旧 `40001`。
+- 池：**8 条健康出口**（free WARP 4 / paid fanout 3 / free_overflow 1）；**43 个账号全部绑定**；预算 paid 30/45/400、free 50/75/2400，窗口 1800s，维护/探针预留 20/6，租约 30~60s。
+- 账号：43（Free 37 / Pro 6）；**3 个 `verify_required` 待扫码**（`acc_86bbfa31` / `acc_59c95a69` / `acc_c11b975f`）；两个 Pro `acc_61a816d1` / `acc_6803137a` 当前 enabled、tier=Pro 正常。
+- 保活：metadata 12/轮、auth 8/轮，连续 3 个 `no_capacity` 停止本轮，region defer 不计 streak；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
+
+本节只记录部署事实，不改动上文任何契约字段与语义。

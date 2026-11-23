@@ -20,6 +20,7 @@
 - [8. 配置口径](#8-配置口径)
 - [9. 代码结构索引](#9-代码结构索引)
 - [10. 智能体工作流与发布纪律](#10-智能体工作流与发布纪律)
+- [11. 外部出口池特殊模式（宿主扩展）](#11-外部出口池特殊模式宿主扩展)
 
 ---
 
@@ -364,6 +365,9 @@ aistudio-api/
 │   │   └── router/                # Vue Router 路由与守卫
 │   └── vite.config.ts             # 构建配置 (输出至 src/aistudio_api/static)
 ├── android/                       # Android 伴侣端：多资料凭据提取器
+├── data/                          # 本地运行时数据 (gitignored；不入主仓)
+│   ├── accounts/                  # registry.json（权威）/ meta.json（镜像）
+│   └── tools/exit-manager/        # 宿主出口管理器（独立本地 git；env 门控，默认不启用）
 ├── src/aistudio_api/
 │   ├── api/                       # FastAPI 接口层与协议适配
 │   │   ├── app.py                 # 应用生命周期、异常映射与静态托管
@@ -417,6 +421,8 @@ aistudio-api/
     └── unit/                      # 按职责划分的单元测试模块
 ```
 
+> 外部出口池相关组件不在主仓构建产物内：宿主 `exit-manager` 代码位于 `data/tools/exit-manager/`（gitignored，独立本地 git），fanout fork（`TonyDG233/fanout`）部署于 VPS `/opt/fanout`；默认构建完全无感，详见 §11。
+
 ---
 
 ## 10. 智能体工作流与发布纪律
@@ -439,6 +445,7 @@ aistudio-api/
 - reviewer 独立审；报告落盘；用户审计确认后才 commit；单步问题只做当前步骤内局部返工，严禁推翻整体计划或重写 `05/06/08-09`。
 - **UI 前置设计确认（强制）**：凡涉及前端 UI 界面、设置卡片、按钮或交互变更的步骤，主 Agent 严禁仅给简短摘要就直接派 Worker 改代码。开工前必须先只读盘点并提交《UI 页面与交互设计清单》，至少包含：①所在页面与卡片位置；②控件类型、中文文案、选项与默认值；③点击后的 API 调用、loading/成功/错误反馈与确认弹窗逻辑；④拟清理的废弃组件/按钮。必须等用户审阅并明确确认后，才准派 Worker 修改 .vue 代码；每次 UI 修改完工必须执行 bun run build 更新 src/aistudio_api/static 产物。
 - **UI 验收闭环（强制）**：UI 步骤必须包含 `AISTUDIO_UI_DEBUG=1` 沙盒 + Playwright `1440x900`/`1024x900`/`768x900` 实测；Reviewer 必须归档 1~2 张完整页面截图并在 `REV-*.md` 引用；多页面或跨模块步骤按文件域并行拆分 Worker/Reviewer，禁止单 Agent 一锅炖。
+- **出口池/特殊模式前置（强制）**：凡涉及外部出口池、`AISTUDIO_EXIT_*`、keepalive 分批或 region 仲裁的步骤，开工前先读 §11 与 `docs/dev/rebuild/domains/P1-account/research/exit-pool/PLAN.md`（配套 `CONTRACT.md`），口径以本章与 PLAN 为准，不得凭记忆改参数或契约。
 
 ### 10.3 版本号与审查文档四位标号规范（`X.Y.Z` + `.W`）
 
@@ -466,3 +473,85 @@ B0（`AGENT.md`）→ B1（P9-pre）→ B2-1（P1/D02）→ B2-2（P3-D03）→ 
 - 不新增 D-xx/Gate/顺序/范围；需要时停下问用户。
 - 不把函数签名/底层实现甩给用户裁决；向用户汇报用大白话，说明功能保留、执行顺序、可运行结果。
 - `archive/` 下所有文件（含 `batch-drafts-20261029/`）均为历史留底，严禁作为施工依据。
+
+---
+
+## 11. 外部出口池特殊模式（宿主扩展）
+
+本章描述主仓之外的一组**外部出口组件与宿主管理器**。它们只在显式开启特殊模式时参与运行；默认构建、默认配置、默认启动完全无感，缺失 `AISTUDIO_EXIT_*` 时行为与本章引入前一致。
+
+### 11.1 架构与边界
+
+```text
+aistudio-api（env 门控，默认关闭）
+  └─ ExitResolver（仅 AISTUDIO_EXIT_MODE=external 时构造）
+       │ Bearer + HMAC（只传账号 HMAC，不传 Cookie/邮箱）
+       ▼
+宿主 exit-manager（systemd、单写者、Python 标准库）
+  ├─ WARP 多实例（wireproxy-inst-1..4）→ free lane
+  ├─ fanout（独立服务）→ paid lane / free_overflow 应急
+  └─ 直连应急阀（默认关；仅 maintenance）
+```
+
+- 管理器**不读取账号 Cookie 与 `auth.json`**，只持有账号 id 的 HMAC、出口 id 与事件分类；不进入镜像、不进 `config.yaml`/`config.schema.json`、不新增任何 UI 设置项（管理页仅只读展示）。
+- `AISTUDIO_EXIT_MODE` 缺失或非 `external` = **完全现状**：不构造 resolver、不发任何 `/v1/*`、不改 `settings.proxy_url`；管理器即使存在也无人访问。
+
+### 11.2 组件与路径
+
+| 组件 | 路径 / 部署 | 说明 |
+|---|---|---|
+| `exit-manager` 代码 | `data/tools/exit-manager/`（独立本地 git，初始提交 `26eb4a9`；`state/`、`config.json` 已 ignore） | 主仓 gitignored，不入镜像 |
+| `exit-manager` 部署 | VPS `/opt/exit-manager`；配置 `/etc/exit-manager/config.json`（`0600`）；state `/var/lib/exit-manager/state` | systemd 单元 `exit-manager`，监听 `172.17.0.1:8788` |
+| fanout fork | `TonyDG233/fanout`（提交 `279fd9c`），VPS `/opt/fanout` | systemd 单元 `fanout`；4 条 SOCKS 出口（需用户名密码） |
+| fanout 接口 | `/api/machine/*`（`FANOUT_MACHINE_TOKEN`）、只读 `/api/readonly/*`（`FANOUT_READONLY_TOKEN`） | 均仅 loopback + Bearer |
+| WARP 多实例 | `wireproxy-inst-1..4`，docker bridge 端口 `40110..40113` | 旧 `wireproxy`（`40001`）保留 |
+
+### 11.3 环境变量（app 侧，只走 env）
+
+| 变量 | 语义 |
+|---|---|
+| `AISTUDIO_EXIT_MODE` | 仅 `external` 开启特殊模式；其它值/缺失 = 现状 |
+| `AISTUDIO_EXIT_ENDPOINT` | 管理器 base URL，仅 `http`/`https`；非法值使出口池整体关闭 |
+| `AISTUDIO_EXIT_TOKEN` | 管理器 Bearer token |
+| `AISTUDIO_EXIT_HMAC_KEY` | 账号 id 的 HMAC 密钥（管理器不持有账号明文） |
+| `AISTUDIO_EXIT_ALLOWED_HOSTS` | `socks_url` 允许主机，默认 `127.0.0.1,172.17.0.1` |
+| `AISTUDIO_EXIT_CANARY_ACCOUNT` | 匿名/元数据 canary 使用的探针账号标识 |
+| `AISTUDIO_EXIT_DIRECT_FALLBACK` | 直连应急阀，默认关；仅 maintenance 直连，generation 永不直连 |
+
+### 11.4 车道与预算参数
+
+- **车道隔离**：`paid` 只落 fanout；`free` 只落 WARP；`free_overflow` 仅在全部 WARP 不可用且维护队列积压时对 free 应急开放；paid 永不落 WARP、永不使用 overflow。
+- **窗口与额度**：滑动窗口 `1800s`；paid 软 `30` / 硬 `45` / 日 `400`；free 软 `50` / 硬 `75` / 日 `2400`。
+- **预留**：每出口维护预留 `20`、探针预留 `6`；生成不得占用维护/探针预留。
+- **日上限**：只约束 `generation`；维护/探针不写日计数，日上限打满仍可在窗口预留内前进。
+- **租约**：TTL `30~60s`（app 缓存同样夹到该区间）。
+- **无容量**：统一 `429 no_capacity + retry_after_s`（带 `Retry-After`），是延迟排队重试，**不是 skip**、不是 503；503 只用于管理器不可达/载荷非法等 fail-closed。
+- **烧毁/隔离**：同一健康出口 30 分钟内出现 `≥2` 个不同账号 `verify` → `cooling` 冷却 `120min`；单账号 verify 只走扫码、不烧出口；`disabled` 为配置硬开关，事件/探针/refresh/recover 均不能复活。
+
+### 11.5 账号状态权威
+
+- `data/accounts/registry.json` 是账号状态**权威事实源**，`meta.json` 只是镜像，启动时会回写。
+- 修改 `verify_required`/`expired` 必须改 registry（或走 store API），**不能只手改 meta**，否则会被启动回写覆盖。
+- `verify_required` 独立于 `session_expired`；扫码验证服务走**直连**出码，不进出口池预算，也不做软件层硬限流。
+
+### 11.6 保活与维护
+
+- 分批上限：metadata `12`/轮、auth `8`/轮；连续 `3` 个 `no_capacity` 即停止本轮，剩余保持 due，下一轮继续。
+- `region defer` 不计入 `no_capacity` streak；metadata/auth 双通道各维护跨轮游标，避免队首长期占用名额。
+- 逐账号 `no_capacity` 记 INFO，每轮只打一条汇总 WARNING。
+- 元数据 region 403 走 canary：`exit_bad` 上报事件并失效绑定；`account_bad` 写 registry 的 `verify_required`。
+
+### 11.7 运维与回滚
+
+- 重启服务：`docker compose stop aistudio-api` / `docker compose up -d aistudio-api`；`systemctl restart exit-manager` / `systemctl restart fanout`。
+- WARP 轮换：`/usr/local/bin/warp-multi/rotate-instance.sh N`。
+- 账号备份：`/root/verifyflip2-backup-1795426068/`。
+- 镜像回滚：回退对应提交后重新构建；不自动购买付费出口。
+- 验证顺序：先看 `/v1/status` 与 systemd 状态，再放量。
+
+### 11.8 铁律
+
+- 特殊模式**只靠 env** 开启；不改 `config.yaml`/`config.schema.json`、不加 UI 设置项。
+- 管理器改动在它自己的 git（`data/tools/exit-manager/`）里提交，不混入主仓提交。
+- 部署与实机操作由用户监督；worker/子 Agent 不得擅自部署或重启真实服务。
+- 不把 `data/` 纳入主仓（gitignored），不提交任何账号文件、state、配置或凭据。
