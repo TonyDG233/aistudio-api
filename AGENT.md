@@ -490,7 +490,7 @@ aistudio-api（env 门控，默认关闭）
 宿主 exit-manager（systemd、单写者、Python 标准库）
   ├─ WARP 多实例（wireproxy-inst-1..4）→ free lane
   ├─ fanout（独立服务）→ paid lane / free_overflow 应急
-  └─ 直连应急阀（默认关；仅 maintenance）
+  └─ 直连应急阀（默认关；探针/凭证不得使用；generation 永不直连）
 ```
 
 - 管理器**不读取账号 Cookie 与 `auth.json`**，只持有账号 id 的 HMAC、出口 id 与事件分类；不进入镜像、不进 `config.yaml`/`config.schema.json`、不新增任何 UI 设置项（管理页仅只读展示）。
@@ -516,7 +516,7 @@ aistudio-api（env 门控，默认关闭）
 | `AISTUDIO_EXIT_HMAC_KEY` | 账号 id 的 HMAC 密钥（管理器不持有账号明文） |
 | `AISTUDIO_EXIT_ALLOWED_HOSTS` | `socks_url` 允许主机，默认 `127.0.0.1,172.17.0.1` |
 | `AISTUDIO_EXIT_CANARY_ACCOUNT` | 匿名/元数据 canary 使用的探针账号标识 |
-| `AISTUDIO_EXIT_DIRECT_FALLBACK` | 直连应急阀，默认关；仅 maintenance 直连，generation 永不直连 |
+| `AISTUDIO_EXIT_DIRECT_FALLBACK` | 直连应急阀，默认关；external 模式下探针/凭证路径不得使用 `direct_fallback`（无出口直接 defer/skip，0 裸请求）；generation 永不直连 |
 
 ### 11.4 车道与预算参数
 
@@ -539,7 +539,8 @@ aistudio-api（env 门控，默认关闭）
 - 分批上限：metadata `12`/轮、auth `8`/轮；连续 `3` 个 `no_capacity` 即停止本轮，剩余保持 due，下一轮继续。
 - `region defer` 不计入 `no_capacity` streak；metadata/auth 双通道各维护跨轮游标，避免队首长期占用名额。
 - 逐账号 `no_capacity` 记 INFO，每轮只打一条汇总 WARNING。
-- 元数据 region 403 走 canary：`exit_bad` 上报事件并失效绑定；`account_bad` 写 registry 的 `verify_required`。
+- 元数据 region 403 走 canary：`exit_bad` 上报事件并失效绑定；`account_bad` 写 registry 的 `verify_required`。canary 必须绑定本次探针实际使用的出口，出口为空或不一致时按 `inconclusive` 处理，不写 verify（`REV-2.1.5.18`）。
+- external 下 tier/email/RotateCookies/导入/status 探针无池会话或无出口时一律 `skip`/`defer`，**不得裸 httpx 直连**（0 裸请求）。
 
 ### 11.7 运维与回滚
 

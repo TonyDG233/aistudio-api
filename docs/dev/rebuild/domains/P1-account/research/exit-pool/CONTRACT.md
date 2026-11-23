@@ -317,8 +317,9 @@ Content-Type: application/json
 ### 8.2 应急阀 `AISTUDIO_EXIT_DIRECT_FALLBACK`
 
 - **默认关闭**；仅 `1` / `true` / `yes` / `on`（大小写不敏感）视为开启。
-- 设计口径：**仅 maintenance 可使用**；generation 永不直连。当前实现由 env 统一门控、尚未按 `class` 收窄；因默认关闭，生产口径以“仅 maintenance”作为目标，收窄列入下一步。
-- 开启后，external 模式拿不到账号出口的带凭据请求**改为直连**（`proxy=None`），**绝不回退 `settings.proxy_url`**；WARNING 按账号 60s 限频。
+- 设计口径：**generation 永不直连**；external 模式下**探针/凭证路径（tier/email/RotateCookies/导入探测/canary）明确不得使用 `direct_fallback`**——无账号出口（`no_pooled_exit` / 空 `_bound_socks`）一律 `skip`/`defer`，构造 **0** 个裸请求。
+- 当前实现仍由 env 统一门控、尚未按 `class` 做代码级收窄；因默认关闭，生产口径以“探针/凭证不直连、generation 永不直连”为准，代码收窄列入下一步。
+- 开启后，当前实现在拿不到账号出口的带凭据**生成**请求上会改为直连（`proxy=None`）；这是尚待收窄的残留实现（设计目标为 generation 永不直连），**绝不回退 `settings.proxy_url`**；WARNING 按账号 60s 限频。
 - 未开启时同一情形 fail-closed：不构造传输、不发起任何上游请求；generation 映射 503，维护按 ≥300s 重试。
 
 ### 8.3 引擎范围
@@ -355,6 +356,14 @@ Content-Type: application/json
 
 - 有池会话时优先走 `rotate_cookies_via_signer`（会话已绑定账号出口）。
 - 无池会话时走裸路径：按 `account_id` 解析出口，凭据 RPC 使用该出口；`no_capacity` 返回 `deferred/skipped=no_exit`，不扇出兄弟账号、不写 Cookie；管理器不可达 fail-closed，绝不回退全局代理。
+
+### 8.8 探针无出口 skip 与 canary 出口绑定（`REV-2.1.5.18`）
+
+- 共享谓词：`probe_egress_allowed()` / `probe_skip_reason()`（`infrastructure/exit_pool/resolver.py`）。`external && action == "direct_fallback"` → 不允许探测（`no_pooled_exit`）；`decision is None` → 不允许（`no_exit`）；off 模式 → 允许。tier/email/RotateCookies/导入/status 探针全部复用该谓词，无出口时 **0 裸请求**、只 `skip`/`defer`。
+- 池化会话探针须有真实出口：external + browserless + 空 `_bound_socks` → 不发送请求（`_session_probe_has_exit` 为假）。
+- canary 归因：`probe_exit_id` 必须等于本次探针实际使用的出口；为空串/不匹配时仲裁结果为 `inconclusive`（不跑 canary、不报事件、不写 `verify_required`）；只有匹配且 canary 判定 `account_bad` 才写 verify。
+- 生成/路由在**真实出口**上的 region 403 行为不变（`routing_pipeline` 不传 `probe_exit_id`，默认 `None`）。
+- 假 verify 清理工具：`scripts/clear_verify_required.sh`（容器内 `docker compose run --rm --entrypoint sh aistudio-api scripts/clear_verify_required.sh ...`）。默认 dry-run；`--list` 只列出；`--ids` 仅清理指定 ID；`--apply` 必须配 `--yes`；`last_refresh_error=None` 的真号需显式 `--force` 才会清；清理前自动备份到 `<accounts-dir>/backups/clear-verify-<ts>`，并同步 registry/meta/rotator。脚本已纳入运行时镜像。
 
 ---
 
@@ -420,13 +429,14 @@ Authorization: Bearer <readonly_token>
 
 ## 11. 当前部署版本 / 状态（2026-11-23）
 
-- 版本：**2.1.5**（app HEAD `cc0c734`，含 `e9081d2` 分批/降噪、`4493ac0` 元数据 403 接 canary、`cf96f03` P1/P2、`cc0c734` 文档；fanout `279fd9c`；管理器本地 git `26eb4a9`）。
+- 版本：**2.1.5**（app HEAD `708dc40`，含 `e9081d2` 分批/降噪、`4493ac0` 元数据 403 接 canary、`cf96f03` P1/P2、`67b0f10` 探针归因与假 verify 清理、`708dc40` 清理脚本入镜像；fanout `279fd9c`；管理器本地 git `26eb4a9`）。
 - 模式：`AISTUDIO_EXIT_MODE=external` + `browserless`；管理器 `172.17.0.1:8788`，fanout 4 出口（SOCKS 需认证），WARP `wireproxy-inst-1..4`（`40110..40113`）+ 旧 `40001`。
 - 池：**8 条健康出口**（free WARP 4 / paid fanout 3 / free_overflow 1）；**43 个账号全部绑定**；预算 paid 30/45/400、free 50/75/2400，窗口 1800s，维护/探针预留 20/6，租约 30~60s。
-- 账号：43（Free 37 / Pro 6）；**`verify_required` 5 个待扫码（用户确认；数量与清单以实机 `registry.json` 为准）**；此前记录的 3 个（`acc_86bbfa31` / `acc_59c95a69` / `acc_c11b975f`）只是当时状态，不是当前数量；两个 Pro `acc_61a816d1` / `acc_6803137a` 当前 enabled、tier=Pro 正常。
-- 扫码验证（本轮本地修复，**未提交/未部署**，审查 `REV-2.1.5.17`）：单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、会话 TTL 300s、出码后自动每 10s 查询上游、手动检查透传 `force=true`、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
+- 账号：43（Free 37 / Pro 6）；`verify_required` 当前 **3 个真号待扫码**（`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`，`last_refresh_error=None`）。2026-11-23 生产曾为 9 个 = 3 真 + 6 假；6 个假标（`last_refresh_error=skipped_no_exit: no_exit`：`acc_a5a0296a`、`acc_b477bef7`、`acc_2d684b14`、`acc_225e8b9f`、`acc_79cbb018`、`acc_fbb16921`）已用 `scripts/clear_verify_required.sh --ids ... --apply --yes` 清理，registry/meta/rotator 同步，备份 `/app/data/accounts/backups/clear-verify-20261123T142240Z`；更早“5 个待验证”的表述为历史快照已作废。两个 Pro `acc_61a816d1` / `acc_6803137a` 当前 enabled、tier=Pro 正常。
+- 扫码验证（`REV-2.1.5.17` PASS，已提交/已部署）：单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、会话 TTL 300s、出码后自动每 10s 查询上游、手动检查透传 `force=true`、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
   - `GET /accounts/{id}/verify/status?...&force=true` 是正式手动检查语义（非测试旁路）：即使验证页面尚未 success 也立即查询上游 `GetUserVerificationStatus`，并绕过 10s 自动节流。
   - 判定口径：上游 `2`（verified）与 `3`（not_required）均视为通过并清 `verify_required`（3 一并清 registry/rotator 锁）；`1`/`None` 保持 pending 且 `message=still_pending`（前端显示「仍在等待扫码」）。该口径不新增/修改本节出口池契约字段。
-- 保活：metadata 12/轮、auth 8/轮，连续 3 个 `no_capacity` 停止本轮，region defer 不计 streak；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
+- 探针归因（`REV-2.1.5.18` PASS，已部署 `67b0f10` + `708dc40`）：external 无出口探针 `skip`/`defer`（0 裸请求）、canary 绑定探针实际出口（空/不一致 → `inconclusive`）；`2035 passed`，CI `45191913250` 绿，Docker `45191913163` / `45193043377` 成功。
+- 保活：metadata 12/轮、auth 8/轮，连续 3 个 `no_capacity` 停止本轮，region defer 不计 streak；部署后 `no_capacity`/`region` 均为 0。
 
 本节只记录部署事实，不改动上文任何契约字段与语义。

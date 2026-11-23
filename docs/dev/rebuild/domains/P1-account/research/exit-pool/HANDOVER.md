@@ -12,7 +12,7 @@
 1. `AGENT.md`（仓库根，工程红线：分层、并发、防风控、测试纪律）。
 2. `docs/dev/rebuild/domains/P1-account/research/exit-pool/PLAN.md`（出口池 v2 定稿：车道、预算、调度、实施状态）。
 3. 同目录 `CONTRACT.md`（app ↔ exit-manager / fanout 的 HTTP 契约与字段白名单）。
-4. 最近审查：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.17-verify-start-status-fix.md`（扫码验证「首次打开不出码 / 扫码后检查无反应」修复，PASS；P2 已处理后复审）；此前再看 `REV-2.1.5.16-batch-and-metadata-arbitration.md`（分批、元数据 403 仲裁、汇总口径）；需要追溯时再看 `REV-2.1.5.12`（fanout 机器接口）、`13`（租约/defer）、`14`（管理器 v2）、`15`（verify 上报）。
+4. 最近审查：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.18-probe-attribution-and-verify-cleanup.md`（探针出口归因修复 + 假 verify 清理，PASS；0 P0/P1/P2）；此前再看 `REV-2.1.5.17-verify-start-status-fix.md`（扫码验证「首次打开不出码 / 扫码后检查无反应」修复，PASS）、`REV-2.1.5.16-batch-and-metadata-arbitration.md`（分批、元数据 403 仲裁、汇总口径）；需要追溯时再看 `REV-2.1.5.12`（fanout 机器接口）、`13`（租约/defer）、`14`（管理器 v2）、`15`（verify 上报）。
 5. 本文（运行态、账号状态、运维命令、上下文保真协议）。
 
 原则：先读文档再动代码；`PLAN.md`/`CONTRACT.md` 是方案与契约，代码是事实；审查结论优先于旧文档。
@@ -80,7 +80,7 @@
 | `AISTUDIO_EXIT_HMAC_KEY` | 账号 HMAC 键；管理器只存 HMAC，不反推账号 |
 | `AISTUDIO_EXIT_ALLOWED_HOSTS` | 允许的 socks 主机（默认 `127.0.0.1,172.17.0.1`） |
 | `AISTUDIO_EXIT_HTTP_TIMEOUT` | 控制面超时（默认 2s） |
-| `AISTUDIO_EXIT_DIRECT_FALLBACK` | 直连应急阀，默认关；目标仅 maintenance，generation 永不直连 |
+| `AISTUDIO_EXIT_DIRECT_FALLBACK` | 直连应急阀，默认关；external 下探针/凭证路径不得使用（无出口直接 skip/defer，0 裸请求），generation 永不直连 |
 
 红线：`AISTUDIO_EXIT_*` 只走 env；UI 只读；不新增 schema 字段。
 
@@ -106,14 +106,15 @@
 ## 四、账号状态与待扫码
 
 - 账号总数 43：Free 37 / Pro 6。
-- `verify_required` **5 个（用户确认）**：最后一次启动时已达 5 个；完整列表与数量**以实机 `/app/data/accounts/registry.json` 为准**，本文不硬编码具体账号清单。
-  - 历史说明：此前记录为 3 个（`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`），只是当时的快照状态，不代表当前数量；这三个账号当时直连探测均返回 200 `[1]`。
-  - 状态改动前备份：`/root/verifyflip2-backup-1795426068/`。
+- `verify_required` 当前 **3 个真号待扫码**（2026-11-23 生产为 9 个 = 3 真 + 6 假，6 个假标已清理）：
+  - 真（`last_refresh_error=None`，确实需要扫码）：`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`。
+  - 假（`last_refresh_error=skipped_no_exit: no_exit`，探针降级误判）：`acc_a5a0296a`、`acc_b477bef7`、`acc_2d684b14`、`acc_225e8b9f`、`acc_79cbb018`、`acc_fbb16921`；已用 `scripts/clear_verify_required.sh --ids ... --apply --yes` 清理，`registry.json`/`meta.json`/`rotator` 三处同步恢复；备份 `/app/data/accounts/backups/clear-verify-20261123T142240Z`。
+  - 历史说明：此前“5 个待验证”“3 个”的表述均为当时快照，现已作废（历史）；当前以实机 `/app/data/accounts/registry.json` 为准，应为 3 个真号。
   - 修改账号状态须 `registry.json` + `meta.json` + `rotator` 状态三处一致；扫码时按 `registry.json` 的 `verify_required` 逐个处理，不在软件层做硬限流。
 - 两个 Pro 账号 `acc_61a816d1`、`acc_6803137a`：当前 `enabled`，`tier=Pro` 正常。
 - 关键事实：`registry.json` 是权威状态，`meta.json` 是镜像；改账号状态必须改 `registry.json`，只改 meta 不生效（meta 里的 `enabled:false` 曾未生效即因此）。
 
-### 4.1 扫码验证当前行为（2026-11-23 修复，待提交）
+### 4.1 扫码验证当前行为（2026-11-23 修复，已提交并部署）
 
 依据：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.17-verify-start-status-fix.md`（PASS；关闭弹窗重复 cancel 的 P2 已修并复审）。
 
@@ -128,6 +129,13 @@
 | 未通过提示 | pending 且 `1`/`None` 时 `message=still_pending`，UI 显示「仍在等待扫码」，不暴露内部变量名 |
 | 关闭弹窗 | 取消职责收敛为一次 `cancel`（`cancelSettled` 守卫），不再重复发送 |
 
+### 4.2 探针出口归因与假 verify 清理（2026-11-23，REV-2.1.5.18 PASS）
+
+- 根因：external 模式下 tier/metadata 探针在没有池化 session 时回退 raw httpx 直连，经 VPS egress 触发 region 403；canary 却用健康出口探测并得到 `list_models_ok`，于是误判 `account_bad`，把假 verify 写入 registry（假标 `last_refresh_error=skipped_no_exit: no_exit`）。
+- 修复：external + `direct_fallback` 无出口一律 `skip`/`defer`，不再发裸请求（层 tier/email/rotate/导入/canary 均复用 `probe_egress_allowed()` 谓词）；canary 必须绑定探针实际出口，出口为空或不一致 → `inconclusive`，不写 verify；生成/路由在真实出口上的 403 行为不变。
+- 清理工具：`scripts/clear_verify_required.sh`（`--list`、`--ids`、`--apply --yes`、`--force`；默认 dry-run；`--force` 仅用于 `last_refresh_error=None` 的真号）。脚本已纳入运行时镜像（`708dc40`），可在容器内执行。
+- 证据：`REV-2.1.5.18` PASS（0 P0/P1/P2）；`2035 passed`；CI `45191913250` 绿；Docker `45191913163` / `45193043377` 成功；已部署 `67b0f10` + `708dc40`，服务 healthy。
+
 ---
 
 ## 五、已完成 / 未完成 / 已知坑
@@ -141,8 +149,9 @@
 - 2.1.5 分批与降噪（`e9081d2`）：首轮保活分批，逐账号 INFO + 每轮汇总 WARNING。
 - 元数据/Cookie region 403 接 canary 出口仲裁（`4493ac0`）。
 - 分批饥饿、仲裁 kind、汇总口径修复（`cf96f03`，审查 `REV-2.1.5.16`）。
-- VPS 部署完成：8 出口健康、43 账号绑定、`verify_required` 5 个待扫码（以 `registry.json` 为准）；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
-- 扫码验证 start/status 修复（本地工作区，**未提交/未部署**；审查 `REV-2.1.5.17` PASS）：单次 start、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
+- VPS 部署完成：8 出口健康、43 账号绑定；2026-11-23 生产 `verify_required` 为 9 个（3 真 + 6 假），6 个假标已清理，现只剩 3 个真号待扫码；部署后 `no_capacity`/`region` 均为 0。
+- 扫码验证 start/status 修复（`REV-2.1.5.17` PASS，已提交/已部署）：单次 start、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
+- 探针出口归因与假 verify 清理（`REV-2.1.5.18` PASS，已提交/已部署 `67b0f10` + `708dc40`）：external 无出口探针改 `skip`/`defer`（0 裸请求）、canary 绑定探针实际出口、假标清理工具与镜像脚本就位；CI `45191913250` 绿，Docker `45191913163` / `45193043377` 成功。
 
 ### 5.2 未完成
 
@@ -151,7 +160,7 @@
 - fanout 节点掉线与热备切换尚未补齐。
 - 1 核 1.9GB 容量评估（WARP 4 + fanout 4 + app/signer 的 RSS 与负载）。
 - `request_id` 幂等 app 未发送；`kind` 不参与管理器绑定（恒 `chat`）。
-- 直连应急阀尚未按 `class` 收窄为 maintenance-only（默认关）。
+- 直连应急阀尚未按 `class` 做代码级收窄（默认关）；external 下探针/凭证路径已改为无出口直接 `skip`/`defer`（0 裸请求），generation 永不直连。
 
 ### 5.3 已知坑（务必先读）
 
@@ -192,7 +201,7 @@ curl -s -H "Authorization: Bearer <token>" http://172.17.0.1:8788/v1/status
 
 ### 6.2 备份
 
-- 账号：已存在备份目录（本次为 `/root/verifyflip2-backup-1795426068/`），改账号状态前先备份 `registry.json` / `meta.json` / rotator 状态。
+- 账号：改账号状态前先备份 `registry.json` / `meta.json` / rotator 状态。最近一次假 verify 清理的备份为 `/app/data/accounts/backups/clear-verify-20261123T142240Z`（含 `registry.json`、`rotator_state.json`、对应 `meta/*.json`）；更早的状态改动备份为 `/root/verifyflip2-backup-1795426068/`。
 - 管理器：备份 `/var/lib/exit-manager/state` 与 `/etc/exit-manager/config.json`；state 丢失会导致重新绑定、出口 IP 可能变化，属已知单点风险。
 - fanout：备份 `/opt/fanout` 配置。
 
@@ -221,5 +230,5 @@ curl -s -H "Authorization: Bearer <token>" http://172.17.0.1:8788/v1/status
 2. 处理无响应体 403 的标签取舍（出口嫌疑 vs 账号级记录），避免误烧出口或反复切号。
 3. 补充 fanout 节点掉线检测与热备切换（当前 paid 3 = 2 主力 + 1 热备，掉线不自动补）。
 4. 做 1 核 1.9GB 容量评估（`free -m` / `top` 实测 WARP 4 + fanout 4 + app/signer 的 RSS）。
-5. 提交并部署本轮扫码验证修复（`REV-2.1.5.17`）后，按 `registry.json` 的 `verify_required` 逐个完成扫码（当前 5 个，数量以 registry 为准），部署后复查 `verify_required` 余量。
+5. 已提交并部署本轮扫码验证修复（`REV-2.1.5.17`）与探针归因修复（`REV-2.1.5.18`）；按 `registry.json` 逐个完成 3 个真号的扫码（`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`），完成后复查 `verify_required` 余量；6 个假标已清理并留档备份，不要重复清理真号。
 6. 把 `HANDOVER.md` 与 `AGENT.md` 固化为开工必读；后续所有结论落盘到 `docs/dev/rebuild/domains/` 对应域，不依赖会话记忆。

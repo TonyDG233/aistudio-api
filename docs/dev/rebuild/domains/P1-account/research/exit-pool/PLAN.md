@@ -11,7 +11,7 @@
 
 ## 0. 结论（v2 单一版本）
 
-1. **池子**：fanout 总上限 4 条 = paid 3 条（2 条主力 + 1 条热备）+ free_overflow 1 条；WARP 目标 3 条、上限 6 条。`paid` 只落 fanout，`free` 只落 WARP，`free_overflow` 仅在全部 WARP 不可用且维护队列积压时对 free 应急开放；paid 永不落 WARP，paid 永不使用 overflow。直连应急阀默认关闭，设计口径仅允许 maintenance，generation 永不直连。
+1. **池子**：fanout 总上限 4 条 = paid 3 条（2 条主力 + 1 条热备）+ free_overflow 1 条；WARP 目标 3 条、上限 6 条。`paid` 只落 fanout，`free` 只落 WARP，`free_overflow` 仅在全部 WARP 不可用且维护队列积压时对 free 应急开放；paid 永不落 WARP，paid 永不使用 overflow。直连应急阀默认关闭；external 下探针/凭证路径不得使用 `direct_fallback`（无出口直接 skip/defer，0 裸请求），generation 永不直连。
 2. **预算**：窗口 1800s；paid 软 30 / 硬 45 / 日 400；free 软 50 / 硬 75 / 日 2400；每出口维护预留 20、探针预留 6；日上限只约束 generation；租约 TTL 30~60s。维护/探针严格吃各自预留，生成不得占用。
 3. **接口**：`POST /v1/lease` 为主入口（`account/lane/class/calls/request_id`；成功返回 `exit_id/socks_url/generation/ttl_s/budget_left`；无容量 **429 `no_capacity` + `retry_after_s`**）；`GET /v1/assign` 仅兼容；`POST /v1/events` 接收 `region_403 | verify_account | other_403` + `canary`；`GET /v1/status` 只返回聚合白名单；`request_id` 幂等 600s 且持久化。
 4. **烧毁**：同一健康出口 30 分钟内 ≥2 个不同账号 verify → `cooling` 120 分钟，到期先 L0 探活；单账号 verify 不烧出口；`disabled` 为配置硬开关，任何事件/探针/refresh 都不覆盖；`quarantined` 只走人工 `recover`。
@@ -65,7 +65,7 @@ aistudio-api 进程（browserless；external 下 browser 引擎启动即 fail-fa
     ├─ 同出口 30min ≥2 个不同账号 verify → cooling 7200s（仅 healthy 出口）
     ├─ WARP 3 条（free，目标 3/上限 6；wireproxy 独立 key/端口）
     ├─ fanout 最多 4 条（paid 3 = 2 主力 + 1 热备；free_overflow 1）
-    └─ 直连应急阀（默认关；仅 maintenance；不进自动池）
+    └─ 直连应急阀（默认关；探针/凭证不得使用；generation 永不直连；不进自动池）
 ```
 
 ### 1.2 默认模式（`AISTUDIO_EXIT_MODE` 缺失/非 external）
@@ -235,6 +235,7 @@ def lease(account, lane, cls, calls, request_id):
 - 绑定出口维护预留耗尽 → 429 + `retry_after_s`；管理器记录 `maint_backlog`；**不切到别的出口**（保持 IP 一致）。
 - 维护/探针严格受 `maint_reserve=20` / `probe_reserve=6` 约束，不能借用未用生成空间；这是 v2 与旧 PLAN“维护可借用未用生成空间”的差异，以 `DEPLOY.md` 与实现为准。
 - `no_capacity` 一律 defer：`account_keepalive._retry_delay = max(300s, retry_after_s)`；保持账号 due，不写 `tier_checked_at`/成功；手动刷新返回 `deferred=true`；导入继续入库，不整批 503。
+- external 下无池会话或无出口时，tier/email/rotate/导入/canary 探针**不得裸 httpx 直连**，一律 `skip`/`defer`（0 请求，`REV-2.1.5.18`）；canary 结果必须绑定探针实际出口，出口为空或不一致按 `inconclusive`。
 - 生产口径：预算耗尽/无出口是**排队重试**，不是永久放弃；只有账号禁用、verify 锁、无 Cookie、出口永久 disabled 才是真正的不可调用状态。
 
 **Free 维护容量示例（不编造峰值）**：当前约 41 个 free 账号，按每账号 1~3 次维护调用约 41~123 次；3 条 WARP、每出口每窗口维护预留 20，严格预留下需要约 1~3 个窗口完成，而不是旧版“两波 20~30 分钟”。不要在单窗口内打满 41+ 次；需要更快时优先补 WARP/出口，而不是提高单出口软阈值。
@@ -342,15 +343,16 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 | 保活分批与 `no_capacity` 降噪 | **已完成** | `e9081d2`；首轮 43 账号分批执行，逐账号 INFO、每轮汇总 WARNING，连续 3 个 no_capacity 停止本轮 |
 | 元数据/Cookie region 403 接 canary 出口仲裁 | **已完成** | `4493ac0`；元数据路径 region 403 触发 canary 出口仲裁，不再只记录 |
 | 分批饥饿 / 仲裁 kind / 汇总口径修复 | **已完成** | `cf96f03`；审查 `REV-2.1.5.16` |
-| 扫码验证 start/status 修复 | **已完成（本地待提交）/待部署** | `REV-2.1.5.17` PASS（P2 处理后复审）；单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `status?force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次；全量 2010 passed |
-| VPS 部署（2.1.5） | **已完成** | 8 条健康出口（free WARP 4 / paid fanout 3 / overflow 1）、43 账号全部绑定、`verify_required` 5 个待扫码（用户确认；数量与清单以 `registry.json` 为准）；部署后最近 2 分钟 no_capacity/region 均为 0 |
+| 扫码验证 start/status 修复 | **已完成/已部署** | `REV-2.1.5.17` PASS（P2 处理后复审）；单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `status?force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次；全量 2010 passed |
+| 探针出口归因修复与假 verify 清理 | **已完成/已部署** | `REV-2.1.5.18` PASS（0 P0/P1/P2）；external 无出口探针改 `skip`/`defer`（0 裸请求）、canary 必须绑定探针实际出口（空/不一致 → `inconclusive`）、生成/路由真实出口 403 行为不变；新增 `scripts/clear_verify_required.sh`（`--list`/`--ids`/`--apply --yes`/`--force`）并纳入运行时镜像；`2035 passed`；已部署 `67b0f10` + `708dc40`，服务 healthy |
+| VPS 部署（2.1.5） | **已完成** | 8 条健康出口（free WARP 4 / paid fanout 3 / overflow 1）、43 账号全部绑定；2026-11-23 生产 `verify_required` 9 个 = 3 真 + 6 假，6 假已清理、`registry/meta/rotator` 同步，备份 `/app/data/accounts/backups/clear-verify-20261123T142240Z`，现只剩 3 个真号待扫码；部署后 `no_capacity`/`region` 均为 0 |
 | 后续批次观察（43 账号轮换完成度） | **当前** | 观察分批保活能否把 43 账号全部轮换完成，无连续 no_capacity/region 堆积 |
-| 扫码验证修复部署与待验证账号 | **下一步** | 部署 `REV-2.1.5.17` 修复后按 `registry.json` 的 `verify_required` 逐个扫码（当前 5 个，数量以 registry 为准）；扫码独立直连 Chromium、不进出口池预算、不做软件层硬限流 |
+| 3 个真号扫码 | **下一步** | 按 `registry.json` 逐个扫码 `acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`；扫码独立直连 Chromium、不进出口池预算、不做软件层硬限流 |
 | 无响应体 403 标签取舍 | **下一步** | 空体 403 目前只能按出口嫌疑（Q2）；需定取舍规则，避免误烧出口或反复切号 |
 | fanout 节点掉线/热备 | **下一步** | paid 3 = 2 主力 + 1 热备；掉线检测与热备切换尚未补齐 |
 | 1 核容量评估 | **下一步** | `free -m`/`top` 实测 WARP 4 + fanout 4 + app/signer 的 RSS 与负载 |
 | Linux 运行时回归（fanout 20 用例 + 管理器 157 用例） | **下一步** | VPS 已实机部署；测试套件仍应在 Linux/Termux 或 CI 执行 `GOOS=linux go test ./...` 与 `python -m unittest discover -s data/tools/exit-manager/tests -v` |
-| 直连应急阀收窄为 maintenance-only | **下一步（防御性）** | 当前由 `AISTUDIO_EXIT_DIRECT_FALLBACK` 统一门控，未按 class 收窄；默认关闭，generation fail-closed |
+| 直连应急阀收窄为 maintenance-only | **下一步（防御性）** | 当前由 `AISTUDIO_EXIT_DIRECT_FALLBACK` 统一门控，未按 class 做代码级收窄；默认关闭。external 下探针/凭证路径已强制 skip/defer（0 裸请求），generation 永不直连 |
 
 ---
 
@@ -398,7 +400,7 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 - D-05：迁移/重建只发生在请求前，顺序 release → `active_requests==0` → close → restart → 一次重试；不 blue-green、不同账号双页、不中途热切换（§4.4）。
 - 不做定时/流量主动轮换；WARP 只在人工 recover（或显式 `rotate_on_isolation`）时轮换；不恢复 12MB/35 分钟逻辑（§4.4-4.8）。
 - 不做后台自动 rebind/rebalance；只有隔离/烧毁/人工动作触发迁移，且由请求或运维动作消费（§4.8）。
-- fail-closed：无出口不回退全局 `AISTUDIO_PROXY`；唯一例外是显式 `AISTUDIO_EXIT_DIRECT_FALLBACK`（默认关，目标仅 maintenance）。
+- fail-closed：无出口不回退全局 `AISTUDIO_PROXY`；唯一例外是显式 `AISTUDIO_EXIT_DIRECT_FALLBACK`（默认关）。external 下探针/凭证路径不得使用该应急阀（无出口直接 skip/defer，0 裸请求）；generation 永不直连。
 - 不读账号 Cookie/auth.json 到管理器；只传 HMAC、出口 id、事件分类；canary 在 app 侧（§4.6、EVALUATION §6.4）。
 - 不新增 config schema/UI 设置项；`AISTUDIO_EXIT_*` 只走 env；UI 只读（D-12、EVALUATION §5）。
 - verify 扫码不做软件层硬限流；不把 verify 纳入出口预算；不因出口池阻断扫码。
@@ -438,6 +440,8 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 - 生成计数/D-05：`src/aistudio_api/infrastructure/waa/engine_runtime.py`（`_resolve_exit_proxy`、`request_scope`、`cold_start_lease`）。
 - 维护 defer：`src/aistudio_api/infrastructure/account/account_info_refresher.py`、`src/aistudio_api/application/account_keepalive.py`。
 - verify 事件：`src/aistudio_api/application/routing_pipeline.py`（`verification_required` 分支与 `_report_verify_account_event`）。
+- 探针出口谓词：`src/aistudio_api/infrastructure/exit_pool/resolver.py`（`probe_egress_allowed`、`probe_skip_reason`）；调用点 `account_info_refresher.py`、`account_keepalive.py`、`cookie_parser.py`、`routes_accounts.py`、`exit_arbitration.py`（`probe_exit_id` 门）。
+- 假 verify 清理工具：`scripts/clear_verify_required.py` / `scripts/clear_verify_required.sh`（`--list`、`--ids`、`--apply --yes`、`--force`；默认 dry-run；备份同源 `<accounts-dir>/backups`）。
 - fanout 机器接口：fanout fork `279fd9c`（`machine.go`、`machine_test.go`、`main.go`、`README.md`），以 `REV-2.1.5.12` 二轮记录为准。
 
 ## 附录 B：配置样例（与 `config.example.json` 对齐）
@@ -477,7 +481,7 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 - ~~“2 条 WARP + 3 条 fanout 共 5 条出口”~~ → v2：WARP 目标 3/上限 6 + fanout 上限 4（paid 3 + overflow 1）。
 - ~~“按账号容量（Free 3~5/IP）”“account_soft_cap”“paid_reserved_accounts”“per_account_window_cap=12 / daily=400”~~ → v2：无按账号容量/配额；只按每出口调用预算。
 - ~~“无容量返回 503 `exit_unavailable` / `no_healthy_exit`”~~ → v2：无容量 **429 `no_capacity` + `retry_after_s`**；503 仅管理器不可达/载荷非法等 fail-closed。
-- ~~“无出口直接 skip”~~ → v2：预算/无容量一律 429/defer；只有禁用账号、verify 锁、无 Cookie、配置 `disabled` 才是不可调用状态。
+- ~~“无出口直接 skip”~~ → v2：生成无容量一律 429/defer；external 下探针/凭证路径无出口时直接 skip/defer 且 0 裸请求（`REV-2.1.5.18`）；只有禁用账号、verify 锁、无 Cookie、配置 `disabled` 才是不可调用状态。
 - ~~“lease 返回 `granted` / `category` / `ttl_s=120`”~~ → v2：返回 `exit_id/socks_url/generation/ttl_s(30~60)/budget_left`；`calls` 是请求字段。
 - ~~“全出口统一 soft=50/hard=75/daily=2400”~~ → v2：paid 30/45/400、free 50/75/2400。
 - ~~“日上限约束所有类别”~~ → v2：日上限只约束 generation；维护/探针只受窗口预留与 hard_limit。
