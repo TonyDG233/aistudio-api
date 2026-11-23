@@ -221,7 +221,7 @@ def _domain_payload(
 def _retry_after_headers(exc: Exception) -> dict[str, str] | None:
     if not isinstance(exc, RoutingError):
         return None
-    if classify_gemini_error_payload(exc)[0] != 503:
+    if classify_gemini_error_payload(exc)[0] not in (429, 503):
         return None
     retry_after = getattr(exc, "retry_after", None)
     try:

@@ -39,7 +39,7 @@ from aistudio_api.application.account_keepalive import (
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.application.instance_manager import InstanceManager
 from aistudio_api.config import settings
-from aistudio_api.domain.errors import RoutingError
+from aistudio_api.domain.errors import ExitBudgetWaitError, RoutingError
 from aistudio_api.domain.instances import InstanceState
 from aistudio_api.infrastructure.account.account_info_refresher import (
     EXTERNAL_BATCH_PACING_SECONDS,
@@ -58,6 +58,7 @@ from aistudio_api.infrastructure.exit_pool import (
     reset_exit_resolver,
     resolve_credential_exit,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import LeaseResult
 from aistudio_api.infrastructure.gateway.instance_pool import InstancePool, InstanceSpec
 from aistudio_api.infrastructure.waa.browserless_session import BrowserlessSession
 from aistudio_api.infrastructure.waa.engine_runtime import (
@@ -1521,6 +1522,7 @@ def test_external_missing_exit_surfaces_503_and_slot_stays_usable(
 
         assert excinfo.value.status_code == 503
         assert excinfo.value.code == "exit_unavailable"
+
         assert signer.method_calls == []  # zero upstream calls
 
         # The protocol adapter renders the same 503/code to the client.
@@ -1544,6 +1546,7 @@ def test_external_missing_exit_surfaces_503_and_slot_stays_usable(
         # Manager recovers: the same slot must build a session and serve.
         resolver.fail = False
         context = await pipeline.begin(model_path="gemini-4-argon")
+
         attempt = await pipeline.acquire(context)
         assert attempt is not None
         assert attempt.handle.slot.session is not None
@@ -1750,3 +1753,228 @@ def test_detect_account_tier_no_exit_returns_503(tmp_path: Any) -> None:
         )
 
     assert excinfo.value.status_code == 503
+
+
+# --------------------------------------------------------------------------- #
+# Lease budget: per-request counting, 429 no_capacity and deferred semantics
+# --------------------------------------------------------------------------- #
+
+
+class _LeaseResolver:
+    """Manager double with the ``/v1/lease`` surface only."""
+
+    def __init__(
+        self, *, no_capacity: bool = False, retry_after_s: float = 0.0
+    ) -> None:
+        self.no_capacity = no_capacity
+        self.retry_after_s = retry_after_s
+        self.calls: list[tuple[str, str, str, int, str]] = []
+
+    async def lease(
+        self,
+        account_id: str,
+        *,
+        lane: str = "free",
+        cls: str = "generation",
+        calls: int = 1,
+        kind: str = "chat",
+        use_cache: bool = False,
+    ) -> LeaseResult:
+        del use_cache
+        self.calls.append((account_id, lane, cls, calls, kind))
+        if self.no_capacity:
+            return LeaseResult(
+                "no_capacity",
+                retry_after_s=self.retry_after_s,
+                reason="no_capacity",
+            )
+        return LeaseResult(
+            "ok",
+            exit_id="exit-1",
+            socks_url=EXIT_ONE,
+            generation=1,
+            ttl_s=120,
+            budget_left=20,
+        )
+
+    async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None:
+        del account_id, kind
+        return None if self.no_capacity else EXIT_ONE
+
+
+def test_resolve_credential_exit_returns_defer_on_no_capacity() -> None:
+    resolver = _LeaseResolver(no_capacity=True, retry_after_s=17.0)
+    decision = asyncio.run(
+        resolve_credential_exit(
+            "acc1",
+            lane="free",
+            category="maintenance",
+            resolver=cast(Any, resolver),
+        )
+    )
+
+    assert decision.action == "defer"
+    assert decision.deferred is True
+    assert decision.allowed is False
+    assert decision.retry_after_s == pytest.approx(17.0)
+    assert resolver.calls == [("acc1", "free", "maintenance", 1, "chat")]
+
+
+def test_leased_session_counts_once_per_request_scope() -> None:
+    from contextlib import asynccontextmanager
+
+    from aistudio_api.infrastructure.waa.engine_runtime import (
+        _LeasedBrowserlessSession,
+    )
+
+    class _Delegate:
+        engine = "browserless"
+        active_context = object()
+
+        @asynccontextmanager
+        async def request_scope(self):
+            yield self.active_context
+
+        async def send_hooked_request(self, **kwargs: object):
+            del kwargs
+            return 200, b"[]"
+
+        async def send_streaming_request(self, **kwargs: object):
+            del kwargs
+            yield "data", b"[]"
+
+        async def rotate_cookies_via_signer(self) -> dict[str, object]:
+            return {"ok": True}
+
+    resolver = _LeaseResolver()
+    session = _LeasedBrowserlessSession(
+        cast(Any, _Delegate()),
+        resolver=cast(Any, resolver),
+        account_id="acc_pro",
+        lane="paid",
+        kind="chat",
+        bound_socks=EXIT_ONE,
+    )
+
+    async def _run() -> None:
+        async with session.request_scope():
+            await session.send_hooked_request(body="x")
+            await session.send_hooked_request(body="x")
+        await session.send_hooked_request(body="x")
+        _ = [event async for event in session.send_streaming_request(body="x")]
+        await session.rotate_cookies_via_signer()
+
+    asyncio.run(_run())
+
+    # One generation lease for the whole request scope (capture + RPC), then
+    # each unscoped maintenance send/rotate leases its own maintenance call.
+    assert resolver.calls == [
+        ("acc_pro", "paid", "generation", 1, "chat"),
+        ("acc_pro", "paid", "maintenance", 1, "chat"),
+        ("acc_pro", "paid", "maintenance", 1, "chat"),
+        ("acc_pro", "paid", "maintenance", 1, "chat"),
+    ]
+
+
+def test_leased_session_raises_429_budget_wait() -> None:
+    from contextlib import asynccontextmanager
+
+    from aistudio_api.infrastructure.waa.engine_runtime import (
+        _LeasedBrowserlessSession,
+    )
+
+    class _Delegate:
+        engine = "browserless"
+        active_context = object()
+
+        @asynccontextmanager
+        async def request_scope(self):
+            yield self.active_context
+
+        async def send_hooked_request(self, **kwargs: object):
+            del kwargs
+            return 200, b"[]"
+
+    resolver = _LeaseResolver(no_capacity=True, retry_after_s=12.0)
+    session = _LeasedBrowserlessSession(
+        cast(Any, _Delegate()),
+        resolver=cast(Any, resolver),
+        account_id="acc1",
+        lane="free",
+        kind="chat",
+        bound_socks=EXIT_ONE,
+    )
+
+    with pytest.raises(ExitBudgetWaitError) as excinfo:
+        asyncio.run(session.send_hooked_request(body="x"))
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.code == "no_capacity"
+    assert excinfo.value.retry_after == 12
+
+
+def test_generation_no_capacity_surfaces_429_and_keeps_slot_retryable(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: engine lease 429 -> pool UNSTARTED -> routing 429 no_capacity."""
+    from aistudio_api.application.routing_pipeline import RoutingPipeline
+
+    monkeypatch.setattr(settings, "proxy_url", SENTINEL_GLOBAL)
+    store = AccountStore(tmp_path / "accounts_e2e_429")
+    account = store.save_account(
+        name="Free",
+        email="free@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_free",
+        tier="Free",
+    )
+    store.set_active_account(account.id)
+    resolver = _LeaseResolver(no_capacity=True, retry_after_s=23.0)
+    runtime = BrowserlessEngineRuntime(
+        {
+            "mode": "browserless",
+            "browserless": {
+                "signer": {"mode": "remote_http", "endpoint": "http://127.0.0.1:1"},
+                "transport": {"mode": "signer_rpc"},
+            },
+        },
+        signer_client=cast(Any, MagicMock()),
+        exit_resolver=cast(Any, resolver),
+    )
+
+    async def _no_cdp() -> Any:
+        raise AssertionError("browserless engine must never request CDP")
+
+    pool = InstancePool(
+        cast(Any, _no_cdp),
+        specs=[InstanceSpec(count=1, surface="chat", only_tier="Free")],
+        max_contexts=2,
+        engine_runtime=runtime,
+        engine="browserless",
+        load_attempts=1,
+    )
+    manager = InstanceManager(pool, store)
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        routing_settings_provider=lambda: {
+            "max_switches": 2,
+            "retry_same_delay_sec": 0,
+        },
+    )
+
+    async def _run() -> None:
+        await manager.startup()
+        listed = (await manager.list_instances()).instances
+        assert [item.state for item in listed] == [InstanceState.UNSTARTED]
+
+        with pytest.raises(ExitBudgetWaitError) as excinfo:
+            context = await pipeline.begin(model_path="gemini-3.7-flash")
+            await pipeline.acquire(context)
+
+        assert excinfo.value.status_code == 429
+        assert excinfo.value.code == "no_capacity"
+        assert excinfo.value.retry_after == 23
+        listed_after = (await manager.list_instances()).instances
+        assert [item.state for item in listed_after] == [InstanceState.UNSTARTED]
+
+    asyncio.run(_run())

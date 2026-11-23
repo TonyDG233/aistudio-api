@@ -45,14 +45,31 @@ def clean_upstream_error_message(raw_msg: str) -> str:
     return msg or inner
 
 
+def _routing_gemini_status(status: int) -> str:
+    if status == 429:
+        return "RESOURCE_EXHAUSTED"
+    return "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
+
+
+def _routing_openai_type(status: int) -> str:
+    if status == 429:
+        return "rate_limit_exceeded"
+    return "service_unavailable" if status >= 500 else "invalid_request"
+
+
+def _routing_claude_type(status: int) -> str:
+    if status == 429:
+        return "rate_limit_error"
+    return "api_error"
+
+
 def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
     """Extract standard Gemini HTTP status code, message, and status string."""
     if isinstance(exc, TierRequiredError):
         return 403, str(exc), "PERMISSION_DENIED"
     if isinstance(exc, RoutingError):
         status = int(getattr(exc, "status_code", 503))
-        status_text = "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
-        return status, str(exc), status_text
+        return status, str(exc), _routing_gemini_status(status)
     if isinstance(exc, SessionExpiredError):
         return (
             401,
@@ -159,24 +176,23 @@ def error_payload(
         if protocol != "gemini":
             field_values.pop("type", None)
         if protocol == "gemini":
-            status_text = "UNAVAILABLE" if status >= 500 else "PERMISSION_DENIED"
             return status, {
                 "error": {
                     "code": status,
                     "message": message,
-                    "status": status_text,
+                    "status": _routing_gemini_status(status),
                     **field_values,
                 }
             }
         if protocol == "claude":
             return status, _claude_error(
                 message=message,
-                error_type="api_error",
+                error_type=_routing_claude_type(status),
                 extra={"code": exc.code, **field_values},
             )
         return status, _openai_error(
             message=message,
-            error_type="service_unavailable" if status >= 500 else "invalid_request",
+            error_type=_routing_openai_type(status),
             code=exc.code,
             extra=field_values,
         )

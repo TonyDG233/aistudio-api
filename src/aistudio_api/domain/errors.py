@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 
 class AistudioError(Exception):
@@ -138,21 +139,57 @@ class RoutingError(AistudioError):
 
 
 EXIT_UNAVAILABLE_CODE = "exit_unavailable"
+EXIT_NO_CAPACITY_CODE = "no_capacity"
+EXIT_REBUILD_REQUIRED_CODE = "exit_rebuild_required"
+
+# Exit-pool rejections that are transient infrastructure conditions, never a
+# broken slot: the pool must leave the slot retryable (UNSTARTED) and let the
+# explicit HTTP status propagate instead of latching INVALID.
+_EXIT_TRANSIENT_CODES = frozenset(
+    {EXIT_UNAVAILABLE_CODE, EXIT_NO_CAPACITY_CODE, EXIT_REBUILD_REQUIRED_CODE}
+)
 
 
 def is_exit_unavailable_error(exc: BaseException | None) -> bool:
-    """True when ``exc`` is the fail-closed "no account exit" routing rejection.
+    """True for transient exit-pool rejections (no exit / no budget / rebuild).
 
-    External exit mode raises :class:`RoutingError` with
-    ``code="exit_unavailable"`` (HTTP 503) before any credential-bearing request
-    is sent.  Instance lifecycle layers must re-raise it untouched instead of
-    wrapping it into an ``InstanceNotReadyError`` (409), otherwise the API can
-    never surface the fail-closed contract and the slot would be poisoned.
+    External exit mode raises :class:`RoutingError` subclasses before any
+    credential-bearing request is sent: ``exit_unavailable`` (503 fail-closed),
+    ``no_capacity`` (429 budget wait) or ``exit_rebuild_required`` (503).  Slot
+    lifecycle layers must re-raise them untouched and keep the slot retryable
+    instead of wrapping them into ``InstanceNotReadyError``/INVALID.
     """
     return (
         isinstance(exc, RoutingError)
-        and getattr(exc, "code", "") == EXIT_UNAVAILABLE_CODE
+        and getattr(exc, "code", "") in _EXIT_TRANSIENT_CODES
     )
+
+
+class ExitBudgetWaitError(RoutingError):
+    """The exit manager returned 429 ``no_capacity`` (call budget exhausted).
+
+    This is not an account failure and must not consume the account's upstream
+    429 cooldown: the request is rejected with HTTP 429 + ``Retry-After`` and
+    the candidate loop must not mask it with a 503 or switch accounts.
+    """
+
+    status_code = 429
+    code = EXIT_NO_CAPACITY_CODE
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float = 30.0,
+        surface: str | None = None,
+    ) -> None:
+        self.retry_after = max(1, math.ceil(retry_after))
+        super().__init__(
+            message,
+            code=self.code,
+            surface=surface,
+            advice="出口调用预算暂不可用，请按 Retry-After 等待后重试。",
+        )
 
 
 class EngineSwitchingError(RoutingError):

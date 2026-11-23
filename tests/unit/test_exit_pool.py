@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -19,6 +20,7 @@ from aistudio_api.infrastructure.exit_pool import (
     parse_socks_url,
     reset_exit_resolver,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import lane_for_tier
 from aistudio_api.infrastructure.waa.engine_runtime import BrowserlessEngineRuntime
 
 _ENV_NAMES = (
@@ -70,6 +72,24 @@ def _resolver_with_transport(
 
 
 # --------------------------------------------------------------- config / gate
+
+
+@pytest.mark.parametrize(
+    ("tier", "lane"),
+    [
+        ("Free", "free"),
+        ("free", "free"),
+        ("", "free"),
+        (None, "free"),
+        ("unknown-tier", "free"),
+        ("Plus", "paid"),
+        ("Pro", "paid"),
+        ("Ultra", "paid"),
+        ("Ultra_20X", "paid"),
+    ],
+)
+def test_lane_for_tier_never_sends_unknown_to_paid(tier: object, lane: str) -> None:
+    assert lane_for_tier(tier) == lane
 
 
 def test_off_mode_builds_no_config_and_no_resolver() -> None:
@@ -186,7 +206,7 @@ def test_parse_socks_url_whitelist(url: object, expected: str | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_assigns_caches_and_sends_hmac(
+async def test_resolve_leases_caches_and_sends_hmac(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_external_env(monkeypatch)
@@ -202,7 +222,7 @@ async def test_resolve_assigns_caches_and_sends_hmac(
                 "socks_url": "socks5h://172.17.0.1:40001",
                 "generation": 3,
                 "ttl_s": 30,
-                "healthy": True,
+                "budget_left": 41,
             },
         )
 
@@ -214,11 +234,13 @@ async def test_resolve_assigns_caches_and_sends_hmac(
     assert second == first
     assert len(seen) == 1
     request = seen[0]
-    assert request.url.path == "/v1/assign"
-    assert request.url.params["account"] == hmac_account_id(
-        "hmac-key", "acc-1@example.com"
-    )
-    assert request.url.params["kind"] == "chat"
+    assert request.method == "POST"
+    assert request.url.path == "/v1/lease"
+    payload = json.loads(request.content)
+    assert payload["account"] == hmac_account_id("hmac-key", "acc-1@example.com")
+    assert payload["lane"] == "free"
+    assert payload["class"] == "generation"
+    assert payload["calls"] == 1
     assert request.headers["authorization"] == "Bearer secret-token"
 
     assignment = resolver.assignment_for("acc-1@example.com", kind="chat")
@@ -229,6 +251,111 @@ async def test_resolve_assigns_caches_and_sends_hmac(
     now[0] += 31.0
     assert await resolver.resolve("acc-1@example.com", kind="chat") == first
     assert len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_lease_counts_every_call_and_parses_no_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_external_env(monkeypatch)
+    calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        if calls[0] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-1",
+                    "socks_url": "socks5h://172.17.0.1:40001",
+                    "generation": 1,
+                    "ttl_s": 120,
+                    "budget_left": 10,
+                },
+            )
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "19"},
+            json={"error": "no_capacity", "retry_after_s": 18.4, "lane": "free"},
+        )
+
+    resolver = _resolver_with_transport(handler)
+    ok = await resolver.lease("acc-1", lane="free", cls="generation")
+    assert ok.ok is True
+    assert ok.exit_id == "exit-1"
+    assert ok.budget_left == 10
+    # The successful lease warmed a 30~60s binding cache...
+    assert resolver.assignment_for("acc-1") is not None
+
+    # ...but counted calls must still reach the manager (no cache bypass).
+    denied = await resolver.lease("acc-1", lane="free", cls="generation")
+    assert denied.status == "no_capacity"
+    assert denied.retry_after_s == pytest.approx(18.4)
+    assert denied.reason == "no_capacity"
+    assert calls[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_keeps_legacy_fake_resolver_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_external_env(monkeypatch)
+    from aistudio_api.infrastructure.exit_pool import resolve_credential_exit
+
+    class _OnlyResolve:
+        async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None:
+            assert account_id == "acc-1"
+            return "socks5h://172.17.0.1:40001"
+
+    decision = await resolve_credential_exit(
+        "acc-1", resolver=cast(Any, _OnlyResolve())
+    )
+    assert decision.action == "proxy"
+    assert decision.proxy == "socks5h://172.17.0.1:40001"
+
+
+@pytest.mark.asyncio
+async def test_lease_cache_ttl_is_clamped_to_30_60s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_external_env(monkeypatch)
+    now = [1000.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "exit_id": "exit-1",
+                "socks_url": "socks5h://172.17.0.1:40001",
+                "generation": 1,
+                "ttl_s": 120,
+            },
+        )
+
+    resolver = _resolver_with_transport(handler, clock=lambda: now[0])
+    assert (await resolver.lease("acc-1")).ok is True
+    now[0] += 59.0
+    assert resolver.assignment_for("acc-1") is not None
+    now[0] += 2.0
+    assert resolver.assignment_for("acc-1") is None
+
+
+@pytest.mark.asyncio
+async def test_lease_no_capacity_retry_after_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_external_env(monkeypatch)
+    header_only = _resolver_with_transport(
+        lambda request: httpx.Response(429, headers={"Retry-After": "45"})
+    )
+    result = await header_only.lease("acc-1")
+    assert result.status == "no_capacity"
+    assert result.retry_after_s == pytest.approx(45.0)
+
+    bare = _resolver_with_transport(lambda request: httpx.Response(429))
+    result = await bare.lease("acc-1")
+    assert result.status == "no_capacity"
+    assert result.retry_after_s == pytest.approx(30.0)
 
 
 @pytest.mark.asyncio
@@ -282,26 +409,33 @@ async def test_resolve_invalid_url_falls_back(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("healthy", [False, None])
-async def test_resolve_unhealthy_exit_falls_back_and_is_not_cached(
-    monkeypatch: pytest.MonkeyPatch, healthy: object
+async def test_lease_contract_has_no_healthy_flag(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The real ``/v1/lease`` 200 payload carries no ``healthy`` flag."""
     _set_external_env(monkeypatch)
-    payload: dict[str, object] = {
+    payload = {
         "exit_id": "exit-1",
         "socks_url": "socks5h://172.17.0.1:40001",
         "generation": 1,
-        "ttl_s": 30,
+        "ttl_s": 120,
+        "budget_left": 5,
     }
-    if healthy is not None:
-        payload["healthy"] = healthy
     resolver = _resolver_with_transport(
         lambda request: httpx.Response(200, json=payload)
     )
 
-    assert await resolver.resolve("acc-1") is None
-    assert resolver.assignment_for("acc-1") is None
-    assert resolver.assignment_for("acc-1", include_expired=True) is None
+    result = await resolver.lease("acc-1")
+    assert result.ok is True
+
+    bad = _resolver_with_transport(
+        lambda request: httpx.Response(
+            200,
+            json={**payload, "socks_url": "http://172.17.0.1:40001"},
+        )
+    )
+    assert (await bad.lease("acc-1")).status == "error"
+    assert bad.assignment_for("acc-1") is None
 
 
 @pytest.mark.asyncio
@@ -311,7 +445,7 @@ async def test_invalidate_exit_drops_every_account_on_that_exit(
     _set_external_env(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        account = request.url.params["account"]
+        account = str(json.loads(request.content)["account"])
         exit_id = (
             "exit-2" if account == hmac_account_id("hmac-key", "acc-2") else "exit-1"
         )

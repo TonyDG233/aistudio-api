@@ -21,13 +21,14 @@ import asyncio
 import hashlib
 import hmac
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 import httpx
 
+from aistudio_api.domain.model_access import account_is_paid
 from aistudio_api.infrastructure.exit_pool.config import (
     ExitPoolConfig,
     direct_fallback_enabled,
@@ -37,11 +38,34 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 log = get_logger("exit-pool")
 
 ASSIGN_PATH = "/v1/assign"
+LEASE_PATH = "/v1/lease"
 EVENTS_PATH = "/v1/events"
 STATUS_PATH = "/v1/status"
 STATUS_TIMEOUT_S = 2.0
 STATUS_CACHE_TTL_S = 15.0
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"socks5", "socks5h"})
+
+# App-side lease/binding cache: the manager remains the authority for sticky
+# bindings, but a resolved exit is reused for a short window so session creation
+# and canary arbitration do not hammer the control endpoint.
+LEASE_CACHE_MIN_S = 30.0
+LEASE_CACHE_MAX_S = 60.0
+
+# Fallback wait when the manager's 429 payload/header omits retry_after_s.
+DEFAULT_DEFER_RETRY_S = 30.0
+
+LANE_FREE = "free"
+LANE_PAID = "paid"
+
+
+def lane_for_tier(tier: object) -> str:
+    """Exit lane derived from an account tier (unknown/empty is always free).
+
+    Only paid tiers (Plus/Pro/Ultra/Paid) may use the paid lane.  An empty or
+    unrecognised tier must never be sent to paid exits.
+    """
+    return LANE_PAID if account_is_paid(tier) else LANE_FREE
+
 
 # Emergency-valve log throttle: one WARNING per account per window so a
 # sustained manager outage never floods the log.
@@ -62,6 +86,33 @@ class ExitAssignmentResolver(Protocol):
 
 
 @dataclass(frozen=True)
+class LeaseResult:
+    """Outcome of one ``POST /v1/lease`` call.
+
+    ``status`` is one of ``"ok"``, ``"no_capacity"`` or ``"error"``.  A
+    ``no_capacity`` result carries ``retry_after_s`` and must never be treated
+    as a skip: the caller defers and retries after that delay.
+    """
+
+    status: str
+    exit_id: str = ""
+    socks_url: str = ""
+    generation: int = 0
+    ttl_s: float = 0.0
+    budget_left: int = 0
+    retry_after_s: float = 0.0
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    @property
+    def no_capacity(self) -> bool:
+        return self.status == "no_capacity"
+
+
+@dataclass(frozen=True)
 class ExitDecision:
     """Explicit outbound-proxy decision for one credential-bearing call.
 
@@ -69,6 +120,8 @@ class ExitDecision:
 
     * ``"proxy"`` — send through ``proxy`` (which may be ``None`` = direct when
       the global mode is off or the emergency valve produced it).
+    * ``"defer"`` — the exit manager returned 429 no_capacity: do not send now,
+      retry after ``retry_after_s`` (never a skip, never a failure).
     * ``"skip"`` — do not send the request at all (fail-closed).
     * ``"direct_fallback"`` — emergency valve: send without any proxy.
     """
@@ -77,15 +130,23 @@ class ExitDecision:
     proxy: str | None = None
     reason: str | None = None
     external: bool = False
+    retry_after_s: float = 0.0
+    exit_id: str = ""
+    generation: int = 0
+
+    @property
+    def deferred(self) -> bool:
+        return self.action == "defer"
 
     @property
     def allowed(self) -> bool:
         """True when the caller may issue the upstream request."""
-        return self.action != "skip"
+        return self.action in ("proxy", "direct_fallback")
 
 
 _direct_fallback_log_at: dict[str, float] = {}
 _skip_log_at: dict[tuple[str, str], float] = {}
+_defer_log_at: dict[tuple[str, str], float] = {}
 
 
 def reset_direct_fallback_log() -> None:
@@ -96,6 +157,27 @@ def reset_direct_fallback_log() -> None:
 def reset_skip_log() -> None:
     """Clear the fail-closed skip log throttle (tests/teardown)."""
     _skip_log_at.clear()
+    _defer_log_at.clear()
+
+
+def _log_deferred(
+    account_id: str, *, kind: str, reason: str, retry_after_s: float
+) -> None:
+    """Throttled no-capacity defer warning (one per account+reason per window)."""
+    key = (account_id or "<none>", reason)
+    now = time.monotonic()
+    last = _defer_log_at.get(key, 0.0)
+    if now - last < SKIP_LOG_INTERVAL_S:
+        return
+    _defer_log_at[key] = now
+    log.warning(
+        "[exit-pool] 出口调用预算不足（no_capacity），账号 %s 本轮延迟 %.0fs 重试"
+        "reason=%s kind=%s",
+        account_id or "<none>",
+        retry_after_s,
+        reason,
+        kind,
+    )
 
 
 def _log_skip(account_id: str, *, kind: str, reason: str) -> None:
@@ -139,15 +221,19 @@ async def resolve_credential_exit(
     account_id: str,
     *,
     kind: str = "chat",
+    lane: str = LANE_FREE,
+    category: str = "generation",
     resolver: ExitAssignmentResolver | None = None,
 ) -> ExitDecision:
     """Decide the outbound proxy for one credential-bearing upstream call.
 
     * off mode (no resolver): return the existing global proxy, which may be
       ``None`` to keep the current direct behaviour.
-    * external mode: ask the manager for this account's exit; a missing exit or
-      an unreachable manager yields ``skip`` (fail-closed) unless the operator
-      explicitly enabled ``AISTUDIO_EXIT_DIRECT_FALLBACK``.
+    * external mode: ask the manager for this account's exit; a 429
+      ``no_capacity`` yields ``defer`` with ``retry_after_s`` (never skip /
+      failure), a missing exit or an unreachable manager yields ``skip``
+      (fail-closed) unless the operator explicitly enabled
+      ``AISTUDIO_EXIT_DIRECT_FALLBACK``.
     """
     active = resolver if resolver is not None else get_exit_resolver()
     if active is None:
@@ -156,7 +242,39 @@ async def resolve_credential_exit(
         _log_skip(account_id, kind=kind, reason="no_account")
         return ExitDecision("skip", reason="no_account", external=True)
     try:
-        proxy = await active.resolve(account_id, kind=kind)
+        lease_fn = getattr(active, "lease", None)
+        if callable(lease_fn):
+            lease_call = cast(Callable[..., Awaitable[LeaseResult]], lease_fn)
+            result = await lease_call(
+                account_id, lane=lane, cls=category, calls=1, kind=kind
+            )
+            if result.ok:
+                return ExitDecision(
+                    "proxy",
+                    proxy=result.socks_url,
+                    external=True,
+                    exit_id=result.exit_id,
+                    generation=result.generation,
+                )
+            if result.no_capacity:
+                reason = result.reason or "no_capacity"
+                retry_after = result.retry_after_s or DEFAULT_DEFER_RETRY_S
+                _log_deferred(
+                    account_id,
+                    kind=kind,
+                    reason=reason,
+                    retry_after_s=retry_after,
+                )
+                return ExitDecision(
+                    "defer",
+                    reason=reason,
+                    external=True,
+                    retry_after_s=retry_after,
+                    exit_id=result.exit_id,
+                )
+            proxy = None
+        else:  # legacy/fake resolver implementing only ``resolve``
+            proxy = await active.resolve(account_id, kind=kind)
     except Exception as exc:  # pragma: no cover - resolver never raises
         log.warning(
             "[exit-pool] 出口解析异常（fail-closed）account=%s kind=%s error=%s",
@@ -379,11 +497,159 @@ class ExitResolver:
             self._cache.pop(key, None)
             self._last_known.pop(key, None)
 
-    async def resolve(self, account_id: str, *, kind: str = "chat") -> str | None:
+    async def lease(
+        self,
+        account_id: str,
+        *,
+        lane: str = LANE_FREE,
+        cls: str = "generation",
+        calls: int = 1,
+        kind: str = "chat",
+        use_cache: bool = False,
+    ) -> LeaseResult:
+        """Lease ``calls`` upstream calls on this account's bound exit.
+
+        Never raises: transport/protocol failures return ``LeaseResult("error")``
+        and a manager 429 returns ``LeaseResult("no_capacity", retry_after_s=...)``
+        so callers can defer without treating it as a failure.  Counting is
+        authoritative: only ``use_cache=True`` (session resolution) may reuse the
+        short-lived binding cache and skip the manager round trip.
+        """
+        if not account_id:
+            return LeaseResult("error", reason="no_account")
+        if use_cache:
+            cached = self.assignment_for(account_id, kind=kind)
+            if cached is not None:
+                return LeaseResult(
+                    "ok",
+                    exit_id=cached.exit_id,
+                    socks_url=cached.socks_url,
+                    generation=cached.generation,
+                    ttl_s=cached.ttl_s,
+                )
+        safe_calls = calls if isinstance(calls, int) and calls >= 1 else 1
+        account_hmac = hmac_account_id(self._config.hmac_key, account_id)
+        payload = {
+            "account": account_hmac,
+            "lane": lane,
+            "class": cls,
+            "calls": safe_calls,
+        }
+        try:
+            client = self._ensure_client()
+            response = await client.post(
+                f"{self._config.endpoint}{LEASE_PATH}",
+                json=payload,
+                headers={"Authorization": f"Bearer {self._config.token}"},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[exit-pool] 租约请求失败 kind=%s class=%s error=%s",
+                kind,
+                cls,
+                type(exc).__name__,
+            )
+            return LeaseResult("error", reason="manager_unreachable")
+
+        if response.status_code == 429:
+            return self._parse_no_capacity(response)
+        if response.status_code != 200:
+            log.warning(
+                "[exit-pool] 租约不可用 kind=%s class=%s status=%s",
+                kind,
+                cls,
+                response.status_code,
+            )
+            return LeaseResult("error", reason=f"http_{response.status_code}")
+        try:
+            body: Any = response.json()
+        except ValueError:
+            log.warning("[exit-pool] 租约响应非 JSON kind=%s class=%s", kind, cls)
+            return LeaseResult("error", reason="invalid_json")
+        result = self._parse_lease(body)
+        if result.ok:
+            self._store(
+                account_id,
+                kind,
+                ExitAssignment(
+                    exit_id=result.exit_id,
+                    socks_url=result.socks_url,
+                    generation=result.generation,
+                    ttl_s=result.ttl_s,
+                    healthy=True,
+                ),
+            )
+        else:
+            log.warning(
+                "[exit-pool] 租约响应非法（socks_url 未通过白名单）"
+                "kind=%s class=%s reason=%s",
+                kind,
+                cls,
+                result.reason,
+            )
+        return result
+
+    def _parse_no_capacity(self, response: httpx.Response) -> LeaseResult:
+        retry_after = 0.0
+        exit_id = ""
+        reason = "no_capacity"
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            retry_after = _as_float(body.get("retry_after_s"), 0.0)
+            if isinstance(body.get("exit_id"), str):
+                exit_id = str(body["exit_id"])
+            if isinstance(body.get("error"), str) and body["error"]:
+                reason = str(body["error"])
+        if retry_after <= 0.0:
+            raw_header = response.headers.get("Retry-After")
+            if isinstance(raw_header, str):
+                try:
+                    retry_after = float(raw_header.strip())
+                except ValueError:
+                    retry_after = 0.0
+        if retry_after <= 0.0:
+            retry_after = DEFAULT_DEFER_RETRY_S
+        return LeaseResult(
+            "no_capacity",
+            retry_after_s=retry_after,
+            reason=reason,
+            exit_id=exit_id,
+        )
+
+    def _parse_lease(self, payload: object) -> LeaseResult:
+        if not isinstance(payload, dict):
+            return LeaseResult("error", reason="invalid_payload")
+        exit_id = payload.get("exit_id")
+        if not isinstance(exit_id, str) or not exit_id.strip():
+            return LeaseResult("error", reason="missing_exit_id")
+        socks_url = parse_socks_url(
+            payload.get("socks_url"), self._config.allowed_hosts
+        )
+        if socks_url is None:
+            return LeaseResult("error", reason="invalid_socks_url", exit_id=exit_id)
+        return LeaseResult(
+            "ok",
+            exit_id=exit_id.strip(),
+            socks_url=socks_url,
+            generation=_as_int(payload.get("generation"), 0),
+            ttl_s=_as_float(payload.get("ttl_s"), 0.0),
+            budget_left=_as_int(payload.get("budget_left"), 0),
+        )
+
+    async def resolve(
+        self, account_id: str, *, kind: str = "chat", lane: str = LANE_FREE
+    ) -> str | None:
         """Resolve the socks URL for one account, or ``None`` when unavailable.
 
         ``None`` means "no usable exit": callers must fail closed, never fall
-        back to the global proxy.
+        back to the global proxy.  This legacy entry point reuses the short
+        binding cache; generation/maintenance callers use :meth:`lease` so every
+        counted call reaches the manager.
         """
         if not account_id:
             return None
@@ -394,21 +660,10 @@ class ExitResolver:
             cached = self.assignment_for(account_id, kind=kind)
             if cached is not None:
                 return cached.socks_url
-            try:
-                assignment = await self._fetch_assignment(account_id, kind)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning(
-                    "[exit-pool] 出口分配异常（无可用出口）kind=%s error=%s",
-                    kind,
-                    type(exc).__name__,
-                )
-                return None
-            if assignment is None:
-                return None
-            self._store(account_id, kind, assignment)
-            return assignment.socks_url
+            result = await self.lease(
+                account_id, lane=lane, cls="generation", calls=1, kind=kind
+            )
+            return result.socks_url if result.ok else None
 
     async def pool_status(self) -> dict[str, object]:
         """Read-only manager status, cached for 15s; never raises.
@@ -467,83 +722,12 @@ class ExitResolver:
 
     def _store(self, account_id: str, kind: str, assignment: ExitAssignment) -> None:
         ttl = assignment.ttl_s if assignment.ttl_s > 0 else self._config.ttl_s
-        ttl = max(1.0, min(ttl, self._config.ttl_s))
+        ttl = max(LEASE_CACHE_MIN_S, min(ttl, LEASE_CACHE_MAX_S))
         key = self.cache_key(account_id, kind)
         self._last_known[key] = assignment
         self._cache[key] = _CacheEntry(
             assignment=assignment,
             expires_at=self._clock() + ttl,
-        )
-
-    async def _fetch_assignment(
-        self, account_id: str, kind: str
-    ) -> ExitAssignment | None:
-        client = self._ensure_client()
-        account_hmac = hmac_account_id(self._config.hmac_key, account_id)
-        try:
-            response = await client.get(
-                f"{self._config.endpoint}{ASSIGN_PATH}",
-                params={"account": account_hmac, "kind": kind},
-                headers={"Authorization": f"Bearer {self._config.token}"},
-            )
-        except httpx.HTTPError as exc:
-            log.warning(
-                "[exit-pool] 出口分配请求失败（无可用出口）kind=%s error=%s",
-                kind,
-                type(exc).__name__,
-            )
-            return None
-        if response.status_code != 200:
-            log.warning(
-                "[exit-pool] 出口分配不可用（无可用出口）kind=%s status=%s",
-                kind,
-                response.status_code,
-            )
-            return None
-        try:
-            payload: Any = response.json()
-        except ValueError:
-            log.warning("[exit-pool] 出口分配响应非 JSON（无可用出口）kind=%s", kind)
-            return None
-        assignment = self._parse_assignment(payload, kind)
-        if assignment is None:
-            log.warning(
-                "[exit-pool] 出口分配响应非法（socks_url 未通过白名单），"
-                "无可用出口 kind=%s",
-                kind,
-            )
-        return assignment
-
-    def _parse_assignment(self, payload: object, kind: str) -> ExitAssignment | None:
-        if not isinstance(payload, dict):
-            return None
-        exit_id = payload.get("exit_id")
-        if not isinstance(exit_id, str) or not exit_id.strip():
-            return None
-        socks_url = parse_socks_url(
-            payload.get("socks_url"), self._config.allowed_hosts
-        )
-        if socks_url is None:
-            return None
-        if payload.get("healthy") is not True:
-            # Treat anything but an explicit ``true`` as unusable: the manager
-            # contract always carries ``healthy``, and a missing/false flag means
-            # the exit is known (or assumed) bad.  Returning ``None`` makes the
-            # caller fail closed (or use the explicit direct-fallback valve);
-            # it never caches the bad exit and never falls back to the global
-            # proxy.
-            log.warning(
-                "[exit-pool] 分配到的出口未标记健康（无可用出口）exit=%s kind=%s",
-                exit_id,
-                kind,
-            )
-            return None
-        return ExitAssignment(
-            exit_id=exit_id.strip(),
-            socks_url=socks_url,
-            generation=_as_int(payload.get("generation"), 0),
-            ttl_s=_as_float(payload.get("ttl_s"), 0.0),
-            healthy=True,
         )
 
     # ------------------------------------------------------------------ events

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aistudio_api.config import settings
-from aistudio_api.domain.errors import RoutingError
+from aistudio_api.domain.errors import ExitBudgetWaitError, RoutingError
 from aistudio_api.infrastructure.browser.browser_engine import (
     find_chromium_executable,
 )
@@ -24,6 +26,7 @@ from aistudio_api.infrastructure.exit_pool import (
     get_exit_resolver,
     resolve_credential_exit,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import lane_for_tier
 from aistudio_api.infrastructure.gateway.browser_engine_session import (
     BrowserEngineSession,
 )
@@ -42,6 +45,148 @@ log = get_logger("engine-runtime")
 
 # Process-wide once-only guard for the direct_http risk warning.
 _direct_http_warned = False
+
+# One warning per account per window when the manager migrates a live session to
+# a new exit: the session keeps its bound socks until the slot is rebuilt (the
+# existing region-403/D-05 path owns the rebuild), never a hot switch.
+_LEASE_MISMATCH_LOG_INTERVAL_S = 60.0
+_lease_mismatch_log_at: dict[str, float] = {}
+
+
+def _warn_lease_mismatch(account_id: str, *, leased_exit: str) -> None:
+    import time
+
+    now = time.monotonic()
+    last = _lease_mismatch_log_at.get(account_id, 0.0)
+    if now - last < _LEASE_MISMATCH_LOG_INTERVAL_S:
+        return
+    _lease_mismatch_log_at[account_id] = now
+    log.warning(
+        "[engine] 出口绑定已迁移，当前会话继续使用旧出口直至槽位重建 "
+        "account=%s leased_exit=%s",
+        account_id,
+        leased_exit,
+    )
+
+
+class _LeasedBrowserlessSession:
+    """EngineSession wrapper that leases each upstream call with the manager.
+
+    A generation request enters :meth:`request_scope` exactly once, so the lease
+    is taken once per request (covers template capture + RPC).  Maintenance
+    probes call ``send_hooked_request`` without a scope and lease the
+    ``maintenance`` category instead.  Off mode never builds this wrapper.
+    """
+
+    def __init__(
+        self,
+        delegate: EngineSession,
+        *,
+        resolver: ExitResolver,
+        account_id: str,
+        lane: str,
+        kind: str,
+        bound_socks: str | None,
+    ) -> None:
+        self._delegate = delegate
+        self._resolver = resolver
+        self._account_id = account_id
+        self._lane = lane
+        self._kind = kind
+        self._bound_socks = bound_socks or ""
+        self._scope_leased = False
+
+    @property
+    def engine(self) -> str:
+        return self._delegate.engine
+
+    @property
+    def active_context(self) -> Any:
+        return self._delegate.active_context
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    @asynccontextmanager
+    async def request_scope(self) -> AsyncGenerator[Any, None]:
+        await self._lease("generation")
+        self._scope_leased = True
+        try:
+            async with self._delegate.request_scope() as ctx:
+                yield ctx
+        finally:
+            self._scope_leased = False
+
+    async def _lease(self, cls: str) -> None:
+        lease_fn = getattr(self._resolver, "lease", None)
+        if not callable(lease_fn):
+            # Legacy/fake resolver surface: still fail closed when no exit.
+            proxy = await self._resolver.resolve(self._account_id, kind=self._kind)
+            if not proxy:
+                raise RoutingError(
+                    "账号出口不可用，已拒绝本次请求（fail-closed）。",
+                    code="exit_unavailable",
+                    surface=self._kind,
+                )
+            return
+        result = await cast(Callable[..., Awaitable[Any]], lease_fn)(
+            self._account_id,
+            lane=self._lane,
+            cls=cls,
+            calls=1,
+            kind=self._kind,
+        )
+        if result.no_capacity:
+            raise ExitBudgetWaitError(
+                "出口池调用预算不足（no_capacity），请按 Retry-After 等待后重试。",
+                retry_after=result.retry_after_s or 30.0,
+                surface=self._kind,
+            )
+        if not result.ok:
+            raise RoutingError(
+                "账号出口租约不可用，已拒绝本次请求（fail-closed）；"
+                "请检查出口池管理器或稍后重试。",
+                code="exit_unavailable",
+                surface=self._kind,
+            )
+        if self._bound_socks and result.socks_url != self._bound_socks:
+            _warn_lease_mismatch(
+                self._account_id,
+                leased_exit=result.exit_id,
+            )
+
+    async def send_hooked_request(
+        self,
+        *,
+        body: str,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        if not self._scope_leased:
+            await self._lease("maintenance")
+        return await self._delegate.send_hooked_request(
+            body=body, url=url, headers=headers
+        )
+
+    async def send_streaming_request(
+        self,
+        *,
+        body: str,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> AsyncGenerator[tuple[str, object], None]:
+        if not self._scope_leased:
+            await self._lease("maintenance")
+        async for event in self._delegate.send_streaming_request(
+            body=body, url=url, headers=headers
+        ):
+            yield event
+
+    async def rotate_cookies_via_signer(self) -> dict[str, object]:
+        await self._lease("maintenance")
+        method = cast(Any, self._delegate).rotate_cookies_via_signer
+        result: dict[str, object] = await method()
+        return result
 
 
 @dataclass
@@ -279,12 +424,14 @@ class BrowserlessEngineRuntime:
         del slot_id
         client = self._ensure_client()
         external = self._exit_resolver is not None
+        lane = lane_for_tier(tier)
+        kind = surface if surface in ("chat", "build") else "chat"
         proxy = (
-            await self._resolve_exit_proxy(account_id, surface)
+            await self._resolve_exit_proxy(account_id, surface, tier)
             if external
             else settings.proxy_url
         )
-        session = BrowserlessSession(
+        session: Any = BrowserlessSession(
             signer=client,
             auth_file=auth_file,
             auth_user=auth_user,
@@ -302,20 +449,46 @@ class BrowserlessEngineRuntime:
                 _float(self._transport_settings.get("read_timeout_s"), 300.0),
             ),
         )
+        if external and self._exit_resolver is not None:
+            session = cast(
+                EngineSession,
+                _LeasedBrowserlessSession(
+                    session,
+                    resolver=self._exit_resolver,
+                    account_id=account_id,
+                    lane=lane,
+                    kind=kind,
+                    bound_socks=proxy,
+                ),
+            )
         return SessionBuild(session=session)
 
-    async def _resolve_exit_proxy(self, account_id: str, surface: str) -> str | None:
+    async def _resolve_exit_proxy(
+        self, account_id: str, surface: str, tier: str = ""
+    ) -> str | None:
         """Resolve one account's exit, or fail closed (never the global proxy).
 
         Returns the bound socks URL, or ``None`` only for an explicit emergency
-        direct fallback.  Raises :class:`RoutingError` (HTTP 503) when the
-        manager has no usable exit and ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is off,
-        so a credential-bearing generation request never leaks onto WARP.
+        direct fallback.  Raises :class:`ExitBudgetWaitError` (HTTP 429
+        ``no_capacity`` + Retry-After) when the manager has no call budget, and
+        :class:`RoutingError` (HTTP 503) when no exit is available and
+        ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is off, so a credential-bearing
+        generation request never leaks onto WARP and never masks a 429 as 503.
         """
         kind = surface if surface in ("chat", "build") else "chat"
         decision = await resolve_credential_exit(
-            account_id or "", kind=kind, resolver=self._exit_resolver
+            account_id or "",
+            kind=kind,
+            lane=lane_for_tier(tier),
+            category="generation",
+            resolver=self._exit_resolver,
         )
+        if decision.deferred:
+            raise ExitBudgetWaitError(
+                "出口池调用预算不足（no_capacity），请按 Retry-After 等待后重试。",
+                retry_after=decision.retry_after_s,
+                surface=kind,
+            )
         if not decision.allowed:
             raise RoutingError(
                 "账号出口不可用，已拒绝本次生成请求（fail-closed）；"
