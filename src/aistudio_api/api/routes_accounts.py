@@ -59,6 +59,7 @@ from aistudio_api.infrastructure.exit_pool import (
     get_exit_resolver,
     resolve_credential_exit,
 )
+from aistudio_api.infrastructure.exit_pool.resolver import lane_for_tier
 from aistudio_api.infrastructure.utils.common import mask_email
 
 if TYPE_CHECKING:
@@ -193,7 +194,24 @@ async def _post_save_identity_probe(
     cookie_dict = _cookie_dict_from_storage(storage_state)
     if not cookie_dict:
         return account
-    decision = await resolve_credential_exit(account.id, kind="chat")
+    decision = await resolve_credential_exit(
+        account.id,
+        kind="chat",
+        lane=lane_for_tier(account.tier),
+        category="maintenance",
+    )
+    if decision.deferred:
+        log.warning(
+            "账号 %s 导入后探测延迟：出口调用预算不足 retry_after=%.0fs（账号已保存）",
+            account.id,
+            decision.retry_after_s,
+        )
+        _mark_probe_reason(
+            account_service,
+            account.id,
+            f"deferred_no_capacity: retry_after_s={decision.retry_after_s:.0f}",
+        )
+        return account
     if not decision.allowed:
         reason = decision.reason or "no_exit"
         log.warning(
@@ -576,6 +594,9 @@ class RefreshAccountResult(BaseModel):
     checked_at: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    # 429 no_capacity: retry this account after retry_after_s; not a failure.
+    deferred: bool = False
+    retry_after_s: float = 0.0
 
 
 class RefreshAccountsResponse(BaseModel):
@@ -810,6 +831,8 @@ async def refresh_accounts(
                     checked_at=result.checked_at,
                     skipped=result.skipped,
                     skip_reason=result.skip_reason,
+                    deferred=getattr(result, "deferred", False),
+                    retry_after_s=float(getattr(result, "retry_after_s", 0.0) or 0.0),
                 )
             )
 
@@ -929,7 +952,25 @@ async def detect_account_email(
         and target_auth
         and target_auth.is_file()
     ):
-        decision = await resolve_credential_exit(account_id, kind="chat")
+        decision = await resolve_credential_exit(
+            account_id,
+            kind="chat",
+            lane=lane_for_tier(acc.tier),
+            category="maintenance",
+        )
+        if decision.deferred:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "deferred": True,
+                    "reason": decision.reason or "no_capacity",
+                    "retry_after_s": decision.retry_after_s,
+                    "message": "出口调用预算不足，本轮探测已延迟，账号信息保持不变",
+                },
+                headers={
+                    "Retry-After": str(max(1, int(decision.retry_after_s + 0.999)))
+                },
+            )
         try:
             auth_data = json.loads(target_auth.read_text(encoding="utf-8"))
             raw_cookies = auth_data.get("cookies") or []
@@ -1116,7 +1157,25 @@ async def detect_account_tier(
                 )
 
     if detected_tier is None and cookie_dict and not engine_attempted:
-        decision = await resolve_credential_exit(account_id, kind="chat")
+        decision = await resolve_credential_exit(
+            account_id,
+            kind="chat",
+            lane=lane_for_tier(acc.tier),
+            category="maintenance",
+        )
+        if decision.deferred:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "deferred": True,
+                    "reason": decision.reason or "no_capacity",
+                    "retry_after_s": decision.retry_after_s,
+                    "message": "出口调用预算不足，本轮探测已延迟，账号原等级保持不变",
+                },
+                headers={
+                    "Retry-After": str(max(1, int(decision.retry_after_s + 0.999)))
+                },
+            )
         if not decision.allowed:
             raise HTTPException(
                 status_code=503,
@@ -1707,8 +1766,20 @@ async def import_cookies(
         and (not detected_email or not detected_tier)
         and (not external or req.account_id)
     ):
-        decision = await resolve_credential_exit(req.account_id or "", kind="chat")
-        if not decision.allowed:
+        decision = await resolve_credential_exit(
+            req.account_id or "",
+            kind="chat",
+            lane=lane_for_tier(detected_tier or req.tier),
+            category="maintenance",
+        )
+        if decision.deferred:
+            log.warning(
+                "导入探测延迟 account=%s：出口调用预算不足 retry_after=%.0fs"
+                "（仍继续导入账号）",
+                req.account_id or cid,
+                decision.retry_after_s,
+            )
+        elif not decision.allowed:
             log.warning(
                 "导入探测跳过 account=%s：无可用出口 reason=%s（仍继续导入账号）",
                 req.account_id or cid,
@@ -1763,8 +1834,21 @@ async def import_cookies(
                 # P1-2: the import-time credential refresh must use the
                 # account's own exit.  Without one, skip the refresh (the
                 # account is already saved) instead of leaking to WARP.
-                decision = await resolve_credential_exit(account.id, kind="chat")
-                if decision.allowed:
+                decision = await resolve_credential_exit(
+                    account.id,
+                    kind="chat",
+                    lane=lane_for_tier(account.tier),
+                    category="maintenance",
+                )
+                if decision.deferred:
+                    do_refresh = False
+                    log.warning(
+                        "导入预刷新延迟 account=%s：出口调用预算不足 "
+                        "retry_after=%.0fs（仍继续导入）",
+                        account.id,
+                        decision.retry_after_s,
+                    )
+                elif decision.allowed:
                     proxy_arg = decision.proxy
                 else:
                     do_refresh = False
@@ -1865,9 +1949,18 @@ async def probe_and_import(
             cookie_id=cid,
             tier="Free",
         )
-        decision = await resolve_credential_exit(anchor.id, kind="chat")
+        decision = await resolve_credential_exit(
+            anchor.id,
+            kind="chat",
+            lane=lane_for_tier(anchor.tier),
+            category="maintenance",
+        )
         probed: list[dict[str, object]] = []
-        if decision.allowed:
+        if decision.deferred:
+            skip_reason = (
+                f"deferred_no_capacity: retry_after_s={decision.retry_after_s:.0f}"
+            )
+        elif decision.allowed:
             try:
                 probed = await probe_google_accounts_infinite(
                     req.cookies, account_id=anchor.id, proxy=decision.proxy

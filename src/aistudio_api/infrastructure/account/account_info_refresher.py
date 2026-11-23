@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 import httpx
 
 from aistudio_api.config import settings
+from aistudio_api.domain.errors import ExitBudgetWaitError
 from aistudio_api.infrastructure.account.benefit_tier import (
     parse_benefit_tier_envelope,
 )
@@ -38,6 +39,7 @@ from aistudio_api.infrastructure.exit_pool import get_exit_resolver
 from aistudio_api.infrastructure.exit_pool.resolver import (
     ExitAssignmentResolver,
     ExitDecision,
+    lane_for_tier,
     resolve_credential_exit,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
@@ -156,6 +158,10 @@ class RefreshResult:
     checked_at: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    # Exit manager returned 429 no_capacity: retry this account after the delay;
+    # never a completed refresh, a skip or an account failure/cooldown.
+    deferred: bool = False
+    retry_after_s: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -168,6 +174,8 @@ class RefreshResult:
             "checked_at": self.checked_at,
             "skipped": self.skipped,
             "skip_reason": self.skip_reason,
+            "deferred": self.deferred,
+            "retry_after_s": self.retry_after_s,
         }
 
 
@@ -527,10 +535,42 @@ class AccountInfoRefresher:
             return self._exit_resolver
         return get_exit_resolver()
 
-    async def _credential_exit(self, account_id: str) -> ExitDecision:
+    async def _credential_exit(
+        self, account_id: str, tier: object = ""
+    ) -> ExitDecision:
         """Resolve the exit for one account's bare credential requests."""
         return await resolve_credential_exit(
-            account_id, kind="chat", resolver=self._active_exit_resolver()
+            account_id,
+            kind="chat",
+            lane=lane_for_tier(tier),
+            category="maintenance",
+            resolver=self._active_exit_resolver(),
+        )
+
+    def _deferred_result(
+        self,
+        account: AccountMeta,
+        decision: ExitDecision,
+        checked_at: str | None,
+    ) -> RefreshResult:
+        reason = decision.reason or "no_capacity"
+        if skip_log_due(account.id, reason):
+            logger.warning(
+                "[Refresh] %s tier/邮箱探测延迟（出口调用预算不足，稍后重试）"
+                "reason=%s retry_after=%.0fs email=%s",
+                account.id,
+                reason,
+                decision.retry_after_s,
+                mask_email(account.email) or "-",
+            )
+        return RefreshResult(
+            account_id=account.id,
+            ok=False,
+            error=None,
+            checked_at=checked_at,
+            deferred=True,
+            retry_after_s=decision.retry_after_s,
+            skip_reason=reason,
         )
 
     def _skipped_result(
@@ -656,7 +696,9 @@ class AccountInfoRefresher:
             email_skip_reason: str | None = None
             wants_email = refresh_email or not account.email
             if wants_email:
-                decision = await self._credential_exit(account.id)
+                decision = await self._credential_exit(account.id, account.tier)
+                if decision.deferred:
+                    return self._deferred_result(account, decision, checked_at)
                 if decision.allowed:
                     try:
                         email = await self._fetch_account_email(
@@ -710,18 +752,32 @@ class AccountInfoRefresher:
             )
 
         session = self._resolve_account_session(account.id)
-        decision = await self._credential_exit(account.id)
+        decision = await self._credential_exit(account.id, account.tier)
+        if decision.deferred:
+            return self._deferred_result(account, decision, checked_at)
         if session is None and not decision.allowed:
             return self._skipped_result(account, decision, checked_at)
 
-        response = await self._post_tier_request(
-            cookies,
-            auth_user=account.auth_user,
-            account_id=account.id,
-            session=session,
-            proxy=decision.proxy,
-            allow_bare=decision.allowed,
-        )
+        try:
+            response = await self._post_tier_request(
+                cookies,
+                auth_user=account.auth_user,
+                account_id=account.id,
+                session=session,
+                proxy=decision.proxy,
+                allow_bare=decision.allowed,
+            )
+        except ExitBudgetWaitError as exc:
+            return self._deferred_result(
+                account,
+                ExitDecision(
+                    "defer",
+                    reason=exc.code,
+                    retry_after_s=float(exc.retry_after),
+                    external=True,
+                ),
+                checked_at,
+            )
         if response is None:
             return self._skipped_result(account, decision, checked_at)
         envelope = parse_benefit_tier_envelope(response.body)
@@ -911,7 +967,26 @@ class AccountInfoRefresher:
 
         checked_at = _now_iso()
         session = self._resolve_account_session(account.id)
-        decision = await self._credential_exit(account.id)
+        decision = await self._credential_exit(account.id, account.tier)
+        if decision.deferred:
+            reason = decision.reason or "no_capacity"
+            if skip_log_due(account.id, reason):
+                logger.warning(
+                    "[Refresh] %s tier probe deferred (exit budget) reason=%s "
+                    "retry_after=%.0fs",
+                    account.id,
+                    reason,
+                    decision.retry_after_s,
+                )
+            return {
+                "tier": None,
+                "expired": None,
+                "error": None,
+                "checked_at": None,
+                "deferred": True,
+                "retry_after_s": decision.retry_after_s,
+                "skip_reason": reason,
+            }
         if session is None and not decision.allowed:
             skip_reason = decision.reason or "no_exit"
             if skip_log_due(account.id, skip_reason):
@@ -927,14 +1002,25 @@ class AccountInfoRefresher:
                 "checked_at": None,
                 "skipped": True,
             }
-        response = await self._post_tier_request(
-            cookies,
-            auth_user=account.auth_user,
-            account_id=account.id,
-            session=session,
-            proxy=decision.proxy,
-            allow_bare=decision.allowed,
-        )
+        try:
+            response = await self._post_tier_request(
+                cookies,
+                auth_user=account.auth_user,
+                account_id=account.id,
+                session=session,
+                proxy=decision.proxy,
+                allow_bare=decision.allowed,
+            )
+        except ExitBudgetWaitError as exc:
+            return {
+                "tier": None,
+                "expired": None,
+                "error": None,
+                "checked_at": None,
+                "deferred": True,
+                "retry_after_s": float(exc.retry_after),
+                "skip_reason": exc.code,
+            }
         if response is None:
             return {
                 "tier": None,
@@ -1001,7 +1087,18 @@ class AccountInfoRefresher:
         cookies = self._load_cookies(account)
         if cookies is None:
             return None
-        decision = await self._credential_exit(account.id)
+        decision = await self._credential_exit(account.id, account.tier)
+        if decision.deferred:
+            reason = decision.reason or "no_capacity"
+            if skip_log_due(account.id, reason):
+                logger.warning(
+                    "[Refresh] %s 邮箱探测延迟（出口调用预算不足，稍后重试）"
+                    "reason=%s retry_after=%.0fs",
+                    account.id,
+                    reason,
+                    decision.retry_after_s,
+                )
+            return None
         if not decision.allowed:
             reason = decision.reason or "no_exit"
             if skip_log_due(account.id, reason):

@@ -183,10 +183,47 @@ class _LeasedBrowserlessSession:
             yield event
 
     async def rotate_cookies_via_signer(self) -> dict[str, object]:
-        await self._lease("maintenance")
+        lease_fn = getattr(self._resolver, "lease", None)
+        if callable(lease_fn):
+            result = await cast(Callable[..., Awaitable[Any]], lease_fn)(
+                self._account_id,
+                lane=self._lane,
+                cls="maintenance",
+                calls=1,
+                kind=self._kind,
+            )
+            if result.no_capacity:
+                # account_service maps signer exceptions to a generic failure;
+                # return an explicit deferred dict so keepalive never counts a
+                # 429 no_capacity as an account failure or cooldown.
+                return {
+                    "ok": False,
+                    "status": 0,
+                    "updated": [],
+                    "skipped": "no_exit",
+                    "deferred": True,
+                    "retry_after_s": result.retry_after_s or 30.0,
+                    "reason": result.reason or "no_capacity",
+                }
+            if not result.ok:
+                return {
+                    "ok": False,
+                    "status": 0,
+                    "updated": [],
+                    "error": "exit_unavailable",
+                }
+        else:
+            proxy = await self._resolver.resolve(self._account_id, kind=self._kind)
+            if not proxy:
+                return {
+                    "ok": False,
+                    "status": 0,
+                    "updated": [],
+                    "error": "exit_unavailable",
+                }
         method = cast(Any, self._delegate).rotate_cookies_via_signer
-        result: dict[str, object] = await method()
-        return result
+        result_dict: dict[str, object] = await method()
+        return result_dict
 
 
 @dataclass

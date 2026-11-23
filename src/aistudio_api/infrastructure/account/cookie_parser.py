@@ -51,7 +51,9 @@ async def _resolve_probe_proxy(account_id: str | None, proxy: object) -> ExitDec
     """
     if isinstance(proxy, str) and proxy.strip():
         return ExitDecision("proxy", proxy=proxy)
-    return await resolve_credential_exit(account_id or "", kind="chat")
+    return await resolve_credential_exit(
+        account_id or "", kind="chat", category="maintenance"
+    )
 
 
 def parse_benefit_tier_response(raw_data: object) -> str:
@@ -822,6 +824,16 @@ async def rotate_google_cookies(
     if client is None:
         decision = await _resolve_probe_proxy(account_id, proxy)
         if not decision.allowed:
+            if decision.deferred:
+                return {
+                    "ok": False,
+                    "status": 0,
+                    "updated": [],
+                    "skipped": "no_exit",
+                    "deferred": True,
+                    "retry_after_s": decision.retry_after_s,
+                    "reason": decision.reason or "no_capacity",
+                }
             return {
                 "ok": False,
                 "status": 0,

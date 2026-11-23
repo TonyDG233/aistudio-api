@@ -296,6 +296,13 @@ class AccountKeepaliveService:
     def _retry_delay(
         self, task: str, result: dict[str, object], interval: float
     ) -> float:
+        if result.get("deferred"):
+            # 429 no_capacity is not a failure: the account stays due and is
+            # retried after the manager's Retry-After (at least the short
+            # failure window), never after the full 24h interval.
+            return max(
+                FAILURE_RETRY_SECONDS, _as_float(result.get("retry_after_s"), 0.0)
+            )
         if result.get("ok"):
             if task == "auth_update":
                 self._auth_partial_failures = 0
@@ -447,13 +454,29 @@ class AccountKeepaliveService:
             return {"ok": False, "reason": "refresh_in_progress", "count": 0}
 
         checked_at = _iso(now)
+        deferred_results = [
+            result for result in results if getattr(result, "deferred", False)
+        ]
+        deferred_ids = [str(result.account_id) for result in deferred_results]
+        deferred_retry = max(
+            (
+                float(getattr(result, "retry_after_s", 0.0) or 0.0)
+                for result in deferred_results
+            ),
+            default=0.0,
+        )
         for result in results:
             self._store.mark_refresh_attempt(
                 str(result.account_id),
-                error=result.error,
+                # 429 no_capacity must not be recorded as an account failure.
+                error=(None if getattr(result, "deferred", False) else result.error),
                 at=result.checked_at or checked_at,
             )
-        failed = sum(1 for result in results if not result.ok)
+        failed = sum(
+            1
+            for result in results
+            if not result.ok and not getattr(result, "deferred", False)
+        )
         # Skipped accounts were not probed at all (no exit): they must stay due
         # so the next keepalive round retries instead of waiting a full 24h.
         skipped_results = [
@@ -477,11 +500,13 @@ class AccountKeepaliveService:
                 unlogged,
             )
         log.info(
-            "[Keepalive] metadata refresh trigger=%s checked=%d failed=%d skipped=%d",
+            "[Keepalive] metadata refresh trigger=%s checked=%d failed=%d "
+            "skipped=%d deferred=%d",
             trigger,
             len(results),
             failed,
             len(skipped_ids),
+            len(deferred_ids),
         )
         return {
             "ok": failed == 0,
@@ -489,6 +514,9 @@ class AccountKeepaliveService:
             "count": len(results),
             "failed": failed,
             "skipped": len(skipped_ids),
+            "deferred": len(deferred_ids),
+            "deferred_accounts": deferred_ids,
+            "retry_after_s": deferred_retry,
             "accounts": [result.account_id for result in results],
         }
 
@@ -666,6 +694,7 @@ class AccountKeepaliveService:
         control_results: dict[str, list[bool]] = {}
         rotate_results: dict[str, list[bool]] = {}
         browserless_disk_ok: set[str] = set()
+        deferred_accounts: dict[str, float] = {}
 
         for slot in slots:
             slot_acc_id = str(getattr(slot, "account_id", "") or "")
@@ -746,7 +775,12 @@ class AccountKeepaliveService:
             acc_sess = slot_sessions.get(account.id)
             try:
                 rot_res = await svc.rotate_account_cookies(account.id, session=acc_sess)
-                if rot_res.get("ok"):
+                if rot_res.get("deferred"):
+                    _ensure_acc(account.id)
+                    deferred_accounts[account.id] = _as_float(
+                        rot_res.get("retry_after_s"), 0.0
+                    )
+                elif rot_res.get("ok"):
                     _ensure_acc(account.id)
                     rotate_results.setdefault(account.id, []).append(True)
                 elif rot_res.get("skipped") == "missing_seed":
@@ -773,6 +807,9 @@ class AccountKeepaliveService:
         saved_accounts: list[str] = []
         failed_accounts: list[str] = []
         for account_id in account_order:
+            if account_id in deferred_accounts:
+                # 429 no_capacity: not saved, not failed, not cooled down.
+                continue
             channel_outcomes: list[bool] = []
             if account_id in slot_results:
                 channel_outcomes.append(all(slot_results[account_id]))
@@ -789,6 +826,7 @@ class AccountKeepaliveService:
         failed_slots = [
             slot_id for acc_id, slot_id in slot_failures if acc_id in failed_set
         ]
+        deferred_retry = max(deferred_accounts.values(), default=0.0)
 
         for account_id in saved_accounts:
             self._store.mark_auth_saved(account_id)
@@ -825,15 +863,31 @@ class AccountKeepaliveService:
             }
             if cycle_exhausted:
                 result["cycle_exhausted"] = True
+            if deferred_accounts:
+                result["deferred"] = True
+                result["deferred_accounts"] = sorted(deferred_accounts)
+                result["retry_after_s"] = deferred_retry
             log.warning(
-                "[Keepalive] auth update trigger=%s partial saved=%s failed=%s",
+                "[Keepalive] auth update trigger=%s partial saved=%s failed=%s "
+                "deferred=%s",
                 trigger,
                 saved_accounts,
                 failed_accounts,
+                sorted(deferred_accounts),
             )
             return result
 
         if not saved_accounts and not control_active_saved:
+            if deferred_accounts:
+                return {
+                    "ok": False,
+                    "reason": "deferred",
+                    "count": 0,
+                    "deferred": True,
+                    "deferred_accounts": sorted(deferred_accounts),
+                    "retry_after_s": deferred_retry,
+                    "failed_slots": failed_slots,
+                }
             return {
                 "ok": False,
                 "reason": "no_active_page",
@@ -857,10 +911,17 @@ class AccountKeepaliveService:
                 "accounts": saved_accounts,
                 "failed_slots": [],
             }
+        if deferred_accounts:
+            # Some accounts were deferred for 429 no_capacity: retry them after
+            # the short defer window instead of the full 24h interval.
+            result["deferred"] = True
+            result["deferred_accounts"] = sorted(deferred_accounts)
+            result["retry_after_s"] = deferred_retry
         log.info(
-            "[Keepalive] auth update trigger=%s saved=%s",
+            "[Keepalive] auth update trigger=%s saved=%s deferred=%s",
             trigger,
             saved_accounts or ["control"],
+            sorted(deferred_accounts),
         )
         return result
 

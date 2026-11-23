@@ -1912,6 +1912,12 @@ def test_leased_session_raises_429_budget_wait() -> None:
     assert excinfo.value.code == "no_capacity"
     assert excinfo.value.retry_after == 12
 
+    rotate = asyncio.run(session.rotate_cookies_via_signer())
+    assert rotate["ok"] is False
+    assert rotate["deferred"] is True
+    assert rotate["retry_after_s"] == pytest.approx(12.0)
+    assert rotate["skipped"] == "no_exit"
+
 
 def test_generation_no_capacity_surfaces_429_and_keeps_slot_retryable(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -1978,3 +1984,228 @@ def test_generation_no_capacity_surfaces_429_and_keeps_slot_retryable(
         assert [item.state for item in listed_after] == [InstanceState.UNSTARTED]
 
     asyncio.run(_run())
+
+
+# --------------------------------------------------------------------------- #
+# Maintenance defer: no_capacity delays the account, never skips/fails it
+# --------------------------------------------------------------------------- #
+
+
+def test_keepalive_metadata_deferred_does_not_advance_due(tmp_path: Any) -> None:
+    store = AccountStore(tmp_path / "accounts_metadata_defer")
+    account = store.save_account(
+        name="Deferred",
+        email="deferred@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_deferred",
+    )
+    stale_at = (datetime.now(UTC) - timedelta(days=5)).isoformat()
+    store.update_account_refresh(
+        account.id, tier="Free", tier_checked_at=stale_at, expired=False
+    )
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        exit_resolver=cast(Any, _LeaseResolver(no_capacity=True, retry_after_s=45.0)),
+    )
+
+    class _Clock:
+        now = datetime.now(UTC).timestamp()
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    service = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        refresher,
+        clock=clock,
+        tick_seconds=3600.0,
+    )
+    service._next_due = {"metadata_refresh": clock.now}
+    settings_block = KeepaliveSettings(
+        auth_update=False,
+        metadata_refresh=True,
+        active_activity=False,
+    )
+
+    asyncio.run(service._run_due(settings_block))
+
+    # 429 no_capacity is a defer, not a 24h completion or an account failure.
+    assert service._next_due["metadata_refresh"] == clock.now + 300.0
+    stored = store.get_account(account.id)
+    assert stored is not None
+    assert stored.tier_checked_at == stale_at
+    assert stored.last_refresh_error is None
+    last = service._last_results["metadata_refresh"]
+    assert last["deferred"] == 1
+
+
+def test_manual_refresh_reports_per_account_deferred() -> None:
+    class _MixedRefresher:
+        async def refresh_accounts(
+            self, accounts: list[Any], **kwargs: object
+        ) -> list[RefreshResult]:
+            del kwargs
+            return [
+                RefreshResult(
+                    account_id="acc_deferred",
+                    ok=False,
+                    deferred=True,
+                    retry_after_s=42.0,
+                    skip_reason="no_capacity",
+                ),
+                RefreshResult(account_id="acc_ok", ok=True, tier="Pro"),
+            ]
+
+    account_service = MagicMock()
+    account_service.list_accounts.return_value = [
+        SimpleNamespace(id="acc_deferred", name="D", email="d@x.com"),
+        SimpleNamespace(id="acc_ok", name="O", email="o@x.com"),
+    ]
+
+    response = asyncio.run(
+        refresh_accounts(
+            RefreshAccountsRequest(all=True),
+            account_service=account_service,
+            refresher=cast(Any, _MixedRefresher()),
+        )
+    )
+
+    assert len(response.results) == 2
+    deferred, ok = response.results
+    assert deferred.id == "acc_deferred"
+    assert deferred.deferred is True
+    assert deferred.retry_after_s == pytest.approx(42.0)
+    assert deferred.ok is False
+    assert ok.id == "acc_ok"
+    assert ok.ok is True
+    assert ok.deferred is False
+
+
+def test_import_probe_deferred_still_imports(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.application.account_service import AccountService
+
+    store = AccountStore(tmp_path / "accounts_import_defer")
+    service = AccountService(store)
+    state = RuntimeState(account_service=service, client=None, rotator=MagicMock())
+    reset_exit_resolver(cast(Any, _LeaseResolver(no_capacity=True, retry_after_s=33.0)))
+
+    email_probe = AsyncMock(return_value="probed@example.com")
+    tier_probe = AsyncMock(return_value="Pro")
+    monkeypatch.setattr(routes_accounts, "probe_account_email", email_probe)
+    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", tier_probe)
+
+    response = asyncio.run(
+        import_cookies(
+            ImportCookiesRequest(cookies="SID=sid; SAPISID=sap"),
+            account_service=service,
+            runtime_state=state,
+        )
+    )
+
+    assert response.account_id
+    email_probe.assert_not_called()
+    tier_probe.assert_not_called()
+    stored = store.get_account(response.account_id)
+    assert stored is not None
+    assert stored.tier == "Free"
+    assert stored.last_refresh_error is not None
+    assert stored.last_refresh_error.startswith("deferred_no_capacity")
+
+
+def test_probe_and_import_deferred_keeps_account(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.application.account_service import AccountService
+
+    store = AccountStore(tmp_path / "accounts_probe_defer")
+    service = AccountService(store)
+    state = RuntimeState(account_service=service, client=None, rotator=None)
+    reset_exit_resolver(cast(Any, _LeaseResolver(no_capacity=True, retry_after_s=21.0)))
+    probe = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.probe_google_accounts_infinite",
+        probe,
+    )
+
+    response = asyncio.run(
+        probe_and_import(
+            ProbeAndImportRequest(cookies="SID=sid; SAPISID=sap"),
+            account_service=service,
+            runtime_state=state,
+        )
+    )
+
+    assert response.imported_count == 1
+    account_id = response.accounts[0].id
+    assert response.skipped == [account_id]
+    assert response.skip_reason is not None
+    assert response.skip_reason.startswith("deferred_no_capacity")
+    probe.assert_not_called()
+    stored = store.get_account(account_id)
+    assert stored is not None
+    assert stored.last_refresh_error is not None
+    assert stored.last_refresh_error.startswith("deferred_no_capacity")
+
+
+def test_auth_update_deferred_is_not_an_account_failure(tmp_path: Any) -> None:
+    from aistudio_api.application.account_service import AccountService
+
+    store = AccountStore(tmp_path / "accounts_auth_defer")
+    account = store.save_account(
+        name="AuthDeferred",
+        email="authdefer@example.com",
+        storage_state=_STORAGE_STATE,
+        account_id="acc_auth_defer",
+    )
+    service = AccountService(store)
+
+    async def _deferred_rotate(account_id: str, session: object = None):
+        del session
+        assert account_id == account.id
+        return {
+            "ok": False,
+            "status": 0,
+            "updated": [],
+            "skipped": "no_exit",
+            "deferred": True,
+            "retry_after_s": 50.0,
+            "reason": "no_capacity",
+        }
+
+    service.rotate_account_cookies = _deferred_rotate  # type: ignore[method-assign]
+
+    class _Clock:
+        now = datetime.now(UTC).timestamp()
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    keepalive = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        cast(Any, SimpleNamespace()),
+        account_service=service,
+        clock=clock,
+        tick_seconds=3600.0,
+    )
+    keepalive._next_due = {"auth_update": clock.now}
+    settings_block = KeepaliveSettings(
+        auth_update=True,
+        metadata_refresh=False,
+        active_activity=False,
+    )
+
+    asyncio.run(keepalive._run_due(settings_block))
+
+    assert keepalive._next_due["auth_update"] == clock.now + 300.0
+    assert keepalive._account_auth_failures == {}
+    assert account.id not in keepalive._auth_saved_at
+    last = keepalive._last_results["auth_update"]
+    assert last["reason"] == "deferred"
+    assert last["deferred"] is True
