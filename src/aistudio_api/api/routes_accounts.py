@@ -59,7 +59,11 @@ from aistudio_api.infrastructure.exit_pool import (
     get_exit_resolver,
     resolve_credential_exit,
 )
-from aistudio_api.infrastructure.exit_pool.resolver import lane_for_tier
+from aistudio_api.infrastructure.exit_pool.resolver import (
+    lane_for_tier,
+    probe_egress_allowed,
+    probe_skip_reason,
+)
 from aistudio_api.infrastructure.utils.common import mask_email
 
 if TYPE_CHECKING:
@@ -212,8 +216,8 @@ async def _post_save_identity_probe(
             f"deferred_no_capacity: retry_after_s={decision.retry_after_s:.0f}",
         )
         return account
-    if not decision.allowed:
-        reason = decision.reason or "no_exit"
+    if not probe_egress_allowed(decision):
+        reason = probe_skip_reason(decision)
         log.warning(
             "账号 %s 导入后探测跳过：无可用出口 reason=%s（账号已保存）",
             account.id,
@@ -979,13 +983,13 @@ async def detect_account_email(
                 for c in raw_cookies
                 if isinstance(c, dict) and c.get("name")
             }
-            if cookie_dict and not decision.allowed:
+            if cookie_dict and not probe_egress_allowed(decision):
                 log.warning(
                     "账号 %s 邮箱/等级 HTTP 探测跳过：无可用出口 reason=%s",
                     account_id,
-                    decision.reason or "no_exit",
+                    probe_skip_reason(decision),
                 )
-            if cookie_dict and decision.allowed:
+            if cookie_dict and probe_egress_allowed(decision):
                 if not email:
                     email = await probe_account_email(
                         cookie_dict,
@@ -1176,12 +1180,12 @@ async def detect_account_tier(
                     "Retry-After": str(max(1, int(decision.retry_after_s + 0.999)))
                 },
             )
-        if not decision.allowed:
+        if not probe_egress_allowed(decision):
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "订阅等级探测跳过：该账号当前无可用出口"
-                    f"（{decision.reason or 'no_exit'}），已按 fail-closed 处理；"
+                    f"（{probe_skip_reason(decision)}），已按 fail-closed 处理；"
                     "账号原等级保持不变"
                 ),
             )
@@ -1784,11 +1788,11 @@ async def import_cookies(
                 req.account_id or cid,
                 decision.retry_after_s,
             )
-        elif not decision.allowed:
+        elif not probe_egress_allowed(decision):
             log.warning(
                 "导入探测跳过 account=%s：无可用出口 reason=%s（仍继续导入账号）",
                 req.account_id or cid,
-                decision.reason or "no_exit",
+                probe_skip_reason(decision),
             )
         else:
             if not detected_email:
@@ -1853,14 +1857,14 @@ async def import_cookies(
                         account.id,
                         decision.retry_after_s,
                     )
-                elif decision.allowed:
+                elif probe_egress_allowed(decision):
                     proxy_arg = decision.proxy
                 else:
                     do_refresh = False
                     log.warning(
                         "导入预刷新跳过 account=%s：无可用出口 reason=%s（仍继续导入）",
                         account.id,
-                        decision.reason or "no_exit",
+                        probe_skip_reason(decision),
                     )
             if do_refresh:
                 count = await browser_session.import_cookies(
@@ -1965,7 +1969,7 @@ async def probe_and_import(
             skip_reason = (
                 f"deferred_no_capacity: retry_after_s={decision.retry_after_s:.0f}"
             )
-        elif decision.allowed:
+        elif probe_egress_allowed(decision):
             try:
                 probed = await probe_google_accounts_infinite(
                     req.cookies, account_id=anchor.id, proxy=decision.proxy
@@ -1974,7 +1978,7 @@ async def probe_and_import(
                 log.warning("多账号探活失败 account=%s: %s", anchor.id, exc)
                 skip_reason = f"probe_error: {exc}"
         else:
-            skip_reason = decision.reason or "no_exit"
+            skip_reason = probe_skip_reason(decision)
 
         metas: list[AccountMeta] = []
         if not probed:
@@ -2269,7 +2273,7 @@ async def import_bundle(
             # the legacy pre-save probe (the global proxy involves no binding).
             decision = await resolve_credential_exit("", kind="chat")
             cookie_dict = _cookie_dict_from_storage(storage_state)
-            if cookie_dict and decision.allowed:
+            if cookie_dict and probe_egress_allowed(decision):
                 if not acc_email:
                     with contextlib.suppress(Exception):
                         acc_email = await probe_account_email(

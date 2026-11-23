@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -73,6 +74,40 @@ from aistudio_api.infrastructure.waa.engine_runtime import (
 EXIT_ONE = "socks5h://127.0.0.1:40001"
 EXIT_TWO = "socks5h://127.0.0.1:40002"
 SENTINEL_GLOBAL = "socks5://127.0.0.1:59998"
+
+
+@contextmanager
+def _capture_logger(
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+    level: int = logging.WARNING,
+):
+    """Capture exactly one logger regardless of root/handler state.
+
+    ``caplog.at_level(level)`` only lowers the *root* logger and relies on the
+    pytest capture handler still being mounted on root.  A suite that ran
+    ``setup_logging`` earlier can leave the ``aistudio`` parent raised (or the
+    root handler cleared), so the concrete logger would drop records on Linux
+    even though Windows passes.  Attaching the capture handler directly to the
+    target logger (with propagation off to avoid duplicate records) is
+    independent of that global state.
+    """
+    target = logging.getLogger(name)
+    previous_level = target.level
+    previous_propagate = target.propagate
+    previous_handler_level = caplog.handler.level
+    target.addHandler(caplog.handler)
+    target.setLevel(level)
+    target.propagate = False
+    caplog.handler.setLevel(level)
+    try:
+        yield
+    finally:
+        target.removeHandler(caplog.handler)
+        target.setLevel(previous_level)
+        target.propagate = previous_propagate
+        caplog.handler.setLevel(previous_handler_level)
+
 
 _STORAGE_STATE: dict[str, object] = {
     "cookies": [
@@ -182,8 +217,10 @@ def test_external_no_exit_skips_with_zero_requests(
     refresher = AccountInfoRefresher(
         store, transport_factory=factory, exit_resolver=resolver
     )
+    arbiter = _RecordingArbiter("account_bad")
+    refresher.set_region_arbiter(arbiter)
 
-    with caplog.at_level(logging.WARNING):
+    with _capture_logger(caplog, "aistudio.account_refresher"):
         result = asyncio.run(refresher.refresh_account(accounts[0]))
 
     assert result.ok is False
@@ -191,6 +228,7 @@ def test_external_no_exit_skips_with_zero_requests(
     assert result.skip_reason == "no_exit"
     assert result.error is not None and "skipped_no_exit" in result.error
     assert proxies == []  # no request was even attempted
+    assert arbiter.calls == []  # no region canary without an exit
     assert any("无可用出口" in record.getMessage() for record in caplog.records)
 
 
@@ -336,7 +374,7 @@ def test_emergency_direct_fallback_is_opt_in_and_log_throttled(
     reset_direct_fallback_log()
 
     monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
-    with caplog.at_level(logging.WARNING, logger="exit-pool"):
+    with _capture_logger(caplog, "aistudio.exit-pool"):
         first = asyncio.run(resolve_credential_exit("acc1", resolver=resolver))
         second = asyncio.run(resolve_credential_exit("acc1", resolver=resolver))
 
@@ -355,7 +393,76 @@ def test_emergency_direct_fallback_is_opt_in_and_log_throttled(
     assert closed.proxy is None
 
 
-def test_emergency_direct_fallback_sends_without_proxy(
+def test_emergency_direct_fallback_never_raw_probes_in_external_mode(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """External maintenance probes never send from the host egress.
+
+    The emergency valve is a generation-path escape hatch; a bare metadata
+    probe from the VPS egress gets a region 403 that a canary would then
+    misattribute to the account (the 5-false-verify incident).  The probe must
+    skip without issuing any request instead.
+    """
+    store, accounts = _make_store(tmp_path)
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    resolver = FakeExitResolver(fail=True)
+    proxies: list[str | None] = []
+
+    def factory(proxy: str | None) -> RecordingTransport:
+        proxies.append(proxy)
+        return RecordingTransport()
+
+    refresher = AccountInfoRefresher(
+        store, transport_factory=factory, exit_resolver=resolver
+    )
+    arbiter = _RecordingArbiter("account_bad")
+    refresher.set_region_arbiter(arbiter)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0], refresh_email=False))
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert result.skip_reason == "no_pooled_exit"
+    assert result.error is not None and "skipped_no_exit" in result.error
+    assert proxies == []
+    assert arbiter.calls == []
+    stored = store.get_account(accounts[0].id)
+    assert stored is not None
+    assert stored.verify_required is False
+
+
+def test_emergency_direct_fallback_skips_email_probe_with_zero_requests(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The email sub-probe must not send from the host egress either."""
+    store, accounts = _make_store(tmp_path)
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    resolver = FakeExitResolver(fail=True)
+    proxies: list[str | None] = []
+
+    def factory(proxy: str | None) -> RecordingTransport:
+        proxies.append(proxy)
+        return RecordingTransport()
+
+    refresher = AccountInfoRefresher(
+        store, transport_factory=factory, exit_resolver=resolver
+    )
+    arbiter = _RecordingArbiter("account_bad")
+    refresher.set_region_arbiter(arbiter)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0], refresh_email=True))
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert result.skip_reason == "no_pooled_exit"
+    assert proxies == []
+    assert arbiter.calls == []
+    stored = store.get_account(accounts[0].id)
+    assert stored is not None
+    assert stored.verify_required is False
+
+
+def test_emergency_direct_fallback_skips_refresh_tier_with_zero_requests(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, accounts = _make_store(tmp_path)
@@ -370,11 +477,171 @@ def test_emergency_direct_fallback_sends_without_proxy(
     refresher = AccountInfoRefresher(
         store, transport_factory=factory, exit_resolver=resolver
     )
+    arbiter = _RecordingArbiter("account_bad")
+    refresher.set_region_arbiter(arbiter)
 
-    result = asyncio.run(refresher.refresh_account(accounts[0], refresh_email=False))
+    result = asyncio.run(refresher.refresh_tier(accounts[0]))
 
-    assert result.ok is True
-    assert proxies == [None]
+    assert result["skipped"] is True
+    assert result["error"] == "skipped_no_exit: no_pooled_exit"
+    assert proxies == []
+    assert arbiter.calls == []
+    stored = store.get_account(accounts[0].id)
+    assert stored is not None
+    assert stored.verify_required is False
+
+
+class _EmptyBoundSignerSession:
+    """Emergency-valve browserless session: no bound exit, sends host-direct."""
+
+    engine = "browserless"
+    _bound_socks = ""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def send_hooked_request(self, **kwargs: object) -> tuple[int, bytes]:
+        del kwargs
+        self.calls += 1
+        return 403, REGION_403_BODY.encode("utf-8")
+
+
+def test_pooled_session_without_bound_exit_skips_without_request(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``_bound_socks`` session must skip, never fall back to binding."""
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    resolver = _ArbitrationResolver()
+    session = _EmptyBoundSignerSession()
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=accounts[0].id, session=session),
+        ),
+        pacing_seconds=0.0,
+    )
+    arbiter = _RecordingArbiter("account_bad")
+    refresher.set_region_arbiter(arbiter)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.skipped is True
+    assert result.skip_reason == "no_pooled_exit"
+    assert session.calls == 0  # the session transport was never used
+    assert arbiter.calls == []
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is False
+
+
+def test_cookie_parser_probe_blocks_direct_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_direct_fallback_log()
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    reset_exit_resolver(cast(Any, FakeExitResolver(fail=True)))
+    captured: list[str | None] = []
+
+    class _FakeClient:  # pragma: no cover - must never be built
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(cast("str | None", kwargs.get("proxy")))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+    tier = asyncio.run(
+        probe_account_benefit_tier({"SID": "sid", "SAPISID": "sap"}, account_id="acc1")
+    )
+
+    assert tier is None
+    assert captured == []
+
+
+def test_rotate_cookies_blocks_direct_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_direct_fallback_log()
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    reset_exit_resolver(cast(Any, FakeExitResolver(fail=True)))
+    captured: list[str | None] = []
+
+    class _FakeClient:  # pragma: no cover - must never be built
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(cast("str | None", kwargs.get("proxy")))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    cookies = {
+        "SID": "sid",
+        "SAPISID": "sap",
+        "LSID": "lsid",
+        "__Secure-1PSIDTS": "old",
+    }
+
+    result = asyncio.run(rotate_google_cookies(cookies, account_id="acc1"))
+
+    assert result["ok"] is False
+    assert result["skipped"] == "no_exit"
+    assert result["reason"] == "no_pooled_exit"
+    assert cookies["__Secure-1PSIDTS"] == "old"
+    assert captured == []
+
+
+def test_fetch_app_html_external_proxy_none_never_sends(tmp_path: Any) -> None:
+    store, accounts = _make_store(tmp_path)
+    resolver = FakeExitResolver(fail=True)
+    proxies: list[str | None] = []
+
+    def factory(proxy: str | None) -> RecordingTransport:
+        proxies.append(proxy)
+        return RecordingTransport()
+
+    refresher = AccountInfoRefresher(
+        store, transport_factory=factory, exit_resolver=resolver
+    )
+    cookies = refresher._collect_cookies(  # type: ignore[attr-defined]
+        [{"name": "SID", "value": "sid", "domain": ".google.com"}]
+    )
+
+    with pytest.raises(RuntimeError, match="skipped_no_exit"):
+        asyncio.run(
+            refresher._fetch_app_html(  # type: ignore[attr-defined]
+                cookies, proxy=None, allow_bare=True
+            )
+        )
+
+    assert proxies == []
+    assert store.get_account(accounts[0].id) is not None
+
+
+def test_keepalive_probe_exit_id_empty_bound_socks_is_inconclusive(
+    tmp_path: Any,
+) -> None:
+    store, accounts = _make_store(tmp_path)
+    resolver = _ArbitrationResolver()
+    service = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        cast(Any, SimpleNamespace()),
+        instance_manager=SimpleNamespace(
+            pool_slots=lambda: (
+                SimpleNamespace(
+                    account_id=accounts[0].id,
+                    surface="chat",
+                    session=_EmptyBoundSignerSession(),
+                ),
+            )
+        ),
+    )
+
+    probe_exit = service._probe_exit_id(  # type: ignore[attr-defined]
+        accounts[0].id, SimpleNamespace(resolver=resolver), "chat"
+    )
+
+    assert probe_exit == ""
 
 
 def test_keepalive_skipped_probe_does_not_advance_due(tmp_path: Any) -> None:
@@ -1646,7 +1913,7 @@ def test_refresher_skip_log_is_throttled_per_account_and_reason(
         exit_resolver=FakeExitResolver(fail=True),
     )
 
-    with caplog.at_level(logging.WARNING):
+    with _capture_logger(caplog, "aistudio.account_refresher"):
         asyncio.run(refresher.refresh_account(accounts[0]))
         asyncio.run(refresher.refresh_account(accounts[0]))
 
@@ -1713,7 +1980,7 @@ def test_keepalive_skip_log_is_throttled_across_rounds(
         auth_update=False, metadata_refresh=True, active_activity=False
     )
 
-    with caplog.at_level(logging.WARNING):
+    with _capture_logger(caplog, "aistudio.keepalive"):
         asyncio.run(service.run_now("metadata_refresh", settings=settings_block))
         asyncio.run(service.run_now("metadata_refresh", settings=settings_block))
 
@@ -2737,9 +3004,14 @@ class _RecordingArbiter:
         self.calls: list[str] = []
 
     async def adjudicate(
-        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+        self,
+        *,
+        account_id: str,
+        kind: str,
+        account_bad_event_kind: str = "region_403",
+        probe_exit_id: str | None = None,
     ) -> str:
-        del kind, account_bad_event_kind
+        del kind, account_bad_event_kind, probe_exit_id
         self.calls.append(account_id)
         return self.outcome
 
@@ -2865,6 +3137,125 @@ def test_region_canary_fires_once_per_account_per_round(tmp_path: Any) -> None:
     assert arbiter.calls == ["acc1"]
 
 
+class _MismatchedExitResolver(_ArbitrationResolver):
+    """Probe lease says exit-1, but the live binding already moved to exit-2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.assignment = ExitAssignment(exit_id="exit-2", socks_url=EXIT_TWO, ttl_s=60)
+
+
+def test_region_403_probe_exit_mismatch_never_writes_verify(tmp_path: Any) -> None:
+    """A host-egress/migrated probe exit must not become an account_bad lock."""
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    resolver = _MismatchedExitResolver()
+    canary = _FixedCanary("account_bad")
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(
+        ExitArbitration(
+            resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+        )
+    )
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "inconclusive"
+    # The probe used exit-1 (its own lease), the binding is exit-2: no canary,
+    # no event, no verify_required write.
+    assert resolver.events == []
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
+
+
+class _BoundSignerSession:
+    """Browserless session still running on its original (migrated-away) exit."""
+
+    engine = "browserless"
+    _bound_socks = EXIT_ONE
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def send_hooked_request(self, **kwargs: object) -> tuple[int, bytes]:
+        del kwargs
+        return 403, REGION_403_BODY.encode("utf-8")
+
+
+def test_pooled_session_probe_exit_mismatch_never_writes_verify(tmp_path: Any) -> None:
+    """A live session on an old exit must not be blamed via the new binding."""
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    resolver = _MismatchedExitResolver()
+    canary = _FixedCanary("account_bad")
+    session = _BoundSignerSession()
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=accounts[0].id, session=session),
+        ),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(
+        ExitArbitration(
+            resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+        )
+    )
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "inconclusive"
+    assert resolver.events == []
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is False
+
+
+def test_pooled_session_probe_exit_match_writes_verify(tmp_path: Any) -> None:
+    """A live session proven on the bound exit may be blamed for account_bad."""
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    resolver = _ArbitrationResolver()
+    canary = _FixedCanary("account_bad")
+    session = _BoundSignerSession()
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=accounts[0].id, session=session),
+        ),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(
+        ExitArbitration(
+            resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+        )
+    )
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "account_bad"
+    # The session's bound exit equals the binding, so the canary may blame the
+    # account: the event is reported and verify_required is written.
+    assert resolver.events == [("acc1", "exit-1", "verify_account", "account_bad")]
+    stored = store.get_account("acc1")
+    assert stored is not None
+    assert stored.verify_required is True
+
+
 class _BuildOnlyArbitrationResolver(_ArbitrationResolver):
     """Manager double whose only live binding is on the build surface."""
 
@@ -2881,9 +3272,14 @@ class _KindRecordingArbiter:
         self.kinds: list[str] = []
 
     async def adjudicate(
-        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+        self,
+        *,
+        account_id: str,
+        kind: str,
+        account_bad_event_kind: str = "region_403",
+        probe_exit_id: str | None = None,
     ) -> str:
-        del account_id, account_bad_event_kind
+        del account_id, account_bad_event_kind, probe_exit_id
         self.kinds.append(kind)
         return self.outcome
 

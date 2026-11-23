@@ -143,6 +143,30 @@ class ExitDecision:
         return self.action in ("proxy", "direct_fallback")
 
 
+def probe_egress_allowed(decision: ExitDecision | None) -> bool:
+    """Whether a credential-bearing *probe* may send with this decision.
+
+    Off mode (``external=False``) keeps the legacy global-proxy/direct
+    behaviour.  In external mode the emergency ``direct_fallback`` valve is a
+    generation-path escape hatch: a bare metadata probe sent from the host
+    egress gets a region 403 that a canary then misattributes to the account
+    (the false ``verify_required`` incident).  Such a decision must therefore be
+    treated as "no exit" for every credential probe.
+    """
+    if decision is None:
+        return False
+    if decision.external and decision.action == "direct_fallback":
+        return False
+    return decision.allowed
+
+
+def probe_skip_reason(decision: ExitDecision) -> str:
+    """Bounded skip reason for a probe decision that may not send."""
+    if decision.external and decision.action == "direct_fallback":
+        return "no_pooled_exit"
+    return decision.reason or "no_exit"
+
+
 _direct_fallback_log_at: dict[str, float] = {}
 _skip_log_at: dict[tuple[str, str], float] = {}
 _defer_log_at: dict[tuple[str, str], float] = {}
@@ -892,6 +916,8 @@ __all__ = [
     "get_exit_resolver",
     "hmac_account_id",
     "parse_socks_url",
+    "probe_egress_allowed",
+    "probe_skip_reason",
     "reset_direct_fallback_log",
     "reset_exit_resolver",
     "reset_skip_log",

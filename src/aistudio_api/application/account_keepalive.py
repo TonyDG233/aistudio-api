@@ -316,6 +316,52 @@ class AccountKeepaliveService:
         resolver = getattr(arbiter, "resolver", None)
         return resolve_arbitration_kind(resolver, account_id)
 
+    def _probe_exit_id(
+        self, account_id: str, arbiter: object | None, kind: str
+    ) -> str | None:
+        """Exit the failing maintenance call actually used.
+
+        The canary may only blame the account when it verified this exact
+        exit; a migrated/other binding must stay inconclusive.  ``""`` forces
+        an inconclusive verdict when the live slot's exit cannot be proven to
+        match the resolver binding.
+        """
+        resolver = getattr(arbiter, "resolver", None)
+        assignment_for = getattr(resolver, "assignment_for", None)
+        if not callable(assignment_for):
+            return None
+        try:
+            try:
+                assignment = assignment_for(account_id, kind=kind, include_expired=True)
+            except TypeError:
+                assignment = assignment_for(account_id, kind=kind)
+        except Exception:
+            return None
+        if assignment is None:
+            return None
+        exit_id = str(getattr(assignment, "exit_id", "") or "")
+        bound_socks = str(getattr(assignment, "socks_url", "") or "")
+        for slot in self._pool_slots():
+            if str(getattr(slot, "account_id", "") or "") != account_id:
+                continue
+            session = getattr(slot, "session", None)
+            session_socks = str(
+                getattr(session, "_bound_socks", "")
+                or getattr(session, "bound_socks", "")
+                or ""
+            )
+            if not session_socks:
+                # An emergency-valve session has no bound exit: the failing
+                # call left from the host egress, so it cannot be attributed to
+                # the current binding. ``""`` forces an inconclusive verdict.
+                return ""
+            if session_socks != bound_socks:
+                # The live slot keeps its original exit after a binding
+                # migration; a canary on the new binding proves nothing.
+                return ""
+            break
+        return exit_id or None
+
     async def _arbitrate_region_once(self, account_id: str, source: str) -> str | None:
         """Run at most one region-403 canary per account per keepalive round."""
         if not account_id or account_id in self._region_arbitrated_round:
@@ -324,11 +370,13 @@ class AccountKeepaliveService:
         if arbiter is None:
             return None
         self._region_arbitrated_round.add(account_id)
+        kind = self._arbitration_kind(account_id, arbiter)
         try:
             outcome = await arbiter.adjudicate(
                 account_id=account_id,
-                kind=self._arbitration_kind(account_id, arbiter),
+                kind=kind,
                 account_bad_event_kind="verify_account",
+                probe_exit_id=self._probe_exit_id(account_id, arbiter, kind),
             )
         except asyncio.CancelledError:
             raise

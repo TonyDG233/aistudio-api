@@ -324,6 +324,68 @@ async def test_account_bad_event_kind_override_reports_verify_account() -> None:
     assert resolver.invalidated_exits == []
 
 
+@pytest.mark.asyncio
+async def test_probe_exit_mismatch_stays_inconclusive() -> None:
+    """A canary on a different exit must never lock the account."""
+    probe = _FakeProbe("account_bad")
+    arbitration, resolver = _arbitration(probe)
+
+    outcome = await arbitration.adjudicate(
+        account_id="acc-1",
+        kind="chat",
+        account_bad_event_kind="verify_account",
+        probe_exit_id="exit-other",
+    )
+
+    assert outcome == "inconclusive"
+    assert probe.calls == []
+    assert resolver.events == []
+    assert resolver.invalidated_exits == []
+
+
+@pytest.mark.asyncio
+async def test_probe_exit_empty_string_stays_inconclusive() -> None:
+    """``""`` means "cannot prove the probe exit": never run a blaming canary."""
+    probe = _FakeProbe("account_bad")
+    arbitration, resolver = _arbitration(probe)
+
+    outcome = await arbitration.adjudicate(
+        account_id="acc-1",
+        kind="chat",
+        account_bad_event_kind="verify_account",
+        probe_exit_id="",
+    )
+
+    assert outcome == "inconclusive"
+    assert probe.calls == []
+    assert resolver.events == []
+    assert resolver.invalidated_exits == []
+
+
+@pytest.mark.asyncio
+async def test_probe_exit_match_allows_account_bad() -> None:
+    probe = _FakeProbe("account_bad")
+    arbitration, resolver = _arbitration(probe)
+
+    outcome = await arbitration.adjudicate(
+        account_id="acc-1",
+        kind="chat",
+        account_bad_event_kind="verify_account",
+        probe_exit_id="exit-1",
+    )
+
+    assert outcome == "account_bad"
+    assert probe.calls == [("socks5h://172.17.0.1:40001", "exit-1")]
+    assert resolver.events == [
+        {
+            "account": "acc-1",
+            "exit_id": "exit-1",
+            "kind": "verify_account",
+            "canary": "account_bad",
+        }
+    ]
+
+
 def test_default_arbitration_registry_resets() -> None:
     reset_default_exit_arbitration()
     assert get_default_exit_arbitration() is None

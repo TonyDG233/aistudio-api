@@ -43,6 +43,8 @@ from aistudio_api.infrastructure.exit_pool.resolver import (
     ExitAssignmentResolver,
     ExitDecision,
     lane_for_tier,
+    probe_egress_allowed,
+    probe_skip_reason,
     resolve_credential_exit,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
@@ -633,7 +635,7 @@ class AccountInfoRefresher:
         decision: ExitDecision,
         checked_at: str | None,
     ) -> RefreshResult:
-        reason = decision.reason or "no_exit"
+        reason = self._probe_skip_reason(decision)
         if skip_log_due(account.id, reason):
             logger.warning(
                 "[Refresh] %s 跳过 tier/邮箱探测（无可用出口，fail-closed）"
@@ -641,6 +643,16 @@ class AccountInfoRefresher:
                 account.id,
                 reason,
                 mask_email(account.email) or "-",
+            )
+        if self.external_mode and skip_log_due(account.id, "probe_no_exit_defer"):
+            # External mode has no exit for this probe: defer without any
+            # region canary so a host-egress 403 can never be attributed to the
+            # account (verify_required must only come from a real upstream
+            # verify-account response).
+            logger.info(
+                "[Refresh] %s 探针无出口，defer，不进行 region 归因 reason=%s",
+                account.id,
+                reason,
             )
         return RefreshResult(
             account_id=account.id,
@@ -663,6 +675,94 @@ class AccountInfoRefresher:
     def external_mode(self) -> bool:
         """True when credential probes resolve per-account exits."""
         return self._active_exit_resolver() is not None
+
+    def _probe_allows_bare(self, decision: ExitDecision | None) -> bool:
+        """Whether a credential probe may issue a bare (non-engine) request.
+
+        Off mode keeps the legacy bare behaviour.  In external mode a
+        ``direct_fallback`` decision has no exit at all; a bare request would
+        leave from the host egress and Google may answer a region 403.  The
+        probe must defer/skip instead of silently poisoning canary attribution.
+        """
+        if decision is None:
+            return not self.external_mode
+        return probe_egress_allowed(decision)
+
+    def _probe_skip_reason(self, decision: ExitDecision) -> str:
+        """Skip reason for a probe that may not send (never a plain direct)."""
+        return probe_skip_reason(decision)
+
+    def _session_probe_has_exit(self, session: object | None) -> bool:
+        """False for an external browserless session with no proven exit.
+
+        A browserless session created under the emergency direct valve has
+        ``_bound_socks == ""`` and sends from the host egress.  Its probes must
+        not run at all: a host-egress region 403 cannot be attributed to the
+        account's current binding, and blaming it would write a false
+        ``verify_required``.
+        """
+        if session is None or not self.external_mode:
+            return True
+        if not _session_is_browserless(session):
+            return True
+        bound = str(
+            getattr(session, "_bound_socks", "")
+            or getattr(session, "bound_socks", "")
+            or ""
+        )
+        return bool(bound)
+
+    def _probe_exit_id(
+        self,
+        account_id: str,
+        decision: ExitDecision | None,
+        session: object | None = None,
+    ) -> str | None:
+        """Exit actually used by this probe, for canary consistency checks.
+
+        A probe resolved its own lease when ``decision`` carries an external
+        exit id.  A pooled engine session has no per-call decision, so compare
+        the session's bound socks URL with the resolver's include-expired
+        binding.  ``""`` means "the probe exit cannot be proven to match the
+        binding" and must force an inconclusive verdict; ``None`` means there
+        is nothing to compare (legacy/caller did not supply an exit).
+        """
+        if decision is not None and decision.external and decision.exit_id:
+            return decision.exit_id
+        resolver = self._active_exit_resolver()
+        if resolver is None or not account_id:
+            return None
+        assignment_for = getattr(resolver, "assignment_for", None)
+        if not callable(assignment_for):
+            return None
+        kind = self._arbitration_kind(account_id)
+        try:
+            try:
+                assignment = assignment_for(account_id, kind=kind, include_expired=True)
+            except TypeError:
+                assignment = assignment_for(account_id, kind=kind)
+        except Exception:
+            return None
+        if assignment is None:
+            return None
+        exit_id = str(getattr(assignment, "exit_id", "") or "")
+        if session is not None:
+            session_socks = str(
+                getattr(session, "_bound_socks", "")
+                or getattr(session, "bound_socks", "")
+                or ""
+            )
+            if _session_is_browserless(session) and not session_socks:
+                # An emergency-valve session has no bound exit; the probe ran
+                # from the host egress and cannot be proven to match the
+                # binding, so the verdict must stay inconclusive.
+                return ""
+            bound_socks = str(getattr(assignment, "socks_url", "") or "")
+            if session_socks and session_socks != bound_socks:
+                # The live session keeps its original exit after a binding
+                # migration; a canary on the new binding proves nothing.
+                return ""
+        return exit_id or None
 
     def _slot_surface_for(self, account_id: str) -> str | None:
         """Bound pool surface (chat/build) for an account, when it holds a slot."""
@@ -690,13 +790,19 @@ class AccountInfoRefresher:
         return resolve_arbitration_kind(self._active_exit_resolver(), account_id)
 
     async def _arbitrate_region_403(
-        self, account_id: str, *, once: set[str]
+        self,
+        account_id: str,
+        *,
+        once: set[str],
+        probe_exit_id: str | None = None,
     ) -> str | None:
         """Run at most one canary arbitration for this account's refresh.
 
         ``once`` is per ``refresh_account`` invocation so a tier probe and its
         follow-up email probe cannot trigger two canaries for the same account
-        in the same maintenance round.
+        in the same maintenance round.  ``probe_exit_id`` binds the canary to
+        the exit the failing probe actually used; a different binding stays
+        inconclusive so a false verify-account verdict can never be written.
         """
         if not account_id or account_id in once:
             return None
@@ -712,6 +818,7 @@ class AccountInfoRefresher:
                 account_id=account_id,
                 kind=self._arbitration_kind(account_id),
                 account_bad_event_kind="verify_account",
+                probe_exit_id=probe_exit_id,
             )
         except asyncio.CancelledError:
             raise
@@ -863,7 +970,7 @@ class AccountInfoRefresher:
                 decision = await self._credential_exit(account.id, account.tier)
                 if decision.deferred:
                     return self._deferred_result(account, decision, checked_at)
-                if decision.allowed:
+                if self._probe_allows_bare(decision):
                     try:
                         email = await self._fetch_account_email(
                             cookies,
@@ -874,7 +981,9 @@ class AccountInfoRefresher:
                         )
                     except RegionRestrictedError as exc:
                         outcome = await self._arbitrate_region_403(
-                            account.id, once=region_once
+                            account.id,
+                            once=region_once,
+                            probe_exit_id=self._probe_exit_id(account.id, decision),
                         )
                         if outcome is not None:
                             return self._region_deferral(account, checked_at, outcome)
@@ -885,7 +994,14 @@ class AccountInfoRefresher:
                     # P2-2: a skipped email probe is NOT a completed refresh.
                     # Mark it skipped/not-ok so keepalive retries in 300s instead
                     # of pushing the next metadata refresh out to 24h.
-                    email_skip_reason = decision.reason or "no_exit"
+                    email_skip_reason = self._probe_skip_reason(decision)
+                    if self.external_mode:
+                        logger.info(
+                            "[Refresh] %s 探针无出口，defer，不进行 region 归因 "
+                            "reason=%s",
+                            account.id,
+                            email_skip_reason,
+                        )
                     email_error = f"skipped_no_exit: {email_skip_reason}"
             if email:
                 self._store.update_account_refresh(account.id, email=email)
@@ -933,8 +1049,20 @@ class AccountInfoRefresher:
             decision = await self._credential_exit(account.id, account.tier)
             if decision.deferred:
                 return self._deferred_result(account, decision, checked_at)
-            if not decision.allowed:
+            if not self._probe_allows_bare(decision):
+                # External mode with no exit (including an emergency direct
+                # fallback) must never send a bare probe from the host egress:
+                # a region 403 there would be misattributed to the account.
                 return self._skipped_result(account, decision, checked_at)
+        elif not self._session_probe_has_exit(session):
+            # An emergency-valve browserless session (``_bound_socks == ""``)
+            # probes from the host egress; skip before sending so no false
+            # region-403 canary can ever lock the account.
+            return self._skipped_result(
+                account,
+                ExitDecision("skip", reason="no_pooled_exit", external=True),
+                checked_at,
+            )
 
         try:
             response = await self._post_tier_request(
@@ -943,7 +1071,9 @@ class AccountInfoRefresher:
                 account_id=account.id,
                 session=session,
                 proxy=decision.proxy if decision is not None else None,
-                allow_bare=decision.allowed if decision is not None else False,
+                allow_bare=(
+                    self._probe_allows_bare(decision) if decision is not None else False
+                ),
             )
         except ExitBudgetWaitError as exc:
             return self._deferred_result(
@@ -963,7 +1093,11 @@ class AccountInfoRefresher:
                 )
             return self._skipped_result(account, decision, checked_at)
         if response.status == 403 and is_region_restricted_message(response.body):
-            outcome = await self._arbitrate_region_403(account.id, once=region_once)
+            outcome = await self._arbitrate_region_403(
+                account.id,
+                once=region_once,
+                probe_exit_id=self._probe_exit_id(account.id, decision, session),
+            )
             if outcome is not None:
                 return self._region_deferral(account, checked_at, outcome)
         envelope = parse_benefit_tier_envelope(response.body)
@@ -1011,9 +1145,9 @@ class AccountInfoRefresher:
                         "deferred_no_capacity: "
                         f"{email_decision.reason or 'no_capacity'}"
                     )
-                elif not email_decision.allowed:
+                elif not self._probe_allows_bare(email_decision):
                     email_error = (
-                        f"skipped_no_exit: {email_decision.reason or 'no_exit'}"
+                        f"skipped_no_exit: {self._probe_skip_reason(email_decision)}"
                     )
                 else:
                     try:
@@ -1022,11 +1156,15 @@ class AccountInfoRefresher:
                             account.email,
                             auth_user=account.auth_user,
                             proxy=email_decision.proxy,
-                            allow_bare=email_decision.allowed,
+                            allow_bare=True,
                         )
                     except RegionRestrictedError as exc:
                         outcome = await self._arbitrate_region_403(
-                            account.id, once=region_once
+                            account.id,
+                            once=region_once,
+                            probe_exit_id=self._probe_exit_id(
+                                account.id, email_decision
+                            ),
                         )
                         if outcome is not None:
                             return self._region_deferral(account, checked_at, outcome)
@@ -1202,8 +1340,8 @@ class AccountInfoRefresher:
                     "retry_after_s": decision.retry_after_s,
                     "skip_reason": reason,
                 }
-            if not decision.allowed:
-                skip_reason = decision.reason or "no_exit"
+            if not self._probe_allows_bare(decision):
+                skip_reason = self._probe_skip_reason(decision)
                 if skip_log_due(account.id, skip_reason):
                     logger.warning(
                         "[Refresh] %s tier probe skipped (no exit, fail-closed) "
@@ -1211,13 +1349,40 @@ class AccountInfoRefresher:
                         account.id,
                         skip_reason,
                     )
+                if self.external_mode:
+                    logger.info(
+                        "[Refresh] %s 探针无出口，defer，不进行 region 归因 reason=%s",
+                        account.id,
+                        skip_reason,
+                    )
                 return {
                     "tier": None,
                     "expired": None,
-                    "error": f"skipped_no_exit: {decision.reason or 'no_exit'}",
+                    "error": f"skipped_no_exit: {skip_reason}",
                     "checked_at": None,
                     "skipped": True,
                 }
+        elif not self._session_probe_has_exit(session):
+            if skip_log_due(account.id, "no_pooled_exit"):
+                logger.warning(
+                    "[Refresh] %s tier probe skipped (empty bound exit, "
+                    "fail-closed) reason=no_pooled_exit",
+                    account.id,
+                )
+            if self.external_mode:
+                logger.info(
+                    "[Refresh] %s 探针无出口，defer，不进行 region 归因 "
+                    "reason=no_pooled_exit",
+                    account.id,
+                )
+            return {
+                "tier": None,
+                "expired": None,
+                "error": "skipped_no_exit: no_pooled_exit",
+                "checked_at": None,
+                "skipped": True,
+                "skip_reason": "no_pooled_exit",
+            }
         try:
             response = await self._post_tier_request(
                 cookies,
@@ -1225,7 +1390,9 @@ class AccountInfoRefresher:
                 account_id=account.id,
                 session=session,
                 proxy=decision.proxy if decision is not None else None,
-                allow_bare=decision.allowed if decision is not None else False,
+                allow_bare=(
+                    self._probe_allows_bare(decision) if decision is not None else False
+                ),
             )
         except ExitBudgetWaitError as exc:
             return {
@@ -1242,7 +1409,7 @@ class AccountInfoRefresher:
                 "tier": None,
                 "expired": None,
                 "error": (
-                    f"skipped_no_exit: {decision.reason or 'no_exit'}"
+                    f"skipped_no_exit: {self._probe_skip_reason(decision)}"
                     if decision is not None
                     else "skipped_no_exit: probe_unavailable"
                 ),
@@ -1250,7 +1417,11 @@ class AccountInfoRefresher:
                 "skipped": True,
             }
         if response.status == 403 and is_region_restricted_message(response.body):
-            outcome = await self._arbitrate_region_403(account.id, once=set())
+            outcome = await self._arbitrate_region_403(
+                account.id,
+                once=set(),
+                probe_exit_id=self._probe_exit_id(account.id, decision, session),
+            )
             if outcome is not None:
                 return {
                     "tier": None,
@@ -1332,11 +1503,17 @@ class AccountInfoRefresher:
                     decision.retry_after_s,
                 )
             return None
-        if not decision.allowed:
-            reason = decision.reason or "no_exit"
+        if not self._probe_allows_bare(decision):
+            reason = self._probe_skip_reason(decision)
             if skip_log_due(account.id, reason):
                 logger.warning(
                     "[Refresh] %s 邮箱探测跳过（无可用出口，fail-closed）reason=%s",
+                    account.id,
+                    reason,
+                )
+            if self.external_mode:
+                logger.info(
+                    "[Refresh] %s 探针无出口，defer，不进行 region 归因 reason=%s",
                     account.id,
                     reason,
                 )
@@ -1350,7 +1527,11 @@ class AccountInfoRefresher:
                 allow_bare=True,
             )
         except RegionRestrictedError:
-            outcome = await self._arbitrate_region_403(account.id, once=set())
+            outcome = await self._arbitrate_region_403(
+                account.id,
+                once=set(),
+                probe_exit_id=self._probe_exit_id(account.id, decision),
+            )
             logger.info(
                 "[Refresh] %s 邮箱探测 region 403 outcome=%s，本轮 defer",
                 account.id,
@@ -1441,10 +1622,13 @@ class AccountInfoRefresher:
         proxy: str | None = None,
         allow_bare: bool = True,
     ) -> TransportResponse | None:
-        """Route the tier RPC by engine: signer → page XHR → raw httpx fallback.
+        """Route the tier RPC by engine: signer → page XHR → leased raw httpx.
 
         ``allow_bare=False`` (external mode with no account exit) forbids the
         raw httpx fallback and returns ``None`` so the caller reports a skip.
+        A bare request in external mode must always carry a resolved exit; a
+        ``None`` proxy would leave from the host egress and invite a false
+        region-403 attribution.
         """
         if session is None:
             session = self._resolve_account_session(account_id)
@@ -1460,11 +1644,20 @@ class AccountInfoRefresher:
         elif account_id and self._slot_provider is not None and allow_bare:
             logger.warning(
                 "[Refresh] %s tier probe has no pooled engine session; "
-                "falling back to raw httpx which Google may reject as "
-                "region-restricted",
+                "falling back to raw httpx on the leased exit (Google may "
+                "reject an unpooled raw request as region-restricted)",
                 account_id,
             )
         if not allow_bare:
+            return None
+        if self.external_mode and proxy is None:
+            # Defensive: external mode never probes bare without an exit.
+            if account_id:
+                logger.info(
+                    "[Refresh] %s 探针无出口，defer，不进行 region 归因 "
+                    "reason=no_pooled_exit",
+                    account_id,
+                )
             return None
         return await self._post_tier_via_http(cookies, auth_user=auth_user, proxy=proxy)
 
@@ -1544,6 +1737,10 @@ class AccountInfoRefresher:
         """
         if not allow_bare:
             raise RuntimeError("skipped_no_exit")
+        if self.external_mode and proxy is None:
+            # Defensive: external mode never fetches a credential page bare.
+            # A host-egress request would invite a false region attribution.
+            raise RuntimeError("skipped_no_exit: no_pooled_exit")
         headers = {
             "accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"

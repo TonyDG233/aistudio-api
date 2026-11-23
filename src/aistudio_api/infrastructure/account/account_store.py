@@ -527,6 +527,16 @@ class AccountStore:
         """确保目录存在。"""
         self._accounts_dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def accounts_dir(self) -> Path:
+        """The resolved accounts directory this store reads and writes.
+
+        Callers that need to lay files beside ``registry.json`` (for example a
+        backup/restore tool) must reuse this exact path instead of resolving
+        ``AISTUDIO_DATA_DIR``/``AISTUDIO_ACCOUNTS_DIR`` a second time.
+        """
+        return self._accounts_dir
+
     def _migrate_legacy_if_needed(self) -> None:
         """如果 accounts 目录为空且存在 data/auth.json，自动迁移。"""
         if self._registry_path.exists():

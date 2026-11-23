@@ -19,6 +19,8 @@ from aistudio_api.infrastructure.account.benefit_tier import (
 )
 from aistudio_api.infrastructure.exit_pool.resolver import (
     ExitDecision,
+    probe_egress_allowed,
+    probe_skip_reason,
     resolve_credential_exit,
 )
 from aistudio_api.infrastructure.gateway.public_web_constants import (
@@ -48,12 +50,23 @@ async def _resolve_probe_proxy(account_id: str | None, proxy: object) -> ExitDec
     (the sentinel, ``None`` or an empty string) re-runs the env-gated resolver,
     so a caller that accidentally passes ``None`` can no longer bypass
     fail-closed and send a credential request without an account exit.
+
+    In external mode the emergency ``direct_fallback`` valve is never a valid
+    probe egress (a host-egress 403 would be misattributed to the account), so
+    it is downgraded to a fail-closed skip here for every cookie/account probe.
     """
     if isinstance(proxy, str) and proxy.strip():
         return ExitDecision("proxy", proxy=proxy)
-    return await resolve_credential_exit(
+    decision = await resolve_credential_exit(
         account_id or "", kind="chat", category="maintenance"
     )
+    if decision.action != "defer" and not probe_egress_allowed(decision):
+        return ExitDecision(
+            "skip",
+            reason=probe_skip_reason(decision),
+            external=decision.external,
+        )
+    return decision
 
 
 def parse_benefit_tier_response(raw_data: object) -> str:

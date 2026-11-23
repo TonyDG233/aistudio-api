@@ -276,8 +276,18 @@ class ExitArbitration:
         account_id: str,
         kind: str,
         account_bad_event_kind: str = "region_403",
+        probe_exit_id: str | None = None,
     ) -> CanaryOutcome:
-        """Classify one region 403 for an account's currently bound exit."""
+        """Classify one region 403 for an account's currently bound exit.
+
+        ``probe_exit_id`` is the exit the *failing probe* actually used.  A
+        maintenance probe can resolve its own lease, so the binding may have
+        migrated before the canary runs.  A canary that verifies a different
+        exit proves nothing about the account and must stay inconclusive: only
+        an ``account_bad`` verdict for the exact same exit may lock the account.
+        An empty string means the probe exit could not be proven to match the
+        binding and is therefore always inconclusive.
+        """
         assignment = self._resolver.assignment_for(
             account_id, kind=kind, include_expired=True
         )
@@ -286,6 +296,19 @@ class ExitArbitration:
             # fallback to the global proxy); there is no exit to blame.
             logger.info(
                 "[exit] region 403 但账号无外部出口绑定，按 inconclusive 处理 kind=%s",
+                kind,
+            )
+            return "inconclusive"
+        if probe_exit_id is not None and assignment.exit_id != probe_exit_id:
+            # The probe that produced the 403 did not run on the exit the
+            # account is bound to now (lease rotated, direct fallback, or a
+            # different surface).  Blaming this exit/account would be a false
+            # verify-account verdict, so stay inconclusive.
+            logger.info(
+                "[exit] region 403 探针出口与当前绑定不一致，按 inconclusive 处理 "
+                "probe_exit=%s bound_exit=%s kind=%s",
+                probe_exit_id,
+                assignment.exit_id,
                 kind,
             )
             return "inconclusive"

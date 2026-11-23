@@ -1558,9 +1558,14 @@ class RecordingRegionArbiter:
         self.kinds: list[str] = []
 
     async def adjudicate(
-        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+        self,
+        *,
+        account_id: str,
+        kind: str,
+        account_bad_event_kind: str = "region_403",
+        probe_exit_id: str | None = None,
     ) -> str:
-        del account_bad_event_kind
+        del account_bad_event_kind, probe_exit_id
         self.calls.append(account_id)
         self.kinds.append(kind)
         return self.outcome
