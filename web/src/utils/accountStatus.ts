@@ -4,6 +4,7 @@ import { boundInstanceFor } from './instances.ts'
 export type AccountStatusKey =
   | 'disabled'
   | 'expired'
+  | 'verify'
   | 'cooldown'
   | 'instance'
   | 'active'
@@ -18,9 +19,13 @@ export interface AccountStatus {
 /**
  * Single source of truth for account status classification.
  *
- * Precedence (v3): disabled -> invalid login -> auth cooldown -> bound
- * instance -> active -> quota -> ready. Every count, filter, and row badge
- * must use this helper so they cannot drift apart.
+ * Precedence (v4): disabled -> invalid login -> verify-account ->
+ * auth cooldown -> bound instance -> active -> quota -> ready. Every count,
+ * filter, and row badge must use this helper so they cannot drift apart.
+ *
+ * ``verify`` (upstream verify-account challenge) is distinct from ``expired``
+ * (real cookie invalidation): the account may still be usable after the user
+ * completes mobile verification, so it must not be shown as 登录态失效.
  */
 export function accountStatus(
   account: AccountWithStats,
@@ -32,6 +37,9 @@ export function accountStatus(
   }
   if (account.expired === true || account.session_expired === true) {
     return { key: 'expired', instance: null }
+  }
+  if (account.verify_required === true) {
+    return { key: 'verify', instance: null }
   }
   if (Number(account.auth_cooldown || 0) > 0) {
     return { key: 'cooldown', instance: null }

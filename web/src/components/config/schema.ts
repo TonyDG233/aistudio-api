@@ -474,9 +474,9 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'engine',
     type: 'number',
     description: 'Worker 闲置多久后允许回收，最小 1 秒。',
-    explanation: '回收只释放空闲 Worker 资源，不影响已绑定槽位；默认 900 秒。',
-    defaultValue: 900,
-    recommendedValue: 900,
+    explanation: '回收只释放空闲 Worker 资源，不影响已绑定槽位；默认 3600 秒。',
+    defaultValue: 3600,
+    recommendedValue: 3600,
     tags: ['签名器', '回收'],
   },
   'engine.browserless.signer.locale': {

@@ -20,6 +20,7 @@ import ReassignAccountModal from '@/components/instances/ReassignAccountModal.vu
 import BindSlotModal from '@/components/instances/BindSlotModal.vue'
 import CookieImportModal from '@/components/modals/CookieImportModal.vue'
 import EditAccountModal from '@/components/modals/EditAccountModal.vue'
+import VerifyAccountModal from '@/components/modals/VerifyAccountModal.vue'
 import {
   isMobileUserAgent,
   TAMPERMONKEY_SCRIPT_URL,
@@ -65,6 +66,9 @@ const reassignInstance = ref<Instance | null>(null)
 const bindModalOpen = ref(false)
 const bindAccount = ref<AccountWithStats | null>(null)
 const bindMode = ref<'activate' | 'change'>('activate')
+
+const verifyModalOpen = ref(false)
+const verifyingAccount = ref<AccountWithStats | null>(null)
 
 async function loadData() {
   await Promise.all([
@@ -121,6 +125,11 @@ function openBindModal(acc: AccountWithStats, mode: 'activate' | 'change' = 'act
 
 function handleCreateFromBind(acc: AccountWithStats) {
   openCreateModal(acc.id)
+}
+
+function openVerifyModal(acc: AccountWithStats) {
+  verifyingAccount.value = acc
+  verifyModalOpen.value = true
 }
 
 async function handleClearAllCooldowns() {
@@ -381,6 +390,7 @@ function onImportModalUpdate(val: boolean) {
       @edit-name="handleEditName"
       @activate-account="openBindModal($event, 'activate')"
       @change-slot="openBindModal($event, 'change')"
+      @verify-account="openVerifyModal"
     />
 
     <!-- Snapshot Save Modal -->
@@ -463,6 +473,12 @@ function onImportModalUpdate(val: boolean) {
     <EditAccountModal
       v-model="editModalOpen"
       :account="editingAccount"
+    />
+
+    <!-- Verify Account (QR) Modal -->
+    <VerifyAccountModal
+      v-model="verifyModalOpen"
+      :account="verifyingAccount"
     />
   </div>
 </template>

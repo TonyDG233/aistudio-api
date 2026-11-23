@@ -66,6 +66,20 @@ const visualDirty = computed(() => !deepEqual(draft.value, baseline.value))
 const yamlDirty = computed(() => isYamlDirty(yamlText.value, baselineYaml.value))
 const isDirty = computed(() => visualDirty.value || yamlDirty.value)
 
+const proxyMode = computed(() =>
+  config.value?.proxy_mode ?? (config.value?.proxy_configured ? 'single' : 'direct'),
+)
+const isExternalPool = computed(() => proxyMode.value === 'external_pool')
+const exitPool = computed(() => config.value?.exit_pool ?? null)
+const exitPoolLastSwitch = computed(() => formatExitSwitch(exitPool.value?.last_switch_at))
+
+function formatExitSwitch(timestamp?: number): string {
+  if (!timestamp || timestamp <= 0) {
+    return '尚无切换记录'
+  }
+  return new Date(timestamp * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+
 const securityModel = computed(() => pickSection(draft.value, 'security'))
 const loggingModel = computed(() => pickSection(draft.value, 'logging'))
 const engineModel = computed(() => pickSection(draft.value, 'engine'))
@@ -76,10 +90,25 @@ const modelDefaultModel = computed(() =>
   asRecord(pickSection(draft.value, 'model').model_defaults),
 )
 
+function sandboxProxyQuery(): { proxy_mode?: string; manager_ok?: string } | undefined {
+  if (typeof window === 'undefined') {
+    return undefined
+  }
+  const params = new URLSearchParams(window.location.search)
+  const proxyMode = params.get('proxy_mode')
+  if (!proxyMode) {
+    return undefined
+  }
+  const managerOk = params.get('manager_ok')
+  return managerOk
+    ? { proxy_mode: proxyMode, manager_ok: managerOk }
+    : { proxy_mode: proxyMode }
+}
+
 async function loadConfig() {
   loading.value = true
   try {
-    const cfg = await systemApi.getConfig()
+    const cfg = await systemApi.getConfig(sandboxProxyQuery())
     config.value = cfg
     const raw = cfg.yaml_content || ''
     let parsed: ConfigDoc = {}
@@ -432,23 +461,59 @@ onBeforeRouteLeave((_to, _from, next) => {
       <div class="bg-white border border-gray-200/80 rounded-2xl p-4 shadow-xs">
         <div class="flex items-center gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
           <Globe class="w-4 h-4 text-amber-600" />
-          <span>网络代理状态</span>
+          <span>{{ isExternalPool ? '外部出口池（只读）' : '网络代理状态' }}</span>
         </div>
-        <div class="text-base font-bold text-gray-900">
-          <span
-            v-if="config?.proxy_configured"
-            class="text-emerald-600 flex items-center gap-1"
+        <template v-if="isExternalPool">
+          <div
+            v-if="exitPool?.manager_ok"
+            class="text-base font-bold text-emerald-600 flex items-center gap-1"
           >
-            <CheckCircle2 class="w-4 h-4" /> 已配置代理
-          </span>
-          <span
+            <CheckCircle2 class="w-4 h-4" /> 管理器在线
+          </div>
+          <div
             v-else
-            class="text-gray-400 text-sm"
-          >直连 (未配代理)</span>
-        </div>
-        <div class="text-[11px] text-gray-400 mt-1">
-          支持 HTTP / SOCKS5 出口代理
-        </div>
+            class="text-base font-bold text-rose-600 flex items-center gap-1"
+          >
+            <AlertCircle class="w-4 h-4" /> 管理器不可达
+          </div>
+          <div
+            v-if="exitPool?.manager_ok"
+            class="text-[11px] text-gray-500 mt-1 space-y-0.5"
+          >
+            <div>
+              健康出口
+              <span class="font-mono text-gray-900">{{ exitPool?.healthy ?? 0 }}/{{ exitPool?.total ?? 0 }}</span>
+              · 隔离 {{ exitPool?.quarantined ?? 0 }}
+              · 停用 {{ exitPool?.disabled ?? 0 }}
+            </div>
+            <div>
+              绑定账号 {{ exitPool?.bound_accounts ?? 0 }} · 最近切换 {{ exitPoolLastSwitch }}
+            </div>
+          </div>
+          <div
+            v-else
+            class="text-[11px] text-rose-500 mt-1"
+          >
+            管理器状态不可用，请求按全局代理/直连回退
+          </div>
+        </template>
+        <template v-else>
+          <div class="text-base font-bold text-gray-900">
+            <span
+              v-if="config?.proxy_configured"
+              class="text-emerald-600 flex items-center gap-1"
+            >
+              <CheckCircle2 class="w-4 h-4" /> 已配置代理
+            </span>
+            <span
+              v-else
+              class="text-gray-400 text-sm"
+            >直连 (未配代理)</span>
+          </div>
+          <div class="text-[11px] text-gray-400 mt-1">
+            支持 HTTP / SOCKS5 出口代理
+          </div>
+        </template>
       </div>
 
       <div class="bg-white border border-gray-200/80 rounded-2xl p-4 shadow-xs min-w-0">

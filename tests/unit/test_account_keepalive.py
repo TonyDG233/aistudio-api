@@ -156,11 +156,22 @@ class FakeManager:
 class FakeRotator:
     """Minimal rotator surface: only auth-lock state matters to keepalive."""
 
-    def __init__(self, locked: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        locked: set[str] | None = None,
+        verify_locked: set[str] | None = None,
+    ) -> None:
         self.locked = set(locked or ())
+        self.verify_locked = set(verify_locked or ())
 
     def get_account_stats(self, account_id: str) -> SimpleNamespace:
-        return SimpleNamespace(session_expired=account_id in self.locked)
+        return SimpleNamespace(
+            session_expired=account_id in self.locked,
+            verify_required=account_id in self.verify_locked,
+        )
+
+    def is_auth_locked(self, account_id: str) -> bool:
+        return account_id in self.locked or account_id in self.verify_locked
 
 
 class FakeRefresher:
@@ -664,6 +675,58 @@ async def test_auth_update_skips_auth_locked_accounts(tmp_path, monkeypatch):
         store,
         account_service=account_service,
         rotator=FakeRotator({"acc_locked"}),
+    )
+
+    await service.run_now("auth_update", settings=_settings())
+
+    assert rotated == ["acc_ok"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_skips_verify_required_accounts(tmp_path):
+    store = AccountStore(tmp_path)
+    now = datetime.now(UTC)
+    stale_at = (now - timedelta(days=2)).isoformat()
+    healthy = _account(store, "acc_ok", "ok@example.com")
+    verify = _account(store, "acc_verify", "verify@example.com")
+    for account in (healthy, verify):
+        store.update_account_refresh(account.id, tier_checked_at=stale_at)
+
+    refresher = FakeRefresher()
+    service = _service(
+        store,
+        refresher=refresher,
+        rotator=FakeRotator(verify_locked={"acc_verify"}),
+        clock=FakeClock(now.timestamp()),
+    )
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["ok"] is True
+    assert refresher.calls == [["acc_ok"]]
+    verify_after = store.get_account("acc_verify")
+    assert verify_after is not None
+    assert verify_after.last_refresh_attempt_at is None
+
+
+@pytest.mark.asyncio
+async def test_auth_update_skips_verify_required_accounts(tmp_path, monkeypatch):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_ok", "ok@example.com")
+    _account(store, "acc_verify", "verify@example.com")
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(account_id: str, session: object = None) -> dict[str, object]:
+        del session
+        rotated.append(account_id)
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        account_service=account_service,
+        rotator=FakeRotator(verify_locked={"acc_verify"}),
     )
 
     await service.run_now("auth_update", settings=_settings())

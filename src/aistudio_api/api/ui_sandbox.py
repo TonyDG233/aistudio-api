@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import secrets
 import shutil
 import tempfile
 import time
@@ -36,6 +37,13 @@ from aistudio_api.application.account_rotator import (
     get_pacific_date_key,
 )
 from aistudio_api.application.account_service import AccountService
+from aistudio_api.application.verify_account_service import (
+    VerifyAccountNotFound,
+    VerifySession,
+    VerifySessionConflict,
+    VerifySessionNotFound,
+    VerifySessionState,
+)
 from aistudio_api.config import resolve_default_config_template
 from aistudio_api.domain.instances import Instance, InstanceList, InstanceState
 from aistudio_api.domain.model_access import (
@@ -74,6 +82,42 @@ ACTIONS = (
     *ENGINE_ACTIONS,
 )
 _SANDBOX_MAX_CONTEXTS = 10
+
+# Deterministic read-only exit pool payload for the SettingsView screenshot
+# flow.  It never talks to a host manager and carries no socks URL/token.
+SANDBOX_EXIT_POOL: dict[str, object] = {
+    "manager_ok": True,
+    "healthy": 3,
+    "total": 4,
+    "quarantined": 1,
+    "disabled": 0,
+    "bound_accounts": 7,
+    "last_switch_at": 1795305600,
+}
+
+
+def sandbox_proxy_status(
+    proxy_mode: str | None,
+    manager_ok: str | None = None,
+) -> tuple[str, dict[str, object] | None]:
+    """Return the stable sandbox proxy mode and optional fake exit pool.
+
+    Only ``proxy_mode=external_pool`` opts into the fake pool; every other value
+    (including an absent query) keeps the default ``single``/``null`` shape.
+    ``manager_ok=0|false`` simulates an unreachable manager for screenshots.
+    """
+    if proxy_mode != "external_pool":
+        return "single", None
+    online = str(manager_ok or "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    payload = dict(SANDBOX_EXIT_POOL)
+    payload["manager_ok"] = online
+    return "external_pool", payload
+
 
 # Built-in, deterministic model catalog for ui_debug.  It intentionally mirrors
 # the cold-start fallback shape (Free + Paid) but lives here so the model routes
@@ -279,6 +323,7 @@ class _AccountSeed:
     group: str = "default"
     cookie_id: str | None = None
     session_expired: bool = False
+    verify_required: bool = False
     auth_cooldown: int = 0
     quota_available: bool = True
 
@@ -925,6 +970,7 @@ class SandboxRotator:
                 "last_rate_limited": None,
                 "is_available": self._sandbox.is_available(account.id),
                 "session_expired": bool(flags["session_expired"]),
+                "verify_required": bool(flags["verify_required"]),
                 "auth_cooldown": cooldown,
                 "auth_errors": stats.auth_errors,
                 "cooldown_remaining": cooldown,
@@ -978,6 +1024,7 @@ class SandboxRotator:
             self._stats[account_id] = stats
         flags = self._sandbox.flags(account_id)
         stats.session_expired = bool(flags["session_expired"])
+        stats.verify_required = bool(flags["verify_required"])
         stats.auth_cooldown = time.time() + int(flags["auth_cooldown"])
         return stats
 
@@ -1121,6 +1168,119 @@ class SandboxKeepalive:
         }
 
 
+class SandboxVerifyService:
+    """Offline verify-account session fake for UI debug integration.
+
+    It never launches a browser and never reads the chrome/proxy env vars.  The
+    frontend can drive ``pending -> passed`` deterministically with
+    ``GET .../verify/status?simulate=passed``.
+    """
+
+    def __init__(self, sandbox: UISandbox) -> None:
+        self._sandbox = sandbox
+        self._session: VerifySession | None = None
+
+    def reset(self) -> None:
+        self._session = None
+
+    def _cleanup_due(self) -> None:
+        session = self._session
+        if (
+            session is not None
+            and session.cleanup_at is not None
+            and time.time() >= session.cleanup_at
+        ):
+            self._session = None
+
+    async def start(self, account_id: str) -> dict[str, object]:
+        self._cleanup_due()
+        existing = self._session
+        if existing is not None:
+            reusable = existing.account_id == account_id and (
+                existing.state
+                in (VerifySessionState.STARTING, VerifySessionState.PENDING)
+                or existing.state is VerifySessionState.PASSED
+            )
+            if reusable:
+                return existing.to_public()
+            if existing.state in (
+                VerifySessionState.STARTING,
+                VerifySessionState.PENDING,
+            ):
+                raise VerifySessionConflict(existing.account_id)
+            self._session = None
+
+        account = self._sandbox.account_service.get_account(account_id)
+        if account is None:
+            raise VerifyAccountNotFound(account_id)
+        now = time.time()
+        suffix = secrets.token_hex(4).upper()
+        short_code = f"SANDBOX{suffix}"
+        session = VerifySession(
+            session_id=f"verify_sandbox_{secrets.token_hex(6)}",
+            account_id=account.id,
+            auth_user=str(account.auth_user or "0"),
+            state=VerifySessionState.PENDING,
+            created_at=now,
+            expires_at=now + 180.0,
+            qr_url=f"https://recaptcha.net/qr/{short_code}",
+            short_code=short_code,
+        )
+        self._session = session
+        return session.to_public()
+
+    async def status(
+        self,
+        account_id: str,
+        session_id: str,
+        *,
+        simulate: str | None = None,
+    ) -> dict[str, object]:
+        self._cleanup_due()
+        session = self._session
+        if (
+            session is None
+            or session.session_id != session_id
+            or session.account_id != account_id
+        ):
+            raise VerifySessionNotFound
+        if session.state in (
+            VerifySessionState.STARTING,
+            VerifySessionState.PENDING,
+        ):
+            if simulate == "passed":
+                self._mark_passed(session)
+            elif simulate == "expired" or time.time() >= session.expires_at:
+                session.state = VerifySessionState.EXPIRED
+                session.message = "expired"
+                session.cleanup_at = time.time() + 10.0
+        return session.to_public()
+
+    async def cancel(self, account_id: str) -> dict[str, object]:
+        self._cleanup_due()
+        session = self._session
+        if session is None or session.account_id != account_id:
+            return {"state": VerifySessionState.CANCELLED.value}
+        if session.state in (
+            VerifySessionState.STARTING,
+            VerifySessionState.PENDING,
+        ):
+            session.state = VerifySessionState.CANCELLED
+            session.message = "cancelled"
+            session.cleanup_at = time.time() + 10.0
+        return {"state": session.state.value}
+
+    def _mark_passed(self, session: VerifySession) -> None:
+        self._sandbox._store.update_account_refresh(
+            session.account_id, verify_required=False
+        )
+        self._sandbox.flags(session.account_id)["verify_required"] = False
+        session.state = VerifySessionState.PASSED
+        session.message = "verified"
+        session.finished_at = time.time()
+        session.cleanup_at = time.time() + 10.0
+
+
 class UISandbox:
     """Stateful offline runtime used by all UI-facing routes in ui_debug mode."""
 
@@ -1139,6 +1299,7 @@ class UISandbox:
             self.rotator = SandboxRotator(self)
             self.refresher = SandboxAccountRefresher(self)
             self.keepalive = SandboxKeepalive(self)
+            self.verify_service = SandboxVerifyService(self)
             self.scenario = "all_states"
             self.keepalive_partial = False
             self.model_stats: dict[str, ModelStatsItem] = {}
@@ -1371,6 +1532,7 @@ class UISandbox:
         self.manager.reset()
         self.rotator.reset()
         self.keepalive.reset()
+        self.verify_service.reset()
         self.model_stats = {}
         self.daily_stats = {}
         self.count_tokens = CountTokensStats()
@@ -1686,6 +1848,7 @@ class UISandbox:
         if flags is None:
             flags = {
                 "session_expired": False,
+                "verify_required": False,
                 "auth_cooldown": 0,
                 "quota_available": True,
                 "_cooldown_until": 0.0,
@@ -1704,6 +1867,7 @@ class UISandbox:
             account.enabled
             and not account.expired
             and not flags["session_expired"]
+            and not flags["verify_required"]
             and int(flags["auth_cooldown"]) == 0
             and flags["quota_available"]
         )
@@ -1718,6 +1882,7 @@ class UISandbox:
             account.enabled
             and not account.expired
             and not flags["session_expired"]
+            and not flags["verify_required"]
             and int(flags["auth_cooldown"]) == 0
             and not flags["quota_available"]
         )
@@ -1745,6 +1910,7 @@ class UISandbox:
             "enabled": account.enabled,
             "group": account.group,
             "session_expired": bool(flags["session_expired"]),
+            "verify_required": bool(flags["verify_required"]),
             "auth_cooldown": int(flags["auth_cooldown"]),
             "is_available": self.is_available(account.id),
             "quota_exhausted": self.quota_exhausted(account.id),
@@ -1857,6 +2023,7 @@ class UISandbox:
             )
             self._flags[account.id] = {
                 "session_expired": seed.session_expired,
+                "verify_required": seed.verify_required,
                 "auth_cooldown": seed.auth_cooldown,
                 "quota_available": seed.quota_available,
                 "_cooldown_until": (
@@ -1950,6 +2117,13 @@ def _all_states_scenario() -> tuple[
             "Pro",
             group="legacy",
             session_expired=True,
+        ),
+        _AccountSeed(
+            "acc_free_verify",
+            "Free Verify Required",
+            "free.verify@example.com",
+            "Free",
+            verify_required=True,
         ),
         _AccountSeed(
             "acc_ultra_cooldown",
@@ -2518,6 +2692,7 @@ __all__ = [
     "DASHBOARD_ACTIONS",
     "DASHBOARD_SCENARIOS",
     "ENGINE_ACTIONS",
+    "SANDBOX_EXIT_POOL",
     "SCENARIOS",
     "SandboxAccountRefresher",
     "SandboxInstanceManager",
@@ -2528,4 +2703,5 @@ __all__ = [
     "create_ui_sandbox",
     "sandbox_model_by_id",
     "sandbox_model_catalog",
+    "sandbox_proxy_status",
 ]

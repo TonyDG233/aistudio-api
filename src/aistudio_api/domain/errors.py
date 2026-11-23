@@ -18,6 +18,11 @@ _ACCOUNT_VERIFICATION_MARKERS: tuple[str, ...] = (
     "free_tier_verification_required",
 )
 
+_REGION_RESTRICTED_MARKERS: tuple[str, ...] = (
+    "region not supported",
+    "available-regions",
+)
+
 
 def is_account_verification_required_message(text: object) -> bool:
     """识别 Google 移动设备账号验证（verify-account）风控报错。"""
@@ -27,12 +32,27 @@ def is_account_verification_required_message(text: object) -> bool:
     return any(marker in lowered for marker in _ACCOUNT_VERIFICATION_MARKERS)
 
 
+def is_region_restricted_message(text: object) -> bool:
+    """识别出口级区域封锁（``[7,"Region not supported."]``）报错。"""
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _REGION_RESTRICTED_MARKERS)
+
+
 class AuthError(AistudioError):
     """认证/鉴权失败。
 
     ``verification_required`` 为 True 表示上游要求完成 Google 移动设备账号
     验证（verify-account 风控）；此类账号必须立即隔离切号，禁止同号重签重试。
+
+    ``region_restricted`` 只由 :func:`classify_error` 在 403/grpc7 分支设置，
+    表示上游 403 报文是区域封锁（出口级嫌疑）；优先级固定为
+    verify-account > region > 其他 403，只有外部出口池模式才会消费该标记，
+    默认模式下它不改变任何行为。
     """
+
+    region_restricted: bool = False
 
     def __init__(self, message: str = "") -> None:
         self.verification_required = is_account_verification_required_message(message)
@@ -289,7 +309,15 @@ def classify_error(status: int, body: str) -> AistudioError:
     if grpc_code == 16 or status == 401:
         return AuthError(f"认证失败: {clean_msg}")
     if grpc_code == 7 or status == 403:
-        return AuthError(f"禁止访问: {clean_msg}")
+        error = AuthError(f"禁止访问: {clean_msg}")
+        # 区域封锁特征可能只出现在原始 body（结构化解析截断）；补一次兜底，
+        # 但仍保持 verify-account > region > 其他 403 的优先级。
+        if not error.verification_required and (
+            is_region_restricted_message(clean_msg)
+            or is_region_restricted_message(body)
+        ):
+            error.region_restricted = True
+        return error
     effective_status = GRPC_CODE_TO_HTTP.get(grpc_code, status) if grpc_code else status
     return RequestError(effective_status, clean_msg)
 

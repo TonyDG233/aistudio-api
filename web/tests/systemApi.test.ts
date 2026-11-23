@@ -32,6 +32,8 @@ test('resetConfig sends POST /config/reset and returns the fresh config', async 
         browser_port: 9222,
         browser_headless: true,
         proxy_configured: false,
+        proxy_mode: 'single',
+        exit_pool: null,
         auth_enabled: false,
         yaml_content: 'api_keys: []\n',
         ui_debug: true,
@@ -47,6 +49,45 @@ test('resetConfig sends POST /config/reset and returns the fresh config', async 
   expect(capturedMethod).toBe('POST')
   expect(result.yaml_content).toBe('api_keys: []\n')
   expect(result.ui_debug).toBe(true)
+})
+
+test('getConfig keeps the read-only external exit pool status', async () => {
+  mockLocalStorage()
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    expect(String(input)).toBe('/config')
+    return new Response(
+      JSON.stringify({
+        port: 8080,
+        browser_port: 9222,
+        browser_headless: true,
+        proxy_configured: true,
+        proxy_mode: 'external_pool',
+        exit_pool: {
+          manager_ok: true,
+          healthy: 3,
+          total: 4,
+          quarantined: 1,
+          disabled: 0,
+          bound_accounts: 7,
+          last_switch_at: 1795305600,
+        },
+        auth_enabled: false,
+        yaml_content: 'api_keys: []\n',
+        ui_debug: true,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as typeof fetch
+
+  const result = await systemApi.getConfig()
+
+  expect(result.proxy_mode).toBe('external_pool')
+  expect(result.exit_pool?.manager_ok).toBe(true)
+  expect(result.exit_pool?.healthy).toBe(3)
+  expect(result.exit_pool?.total).toBe(4)
+  expect(result.exit_pool?.bound_accounts).toBe(7)
+  expect(result.exit_pool?.last_switch_at).toBe(1795305600)
 })
 
 test('getStats appends the frozen days range query', async () => {
@@ -94,4 +135,37 @@ test('getStats appends the frozen days range query', async () => {
   await systemApi.getStats(90)
 
   expect(urls).toEqual(['/stats', '/stats?days=7', '/stats?days=90'])
+})
+
+test('getConfig forwards the sandbox proxy query in a single request', async () => {
+  mockLocalStorage()
+
+  const urls: string[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    urls.push(String(input))
+    return new Response(
+      JSON.stringify({
+        port: 8080,
+        browser_port: 9222,
+        browser_headless: true,
+        proxy_configured: true,
+        proxy_mode: 'external_pool',
+        exit_pool: null,
+        auth_enabled: false,
+        yaml_content: 'api_keys: []\n',
+        ui_debug: true,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as typeof fetch
+
+  await systemApi.getConfig({ proxy_mode: 'external_pool', manager_ok: '0' })
+  await systemApi.getConfig({ proxy_mode: 'external_pool' })
+  await systemApi.getConfig()
+
+  expect(urls).toEqual([
+    '/config?proxy_mode=external_pool&manager_ok=0',
+    '/config?proxy_mode=external_pool',
+    '/config',
+  ])
 })

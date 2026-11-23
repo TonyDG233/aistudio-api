@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from aistudio_api.api.app import app
+from aistudio_api.api.routes_accounts import _account_status, to_account_response
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.infrastructure.account.account_store import AccountMeta
@@ -160,9 +161,7 @@ async def test_activate_reuses_ready_pool_slot_without_control_switch(
     saved_rotator = runtime_state.rotator
     runtime_state.instance_manager = cast(
         Any,
-        SimpleNamespace(
-            ready_slot_for_account=MagicMock(return_value=object())
-        ),
+        SimpleNamespace(ready_slot_for_account=MagicMock(return_value=object())),
     )
     runtime_state.client = cast(Any, SimpleNamespace(_session=control_session))
     runtime_state.rotator = None
@@ -210,3 +209,51 @@ async def test_activate_without_ready_pool_keeps_control_switch_fallback(
     setup_mock_account_service.activate_account.assert_awaited_once_with(
         "acc_1", control_session
     )
+
+
+def test_account_status_keeps_verify_required_distinct_from_session_expired():
+    account = AccountMeta(
+        id="acc_verify",
+        name="Verify Account",
+        email="verify@example.com",
+        created_at="2026-11-22T00:00:00Z",
+        verify_required=True,
+    )
+    service = MagicMock()
+    service.get_account.return_value = account
+    stats = SimpleNamespace(
+        auth_cooldown=0.0,
+        session_expired=False,
+        verify_required=True,
+    )
+    rotator = MagicMock()
+    rotator.get_account_stats.return_value = stats
+    state = SimpleNamespace(ui_sandbox=None, ui_debug=False, rotator=rotator)
+    state.account_service = service
+
+    status = _account_status(cast(Any, state), account.id)
+
+    assert status is not None
+    assert status["verify_required"] is True
+    assert status["session_expired"] is False
+    assert status["is_available"] is False
+
+    response = to_account_response(account, status=status)
+    assert response.verify_required is True
+    assert response.session_expired is False
+    assert response.is_available is False
+
+
+def test_account_response_verify_required_defaults_false():
+    account = AccountMeta(
+        id="acc_ok",
+        name="OK Account",
+        email="ok@example.com",
+        created_at="2026-11-22T00:00:00Z",
+    )
+
+    response = to_account_response(account)
+
+    assert response.verify_required is False
+    assert response.session_expired is False
+    assert response.is_available is True

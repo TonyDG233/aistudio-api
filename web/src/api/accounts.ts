@@ -13,6 +13,8 @@ import type {
   ApplyPresetResponse,
   RefreshAccountsRequest,
   RefreshAccountsResponse,
+  VerifySessionResponse,
+  VerifyCancelResponse,
   BatchDeleteResponse,
   BatchToggleResponse,
 } from '@/types'
@@ -146,6 +148,31 @@ export const accountsApi = {
     return request<BatchToggleResponse>('/api/accounts/batch-toggle', {
       method: 'POST',
       body: JSON.stringify({ ids, enabled }),
+    })
+  },
+
+  startVerify(id: string, signal?: AbortSignal): Promise<VerifySessionResponse> {
+    return request<VerifySessionResponse>(`/api/accounts/${encodeURIComponent(id)}/verify/start`, {
+      method: 'POST',
+      signal,
+    })
+  },
+
+  getVerifyStatus(
+    id: string,
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<VerifySessionResponse> {
+    const query = new URLSearchParams({ session_id: sessionId })
+    return request<VerifySessionResponse>(
+      `/api/accounts/${encodeURIComponent(id)}/verify/status?${query.toString()}`,
+      { signal },
+    )
+  },
+
+  cancelVerify(id: string): Promise<VerifyCancelResponse> {
+    return request<VerifyCancelResponse>(`/api/accounts/${encodeURIComponent(id)}/verify/cancel`, {
+      method: 'POST',
     })
   },
 }

@@ -340,6 +340,7 @@ class AccountMeta:
     last_refresh_error: str | None = None
     enabled: bool = True
     group: str = "default"
+    verify_required: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -383,6 +384,7 @@ class AccountMeta:
             else None,
             enabled=enabled,
             group=raw_group or "default",
+            verify_required=bool(data.get("verify_required", False)),
         )
 
 
@@ -910,7 +912,12 @@ class AccountStore:
         enabled: bool = True,
         group: str = "default",
     ) -> AccountMeta:
-        """保存新账号。"""
+        """保存新账号。
+
+        对已存在的同账号（按 email+auth_user 或显式 ``account_id`` 命中）执行
+        “重新导入”语义：保留 tier/group/cookie_id/enabled，但明确清除
+        ``verify_required``（用户刚提供了新凭据），并写 INFO 日志。
+        """
         registry = self._load_registry()
         now = datetime.now(UTC).isoformat()
         created_at = now
@@ -952,6 +959,16 @@ class AccountStore:
         account_dir = _safe_account_dir(self._accounts_dir, account_id)
         safe_id = account_dir.name
         existing_meta = registry.accounts.get(safe_id)
+        if existing_meta is not None and getattr(
+            existing_meta, "verify_required", False
+        ):
+            # Product semantics: re-importing the same account's cookies means
+            # the user just supplied fresh credentials, so the local
+            # verify-account lock is cleared explicitly (not silently).  The
+            # rotator reconciles its persisted state from the store afterwards.
+            logger.info(
+                "重新导入账号 %s 的 Cookie，按既定语义清除 verify-account 锁", safe_id
+            )
         meta = AccountMeta(
             id=safe_id,
             name=name,
@@ -1065,8 +1082,9 @@ class AccountStore:
         tier_checked_at: object = _UNSET,
         expired: object = _UNSET,
         email: object = _UNSET,
+        verify_required: object = _UNSET,
     ) -> bool:
-        """更新账号刷新字段（tier/tier_checked_at/expired/email），返回是否有改动。"""
+        """更新账号刷新字段（tier/tier_checked_at/expired/email/verify_required），返回是否有改动。"""
         registry = self._load_registry()
         acc = self._find_registered_account(registry, account_id)
         if acc is None:
@@ -1092,6 +1110,12 @@ class AccountStore:
             new_email = None if email is None else str(email)
             if acc.email != new_email:
                 acc.email = new_email
+                changed = True
+
+        if verify_required is not _UNSET:
+            new_verify = bool(verify_required)
+            if acc.verify_required != new_verify:
+                acc.verify_required = new_verify
                 changed = True
 
         if not changed:

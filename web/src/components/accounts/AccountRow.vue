@@ -17,6 +17,8 @@ import {
   Check,
   ArrowLeftRight,
   Play,
+  ScanLine,
+  ShieldAlert,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
@@ -40,6 +42,7 @@ const emit = defineEmits<{
   clearCooldown: []
   clearModel: [model: string]
   toggleSelect: []
+  verify: []
 }>()
 
 const modelsExpanded = ref(false)
@@ -89,6 +92,10 @@ const isEnabled = computed(() => {
 
 const isExpired = computed(() => {
   return props.account.expired === true || props.account.session_expired === true
+})
+
+const isVerifyRequired = computed(() => {
+  return props.account.verify_required === true && !isExpired.value
 })
 
 const primaryLabel = computed(() => {
@@ -156,13 +163,15 @@ async function handleRefresh() {
         ? 'border-gray-200 bg-gray-50/60 opacity-60'
         : isExpired
           ? 'border-rose-300 bg-rose-50/30'
-          : isRunningInstance
-            ? 'border-emerald-300 bg-emerald-50/40 ring-1 ring-emerald-400/20'
-            : batchMode && selected
-              ? 'border-brand-300 bg-brand-50/30 ring-1 ring-brand-300/30'
-              : active
-                ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
-                : 'border-gray-200/80 hover:border-gray-300',
+          : isVerifyRequired
+            ? 'border-amber-300 bg-amber-50/30 border-l-4 border-l-amber-500'
+            : isRunningInstance
+              ? 'border-emerald-300 bg-emerald-50/40 ring-1 ring-emerald-400/20'
+              : batchMode && selected
+                ? 'border-brand-300 bg-brand-50/30 ring-1 ring-brand-300/30'
+                : active
+                  ? 'border-brand-300 bg-brand-50/20 ring-1 ring-brand-400/20'
+                  : 'border-gray-200/80 hover:border-gray-300',
     ]"
   >
     <!-- Sub-Account Header Bar -->
@@ -324,6 +333,14 @@ async function handleRefresh() {
           <span>登录态失效</span>
         </div>
         <div
+          v-else-if="status.key === 'verify'"
+          class="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-800 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-300"
+          title="该账号会话可能仍然有效，但 Google 要求完成移动设备扫码验证；点击「验证」扫码即可恢复调度。"
+        >
+          <ShieldAlert class="w-3 h-3 text-amber-600" />
+          <span>需扫码验证</span>
+        </div>
+        <div
           v-else-if="status.key === 'cooldown'"
           class="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200"
         >
@@ -374,6 +391,18 @@ async function handleRefresh() {
             <span>恢复</span>
           </button>
 
+          <!-- 扫码验证按钮（与登录态失效的「恢复」严格区分） -->
+          <button
+            v-if="isVerifyRequired"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg transition-colors cursor-pointer"
+            title="打开扫码验证弹窗，用手机扫码恢复该账号"
+            @click="emit('verify')"
+          >
+            <ScanLine class="w-3 h-3" />
+            <span>验证</span>
+          </button>
+
           <button
             v-if="boundNumber !== null"
             type="button"
@@ -386,7 +415,7 @@ async function handleRefresh() {
           </button>
 
           <button
-            v-if="!active && !isExpired && isEnabled && boundNumber === null"
+            v-if="!active && !isExpired && !isVerifyRequired && isEnabled && boundNumber === null"
             type="button"
             class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
             title="激活此账号并分配实例槽位"
@@ -411,10 +440,10 @@ async function handleRefresh() {
           </button>
 
           <button
-            v-if="(account.rate_limited || 0) > 0 && !isExpired"
+            v-if="(account.rate_limited || 0) > 0 && !isExpired && !isVerifyRequired"
             type="button"
             class="p-1 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer"
-            title="清除该账号锁定"
+            title="清除该账号的 429/鉴权冷却（不解除扫码验证）"
             @click="emit('clearCooldown')"
           >
             <RotateCcw class="w-3.5 h-3.5" />

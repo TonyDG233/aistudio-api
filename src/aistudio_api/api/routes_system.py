@@ -58,6 +58,30 @@ def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
     return None
 
 
+async def _resolve_proxy_status(
+    runtime_state: RuntimeState,
+    proxy_mode: str | None = None,
+    manager_ok: str | None = None,
+) -> tuple[str, dict[str, object] | None]:
+    """Return the read-only proxy mode and optional exit-pool status.
+
+    The debug query parameters are only consulted while the UI sandbox is
+    active; the production path never reads them and never contacts a manager
+    unless ``AISTUDIO_EXIT_MODE=external`` already created a resolver.
+    """
+    if runtime_state.ui_debug and runtime_state.ui_sandbox is not None:
+        from aistudio_api.api.ui_sandbox import sandbox_proxy_status
+
+        return sandbox_proxy_status(proxy_mode, manager_ok)
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.exit_pool.resolver import get_exit_resolver
+
+    resolver = get_exit_resolver()
+    if resolver is None:
+        return ("single" if settings.proxy_url else "direct"), None
+    return "external_pool", await resolver.pool_status()
+
+
 def health_response() -> HealthResponse:
     from aistudio_api.api.state import runtime_state
 
@@ -754,6 +778,8 @@ def _apply_logging_runtime(parsed: object) -> None:
 @protected_router.get("/config")
 async def get_system_config(
     runtime_state: RuntimeState = Depends(get_runtime_state),
+    proxy_mode: str | None = Query(default=None),
+    manager_ok: str | None = Query(default=None),
 ) -> dict[str, object]:
     """获取系统运行配置与 config.yaml 内容。"""
     from aistudio_api.config import settings
@@ -773,6 +799,9 @@ async def get_system_config(
     engine_settings = _sandbox_engine_settings(runtime_state) or (
         runtime_state.engine_settings or {}
     )
+    effective_proxy_mode, exit_pool = await _resolve_proxy_status(
+        runtime_state, proxy_mode, manager_ok
+    )
     return {
         "port": settings.port,
         "browser_port": settings.browser_port,
@@ -780,6 +809,8 @@ async def get_system_config(
         "engine": str(engine_settings.get("mode") or "browser"),
         "engine_settings": engine_settings,
         "proxy_configured": bool(settings.proxy_url),
+        "proxy_mode": effective_proxy_mode,
+        "exit_pool": exit_pool,
         "auth_enabled": settings.auth_enabled,
         "yaml_content": yaml_content,
         "log_level": get_log_level(),

@@ -167,6 +167,9 @@ class AccountStats:
     auth_cooldown: float = 0.0
     session_expired: bool = False
     last_session_expired: float = 0.0
+    verify_required: bool = False
+    verify_required_count: int = 0
+    last_verify_required_at: float = 0.0
     daily_date_la: str = ""
     daily_models: dict[str, AccountModelDailyStats] = field(default_factory=dict)
 
@@ -241,9 +244,11 @@ class AccountStats:
         surface: str | None = None,
         ignore_auth_cooldown: bool = False,
     ) -> bool:
-        """检查账号在指定模型下是否可用（软限额超标不禁用，仅上游真 429 冷却与登录态失效不可用）。"""
+        """检查账号在指定模型下是否可用（软限额超标不禁用，仅上游真 429 冷却与登录态失效/待验证不可用）。"""
         now = time.time()
         if self.session_expired:
+            return False
+        if self.verify_required:
             return False
         if not ignore_auth_cooldown and self.auth_cooldown > now:
             return False
@@ -263,6 +268,10 @@ class AccountStats:
     ) -> float:
         """获取距离配额刷新的剩余秒数。"""
         if self.is_available(model, surface=surface):
+            return 0.0
+        if self.verify_required:
+            # verify-account has no timed cooldown: it clears only after the
+            # mobile verification succeeds, so never fake a midnight reset.
             return 0.0
         now = time.time()
         if self.auth_cooldown > now:
@@ -406,6 +415,26 @@ class AccountStats:
         m_stats.requests += 1
         m_stats.errors += 1
 
+    def record_verify_required(
+        self, model: str | None = None, *, surface: str | None = None
+    ) -> None:
+        """Record an upstream verify-account lock for this single account.
+
+        Kept deliberately separate from ``record_session_expired``: verify-account
+        means the Google session is still alive but the account must pass mobile
+        verification, so it must never be folded into the dead-login flag.
+        """
+        now = time.time()
+        self.total_requests += 1
+        self.total_errors += 1
+        self.verify_required = True
+        self.verify_required_count += 1
+        self.last_verify_required_at = now
+        self.last_used = now
+        m_stats = self.get_model_daily(model, surface=surface)
+        m_stats.requests += 1
+        m_stats.errors += 1
+
     def clear_cooldown(
         self, model: str | None = None, *, surface: str | None = None
     ) -> None:
@@ -442,6 +471,9 @@ class AccountStats:
             "auth_cooldown": self.auth_cooldown,
             "session_expired": self.session_expired,
             "last_session_expired": self.last_session_expired,
+            "verify_required": self.verify_required,
+            "verify_required_count": self.verify_required_count,
+            "last_verify_required_at": self.last_verify_required_at,
             "daily_date_la": self.daily_date_la,
             "daily_models": {
                 m: m_stats.to_dict() for m, m_stats in self.daily_models.items()
@@ -525,6 +557,9 @@ class AccountStats:
             auth_cooldown=_as_float(data.get("auth_cooldown")),
             session_expired=bool(data.get("session_expired")),
             last_session_expired=_as_float(data.get("last_session_expired")),
+            verify_required=bool(data.get("verify_required")),
+            verify_required_count=_as_int(data.get("verify_required_count")),
+            last_verify_required_at=_as_float(data.get("last_verify_required_at")),
             daily_date_la=str(data.get("daily_date_la") or get_pacific_date_key()),
             daily_models=daily_models,
         )
@@ -555,10 +590,16 @@ class AccountRotator:
         self.load_state()
         self.cleanup_ghost_accounts()
         for account in self._store.list_accounts():
-            if account.id not in self._stats:
+            stats = self._stats.get(account.id)
+            if stats is None:
                 self._stats[account.id] = AccountStats(
                     account_id=account.id, quota_scope=self.quota_scope
                 )
+            else:
+                # AccountStore is authoritative: a successful verify pass writes
+                # meta.json verify_required=false before this state is reloaded,
+                # so a stale persisted ``true`` must not re-lock the account.
+                stats.verify_required = bool(getattr(account, "verify_required", False))
 
     def load_state(self) -> None:
         """从持久化文件恢复账号统计状态。"""
@@ -639,6 +680,15 @@ class AccountRotator:
                 # death) is authoritative for admission; mirror it into the
                 # rotator view so stats and selection stay consistent.
                 stats.session_expired = True
+            if (
+                account is not None
+                and getattr(account, "verify_required", False) is True
+            ):
+                # Persisted verify-account lock survives restarts independently
+                # of rotator_state; mirror it so keepalive/admission see it.
+                # Do not clear an in-memory lock here: a store that lacks the
+                # durable flag must not erase a lock recorded this process.
+                stats.verify_required = True
         return stats
 
     def is_account_available(
@@ -658,13 +708,15 @@ class AccountRotator:
     def is_auth_locked(self, account_id: str) -> bool:
         """True when the account is locked by a dead login / verify-account.
 
-        ``get_account_stats`` mirrors the store-level ``expired`` flag into
-        ``session_expired``, so this covers both a rotator-recorded lock and a
-        credential death detected by the account store.  Keepalive and model
-        discovery use it to stop probing a locked account.
+        ``get_account_stats`` mirrors the store-level ``expired`` and
+        ``verify_required`` flags into ``session_expired``/``verify_required``,
+        so this covers both a rotator-recorded lock and a durable store flag.
+        Keepalive and model discovery use it to stop probing a locked account.
         """
         stats = self.get_account_stats(account_id)
-        return bool(stats is not None and stats.session_expired)
+        return bool(
+            stats is not None and (stats.session_expired or stats.verify_required)
+        )
 
     def select_rebind_account(
         self,
@@ -769,6 +821,8 @@ class AccountRotator:
         for account in self._store.list_accounts():
             stats = self._stats.get(account.id, AccountStats(account_id=account.id))
             stats._check_date_reset(current_la)
+            if getattr(account, "verify_required", False) is True:
+                stats.verify_required = True
             tier_str = getattr(account, "tier", "Free") or "Free"
 
             today_models_data: dict[str, dict[str, object]] = {}
@@ -838,6 +892,7 @@ class AccountRotator:
                     and stats.is_available()
                 ),
                 "session_expired": stats.session_expired,
+                "verify_required": stats.verify_required,
                 "auth_cooldown": max(0, int(stats.auth_cooldown - time.time()))
                 if stats.auth_cooldown > time.time()
                 else 0,
@@ -874,6 +929,8 @@ class AccountRotator:
 
         for account in accounts:
             if not account.enabled or getattr(account, "expired", False):
+                continue
+            if getattr(account, "verify_required", False) is True:
                 continue
             if required_tiers and not tier_satisfies_required(
                 account.tier, required_tiers
@@ -1054,6 +1111,75 @@ class AccountRotator:
             surface or "-",
             reason or "-",
         )
+        self.save_state()
+
+    def record_verify_required(
+        self,
+        account_id: str,
+        model: str | None = None,
+        *,
+        surface: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record an upstream verify-account lock without touching session flags."""
+        if account_id not in self._stats:
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        self._stats[account_id].record_verify_required(model, surface=surface)
+        updater = getattr(self._store, "update_account_refresh", None)
+        if callable(updater):
+            try:
+                updater(account_id, verify_required=True)
+            except Exception as exc:
+                logger.warning(
+                    "账号 %s 持久化 verify_required 失败: %s", account_id, exc
+                )
+        logger.warning(
+            "账号 %s 触发上游 verify-account 移动设备验证要求，已标记待验证并隔离"
+            " (model=%s surface=%s reason=%s)",
+            account_id,
+            model or "all",
+            surface or "-",
+            reason or "-",
+        )
+        self.save_state()
+
+    def record_verify_cleared(self, account_id: str) -> None:
+        """Clear the verify-account lock and persist it immediately.
+
+        ``record_verify_required`` persists ``true`` at once, so a successful
+        pass must also persist ``false`` before a restart could reload the old
+        state and re-lock the account.
+        """
+        if account_id not in self._stats:
+            self._stats[account_id] = AccountStats(
+                account_id=account_id, quota_scope=self.quota_scope
+            )
+        stats = self._stats[account_id]
+        stats.verify_required = False
+        stats.last_verify_required_at = 0.0
+        logger.info("账号 %s 验证通过，已清除并持久化 verify-account 锁", account_id)
+        self.save_state()
+
+    def reconcile_verify_cleared(self, account_id: str) -> None:
+        """Drop an in-memory verify lock when the store already says it is clear.
+
+        Re-importing the same account rebuilds ``AccountMeta`` with
+        ``verify_required=false`` (see ``AccountStore.save_account``), but the
+        rotator keeps its own in-memory flag.  Without this reconcile the
+        account would keep showing "需扫码验证" until a restart, even though the
+        store was just rewritten with fresh credentials.
+        """
+        account = self._store.get_account(account_id)
+        if account is None or getattr(account, "verify_required", False):
+            return
+        stats = self._stats.get(account_id)
+        if stats is None or not stats.verify_required:
+            return
+        stats.verify_required = False
+        stats.last_verify_required_at = 0.0
+        logger.info("账号 %s 重新导入后已同步清除内存 verify-account 锁", account_id)
         self.save_state()
 
     def clear_cooldown(

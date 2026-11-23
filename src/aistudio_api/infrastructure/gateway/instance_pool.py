@@ -686,6 +686,7 @@ class InstancePool:
                         tier=slot.tier,
                         account_id=slot.account_id,
                         realm_id=realm_id,
+                        surface=slot.surface,
                     )
                 except asyncio.CancelledError:
                     raise

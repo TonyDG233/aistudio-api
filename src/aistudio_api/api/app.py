@@ -243,12 +243,29 @@ async def _shutdown_runtime(
     if cancelled:
         await asyncio.gather(*cancelled, return_exceptions=True)
 
+    from aistudio_api.application.verify_account_service import (
+        shutdown_verify_account_service,
+    )
+
+    await shutdown_verify_account_service()
     await _call_lifecycle_method(state.keepalive, "stop")
     await _call_lifecycle_method(state.instance_manager, "close")
     # Per-slot transports/minter are released by instance_manager.close();
     # then the engine runtime (self-owned signer daemon) and finally the
     # control-plane browser.
     await _call_lifecycle_method(getattr(state, "engine_runtime", None), "close")
+    # External exit pool control-endpoint client (only present in the env-gated
+    # special mode).  Never let teardown failures mask shutdown.
+    from aistudio_api.infrastructure import exit_pool as exit_pool_module
+
+    exit_resolver = exit_pool_module.get_exit_resolver()
+    if exit_resolver is not None:
+        try:
+            await exit_resolver.aclose()
+        except Exception as exc:
+            logger.warning("[exit-pool] 关闭控制端点客户端失败: %s", type(exc).__name__)
+        finally:
+            exit_pool_module.reset_exit_resolver()
     await _call_lifecycle_method(state.client, "close")
 
     state.keepalive = None
@@ -267,6 +284,11 @@ async def _shutdown_runtime(
 async def lifespan(_app: FastAPI):
     ui_debug = resolve_ui_debug()
     runtime_state.ui_debug = ui_debug
+    from aistudio_api.application.verify_account_service import (
+        shutdown_verify_account_service,
+    )
+
+    await shutdown_verify_account_service()
     isolation = None
     if ui_debug:
         # Q1/Q2：在任何 config/log/API-key 路由或 validate_config 迁移写盘之前，
@@ -359,6 +381,13 @@ async def lifespan(_app: FastAPI):
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
     runtime_state.rotator = rotator
+
+    # verify-account 扫码验证：全局单会话服务，浏览器仅在显式 start 时拉起。
+    from aistudio_api.application.verify_account_service import (
+        init_verify_account_service,
+    )
+
+    await init_verify_account_service(account_store, rotator)
 
     for a in account_store.list_accounts():
         st = rotator.get_account_stats(a.id)
@@ -480,6 +509,7 @@ async def lifespan(_app: FastAPI):
     )
     runtime_state.engine_switcher = engine_switcher
 
+    from aistudio_api.application.exit_arbitration import build_exit_arbitration
     from aistudio_api.application.routing_pipeline import RoutingPipeline
 
     runtime_state.routing_pipeline = RoutingPipeline(
@@ -489,6 +519,14 @@ async def lifespan(_app: FastAPI):
         stats_recorder=runtime_state.record,
         client_recorder=runtime_state.record_client,
         count_token_recorder=runtime_state.record_count_tokens,
+        # Env-gated: ``None`` unless AISTUDIO_EXIT_MODE=external.
+        exit_arbitration=build_exit_arbitration(
+            runtime_getter=lambda: runtime_state.engine_runtime,
+            account_store=account_store,
+            # The canary must never be a schedulable slot account: probing
+            # releases the signer worker it shares with a live instance.
+            slot_account_ids_getter=instance_manager.instance_account_ids,
+        ),
     )
 
     keepalive = AccountKeepaliveService(

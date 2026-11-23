@@ -15,6 +15,7 @@ export interface Account {
   enabled: boolean
   group: string
   session_expired?: boolean
+  verify_required?: boolean
   auth_cooldown?: number
   is_available?: boolean
   rebind_required?: boolean
@@ -91,6 +92,30 @@ export interface RefreshAccountsResponse {
   results: RefreshAccountResult[]
   refreshed_count: number
   expired_count: number
+}
+
+export type VerifyState =
+  | 'starting'
+  | 'pending'
+  | 'passed'
+  | 'failed'
+  | 'expired'
+  | 'error'
+  | 'region_blocked'
+  | 'session_invalid'
+  | 'cancelled'
+
+export interface VerifySessionResponse {
+  session_id: string
+  state: VerifyState
+  qr_url?: string | null
+  short_code?: string | null
+  expires_at: string
+  message?: string | null
+}
+
+export interface VerifyCancelResponse {
+  state: VerifyState
 }
 
 export interface BatchDeleteResponse {

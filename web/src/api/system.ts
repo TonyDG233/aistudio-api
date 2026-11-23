@@ -17,6 +17,11 @@ import type {
 } from '@/types'
 
 
+export interface SystemConfigQuery {
+  proxy_mode?: string
+  manager_ok?: string
+}
+
 export const systemApi = {
   health(): Promise<HealthCheckResponse> {
     return request<HealthCheckResponse>('/health')
@@ -60,8 +65,16 @@ export const systemApi = {
     })
   },
 
-  getConfig(): Promise<SystemConfig> {
-    return request<SystemConfig>('/config')
+  getConfig(params?: SystemConfigQuery): Promise<SystemConfig> {
+    const query = new URLSearchParams()
+    if (params?.proxy_mode) {
+      query.set('proxy_mode', params.proxy_mode)
+    }
+    if (params?.manager_ok) {
+      query.set('manager_ok', params.manager_ok)
+    }
+    const search = query.toString()
+    return request<SystemConfig>(search ? `/config?${search}` : '/config')
   },
 
   updateConfigYaml(yamlContent: string): Promise<{ ok: boolean; message: string }> {

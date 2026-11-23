@@ -8,7 +8,14 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastApiPath
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Path as FastApiPath,
+    Query,
+)
 from pydantic import BaseModel, Field
 
 from aistudio_api.api.dependencies import (
@@ -20,6 +27,14 @@ from aistudio_api.application.instance_manager import (
     InstanceError,
     InstanceRebindError,
     InstanceRebindTargetError,
+)
+from aistudio_api.application.verify_account_service import (
+    VerifyAccountController,
+    VerifyAccountNotFound,
+    VerifyBrowserUnavailable,
+    VerifySessionConflict,
+    VerifySessionNotFound,
+    get_verify_account_service,
 )
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
@@ -81,6 +96,54 @@ def get_ui_sandbox(runtime_state: RuntimeState) -> UISandbox | None:
     return None
 
 
+def get_verify_account_controller(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> VerifyAccountController:
+    """Resolve the active verify-account controller (sandbox fake or real)."""
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        return sandbox.verify_service
+    service = get_verify_account_service()
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "验证服务未初始化",
+                "hint": "服务尚未完成启动或已进入关闭流程，请稍后重试",
+            },
+        )
+    return service
+
+
+def _optional_verify_controller(
+    runtime_state: RuntimeState,
+) -> VerifyAccountController | None:
+    """Resolve the verify controller without raising when it is uninitialized."""
+    sandbox = get_ui_sandbox(runtime_state)
+    if sandbox is not None:
+        return sandbox.verify_service
+    return get_verify_account_service()
+
+
+async def _cancel_verify_for_deleted_account(
+    runtime_state: RuntimeState, account_id: str
+) -> None:
+    controller = _optional_verify_controller(runtime_state)
+    if controller is None:
+        return
+    try:
+        await controller.cancel(account_id)
+    except Exception as exc:
+        log.warning("删除账号 %s 时取消验证会话失败: %s", account_id, exc)
+
+
+def _reconcile_verify_after_import(rotator: object, account_id: str) -> None:
+    """Sync a re-import's store-level verify clear into the rotator memory flag."""
+    reconcile = getattr(rotator, "reconcile_verify_cleared", None)
+    if callable(reconcile):
+        reconcile(account_id)
+
+
 def _browserless_engine(runtime_state: RuntimeState) -> bool:
     """True when the active engine has no browser control page.
 
@@ -107,6 +170,7 @@ def _account_status(
         flags = sandbox.flags(account_id)
         return {
             "session_expired": bool(flags["session_expired"]),
+            "verify_required": bool(flags["verify_required"]),
             "auth_cooldown": int(flags["auth_cooldown"]),
             "is_available": sandbox.is_available(account_id),
             "quota_exhausted": sandbox.quota_exhausted(account_id),
@@ -124,14 +188,19 @@ def _account_status(
         max(0, int(stats.auth_cooldown - now)) if stats.auth_cooldown > now else 0
     )
     session_expired = bool(stats.session_expired)
+    verify_required = bool(
+        stats.verify_required or getattr(account, "verify_required", False)
+    )
     is_available = bool(
         account.enabled
         and not account.expired
         and not session_expired
+        and not verify_required
         and cooldown == 0
     )
     return {
         "session_expired": session_expired,
+        "verify_required": verify_required,
         "auth_cooldown": cooldown,
         "is_available": is_available,
         # Real quota is a soft limit; only sandbox models an exhausted quota state.
@@ -159,6 +228,7 @@ class AccountResponse(BaseModel):
     active_account_id: str | None = None
     target_account: AccountResponse | None = None
     session_expired: bool = False
+    verify_required: bool = False
     auth_cooldown: int = 0
     is_available: bool = True
     quota_exhausted: bool = False
@@ -231,13 +301,17 @@ def to_account_response(
     expired = bool(getattr(account, "expired", False))
     enabled = getattr(account, "enabled", True)
     if status is None:
-        is_available = bool(enabled and not expired)
         session_expired = False
+        verify_required = bool(getattr(account, "verify_required", False))
+        # No rotator status yet (early startup): a verify lock still makes the
+        # account unavailable, otherwise the response contradicts itself.
+        is_available = bool(enabled and not expired and not verify_required)
         auth_cooldown = 0
         quota_exhausted = False
     else:
         is_available = bool(status.get("is_available", True))
         session_expired = bool(status.get("session_expired", False))
+        verify_required = bool(status.get("verify_required", False))
         auth_cooldown = int(str(status.get("auth_cooldown") or 0))
         quota_exhausted = bool(status.get("quota_exhausted", False))
     return AccountResponse(
@@ -255,6 +329,7 @@ def to_account_response(
         enabled=enabled,
         group=getattr(account, "group", "default") or "default",
         session_expired=session_expired,
+        verify_required=verify_required,
         auth_cooldown=auth_cooldown,
         is_available=is_available,
         quota_exhausted=quota_exhausted,
@@ -296,6 +371,19 @@ class BatchToggleResponse(BaseModel):
     results: list[BatchToggleResult]
     toggled_count: int
     error_count: int
+
+
+class VerifySessionResponse(BaseModel):
+    session_id: str
+    state: str
+    qr_url: str | None = None
+    short_code: str | None = None
+    expires_at: str
+    message: str | None = None
+
+
+class VerifyCancelResponse(BaseModel):
+    state: str
 
 
 class RefreshAccountsRequest(BaseModel):
@@ -882,6 +970,86 @@ async def detect_account_tier(
     return to_account_response(acc)
 
 
+@router.post("/{account_id}/verify/start", response_model=VerifySessionResponse)
+async def start_account_verification(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    account_service: AccountService = Depends(get_account_service),
+    controller: VerifyAccountController = Depends(get_verify_account_controller),
+) -> VerifySessionResponse:
+    """启动单账号扫码验证会话（全局同一时间只允许一个）。"""
+    if account_service.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    try:
+        payload = await controller.start(account_id)
+    except VerifyAccountNotFound as exc:
+        raise HTTPException(status_code=404, detail="账号不存在") from exc
+    except VerifySessionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "已有其它账号的验证会话正在进行，请先取消或等待结束",
+                "account_id": exc.account_id,
+            },
+        ) from exc
+    except VerifyBrowserUnavailable as exc:
+        hint = (
+            "可按三种布局之一提供验证浏览器：仓库默认 "
+            ".cloakbrowser/chromium-*/chrome；Termux 包装脚本 "
+            "scripts/cloakbrowser_termux/run-chrome.sh；或设置 "
+            "AISTUDIO_VERIFY_CHROME_PATH 指向可执行文件。"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"{exc}；{hint}",
+                "hint": hint,
+            },
+        ) from exc
+    log.info("账号验证会话已启动: id=%s, state=%s", account_id, payload.get("state"))
+    return VerifySessionResponse.model_validate(payload)
+
+
+@router.get("/{account_id}/verify/status", response_model=VerifySessionResponse)
+async def get_account_verification_status(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    session_id: str = Query(..., min_length=1),
+    simulate: str | None = Query(default=None),
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+    controller: VerifyAccountController = Depends(get_verify_account_controller),
+) -> VerifySessionResponse:
+    """查询验证会话状态；通过判定只在 status 被调用时推进。
+
+    ``simulate`` 是 ui-debug 沙盒专用的确定性驱动参数，生产路由忽略它，
+    避免测试参数进入真实契约。
+    """
+    if account_service.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    sandbox_simulate = simulate if get_ui_sandbox(runtime_state) is not None else None
+    try:
+        payload = await controller.status(
+            account_id, session_id, simulate=sandbox_simulate
+        )
+    except VerifySessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return VerifySessionResponse.model_validate(payload)
+
+
+@router.post("/{account_id}/verify/cancel", response_model=VerifyCancelResponse)
+async def cancel_account_verification(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    account_service: AccountService = Depends(get_account_service),
+    controller: VerifyAccountController = Depends(get_verify_account_controller),
+) -> VerifyCancelResponse:
+    """取消当前账号的验证会话；重复调用幂等。"""
+    if account_service.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    payload = await controller.cancel(account_id)
+    state = str(payload.get("state") or "")
+    log.info("账号验证会话取消: id=%s, state=%s", account_id, state)
+    return VerifyCancelResponse(state=state)
+
+
 @router.delete("/{account_id}")
 async def delete_account(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
@@ -892,6 +1060,7 @@ async def delete_account(
     active_account = account_service.get_active_account()
     is_active = active_account is not None and active_account.id == account_id
 
+    await _cancel_verify_for_deleted_account(runtime_state, account_id)
     success = account_service.delete_account(account_id)
     if not success:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -932,6 +1101,7 @@ async def batch_delete_accounts(
     active_id = active.id if active is not None else None
     deleted_ids: list[str] = []
     for account_id in dict.fromkeys(str(i) for i in req.ids if str(i).strip()):
+        await _cancel_verify_for_deleted_account(runtime_state, account_id)
         if account_service.delete_account(account_id):
             deleted_ids.append(account_id)
             if runtime_state.rotator:
@@ -976,6 +1146,7 @@ async def delete_cookie_group(
         if acc_cid == cookie_id:
             if a.id == active_id:
                 active_deleted = True
+            await _cancel_verify_for_deleted_account(runtime_state, a.id)
             if account_service.delete_account(a.id):
                 deleted_count += 1
                 if rotator:
@@ -1346,6 +1517,7 @@ async def import_cookies(
     if runtime_state.rotator:
         runtime_state.rotator.add_account(account.id)
         runtime_state.rotator.clear_cooldown(account.id)
+        _reconcile_verify_after_import(runtime_state.rotator, account.id)
     try:
         browser_session = (
             runtime_state.client._session if runtime_state.client else None
@@ -1428,6 +1600,7 @@ async def probe_and_import(
         for meta in metas:
             rotator.add_account(meta.id)
             rotator.clear_cooldown(meta.id)
+            _reconcile_verify_after_import(rotator, meta.id)
 
     imported_accounts = [to_account_response(account) for account in metas]
 
@@ -1628,6 +1801,7 @@ async def import_bundle(
         if rotator:
             rotator.add_account(account.id)
             rotator.clear_cooldown(account.id)
+            _reconcile_verify_after_import(rotator, account.id)
         imported_accounts.append(
             to_account_response(
                 account, status=_account_status(runtime_state, account.id)

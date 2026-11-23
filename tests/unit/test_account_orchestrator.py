@@ -103,13 +103,55 @@ def test_verification_required_isolates_current_account_without_siblings() -> No
         rotator=rotator,
     )
 
-    rotator.record_session_expired.assert_called_once_with(
+    rotator.record_verify_required.assert_called_once_with(
         "acc-1",
         model="gemini-3.7-flash",
         surface="chat",
         reason="verify-account",
     )
+    rotator.record_session_expired.assert_not_called()
     rotator.account_store.get_sibling_account_ids.assert_not_called()
+
+
+def test_verification_and_session_events_write_distinct_fields(tmp_path) -> None:
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    store = AccountStore(tmp_path)
+    store.save_account("A", "a@example.com", {}, account_id="acc_a")
+    store.save_account("B", "b@example.com", {}, account_id="acc_b")
+    rotator = AccountRotator(store)
+
+    record_rotator_event(
+        "verification_required",
+        account_id="acc_a",
+        model="m",
+        surface="chat",
+        rotator=rotator,
+    )
+    record_rotator_event(
+        "session_expired",
+        account_id="acc_b",
+        model="m",
+        surface="chat",
+        rotator=rotator,
+    )
+
+    verify_stats = rotator.get_account_stats("acc_a")
+    session_stats = rotator.get_account_stats("acc_b")
+    assert verify_stats is not None and session_stats is not None
+    assert verify_stats.verify_required is True
+    assert verify_stats.verify_required_count == 1
+    assert verify_stats.last_verify_required_at > 0
+    assert verify_stats.session_expired is False
+    assert verify_stats.is_available("m") is False
+    assert session_stats.session_expired is True
+    assert session_stats.verify_required is False
+    assert session_stats.verify_required_count == 0
+
+    verify_meta = store.get_account("acc_a")
+    session_meta = store.get_account("acc_b")
+    assert verify_meta is not None and verify_meta.verify_required is True
+    assert session_meta is not None and session_meta.verify_required is False
 
 
 def test_session_expired_still_isolates_same_anchor_siblings() -> None:

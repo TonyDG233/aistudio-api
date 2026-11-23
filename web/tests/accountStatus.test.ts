@@ -21,6 +21,7 @@ function account(overrides: Partial<AccountWithStats> = {}): AccountWithStats {
     group: 'default',
     expired: false,
     session_expired: false,
+    verify_required: false,
     auth_cooldown: 0,
     is_available: true,
     ...overrides,
@@ -152,6 +153,41 @@ describe('accountStatus precedence', () => {
       null,
     )
     expect(status.key).toBe('ready')
+  })
+})
+
+describe('verify_required status', () => {
+  test('verify wins over cooldown, binding, active and quota', () => {
+    const status = accountStatus(
+      account({
+        id: 'acc',
+        verify_required: true,
+        auth_cooldown: 120,
+        is_available: false,
+      }),
+      [instance({ id: 'i', account_id: 'acc', state: 'active' })],
+      'acc',
+    )
+    expect(status.key).toBe('verify')
+    expect(status.instance).toBeNull()
+  })
+
+  test('real login expiry wins over verify', () => {
+    expect(accountStatus(account({ expired: true, verify_required: true })).key).toBe('expired')
+    expect(
+      accountStatus(account({ session_expired: true, verify_required: true })).key,
+    ).toBe('expired')
+  })
+
+  test('disabled wins over verify', () => {
+    expect(
+      accountStatus(account({ enabled: false, verify_required: true })).key,
+    ).toBe('disabled')
+  })
+
+  test('verify is distinct from session_expired', () => {
+    expect(accountStatus(account({ verify_required: true }), [], null).key).toBe('verify')
+    expect(accountStatus(account({ session_expired: true }), [], null).key).toBe('expired')
   })
 })
 

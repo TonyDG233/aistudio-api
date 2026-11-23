@@ -26,6 +26,10 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from aistudio_api.application.account_orchestrator import record_rotator_event
+from aistudio_api.application.exit_arbitration import (
+    ExitArbitration,
+    build_exit_arbitration,
+)
 from aistudio_api.application.routing_eligibility import (
     ModelRoute,
     resolve_model_route,
@@ -211,6 +215,9 @@ class RouteContext:
     # countTokens reuses the route but must never touch the generation attempt
     # ledger or consume account generation quota.
     record_attempts: bool = True
+    # External exit pool only: one in-slot rebuild (new exit) per request after
+    # an ``exit_bad`` canary verdict, so a flapping manager cannot loop.
+    exit_rebuild_retried: bool = False
 
     def next_candidate(self) -> RouteCandidate | None:
         for candidate in self.candidates:
@@ -444,6 +451,7 @@ class RoutingPipeline:
         count_token_recorder: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         switch_backoff_range: tuple[float, float] | None = None,
+        exit_arbitration: ExitArbitration | None = None,
     ) -> None:
         self._manager = instance_manager
         self._accounts = account_store
@@ -466,6 +474,12 @@ class RoutingPipeline:
         # Serializes dead-slot healing so two concurrent begin() calls cannot
         # rebind the same slot twice (or race the idle-check with reassign).
         self._heal_lock = asyncio.Lock()
+        # ``None`` in the default (env-off) deployment: no client, no behavior.
+        self._exit_arbitration = (
+            exit_arbitration
+            if exit_arbitration is not None
+            else build_exit_arbitration(account_store=account_store)
+        )
 
     def _rotator_or_none(self) -> AccountRotator | None:
         return cast("AccountRotator | None", self._rotator)
@@ -957,11 +971,20 @@ class RoutingPipeline:
                     context, attempt, exc, reason="verification_required"
                 )
             if not tier_allows(attempt.candidate.tier, context.route):
-                # The upstream call really happened and returned 403 on a
-                # tier that cannot satisfy the route: count it as an attempt
-                # before surfacing the tier error.
+                # Local tier rejection comes first: never spend a canary probe
+                # or an in-slot rebuild on a candidate that cannot satisfy the
+                # route, even when the upstream 403 is region-flavoured.
                 self._record_error("auth_error", context, attempt, exc=exc)
                 raise self._tier_error(context.route, attempt.candidate.tier) from exc
+            if (
+                getattr(exc, "region_restricted", False)
+                and self._exit_arbitration is not None
+                and context.record_attempts
+                and not has_yielded_data
+            ):
+                exit_action = await self._arbitrate_region_error(context, attempt, exc)
+                if exit_action is not None:
+                    return exit_action
             self._record_error("auth_error", context, attempt, exc=exc)
             if has_yielded_data:
                 attempt.client.clear_templates()
@@ -1157,6 +1180,132 @@ class RoutingPipeline:
                 context.route.model,
             )
         return refreshed
+
+    async def _arbitrate_region_error(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exc: Exception,
+    ) -> Literal["switch"] | None:
+        """Ask the canary whether a region 403 is exit-level or account-level.
+
+        Returns ``"switch"`` only after a successful D-05 style in-slot rebuild
+        on a fresh exit; ``None`` means "fall through to the existing 403
+        refresh/switch logic".  Region failures never touch ``failed_accounts``
+        and never add an account cooldown.
+        """
+        arbitration = self._exit_arbitration
+        if arbitration is None:
+            return None
+        try:
+            outcome = await arbitration.adjudicate(
+                account_id=attempt.account_id,
+                kind=context.route.surface,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as arbit_exc:
+            logger.warning(
+                "[routing] region 403 出口仲裁异常，按现有 403 逻辑处理 "
+                "instance=%s account=%s error=%s",
+                attempt.instance_id,
+                attempt.account_id,
+                _summarize_error(arbit_exc),
+            )
+            return None
+        if outcome == "exit_bad":
+            logger.error(
+                "[routing] region 403 canary 判定 exit_bad：上报事件并使绑定失效，"
+                "同槽换出口重建后重试一次 model=%s surface=%s instance=%s "
+                "account=%s",
+                context.route.model,
+                context.route.surface,
+                attempt.instance_id,
+                attempt.account_id,
+            )
+            self._record_error("error", context, attempt, exc=exc)
+            return await self._rebuild_for_new_exit(context, attempt, exc)
+        if outcome == "account_bad":
+            logger.warning(
+                "[routing] region 403 canary 判定 account_bad（出口可用）：不换出口，"
+                "按现有 403 逻辑切号 model=%s instance=%s account=%s",
+                context.route.model,
+                attempt.instance_id,
+                attempt.account_id,
+            )
+        else:
+            logger.warning(
+                "[routing] region 403 canary 判定 inconclusive：不换出口，"
+                "按现有 403 逻辑处理 model=%s instance=%s account=%s",
+                context.route.model,
+                attempt.instance_id,
+                attempt.account_id,
+            )
+        return None
+
+    async def _rebuild_for_new_exit(
+        self,
+        context: RouteContext,
+        attempt: RouteAttempt,
+        exc: Exception,
+    ) -> Literal["switch"]:
+        """D-05 shaped rebuild of the same slot on a freshly assigned exit.
+
+        Release the request handle, require ``active_requests == 0``, close the
+        old session and re-activate the slot (which re-resolves the exit).  Any
+        unsupported/failed/busy path degrades to failing the current request
+        with the original ``AuthError``; the binding is already invalidated.
+        """
+        if context.exit_rebuild_retried:
+            raise exc
+        context.exit_rebuild_retried = True
+        restart = getattr(self._manager, "restart", None)
+        if not callable(restart):
+            logger.warning(
+                "[routing] 管理器不支持 restart，出口切换退化为当前请求失败 "
+                "instance=%s",
+                attempt.instance_id,
+            )
+            raise exc
+        await self.release(attempt)
+        if self._instance_active_requests(attempt.instance_id) > 0:
+            logger.info(
+                "[routing] 出口切换跳过：实例仍有在途请求 instance=%s",
+                attempt.instance_id,
+            )
+            raise exc
+        try:
+            result = restart(attempt.instance_id)
+            updated = await result if inspect.isawaitable(result) else result
+        except asyncio.CancelledError:
+            raise
+        except Exception as restart_exc:
+            logger.warning(
+                "[routing] 出口切换同槽重建失败，当前请求按普通 403 失败 "
+                "instance=%s error=%s",
+                attempt.instance_id,
+                _summarize_error(restart_exc),
+            )
+            raise exc from restart_exc
+        if isinstance(updated, Instance):
+            rebuilt = RouteCandidate.from_instance(updated)
+            context.candidates = [
+                rebuilt if candidate.instance_id == attempt.instance_id else candidate
+                for candidate in context.candidates
+            ]
+        context.attempted_instances.discard(attempt.instance_id)
+        context.retry_same = False
+        context.last_reason = "exit_rebuild"
+        attempt.client.clear_templates()
+        logger.warning(
+            "[routing] 出口切换完成：同槽重建后重试一次 model=%s surface=%s "
+            "instance=%s account=%s",
+            context.route.model,
+            context.route.surface,
+            attempt.instance_id,
+            attempt.account_id,
+        )
+        return "switch"
 
     async def _try_rebind(
         self,
@@ -1706,9 +1855,7 @@ class RoutingPipeline:
 
     def _reset_instance_consecutive_requests(self, instance_id: str) -> int:
         """Clear one slot's streak when proactive rotation has no target (Q-2)."""
-        resetter = getattr(
-            self._manager, "reset_instance_consecutive_requests", None
-        )
+        resetter = getattr(self._manager, "reset_instance_consecutive_requests", None)
         if not callable(resetter):
             return 0
         try:

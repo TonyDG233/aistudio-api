@@ -8,6 +8,7 @@ for both engines.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from aistudio_api.config import settings
 from aistudio_api.infrastructure.browser.browser_engine import (
     find_chromium_executable,
 )
+from aistudio_api.infrastructure.exit_pool import ExitResolver, get_exit_resolver
 from aistudio_api.infrastructure.gateway.browser_engine_session import (
     BrowserEngineSession,
 )
@@ -91,8 +93,9 @@ class BrowserEngineRuntime:
         tier: str,
         account_id: str,
         realm_id: str,
+        surface: str = "chat",
     ) -> SessionBuild:
-        del slot_id, tier
+        del slot_id, tier, surface
         cdp = await self._client.session.ensure_cdp_client()
         context_id = await cdp.create_browser_context()
         try:
@@ -133,6 +136,7 @@ class BrowserlessEngineRuntime:
         account_store: Any | None = None,
         signer_client: SignerClient | None = None,
         daemon: LocalSignerDaemon | None = None,
+        exit_resolver: ExitResolver | None = None,
     ) -> None:
         browserless = engine_settings.get("browserless")
         block = dict(browserless) if isinstance(browserless, dict) else {}
@@ -148,6 +152,11 @@ class BrowserlessEngineRuntime:
         self._daemon = daemon
         self._started = False
         self._health = SignerHealth(ok=False)
+        # External exit pool is strictly env gated: ``None`` keeps the legacy
+        # single global proxy and constructs no control-endpoint client.
+        self._exit_resolver = (
+            exit_resolver if exit_resolver is not None else get_exit_resolver()
+        )
 
     # ------------------------------------------------------------------ setup
 
@@ -257,9 +266,13 @@ class BrowserlessEngineRuntime:
         tier: str,
         account_id: str,
         realm_id: str,
+        surface: str = "chat",
     ) -> SessionBuild:
         del slot_id
         client = self._ensure_client()
+        proxy = settings.proxy_url
+        if self._exit_resolver is not None:
+            proxy = await self._resolve_exit_proxy(account_id, surface) or proxy
         session = BrowserlessSession(
             signer=client,
             auth_file=auth_file,
@@ -268,7 +281,7 @@ class BrowserlessEngineRuntime:
             account_id=account_id,
             realm_id=realm_id,
             transport_mode=str(self._transport_settings.get("mode") or "signer_rpc"),
-            proxy=settings.proxy_url,
+            proxy=proxy,
             locale=str(self._signer_settings.get("locale") or settings.locale),
             timezone=str(self._signer_settings.get("timezone") or settings.timezone),
             http2=bool(self._transport_settings.get("http2", True)),
@@ -278,6 +291,61 @@ class BrowserlessEngineRuntime:
             ),
         )
         return SessionBuild(session=session)
+
+    async def _resolve_exit_proxy(self, account_id: str, surface: str) -> str | None:
+        """Resolve this account's exit; failures fall back to the global proxy."""
+        resolver = self._exit_resolver
+        if resolver is None or not account_id:
+            return None
+        kind = surface if surface in ("chat", "build") else "chat"
+        try:
+            assigned = await resolver.resolve(account_id, kind=kind)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[engine] 外部出口解析异常，回退全局代理 surface=%s error=%s",
+                kind,
+                type(exc).__name__,
+            )
+            return None
+        if assigned and assigned != settings.proxy_url:
+            # Never log the socks URL itself: it may carry credentials.
+            log.info("[engine] 使用外部出口 surface=%s", kind)
+        return assigned
+
+    async def create_canary_session(
+        self,
+        *,
+        account_id: str,
+        auth_file: str | None,
+        proxy: str,
+        auth_user: str = "0",
+        tier: str = "Free",
+    ) -> BrowserlessSession:
+        """Build a throwaway probe session for region canary arbitration.
+
+        It shares the signer/transport settings with real slots but is created
+        outside the pool: it never takes ``active_requests`` and never becomes
+        an instance.  The caller owns ``close()`` and the auth file path.
+        """
+        return BrowserlessSession(
+            signer=self._ensure_client(),
+            auth_file=auth_file,
+            auth_user=auth_user,
+            tier=tier,
+            account_id=account_id,
+            realm_id=f"exit-canary-{account_id}",
+            transport_mode=str(self._transport_settings.get("mode") or "signer_rpc"),
+            proxy=proxy,
+            locale=str(self._signer_settings.get("locale") or settings.locale),
+            timezone=str(self._signer_settings.get("timezone") or settings.timezone),
+            http2=bool(self._transport_settings.get("http2", True)),
+            read_timeout_s=max(
+                _float(self._signer_settings.get("request_timeout_s"), 300.0),
+                _float(self._transport_settings.get("read_timeout_s"), 300.0),
+            ),
+        )
 
     async def health(self) -> SignerHealth:
         try:
@@ -324,6 +392,13 @@ def build_engine_runtime(
     mode = str(engine_settings.get("mode") or "browser")
     if mode == "browserless":
         return BrowserlessEngineRuntime(engine_settings, account_store=account_store)
+    if get_exit_resolver() is not None:
+        # Per-account exits require per-session proxies; Chrome's proxy is a
+        # process-level flag, so the special mode stays browserless-only.
+        log.warning(
+            "[engine] AISTUDIO_EXIT_MODE=external 仅支持 browserless 引擎；"
+            "browser 引擎继续使用全局代理"
+        )
     return BrowserEngineRuntime(client)
 
 

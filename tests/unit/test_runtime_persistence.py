@@ -95,6 +95,112 @@ def test_account_rotator_state_persistence(tmp_path, monkeypatch):
     assert rotator2._stats["acc_test2"].is_available("gemini-3.7-flash")
 
 
+def test_account_meta_verify_required_round_trip_and_legacy_default():
+    meta = AccountMeta(
+        id="acc_verify",
+        name="Verify",
+        email="verify@example.com",
+        created_at="2026-11-22 00:00:00",
+        verify_required=True,
+    )
+    restored = AccountMeta.from_dict(meta.to_dict())
+    assert restored.verify_required is True
+    assert restored.id == meta.id
+
+    legacy = AccountMeta.from_dict(
+        {
+            "id": "acc_legacy",
+            "name": "Legacy",
+            "email": None,
+            "created_at": "2025-01-01 00:00:00",
+        }
+    )
+    assert legacy.verify_required is False
+
+
+def test_account_stats_verify_required_is_separate_from_session_expired():
+    from aistudio_api.application.account_rotator import AccountStats
+
+    stats = AccountStats(account_id="acc_verify")
+    stats.record_verify_required("gemini-3.7-flash", surface="chat")
+
+    assert stats.verify_required is True
+    assert stats.verify_required_count == 1
+    assert stats.last_verify_required_at > 0
+    assert stats.session_expired is False
+    assert stats.is_available("gemini-3.7-flash", surface="chat") is False
+    assert stats.get_cooldown_remaining("gemini-3.7-flash", surface="chat") == 0.0
+
+    data = stats.to_dict()
+    restored = AccountStats.from_dict(data)
+    assert restored.verify_required is True
+    assert restored.verify_required_count == 1
+    assert restored.last_verify_required_at == stats.last_verify_required_at
+    assert restored.session_expired is False
+
+
+def test_rotator_is_auth_locked_covers_verify_required(tmp_path):
+    mock_store = MagicMock(spec=AccountStore)
+    verify_meta = AccountMeta(
+        id="acc_verify",
+        name="Verify",
+        email="v@example.com",
+        created_at="2026-11-22 00:00:00",
+        verify_required=True,
+    )
+    ok_meta = AccountMeta(
+        id="acc_ok",
+        name="OK",
+        email="ok@example.com",
+        created_at="2026-11-22 00:00:00",
+    )
+    mock_store.list_accounts.return_value = [verify_meta, ok_meta]
+    mock_store.get_account.side_effect = lambda account_id: (
+        verify_meta if account_id == "acc_verify" else ok_meta
+    )
+
+    rotator = AccountRotator(mock_store)
+
+    assert rotator.is_auth_locked("acc_verify") is True
+    assert rotator.is_auth_locked("acc_ok") is False
+    verify_stats = rotator.get_account_stats("acc_verify")
+    assert verify_stats is not None and verify_stats.verify_required is True
+
+
+def test_reimport_same_account_clears_verify_lock_explicitly(tmp_path):
+    store = AccountStore(tmp_path / "accounts")
+    state = {
+        "cookies": [
+            {"name": "SID", "value": "a", "domain": ".google.com", "path": "/"}
+        ],
+        "origins": [],
+    }
+    first = store.save_account(
+        name="A",
+        email="a@example.com",
+        storage_state=state,
+        account_id="acc_reimport",
+        tier="Free",
+    )
+    assert store.update_account_refresh(account_id="acc_reimport", verify_required=True)
+    assert store.get_account(first.id).verify_required is True  # type: ignore[union-attr]
+
+    again = store.save_account(
+        name="A",
+        email="a@example.com",
+        storage_state={
+            "cookies": [
+                {"name": "SID", "value": "b", "domain": ".google.com", "path": "/"}
+            ],
+            "origins": [],
+        },
+        account_id="acc_reimport",
+        tier="Free",
+    )
+    assert again.id == "acc_reimport"
+    assert again.verify_required is False
+
+
 def test_resolve_config_file_initializes_from_template_when_missing(
     tmp_path, monkeypatch
 ):

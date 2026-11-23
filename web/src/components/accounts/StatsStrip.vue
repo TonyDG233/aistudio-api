@@ -10,6 +10,7 @@ import {
   Clock3,
   Gauge,
   Server,
+  ShieldAlert,
   Timer,
   Users,
 } from 'lucide-vue-next'
@@ -38,6 +39,10 @@ const authCooldownCount = computed(
   () => statuses.value.filter((status) => status.key === 'cooldown').length,
 )
 
+const verifyCount = computed(
+  () => statuses.value.filter((status) => status.key === 'verify').length,
+)
+
 const quotaExhaustedCount = computed(
   () => statuses.value.filter((status) => status.key === 'quota').length,
 )
@@ -63,7 +68,7 @@ const keepaliveAge = computed(() => {
 </script>
 
 <template>
-  <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-2">
+  <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-2">
     <div class="bg-white border border-gray-200/80 rounded-xl px-3 py-2.5 shadow-2xs">
       <div class="flex items-center gap-1.5 text-[11px] text-gray-500">
         <Users class="w-3.5 h-3.5 text-brand-600" />
@@ -94,6 +99,19 @@ const keepaliveAge = computed(() => {
         :class="expiredCount > 0 ? 'text-rose-700' : 'text-gray-900'"
       >
         {{ expiredCount }}
+      </div>
+    </div>
+
+    <div class="bg-white border border-gray-200/80 rounded-xl px-3 py-2.5 shadow-2xs">
+      <div class="flex items-center gap-1.5 text-[11px] text-gray-500">
+        <ShieldAlert class="w-3.5 h-3.5 text-amber-600" />
+        <span>需验证</span>
+      </div>
+      <div
+        class="mt-1 text-lg font-bold font-mono"
+        :class="verifyCount > 0 ? 'text-amber-700' : 'text-gray-900'"
+      >
+        {{ verifyCount }}
       </div>
     </div>
 

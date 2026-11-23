@@ -456,3 +456,170 @@ async def test_models_refresh_uses_sandbox_payload_only_in_ui_debug(monkeypatch)
 
     assert sandbox_calls == [1]
     assert prod_result == {"source": "live_signer", "model_count": 1}
+
+
+# ------------------------------------------------------------ exit pool status
+
+_EXIT_ENV_VALUES = {
+    "AISTUDIO_EXIT_MODE": "external",
+    "AISTUDIO_EXIT_ENDPOINT": "http://172.17.0.1:41999",
+    "AISTUDIO_EXIT_TOKEN": "secret-token",
+    "AISTUDIO_EXIT_HMAC_KEY": "hmac-key",
+}
+
+_EXIT_POOL_DOWN = {
+    "manager_ok": False,
+    "healthy": 0,
+    "total": 0,
+    "quarantined": 0,
+    "disabled": 0,
+    "bound_accounts": 0,
+    "last_switch_at": 0,
+}
+
+
+def _enable_external_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _EXIT_ENV_VALUES.items():
+        monkeypatch.setenv(name, value)
+
+
+def _exit_resolver_with(handler: Any) -> Any:
+    from aistudio_api.infrastructure.exit_pool import ExitPoolConfig, ExitResolver
+
+    config = ExitPoolConfig.from_env()
+    assert config is not None, "external env must be set"
+    transport = httpx.MockTransport(handler)
+
+    def factory() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=transport)
+
+    return ExitResolver(config, client_factory=factory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_url", "expected_mode"),
+    [(None, "direct"), ("socks5://127.0.0.1:1080", "single")],
+)
+async def test_get_config_without_external_mode_skips_manager(
+    monkeypatch: pytest.MonkeyPatch, proxy_url: str | None, expected_mode: str
+) -> None:
+    from aistudio_api.api.state import runtime_state
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.exit_pool import resolver as resolver_module
+
+    monkeypatch.setattr(settings, "proxy_url", proxy_url)
+    monkeypatch.setattr(runtime_state, "ui_debug", False)
+    builds: list[object] = []
+
+    def _forbidden(*args: object, **kwargs: object) -> object:
+        builds.append(args)
+        raise AssertionError("resolver must not be built when the env is off")
+
+    monkeypatch.setattr(resolver_module, "ExitResolver", _forbidden)
+
+    async with _client() as client:
+        resp = await client.get("/config")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["proxy_mode"] == expected_mode
+    assert data["exit_pool"] is None
+    assert builds == []
+
+
+@pytest.mark.asyncio
+async def test_get_config_external_pool_returns_whitelisted_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aistudio_api.infrastructure.exit_pool import resolver as resolver_module
+
+    _enable_external_exit(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/status"
+        assert request.headers["authorization"] == "Bearer secret-token"
+        return httpx.Response(
+            200,
+            json={
+                "manager_ok": True,
+                "exits": {
+                    "healthy": 2,
+                    "total": 3,
+                    "quarantined": 1,
+                    "disabled": 0,
+                    "unknown": 9,
+                },
+                "bound_accounts": 5,
+                "last_switch_at": 1700000000,
+                "secret": "must-not-leak",
+            },
+        )
+
+    resolver = _exit_resolver_with(handler)
+    monkeypatch.setattr(resolver_module, "get_exit_resolver", lambda: resolver)
+    try:
+        async with _client() as client:
+            data = (await client.get("/config")).json()
+    finally:
+        await resolver.aclose()
+
+    assert data["proxy_mode"] == "external_pool"
+    assert data["exit_pool"] == {
+        "manager_ok": True,
+        "healthy": 2,
+        "total": 3,
+        "quarantined": 1,
+        "disabled": 0,
+        "bound_accounts": 5,
+        "last_switch_at": 1700000000,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http_503", "timeout"])
+async def test_get_config_external_manager_down_reports_manager_ok_false(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from aistudio_api.infrastructure.exit_pool import resolver as resolver_module
+
+    _enable_external_exit(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "timeout":
+            raise httpx.ReadTimeout("manager slow", request=request)
+        return httpx.Response(503, content=b"")
+
+    resolver = _exit_resolver_with(handler)
+    monkeypatch.setattr(resolver_module, "get_exit_resolver", lambda: resolver)
+    try:
+        async with _client() as client:
+            data = (await client.get("/config")).json()
+    finally:
+        await resolver.aclose()
+
+    assert data["proxy_mode"] == "external_pool"
+    assert data["exit_pool"] == _EXIT_POOL_DOWN
+
+
+@pytest.mark.asyncio
+async def test_get_config_ignores_sandbox_query_outside_ui_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aistudio_api.api.state import runtime_state
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.exit_pool import resolver as resolver_module
+
+    monkeypatch.setattr(settings, "proxy_url", None)
+    monkeypatch.setattr(runtime_state, "ui_debug", False)
+    monkeypatch.setattr(resolver_module, "get_exit_resolver", lambda: None)
+
+    async with _client() as client:
+        data = (
+            await client.get(
+                "/config", params={"proxy_mode": "external_pool", "manager_ok": "1"}
+            )
+        ).json()
+
+    assert data["proxy_mode"] == "direct"
+    assert data["exit_pool"] is None

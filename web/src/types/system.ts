@@ -1,8 +1,22 @@
+export type ProxyMode = 'direct' | 'single' | 'external_pool'
+
+export interface ExitPoolStatus {
+  manager_ok: boolean
+  healthy: number
+  total: number
+  quarantined: number
+  disabled: number
+  bound_accounts: number
+  last_switch_at: number
+}
+
 export interface SystemConfig {
   port: number
   browser_port: number
   browser_headless: boolean
   proxy_configured: boolean
+  proxy_mode?: ProxyMode
+  exit_pool?: ExitPoolStatus | null
   auth_enabled: boolean
   yaml_content: string
   log_level?: string

@@ -34,6 +34,7 @@ const emit = defineEmits<{
   editName: [account: AccountWithStats]
   activateAccount: [account: AccountWithStats]
   changeSlot: [account: AccountWithStats]
+  verifyAccount: [account: AccountWithStats]
 }>()
 
 const accountsStore = useAccountsStore()
@@ -43,7 +44,7 @@ const toast = useToastStore()
 
 // 搜索与状态过滤
 const searchKeyword = ref('')
-const statusFilter = ref<'all' | 'ready' | 'limited' | 'cooldown' | 'expired'>('all')
+const statusFilter = ref<'all' | 'ready' | 'limited' | 'cooldown' | 'expired' | 'verify'>('all')
 
 function matchesStatusFilter(acc: AccountWithStats): boolean {
   if (statusFilter.value === 'all') return true
@@ -53,6 +54,7 @@ function matchesStatusFilter(acc: AccountWithStats): boolean {
     accountsStore.activeId,
   )
   if (statusFilter.value === 'expired') return status.key === 'expired'
+  if (statusFilter.value === 'verify') return status.key === 'verify'
   if (statusFilter.value === 'limited') return status.key === 'quota'
   if (statusFilter.value === 'cooldown') return status.key === 'cooldown'
   return status.key === 'ready'
@@ -458,6 +460,14 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             >
               登录态失效
             </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded-lg transition-all cursor-pointer"
+              :class="statusFilter === 'verify' ? 'bg-white text-amber-800 font-semibold shadow-2xs' : 'text-gray-500 hover:text-gray-900'"
+              @click="statusFilter = 'verify'"
+            >
+              需验证
+            </button>
           </div>
         </div>
 
@@ -570,6 +580,7 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           @delete="handleDeleteAccount(acc)"
           @edit-name="emit('editName', acc)"
           @toggle-select="toggleRow(acc.id)"
+          @verify="emit('verifyAccount', acc)"
           @clear-cooldown="acc.session_expired || acc.expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
           @clear-model="handleClearModelCooldown(acc.id, $event)"
         />

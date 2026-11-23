@@ -111,7 +111,7 @@ async def test_ui_debug_lifespan_is_offline_and_temp_only(monkeypatch):
         async with _client() as client:
             resp = await client.get("/api/accounts")
         assert resp.status_code == 200
-        assert len(resp.json()) == 12
+        assert len(resp.json()) == 13
         assert set(data_dir.rglob("*")) == before
     assert sandbox_root is not None
     assert not sandbox_root.exists()
@@ -129,6 +129,9 @@ async def test_debug_endpoints_and_scenario_actions(ui_debug):
         accounts = {item["id"]: item for item in state["accounts"]}
         assert accounts["acc_pro_expired"]["expired"] is True
         assert accounts["acc_pro_session"]["session_expired"] is True
+        assert accounts["acc_free_verify"]["verify_required"] is True
+        assert accounts["acc_free_verify"]["session_expired"] is False
+        assert accounts["acc_free_verify"]["is_available"] is False
         assert accounts["acc_ultra_cooldown"]["auth_cooldown"] > 0
         assert accounts["acc_ultra_cooldown"]["quota_exhausted"] is False
         assert accounts["acc_free_quota"]["is_available"] is False
@@ -792,3 +795,79 @@ async def test_engine_config_switch_and_health_in_sandbox(ui_debug):
         )
         done = (await client.post("/api/engine/health-check")).json()
         assert done["engine"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_verify_account_sandbox_flow(ui_debug):
+    async with ui_debug, _client() as client:
+        before = (await client.get("/api/accounts")).json()
+        verify_acc = next(a for a in before if a["id"] == "acc_free_verify")
+        assert verify_acc["verify_required"] is True
+        assert verify_acc["is_available"] is False
+
+        started = await client.post("/api/accounts/acc_free_verify/verify/start")
+        assert started.status_code == 200
+        payload = started.json()
+        assert payload["state"] == "pending"
+        assert payload["qr_url"].startswith("https://recaptcha.net/qr/")
+        assert payload["short_code"].startswith("SANDBOX")
+        session_id = payload["session_id"]
+
+        pending = await client.get(
+            "/api/accounts/acc_free_verify/verify/status",
+            params={"session_id": session_id},
+        )
+        assert pending.status_code == 200
+        assert pending.json()["state"] == "pending"
+
+        cancelled = await client.post("/api/accounts/acc_free_verify/verify/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.json() == {"state": "cancelled"}
+
+        restarted = await client.post("/api/accounts/acc_free_verify/verify/start")
+        assert restarted.status_code == 200
+        new_session = restarted.json()["session_id"]
+        assert new_session != session_id
+
+        passed = await client.get(
+            "/api/accounts/acc_free_verify/verify/status",
+            params={"session_id": new_session, "simulate": "passed"},
+        )
+        assert passed.status_code == 200
+        assert passed.json()["state"] == "passed"
+
+        after = (await client.get("/api/accounts")).json()
+        cleared = next(a for a in after if a["id"] == "acc_free_verify")
+        assert cleared["verify_required"] is False
+        assert cleared["is_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_config_proxy_status_sandbox_query_only_in_ui_debug(ui_debug):
+    async with ui_debug, _client() as client:
+        default = (await client.get("/config")).json()
+        assert default["proxy_mode"] == "single"
+        assert default["exit_pool"] is None
+
+        online = (
+            await client.get("/config", params={"proxy_mode": "external_pool"})
+        ).json()
+        assert online["proxy_mode"] == "external_pool"
+        assert online["exit_pool"] == {
+            "manager_ok": True,
+            "healthy": 3,
+            "total": 4,
+            "quarantined": 1,
+            "disabled": 0,
+            "bound_accounts": 7,
+            "last_switch_at": 1795305600,
+        }
+
+        down = (
+            await client.get(
+                "/config",
+                params={"proxy_mode": "external_pool", "manager_ok": "0"},
+            )
+        ).json()
+        assert down["proxy_mode"] == "external_pool"
+        assert down["exit_pool"]["manager_ok"] is False
