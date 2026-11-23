@@ -8,6 +8,7 @@ import logging
 import platform
 import tempfile
 import time
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1700,3 +1701,266 @@ def test_safe_page_text_masks_email_and_tokens() -> None:
     assert "***@***" in preview
     assert "SID=***" in preview
     assert len(preview) <= verify_module._PAGE_TEXT_LOG_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# verify-account observation: CDP network record + QR frame diagnostics
+# ---------------------------------------------------------------------------
+
+
+class _NetFakePage:
+    """Fake CDP page exposing the three network hooks the driver subscribes to."""
+
+    def __init__(self) -> None:
+        self.request_cb: Any = None
+        self.response_cb: Any = None
+        self.failed_cb: Any = None
+        self.unsubscribed: list[str] = []
+
+    def on_request(self, callback: Any) -> Any:
+        self.request_cb = callback
+        return lambda: self.unsubscribed.append("request")
+
+    def on_response(self, callback: Any) -> Any:
+        self.response_cb = callback
+        return lambda: self.unsubscribed.append("response")
+
+    def on_loading_failed(self, callback: Any) -> Any:
+        self.failed_cb = callback
+        return lambda: self.unsubscribed.append("loading_failed")
+
+
+def test_net_trace_records_only_whitelisted_fields() -> None:
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    assert page.request_cb is not None and page.response_cb is not None
+    assert page.failed_cb is not None
+    assert len(driver._net_unsubscribers) == 3
+
+    page.request_cb(
+        {
+            "request_id": "req-1",
+            "url": "https://aistudio.google.com/verify-account?token=SUPERSECRET",
+            "method": "POST",
+            "headers": {"Cookie": "SID=secret-cookie", "Authorization": "Bearer x"},
+            "post_data": "post-body-secret",
+        }
+    )
+    page.response_cb(
+        {
+            "request_id": "req-1",
+            "url": "https://aistudio.google.com/verify-account?token=SUPERSECRET",
+            "status": 200,
+            "headers": {"Set-Cookie": "leak=1"},
+            "mime_type": "application/json; charset=utf-8",
+        }
+    )
+
+    entries = list(driver._net_trace)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert {f.name for f in dataclass_fields(entry)} == {
+        "ts",
+        "method",
+        "url_path",
+        "status",
+        "mime",
+        "request_id",
+        "failed",
+    }
+    assert entry.method == "POST"
+    assert entry.url_path == "verify-account"
+    assert "?" not in entry.url_path
+    assert entry.status == 200
+    assert entry.mime == "application/json"
+    assert entry.request_id == "req-1"
+    assert entry.failed == ""
+    rendered = repr(entry)
+    assert "secret-cookie" not in rendered
+    assert "post-body-secret" not in rendered
+    assert "SUPERSECRET" not in rendered
+    assert "Bearer" not in rendered
+
+    # Pages without network hooks (test doubles / future engines) must not raise.
+    driver._register_net_trace(object())
+
+
+def test_net_trace_masks_rpc_service_segment_but_keeps_method_name() -> None:
+    host, path = verify_module._sanitize_url_for_log(
+        "https://alkalimakersuite-pa.clients6.google.com/$rpc/"
+        "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
+        "GetUserVerificationStatus?key=SECRETKEY"
+    )
+    assert host == "alkalimakersuite-pa.clients6.google.com"
+    assert path == "rpc/MakerSuiteService/GetUserVerificationStatus"
+    assert "SECRETKEY" not in path
+    # QR short codes are masked, not logged in clear text.
+    assert verify_module._sanitize_url_for_log("https://x/qr/ABCDEF123456")[1] == "qr/…"
+
+
+@pytest.mark.asyncio
+async def test_qr_timeout_dumps_net_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(
+        auth_file=Path("unused.json"), code_timeout_seconds=0.3
+    )
+    driver._register_net_trace(page)
+    page.request_cb(
+        {
+            "request_id": "req-9",
+            "url": "https://www.google.com/recaptcha/api2/bframe?k=abc",
+            "method": "GET",
+            "headers": {"Cookie": "SID=secret"},
+            "post_data": "",
+        }
+    )
+
+    qr_page = _BlankFramePage()
+    with pytest.raises(VerifyChallengeTimeout):
+        await driver._wait_for_qr(cast(Any, qr_page))
+
+    messages = [record.getMessage() for record in caplog.records]
+    dump = [m for m in messages if "网络记录 reason=qr_timeout" in m]
+    assert dump, "qr_timeout must dump the network record before raising"
+    assert "total=1" in dump[-1]
+    assert "interesting=1" in dump[-1]
+    assert any("recaptcha/api2/bframe" in m for m in messages)
+    assert all("secret" not in m for m in messages)
+
+
+class _NetDumpDriver(FakeDriver):
+    """FakeDriver that records ``still_pending`` dump invocations."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.dump_reasons: list[str] = []
+
+    def _dump_net_trace(self, reason: str) -> None:
+        self.dump_reasons.append(reason)
+
+
+@pytest.mark.asyncio
+async def test_still_pending_dump_is_throttled(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = _NetDumpDriver(
+        poll_results=[PageProbe(_VERIFY_URL, False)], confirm_status=1
+    )
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+    try:
+        started = await service.start("acc_1")
+        session_id = str(started["session_id"])
+
+        await service.status("acc_1", session_id, force=True)
+        await service.status("acc_1", session_id, force=True)
+        assert driver.dump_reasons.count("still_pending") == 1
+
+        session = service.session
+        assert session is not None
+        session.last_net_dump_at = time.time() - 11.0
+        await service.status("acc_1", session_id, force=True)
+        assert driver.dump_reasons.count("still_pending") == 2
+    finally:
+        await service.close()
+
+
+class _BlankFramePage:
+    """Frame tree where the QR lives in a frame whose URL is still about:blank."""
+
+    def __init__(self) -> None:
+        self.worlds = 0
+
+        owner = self
+
+        class _Cdp:
+            async def send(
+                self, method: str, params: dict[str, object] | None = None
+            ) -> dict[str, object]:
+                if method == "Page.getFrameTree":
+                    return {
+                        "frameTree": {
+                            "frame": {"id": "main", "url": _VERIFY_URL},
+                            "childFrames": [
+                                {"frame": {"id": "bframe_blank", "url": "about:blank"}}
+                            ],
+                        }
+                    }
+                if method == "Page.createIsolatedWorld":
+                    owner.worlds += 1
+                    return {"executionContextId": 200 + owner.worlds}
+                return {"result": {"value": {"hasCanvas": True, "dataImageCount": 1}}}
+
+        self.cdp = _Cdp()
+
+    async def evaluate(self, expression: str, *args: Any, **kwargs: Any) -> object:
+        if "window.location.href" in expression:
+            return _VERIFY_URL
+        return None
+
+
+@pytest.mark.asyncio
+async def test_blank_url_frame_is_logged_not_silently_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _BlankFramePage()
+    driver = CdpVerifyBrowserDriver(
+        auth_file=Path("unused.json"), code_timeout_seconds=1.0
+    )
+    challenge = await driver._read_bframe_qr(cast(Any, page))
+    assert challenge is None
+
+    messages = [record.getMessage() for record in caplog.records]
+    blank = [m for m in messages if "filter_reason=blank_url" in m]
+    assert blank, "an about:blank candidate frame must be logged as filtered"
+    assert any("frame_id=bframe_blank" in m for m in blank)
+    assert any("qr_image_only=true" in m for m in messages)
+    # The tentative read is allowed once per frame per session only.
+    assert page.worlds == 1
+
+
+def test_read_qr_js_extension_keeps_short_code_extraction() -> None:
+    js = verify_module._READ_QR_JS
+    for field in ("canvasAriaLabel", "imgQrAlts", "dataImageCount", "hasCanvas"):
+        assert field in js
+    # Only the count of data: images is returned, never the payload itself.
+    assert 'img[src^="data:image"]' in js
+
+    legacy_payload = {
+        "href": "https://recaptcha.net/qr/ABCDEF123456",
+        "title": "",
+        "fallback": "",
+        "hasCanvas": True,
+    }
+    extended_payload = {
+        **legacy_payload,
+        "canvasAriaLabel": "",
+        "imgQrAlts": [],
+        "dataImageCount": 0,
+    }
+
+    def extract(payload: dict[str, object]) -> str | None:
+        return verify_module._extract_short_code(
+            tuple(value for _, value in verify_module._qr_code_sources(payload))
+        )
+
+    assert extract(legacy_payload) == extract(extended_payload) == "ABCDEF123456"
+    # New read-only sources can also carry the code, searched after the legacy
+    # href/title/fallback order.
+    alt_payload = {
+        "href": "",
+        "title": "",
+        "fallback": "",
+        "canvasAriaLabel": "",
+        "imgQrAlts": ["QR code https://recaptcha.net/qr/ZYXWVU654321"],
+        "dataImageCount": 3,
+    }
+    assert extract(alt_payload) == "ZYXWVU654321"
+    # A data: image payload with no textual code must still yield ``None``.
+    assert (
+        extract({"href": "", "title": "", "fallback": "", "dataImageCount": 4}) is None
+    )

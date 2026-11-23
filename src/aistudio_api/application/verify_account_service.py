@@ -35,12 +35,14 @@ import socket
 import tempfile
 import time
 import uuid
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -95,6 +97,29 @@ CONFIRM_RPC_TIMEOUT_SECONDS = 8.0
 # Minimum spacing between automatic ``GetUserVerificationStatus`` RPCs driven
 # by plain (non-forced) status polls.  A manual ``force`` check bypasses it.
 CONFIRM_RPC_INTERVAL_SECONDS = 10.0
+# Bounded per-session CDP network record used only for diagnosing the headless
+# QR flow (did the page actually fire ``VerifyUser`` / receive Google's
+# callback?).  Entry fields are whitelisted: no headers, Cookie/Set-Cookie,
+# postData, Authorization, query strings, QR short codes or data: image bodies
+# are ever stored or logged.
+NET_TRACE_MAXLEN = 300
+NET_URL_PATH_LIMIT = 200
+NET_DETAIL_LIMIT = 25
+# ``still_pending`` dumps are throttled per session so a 5 minute QR wait does
+# not flood the log with the same 100+ network entries.
+NET_DUMP_INTERVAL_SECONDS = 10.0
+NET_INTERESTING_TOKENS = (
+    "$rpc/",
+    "rpc/",
+    "recaptcha",
+    "VerifyUser",
+    "GetUserVerificationStatus",
+    "verify-account",
+)
+# QR frame diagnostics are logged at most once per interval (per round of frame
+# scanning), so the 0.5s polling loop does not double the log volume.
+QR_DIAG_INTERVAL_SECONDS = 2.0
+QR_DIAG_URL_LIMIT = 120
 # ``CdpVerifyBrowserDriver.close`` is bounded at ~1.5s+1.0s (process) + 2s
 # (Page.close) + 2s (client) = 6.5s worst case; keep the outer guard above it so
 # a healthy teardown is never cancelled half-way.
@@ -183,10 +208,22 @@ _READ_QR_JS = """
   const fallback = document.querySelector(
     '.recaptchaJavascriptChallengeQrFallbackText'
   );
+  const imgQrAlts = [];
+  for (const img of document.querySelectorAll('img')) {
+    if (imgQrAlts.length >= 5) break;
+    const raw = img.getAttribute('alt') || img.getAttribute('aria-label') || '';
+    const label = String(raw);
+    if (!label || !label.toLowerCase().includes('qr')) continue;
+    imgQrAlts.push(label.slice(0, 200));
+  }
+  const aria = canvas ? canvas.getAttribute('aria-label') : '';
   return {
     href: button && button.href ? String(button.href) : '',
     title: canvas && canvas.title ? String(canvas.title) : '',
     fallback: fallback && fallback.textContent ? String(fallback.textContent) : '',
+    canvasAriaLabel: aria ? String(aria) : '',
+    imgQrAlts: imgQrAlts,
+    dataImageCount: document.querySelectorAll('img[src^="data:image"]').length,
     hasCanvas: !!canvas,
   };
 })()
@@ -240,6 +277,108 @@ def _safe_page_text(text: object, *, limit: int = _PAGE_TEXT_LOG_LIMIT) -> str:
 def _safe_error_detail(error: object) -> str:
     """Mask an exception message before it reaches an ERROR record."""
     return _safe_page_text(str(error), limit=300) or "-"
+
+
+@dataclass
+class _NetTraceEntry:
+    """One CDP network event, reduced to non-secret projection fields only."""
+
+    ts: float
+    method: str
+    url_path: str
+    status: int | None
+    mime: str
+    request_id: str
+    failed: str = ""
+
+
+_SECRET_SEGMENT_RE = re.compile(r"[A-Za-z0-9_\-]+")
+_RPC_METHOD_LIMIT = 60
+_LONG_SEGMENT_LIMIT = 40
+
+
+def _is_secret_like_segment(segment: str, *, previous: str) -> bool:
+    """True for QR short codes / long opaque tokens that must be masked."""
+    if previous.lower() == "qr" and segment:
+        return True
+    return len(segment) >= 24 and _SECRET_SEGMENT_RE.fullmatch(segment) is not None
+
+
+def _sanitize_url_for_log(url: str) -> tuple[str, str]:
+    """Split a URL into ``(host, path)`` without query/fragment/secret tokens.
+
+    The RPC method name (last path segment of a ``$rpc/...`` URL) is kept
+    verbatim because it is the key diagnostic (``VerifyUser``,
+    ``GetUserVerificationStatus``, ``ListModels``); every other long or
+    token-looking segment collapses to ``…``.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return "", ""
+    if raw.startswith("data:"):
+        return "", "data:…"
+    try:
+        split = urlsplit(raw)
+    except ValueError:
+        return "", "…"
+    host = split.netloc.rsplit("@", 1)[-1]
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    host = host.lower()[:80]
+    segments = [seg for seg in split.path.split("/") if seg]
+    if not segments:
+        return host, "/"
+    is_rpc = any(seg.lower() == "$rpc" for seg in segments)
+    out: list[str] = []
+    for index, seg in enumerate(segments):
+        previous = segments[index - 1] if index else ""
+        if seg.lower() == "$rpc":
+            out.append("rpc")
+            continue
+        if is_rpc and index == len(segments) - 1:
+            out.append(seg[:_RPC_METHOD_LIMIT])
+            continue
+        if _is_secret_like_segment(seg, previous=previous):
+            out.append("…")
+            continue
+        if len(seg) > _LONG_SEGMENT_LIMIT:
+            # A long dotted RPC service segment keeps its trailing class name
+            # so the detail line still reads as an RPC call.
+            out.append(seg.rsplit(".", 1)[-1][:40] if is_rpc and "." in seg else "…")
+            continue
+        out.append(seg)
+    return host, "/".join(out)[:NET_URL_PATH_LIMIT]
+
+
+def _net_url_interesting(url_path: str) -> bool:
+    lowered = url_path.lower()
+    return any(token.lower() in lowered for token in NET_INTERESTING_TOKENS)
+
+
+def _qr_code_sources(payload: dict[str, object]) -> list[tuple[str, str]]:
+    """Ordered string sources probed for a QR short code (never image bodies)."""
+    sources: list[tuple[str, str]] = []
+    for key in ("href", "title", "fallback", "canvasAriaLabel"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            sources.append((key, value))
+    alts = payload.get("imgQrAlts")
+    if isinstance(alts, list):
+        for index, alt in enumerate(alts[:5]):
+            if isinstance(alt, str) and alt:
+                sources.append((f"img_alt[{index}]", alt))
+    return sources
+
+
+def _dump_driver_net_trace(driver: object, reason: str) -> None:
+    """Best-effort dump via a duck-typed driver; never raises into the session."""
+    dumper = getattr(driver, "_dump_net_trace", None)
+    if not callable(dumper):
+        return
+    try:
+        dumper(reason)
+    except Exception:
+        log.debug("验证会话网络记录导出失败: reason=%s", reason)
 
 
 class VerifySessionState(StrEnum):
@@ -356,6 +495,10 @@ class VerifySession:
     # 0.0 means "never".  Plain polls only re-query once it is older than
     # ``CONFIRM_RPC_INTERVAL_SECONDS``.
     last_confirm_at: float = 0.0
+    # Throttles the ``still_pending`` network dump and remembers whether the
+    # one-shot ``page_transition`` dump already fired for this session.
+    last_net_dump_at: float = 0.0
+    net_transition_logged: bool = False
 
     def to_public(self) -> dict[str, object]:
         return {
@@ -1168,6 +1311,14 @@ class VerifyAccountService:
             _safe_page_text(page_info.get("text")) or "-",
         )
 
+        # Diagnostic only: once the page leaves verify-account (or reports the
+        # success copy), dump the network record right before the loop would
+        # finish/clear the lock.  Fires at most once per session.
+        leaving_verify_page = bool(page_url) and "verify-account" not in page_url
+        if (probe.success or leaving_verify_page) and not session.net_transition_logged:
+            session.net_transition_logged = True
+            _dump_driver_net_trace(driver, "page_transition")
+
         if is_login_page_url(probe.page_url):
             await self._finish(
                 session, VerifySessionState.SESSION_INVALID, "login_redirect"
@@ -1261,6 +1412,19 @@ class VerifyAccountService:
             return
         # 1 / None: upstream still pending.
         session.message = "still_pending"
+        log.info(
+            "验证会话上游仍待确认: session=%s account=%s manual=%s page_url=%s "
+            "upstream_status=%s",
+            session.session_id,
+            session.account_id,
+            force,
+            page_url or "-",
+            status_value,
+        )
+        now_ts = time.time()
+        if now_ts - session.last_net_dump_at >= NET_DUMP_INTERVAL_SECONDS:
+            session.last_net_dump_at = now_ts
+            _dump_driver_net_trace(driver, "still_pending")
 
     async def _describe_page_for_log(
         self, driver: VerifyBrowserSession
@@ -1435,6 +1599,14 @@ class CdpVerifyBrowserDriver:
         self._page: CDPPage | None = None
         self._user_data_dir: str | None = None
         self._worlds: dict[str, int] = {}
+        # Frame ids that already got their one tentative read while their URL
+        # was empty/about:blank; never retried so polling cadence is unchanged.
+        self._qr_blank_attempted: set[str] = set()
+        self._qr_diag_last_at = 0.0
+        self._net_trace: deque[_NetTraceEntry] = deque(maxlen=NET_TRACE_MAXLEN)
+        self._net_hosts: Counter[str] = Counter()
+        self._net_started_at: float | None = None
+        self._net_unsubscribers: list[Callable[[], None]] = []
         self._closed = False
 
     def _resolve_binary(self) -> Path:
@@ -1482,6 +1654,9 @@ class CdpVerifyBrowserDriver:
             self._client = client
             page = await client.connect_page(block_assets=False)
             self._page = page
+            # Observe only: whitelisted request/response/failure records used by
+            # ``_dump_net_trace`` to answer "did Google's callback reach us?".
+            self._register_net_trace(page)
         except Exception as exc:
             log.error(
                 "验证浏览器进程启动失败: error_type=%s error=%s",
@@ -1530,6 +1705,133 @@ class CdpVerifyBrowserDriver:
             info.get("error") or "-",
             _safe_page_text(info.get("text")) or "-",
         )
+
+    # -- CDP network record (observation only) ------------------------------
+
+    def _net_elapsed(self) -> float:
+        started = self._net_started_at
+        if started is None:
+            return 0.0
+        return round(max(0.0, time.monotonic() - started), 2)
+
+    def _register_net_trace(self, page: object) -> None:
+        """Subscribe to network events, tolerating pages without such hooks."""
+        self._net_started_at = time.monotonic()
+        subscribers = (
+            ("on_request", self._on_net_request),
+            ("on_response", self._on_net_response),
+            ("on_loading_failed", self._on_net_failed),
+        )
+        for name, callback in subscribers:
+            try:
+                register = getattr(page, name, None)
+                if not callable(register):
+                    continue
+                unsubscribe = register(callback)
+            except Exception as exc:
+                log.debug(
+                    "验证会话网络事件订阅失败: hook=%s error=%s",
+                    name,
+                    type(exc).__name__,
+                )
+                continue
+            if callable(unsubscribe):
+                self._net_unsubscribers.append(cast("Callable[[], None]", unsubscribe))
+
+    def _record_net_entry(self, entry: _NetTraceEntry) -> None:
+        self._net_trace.append(entry)
+
+    def _on_net_request(self, data: dict[str, object]) -> None:
+        """Store only method/path/request id; headers and postData are dropped."""
+        try:
+            host, url_path = _sanitize_url_for_log(str(data.get("url") or ""))
+            if host:
+                self._net_hosts[host] += 1
+            self._record_net_entry(
+                _NetTraceEntry(
+                    ts=self._net_elapsed(),
+                    method=str(data.get("method") or "GET")[:16],
+                    url_path=url_path,
+                    status=None,
+                    mime="",
+                    request_id=str(data.get("request_id") or "")[:80],
+                )
+            )
+        except Exception:
+            log.debug("验证会话网络请求记录失败")
+
+    def _on_net_response(self, data: dict[str, object]) -> None:
+        try:
+            request_id = str(data.get("request_id") or "")
+            raw_status = data.get("status")
+            status = (
+                int(raw_status)
+                if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+                else None
+            )
+            mime = str(data.get("mime_type") or "").split(";", 1)[0].strip()[:40]
+            for entry in reversed(self._net_trace):
+                if entry.request_id == request_id and entry.status is None:
+                    entry.status = status
+                    entry.mime = mime
+                    return
+        except Exception:
+            log.debug("验证会话网络响应记录失败")
+
+    def _on_net_failed(self, params: dict[str, object]) -> None:
+        try:
+            request_id = str(params.get("requestId") or "")
+            raw_error = str(params.get("errorText") or "")
+            reason = "canceled" if params.get("canceled") else (raw_error or "failed")
+            if not request_id:
+                return
+            for entry in reversed(self._net_trace):
+                if entry.request_id == request_id:
+                    entry.failed = reason[:60]
+                    return
+        except Exception:
+            log.debug("验证会话网络失败事件记录失败")
+
+    def _dump_net_trace(self, reason: str) -> None:
+        """Log a bounded summary plus the interesting request lines."""
+        try:
+            entries = list(self._net_trace)
+            interesting = [e for e in entries if _net_url_interesting(e.url_path)]
+            hosts = " ".join(
+                f'"{host}":{count}' for host, count in self._net_hosts.most_common(6)
+            )
+            log.info(
+                "[Verify] 网络记录 reason=%s total=%d interesting=%d 主域名={%s}",
+                reason,
+                len(entries),
+                len(interesting),
+                hosts,
+            )
+            printed = 0
+            for index, entry in enumerate(entries, 1):
+                if not _net_url_interesting(entry.url_path):
+                    continue
+                if printed >= NET_DETAIL_LIMIT:
+                    break
+                printed += 1
+                status = "-" if entry.status is None else str(entry.status)
+                suffix = f" failed={entry.failed}" if entry.failed else ""
+                log.info(
+                    "  #%d +%.2fs %s %s → %s %s%s",
+                    index,
+                    entry.ts,
+                    entry.method,
+                    entry.url_path or "-",
+                    status,
+                    entry.mime or "-",
+                    suffix,
+                )
+            if len(interesting) > printed:
+                log.info(
+                    "  …另有 %d 条 interesting 记录未展示", len(interesting) - printed
+                )
+        except Exception:
+            log.debug("验证会话网络记录导出失败: reason=%s", reason)
 
     async def poll(self) -> PageProbe:
         page = self._page
@@ -1621,8 +1923,16 @@ class CdpVerifyBrowserDriver:
         if self._closed:
             return
         self._closed = True
+        # Diagnostic: the last chance to see whether the callback ever arrived.
+        if self._net_trace or self._page is not None:
+            self._dump_net_trace("session_close")
         user_data_dir = self._user_data_dir
         self._user_data_dir = None
+        unsubscribers = self._net_unsubscribers
+        self._net_unsubscribers = []
+        for unsubscribe in unsubscribers:
+            with contextlib.suppress(Exception):
+                unsubscribe()
         try:
             # Terminate the process first: after the browser is gone, Page.close
             # / CDP close fail fast (and are still bounded) instead of waiting
@@ -1690,55 +2000,185 @@ class CdpVerifyBrowserDriver:
                     last_click_at = now
             await asyncio.sleep(0.5)
         log.warning("扫码等待超时: deadline=%.1fs", self._code_timeout)
+        self._dump_net_trace("qr_timeout")
         raise VerifyChallengeTimeout("qr_timeout")
 
     async def _read_bframe_qr(self, page: CDPPage) -> QrChallenge | None:
         try:
             response = await page.cdp.send("Page.getFrameTree")
-        except Exception:
+        except Exception as exc:
+            log.debug("QR 帧树读取失败: error=%s", type(exc).__name__)
             return None
         frames = list(_iter_frame_tree(response.get("frameTree")))
         live_ids = {str(frame.get("id") or "") for frame in frames if frame.get("id")}
         # A navigated/rebuilt bframe invalidates its old isolated world.
         for stale_id in [key for key in self._worlds if key not in live_ids]:
             self._worlds.pop(stale_id, None)
+        for stale_id in [
+            key for key in self._qr_blank_attempted if key not in live_ids
+        ]:
+            self._qr_blank_attempted.discard(stale_id)
+        now = time.monotonic()
+        log_diag = now - self._qr_diag_last_at >= QR_DIAG_INTERVAL_SECONDS
+        if log_diag:
+            self._qr_diag_last_at = now
         for frame in frames:
             url = str(frame.get("url") or "")
-            if "bframe" not in url and "recaptcha" not in url:
-                continue
             frame_id = str(frame.get("id") or "")
+            selected = "bframe" in url or "recaptcha" in url
+            if not url or url.startswith("about:"):
+                filter_reason = "blank_url"
+            elif not selected:
+                filter_reason = "not_bframe"
+            else:
+                filter_reason = "ok"
             if not frame_id:
                 continue
-            value = await self._evaluate_qr_in_frame(page, frame_id)
-            if not isinstance(value, dict):
+            if filter_reason != "ok":
+                # A zero/`about:blank` URL is exactly the blind spot behind
+                # ``qr_timeout``: the QR may live in a frame we would otherwise
+                # skip silently.  Read it once per frame for diagnostics only
+                # (the result never creates a challenge, so behaviour is
+                # unchanged and the polling cadence is untouched).
+                diag: dict[str, object] | None = None
+                if (
+                    filter_reason == "blank_url"
+                    and frame_id not in self._qr_blank_attempted
+                ):
+                    self._qr_blank_attempted.add(frame_id)
+                    diag = await self._evaluate_qr_in_frame(page, frame_id)
+                if log_diag:
+                    self._log_qr_frame(
+                        frame_id=frame_id,
+                        url=url,
+                        selected=selected,
+                        filter_reason=filter_reason,
+                        diag=diag,
+                    )
                 continue
-            payload = value.get("value")
-            if not isinstance(payload, dict):
-                continue
-            short_code = _extract_short_code(
-                (
-                    str(payload.get("href") or ""),
-                    str(payload.get("title") or ""),
-                    str(payload.get("fallback") or ""),
-                )
-            )
+            diag = await self._evaluate_qr_in_frame(page, frame_id)
+            payload = diag.get("payload") if isinstance(diag, dict) else None
+            payload_dict = payload if isinstance(payload, dict) else {}
+            sources = _qr_code_sources(payload_dict)
+            short_code = _extract_short_code(tuple(value for _, value in sources))
             if short_code:
+                matched = [
+                    name for name, value in sources if _SHORT_CODE_RE.search(value)
+                ]
+                if log_diag:
+                    self._log_qr_frame(
+                        frame_id=frame_id,
+                        url=url,
+                        selected=selected,
+                        filter_reason="ok",
+                        diag=diag,
+                        sources=matched,
+                        short_code=True,
+                    )
                 return QrChallenge(
                     qr_url=f"https://recaptcha.net/qr/{short_code}",
                     short_code=short_code,
                 )
+            if log_diag:
+                self._log_qr_frame(
+                    frame_id=frame_id,
+                    url=url,
+                    selected=selected,
+                    filter_reason="ok",
+                    diag=diag,
+                    sources=[],
+                    short_code=False,
+                )
         return None
+
+    def _log_qr_frame(
+        self,
+        *,
+        frame_id: str,
+        url: str,
+        selected: bool,
+        filter_reason: str,
+        diag: dict[str, object] | None,
+        sources: list[str] | None = None,
+        short_code: bool | None = None,
+    ) -> None:
+        """Log one candidate frame's read-only QR probe outcome (throttled)."""
+        try:
+            raw_url = str(url or "")
+            if not raw_url:
+                display = "-"
+            elif raw_url.startswith("about:"):
+                display = raw_url[:QR_DIAG_URL_LIMIT]
+            else:
+                host, path = _sanitize_url_for_log(raw_url)
+                display = f"{host}/{path}" if host else (path or "-")
+            payload = diag.get("payload") if isinstance(diag, dict) else None
+            payload_dict = payload if isinstance(payload, dict) else {}
+            if short_code is None:
+                hit_sources = _qr_code_sources(payload_dict)
+                short_code = (
+                    _extract_short_code(tuple(value for _, value in hit_sources))
+                    is not None
+                )
+            has_canvas = bool(payload_dict.get("hasCanvas"))
+            data_images = payload_dict.get("dataImageCount")
+            data_image_count = (
+                data_images
+                if isinstance(data_images, int) and not isinstance(data_images, bool)
+                else 0
+            )
+            log.info(
+                "[Verify] QR帧诊断 frame_id=%s url=%s selected=%s filter_reason=%s "
+                "isolated_world=%s evaluate=%s short_code=%s has_canvas=%s "
+                "data_images=%s sources=%s",
+                (frame_id or "-")[:40],
+                display[:QR_DIAG_URL_LIMIT] or "-",
+                selected,
+                filter_reason,
+                (diag or {}).get("isolated_world", "skipped"),
+                (diag or {}).get("evaluate", "skipped"),
+                "yes" if short_code else "no",
+                "true" if has_canvas else "false",
+                data_image_count,
+                ",".join(sources) if sources else "-",
+            )
+            if not short_code and (has_canvas or data_image_count > 0):
+                log.info(
+                    "[Verify] QR 仅图片形态: frame_id=%s qr_image_only=true "
+                    "has_canvas=%s data_images=%d",
+                    (frame_id or "-")[:40],
+                    "true" if has_canvas else "false",
+                    data_image_count,
+                )
+        except Exception:
+            log.debug("QR 帧诊断日志失败")
 
     async def _evaluate_qr_in_frame(
         self, page: CDPPage, frame_id: str
-    ) -> dict[str, object] | None:
-        """Evaluate the QR probe, rebuilding the isolated world when stale."""
+    ) -> dict[str, object]:
+        """Evaluate the QR probe; return payload plus world/evaluate diagnostics.
+
+        Never raises: the caller distinguishes ``isolated_world`` /
+        ``evaluate`` failures from "frame had no QR" so the silent ``None``
+        path that hid the real ``qr_timeout`` cause is gone.
+        """
         for attempt in range(2):
             context_id = self._worlds.get(frame_id)
             if context_id is None:
-                context_id = await self._create_isolated_world(page, frame_id)
+                try:
+                    context_id = await self._create_isolated_world(page, frame_id)
+                except Exception as exc:
+                    return {
+                        "isolated_world": f"fail:{type(exc).__name__}",
+                        "evaluate": "skipped",
+                        "payload": None,
+                    }
                 if context_id is None:
-                    return None
+                    return {
+                        "isolated_world": "fail:unavailable",
+                        "evaluate": "skipped",
+                        "payload": None,
+                    }
             try:
                 result = await page.cdp.send(
                     "Runtime.evaluate",
@@ -1748,21 +2188,34 @@ class CdpVerifyBrowserDriver:
                         "returnByValue": True,
                     },
                 )
-            except Exception:
+            except Exception as exc:
                 # Context/frame was destroyed mid-challenge: drop the cache and
                 # rebuild once inside the same round.
                 self._worlds.pop(frame_id, None)
                 if attempt == 0:
                     continue
-                return None
+                return {
+                    "isolated_world": "ok",
+                    "evaluate": f"err:{type(exc).__name__}",
+                    "payload": None,
+                }
             value = result.get("result")
             if isinstance(value, dict) and value.get("exceptionDetails"):
                 self._worlds.pop(frame_id, None)
                 if attempt == 0:
                     continue
-                return None
-            return value if isinstance(value, dict) else None
-        return None
+                return {
+                    "isolated_world": "ok",
+                    "evaluate": "err:exceptionDetails",
+                    "payload": None,
+                }
+            payload = value.get("value") if isinstance(value, dict) else None
+            return {
+                "isolated_world": "ok",
+                "evaluate": "ok",
+                "payload": payload if isinstance(payload, dict) else None,
+            }
+        return {"isolated_world": "ok", "evaluate": "err:unknown", "payload": None}
 
     async def _create_isolated_world(self, page: CDPPage, frame_id: str) -> int | None:
         try:
