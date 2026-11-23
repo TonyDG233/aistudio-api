@@ -2702,7 +2702,7 @@ class _ArbitrationResolver(_LeaseResolver):
 
     def assignment_for(
         self, account_id: str, *, kind: str = "chat", include_expired: bool = False
-    ) -> ExitAssignment:
+    ) -> ExitAssignment | None:
         del account_id, kind, include_expired
         return self.assignment
 
@@ -2863,3 +2863,67 @@ def test_region_canary_fires_once_per_account_per_round(tmp_path: Any) -> None:
     assert first == "inconclusive"
     assert second is None
     assert arbiter.calls == ["acc1"]
+
+
+class _BuildOnlyArbitrationResolver(_ArbitrationResolver):
+    """Manager double whose only live binding is on the build surface."""
+
+    def assignment_for(
+        self, account_id: str, *, kind: str = "chat", include_expired: bool = False
+    ) -> ExitAssignment | None:
+        del account_id, include_expired
+        return self.assignment if kind == "build" else None
+
+
+class _KindRecordingArbiter:
+    def __init__(self, outcome: str = "exit_bad") -> None:
+        self.outcome = outcome
+        self.kinds: list[str] = []
+
+    async def adjudicate(
+        self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
+    ) -> str:
+        del account_id, account_bad_event_kind
+        self.kinds.append(kind)
+        return self.outcome
+
+
+def test_region_arbitration_uses_bound_build_surface_kind(tmp_path: Any) -> None:
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    arbiter = _KindRecordingArbiter("exit_bad")
+    refresher = AccountInfoRefresher(
+        store,
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, _BuildOnlyArbitrationResolver()),
+        pacing_seconds=0.0,
+    )
+    refresher.set_region_arbiter(arbiter)
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert result.region_outcome == "exit_bad"
+    # P2-1: the maintenance arbitration must carry the account's bound kind
+    # (build), not a hard-coded "chat".
+    assert arbiter.kinds == ["build"]
+
+
+def test_account_bad_keeps_an_existing_expiry(tmp_path: Any) -> None:
+    reset_skip_log_throttle()
+    store, accounts = _make_store(tmp_path)
+    store.update_account_refresh("acc1", expired=True)
+    refresher, resolver = _region_refresher(
+        store, _ArbitrationResolver(), _FixedCanary("account_bad")
+    )
+
+    result = asyncio.run(refresher.refresh_account(accounts[0]))
+
+    assert result.deferred is True
+    assert resolver.events == [("acc1", "exit-1", "verify_account", "account_bad")]
+    stored = store.get_account("acc1")
+    assert stored is not None
+    # Q1: verify_required is written independently; the stronger real expiry is
+    # never cleared by an account_bad verdict.
+    assert stored.verify_required is True
+    assert stored.expired is True

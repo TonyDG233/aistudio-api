@@ -20,6 +20,9 @@ _EXIT_POOL_ENV_NAMES = (
 @pytest.fixture(autouse=True)
 def isolate_exit_pool_env(monkeypatch):
     """Keep the env-gated exit pool off unless a test opts in."""
+    from aistudio_api.application.exit_arbitration import (
+        reset_default_exit_arbitration,
+    )
     from aistudio_api.infrastructure.account.account_info_refresher import (
         reset_skip_log_throttle,
     )
@@ -28,9 +31,14 @@ def isolate_exit_pool_env(monkeypatch):
     for name in _EXIT_POOL_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     reset_exit_resolver()
+    # The process-wide arbiter holds the previous test's resolver and its
+    # asyncio.Lock; leaving it behind can leak a stale/inconclusive arbiter and
+    # a cross-loop lock into the next test's keepalive round.
+    reset_default_exit_arbitration()
     reset_skip_log_throttle()
     yield
     reset_exit_resolver()
+    reset_default_exit_arbitration()
     reset_skip_log_throttle()
 
 

@@ -335,6 +335,24 @@ def test_default_arbitration_registry_resets() -> None:
     assert get_default_exit_arbitration() is None
 
 
+def test_default_arbitration_registered_when_built_without_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-4: production wiring (resolver=None) must register the default."""
+    reset_default_exit_arbitration()
+    assert get_default_exit_arbitration() is None
+    resolver = SimpleNamespace(config=SimpleNamespace(canary_account=""))
+    monkeypatch.setattr(
+        "aistudio_api.application.exit_arbitration.get_exit_resolver",
+        lambda: resolver,
+    )
+
+    built = build_exit_arbitration()
+
+    assert built is not None
+    assert get_default_exit_arbitration() is built
+
+
 @pytest.mark.asyncio
 async def test_account_bad_keeps_exit_and_uses_existing_switch_logic() -> None:
     probe = _FakeProbe("account_bad")

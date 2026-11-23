@@ -300,6 +300,8 @@ def _service(
     rotator: Any | None = None,
     clock: FakeClock | None = None,
     region_arbiter: Any | None = None,
+    metadata_attempt_limit: int | None = None,
+    auth_attempt_limit: int | None = None,
 ) -> AccountKeepaliveService:
     client_obj: Any = client or FakeClient()
     return AccountKeepaliveService(
@@ -310,6 +312,8 @@ def _service(
         account_service=account_service,
         rotator=rotator if rotator is not None else FakeRotator(),
         region_arbiter=region_arbiter,
+        metadata_attempt_limit=metadata_attempt_limit,
+        auth_attempt_limit=auth_attempt_limit,
         clock=clock or FakeClock(),
         tick_seconds=3600.0,
     )
@@ -1479,12 +1483,14 @@ async def test_metadata_refresh_batches_and_stops_on_consecutive_no_capacity(
         if record.levelname == "WARNING"
     )
 
-    # The next round resumes with the remaining due accounts (acc01..03 are
-    # now fresh) instead of restarting from the first account.
+    # The next round resumes after the previous round's cursor (acc06): the
+    # no_capacity-deferred acc04..06 rotate to the tail instead of re-occupying
+    # the head, so the remaining accounts are actually attempted.
     resolver.calls.clear()
     await service.run_now("metadata_refresh", settings=_settings())
-    assert resolver.calls[:3] == ["acc04", "acc05", "acc06"]
+    assert resolver.calls[:3] == ["acc07", "acc08", "acc09"]
     assert "acc01" not in resolver.calls
+    assert "acc04" not in resolver.calls[:3]
 
 
 @pytest.mark.asyncio
@@ -1549,12 +1555,14 @@ class RecordingRegionArbiter:
     def __init__(self, outcome: str = "exit_bad") -> None:
         self.outcome = outcome
         self.calls: list[str] = []
+        self.kinds: list[str] = []
 
     async def adjudicate(
         self, *, account_id: str, kind: str, account_bad_event_kind: str = "region_403"
     ) -> str:
-        del kind, account_bad_event_kind
+        del account_bad_event_kind
         self.calls.append(account_id)
+        self.kinds.append(kind)
         return self.outcome
 
 
@@ -1660,3 +1668,346 @@ async def test_metadata_account_bad_updates_registry_and_rotator(tmp_path):
     assert stored.verify_required is True
     assert stored.expired is False
     assert rotator.verify_recorded == ["acc_bad"]
+
+
+class RegionDeferRefresher(FakeRefresher):
+    """External refresher double: some accounts defer on a region 403."""
+
+    external_mode = True
+
+    def __init__(self, region_ids: set[str]) -> None:
+        super().__init__()
+        self.region_ids = region_ids
+
+    def set_region_arbiter(self, arbiter: Any | None) -> None:
+        del arbiter
+
+    async def refresh_accounts(
+        self, accounts: list[AccountMeta], **kwargs: object
+    ) -> list[SimpleNamespace]:
+        del kwargs
+        now = datetime.now(UTC).isoformat()
+        self.calls.append([account.id for account in accounts])
+        results: list[SimpleNamespace] = []
+        for account in accounts:
+            if account.id in self.region_ids:
+                results.append(
+                    SimpleNamespace(
+                        account_id=account.id,
+                        ok=False,
+                        error=None,
+                        checked_at=now,
+                        deferred=True,
+                        skip_reason="exit_bad",
+                        region_outcome="exit_bad",
+                        retry_after_s=300.0,
+                    )
+                )
+            else:
+                results.append(
+                    SimpleNamespace(
+                        account_id=account.id,
+                        ok=True,
+                        error=None,
+                        checked_at=now,
+                    )
+                )
+        return results
+
+
+class MixedOutcomeRefresher(FakeRefresher):
+    """External refresher double: one skipped, one failed, the rest ok."""
+
+    external_mode = True
+
+    def set_region_arbiter(self, arbiter: Any | None) -> None:
+        del arbiter
+
+    async def refresh_accounts(
+        self, accounts: list[AccountMeta], **kwargs: object
+    ) -> list[SimpleNamespace]:
+        del kwargs
+        now = datetime.now(UTC).isoformat()
+        self.calls.append([account.id for account in accounts])
+        results: list[SimpleNamespace] = []
+        for index, account in enumerate(accounts):
+            if index == 0:
+                results.append(
+                    SimpleNamespace(
+                        account_id=account.id,
+                        ok=False,
+                        error="skipped_no_exit: no_exit",
+                        checked_at=now,
+                        skipped=True,
+                        skip_reason="no_exit",
+                    )
+                )
+            elif index == 1:
+                results.append(
+                    SimpleNamespace(
+                        account_id=account.id,
+                        ok=False,
+                        error="HTTP 503",
+                        checked_at=now,
+                    )
+                )
+            else:
+                results.append(
+                    SimpleNamespace(
+                        account_id=account.id,
+                        ok=True,
+                        error=None,
+                        checked_at=now,
+                    )
+                )
+        return results
+
+
+@pytest.mark.asyncio
+async def test_metadata_region_deferrals_do_not_stop_round_and_rotate_cursor(
+    tmp_path, caplog
+):
+    """P1-1: region defer is not no_capacity and never starves the queue head."""
+    store = AccountStore(tmp_path)
+    _stale_accounts(store, 10)
+    refresher = RegionDeferRefresher({"acc01", "acc02", "acc03"})
+    service = _service(
+        store,
+        refresher=refresher,
+        clock=FakeClock(4_000.0),
+        metadata_attempt_limit=6,
+    )
+
+    with caplog.at_level("INFO"):
+        result = await service.run_now("metadata_refresh", settings=_settings())
+
+    # The first three accounts defer on a region 403; the round still walks the
+    # whole batch instead of stopping at the third deferred head account.
+    assert [item for chunk in refresher.calls for item in chunk] == [
+        f"acc{i:02d}" for i in range(1, 7)
+    ]
+    assert result["attempted"] == 6
+    assert result["deferred"] == 3
+    assert result["no_capacity"] == 0
+
+    capacity_warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING" and "capacity summary" in record.getMessage()
+    ]
+    assert capacity_warnings == []
+    region_summaries = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO" and "region defer summary" in record.getMessage()
+    ]
+    assert len(region_summaries) == 1
+
+    # Next round resumes after the previous cursor: acc04-06 are fresh, but the
+    # deferred acc01-03 must no longer head the batch.
+    refresher.calls.clear()
+    await service.run_now("metadata_refresh", settings=_settings())
+    assert refresher.calls[0][0] == "acc07"
+    assert "acc01" not in refresher.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_metadata_attempt_limit_stops_at_twelve_and_leaves_rest_due(tmp_path):
+    store = AccountStore(tmp_path)
+    accounts = _stale_accounts(store, 43)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    service = _service(store, refresher=refresher, clock=FakeClock(4_000.0))
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["attempted"] == 12
+    assert result["succeeded"] == 12
+    assert result["no_capacity"] == 0
+    for account in accounts[12:]:
+        after = store.get_account(account.id)
+        assert after is not None and after.tier_checked_at is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_failed_excludes_skipped_accounts(tmp_path):
+    store = AccountStore(tmp_path)
+    _stale_accounts(store, 3)
+    refresher = MixedOutcomeRefresher()
+    service = _service(store, refresher=refresher, clock=FakeClock(4_000.0))
+
+    result = await service.run_now("metadata_refresh", settings=_settings())
+
+    assert result["attempted"] == 3
+    assert result["succeeded"] == 1
+    assert result["failed"] == 1
+    assert result["skipped"] == 1
+    # A skip is not a failure, but the round must still stay "not ok" so the
+    # skipped account keeps its 300s retry instead of a full 24h wait.
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_auth_region_deferrals_do_not_stop_round_and_rotate_cursor(
+    tmp_path, monkeypatch, caplog
+):
+    store = AccountStore(tmp_path)
+    _stale_accounts(store, 10)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> dict[str, object]:
+        del session, client
+        rotated.append(account_id)
+        if account_id in {"acc01", "acc02", "acc03"}:
+            return {"ok": False, "status": 403, "updated": []}
+        return {"ok": True, "status": 200, "updated": ["SID"]}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    arbiter = RecordingRegionArbiter("exit_bad")
+    service = _service(
+        store,
+        refresher=refresher,
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+        auth_attempt_limit=6,
+    )
+
+    with caplog.at_level("INFO"):
+        result = await service.run_now(
+            "auth_update", trigger="schedule", settings=_settings()
+        )
+
+    # Three leading region deferrals must not stop the rotate pass at the limit.
+    assert rotated == [f"acc{i:02d}" for i in range(1, 7)]
+    assert result["deferred"] is True
+    assert result["deferred_accounts"] == ["acc01", "acc02", "acc03"]
+    assert arbiter.calls == ["acc01", "acc02", "acc03"]
+
+    capacity_warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING" and "capacity summary" in record.getMessage()
+    ]
+    assert capacity_warnings == []
+    region_summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "INFO" and "region defer summary" in record.getMessage()
+    ]
+    # attempted counts every auth channel attempt of this round, so it can never
+    # be smaller than succeeded.
+    assert len(region_summaries) == 1
+    assert "attempted=6" in region_summaries[0]
+    assert "succeeded=3" in region_summaries[0]
+
+    rotated.clear()
+    await service.run_now("auth_update", trigger="schedule", settings=_settings())
+    assert rotated[0] == "acc07"
+    assert "acc01" not in rotated[:1]
+
+
+@pytest.mark.asyncio
+async def test_auth_attempt_limit_stops_at_eight_and_leaves_rest_due(
+    tmp_path, monkeypatch
+):
+    store = AccountStore(tmp_path)
+    accounts = _stale_accounts(store, 20)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    account_service = AccountService(store)
+    rotated: list[str] = []
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> dict[str, object]:
+        del session, client
+        rotated.append(account_id)
+        return {"ok": True, "status": 200, "updated": ["SID"]}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        refresher=refresher,
+        account_service=account_service,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now(
+        "auth_update", trigger="schedule", settings=_settings()
+    )
+
+    assert rotated == [f"acc{i:02d}" for i in range(1, 9)]
+    assert result["ok"] is True
+    for account in accounts[8:]:
+        after = store.get_account(account.id)
+        assert after is not None and after.auth_saved_at is None
+
+
+@pytest.mark.asyncio
+async def test_auth_region_arbitration_uses_bound_build_surface(tmp_path, monkeypatch):
+    store = AccountStore(tmp_path)
+    _stale_accounts(store, 1)
+    refresher = AccountInfoRefresher(
+        store,
+        transport=TierOkTransport(),
+        exit_resolver=FirstNLeaseResolver(ok_count=100),
+        pacing_seconds=0.0,
+    )
+    account_service = AccountService(store)
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> dict[str, object]:
+        del account_id, session, client
+        return {"ok": False, "status": 403, "updated": []}
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    arbiter = RecordingRegionArbiter("exit_bad")
+    manager = SimpleNamespace(
+        pool_slots=lambda: (FakeSlot("slot-build", "acc01", surface="build"),)
+    )
+    service = _service(
+        store,
+        refresher=refresher,
+        account_service=account_service,
+        manager=manager,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    await service.run_now("auth_update", settings=_settings())
+
+    assert arbiter.calls == ["acc01"]
+    assert arbiter.kinds == ["build"]
+
+
+def test_persist_account_bad_keeps_existing_expired_flag(tmp_path):
+    store = AccountStore(tmp_path)
+    _account(store, "acc_exp", "exp@example.com")
+    store.update_account_refresh("acc_exp", expired=True)
+    service = _service(store)
+
+    service._persist_account_bad("acc_exp")
+
+    stored = store.get_account("acc_exp")
+    assert stored is not None
+    assert stored.verify_required is True
+    assert stored.expired is True

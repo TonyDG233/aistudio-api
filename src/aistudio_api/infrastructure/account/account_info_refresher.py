@@ -106,7 +106,39 @@ class RegionRestrictedError(RuntimeError):
 
 # A maintenance region 403 is not an account failure: defer the account and
 # retry after the short keepalive window instead of a full 24h/6h backoff.
+# Single source of truth: keepalive imports this constant (never redefines it).
 REGION_DEFER_RETRY_SECONDS = 300.0
+
+# Bound kinds an account's exit binding can be cached under (chat / build).
+ARBITRATION_KINDS = ("chat", "build")
+
+
+def resolve_arbitration_kind(resolver: object | None, account_id: str) -> str:
+    """Return the account's currently bound kind, defaulting to ``chat``.
+
+    Maintenance arbitration used to hard-code ``kind="chat"``, so a
+    build-surface slot account could never be attributed to its exit.  Ask the
+    resolver which kind (chat, then build) has a live binding for the account;
+    an unknown/absent binding falls back to ``chat``.
+    """
+    if resolver is None or not account_id:
+        return "chat"
+    assignment_for = getattr(resolver, "assignment_for", None)
+    if not callable(assignment_for):
+        return "chat"
+    for kind in ARBITRATION_KINDS:
+        try:
+            assignment = assignment_for(account_id, kind=kind, include_expired=True)
+        except TypeError:
+            try:
+                assignment = assignment_for(account_id, kind=kind)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if assignment is not None:
+            return kind
+    return "chat"
 
 
 # Fail-closed skip logging is throttled per (account, reason) so a sustained
@@ -632,6 +664,31 @@ class AccountInfoRefresher:
         """True when credential probes resolve per-account exits."""
         return self._active_exit_resolver() is not None
 
+    def _slot_surface_for(self, account_id: str) -> str | None:
+        """Bound pool surface (chat/build) for an account, when it holds a slot."""
+        provider = self._slot_provider
+        if provider is None or not account_id:
+            return None
+        try:
+            slots = provider()
+        except Exception as exc:
+            logger.debug("[Refresh] pool slot inspection failed: %s", exc)
+            return None
+        for slot in slots or ():
+            if str(getattr(slot, "account_id", "") or "") != account_id:
+                continue
+            surface = str(getattr(slot, "surface", "") or "").lower()
+            if surface in ARBITRATION_KINDS:
+                return surface
+        return None
+
+    def _arbitration_kind(self, account_id: str) -> str:
+        """Pass the account's actually bound kind (chat/build) to the arbiter."""
+        surface = self._slot_surface_for(account_id)
+        if surface is not None:
+            return surface
+        return resolve_arbitration_kind(self._active_exit_resolver(), account_id)
+
     async def _arbitrate_region_403(
         self, account_id: str, *, once: set[str]
     ) -> str | None:
@@ -653,7 +710,7 @@ class AccountInfoRefresher:
         try:
             outcome = await cast("Any", arbiter).adjudicate(
                 account_id=account_id,
-                kind="chat",
+                kind=self._arbitration_kind(account_id),
                 account_bad_event_kind="verify_account",
             )
         except asyncio.CancelledError:
@@ -667,10 +724,10 @@ class AccountInfoRefresher:
             return "inconclusive"
         if outcome == "account_bad":
             # Registry is authoritative; keepalive also refreshes rotator stats.
+            # ``expired`` is a separate, stronger signal and is left untouched
+            # so a real expiry is never cleared by a verify verdict (Q1).
             try:
-                self._store.update_account_refresh(
-                    account_id, verify_required=True, expired=False
-                )
+                self._store.update_account_refresh(account_id, verify_required=True)
             except Exception as exc:
                 logger.warning(
                     "[Refresh] 持久化 verify_required 失败 account=%s: %s",
@@ -1540,6 +1597,7 @@ class AccountInfoRefresher:
 
 
 __all__ = [
+    "ARBITRATION_KINDS",
     "EXTERNAL_BATCH_PACING_SECONDS",
     "REGION_DEFER_RETRY_SECONDS",
     "TIER_PROBE_BACKOFF_CAP_SECONDS",
@@ -1559,4 +1617,5 @@ __all__ = [
     "find_account_session",
     "probe_tier_over_session",
     "resolve_app_id",
+    "resolve_arbitration_kind",
 ]

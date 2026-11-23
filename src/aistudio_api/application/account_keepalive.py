@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from aistudio_api.domain.errors import is_region_restricted_message
 from aistudio_api.infrastructure.account.account_info_refresher import (
+    REGION_DEFER_RETRY_SECONDS,
     RefreshInProgressError,
+    resolve_arbitration_kind,
     skip_log_due,
 )
 from aistudio_api.infrastructure.account.benefit_tier import (
@@ -48,7 +50,6 @@ DEFAULT_METADATA_ATTEMPT_LIMIT = 12
 DEFAULT_AUTH_ATTEMPT_LIMIT = 8
 CONSECUTIVE_NO_CAPACITY_LIMIT = 3
 REGION_403_STATUS = 403
-REGION_DEFER_RETRY_SECONDS = 300.0
 
 DEFAULT_AUTH_UPDATE_HOURS = 24.0
 DEFAULT_METADATA_REFRESH_HOURS = 24.0
@@ -89,6 +90,38 @@ def _is_no_capacity_result(result: object) -> bool:
         return True
     error = getattr(result, "error", None)
     return isinstance(error, str) and error.startswith(_DEFERRED_EMAIL_PREFIX)
+
+
+def _rotate_after(
+    items: list[Any], last_id: str | None, order_ids: list[str] | None = None
+) -> list[Any]:
+    """Order ``items`` starting right after the account that ended the last round.
+
+    External maintenance rounds attempt only a bounded batch, so a fixed
+    store-order head would let persistently region-deferred accounts occupy
+    every round and starve the rest.  The in-memory cursor (last attempted
+    account id) rotates each round past that head.  ``order_ids`` is the stable
+    store order used as the rotation clock when ``items`` is a due-only subset;
+    it defaults to the ids of ``items`` itself.  An unknown/missing cursor
+    restarts from the original order.
+    """
+    if not last_id or not items:
+        return items
+    if order_ids is None:
+        order_ids = [str(getattr(item, "id", "") or "") for item in items]
+    positions = {account_id: index for index, account_id in enumerate(order_ids)}
+    anchor = positions.get(last_id)
+    if anchor is None:
+        return items
+    total = len(order_ids)
+
+    def rank(item: Any) -> int:
+        position = positions.get(str(getattr(item, "id", "") or ""), -1)
+        if position < 0:
+            return total
+        return (position - anchor - 1) % total
+
+    return sorted(items, key=rank)
 
 
 @dataclass(slots=True)
@@ -218,6 +251,11 @@ class AccountKeepaliveService:
         self._startup_capture_consumed: dict[str, str] = {}
         # One canary arbitration per account per keepalive round.
         self._region_arbitrated_round: set[str] = set()
+        # In-memory rotation cursors (last attempted account per channel) so a
+        # bounded external batch never restarts from a persistently deferred
+        # queue head.  Off mode ignores them and still attempts every account.
+        self._metadata_cursor: str | None = None
+        self._auth_cursor: str | None = None
         self._paused = False
         self._attach_tier_slot_provider()
         self._attach_region_arbiter()
@@ -258,6 +296,26 @@ class AccountKeepaliveService:
         except Exception:
             return False
 
+    def _slot_surface_for(self, account_id: str) -> str | None:
+        """Bound pool surface (chat/build) for an account, when it holds a slot."""
+        if not account_id:
+            return None
+        for slot in self._pool_slots():
+            if str(getattr(slot, "account_id", "") or "") != account_id:
+                continue
+            surface = str(getattr(slot, "surface", "") or "").lower()
+            if surface in ("chat", "build"):
+                return surface
+        return None
+
+    def _arbitration_kind(self, account_id: str, arbiter: object | None) -> str:
+        """Pass the account's actually bound kind (chat/build) to the arbiter."""
+        surface = self._slot_surface_for(account_id)
+        if surface is not None:
+            return surface
+        resolver = getattr(arbiter, "resolver", None)
+        return resolve_arbitration_kind(resolver, account_id)
+
     async def _arbitrate_region_once(self, account_id: str, source: str) -> str | None:
         """Run at most one region-403 canary per account per keepalive round."""
         if not account_id or account_id in self._region_arbitrated_round:
@@ -269,7 +327,7 @@ class AccountKeepaliveService:
         try:
             outcome = await arbiter.adjudicate(
                 account_id=account_id,
-                kind="chat",
+                kind=self._arbitration_kind(account_id, arbiter),
                 account_bad_event_kind="verify_account",
             )
         except asyncio.CancelledError:
@@ -293,11 +351,14 @@ class AccountKeepaliveService:
         return str(outcome)
 
     def _persist_account_bad(self, account_id: str) -> None:
-        """Registry is authoritative: verify_required=true and expired=false."""
+        """Registry is authoritative: set verify_required, keep ``expired`` as-is.
+
+        ``expired`` is a separate, stronger signal: a real credential expiry must
+        never be cleared by a verify-account verdict (Q1), so only
+        ``verify_required`` is written here.
+        """
         try:
-            self._store.update_account_refresh(
-                account_id, verify_required=True, expired=False
-            )
+            self._store.update_account_refresh(account_id, verify_required=True)
         except Exception as exc:
             log.warning(
                 "[Keepalive] 持久化 verify_required 失败 account=%s: %s",
@@ -619,7 +680,9 @@ class AccountKeepaliveService:
         if self._external_runtime():
             self._attach_region_arbiter()
             try:
-                results = await self._refresh_metadata_batched(due)
+                results = await self._refresh_metadata_batched(
+                    due, [str(account.id) for account in accounts]
+                )
             except RefreshInProgressError:
                 log.info("[Keepalive] metadata refresh skipped: already running")
                 return {"ok": False, "reason": "refresh_in_progress", "count": 0}
@@ -670,7 +733,11 @@ class AccountKeepaliveService:
                 at=result.checked_at or checked_at,
             )
         failed = sum(
-            1 for result in results if not result.ok and not _is_deferred_result(result)
+            1
+            for result in results
+            if not result.ok
+            and not _is_deferred_result(result)
+            and not getattr(result, "skipped", False)
         )
         succeeded = sum(
             1
@@ -713,8 +780,10 @@ class AccountKeepaliveService:
             len(deferred_ids),
             no_capacity,
         )
-        if deferred_ids:
+        if no_capacity:
             # One aggregate warning per round; per-account defers stay INFO.
+            # Region deferrals are not exit-budget exhaustion and must not be
+            # reported as ``no_capacity=0`` capacity warnings (P2-2).
             log.warning(
                 "[Keepalive] metadata refresh capacity summary trigger=%s "
                 "attempted=%d succeeded=%d deferred=%d no_capacity=%d",
@@ -724,8 +793,20 @@ class AccountKeepaliveService:
                 len(deferred_ids),
                 no_capacity,
             )
+        elif deferred_ids:
+            log.info(
+                "[Keepalive] metadata refresh region defer summary trigger=%s "
+                "attempted=%d succeeded=%d deferred=%d",
+                trigger,
+                len(results),
+                succeeded,
+                len(deferred_ids),
+            )
         return {
-            "ok": failed == 0,
+            # ``failed`` excludes skipped accounts (they were never probed), but
+            # a skip still keeps the round "not ok" so those accounts stay due
+            # for the next 300s round instead of waiting a full 24h.
+            "ok": failed == 0 and not skipped_ids,
             "reason": "checked",
             "count": len(results),
             "attempted": len(results),
@@ -739,17 +820,24 @@ class AccountKeepaliveService:
             "accounts": [result.account_id for result in results],
         }
 
-    async def _refresh_metadata_batched(self, due: list[Any]) -> list[Any]:
+    async def _refresh_metadata_batched(
+        self, due: list[Any], order_ids: list[str]
+    ) -> list[Any]:
         """Attempt a bounded metadata batch, stopping on repeated no_capacity.
 
         External-mode maintenance shares a small per-exit budget.  Accounts are
-        processed in small chunks so three consecutive ``no_capacity`` results
-        stop the round immediately; anything not attempted stays due for the
-        next 300s round instead of advancing its 24h clock.
+        processed in small chunks so three *consecutive ``no_capacity``* results
+        stop the round immediately; a region-403 deferral is not budget
+        exhaustion and never breaks the streak.  Anything not attempted stays
+        due for the next 300s round instead of advancing its 24h clock.
+
+        Each round starts right after the previous round's last attempted
+        account (in-memory cursor), so a head of persistently region-deferred
+        accounts can never occupy every round and starve the rest.
         """
         limit = self._metadata_attempt_limit
         stop_after = self._consecutive_no_capacity_limit
-        batch = due[:limit]
+        batch = _rotate_after(due, self._metadata_cursor, order_ids)[:limit]
         chunk_size = max(1, min(stop_after, limit))
         results: list[Any] = []
         streak = 0
@@ -774,7 +862,7 @@ class AccountKeepaliveService:
             results.extend(chunk_results)
             stop = False
             for result in chunk_results:
-                if _is_deferred_result(result):
+                if _is_no_capacity_result(result):
                     streak += 1
                     if streak >= stop_after:
                         stop = True
@@ -789,6 +877,10 @@ class AccountKeepaliveService:
                     streak,
                 )
                 break
+        if results:
+            self._metadata_cursor = (
+                str(getattr(results[-1], "account_id", "") or "") or None
+            )
         return results
 
     async def _save_slot(self, slot: Any) -> tuple[str | None, str, bool, bool]:
@@ -1038,8 +1130,16 @@ class AccountKeepaliveService:
         auth_attempts = 0
         no_capacity_streak = 0
         stop_after_account = False
+        last_attempted: str | None = None
 
-        for account in accounts:
+        # External rounds attempt only a bounded batch: rotate past the previous
+        # round's cursor so a head of persistently region-deferred accounts can
+        # never block the rest.  Off mode keeps the original full pass.
+        iteration = (
+            _rotate_after(list(accounts), self._auth_cursor) if external else accounts
+        )
+
+        for account in iteration:
             if not account.enabled or account.expired:
                 continue
             if not self._is_account_auth_due(
@@ -1059,8 +1159,9 @@ class AccountKeepaliveService:
                 )
                 break
             acc_sess = slot_sessions.get(account.id)
-            account_deferred = False
+            account_no_capacity = False
             auth_attempts += 1
+            last_attempted = account.id
             try:
                 rot_res = await svc.rotate_account_cookies(account.id, session=acc_sess)
                 if rot_res.get("deferred"):
@@ -1068,7 +1169,7 @@ class AccountKeepaliveService:
                     deferred_accounts[account.id] = _as_float(
                         rot_res.get("retry_after_s"), 0.0
                     )
-                    account_deferred = True
+                    account_no_capacity = True
                 elif self._rotation_is_region_403(rot_res):
                     outcome = await self._arbitrate_region_once(
                         account.id, "auth_update"
@@ -1081,7 +1182,6 @@ class AccountKeepaliveService:
                         _ensure_acc(account.id)
                         deferred_accounts[account.id] = REGION_DEFER_RETRY_SECONDS
                         region_deferred_accounts.add(account.id)
-                        account_deferred = True
                 elif rot_res.get("ok"):
                     _ensure_acc(account.id)
                     rotate_results.setdefault(account.id, []).append(True)
@@ -1105,7 +1205,7 @@ class AccountKeepaliveService:
                 rotate_results.setdefault(account.id, []).append(False)
             if acc_sess is not None:
                 await self._harvest_worker_startup(account.id, acc_sess)
-            if account_deferred:
+            if account_no_capacity:
                 no_capacity_streak += 1
                 if (
                     external
@@ -1113,15 +1213,22 @@ class AccountKeepaliveService:
                 ):
                     stop_after_account = True
             else:
+                # A region-403 deferral (or any real attempt) is not exit-budget
+                # exhaustion: it must not contribute to the no_capacity streak.
                 no_capacity_streak = 0
             if stop_after_account:
                 log.info(
                     "[Keepalive] auth update stopped early after %d account(s): "
-                    "%d consecutive no_capacity/deferred",
+                    "%d consecutive no_capacity",
                     auth_attempts,
                     no_capacity_streak,
                 )
                 break
+
+        if external and last_attempted:
+            self._auth_cursor = last_attempted
+
+        attempted_accounts = len(account_order)
 
         saved_accounts: list[str] = []
         failed_accounts: list[str] = []
@@ -1148,16 +1255,28 @@ class AccountKeepaliveService:
         deferred_retry = max(deferred_accounts.values(), default=0.0)
         no_capacity_deferred = len(deferred_accounts) - len(region_deferred_accounts)
 
-        if deferred_accounts:
+        if no_capacity_deferred:
             # One aggregate warning per round; per-account defers stay INFO.
             log.warning(
                 "[Keepalive] auth update capacity summary trigger=%s "
                 "attempted=%d succeeded=%d deferred=%d no_capacity=%d",
                 trigger,
-                auth_attempts,
+                attempted_accounts,
                 len(saved_accounts),
                 len(deferred_accounts),
                 no_capacity_deferred,
+            )
+        elif deferred_accounts:
+            # Only region deferrals: not exit-budget exhaustion, so this must
+            # never read as a ``no_capacity=0`` capacity warning (P2-2).
+            log.info(
+                "[Keepalive] auth update region defer summary trigger=%s "
+                "attempted=%d succeeded=%d deferred=%d region_deferred=%d",
+                trigger,
+                attempted_accounts,
+                len(saved_accounts),
+                len(deferred_accounts),
+                len(region_deferred_accounts),
             )
 
         for account_id in saved_accounts:
