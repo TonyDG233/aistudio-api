@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import platform
@@ -2367,3 +2368,176 @@ async def test_waa_create_is_whitelisted_and_records_body_preview() -> None:
     assert entry.url_path == "waa/Waa/Create"
     assert entry.body_preview == '{"ok":1}'
     assert page.body_request_ids == ["req-waa"]
+
+
+class _VerifyStartPage:
+    """Minimal fake CDP page for ``CdpVerifyBrowserDriver.start`` (no network)."""
+
+    def __init__(
+        self,
+        *,
+        calls: list[str],
+        cookies: list[dict[str, object]] | None = None,
+        url: str = _VERIFY_URL,
+    ) -> None:
+        self.calls = calls
+        self.cookies = list(cookies or [])
+        self.url = url
+        self.goto_calls: list[str] = []
+        self.closed = False
+
+    async def goto(self, url: str, **_kwargs: Any) -> None:
+        target = str(url)
+        self.goto_calls.append(target)
+        self.calls.append(f"goto:{target}")
+
+    async def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    async def evaluate(self, expression: str, *_args: Any, **_kwargs: Any) -> object:
+        if "window.location.href" in expression:
+            return self.url
+        return None
+
+    async def get_cookies(self) -> list[dict[str, object]]:
+        return self.cookies
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _drive_verify_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    page: _VerifyStartPage,
+    bootstrap_error: Exception | None = None,
+) -> CdpVerifyBrowserDriver:
+    """Wire ``driver.start`` to fakes so no real Chromium/CDP runs."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    binary = tmp_path / "chrome.exe"
+    binary.write_text("", encoding="utf-8")
+    driver = CdpVerifyBrowserDriver(auth_file=auth_file, chrome_path=str(binary))
+
+    async def fake_exec(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(pid=4321, returncode=None)
+
+    async def fake_load(_page: Any, _auth: str) -> bool:
+        page.calls.append("load_cookies")
+        return True
+
+    async def fake_bootstrap(_page: Any) -> None:
+        page.calls.append("bootstrap")
+        if bootstrap_error is not None:
+            raise bootstrap_error
+
+    async def fake_connect_page(**_kwargs: Any) -> Any:
+        return page
+
+    async def fake_wait_for_qr(_self: Any, _page: Any) -> QrChallenge:
+        return _QR
+
+    async def fake_close(_self: Any) -> None:
+        path = driver._user_data_dir
+        if path:
+            with contextlib.suppress(OSError):
+                Path(path).rmdir()
+            driver._user_data_dir = None
+
+    monkeypatch.setattr(verify_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        verify_module,
+        "CDPClient",
+        lambda _port: SimpleNamespace(connect_page=fake_connect_page),
+    )
+    monkeypatch.setattr(verify_module, "load_cookies_to_page", fake_load)
+    monkeypatch.setattr(verify_module, "bootstrap_google_session", fake_bootstrap)
+    monkeypatch.setattr(CdpVerifyBrowserDriver, "_wait_for_qr", fake_wait_for_qr)
+    monkeypatch.setattr(CdpVerifyBrowserDriver, "close", fake_close)
+    return driver
+
+
+@pytest.mark.asyncio
+async def test_start_bootstraps_session_between_cookies_and_verify_navigation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+    page = _VerifyStartPage(calls=calls)
+    driver = _drive_verify_start(monkeypatch, tmp_path, page=page)
+
+    challenge = await driver.start()
+
+    assert challenge == _QR
+    # Exactly one bootstrap, strictly after the Cookie load and strictly before
+    # the verify-account navigation.
+    assert calls == ["load_cookies", "bootstrap", f"goto:{_VERIFY_URL}"]
+
+
+@pytest.mark.asyncio
+async def test_start_survives_bootstrap_failure_and_still_fetches_qr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="aistudio.verify-account")
+    calls: list[str] = []
+    page = _VerifyStartPage(calls=calls)
+    driver = _drive_verify_start(
+        monkeypatch,
+        tmp_path,
+        page=page,
+        bootstrap_error=RuntimeError("bootstrap stayed on login flow"),
+    )
+
+    challenge = await driver.start()
+
+    assert challenge == _QR
+    assert page.goto_calls == [_VERIFY_URL]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "会话引导失败" in record.getMessage()
+    ]
+    assert warnings and "RuntimeError" in warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_start_logs_cookie_names_without_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    secret_osid = "SECRET-OSID-VALUE-111"
+    secret_sidcc = "SECRET-SIDCC-VALUE-222"
+    secret_sid = "SECRET-SID-VALUE-333"
+    calls: list[str] = []
+    page = _VerifyStartPage(
+        calls=calls,
+        cookies=[
+            {"name": "OSID", "value": secret_osid},
+            {"name": "SIDCC", "value": secret_sidcc},
+            {"name": "SID", "value": secret_sid},
+        ],
+    )
+    driver = _drive_verify_start(monkeypatch, tmp_path, page=page)
+
+    await driver.start()
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "[Verify] 会话引导后 Cookie" in record.getMessage()
+    )
+    assert "total=3" in line
+    assert "osid=yes" in line
+    assert "sidcc=yes" in line
+    assert "secure_osid=no" in line
+    assert "gaps=no" in line
+    for secret in (secret_osid, secret_sidcc, secret_sid):
+        assert secret not in line
+        assert secret not in caplog.text

@@ -70,6 +70,7 @@ from aistudio_api.infrastructure.gateway.public_web_constants import (
     rpc_url,
 )
 from aistudio_api.infrastructure.gateway.session_auth import (
+    bootstrap_google_session,
     is_aistudio_page_url,
     is_login_page_url,
     load_cookies_to_page,
@@ -202,6 +203,17 @@ _SESSION_INVALID_401_MARKERS = (
 # silently burned its single click and then timed out waiting for the bframe.
 _VERIFY_BUTTON_USABLE_PREDICATE = (
     "!el.disabled && el.getAttribute('aria-disabled') !== 'true'"
+)
+
+
+# Cookie names whose *presence* (never value) is logged after the session
+# bootstrap; these are the Google auth/anti-abuse cookies the verify flow needs
+# on the ``accounts.google.com`` side.
+_VERIFY_COOKIE_NAME_CHECKS = (
+    ("osid", "OSID"),
+    ("secure_osid", "__Secure-OSID"),
+    ("gaps", "__Host-GAPS"),
+    ("sidcc", "SIDCC"),
 )
 
 
@@ -1776,6 +1788,21 @@ class CdpVerifyBrowserDriver:
             loaded = await load_cookies_to_page(page, str(self._auth_file))
             if not loaded:
                 raise VerifyAccountError("credentials_missing")
+            # The pooled session consumes the same bootstrap before landing on
+            # AI Studio: it negotiates the ``accounts.google.com`` side (OSID
+            # and friends) that the verify RPCs need as caller identity.  The
+            # verify path used to skip it, so ``VerifyUser`` returned 403 for an
+            # account that scans fine in a real browser.  A bootstrap hiccup
+            # must never abort the session: the verify page is still tried.
+            try:
+                await bootstrap_google_session(page)
+            except Exception as exc:
+                log.warning(
+                    "[Verify] 会话引导失败: error_type=%s error=%s",
+                    type(exc).__name__,
+                    _safe_error_detail(exc),
+                )
+            await self._log_cookie_names(page)
             await page.goto(
                 VERIFY_ACCOUNT_URL, timeout_s=30.0, wait_until="domcontentloaded"
             )
@@ -1808,6 +1835,29 @@ class CdpVerifyBrowserDriver:
             info.get("error") or "-",
             _safe_page_text(info.get("text")) or "-",
         )
+
+    async def _log_cookie_names(self, page: object) -> None:
+        """Log Cookie *name* presence only; never values or the list itself."""
+        getter = getattr(page, "get_cookies", None)
+        if not callable(getter):
+            return
+        try:
+            cookies = await cast("Awaitable[object]", getter())
+        except Exception as exc:
+            log.debug(
+                "[Verify] 会话引导后 Cookie 读取失败: error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        rows = cookies if isinstance(cookies, list) else []
+        names = {
+            str(cookie.get("name") or "") for cookie in rows if isinstance(cookie, dict)
+        }
+        flags = " ".join(
+            f"{label}={'yes' if name in names else 'no'}"
+            for label, name in _VERIFY_COOKIE_NAME_CHECKS
+        )
+        log.info("[Verify] 会话引导后 Cookie: total=%d %s", len(rows), flags)
 
     # -- CDP network record (observation only) ------------------------------
 
