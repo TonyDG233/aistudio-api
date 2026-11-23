@@ -12,7 +12,7 @@
 1. `AGENT.md`（仓库根，工程红线：分层、并发、防风控、测试纪律）。
 2. `docs/dev/rebuild/domains/P1-account/research/exit-pool/PLAN.md`（出口池 v2 定稿：车道、预算、调度、实施状态）。
 3. 同目录 `CONTRACT.md`（app ↔ exit-manager / fanout 的 HTTP 契约与字段白名单）。
-4. 最近审查：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.16-batch-and-metadata-arbitration.md`（分批、元数据 403 仲裁、汇总口径）；需要追溯时再看 `REV-2.1.5.12`（fanout 机器接口）、`13`（租约/defer）、`14`（管理器 v2）、`15`（verify 上报）。
+4. 最近审查：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.17-verify-start-status-fix.md`（扫码验证「首次打开不出码 / 扫码后检查无反应」修复，PASS；P2 已处理后复审）；此前再看 `REV-2.1.5.16-batch-and-metadata-arbitration.md`（分批、元数据 403 仲裁、汇总口径）；需要追溯时再看 `REV-2.1.5.12`（fanout 机器接口）、`13`（租约/defer）、`14`（管理器 v2）、`15`（verify 上报）。
 5. 本文（运行态、账号状态、运维命令、上下文保真协议）。
 
 原则：先读文档再动代码；`PLAN.md`/`CONTRACT.md` 是方案与契约，代码是事实；审查结论优先于旧文档。
@@ -103,15 +103,30 @@
 
 ---
 
-## 四、账号状态与三个待扫码
+## 四、账号状态与待扫码
 
 - 账号总数 43：Free 37 / Pro 6。
-- `verify_required` 3 个：`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`。
+- `verify_required` **5 个（用户确认）**：最后一次启动时已达 5 个；完整列表与数量**以实机 `/app/data/accounts/registry.json` 为准**，本文不硬编码具体账号清单。
+  - 历史说明：此前记录为 3 个（`acc_86bbfa31`、`acc_59c95a69`、`acc_c11b975f`），只是当时的快照状态，不代表当前数量；这三个账号当时直连探测均返回 200 `[1]`。
   - 状态改动前备份：`/root/verifyflip2-backup-1795426068/`。
-  - 已修改 `registry.json` + `meta.json` + `rotator` 状态（三处一致）。
-  - 直连探测均返回 200 `[1]`；当前仍列为待扫码，未做软件层硬限制。
+  - 修改账号状态须 `registry.json` + `meta.json` + `rotator` 状态三处一致；扫码时按 `registry.json` 的 `verify_required` 逐个处理，不在软件层做硬限流。
 - 两个 Pro 账号 `acc_61a816d1`、`acc_6803137a`：当前 `enabled`，`tier=Pro` 正常。
 - 关键事实：`registry.json` 是权威状态，`meta.json` 是镜像；改账号状态必须改 `registry.json`，只改 meta 不生效（meta 里的 `enabled:false` 曾未生效即因此）。
+
+### 4.1 扫码验证当前行为（2026-11-23 修复，待提交）
+
+依据：`docs/dev/rebuild/domains/P1-account/reviews/REV-2.1.5.17-verify-start-status-fix.md`（PASS；关闭弹窗重复 cancel 的 P2 已修并复审）。
+
+| 行为 | 当前实现 |
+|---|---|
+| 单次 start | 前端单 watcher + `openedFor` guard，一次打开只发 1 条 `POST /verify/start`；不再需要「开两次弹窗才出码」 |
+| STARTING | 前端每 2.5s 轮询 status，展示启动骨架与已等待秒数；后端 STARTING 复用并等待在途启动，不再回空 `starting`/`qr_url=null` |
+| 会话 TTL | `DEFAULT_TTL_SECONDS=300s` |
+| 出码后自动查询 | 页面 success 或距上次确认满 10s（`CONFIRM_RPC_INTERVAL_SECONDS=10`）即自动调上游 `GetUserVerificationStatus`；页面卡在 verify-account 也会查 |
+| 手动检查 | `GET /verify/status?force=true` 绕过页面 success 与 10s 节流立即查询；按钮显示「检查中…」 |
+| 通过判定 | 上游 `2`（verified）与 `3`（not_required）均视为通过并清 `verify_required`（3 一并清 registry/rotator 锁）；`1`/`None` 保持 pending |
+| 未通过提示 | pending 且 `1`/`None` 时 `message=still_pending`，UI 显示「仍在等待扫码」，不暴露内部变量名 |
+| 关闭弹窗 | 取消职责收敛为一次 `cancel`（`cancelSettled` 守卫），不再重复发送 |
 
 ---
 
@@ -126,7 +141,8 @@
 - 2.1.5 分批与降噪（`e9081d2`）：首轮保活分批，逐账号 INFO + 每轮汇总 WARNING。
 - 元数据/Cookie region 403 接 canary 出口仲裁（`4493ac0`）。
 - 分批饥饿、仲裁 kind、汇总口径修复（`cf96f03`，审查 `REV-2.1.5.16`）。
-- VPS 部署完成：8 出口健康、43 账号绑定、3 待扫码；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
+- VPS 部署完成：8 出口健康、43 账号绑定、`verify_required` 5 个待扫码（以 `registry.json` 为准）；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
+- 扫码验证 start/status 修复（本地工作区，**未提交/未部署**；审查 `REV-2.1.5.17` PASS）：单次 start、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
 
 ### 5.2 未完成
 
@@ -205,4 +221,5 @@ curl -s -H "Authorization: Bearer <token>" http://172.17.0.1:8788/v1/status
 2. 处理无响应体 403 的标签取舍（出口嫌疑 vs 账号级记录），避免误烧出口或反复切号。
 3. 补充 fanout 节点掉线检测与热备切换（当前 paid 3 = 2 主力 + 1 热备，掉线不自动补）。
 4. 做 1 核 1.9GB 容量评估（`free -m` / `top` 实测 WARP 4 + fanout 4 + app/signer 的 RSS）。
-5. 把 `HANDOVER.md` 与 `AGENT.md` 固化为开工必读；后续所有结论落盘到 `docs/dev/rebuild/domains/` 对应域，不依赖会话记忆。
+5. 提交并部署本轮扫码验证修复（`REV-2.1.5.17`）后，按 `registry.json` 的 `verify_required` 逐个完成扫码（当前 5 个，数量以 registry 为准），部署后复查 `verify_required` 余量。
+6. 把 `HANDOVER.md` 与 `AGENT.md` 固化为开工必读；后续所有结论落盘到 `docs/dev/rebuild/domains/` 对应域，不依赖会话记忆。

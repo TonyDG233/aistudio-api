@@ -423,7 +423,10 @@ Authorization: Bearer <readonly_token>
 - 版本：**2.1.5**（app HEAD `cc0c734`，含 `e9081d2` 分批/降噪、`4493ac0` 元数据 403 接 canary、`cf96f03` P1/P2、`cc0c734` 文档；fanout `279fd9c`；管理器本地 git `26eb4a9`）。
 - 模式：`AISTUDIO_EXIT_MODE=external` + `browserless`；管理器 `172.17.0.1:8788`，fanout 4 出口（SOCKS 需认证），WARP `wireproxy-inst-1..4`（`40110..40113`）+ 旧 `40001`。
 - 池：**8 条健康出口**（free WARP 4 / paid fanout 3 / free_overflow 1）；**43 个账号全部绑定**；预算 paid 30/45/400、free 50/75/2400，窗口 1800s，维护/探针预留 20/6，租约 30~60s。
-- 账号：43（Free 37 / Pro 6）；**3 个 `verify_required` 待扫码**（`acc_86bbfa31` / `acc_59c95a69` / `acc_c11b975f`）；两个 Pro `acc_61a816d1` / `acc_6803137a` 当前 enabled、tier=Pro 正常。
+- 账号：43（Free 37 / Pro 6）；**`verify_required` 5 个待扫码（用户确认；数量与清单以实机 `registry.json` 为准）**；此前记录的 3 个（`acc_86bbfa31` / `acc_59c95a69` / `acc_c11b975f`）只是当时状态，不是当前数量；两个 Pro `acc_61a816d1` / `acc_6803137a` 当前 enabled、tier=Pro 正常。
+- 扫码验证（本轮本地修复，**未提交/未部署**，审查 `REV-2.1.5.17`）：单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、会话 TTL 300s、出码后自动每 10s 查询上游、手动检查透传 `force=true`、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次。
+  - `GET /accounts/{id}/verify/status?...&force=true` 是正式手动检查语义（非测试旁路）：即使验证页面尚未 success 也立即查询上游 `GetUserVerificationStatus`，并绕过 10s 自动节流。
+  - 判定口径：上游 `2`（verified）与 `3`（not_required）均视为通过并清 `verify_required`（3 一并清 registry/rotator 锁）；`1`/`None` 保持 pending 且 `message=still_pending`（前端显示「仍在等待扫码」）。该口径不新增/修改本节出口池契约字段。
 - 保活：metadata 12/轮、auth 8/轮，连续 3 个 `no_capacity` 停止本轮，region defer 不计 streak；部署后最近 2 分钟 `no_capacity`/`region` 均为 0。
 
 本节只记录部署事实，不改动上文任何契约字段与语义。

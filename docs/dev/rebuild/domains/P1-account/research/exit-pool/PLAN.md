@@ -342,8 +342,10 @@ disabled --(任何事件/探针/refresh)--> 仍 disabled（硬开关）
 | 保活分批与 `no_capacity` 降噪 | **已完成** | `e9081d2`；首轮 43 账号分批执行，逐账号 INFO、每轮汇总 WARNING，连续 3 个 no_capacity 停止本轮 |
 | 元数据/Cookie region 403 接 canary 出口仲裁 | **已完成** | `4493ac0`；元数据路径 region 403 触发 canary 出口仲裁，不再只记录 |
 | 分批饥饿 / 仲裁 kind / 汇总口径修复 | **已完成** | `cf96f03`；审查 `REV-2.1.5.16` |
-| VPS 部署（2.1.5） | **已完成** | 8 条健康出口（free WARP 4 / paid fanout 3 / overflow 1）、43 账号全部绑定、3 个待扫码；部署后最近 2 分钟 no_capacity/region 均为 0 |
+| 扫码验证 start/status 修复 | **已完成（本地待提交）/待部署** | `REV-2.1.5.17` PASS（P2 处理后复审）；单次 start（单 watcher + `openedFor` guard）、starting 2.5s 轮询、TTL 300s、出码后每 10s 自动查询、手动 `status?force=true`、上游 2/3 均视为通过（3 清锁）、1/None 显示「仍在等待扫码」、STARTING 复用等待在途启动、关闭弹窗只 cancel 一次；全量 2010 passed |
+| VPS 部署（2.1.5） | **已完成** | 8 条健康出口（free WARP 4 / paid fanout 3 / overflow 1）、43 账号全部绑定、`verify_required` 5 个待扫码（用户确认；数量与清单以 `registry.json` 为准）；部署后最近 2 分钟 no_capacity/region 均为 0 |
 | 后续批次观察（43 账号轮换完成度） | **当前** | 观察分批保活能否把 43 账号全部轮换完成，无连续 no_capacity/region 堆积 |
+| 扫码验证修复部署与待验证账号 | **下一步** | 部署 `REV-2.1.5.17` 修复后按 `registry.json` 的 `verify_required` 逐个扫码（当前 5 个，数量以 registry 为准）；扫码独立直连 Chromium、不进出口池预算、不做软件层硬限流 |
 | 无响应体 403 标签取舍 | **下一步** | 空体 403 目前只能按出口嫌疑（Q2）；需定取舍规则，避免误烧出口或反复切号 |
 | fanout 节点掉线/热备 | **下一步** | paid 3 = 2 主力 + 1 热备；掉线检测与热备切换尚未补齐 |
 | 1 核容量评估 | **下一步** | `free -m`/`top` 实测 WARP 4 + fanout 4 + app/signer 的 RSS 与负载 |
