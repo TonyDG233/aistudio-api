@@ -70,8 +70,10 @@ docs/
 *.md
 !README.md
 
-# Development scripts
-scripts/
+# Development scripts (only the verify_required cleanup tool ships in the image)
+scripts/*
+!scripts/clear_verify_required.sh
+!scripts/clear_verify_required.py
 
 # Docker
 Dockerfile

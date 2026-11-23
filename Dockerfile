@@ -204,6 +204,12 @@ COPY main.py .
 COPY defaults/config.yaml /app/defaults/config.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
+# Ship only the verify_required cleanup tool from scripts/ (the rest of that
+# directory is development tooling excluded by .dockerignore). The wrapper
+# resolves REPO_ROOT=/app and prepends /app/src to PYTHONPATH at runtime.
+COPY --chmod=755 scripts/clear_verify_required.sh /app/scripts/clear_verify_required.sh
+COPY --chmod=755 scripts/clear_verify_required.py /app/scripts/clear_verify_required.py
+
 # Bundle the statically linked waa-signer for the browserless engine. The path
 # must stay identical to engine.browserless.signer.binary_path in
 # defaults/config.yaml and resolves relative to /app at runtime.
