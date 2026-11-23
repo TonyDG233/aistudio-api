@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from aistudio_api.application.account_rotator import AccountRotator
@@ -18,6 +22,12 @@ from aistudio_api.domain.errors import (
 from aistudio_api.infrastructure.account import cookie_parser
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.browser.cdp_client import CDPPage
+from aistudio_api.infrastructure.exit_pool import (
+    ExitPoolConfig,
+    ExitResolver,
+    hmac_account_id,
+    reset_exit_resolver,
+)
 from aistudio_api.infrastructure.gateway.capture import (
     CapturedRequest,
     RequestCaptureService,
@@ -538,3 +548,217 @@ async def test_verification_required_isolates_account_without_same_account_retry
     # A brand-new request must not touch the isolated account again.
     next_context = await pipeline.begin(model_path="gemini-3.7-flash")
     assert [candidate.account_id for candidate in next_context.candidates] == ["acc-2"]
+
+
+# ------------------------------------------------- verify-account exit events
+
+_EXIT_ENV_NAMES = (
+    "AISTUDIO_EXIT_MODE",
+    "AISTUDIO_EXIT_ENDPOINT",
+    "AISTUDIO_EXIT_TOKEN",
+    "AISTUDIO_EXIT_HMAC_KEY",
+    "AISTUDIO_EXIT_ALLOWED_HOSTS",
+    "AISTUDIO_EXIT_HTTP_TIMEOUT",
+    "AISTUDIO_EXIT_TTL",
+    "AISTUDIO_EXIT_DIRECT_FALLBACK",
+)
+
+
+def _enable_external_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AISTUDIO_EXIT_MODE", "external")
+    monkeypatch.setenv("AISTUDIO_EXIT_ENDPOINT", "http://172.17.0.1:41999")
+    monkeypatch.setenv("AISTUDIO_EXIT_TOKEN", "secret-token")
+    monkeypatch.setenv("AISTUDIO_EXIT_HMAC_KEY", "hmac-key")
+
+
+def _resolver_with_transport(handler: Any) -> ExitResolver:
+    config = ExitPoolConfig.from_env()
+    assert config is not None, "external env must be set"
+    transport = httpx.MockTransport(handler)
+    return ExitResolver(
+        config, client_factory=lambda: httpx.AsyncClient(transport=transport)
+    )
+
+
+def _verify_pipeline() -> tuple[
+    RoutingPipeline, Any, Any, RebindFakeManager, AccountRotator
+]:
+    store = _AccountsStore([_make_account("acc-1"), _make_account("acc-2")])
+    rotator = AccountRotator(store)  # type: ignore[arg-type]
+    manager = RebindFakeManager([make_instance("inst-1", account_id="acc-1", number=1)])
+    context = make_context(manager.instances, max_switches=2)
+    attempt = make_attempt(_TrackingClient(), tier="Free")
+    pipeline = RoutingPipeline(
+        instance_manager=manager,
+        rotator=rotator,
+        routing_settings_provider=lambda: {"max_switches": 2},
+    )
+    return pipeline, context, attempt, manager, rotator
+
+
+@pytest.mark.asyncio
+async def test_verification_required_reports_verify_account_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+    events: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/lease":
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-7",
+                    "socks_url": "socks5h://172.17.0.1:40007",
+                    "generation": 3,
+                    "ttl_s": 120,
+                },
+            )
+        if request.url.path == "/v1/events":
+            events.append(
+                {
+                    "body": json.loads(request.content),
+                    "auth": request.headers.get("authorization"),
+                }
+            )
+            return httpx.Response(202)
+        return httpx.Response(404)
+
+    resolver = _resolver_with_transport(handler)
+    try:
+        await resolver.lease("acc-1", kind="chat")
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, manager, rotator = _verify_pipeline()
+
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+        await resolver.wait_pending()
+    finally:
+        reset_exit_resolver()
+
+    assert outcome == "switch"
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+    assert rotator.is_account_available("acc-1") is False
+    assert len(events) == 1
+    payload = cast(dict[str, object], events[0]["body"])
+    assert payload == {
+        "account": hmac_account_id("hmac-key", "acc-1"),
+        "exit_id": "exit-7",
+        "kind": "verify_account",
+        "canary": "inconclusive",
+        "ts": payload["ts"],
+    }
+    assert isinstance(payload["ts"], int)
+    assert "acc-1" not in json.dumps(payload)
+    assert events[0]["auth"] == "Bearer secret-token"
+
+
+@pytest.mark.asyncio
+async def test_same_account_exit_verify_event_is_reported_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+    events: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/lease":
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-7",
+                    "socks_url": "socks5h://172.17.0.1:40007",
+                    "generation": 3,
+                    "ttl_s": 120,
+                },
+            )
+        events.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    resolver = _resolver_with_transport(handler)
+    try:
+        await resolver.lease("acc-1", kind="chat")
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, _manager, _rotator = _verify_pipeline()
+
+        pipeline._report_verify_account_event(context, attempt)
+        pipeline._report_verify_account_event(context, attempt)
+        await resolver.wait_pending()
+    finally:
+        reset_exit_resolver()
+
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_off_mode_verification_sends_no_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _EXIT_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    reset_exit_resolver()
+
+    def _forbidden_client(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("off mode must not build an HTTP client")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _forbidden_client)
+    pipeline, context, attempt, manager, _rotator = _verify_pipeline()
+
+    outcome = await pipeline.handle_error(
+        context,
+        attempt,
+        AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+        has_yielded_data=False,
+    )
+
+    assert outcome == "switch"
+    assert manager.reassign_calls == [("inst-1", "acc-2")]
+    reset_exit_resolver()
+
+
+@pytest.mark.asyncio
+async def test_verify_event_failure_does_not_block_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_external_exit(monkeypatch)
+    released = asyncio.Event()
+    started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/lease":
+            return httpx.Response(
+                200,
+                json={
+                    "exit_id": "exit-7",
+                    "socks_url": "socks5h://172.17.0.1:40007",
+                    "generation": 3,
+                    "ttl_s": 120,
+                },
+            )
+        started.set()
+        await released.wait()
+        raise httpx.ConnectError("down", request=request)
+
+    resolver = _resolver_with_transport(handler)
+    try:
+        await resolver.lease("acc-1", kind="chat")
+        reset_exit_resolver(resolver)
+        pipeline, context, attempt, manager, _rotator = _verify_pipeline()
+
+        outcome = await pipeline.handle_error(
+            context,
+            attempt,
+            AuthError(f"禁止访问: {VERIFY_ACCOUNT_MESSAGE}"),
+            has_yielded_data=False,
+        )
+        # The request completed while the event POST is still pending.
+        assert outcome == "switch"
+        assert manager.reassign_calls == [("inst-1", "acc-2")]
+        released.set()
+        await resolver.wait_pending()
+        assert started.is_set()
+    finally:
+        reset_exit_resolver()

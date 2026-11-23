@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -587,6 +588,29 @@ async def test_report_event_nowait_never_raises(
         canary="inconclusive",
     )
     await resolver.wait_pending()
+
+
+@pytest.mark.asyncio
+async def test_report_event_nowait_is_bounded_on_hung_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_external_env(monkeypatch, AISTUDIO_EXIT_HTTP_TIMEOUT="0.05")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        await asyncio.sleep(5)
+        return httpx.Response(202)
+
+    resolver = _resolver_with_transport(handler)
+    resolver.report_event_nowait(
+        account_id="acc-1",
+        exit_id="exit-1",
+        event_kind="verify_account",
+        canary="inconclusive",
+    )
+    started = time.monotonic()
+    await resolver.wait_pending()
+    assert time.monotonic() - started < 1.0
 
 
 # ---------------------------------------------------------------- pool status

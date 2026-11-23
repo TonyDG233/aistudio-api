@@ -59,6 +59,7 @@ from aistudio_api.domain.model_access import (
     tier_satisfies_required,
 )
 from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.exit_pool.resolver import get_exit_resolver
 from aistudio_api.infrastructure.gateway.instance_client import InstanceRequestClient
 from aistudio_api.infrastructure.gateway.session_protocol import RequestSession
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
@@ -219,6 +220,9 @@ class RouteContext:
     # External exit pool only: one in-slot rebuild (new exit) per request after
     # an ``exit_bad`` canary verdict, so a flapping manager cannot loop.
     exit_rebuild_retried: bool = False
+    # One ``verify_account`` event per (account, exit) inside one verify
+    # occurrence: repeated handle_error/streaming paths must not spam the manager.
+    reported_verify_exits: set[tuple[str, str]] = field(default_factory=set)
 
     def next_candidate(self) -> RouteCandidate | None:
         for candidate in self.candidates:
@@ -890,6 +894,44 @@ class RoutingPipeline:
             except Exception as exc:
                 logger.debug("[routing] 统计记录失败: %s", exc)
 
+    def _report_verify_account_event(
+        self, context: RouteContext, attempt: RouteAttempt
+    ) -> None:
+        """Report one real ``verify_account`` observation to the exit manager.
+
+        Off mode (no resolver) is a pure no-op: zero event traffic.  External
+        mode posts fire-and-forget (bounded by the client timeout, failures are
+        swallowed) and is de-duplicated per (account, bound exit) so a single
+        verify occurrence can never spam the manager.
+        """
+        resolver = get_exit_resolver()
+        if resolver is None:
+            return
+        assignment_for = getattr(resolver, "assignment_for", None)
+        assignment = (
+            assignment_for(
+                attempt.account_id,
+                kind=context.route.surface,
+                include_expired=True,
+            )
+            if callable(assignment_for)
+            else None
+        )
+        exit_id = str(getattr(assignment, "exit_id", "") or "")
+        key = (attempt.account_id, exit_id)
+        if key in context.reported_verify_exits:
+            return
+        report = getattr(resolver, "report_event_nowait", None)
+        if not callable(report):
+            return
+        context.reported_verify_exits.add(key)
+        report(
+            account_id=attempt.account_id,
+            exit_id=exit_id,
+            event_kind="verify_account",
+            canary="inconclusive",
+        )
+
     def record_empty_retry(self, context: RouteContext, attempt: RouteAttempt) -> None:
         """Record one independent attempt for an empty-response retry."""
         if not context.record_attempts:
@@ -978,6 +1020,7 @@ class RoutingPipeline:
                     context.route.model,
                     exc,
                 )
+                self._report_verify_account_event(context, attempt)
                 if has_yielded_data:
                     raise exc
                 return await self._switch_or_raise(

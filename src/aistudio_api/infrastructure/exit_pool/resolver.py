@@ -739,14 +739,18 @@ class ExitResolver:
         event_kind: str,
         canary: str,
     ) -> None:
-        """Fire-and-forget event report; never blocks or raises."""
+        """Fire-and-forget event report; never blocks or raises.
+
+        The background task is bounded by ``http_timeout_s`` so a manager that
+        accepts the connection but never answers cannot accumulate hung tasks.
+        """
         payload = self.event_payload(
             account_id=account_id,
             exit_id=exit_id,
             event_kind=event_kind,
             canary=canary,
         )
-        task = asyncio.create_task(self._post_event(payload))
+        task = asyncio.create_task(self._post_event_bounded(payload))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
 
@@ -781,6 +785,10 @@ class ExitResolver:
             event_kind=event_kind,
             canary=canary,
         )
+        return await self._post_event_bounded(payload)
+
+    async def _post_event_bounded(self, payload: dict[str, object]) -> bool:
+        """One event POST bounded by the configured HTTP timeout; never raises."""
         try:
             return await asyncio.wait_for(
                 self._post_event(payload),
@@ -788,14 +796,16 @@ class ExitResolver:
             )
         except TimeoutError:
             log.warning(
-                "[exit-pool] 出口事件上报超时 kind=%s exit=%s", event_kind, exit_id
+                "[exit-pool] 出口事件上报超时 kind=%s exit=%s",
+                payload.get("kind"),
+                payload.get("exit_id"),
             )
             return False
         except Exception as exc:
             log.warning(
                 "[exit-pool] 出口事件上报失败 kind=%s exit=%s error=%s",
-                event_kind,
-                exit_id,
+                payload.get("kind"),
+                payload.get("exit_id"),
                 type(exc).__name__,
             )
             return False

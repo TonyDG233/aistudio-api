@@ -1802,6 +1802,42 @@ class _LeaseResolver:
         return None if self.no_capacity else EXIT_ONE
 
 
+class _SequencedLeaseResolver(_LeaseResolver):
+    """Lease double that returns queued outcomes, then a healthy default.
+
+    Used to model one account where the tier probe succeeds but the follow-up
+    email probe hits ``no_capacity`` (Q-10), or a failed creation lease followed
+    by a successful generation lease (Q-11).
+    """
+
+    def __init__(self, results: list[LeaseResult]) -> None:
+        super().__init__()
+        self._results = list(results)
+
+    async def lease(
+        self,
+        account_id: str,
+        *,
+        lane: str = "free",
+        cls: str = "generation",
+        calls: int = 1,
+        kind: str = "chat",
+        use_cache: bool = False,
+    ) -> LeaseResult:
+        del use_cache
+        self.calls.append((account_id, lane, cls, calls, kind))
+        if self._results:
+            return self._results.pop(0)
+        return LeaseResult(
+            "ok",
+            exit_id="exit-1",
+            socks_url=EXIT_ONE,
+            generation=1,
+            ttl_s=120,
+            budget_left=20,
+        )
+
+
 def test_resolve_credential_exit_returns_defer_on_no_capacity() -> None:
     resolver = _LeaseResolver(no_capacity=True, retry_after_s=17.0)
     decision = asyncio.run(
@@ -2068,6 +2104,67 @@ def test_cold_start_session_reuses_creation_lease_for_first_request() -> None:
             pass
         generation = [call for call in resolver.calls if call[2] == "generation"]
         assert len(generation) == 2
+
+    asyncio.run(_run())
+
+
+def test_direct_fallback_cold_start_does_not_grant_generation_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-11: only a successful create-time lease may be reused by request #1."""
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+    resolver = _SequencedLeaseResolver(
+        [LeaseResult("error", reason="manager_unreachable")]
+    )
+    runtime = _browserless_runtime(resolver)
+
+    async def _run() -> None:
+        build = await runtime.create_session(
+            slot_id="slot-df",
+            auth_file=None,
+            auth_user="0",
+            tier="Free",
+            account_id="acc_direct",
+            realm_id="realm-df",
+            surface="chat",
+        )
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        # The create-time decision fell back to direct (failed lease): the
+        # wrapper must not hand its first request a free generation credit.
+        assert len(generation) == 1
+        async with build.session.request_scope():
+            pass
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        assert len(generation) == 2
+
+    asyncio.run(_run())
+
+
+def test_skip_cold_start_does_not_grant_generation_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q-11: a fail-closed skip creates no session and consumes no credit."""
+    monkeypatch.delenv("AISTUDIO_EXIT_DIRECT_FALLBACK", raising=False)
+    resolver = _SequencedLeaseResolver(
+        [LeaseResult("error", reason="manager_unreachable")]
+    )
+    runtime = _browserless_runtime(resolver)
+
+    async def _run() -> None:
+        with pytest.raises(RoutingError):
+            await runtime.create_session(
+                slot_id="slot-skip",
+                auth_file=None,
+                auth_user="0",
+                tier="Free",
+                account_id="acc_skip",
+                realm_id="realm-skip",
+                surface="chat",
+            )
+        generation = [call for call in resolver.calls if call[2] == "generation"]
+        # Exactly the refused create-time probe: nothing was granted to a
+        # request scope because no session exists.
+        assert len(generation) == 1
 
     asyncio.run(_run())
 
@@ -2480,3 +2577,80 @@ def test_auth_update_deferred_is_not_an_account_failure(tmp_path: Any) -> None:
     last = keepalive._last_results["auth_update"]
     assert last["reason"] == "deferred"
     assert last["deferred"] is True
+
+
+def test_keepalive_defers_when_email_subprobe_hits_no_capacity(
+    tmp_path: Any,
+) -> None:
+    """Q-10: a successful tier probe with a deferred email probe keeps 300s retry.
+
+    The tier result itself is ``ok=True``; the email sub-probe is reported as
+    ``deferred_no_capacity``.  Keepalive must treat the account as deferred and
+    not push the next metadata pass out to the full 24h interval.
+    """
+    store = AccountStore(tmp_path / "accounts_metadata_email_defer")
+    account = store.save_account(
+        name="Email deferred",
+        email=None,
+        storage_state=_STORAGE_STATE,
+        account_id="acc_email_defer",
+        tier="Free",
+    )
+    resolver = _SequencedLeaseResolver(
+        [
+            LeaseResult(
+                "ok",
+                exit_id="exit-1",
+                socks_url=EXIT_ONE,
+                generation=1,
+                ttl_s=120,
+                budget_left=20,
+            ),
+            LeaseResult("no_capacity", retry_after_s=45.0, reason="no_capacity"),
+        ]
+    )
+    session = _leased_probe_session(resolver, account_id=account.id)
+    refresher = AccountInfoRefresher(
+        store,
+        transport_factory=lambda _proxy: RecordingTransport(),
+        exit_resolver=cast(Any, resolver),
+    )
+
+    class _Clock:
+        now = datetime.now(UTC).timestamp()
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    service = AccountKeepaliveService(
+        store,
+        cast(Any, SimpleNamespace(session=None)),
+        refresher,
+        instance_manager=SimpleNamespace(
+            pool_slots=lambda: (
+                SimpleNamespace(account_id=account.id, session=session),
+            )
+        ),
+        clock=clock,
+        tick_seconds=3600.0,
+    )
+    service._next_due = {"metadata_refresh": clock.now}
+    settings_block = KeepaliveSettings(
+        auth_update=False,
+        metadata_refresh=True,
+        active_activity=False,
+    )
+
+    asyncio.run(service._run_due(settings_block))
+
+    last = service._last_results["metadata_refresh"]
+    assert last["deferred"] == 1
+    assert service._next_due["metadata_refresh"] == pytest.approx(clock.now + 300.0)
+    stored = store.get_account(account.id)
+    assert stored is not None
+    # Tier data was authoritative and saved; the missing email still keeps the
+    # account due for the 300s retry.
+    assert stored.tier == "Pro"
+    assert stored.tier_checked_at is not None
+    assert stored.email is None

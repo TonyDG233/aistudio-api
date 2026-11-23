@@ -56,6 +56,20 @@ def _as_float(value: object, default: float) -> float:
     return number if number > 0 else default
 
 
+# The refresher reports a deferred email sub-probe (tier itself succeeded) as
+# this error prefix, because the tier probe already produced a successful
+# result.  Q-10: keepalive must still treat the account as deferred so the
+# next metadata pass happens after 300s instead of a full 24h.
+_DEFERRED_EMAIL_PREFIX = "deferred_no_capacity"
+
+
+def _is_deferred_result(result: object) -> bool:
+    if bool(getattr(result, "deferred", False)):
+        return True
+    error = getattr(result, "error", None)
+    return isinstance(error, str) and error.startswith(_DEFERRED_EMAIL_PREFIX)
+
+
 @dataclass(slots=True)
 class KeepaliveSettings:
     """The two 24h jobs plus the optional (default off) control-page activity."""
@@ -454,9 +468,7 @@ class AccountKeepaliveService:
             return {"ok": False, "reason": "refresh_in_progress", "count": 0}
 
         checked_at = _iso(now)
-        deferred_results = [
-            result for result in results if getattr(result, "deferred", False)
-        ]
+        deferred_results = [result for result in results if _is_deferred_result(result)]
         deferred_ids = [str(result.account_id) for result in deferred_results]
         deferred_retry = max(
             (
@@ -470,7 +482,7 @@ class AccountKeepaliveService:
             for account in due
         }
         for result in results:
-            deferred = bool(getattr(result, "deferred", False))
+            deferred = _is_deferred_result(result)
             self._store.mark_refresh_attempt(
                 str(result.account_id),
                 # 429 no_capacity must not be recorded as an account failure, and
@@ -484,9 +496,7 @@ class AccountKeepaliveService:
                 at=result.checked_at or checked_at,
             )
         failed = sum(
-            1
-            for result in results
-            if not result.ok and not getattr(result, "deferred", False)
+            1 for result in results if not result.ok and not _is_deferred_result(result)
         )
         # Skipped accounts were not probed at all (no exit): they must stay due
         # so the next keepalive round retries instead of waiting a full 24h.
