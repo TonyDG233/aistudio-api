@@ -162,7 +162,9 @@ describe('dashboard metrics', () => {
     expect(overview.instance).toBe(1)
     expect(overview.idleReady).toBe(1)
     expect(overview.instance + overview.idleReady).toBe(overview.available)
-    expect(overview.ready).toBe(0)
+    // Pool mode owns activation, so the unbound account is idle-ready rather
+    // than a stale "当前激活" account.
+    expect(overview.ready).toBe(1)
     expect(overview.expired).toBe(2)
     expect(overview.cooldown).toBe(1)
   })

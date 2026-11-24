@@ -48,7 +48,11 @@ export function accountStatus(
   if (instance) {
     return { key: 'instance', instance }
   }
-  if (activeId && account.id === activeId) {
+  // Pool mode owns activation: `activeId` is the legacy control-plane account
+  // and goes stale once slots exist, so it must not advertise an unbound
+  // account as 当前激活 next to a real "实例 #N 运行中" badge.
+  const poolManaged = instances.length > 0
+  if (!poolManaged && activeId && account.id === activeId) {
     return { key: 'active', instance: null }
   }
   if (account.is_available === false) {

@@ -586,7 +586,10 @@ class BrowserlessSession:
             except SignerAuthError as exc:
                 raise self._raise_signer_auth_error(exc) from exc
             except SignerError as exc:
-                text = str(exc)
+                # The signer keeps the actionable server text in ``reason``;
+                # ``str(exc)`` alone is often just "waa-signer mint 失败 (502)".
+                reason_text = getattr(exc, "reason", "") or ""
+                text = f"{exc} {reason_text}".strip()
                 if is_region_restricted_message(text):
                     # The signer surfaces Google's region denial during worker
                     # bootstrap (GetLoggingContext 403 / grpc 7).  Routing must

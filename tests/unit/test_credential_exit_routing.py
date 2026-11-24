@@ -100,6 +100,13 @@ def _capture_logger(
     target.setLevel(level)
     target.propagate = False
     caplog.handler.setLevel(level)
+    # A suite that ran ``logging.disable`` or disabled this logger earlier must
+    # not silence the capture: reset both and restore them afterwards.
+    manager = logging.root.manager
+    previous_disable = manager.disable
+    previous_disabled = target.disabled
+    manager.disable = logging.NOTSET
+    target.disabled = False
     try:
         yield
     finally:
@@ -107,6 +114,8 @@ def _capture_logger(
         target.setLevel(previous_level)
         target.propagate = previous_propagate
         caplog.handler.setLevel(previous_handler_level)
+        target.disabled = previous_disabled
+        manager.disable = previous_disable
 
 
 _STORAGE_STATE: dict[str, object] = {

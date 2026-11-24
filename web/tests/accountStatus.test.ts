@@ -101,6 +101,16 @@ describe('accountStatus precedence', () => {
     expect(accountStatus(account(), [], null).key).toBe('ready')
   })
 
+  test('legacy activeId is ignored once the pool manages slots', () => {
+    const instances = [
+      instance({ id: 'i-1', number: 1, account_id: 'other', state: 'active' }),
+    ]
+    // Unbound account matching the stale control-plane id must not claim 当前激活.
+    expect(accountStatus(account({ id: 'acc' }), instances, 'acc').key).toBe('ready')
+    // Without any slot (legacy single-account control plane) it still applies.
+    expect(accountStatus(account({ id: 'acc' }), [], 'acc').key).toBe('active')
+  })
+
   test('counts match filters over a mixed matrix', () => {
     const instances = [
       instance({ id: 'i-active', number: 1, account_id: 'bound-active', state: 'active' }),
@@ -131,9 +141,11 @@ describe('accountStatus precedence', () => {
     expect(count('expired')).toBe(2)
     expect(count('cooldown')).toBe(2)
     expect(count('instance')).toBe(3)
-    expect(count('active')).toBe(1)
+    // Pool mode owns activation: the legacy control-plane activeId must not
+    // label an unbound account as 当前激活 while real slots exist.
+    expect(count('active')).toBe(0)
     expect(count('quota')).toBe(2)
-    expect(count('ready')).toBe(1)
+    expect(count('ready')).toBe(2)
 
     expect(rows.filter((row) => accountStatus(row, instances, 'active').key === 'quota')).toHaveLength(2)
     expect(
