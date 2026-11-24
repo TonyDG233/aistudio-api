@@ -47,6 +47,16 @@ _QR = QrChallenge(
 _VERIFY_URL = "https://aistudio.google.com/verify-account"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_verify_diagnostics_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verbose verify logs are opt-in: every test starts with them off."""
+    monkeypatch.delenv(verify_module.VERIFY_DIAGNOSTICS_ENV, raising=False)
+
+
+def _enable_verify_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(verify_module.VERIFY_DIAGNOSTICS_ENV, "1")
+
+
 def _add_account(
     store: AccountStore,
     account_id: str,
@@ -1678,8 +1688,11 @@ class _DescribingDriver(FakeDriver):
 
 @pytest.mark.asyncio
 async def test_refresh_logs_page_state_and_upstream_status_without_secrets(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     store = AccountStore(tmp_path / "accounts")
     _add_account(store, "acc_1", verify_required=True)
@@ -1882,7 +1895,9 @@ def test_net_trace_masks_rpc_service_segment_but_keeps_method_name() -> None:
 @pytest.mark.asyncio
 async def test_qr_timeout_dumps_net_trace(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _NetFakePage()
     driver = CdpVerifyBrowserDriver(
@@ -1937,7 +1952,9 @@ def _feed_interesting_requests(page: _NetFakePage, count: int) -> None:
 
 def test_net_trace_dump_prints_tail_not_head(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _NetFakePage()
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -1956,7 +1973,9 @@ def test_net_trace_dump_prints_tail_not_head(
 
 def test_net_trace_summary_flags_verify_user(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
 
@@ -1971,13 +1990,14 @@ def test_net_trace_summary_flags_verify_user(
             "method": "POST",
         }
     )
+    with_user.response_cb({"request_id": "req-v", "status": 200, "mime_type": ""})
     driver._dump_net_trace("with_user")
     summary = [
         r.getMessage()
         for r in caplog.records
         if "网络记录 reason=with_user" in r.getMessage()
     ]
-    assert summary and "verify_user=yes" in summary[-1]
+    assert summary and "verify_user=yes(200)" in summary[-1]
 
     without_user = _NetFakePage()
     other_driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -1994,7 +2014,9 @@ def test_net_trace_summary_flags_verify_user(
 
 def test_net_trace_summary_counts_failed_and_navigations(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _FrameNavFakePage()
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -2026,7 +2048,9 @@ def test_net_trace_summary_counts_failed_and_navigations(
 
 def test_frame_navigation_whitelist_and_log_line(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _FrameNavFakePage()
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -2118,7 +2142,9 @@ class _BlankFramePage:
 @pytest.mark.asyncio
 async def test_blank_url_frame_is_logged_not_silently_skipped(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _BlankFramePage()
     driver = CdpVerifyBrowserDriver(
@@ -2292,7 +2318,11 @@ async def test_net_body_preview_decodes_base64_tuple_and_dict() -> None:
 
 @pytest.mark.asyncio
 async def test_net_body_preview_truncates_to_budget() -> None:
-    page = _BodyFakePage("a" * 500)
+    # Spaces break the text into short runs so this covers the length budget;
+    # a single >=32-char run is now collapsed by the generic token fallback
+    # (see ``test_body_preview_masks_unregistered_long_token``).
+    body = "a " * 250
+    page = _BodyFakePage(body)
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
     driver._page = cast(Any, page)
     driver._register_net_trace(page)
@@ -2301,7 +2331,7 @@ async def test_net_body_preview_truncates_to_budget() -> None:
     await _flush_net_bodies(driver)
 
     preview = next(iter(driver._net_trace)).body_preview
-    assert preview == "a" * verify_module.NET_BODY_PREVIEW_LIMIT + "…"
+    assert preview == body[: verify_module.NET_BODY_PREVIEW_LIMIT] + "…"
     assert len(preview) <= verify_module.NET_BODY_PREVIEW_LIMIT + 1
 
 
@@ -2325,7 +2355,9 @@ async def test_net_body_preview_masks_long_tokens_and_cookie() -> None:
 @pytest.mark.asyncio
 async def test_net_body_binary_records_only_length(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     content = "PDF-1.4-binary-content"
     page = _BodyFakePage(content)
@@ -2363,7 +2395,9 @@ async def test_net_body_capture_is_capped_per_session() -> None:
 @pytest.mark.asyncio
 async def test_net_trace_summary_includes_verify_user_status(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _BodyFakePage('{"error":"denied"}')
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -2385,7 +2419,9 @@ async def test_net_trace_summary_includes_verify_user_status(
 @pytest.mark.asyncio
 async def test_generate_access_token_401_body_is_captured_with_immediate_info(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     assert verify_module._net_body_url_interesting("GenerateAccessToken") is True
 
@@ -2569,6 +2605,7 @@ async def test_start_logs_cookie_names_without_values(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     secret_osid = "SECRET-OSID-VALUE-111"
     secret_sidcc = "SECRET-SIDCC-VALUE-222"
@@ -2631,6 +2668,33 @@ def test_post_preview_truncates_to_budget() -> None:
     assert out.endswith("…")
 
 
+def test_body_preview_masks_unregistered_long_token() -> None:
+    token = "A" * 80
+    out = verify_module._sanitize_body_preview(json.dumps({"unknown": token}))
+    assert token not in out
+    assert "…" in out
+
+
+def test_body_preview_masks_jwt_fragment() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signaturelonglonglonglong"
+    out = verify_module._sanitize_body_preview(json.dumps({"jwt": jwt}))
+    assert "eyJ" not in out
+    assert jwt not in out
+    assert "…" in out
+
+
+def test_body_preview_keeps_short_text() -> None:
+    payload = '{"msg":"ok"}'
+    assert verify_module._sanitize_body_preview(payload) == payload
+
+
+def test_body_preview_keeps_known_key_redaction() -> None:
+    secret = "secretvalue1234567890abcdefghijklmnopqr"
+    out = verify_module._sanitize_body_preview(json.dumps({"access_token": secret}))
+    assert secret not in out
+    assert "…" in out or "***" in out
+
+
 def test_classify_auth_buckets_without_leaking() -> None:
     assert verify_module._classify_auth({"authorization": "SAPISIDHASH 1_2"}) == (
         "sapisidhash"
@@ -2642,7 +2706,9 @@ def test_classify_auth_buckets_without_leaking() -> None:
 
 def test_rpc_request_fingerprint_line_is_masked(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _NetFakePage()
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -2677,7 +2743,9 @@ def test_rpc_request_fingerprint_line_is_masked(
 
 def test_rpc_request_fingerprint_is_capped_per_session(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _NetFakePage()
     driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
@@ -2708,6 +2776,7 @@ async def test_start_logs_cookie_names_at_both_stages_in_order(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """E: the post-injection census runs before the post-bootstrap one."""
+    _enable_verify_diagnostics(monkeypatch)
     caplog.set_level(logging.INFO, logger="aistudio.verify-account")
     page = _VerifyStartPage(
         calls=[],
@@ -2791,6 +2860,68 @@ def test_full_capture_dir_override(
         assert sink.path.parent == target
     finally:
         sink.close()
+
+
+def test_full_capture_default_dir_is_absolute_and_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(verify_module.FULL_CAPTURE_DIR_ENV, raising=False)
+    sink = verify_module._FullCaptureSink(account_label="acc", data_root=tmp_path)
+    try:
+        root = sink.path.parent
+        assert root.is_absolute()
+        assert root == tmp_path / "verify-capture"
+        assert root.is_dir()
+        # The sink already wrote its JSONL file here, proving the dir is writable.
+        assert sink.path.is_file()
+    finally:
+        sink.close()
+
+
+def test_full_capture_relative_override_resolves_against_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(verify_module.FULL_CAPTURE_DIR_ENV, "rel-capture")
+    sink = verify_module._FullCaptureSink(account_label="acc", data_root=tmp_path)
+    try:
+        assert sink.path.is_absolute()
+        assert sink.path.parent == (tmp_path / "rel-capture").resolve()
+    finally:
+        sink.close()
+
+
+def test_capture_data_root_prefers_project_data_dir_and_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    auth_file = tmp_path / "custom" / "accounts" / "acc_x" / "auth.json"
+    monkeypatch.setattr(verify_module, "resolve_data_dir", lambda: tmp_path / "data")
+    assert verify_module._resolve_capture_data_root(auth_file) == tmp_path / "data"
+
+    def boom() -> Path:
+        raise RuntimeError("data dir unavailable")
+
+    monkeypatch.setattr(verify_module, "resolve_data_dir", boom)
+    assert verify_module._resolve_capture_data_root(auth_file) == auth_file.parents[2]
+
+
+def test_start_full_capture_lands_in_project_data_root_not_auth_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(verify_module.FULL_CAPTURE_ENV, "1")
+    monkeypatch.delenv(verify_module.FULL_CAPTURE_DIR_ENV, raising=False)
+    monkeypatch.setattr(verify_module, "resolve_data_dir", lambda: tmp_path / "data")
+    auth_file = tmp_path / "custom" / "accounts" / "acc_x" / "auth.json"
+    driver = verify_module.CdpVerifyBrowserDriver(auth_file=auth_file)
+    driver._start_full_capture(SimpleNamespace())
+    capture = driver._capture
+    assert capture is not None
+    try:
+        assert capture.path.parent == tmp_path / "data" / "verify-capture"
+        # The old heuristic (auth_file.parents[2]) would have landed elsewhere.
+        assert capture.path.parent != auth_file.parents[2] / "verify-capture"
+    finally:
+        capture.close()
 
 
 def test_full_capture_body_slots_are_bounded(tmp_path: Path) -> None:
@@ -2878,3 +3009,219 @@ def test_windows_headed_run_restores_sandbox_flags(
     if __import__("os").name == "nt":
         assert "--no-sandbox" not in args
         assert "--disable-setuid-sandbox" not in args
+
+
+# ---------------------------------------------------------------------------
+# AISTUDIO_VERIFY_DIAGNOSTICS: verbose lines are opt-in
+# ---------------------------------------------------------------------------
+
+
+async def _emit_verbose_verify_diagnostics(
+    driver: CdpVerifyBrowserDriver, page: _FrameNavFakePage
+) -> None:
+    """Drive every diagnostic emitter that the switch gates."""
+    page.request_cb(
+        {
+            "request_id": "req-fp",
+            "url": _RPC_FP_URL + "GenerateAccessToken",
+            "method": "POST",
+            "headers": {},
+            "post_data": "",
+        }
+    )
+    driver._log_qr_frame(
+        frame_id="bframe_1",
+        url="https://www.google.com/recaptcha/api2/bframe?k=abc",
+        selected=True,
+        filter_reason="ok",
+        diag={"payload": {"hasCanvas": True}},
+        sources=[],
+        short_code=False,
+    )
+    await driver._log_page_state(
+        "扫码等待中", cast(Any, _VerifyStartPage(calls=[])), diagnostic=True
+    )
+    driver._dump_net_trace("diagnostics_probe")
+
+
+async def _run_polling_session_with_verbose_diagnostics(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = FakeDriver(poll_results=[PageProbe(_VERIFY_URL, False)], confirm_status=1)
+    service = VerifyAccountService(store, None, driver_factory=lambda _s, _a: driver)
+
+    trace_page = _FrameNavFakePage()
+    trace_driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    trace_driver._register_net_trace(trace_page)
+    try:
+        started = await service.start("acc_1")
+        await service.status("acc_1", str(started["session_id"]), force=True)
+        await _emit_verbose_verify_diagnostics(trace_driver, trace_page)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_off_keeps_polling_session_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Capture DEBUG too, so "downgraded" can be distinguished from "removed".
+    caplog.set_level(logging.DEBUG, logger="aistudio.verify-account")
+
+    await _run_polling_session_with_verbose_diagnostics(tmp_path)
+
+    assert "[Verify] 诊断日志=关" in caplog.text
+    assert "验证会话就绪" in caplog.text
+    for fragment in ("QR帧诊断", "扫码等待中", "RPC 请求指纹", "网络记录"):
+        at_info_or_higher = [
+            record
+            for record in caplog.records
+            if fragment in record.getMessage() and record.levelno >= logging.INFO
+        ]
+        assert not at_info_or_higher, fragment
+    assert any(
+        record.levelno == logging.DEBUG and "QR帧诊断" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_on_promotes_verbose_lines_to_info(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_verify_diagnostics(monkeypatch)
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+
+    await _run_polling_session_with_verbose_diagnostics(tmp_path)
+
+    assert "[Verify] 诊断日志=开" in caplog.text
+    assert "验证会话就绪" in caplog.text
+    for fragment in ("QR帧诊断", "扫码等待中", "RPC 请求指纹", "网络记录"):
+        hits = [
+            record
+            for record in caplog.records
+            if fragment in record.getMessage() and record.levelno >= logging.INFO
+        ]
+        assert hits, fragment
+
+
+def _feed_verify_user_traffic(
+    page: _NetFakePage, request_id: str, method: str, status: int
+) -> None:
+    page.request_cb(
+        {"request_id": request_id, "url": _VERIFY_USER_URL, "method": method}
+    )
+    page.response_cb({"request_id": request_id, "status": status, "mime_type": ""})
+
+
+@pytest.mark.parametrize(
+    ("traffic", "expected"),
+    [
+        # A CORS preflight 200 must not mask the real POST verdict.
+        ((("OPTIONS", 200), ("POST", 403)), "verify_user=yes(403)"),
+        ((("OPTIONS", 200), ("POST", 200)), "verify_user=yes(200)"),
+        ((("OPTIONS", 200),), "verify_user=no"),
+        # The last non-2xx POST wins, even when a later POST succeeds.
+        ((("POST", 403), ("POST", 500)), "verify_user=yes(500)"),
+        ((("POST", 500), ("POST", 200)), "verify_user=yes(500)"),
+    ],
+)
+def test_verify_user_summary_counts_post_responses_only(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    traffic: tuple[tuple[str, int], ...],
+    expected: str,
+) -> None:
+    _enable_verify_diagnostics(monkeypatch)
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    page = _NetFakePage()
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._register_net_trace(page)
+    for index, (method, status) in enumerate(traffic):
+        _feed_verify_user_traffic(page, f"req-{index}", method, status)
+
+    driver._dump_net_trace("verify_user_summary")
+
+    summary = [
+        record.getMessage()
+        for record in caplog.records
+        if "网络记录 reason=verify_user_summary" in record.getMessage()
+    ]
+    assert summary and expected in summary[-1]
+
+
+@pytest.mark.asyncio
+async def test_verify_user_non_2xx_stays_info_with_diagnostics_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aistudio.verify-account")
+    page = _BodyFakePage('{"error":"denied"}')
+    driver = CdpVerifyBrowserDriver(auth_file=Path("unused.json"))
+    driver._page = cast(Any, page)
+    driver._register_net_trace(page)
+
+    _feed_net_pair(page, "req-403", _VERIFY_USER_URL, status=403)
+    await _flush_net_bodies(driver)
+
+    forbidden = [
+        record
+        for record in caplog.records
+        if "VerifyUser 响应 status=403" in record.getMessage()
+    ]
+    assert forbidden and forbidden[-1].levelno == logging.INFO
+    assert 'body={"error":"denied"}' in forbidden[-1].getMessage()
+
+    # The dump has no INFO summary with diagnostics off, but the non-2xx
+    # VerifyUser body subline is still the decisive evidence.
+    driver._dump_net_trace("off_dump")
+    body_at_info = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("      body=")
+        and record.levelno == logging.INFO
+    ]
+    assert len(body_at_info) == 1
+
+    # A 2xx VerifyUser has no failure value, so it drops to DEBUG.
+    _feed_net_pair(page, "req-200", _VERIFY_USER_URL, status=200)
+    await _flush_net_bodies(driver)
+    succeeded = [
+        record
+        for record in caplog.records
+        if "VerifyUser 响应 status=200" in record.getMessage()
+    ]
+    assert succeeded and all(record.levelno == logging.DEBUG for record in succeeded)
+
+    before = len(caplog.records)
+    driver._dump_net_trace("off_dump_after_200")
+    new_body_levels = [
+        record.levelno
+        for record in caplog.records[before:]
+        if record.getMessage().startswith("      body=")
+    ]
+    # The 403 VerifyUser body stays INFO; the 200 one drops to DEBUG.
+    assert new_body_levels == [logging.INFO, logging.DEBUG]
+
+
+def test_minimal_flags_switch_is_gone_and_headed_keeps_compat_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert not hasattr(verify_module, "MINIMAL_FLAGS_ENV")
+    assert not hasattr(verify_module, "_minimal_flags_enabled")
+
+    monkeypatch.setenv("AISTUDIO_VERIFY_HEADED", "1")
+    args = verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome.exe",
+        port=9222,
+        user_data_dir=str(tmp_path),
+        proxy=None,
+    )
+    # The compat rewrite is unconditional now, with no minimal-flags branch.
+    assert "--disable-site-isolation-trials" in args
+    assert not any(arg.startswith("--disable-background-networking") for arg in args)
+    assert not any(arg.startswith("--disable-features=") for arg in args)
+    assert not any(arg.startswith("--headless") for arg in args)

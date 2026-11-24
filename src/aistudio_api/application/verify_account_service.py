@@ -49,6 +49,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from aistudio_api.config import resolve_data_dir
 from aistudio_api.infrastructure.account.account_store import AccountStore
 from aistudio_api.infrastructure.account.cookie_parser import (
     DEFAULT_ACCEPT_LANGUAGE,
@@ -87,6 +88,9 @@ log = get_logger("verify-account")
 VERIFY_ACCOUNT_URL = "https://aistudio.google.com/verify-account"
 DEFAULT_PROXY_ENV = "AISTUDIO_VERIFY_PROXY"
 CHROME_PATH_ENV = "AISTUDIO_VERIFY_CHROME_PATH"
+# Verbose per-poll/per-frame diagnostics are opt-in: unset means the session
+# only logs its milestones (ready/finish/lock clear) plus non-2xx RPC evidence.
+VERIFY_DIAGNOSTICS_ENV = "AISTUDIO_VERIFY_DIAGNOSTICS"
 
 
 DEFAULT_TTL_SECONDS = 300.0
@@ -188,9 +192,6 @@ FULL_CAPTURE_DIR_ENV = "AISTUDIO_VERIFY_CAPTURE_DIR"
 FULL_CAPTURE_MAX_ENTRIES = 20000
 FULL_CAPTURE_MAX_BODIES = 600
 FULL_CAPTURE_BODY_LIMIT = 16384
-# Diagnostics: strip the stealth/low-memory flags from a headed verify browser
-# so it behaves like a stock install (reCAPTCHA depends on those channels).
-MINIMAL_FLAGS_ENV = "AISTUDIO_VERIFY_MINIMAL_FLAGS"
 
 _SHORT_CODE_RE = re.compile(r"recaptcha\.net/qr/([A-Za-z0-9_-]{6,32})")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -245,6 +246,26 @@ _VERIFY_COOKIE_NAME_CHECKS = (
     ("sidcc", "SIDCC"),
     ("sid", "SID"),
 )
+
+
+def _verify_diagnostics_enabled() -> bool:
+    """True only when ``AISTUDIO_VERIFY_DIAGNOSTICS`` opts into verbose logs.
+
+    Read at call time (not import time) so tests and operators can toggle it
+    without restarting the process.
+    """
+    raw = os.environ.get(VERIFY_DIAGNOSTICS_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes"}
+
+
+def _log_diagnostic(message: str, *args: object) -> None:
+    """Emit a per-poll/per-frame diagnostic at INFO when enabled, else DEBUG."""
+    if _verify_diagnostics_enabled():
+        log.info(message, *args)
+    else:
+        log.debug(message, *args)
 
 
 def _verify_button_usable(*, disabled: bool, aria_disabled: str | None) -> bool:
@@ -444,6 +465,10 @@ _BODY_SECRET_ASSIGN_RE = re.compile(
     r"([\"']?\s*[:=]\s*[\"']?)"
     r"([A-Za-z0-9._~+/=\-]{24,})"
 )
+# Generic fallback for a token sitting under an *unregistered* key (or bare in
+# the body): any run of >=32 credential-alphabet characters collapses to ``…``,
+# so an unknown field cannot leak a long opaque value into the INFO line.
+_BODY_LONG_RUN_RE = re.compile(r"[A-Za-z0-9_\-\.=/+]{32,}")
 
 
 def _net_body_url_interesting(url_path: str) -> bool:
@@ -479,11 +504,19 @@ def _normalize_body_result(value: object) -> tuple[str, bool]:
 
 
 def _sanitize_body_preview(body: str) -> str:
-    """Mask credential-like fragments, then truncate to the preview budget."""
+    """Mask credential-like fragments, then truncate to the preview budget.
+
+    Known keys are masked first (unchanged), then a generic run-length fallback
+    collapses any >=32-character opaque fragment regardless of its key name,
+    and a residual ``eyJ`` JWT head is folded last.  Truncation happens after
+    masking so a cut preview never ends inside an unmasked token.
+    """
     text = sanitize_log_message(str(body or ""))
     text = _BODY_SECRET_ASSIGN_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}…", text
     )
+    text = _BODY_LONG_RUN_RE.sub("…", text)
+    text = _RPC_FINGERPRINT_JWT_HEAD_RE.sub("…", text)
     if len(text) > NET_BODY_PREVIEW_LIMIT:
         text = text[:NET_BODY_PREVIEW_LIMIT] + "…"
     return text
@@ -692,6 +725,9 @@ class VerifySession:
     # one-shot ``page_transition`` dump already fired for this session.
     last_net_dump_at: float = 0.0
     net_transition_logged: bool = False
+    # Last upstream ``GetUserVerificationStatus`` value observed for this
+    # session (``2``/``3`` pass, ``1`` pending); surfaced in the final log.
+    upstream_status: int | None = None
 
     def to_public(self) -> dict[str, object]:
         return {
@@ -877,6 +913,10 @@ class VerifyAccountService:
                     cancel_event = asyncio.Event()
                     self._cancel_event = cancel_event
                     self._session_lock = asyncio.Lock()
+                    log.info(
+                        "[Verify] 诊断日志=%s（AISTUDIO_VERIFY_DIAGNOSTICS）",
+                        "开" if _verify_diagnostics_enabled() else "关",
+                    )
 
                     auth_file = self._store.get_auth_path_optional(account_id)
                     if auth_file is None or not auth_file.is_file():
@@ -1156,9 +1196,10 @@ class VerifyAccountService:
                 session.finished_at = time.time()
                 session.cleanup_at = session.finished_at + self._terminal_retention
                 log.info(
-                    "验证会话取消: session=%s account=%s",
+                    "验证会话取消: session=%s account=%s upstream_status=%s",
                     session.session_id,
                     session.account_id,
+                    session.upstream_status,
                 )
                 self._schedule_timer_locked(session.cleanup_at, session.session_id)
             result = {"state": session.state.value}
@@ -1485,7 +1526,7 @@ class VerifyAccountService:
         page_url = str(page_info.get("url") or probe.page_url or "")
         page_title = str(page_info.get("title") or "-")
         probe_error = str(probe.error or page_info.get("error") or "-")
-        log.info(
+        _log_diagnostic(
             "验证会话页面状态: session=%s account=%s manual=%s page_url=%s "
             "page_title=%s probe_success=%s probe_failed=%s probe_error=%s "
             "verify_button=%s qr_canvas=%s region_blocked=%s login_form=%s text=%s",
@@ -1572,6 +1613,7 @@ class VerifyAccountService:
             return
         if isinstance(result, int) and not isinstance(result, bool):
             status_value = result
+        session.upstream_status = status_value
 
         if force:
             log.info(
@@ -1639,7 +1681,16 @@ class VerifyAccountService:
         )
 
     def _clear_verify_required(self, account_id: str) -> None:
-        self._store.update_account_refresh(account_id, verify_required=False)
+        try:
+            self._store.update_account_refresh(account_id, verify_required=False)
+        except Exception as exc:
+            log.warning(
+                "验证锁清除失败: account=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            raise
+        log.info("验证锁已清除: account=%s", account_id)
         rotator = self._rotator
         if rotator is None:
             return
@@ -1690,11 +1741,13 @@ class VerifyAccountService:
         self._driver = None
         duration = max(0.0, session.finished_at - session.created_at)
         log.info(
-            "验证会话结束: session=%s account=%s state=%s message=%s duration=%.1fs",
+            "验证会话结束: session=%s account=%s state=%s message=%s "
+            "upstream_status=%s duration=%.1fs",
             session.session_id,
             session.account_id,
             state.value,
             message,
+            session.upstream_status,
             duration,
         )
         self._schedule_timer_locked(session.cleanup_at, session.session_id)
@@ -1765,9 +1818,23 @@ def _full_capture_enabled() -> bool:
     return os.getenv(FULL_CAPTURE_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
-def _minimal_flags_enabled() -> bool:
-    """Diagnostics: launch a headed verify browser with stock-like flags only."""
-    return os.getenv(MINIMAL_FLAGS_ENV, "").strip().lower() in {"1", "true", "yes"}
+def _resolve_capture_data_root(auth_file: Path) -> Path:
+    """Resolve the capture data root, preferring the project data directory.
+
+    ``AISTUDIO_ACCOUNTS_DIR`` can point the account tree outside the project
+    ``data/`` root, in which case ``auth_file.parents[2]`` would scatter the
+    dump into an unrelated directory.  The project resolver wins; any failure
+    falls back to the old ancestor heuristic instead of aborting capture.
+    """
+    resolved: Path | None = None
+    with contextlib.suppress(Exception):
+        resolved = resolve_data_dir()
+    if resolved is not None:
+        return resolved
+    try:
+        return auth_file.parents[2]
+    except IndexError:
+        return auth_file.parent
 
 
 class _FullCaptureSink:
@@ -1782,7 +1849,11 @@ class _FullCaptureSink:
 
     def __init__(self, *, account_label: str, data_root: Path) -> None:
         override = (os.getenv(FULL_CAPTURE_DIR_ENV) or "").strip()
-        root = Path(override) if override else data_root / "verify-capture"
+        root = Path(override).expanduser() if override else data_root / "verify-capture"
+        # A relative override (e.g. ``data/verify-capture``) must not drift with
+        # the process working directory, so pin it to an absolute path now.
+        if not root.is_absolute():
+            root = (Path.cwd() / root).resolve()
         root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%S")
         self.path = (
@@ -1932,8 +2003,9 @@ class CdpVerifyBrowserDriver:
             user_data_dir=self._user_data_dir,
             proxy=self._proxy,
         )
-        if _verify_headed_enabled():
-            log.info("验证浏览器以有头模式启动")
+        log.info(
+            "验证浏览器启动: 模式=%s", "有头" if _verify_headed_enabled() else "无头"
+        )
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *command,
@@ -1999,11 +2071,19 @@ class CdpVerifyBrowserDriver:
         """Read-only page snapshot (URL/title/text/key controls) for logs."""
         return await _describe_page_snapshot(self._page)
 
-    async def _log_page_state(self, tag: str, page: CDPPage | None = None) -> None:
+    async def _log_page_state(
+        self,
+        tag: str,
+        page: CDPPage | None = None,
+        *,
+        diagnostic: bool = False,
+    ) -> None:
         info = await _describe_page_snapshot(self._page if page is None else page)
-        log.info(
+        message = (
             "%s: page_url=%s page_title=%s verify_button=%s qr_canvas=%s "
-            "region_blocked=%s login_form=%s page_error=%s text=%s",
+            "region_blocked=%s login_form=%s page_error=%s text=%s"
+        )
+        args: tuple[object, ...] = (
             tag,
             info.get("url") or "-",
             info.get("title") or "-",
@@ -2014,6 +2094,10 @@ class CdpVerifyBrowserDriver:
             info.get("error") or "-",
             _safe_page_text(info.get("text")) or "-",
         )
+        if diagnostic:
+            _log_diagnostic(message, *args)
+        else:
+            log.info(message, *args)
 
     async def _log_cookie_names(self, page: object, stage: str = "会话引导后") -> None:
         """Log Cookie *name* presence only; never values or the list itself."""
@@ -2037,7 +2121,7 @@ class CdpVerifyBrowserDriver:
             f"{label}={'yes' if name in names else 'no'}"
             for label, name in _VERIFY_COOKIE_NAME_CHECKS
         )
-        log.info("[Verify] %s Cookie: total=%d %s", stage, len(rows), flags)
+        _log_diagnostic("[Verify] %s Cookie: total=%d %s", stage, len(rows), flags)
 
     # -- CDP network record (observation only) ------------------------------
 
@@ -2119,7 +2203,7 @@ class CdpVerifyBrowserDriver:
         if not _full_capture_enabled():
             return
         try:
-            data_root = self._auth_file.parents[2]
+            data_root = _resolve_capture_data_root(self._auth_file)
             sink = _FullCaptureSink(
                 account_label=self._auth_file.parent.name,
                 data_root=data_root,
@@ -2307,7 +2391,7 @@ class CdpVerifyBrowserDriver:
             now = time.monotonic()
             if now - self._frame_nav_last_log_at >= NET_FRAME_NAV_LOG_INTERVAL_SECONDS:
                 self._frame_nav_last_log_at = now
-                log.info("[Verify] 帧导航 +%.2fs url=%s", elapsed, display)
+                _log_diagnostic("[Verify] 帧导航 +%.2fs url=%s", elapsed, display)
         except Exception:
             log.debug("验证会话帧导航记录失败")
 
@@ -2350,7 +2434,7 @@ class CdpVerifyBrowserDriver:
                 return
             headers = data.get("headers")
             post_data = str(data.get("post_data") or "")
-            log.info(
+            _log_diagnostic(
                 "[Verify] RPC 请求指纹 %s method=%s auth=%s authuser=%s "
                 "apikey=%s cookies=%d post_len=%d post=%s",
                 rpc,
@@ -2457,17 +2541,28 @@ class CdpVerifyBrowserDriver:
                 self._net_bodies[request_id] = preview
                 lowered_path = (entry.url_path or "").lower()
                 if "verifyuser" in lowered_path:
-                    log.info(
-                        "[Verify] VerifyUser 响应 status=%s len=%d body=%s",
-                        "-" if status is None else status,
-                        len(body),
-                        preview or "-",
-                    )
+                    # A non-2xx VerifyUser is the decisive failure evidence, so
+                    # it stays at INFO even with diagnostics off; a 2xx is only
+                    # interesting while debugging.
+                    if status is not None and 200 <= status < 300:
+                        _log_diagnostic(
+                            "[Verify] VerifyUser 响应 status=%s len=%d body=%s",
+                            status,
+                            len(body),
+                            preview or "-",
+                        )
+                    else:
+                        log.info(
+                            "[Verify] VerifyUser 响应 status=%s len=%d body=%s",
+                            "-" if status is None else status,
+                            len(body),
+                            preview or "-",
+                        )
                 elif "generateaccesstoken" in lowered_path:
                     # Debugging the recurring ``POST GenerateAccessToken -> 401``:
                     # the body names the missing credential, so surface it the
                     # moment the response arrives instead of only in the dump.
-                    log.info(
+                    _log_diagnostic(
                         "[Verify] GenerateAccessToken 响应 status=%s len=%d body=%s",
                         "-" if status is None else status,
                         len(body),
@@ -2550,24 +2645,30 @@ class CdpVerifyBrowserDriver:
             hosts = " ".join(
                 f'"{host}":{count}' for host, count in self._net_hosts.most_common(6)
             )
-            verify_entries = [
-                entry for entry in entries if "verifyuser" in entry.url_path.lower()
+            # Only POST responses carry the device-check verdict; the CORS
+            # preflight (OPTIONS 200) must never make a 403 POST look healthy.
+            verify_post_statuses = [
+                entry.status
+                for entry in entries
+                if "verifyuser" in entry.url_path.lower()
+                and entry.method.strip().upper() == "POST"
+                and entry.status is not None
             ]
-            if verify_entries:
-                verify_status = next(
+            if verify_post_statuses:
+                last_non_2xx = next(
                     (
-                        entry.status
-                        for entry in reversed(verify_entries)
-                        if entry.status is not None
+                        status
+                        for status in reversed(verify_post_statuses)
+                        if not 200 <= status < 300
                     ),
                     None,
                 )
                 verify_user = (
-                    "yes" if verify_status is None else f"yes({verify_status})"
+                    "yes(200)" if last_non_2xx is None else f"yes({last_non_2xx})"
                 )
             else:
                 verify_user = "no"
-            log.info(
+            _log_diagnostic(
                 "[Verify] 网络记录 reason=%s total=%d interesting=%d "
                 "verify_user=%s navigations=%d failed=%d 主域名={%s}",
                 reason,
@@ -2586,11 +2687,13 @@ class CdpVerifyBrowserDriver:
             tail = indexed[-NET_DETAIL_LIMIT:]
             skipped = len(indexed) - len(tail)
             if skipped > 0:
-                log.info("  …更早 %d 条 interesting 未展示 #%d…", skipped, tail[0][0])
+                _log_diagnostic(
+                    "  …更早 %d 条 interesting 未展示 #%d…", skipped, tail[0][0]
+                )
             for index, entry in tail:
                 status = "-" if entry.status is None else str(entry.status)
                 suffix = f" failed={entry.failed}" if entry.failed else ""
-                log.info(
+                _log_diagnostic(
                     "  #%d +%.2fs %s %s → %s %s%s",
                     index,
                     entry.ts,
@@ -2601,7 +2704,16 @@ class CdpVerifyBrowserDriver:
                     suffix,
                 )
                 if entry.body_preview:
-                    log.info("      body=%s", entry.body_preview)
+                    # The non-2xx VerifyUser body is the key failure evidence;
+                    # every other response body is diagnostic only.
+                    failed_verify_user = (
+                        "verifyuser" in entry.url_path.lower()
+                        and not (entry.status is not None and 200 <= entry.status < 300)
+                    )
+                    if failed_verify_user:
+                        log.info("      body=%s", entry.body_preview)
+                    else:
+                        _log_diagnostic("      body=%s", entry.body_preview)
         except Exception:
             log.debug("验证会话网络记录导出失败: reason=%s", reason)
 
@@ -2763,7 +2875,7 @@ class CdpVerifyBrowserDriver:
                 # Periodic, read-only wait diagnostics: show which page the
                 # headless browser is stuck on (URL/title/controls/text) without
                 # touching the reCAPTCHA challenge.
-                await self._log_page_state("扫码等待中", page)
+                await self._log_page_state("扫码等待中", page, diagnostic=True)
                 last_log_at = now
             challenge = await self._read_bframe_qr(page)
             if challenge is not None:
@@ -2907,7 +3019,7 @@ class CdpVerifyBrowserDriver:
                 if isinstance(data_images, int) and not isinstance(data_images, bool)
                 else 0
             )
-            log.info(
+            _log_diagnostic(
                 "[Verify] QR帧诊断 frame_id=%s url=%s selected=%s filter_reason=%s "
                 "isolated_world=%s evaluate=%s short_code=%s has_canvas=%s "
                 "data_images=%s sources=%s",
@@ -2923,7 +3035,7 @@ class CdpVerifyBrowserDriver:
                 ",".join(sources) if sources else "-",
             )
             if not short_code and (has_canvas or data_image_count > 0):
-                log.info(
+                _log_diagnostic(
                     "[Verify] QR 仅图片形态: frame_id=%s qr_image_only=true "
                     "has_canvas=%s data_images=%d",
                     (frame_id or "-")[:40],
@@ -3115,21 +3227,6 @@ def _build_verify_chrome_command(
         args.append("--window-size=1280,900")
     if proxy is None:
         args = [arg for arg in args if not arg.startswith("--proxy-server=")]
-    if headed and _minimal_flags_enabled():
-        # Escape hatch for future diagnosis: a stock-looking browser with only
-        # the switches CDP and the bframe reader need.
-        args = [
-            f"--remote-debugging-port={port}",
-            "--remote-allow-origins=*",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-site-isolation-trials",
-            "--window-size=1280,900",
-            "--lang=en-US",
-        ]
-        if user_data_dir:
-            args.append(f"--user-data-dir={user_data_dir}")
-        log.warning("[Verify] 验证浏览器以最小参数启动（诊断模式）")
     return [str(binary), *args]
 
 
