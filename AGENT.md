@@ -256,6 +256,12 @@ uv run python3 main.py server --port 8080
 - **前端 UI Debug 沙盒例外（强制规范）**：严禁在默认生产模式（`ui_debug=false`）下启动服务或拉起真实浏览器；凡涉及前端 UI 变更，Worker 与 Reviewer 必须在强制注入环境变量 `AISTUDIO_UI_DEBUG=1`（开启 `diagnostics.ui_debug=true` 的纯内存/临时目录隔离沙盒，100% 阻断真实浏览器与外网请求）的前提下，在 `127.0.0.1:<随机空闲端口>` 启动临时沙盒服务，使用 Playwright 等浏览器工具在多分辨率（`1440x900` / `1024x900` / `768x900`）下实测页面交互与检查样式；测试结束后必须在 `finally` 中立即关闭临时服务进程，并确认端口关闭、无进程残留、临时目录已清理。
 - **Windows UI Debug 启动方式（强制）**：今后一律使用 `uv run python main.py server --port <port> --ui-debug`，不得依赖后台命令内联环境变量传递 `AISTUDIO_UI_DEBUG`。
 
+#### 4.6.1 排障文档指针与 verify-account 实机测试约束
+
+- 扫码/设备验证（verify-account）的机制、错误文案对照与启动参数约束：`docs/VERIFY_ACCOUNT_DEVICE_VERIFICATION.md`。
+- 排障方法论、四层证据与取证文件读取方式：`docs/DEBUG_GUIDE.md`。
+- **硬约束**：涉及 verify-account 的实机测试，必须先用 iOS 16.4+ 的 App Clip 路径；安卓扫码失败属已知的上游误杀（社区资料：大面积误杀，本仓仅单次实测被拒），不得据此判定“本服务不可用”。
+
 ### 4.7 浏览器进程与 CDP（D-02/D-03）
 
 - 保留 pipe watchdog，只负责父进程死亡后的孤儿 Chromium 清理；不得据此做账号 stale 复活、自动 rebind 或自动重启浏览器会话。
@@ -455,6 +461,28 @@ aistudio-api/
 2. **第二位（Minor 功能版本号 `Y`）**：**重大功能性变更**（例如：`2.1.0` 引入无浏览器双引擎方案；`2.2.0` 独立 Android APK 服务端化构建等）。
 3. **第三位（Patch 维护版本号 `Z`）**：**维护式更新**（日常防风控加固、协议/配额更新、体验与性能调优等）。对外发布、Git Tag 与 `docs/changelog.md` 章节标题始终使用前三位 `X.Y.Z`（例如 `2.1.3`）。
 4. **隐藏第四位（Review 审查步进标号 `W`）**：**单个改进意见/子任务的审查文档标号**，格式为 `REV-X.Y.Z.W-<slug>.md`（落盘于 `docs/dev/rebuild/domains/<Domain>/reviews/`）。在同一维护版本 `X.Y.Z` 周期内的多次子任务迭代审查，统一使用第四位 `W` 按时间顺序递增（如 `REV-2.1.3.1-...`、`REV-2.1.3.2-...`），**严禁因单次改进审查就私自递增第三位发布版本号 `Z`**（禁止出现未发版先跳号为 `REV-2.1.4` / `REV-2.1.5` / `REV-2.1.6` 的情况）。
+
+**发布 tag 与 `pyproject.toml` 版本同步（强制）**：
+
+- 每次对外打 tag（`X.Y.Z`）时，必须同步把 `pyproject.toml` 的 `version` 改成同一个 `X.Y.Z`；不允许 tag 与 `pyproject.toml` 版本不一致。`web/package.json` 与 waa-signer 服务版本也应同步到同一版本。
+- 已知历史欠账：tag `2.1.5` 已发布时 `pyproject.toml` 仍停在 `2.1.4`，**已在 `2.1.6` 补齐**（`pyproject.toml:7` 为 `2.1.6`，`web/package.json:4` 与 waa-signer `signerVersion`（`waa-signer/cmd/waa-signer/main.go:42`）同为 `2.1.6`）。
+- 打 tag 后自检，比较两侧输出版本号（去掉可选的 `v` 前缀）是否一致：
+
+  ```powershell
+  # 1) 当前 HEAD 上的 tag（打 tag 前为空，属预期）
+  git tag --points-at HEAD
+  # 2) 包版本（输出形如 `version = "2.1.6"`，取引号内的版本号比较）
+  Select-String -Path pyproject.toml -Pattern '^version'
+  ```
+
+  POSIX（Termux/Linux）：
+
+  ```bash
+  git tag --points-at HEAD
+  grep '^version' pyproject.toml
+  ```
+
+  两者取出的版本号必须完全相等；`README.md`/`README_EN.md` 里的 `AISTUDIO_IMAGE_TAG=2.1.4` 是示例镜像 tag，待镜像发布后更新，不参与上述自检。
 
 ### 10.4 施工阶段顺序（历史追溯）
 
