@@ -3083,6 +3083,36 @@ def _build_verify_chrome_command(
         "--window-size=1280,900" if arg.startswith("--window-size=") else arg
         for arg in args
     ]
+    if headed:
+        # The canonical launcher is tuned for a 1.9G VPS: software rendering
+        # (SwiftShader), a single renderer process, 128MB V8 and a muted,
+        # unsandboxed profile.  Those are all detectable deviations from a real
+        # desktop browser (WebGL renderer string included), so a headed run on
+        # the operator's machine must not inherit them.
+        drop_prefixes = (
+            "--disable-gpu",
+            "--in-process-gpu",
+            "--use-gl=",
+            "--use-angle=",
+            "--renderer-process-limit=",
+            "--no-zygote",
+            "--js-flags=",
+            "--disable-breakpad",
+            "--mute-audio",
+            # A real desktop browser is not "low-end", does not throw away its
+            # cache aggressively, and keeps the machine's own timezone; a
+            # spoofed LA timezone behind a CN/residential IP is a mismatch.
+            "--enable-low-end-device-mode",
+            "--aggressive-cache-discard",
+            "--fingerprint-timezone=",
+        )
+        args = [
+            arg
+            for arg in args
+            if not any(
+                arg == prefix or arg.startswith(prefix) for prefix in drop_prefixes
+            )
+        ]
     if headed and not any(arg.startswith("--window-size=") for arg in args):
         args.append("--window-size=1280,900")
     if proxy is None:
