@@ -1,7 +1,7 @@
 {
   "name": "aistudio-api-web",
   "private": true,
-  "version": "2.1.4",
+  "version": "2.1.6",
   "type": "module",
   "scripts": {
     "dev": "bun --bun vite",

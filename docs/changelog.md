@@ -3,6 +3,39 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.6] - 2026-11-24
+
+在 2.1.5 基础上收口 verify-account 扫码设备验证、Cookie 注入属性、出口探针误判与扫码链路可观测性，并补齐 2.1.5 遗留的版本号欠账。
+
+### Added
+
+- **扫码链路全量网络取证（默认关闭）**：设置 `AISTUDIO_VERIFY_FULL_CAPTURE=1` 后，验证会话把整页网络交互按 JSONL 落盘（请求头、Cookie、Authorization、postData、响应头、Set-Cookie、响应体、帧导航、控制台与 WebSocket 帧），用于复现“Google 到底拒了什么”；目录可用 `AISTUDIO_VERIFY_CAPTURE_DIR` 覆盖，未设时优先落在项目数据根下 `verify-capture/`（`resolve_data_dir()`，即 `<AISTUDIO_DATA_DIR>` 或 `<repo>/data`，相对路径按 cwd 解析为绝对路径）。产物含明文凭据，仅限本机隔离目录使用；单会话有条数与响应体上限，未设置该变量时不注册任何额外监听。
+- **`AISTUDIO_VERIFY_DIAGNOSTICS`（诊断日志开关，默认关闭）**：默认只保留出码就绪、会话就绪、最终结果、非 2xx `VerifyUser` 响应体与清锁等关键行；网络记录、`GenerateAccessToken` 响应体、帧诊断与逐轮页面状态等降为 DEBUG。设为 `1`/`true`/`yes` 时恢复全部诊断行。`GenerateAccessToken` 的 401 响应体只在开启时出现，不作为成败判据。
+- **独立账号状态查询 `POST /api/accounts/{id}/verify/check`**：不依赖二维码与浏览器，直接调用 `GetUserVerificationStatus`；`2/3` 清锁并返回 `passed`，`1` 或 `None` 返回 `pending`。凭据文件缺失、Cookie 不可读、缺少 SAPISID、上游会话失效（`session_invalid`）与 region 拦截等返回 `error`，不是 pending。管理台账号验证弹窗新增「查询账号状态」按钮（`web/src/components/modals/VerifyAccountModal.vue:884-900`，由账号列表页 `web/src/views/AccountsView.vue:479` 打开），并区分“扫码会话状态”与“账号真实状态”。
+- **本地调试新增 `AISTUDIO_ALLOW_EMPTY_INSTANCES`**：仅当配置 `instances` 原始列表为空时放行校验，用于只跑 verify 的本地调试；不会创建任何请求实例。
+- **本地调试新增 `AISTUDIO_SKIP_CONTROL_WARMUP`**：在无实例（`pool_enabled=False`）分支跳过控制面预热，避免拉起控制页 Chromium 与 BotGuard；有实例时该开关不被读取。
+- **`docs/DEBUG_GUIDE.md` 与 `docs/VERIFY_ACCOUNT_DEVICE_VERIFICATION.md`**：前者沉淀四层证据法、取证文件读法与本地隔离调试姿势；后者记录 verify-account 状态机、错误文案归因、启动参数影响与验收口径。
+
+### Removed
+
+- **移除调查期开关 `AISTUDIO_VERIFY_MINIMAL_FLAGS`**：有头模式的“最小参数档”不再受该环境变量控制；如未来需要极简参数，应新增独立开关，不要复活旧名。
+- **移除 `AISTUDIO_IMPORT_KEEP_OSID`**：导入不再提供“保留 OSID 类 Cookie”的开关，相关陈旧设备凭据一律按既有过滤规则剔除。
+
+### Changed
+
+- **扫码取码预算 `20s` → `45s`**：弱机实测二维码在 `+22~24s` 才出现（bframe 200 与 reload 均晚于原预算），20s 会在出码前抛假 `qr_timeout`；45s 仍在 300s 会话 TTL 内。
+- **扫码浏览器统一使用内核原生 UA**：有头与无头模式都不再注入固定 `Chrome/133` UA（内核为 146，`sec-ch-ua` 自相矛盾），统一使用内核原生 UA 与一致的 client hints；有头模式同时剔除软件渲染、单 renderer、128MB V8、低端设备模式与时区伪造等低配机专属或指纹不一致参数。
+- **版本一致性**：`pyproject.toml` 由 `2.1.4` 补齐到 `2.1.6`（tag `2.1.5` 发布时漏更的历史欠账），`web/package.json` 与 waa-signer `/health` 服务版本同步为 `2.1.6`；`AGENT.md` 明确打 tag 必须同步 `pyproject.toml` 版本，禁止 tag 与包版本不一致。README 中的 `AISTUDIO_IMAGE_TAG=2.1.4` 是示例镜像 tag，待镜像发布后更新。
+
+### Fixed
+
+- **verify-account：启动参数破坏 reCAPTCHA 设备验证**：验证浏览器此前携带 `--disable-background-networking`、`--disable-component-update`、`--disable-features=`、Windows 下 `--no-sandbox` 等参数，直接掐死 reCAPTCHA 后台通道与 Google 组件，页面报 `Something went wrong…`（含浏览器扩展相关提示）；现已无条件剔除这些参数并恢复沙箱，页面错误回到与真实浏览器同类的设备级提示，出码正常。证据等级：**本仓实测 iOS App Clip 通过一次、安卓被拒；社区资料为安卓大面积误杀**，不代表本服务不可用。
+- **Cookie 被 Chromium 拒收导致账号侧会话不成立**：`SameSite=None` 未配 `Secure` 的 Cookie（如 `SID`）会被 Chromium 整条拒收，验证会话注入后仅剩部分 Cookie，伴随 `GenerateAccessToken` 401 与 `VerifyUser` 403（401 只是伴随症状，不是判据）。`set_cookies` 现按固定顺序合法化（`__Secure-` 强制 `Secure`、`__Host-` 强制 `Secure` 与 `path=/`、`None` + 非 `Secure` 强制 `Secure`），并在注入后与 `Network.getCookies` 比对输出缺失名称 `WARNING`；池化会话共用同一注入路径，一并受益。
+- **页面未导航时不再误报 Cookie 缺失**：`_log_missing_cookie_names`（`src/aistudio_api/infrastructure/browser/cdp_client.py:729-755`）在 `Network.getCookies` 返回空（页面尚未导航，如 `about:blank`）时只打一行 DEBUG，不再按“Cookie 注入后缺失 N 项”刷 WARNING；仅在页面已导航且确有名项缺失时保留 WARNING。
+- **裸 httpx 探针的 region 403 不再写入假 `verify_required`**：`external` 出口模式下，无池化会话的 tier / 邮箱 / RotateCookies 探针走裸 httpx 经租约出口，请求形状与 signer 不一致被 Google 回 region 403，而 canary 用 signer 形状在同一出口回 200，导致误判 `account_bad` 并回写 `verify_required`（假标清理后再次回弹的根因）。现在探针按实际传输标记上报，裸传输的 `probe_exit_id` 一律为空，仲裁对空值早退、不跑 canary、不报事件、不写 verify。
+- **保活 `auth_update` 裸轮换的 region 403 不再写入 verify**：`auth_update` 因签发者通道不可用而回落到裸 httpx `RotateCookies` 时，其 region 403 无法证明出口匹配；现在按 `inconclusive` 处理，不跑 canary 归因、不写 `verify_required`，避免把出口噪声误记成账号需要验证。
+- **验证响应体预览的脱敏增加 ≥32 连续令牌兜底**：已知键先按原规则掩码，再对任意 ≥32 字符的凭据字母表连续片段统一折叠为 `…`，使未注册字段或裸置的长令牌也不会进入 INFO 行；截断发生在掩码之后。
+
 ## [2.1.4] - 2026-11-15
 
 在 2.1.3 基础上补齐主动轮换、切号退避、真 LRU 选号与防风控超时口径，并完成文档体系与 Docker 开箱即用分发重塑。
