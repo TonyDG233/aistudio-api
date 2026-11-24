@@ -33,9 +33,7 @@ def _enable_atg(monkeypatch, mode="prefer", **overrides):
 
 
 def _req(*, tools=None, tool_config=None):
-    body: dict[str, Any] = {
-        "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
-    }
+    body: dict[str, Any] = {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}
     if tools is not None:
         body["tools"] = tools
     if tool_config is not None:
@@ -368,3 +366,32 @@ def test_e5_wire_whitelist_filters_then_fix_keeps_synthetic():
         "real_tool",
         "atg_emit_synth",
     }
+
+
+async def test_non_stream_empty_truncated_by_max_tokens_does_not_retry(caplog):
+    """Thinking-only output at the token limit must not trigger the empty rescue.
+
+    ATG stays off here: with synthetic tools enabled the empty candidate would
+    fail unwrap and retry through the error path, which is a different scenario.
+    """
+    import logging
+
+    client = MagicMock()
+
+    async def fake_generate(**_kwargs):
+        # Wire finish-reason 2 == MAX_TOKENS (see finish_reasons.py).
+        return ModelOutput(candidates=[Candidate(finish_reason=2)], usage={})
+
+    client.generate_content = AsyncMock(side_effect=fake_generate)
+    with caplog.at_level(logging.WARNING, logger="aistudio.generation"):
+        outcome = await generation_service.generate(
+            model_path=MODEL,
+            req=_req(),
+            pipeline=_pipeline(client),
+            api_format="gemini",
+        )
+    assert outcome.output.candidates[0].text == ""
+    assert not any(
+        "empty response, retrying same account" in record.getMessage()
+        for record in caplog.records
+    )

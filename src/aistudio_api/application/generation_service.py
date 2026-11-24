@@ -24,6 +24,7 @@ from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     normalize_gemini_request,
 )
+from aistudio_api.application.finish_reasons import to_gemini_finish_reason
 from aistudio_api.application.routing_pipeline import (
     RouteAttempt,
     RouteContext,
@@ -78,6 +79,18 @@ def _output_is_empty(output: ModelOutput) -> bool:
         or candidate.images
         or candidate.reasoning_images
     )
+
+
+def _truncated_by_token_limit(output: ModelOutput) -> bool:
+    """True when the upstream stopped because the output token budget ran out.
+
+    Thinking-first models can spend the whole ``max_tokens`` on reasoning and
+    return no visible text.  Retrying the same account cannot produce text
+    there either, so the empty-response rescue must not fire.
+    """
+    if not output.candidates:
+        return False
+    return to_gemini_finish_reason(output.candidates[0].finish_reason) == "MAX_TOKENS"
 
 
 def _is_thinking_only(candidate: Candidate) -> bool:
@@ -309,7 +322,9 @@ async def generate(
                     )
                     if not _output_is_empty(output):
                         break
-                    if empty_index < max_empty:
+                    if empty_index < max_empty and not _truncated_by_token_limit(
+                        output
+                    ):
                         rescued = True
                         _record_empty_retry(pipeline, context, attempt)
                         logger.warning(
@@ -320,6 +335,15 @@ async def generate(
                             effective_model_path,
                         )
                         continue
+                    if _truncated_by_token_limit(output):
+                        logger.info(
+                            "[generation] empty text because max_tokens was "
+                            "exhausted (finish_reason=%s); not retrying: model=%s",
+                            to_gemini_finish_reason(output.candidates[0].finish_reason)
+                            if output.candidates
+                            else None,
+                            effective_model_path,
+                        )
                     if atg.enabled and tool_name and atg.cfg.mode == "required":
                         raise SyntheticRequiredError(
                             "synthetic tool call required but not present in "
