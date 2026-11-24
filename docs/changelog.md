@@ -3,6 +3,32 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.7] - 2026-11-24
+
+在 2.1.6 基础上修复出入口 region 403 的误归因、canary 污染的永久停摆与死槽抱死 503，并把出口隔离/轮换的权责收敛到宿主脚本。
+
+### Fixed
+
+- **region 403 不再被当作“账号需扫码”**：新增内部归因 `region_suspect`，事件按 `other_403` + `canary=account_bad` 上报；不再写 `verify_required`，也不再触发同一出口的 verify 连坐烧毁。只有上游返回真实 verify-account 报文时才写入扫码锁。
+- **canary 污染不再让进程永久停摆**：改为按出口 600s TTL 失效，TTL 到期自动恢复探测，无需重启进程。
+- **INVALID 实例槽位不再永久 503**：新增 30/120/600s 有界自愈（最多 3 次）后再判定不可用。
+- **generation 通道代码级拒绝应急直连**：生成路径不接受 `direct_fallback`，维护与探针通道行为不变。
+- **出口管理器不再把 `fanout reports suspect=true` 当作出口损坏**：改为记录事件并限频告警，出口好坏交由 L1 探针判定，避免健康出口被反复误隔离。
+
+### Added
+
+- **出口隔离自动收敛**：`health.quarantine_ttl_s=1800`，隔离到期进入探针（锁外执行、独立 10s 超时），连续 3 次失败才置 `disabled`；`/v1/status` 巡检本身不再触发恢复。
+- **`GET /v1/exits` 逐出口只读事实**：只暴露出口状态与预算等事实，不含 `socks_url`、凭据与账号明文；事件按 `kind`/`exit_id`/`canary`/HMAC 前缀结构化持久化。
+- **宿主运维脚本（`data/tools/vps-exit-scripts/`，不入库）**：按实例 WARP 健康检查与轮换（quiet-gap、单实例 30min 冷却、全局每小时 ≤3 次、`flock` 互斥、默认 dry-run）；`warp-provision-instance.sh` 补位；`fanout-guard.sh` 以端口为判据、每小时最多重启 3 次。
+
+### Changed
+
+- **轮换权责收敛**：轮换只由宿主脚本负责，管理器 `rotate_on_auto_recover=false`、`rotate_on_recover=false`，自身只做状态机与探针。
+
+### Notes
+
+- **补池（replenish）仍未实现**：三条命令为空时如实输出 `replenish: disabled (no command)`，不再暗示会自动补齐。
+
 ## [2.1.6] - 2026-11-24
 
 在 2.1.5 基础上收口 verify-account 扫码设备验证、Cookie 注入属性、出口探针误判与扫码链路可观测性，并补齐 2.1.5 遗留的版本号欠账。

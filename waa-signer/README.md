@@ -103,7 +103,7 @@ nohup ./bin/waa-signer -listen "127.0.0.1:8081" -proxy "http://127.0.0.1:7890" >
   "workers": 1,
   "idleWorkers": 1,
   "maxWorkers": 8,
-  "version": "2.1.6",
+  "version": "2.1.7",
   "ready": true
 }
 ```
