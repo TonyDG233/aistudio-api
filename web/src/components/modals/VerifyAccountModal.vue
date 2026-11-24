@@ -644,7 +644,6 @@ onBeforeUnmount(() => {
   <div
     v-if="modelValue"
     class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs"
-    @click.self="closeModal"
   >
     <div class="bg-white rounded-2xl w-full max-w-lg shadow-xl border border-gray-100 flex flex-col max-h-[92vh]">
       <!-- Header -->

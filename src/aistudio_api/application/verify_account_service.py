@@ -16,8 +16,13 @@
 * 手动 ``status(force=True)`` 不依赖页面 success 立即查询上游；自动查询在页面
   success 或距上次确认满 ``CONFIRM_RPC_INTERVAL_SECONDS`` 时触发，避免页面
   卡在 verify-account 时永远不查上游。
-* 只允许由 API 轮询驱动状态推进；服务内部除一次性过期/清理定时器外没有
-  后台轮询循环。
+* 页面级 success 一旦被观测到，会为该会话启动一个有界后台确认任务（固定退避
+  ``2/5/10/30/60/120/300s``，总上限 10 分钟）。它在 ``session_lock`` 下串行调用
+  ``confirm_verified``，拿到上游 ``2/3`` 就清锁并结束；会话被 ``cancel`` /
+  ``expired`` / ``error`` 之后该任务仍继续，直到拿到结果或超时。因此清锁不再
+  依赖前端继续轮询 ``/verify/status``。
+* 状态推进仍以 API 轮询为主；该后台确认任务是唯一新增的有限后台循环，且必须
+  在 ``close()`` 中被取消并等待退出。
 """
 
 from __future__ import annotations
@@ -106,6 +111,24 @@ CONFIRM_RPC_TIMEOUT_SECONDS = 8.0
 # Minimum spacing between automatic ``GetUserVerificationStatus`` RPCs driven
 # by plain (non-forced) status polls.  A manual ``force`` check bypasses it.
 CONFIRM_RPC_INTERVAL_SECONDS = 10.0
+# Bounded background confirmation: once the page reports success, keep asking
+# upstream ``GetUserVerificationStatus`` on this fixed backoff until it returns
+# 2/3 (verified/notRequired) or the 10 minute deadline expires.  This is what
+# makes the lock clear without depending on the UI continuing to poll.
+BACKGROUND_CONFIRM_BACKOFF_SECONDS: tuple[float, ...] = (
+    2.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+)
+BACKGROUND_CONFIRM_DEADLINE_SECONDS = 600.0
+# ``close()`` cancels in-flight confirmations and waits this long for them to
+# unwind; a confirmation only awaits a bounded RPC or backoff sleep, so this
+# can never hang shutdown.
+CONFIRM_TASK_CLOSE_TIMEOUT_SECONDS = 5.0
 # Bounded per-session CDP network record used only for diagnosing the headless
 # QR flow (did the page actually fire ``VerifyUser`` / receive Google's
 # callback?).  Entry fields are whitelisted: no headers, Cookie/Set-Cookie,
@@ -266,6 +289,11 @@ def _log_diagnostic(message: str, *args: object) -> None:
         log.info(message, *args)
     else:
         log.debug(message, *args)
+
+
+async def _confirm_sleep(seconds: float) -> None:
+    """Backoff sleep for the bounded confirmation task (test-injectable hook)."""
+    await asyncio.sleep(seconds)
 
 
 def _verify_button_usable(*, disabled: bool, aria_disabled: str | None) -> bool:
@@ -728,6 +756,9 @@ class VerifySession:
     # Last upstream ``GetUserVerificationStatus`` value observed for this
     # session (``2``/``3`` pass, ``1`` pending); surfaced in the final log.
     upstream_status: int | None = None
+    # True once the bounded background confirmation task was launched for this
+    # session; guarantees at most one task per session across many polls.
+    confirm_background_started: bool = False
 
     def to_public(self) -> dict[str, object]:
         return {
@@ -816,6 +847,8 @@ class VerifyAccountService:
         code_timeout_seconds: float = DEFAULT_CODE_TIMEOUT_SECONDS,
         passed_retention_seconds: float = PASSED_RETENTION_SECONDS,
         terminal_retention_seconds: float = TERMINAL_RETENTION_SECONDS,
+        confirm_backoff_seconds: tuple[float, ...] | None = None,
+        confirm_deadline_seconds: float = BACKGROUND_CONFIRM_DEADLINE_SECONDS,
     ) -> None:
         self._store = account_store
         self._rotator = rotator
@@ -827,6 +860,15 @@ class VerifyAccountService:
         self._code_timeout = max(0.1, code_timeout_seconds)
         self._passed_retention = max(0.0, passed_retention_seconds)
         self._terminal_retention = max(0.0, terminal_retention_seconds)
+        self._confirm_backoff = (
+            tuple(confirm_backoff_seconds)
+            if confirm_backoff_seconds is not None
+            else BACKGROUND_CONFIRM_BACKOFF_SECONDS
+        )
+        self._confirm_deadline = max(0.0, confirm_deadline_seconds)
+        self._confirm_tasks: dict[str, asyncio.Task[None]] = {}
+        # Launch counter for tests/diagnostics; guarantees one task per session.
+        self._confirm_task_launches = 0
         self._lock = asyncio.Lock()
         self._session: VerifySession | None = None
         self._driver: VerifyBrowserSession | None = None
@@ -1173,7 +1215,9 @@ class VerifyAccountService:
         async with session_lock:
             if cancel_event.is_set() or session.state in _TERMINAL_STATES:
                 return session.to_public()
-            await self._refresh(session, driver, cancel_event, force=force)
+            await self._refresh(
+                session, driver, cancel_event, session_lock, force=force
+            )
         return session.to_public()
 
     async def cancel(self, account_id: str) -> dict[str, object]:
@@ -1402,7 +1446,14 @@ class VerifyAccountService:
             cancel_event = self._cancel_event
             if cancel_event is not None:
                 cancel_event.set()
+            confirm_tasks = list(self._confirm_tasks.values())
+            self._confirm_tasks.clear()
+            for task in confirm_tasks:
+                task.cancel()
             await self._dispose_session_locked()
+        await self._await_confirmation_tasks(
+            confirm_tasks, timeout=CONFIRM_TASK_CLOSE_TIMEOUT_SECONDS
+        )
         await self.wait_for_cleanup()
 
     async def wait_for_cleanup(self) -> None:
@@ -1494,6 +1545,7 @@ class VerifyAccountService:
         session: VerifySession,
         driver: VerifyBrowserSession,
         cancel_event: asyncio.Event,
+        session_lock: asyncio.Lock,
         *,
         force: bool = False,
     ) -> None:
@@ -1566,6 +1618,12 @@ class VerifyAccountService:
         if probe.failed:
             await self._finish(session, VerifySessionState.FAILED, "page_failed")
             return
+
+        # Page-level success is the trigger for the bounded background
+        # confirmation: the lock must still clear even if the operator closes
+        # the panel and no further ``/verify/status`` poll ever arrives.
+        if probe.success or leaving_verify_page:
+            self._ensure_background_confirmation(session, driver, session_lock)
 
         # A page that never leaves verify-account must not suppress the
         # upstream truth: a forced check queries immediately, and an automatic
@@ -1660,6 +1718,165 @@ class VerifyAccountService:
         if now_ts - session.last_net_dump_at >= NET_DUMP_INTERVAL_SECONDS:
             session.last_net_dump_at = now_ts
             _dump_driver_net_trace(driver, "still_pending")
+
+    def _ensure_background_confirmation(
+        self,
+        session: VerifySession,
+        driver: VerifyBrowserSession,
+        session_lock: asyncio.Lock,
+    ) -> None:
+        """Launch at most one bounded confirmation task per session (idempotent)."""
+        if self._closed or session.confirm_background_started:
+            return
+        if session.session_id in self._confirm_tasks:
+            return
+        session.confirm_background_started = True
+        self._confirm_task_launches += 1
+        task = asyncio.create_task(
+            self._run_background_confirmation(session, driver, session_lock)
+        )
+        self._confirm_tasks[session.session_id] = task
+
+    async def _run_background_confirmation(
+        self,
+        session: VerifySession,
+        driver: VerifyBrowserSession,
+        session_lock: asyncio.Lock,
+    ) -> None:
+        """Keep confirming upstream after page success until 2/3 or the deadline.
+
+        Runs independently of ``cancel``/``expired``/``error``: ``confirm_verified``
+        only reads the auth file and calls httpx, so it never touches the (already
+        closed) browser driver internals.  Each RPC, the lock clear and the final
+        state write happen under ``session_lock`` so they never interleave with a
+        concurrent ``/verify/status`` refresh.
+        """
+        session_id = session.session_id
+        account_id = session.account_id
+        started_at = time.monotonic()
+        attempts = 0
+        last_status = session.upstream_status
+        result = "timeout"
+        cancelled = False
+        log.info(
+            "[Verify] 后台确认已启动: session=%s account=%s", session_id, account_id
+        )
+        try:
+            for backoff in self._confirm_backoff:
+                if session.state is VerifySessionState.PASSED:
+                    # A concurrent poll already cleared the lock; no extra RPC.
+                    result = "passed"
+                    return
+                remaining = self._confirm_deadline - (time.monotonic() - started_at)
+                if remaining <= 0:
+                    break
+                await _confirm_sleep(backoff if backoff <= remaining else remaining)
+                if time.monotonic() - started_at >= self._confirm_deadline:
+                    break
+                attempts += 1
+                try:
+                    async with session_lock:
+                        status_value = await driver.confirm_verified(session.auth_user)
+                        last_status = (
+                            status_value
+                            if isinstance(status_value, int)
+                            and not isinstance(status_value, bool)
+                            else None
+                        )
+                        session.upstream_status = last_status
+                        if last_status in (2, 3):
+                            self._clear_verify_required(account_id)
+                            await self._finish(
+                                session,
+                                VerifySessionState.PASSED,
+                                "verified" if last_status == 2 else "not_required",
+                            )
+                            result = "passed"
+                            return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    result = "error"
+                    log.warning(
+                        "[Verify] 后台确认异常: session=%s account=%s attempts=%d "
+                        "error_type=%s error=%s",
+                        session_id,
+                        account_id,
+                        attempts,
+                        type(exc).__name__,
+                        _safe_error_detail(exc),
+                    )
+                    return
+        except asyncio.CancelledError:
+            cancelled = True
+            log.debug(
+                "[Verify] 后台确认被取消: session=%s account=%s attempts=%d",
+                session_id,
+                account_id,
+                attempts,
+            )
+            raise
+        except Exception as exc:
+            # Defensive: any unexpected failure ends this task with one WARNING
+            # and never propagates into the event loop.
+            result = "error"
+            log.warning(
+                "[Verify] 后台确认异常: session=%s account=%s attempts=%d "
+                "error_type=%s error=%s",
+                session_id,
+                account_id,
+                attempts,
+                type(exc).__name__,
+                _safe_error_detail(exc),
+            )
+        finally:
+            if self._confirm_tasks.get(session_id) is asyncio.current_task():
+                self._confirm_tasks.pop(session_id, None)
+            if not cancelled:
+                log.info(
+                    "[Verify] 后台确认结束: session=%s result=%s upstream_status=%s "
+                    "attempts=%d duration=%.1fs",
+                    session_id,
+                    result,
+                    last_status,
+                    attempts,
+                    time.monotonic() - started_at,
+                )
+
+    async def wait_for_background_confirmation(
+        self, *, timeout: float | None = None
+    ) -> None:
+        """Await the current confirmation task(s) (tests/diagnostics/shutdown)."""
+        tasks = list(self._confirm_tasks.values())
+        if not tasks:
+            return
+        if timeout is None:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            _done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=1.0)
+        for session_id, task in list(self._confirm_tasks.items()):
+            if task.done():
+                self._confirm_tasks.pop(session_id, None)
+
+    async def _await_confirmation_tasks(
+        self, tasks: list[asyncio.Task[None]], *, timeout: float
+    ) -> None:
+        """Wait (bounded) for cancelled confirmation tasks to unwind."""
+        pending = [task for task in tasks if not task.done()]
+        if pending:
+            _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+            for task in still_pending:
+                task.cancel()
+            if still_pending:
+                await asyncio.wait(still_pending, timeout=1.0)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                with contextlib.suppress(BaseException):
+                    task.exception()
 
     async def _describe_page_for_log(
         self, driver: VerifyBrowserSession

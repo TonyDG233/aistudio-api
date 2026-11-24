@@ -3225,3 +3225,186 @@ def test_minimal_flags_switch_is_gone_and_headed_keeps_compat_args(
     assert not any(arg.startswith("--disable-background-networking") for arg in args)
     assert not any(arg.startswith("--disable-features=") for arg in args)
     assert not any(arg.startswith("--headless") for arg in args)
+
+
+# ---------------------------------------------------------------------------
+# Bounded background confirmation after page-level success
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedConfirmDriver(FakeDriver):
+    """Confirm driver that returns scripted upstream statuses, then a fallback."""
+
+    def __init__(
+        self,
+        statuses: list[int | None],
+        *,
+        fallback: int | None = 1,
+        poll_results: list[PageProbe] | None = None,
+    ) -> None:
+        super().__init__(
+            poll_results=poll_results or [PageProbe(_VERIFY_URL, True)],
+            confirm_status=fallback,
+        )
+        self._statuses = list(statuses)
+        self._fallback = fallback
+        self.confirm_calls = []
+
+    async def confirm_verified(self, auth_user: str) -> int | None:
+        self.confirm_calls.append(auth_user)
+        if self._statuses:
+            return self._statuses.pop(0)
+        return self._fallback
+
+
+@pytest.mark.asyncio
+async def test_background_confirmation_clears_lock_without_further_status_polls(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    # First status(): sync confirm -> 1. Background task: 1 then 2 -> clear.
+    driver = _ScriptedConfirmDriver([1, 1, 2])
+    service = VerifyAccountService(
+        store,
+        None,
+        driver_factory=lambda _s, _a: driver,
+        confirm_backoff_seconds=(0.0, 0.0, 0.0),
+    )
+    try:
+        started = await service.start("acc_1")
+        status = await service.status("acc_1", str(started["session_id"]))
+        assert status["state"] == VerifySessionState.PENDING.value
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is True
+
+        # No further status() calls: the background task alone must clear it.
+        await service.wait_for_background_confirmation(timeout=2.0)
+
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is False
+        assert service._confirm_tasks == {}
+        ends = [
+            record.getMessage()
+            for record in caplog.records
+            if "后台确认结束" in record.getMessage()
+        ]
+        assert ends and "result=passed" in ends[-1]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_background_confirmation_clears_lock_after_session_cancelled(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    # status() consumes the first 1, then cancel(), then background sees 1 -> 2.
+    driver = _ScriptedConfirmDriver([1, 1, 2])
+    service = VerifyAccountService(
+        store,
+        None,
+        driver_factory=lambda _s, _a: driver,
+        confirm_backoff_seconds=(0.05, 0.05, 0.05),
+    )
+    try:
+        started = await service.start("acc_1")
+        status = await service.status("acc_1", str(started["session_id"]))
+        assert status["state"] == VerifySessionState.PENDING.value
+        cancelled = await service.cancel("acc_1")
+        assert cancelled == {"state": VerifySessionState.CANCELLED.value}
+
+        # The task must keep running after cancel and still clear the lock.
+        await service.wait_for_background_confirmation(timeout=2.0)
+
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is False
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_background_confirmation_times_out_and_keeps_lock(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="aistudio.verify-account")
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = _ScriptedConfirmDriver([], fallback=1)
+    service = VerifyAccountService(
+        store,
+        None,
+        driver_factory=lambda _s, _a: driver,
+        confirm_backoff_seconds=(0.0, 0.0, 0.0),
+    )
+    try:
+        started = await service.start("acc_1")
+        await service.status("acc_1", str(started["session_id"]))
+
+        await service.wait_for_background_confirmation(timeout=2.0)
+
+        account = store.get_account("acc_1")
+        assert account is not None and account.verify_required is True
+        assert service._confirm_tasks == {}
+        ends = [
+            record.getMessage()
+            for record in caplog.records
+            if "后台确认结束" in record.getMessage()
+        ]
+        assert ends
+        assert "result=timeout" in ends[-1]
+        assert "attempts=3" in ends[-1]
+        assert "upstream_status=1" in ends[-1]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_background_confirmation_launches_once_across_many_polls(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = _ScriptedConfirmDriver([], fallback=1)
+    service = VerifyAccountService(
+        store,
+        None,
+        driver_factory=lambda _s, _a: driver,
+        # Long first backoff: the task stays parked so only idempotency matters.
+        confirm_backoff_seconds=(3600.0,),
+    )
+    try:
+        started = await service.start("acc_1")
+        session_id = str(started["session_id"])
+        for _ in range(3):
+            await service.status("acc_1", session_id)
+        assert service._confirm_task_launches == 1
+        assert len(service._confirm_tasks) == 1
+    finally:
+        await service.close()
+    assert service._confirm_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_background_confirmation_tasks(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "accounts")
+    _add_account(store, "acc_1", verify_required=True)
+    driver = _ScriptedConfirmDriver([], fallback=1)
+    service = VerifyAccountService(
+        store,
+        None,
+        driver_factory=lambda _s, _a: driver,
+        confirm_backoff_seconds=(3600.0,),
+    )
+    started = await service.start("acc_1")
+    await service.status("acc_1", str(started["session_id"]))
+    task = next(iter(service._confirm_tasks.values()))
+
+    await service.close()
+
+    assert service._confirm_tasks == {}
+    assert task.done() is True
+    assert task.cancelled() is True
+    assert service.session is None

@@ -202,6 +202,7 @@ stateDiagram-v2
 4. **`GenerateAccessToken` 401 `[16]` 不是判据**：它可能反映 Cookie 未被完整接受（见 changelog 2.1.6 的 Cookie 合法化条目），也可能是旁支噪声；始终以 `GetUserVerificationStatus` 的 `2/3` 为准。
 5. **精确时序未全量落盘**：除 bframe `+22s`、reload `+24s` 与 45s 预算外，其余节点只记录顺序，不声称毫秒级时间。
 6. **取码超时语义**：20s 预算会产生假 `qr_timeout`；45s 是当前固定预算（`DEFAULT_CODE_TIMEOUT_SECONDS`，`verify_account_service.py:97-101`），未提供环境变量覆盖。
+7. **清锁不再依赖前端轮询**：页面级 success 一旦被观测到，服务会为该会话启动一个**有界后台确认任务**（固定退避 2/5/10/30/60/120/300s，总上限 10 分钟），在 `session_lock` 下串行调用 `GetUserVerificationStatus`；返回 2/3 立即清锁并结束，返回 1/None 继续退避，超时只记 INFO、不会强改会话为 `passed`。会话被 `cancel`/`expired`/`error` 之后该任务仍会跑完（`confirm_verified` 只走 httpx，不依赖浏览器页），`close()` 会取消并等待所有未完成任务退出。因此关闭弹窗/标签页休眠不再导致「扫码已通过但锁没清」；启动时仍不会自动对所有 `verify_required` 账号发起查询。
 
 ---
 
