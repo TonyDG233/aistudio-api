@@ -73,15 +73,28 @@ class FakeCDP:
         self.events.append(f"context.dispose:{context_id}")
 
 
+class _FixedClock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
 async def _ready(value: FakeCDP) -> FakeCDP:
     return value
 
 
-def _factory(cdp: FakeCDP, *, fail_contexts: set[str] | None = None) -> SessionFactory:
+def _factory(
+    cdp: FakeCDP,
+    *,
+    fail_contexts: set[str] | None = None,
+    always_fail: bool = False,
+) -> SessionFactory:
     async def factory(_cdp: Any, **kwargs: Any) -> FakeSession:
         context_id = str(kwargs["context_id"])
         cdp.events.append(f"session.create:{context_id}")
-        if fail_contexts and context_id in fail_contexts:
+        if always_fail or (fail_contexts and context_id in fail_contexts):
             raise RuntimeError(f"bootstrap failed for {context_id}")
         return FakeSession(cdp.events, str(kwargs.get("auth_user") or "0"))
 
@@ -95,19 +108,26 @@ def _manager(
     specs: list[InstanceSpec],
     max_contexts: int,
     fail_contexts: set[str] | None = None,
+    always_fail: bool = False,
     load_attempts: int = 1,
     drain_timeout_s: float = 12.0,
     retired: list[str] | None = None,
+    clock: Any = None,
 ) -> InstanceManager:
     pool = InstancePool(
         cast(Any, lambda: _ready(cdp)),
         specs=specs,
         max_contexts=max_contexts,
-        session_factory=_factory(cdp, fail_contexts=fail_contexts),
+        session_factory=_factory(
+            cdp, fail_contexts=fail_contexts, always_fail=always_fail
+        ),
         load_attempts=load_attempts,
         on_slot_retired=(retired.append if retired is not None else None),
     )
-    return InstanceManager(pool, store, drain_timeout_s=drain_timeout_s)
+    kwargs: dict[str, Any] = {"drain_timeout_s": drain_timeout_s}
+    if clock is not None:
+        kwargs["clock"] = clock
+    return InstanceManager(pool, store, **kwargs)
 
 
 def _store_with_accounts(
@@ -527,6 +547,78 @@ async def test_stale_instance_waits_for_manual_restart(tmp_path) -> None:
     restarted = await manager.restart(record.id)
     assert restarted.state is InstanceState.ACTIVE
     assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_slot_self_heals_after_backoff(tmp_path) -> None:
+    """A transient bootstrap failure must recover without a manual restart."""
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    clock = _FixedClock(1000.0)
+    cdp = FakeCDP()
+    manager = _manager(
+        store,
+        cdp,
+        specs=[_free_spec()],
+        max_contexts=1,
+        fail_contexts={"ctx-1"},
+        load_attempts=1,
+        clock=clock,
+    )
+
+    await manager.startup()
+    assert (await manager.list_instances()).instances[0].state is InstanceState.INVALID
+    assert len(cdp.created) == 1
+
+    # Not due before the 30s backoff.
+    clock.now += 29.0
+    assert (await manager.list_instances()).instances[0].state is InstanceState.INVALID
+    assert len(cdp.created) == 1
+
+    # At 30s the bounded self-heal runs through the manual restart path.
+    clock.now += 1.0
+    healed = (await manager.list_instances()).instances[0]
+    assert healed.state is InstanceState.ACTIVE
+    assert len(cdp.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_slot_self_heal_gives_up_after_three_failures(
+    tmp_path, caplog
+) -> None:
+    store, _accounts = _store_with_accounts(
+        tmp_path, ("free", "free@example.com", "Free")
+    )
+    clock = _FixedClock(1000.0)
+    cdp = FakeCDP()
+    manager = _manager(
+        store,
+        cdp,
+        specs=[_free_spec()],
+        max_contexts=1,
+        always_fail=True,
+        load_attempts=1,
+        clock=clock,
+    )
+
+    await manager.startup()
+    assert (await manager.list_instances()).instances[0].state is InstanceState.INVALID
+    assert len(cdp.created) == 1
+
+    with caplog.at_level("WARNING"):
+        for delay in (30.0, 120.0, 600.0):
+            clock.now += delay
+            listed = (await manager.list_instances()).instances[0]
+            assert listed.state is InstanceState.INVALID
+    # One bootstrap context per activation: startup + three self-heal attempts.
+    assert len(cdp.created) == 4
+    assert any("自愈连续 3 次失败" in record.getMessage() for record in caplog.records)
+
+    # Give-up is terminal: no fourth attempt on later listings.
+    clock.now += 10_000.0
+    assert (await manager.list_instances()).instances[0].state is InstanceState.INVALID
+    assert len(cdp.created) == 4
 
 
 @pytest.mark.asyncio

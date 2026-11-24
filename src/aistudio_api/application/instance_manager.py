@@ -46,6 +46,13 @@ log = get_logger("instances")
 
 DEFAULT_DRAIN_TIMEOUT_S = 12.0
 
+# Bounded self-heal for a slot that failed activation.  A transient bootstrap
+# failure must not pin the slot to INVALID (and therefore 503 every request)
+# until an operator restarts it by hand.  Three attempts at 30s/120s/600s reuse
+# the manual restart path; after the third failure the slot stays INVALID.
+INVALID_RECOVERY_BACKOFF_S: tuple[float, ...] = (30.0, 120.0, 600.0)
+MAX_INVALID_RECOVERY_ATTEMPTS = len(INVALID_RECOVERY_BACKOFF_S)
+
 
 def _account_rotator() -> Any | None:
     """Best-effort access to the process-wide rotator for LRU-aware selection."""
@@ -143,6 +150,9 @@ class _Record:
     created_at: float = 0.0
     started_at: float = 0.0
     last_error: str | None = None
+    # Bounded INVALID self-heal bookkeeping (never a second concurrency ledger).
+    invalid_recovery_attempts: int = 0
+    invalid_recovery_at: float = 0.0
 
     @property
     def spec(self) -> InstanceSpec:
@@ -323,7 +333,9 @@ class InstanceManager:
             )
 
     async def list_instances(self) -> InstanceList:
-        self._sync_records()
+        async with self._lifecycle_lock:
+            self._sync_records()
+            await self._heal_invalid_records()
         self._repair_latest()
         self._repair_current()
         instances = tuple(
@@ -595,14 +607,83 @@ class InstanceManager:
         """Explicit manual restart for INVALID/stale instances."""
         async with self._lifecycle_lock:
             record = self._record(instance_id)
-            account = self._require_account_for_record(record)
+            await self._restart_record(record)
+            return self._view(record)
+
+    async def _restart_record(self, record: _Record) -> None:
+        """Restart one record on a fresh runtime; caller holds the lifecycle lock."""
+        account = self._require_account_for_record(record)
+        slot = self._pool.get(record.slot_id)
+        if slot is not None and int(slot.active_requests) > 0:
+            raise InstanceBusyError("该实例仍有在途请求")
+        await self._activate(record, account, force=True)
+        if self._current_id is None:
+            self._current_id = record.id
+
+    def _schedule_invalid_recovery(self, record: _Record) -> None:
+        """Schedule the next bounded self-heal attempt for an INVALID record."""
+        if record.invalid_recovery_attempts >= MAX_INVALID_RECOVERY_ATTEMPTS:
+            record.invalid_recovery_at = 0.0
+            return
+        if record.invalid_recovery_at:
+            return
+        delay = INVALID_RECOVERY_BACKOFF_S[record.invalid_recovery_attempts]
+        record.invalid_recovery_at = self._clock() + delay
+
+    async def _heal_invalid_records(self) -> None:
+        """Bounded self-heal for slots that failed activation (caller holds lock)."""
+        now = self._clock()
+        for record in sorted(self._records.values(), key=lambda item: item.number):
+            if record.state is not InstanceState.INVALID:
+                continue
+            if record.invalid_recovery_attempts >= MAX_INVALID_RECOVERY_ATTEMPTS:
+                continue
+            due = record.invalid_recovery_at
+            if due <= 0.0 or now < due:
+                # Not scheduled (stale page / missing runtime) or not yet due.
+                continue
             slot = self._pool.get(record.slot_id)
             if slot is not None and int(slot.active_requests) > 0:
-                raise InstanceBusyError("该实例仍有在途请求")
-            await self._activate(record, account, force=True)
-            if self._current_id is None:
-                self._current_id = record.id
-            return self._view(record)
+                # A busy slot is not a failed attempt: retry after the shortest
+                # backoff without burning one of the three attempts.
+                record.invalid_recovery_at = now + INVALID_RECOVERY_BACKOFF_S[0]
+                continue
+            record.invalid_recovery_attempts += 1
+            record.invalid_recovery_at = 0.0
+            try:
+                await self._restart_record(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                record.state = InstanceState.INVALID
+                record.last_error = str(exc)
+                if record.invalid_recovery_attempts >= MAX_INVALID_RECOVERY_ATTEMPTS:
+                    log.warning(
+                        "[instances] 槽位自愈连续 %d 次失败，保留 INVALID slot=%s "
+                        "account=%s error=%s",
+                        record.invalid_recovery_attempts,
+                        record.slot_id,
+                        record.account_id or "-",
+                        exc,
+                    )
+                else:
+                    self._schedule_invalid_recovery(record)
+                    log.info(
+                        "[instances] 槽位自愈失败，稍后重试 slot=%s attempt=%d/%d "
+                        "error=%s",
+                        record.slot_id,
+                        record.invalid_recovery_attempts,
+                        MAX_INVALID_RECOVERY_ATTEMPTS,
+                        exc,
+                    )
+            else:
+                record.invalid_recovery_attempts = 0
+                record.invalid_recovery_at = 0.0
+                log.info(
+                    "[instances] 槽位自愈成功 slot=%s account=%s",
+                    record.slot_id,
+                    record.account_id or "-",
+                )
 
     async def sleep(self, instance_id: str) -> Instance:
         async with self._lifecycle_lock:
@@ -635,6 +716,8 @@ class InstanceManager:
         """Message arrival wakes every eligible sleeping/unstarted instance."""
         started: list[Instance] = []
         async with self._lifecycle_lock:
+            self._sync_records()
+            await self._heal_invalid_records()
             used = {
                 record.account_id
                 for record in self._records.values()
@@ -1375,10 +1458,13 @@ class InstanceManager:
                 raise
             record.state = InstanceState.INVALID
             record.last_error = str(exc)
+            self._schedule_invalid_recovery(record)
             raise InstanceNotReadyError(str(exc)) from exc
         record.account_id = account.id
         record.surface = target_surface
         record.state = InstanceState.ACTIVE
+        record.invalid_recovery_attempts = 0
+        record.invalid_recovery_at = 0.0
         record.started_at = self._clock()
         self._latest_id = record.id
         if self._current_id is None:

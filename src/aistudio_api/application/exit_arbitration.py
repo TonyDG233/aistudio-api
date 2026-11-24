@@ -36,10 +36,20 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("exit-arbitration")
 
-CanaryOutcome = Literal["exit_bad", "account_bad", "inconclusive"]
+CanaryOutcome = Literal["exit_bad", "region_suspect", "account_bad", "inconclusive"]
 
 DEFAULT_CANARY_TIMEOUT_S = 9.0
 DEFAULT_PROBE_COOLDOWN_S = 600.0
+# A contaminated canary reply (verify-account / 401 / unexpected status) is
+# isolated per exit and expires, so a single bad probe can never stop the
+# process from probing again until restart.
+DEFAULT_CANARY_CONTAMINATION_TTL_S = 600.0
+# The host manager only accepts ``region_403`` / ``verify_account`` /
+# ``other_403``.  A region-level 403 (including the canary ``200`` inference)
+# is a suspicion, never upstream verify-account semantics, so it is reported as
+# ``other_403`` with ``canary=account_bad`` until the manager learns a dedicated
+# ``region_suspect`` kind.
+REGION_SUSPECT_EVENT_KIND = "other_403"
 
 
 @dataclass(frozen=True)
@@ -86,15 +96,20 @@ class SignerCanaryProbe:
         canary_account: str,
         timeout_s: float = DEFAULT_CANARY_TIMEOUT_S,
         slot_account_ids_getter: Callable[[], Iterable[str]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        contamination_ttl_s: float = DEFAULT_CANARY_CONTAMINATION_TTL_S,
     ) -> None:
         self._runtime_getter = runtime_getter
         self._account_store = account_store
         self._canary_account = canary_account
         self._timeout_s = max(1.0, timeout_s)
         self._slot_account_ids_getter = slot_account_ids_getter
-        # Process-local contamination latch: once the canary account gets an
-        # upstream response that says it is not a clean probe identity (verify
-        # account, 401, unexpected status) we stop probing for this process.
+        self._clock = clock
+        self._contamination_ttl_s = max(0.0, contamination_ttl_s)
+        # Per-exit contamination with TTL: one polluted probe only suppresses
+        # further probes on that exit until the TTL expires.  A separate
+        # ``_contaminated_reason`` is kept for logs and never gates probing.
+        self._contaminated: dict[str, tuple[float, str]] = {}
         self._contaminated_reason: str | None = None
 
     def _auth_file(self) -> str | None:
@@ -153,10 +168,9 @@ class SignerCanaryProbe:
         return self._canary_account in {str(item) for item in raw if item}
 
     async def probe(self, *, socks_url: str, exit_id: str) -> CanaryVerdict:
-        if self._contaminated_reason is not None:
-            return CanaryVerdict(
-                "inconclusive", f"canary-contaminated:{self._contaminated_reason}"
-            )
+        contaminated = self._contamination_state(exit_id)
+        if contaminated is not None:
+            return CanaryVerdict("inconclusive", f"canary-contaminated:{contaminated}")
         if self._slot_conflict():
             # A slot also owns this account's signer worker; probing would
             # release/steal it.  Operators must keep the canary out of slots.
@@ -221,7 +235,10 @@ class SignerCanaryProbe:
 
         code = int(status) if isinstance(status, int) else 0
         if code == 200:
-            return CanaryVerdict("account_bad", "list_models_ok")
+            # The canary works on this exit while the real account was region
+            # blocked: suspicious for the account, but nowhere near upstream
+            # verify-account semantics, so this can never lock the account.
+            return CanaryVerdict("region_suspect", "list_models_ok")
         text = _body_text(body)
         # verify-account wins over region: a response that says both must never
         # be judged as an exit-level failure.
@@ -231,12 +248,35 @@ class SignerCanaryProbe:
             return CanaryVerdict("exit_bad", "list_models_region_403")
         return self._mark_contaminated(f"status_{code}", exit_id)
 
+    def _contamination_state(self, exit_id: str) -> str | None:
+        """Return the live contamination reason for ``exit_id``, or ``None``.
+
+        Expired entries are cleared so the next probe can recover inside the
+        same process without a restart.
+        """
+        entry = self._contaminated.get(exit_id)
+        if entry is None:
+            return None
+        expires_at, reason = entry
+        if self._clock() < expires_at:
+            return reason
+        self._contaminated.pop(exit_id, None)
+        logger.info(
+            "[exit] canary 污染已过期，恢复探测 exit=%s reason=%s", exit_id, reason
+        )
+        return None
+
     def _mark_contaminated(self, reason: str, exit_id: str) -> CanaryVerdict:
-        """Latch the canary as polluted and stop probing for this process."""
+        """Quarantine one exit for the contamination TTL, never the process."""
+        self._contaminated[exit_id] = (
+            self._clock() + self._contamination_ttl_s,
+            reason,
+        )
         self._contaminated_reason = reason
         logger.warning(
-            "[exit] canary 返回非区域失败，本进程内标记 canary 账号受污染并停止再探测 "
+            "[exit] canary 返回非区域失败，出口 %.0fs 内暂停探测（仅限该出口，到期自动恢复） "
             "account=%s exit=%s reason=%s",
+            self._contamination_ttl_s,
             self._canary_account,
             exit_id,
             reason,
@@ -275,7 +315,6 @@ class ExitArbitration:
         *,
         account_id: str,
         kind: str,
-        account_bad_event_kind: str = "region_403",
         probe_exit_id: str | None = None,
     ) -> CanaryOutcome:
         """Classify one region 403 for an account's currently bound exit.
@@ -356,7 +395,6 @@ class ExitArbitration:
             kind=kind,
             assignment=assignment,
             verdict=verdict,
-            account_bad_event_kind=account_bad_event_kind,
         )
 
     async def _apply(
@@ -366,7 +404,6 @@ class ExitArbitration:
         kind: str,
         assignment: ExitAssignment,
         verdict: CanaryVerdict,
-        account_bad_event_kind: str = "region_403",
     ) -> CanaryOutcome:
         logger.warning(
             "[exit] canary 仲裁结果=%s exit=%s kind=%s detail=%s",
@@ -388,14 +425,19 @@ class ExitArbitration:
             # all of their TTL caches instead of only the reporting account.
             self._resolver.invalidate_exit(assignment.exit_id)
             return "exit_bad"
-        if verdict.outcome == "account_bad":
+        if verdict.outcome in ("region_suspect", "account_bad"):
+            # The exit answered the canary, so the failure is account-level
+            # *suspicion*.  It is not upstream verify-account semantics and
+            # must never be reported as ``verify_account`` (the manager burns
+            # an exit after two such events).  Report the compatible
+            # ``other_403`` kind until the manager learns ``region_suspect``.
             self._resolver.report_event_nowait(
                 account_id=account_id,
                 exit_id=assignment.exit_id,
-                event_kind=account_bad_event_kind,
+                event_kind=REGION_SUSPECT_EVENT_KIND,
                 canary="account_bad",
             )
-            return "account_bad"
+            return verdict.outcome
         self._resolver.report_event_nowait(
             account_id=account_id,
             exit_id=assignment.exit_id,

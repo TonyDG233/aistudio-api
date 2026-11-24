@@ -1572,10 +1572,9 @@ class RecordingRegionArbiter:
         *,
         account_id: str,
         kind: str,
-        account_bad_event_kind: str = "region_403",
         probe_exit_id: str | None = None,
     ) -> str:
-        del account_bad_event_kind, probe_exit_id
+        del probe_exit_id
         self.calls.append(account_id)
         self.kinds.append(kind)
         return self.outcome
@@ -1594,7 +1593,7 @@ class RecordingRotator(FakeRotator):
 
 
 class RegionOutcomeRefresher(FakeRefresher):
-    """External refresher double: every account comes back account_bad."""
+    """External refresher double: every account comes back region_suspect."""
 
     external_mode = True
 
@@ -1614,12 +1613,25 @@ class RegionOutcomeRefresher(FakeRefresher):
                 error=None,
                 checked_at=now,
                 deferred=True,
-                skip_reason="account_bad",
-                region_outcome="account_bad",
+                skip_reason="region_suspect",
+                region_outcome="region_suspect",
                 retry_after_s=300.0,
             )
             for account in accounts
         ]
+
+
+class VerifyOutcomeRefresher(RegionOutcomeRefresher):
+    """External refresher double: an explicit upstream verify-account body."""
+
+    async def refresh_accounts(
+        self, accounts: list[AccountMeta], **kwargs: object
+    ) -> list[SimpleNamespace]:
+        results = await super().refresh_accounts(accounts, **kwargs)
+        for result in results:
+            result.skip_reason = "verify_account"
+            result.region_outcome = "verify_account"
+        return results
 
 
 @pytest.mark.asyncio
@@ -1793,14 +1805,14 @@ async def test_auth_update_bare_rotate_region_403_never_writes_verify(
 
 
 @pytest.mark.asyncio
-async def test_auth_update_signer_rotate_region_403_account_bad_writes_verify(
+async def test_auth_update_signer_rotate_region_403_account_bad_stays_suspect(
     tmp_path, monkeypatch
 ):
-    """The signer rotation path keeps its proven-exit verdict (no over-block).
+    """A proven-exit canary account_bad is suspicious, never a verify lock.
 
-    The slot session's bound exit equals the resolver binding, so the canary
-    verdict is attributable: the event is reported and ``verify_required`` is
-    written, exactly as before the bare-transport guard.
+    The event is still reported for attribution, but as ``other_403`` (the
+    manager-compatible region-suspect kind) instead of ``verify_account``, and
+    the registry keeps ``verify_required`` false.
     """
     store = AccountStore(tmp_path)
     _account(store, "acc_signer", "signer@example.com")
@@ -1834,12 +1846,10 @@ async def test_auth_update_signer_rotate_region_403_account_bad_writes_verify(
     result = await service.run_now("auth_update", settings=_settings())
 
     assert canary.calls == 1
-    assert resolver.events == [
-        ("acc_signer", "exit-1", "verify_account", "account_bad")
-    ]
+    assert resolver.events == [("acc_signer", "exit-1", "other_403", "account_bad")]
     stored = store.get_account("acc_signer")
     assert stored is not None
-    assert stored.verify_required is True
+    assert stored.verify_required is False
     assert stored.expired is False
     assert result["deferred"] is True
 
@@ -1965,10 +1975,10 @@ async def test_auth_update_reports_actual_raw_transport_when_signer_dies(
 
 
 @pytest.mark.asyncio
-async def test_auth_update_reports_signer_transport_and_keeps_verify_verdict(
+async def test_auth_update_reports_signer_transport_and_region_suspect(
     tmp_path, monkeypatch
 ):
-    """The real signer rotation still proves the exit: account_bad writes verify."""
+    """The real signer rotation proves the exit but only yields region_suspect."""
     store = AccountStore(tmp_path)
     _account(store, "acc_signer", "signer@example.com")
     account_service = AccountService(store)
@@ -1990,12 +2000,10 @@ async def test_auth_update_reports_signer_transport_and_keeps_verify_verdict(
 
     assert transports == ["signer"]
     assert canary.calls == 1
-    assert resolver.events == [
-        ("acc_signer", "exit-1", "verify_account", "account_bad")
-    ]
+    assert resolver.events == [("acc_signer", "exit-1", "other_403", "account_bad")]
     stored = store.get_account("acc_signer")
     assert stored is not None
-    assert stored.verify_required is True
+    assert stored.verify_required is False
     assert stored.expired is False
     assert result["deferred"] is True
 
@@ -2031,7 +2039,7 @@ async def test_auth_update_bare_path_without_session_reports_raw(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_metadata_account_bad_updates_registry_and_rotator(tmp_path):
+async def test_metadata_region_suspect_does_not_write_verify(tmp_path):
     store = AccountStore(tmp_path)
     account = _account(store, "acc_bad", "bad@example.com")
     rotator = RecordingRotator()
@@ -2047,9 +2055,31 @@ async def test_metadata_account_bad_updates_registry_and_rotator(tmp_path):
 
     stored = store.get_account(account.id)
     assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
+    assert rotator.verify_recorded == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_verify_account_updates_registry_and_rotator(tmp_path):
+    store = AccountStore(tmp_path)
+    account = _account(store, "acc_verify", "verify@example.com")
+    rotator = RecordingRotator()
+    refresher = VerifyOutcomeRefresher()
+    service = _service(
+        store,
+        refresher=refresher,
+        rotator=rotator,
+        clock=FakeClock(4_000.0),
+    )
+
+    await service.run_now("metadata_refresh", settings=_settings())
+
+    stored = store.get_account(account.id)
+    assert stored is not None
     assert stored.verify_required is True
     assert stored.expired is False
-    assert rotator.verify_recorded == ["acc_bad"]
+    assert rotator.verify_recorded == ["acc_verify"]
 
 
 class RegionDeferRefresher(FakeRefresher):

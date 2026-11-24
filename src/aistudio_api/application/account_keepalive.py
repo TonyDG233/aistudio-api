@@ -16,7 +16,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from aistudio_api.domain.errors import is_region_restricted_message
+from aistudio_api.domain.errors import (
+    is_account_verification_required_message,
+    is_region_restricted_message,
+)
 from aistudio_api.infrastructure.account.account_info_refresher import (
     REGION_DEFER_RETRY_SECONDS,
     RefreshInProgressError,
@@ -400,7 +403,6 @@ class AccountKeepaliveService:
             outcome = await arbiter.adjudicate(
                 account_id=account_id,
                 kind=kind,
-                account_bad_event_kind="verify_account",
                 probe_exit_id=self._probe_exit_id(
                     account_id, arbiter, kind, raw_transport=raw_transport
                 ),
@@ -415,8 +417,15 @@ class AccountKeepaliveService:
                 type(exc).__name__,
             )
             return "inconclusive"
-        if outcome == "account_bad":
-            self._persist_account_bad(account_id)
+        if outcome in ("region_suspect", "account_bad"):
+            # A working canary on the same exit only makes the account
+            # *suspect*: never write verify_required from a canary verdict.
+            log.warning(
+                "[Keepalive] region 403 判定出口可用、账号可疑（region_suspect）；"
+                "不写 verify_required account=%s source=%s",
+                account_id,
+                source,
+            )
         log.info(
             "[Keepalive] region 403 canary 仲裁 account=%s source=%s outcome=%s",
             account_id,
@@ -426,11 +435,12 @@ class AccountKeepaliveService:
         return str(outcome)
 
     def _persist_account_bad(self, account_id: str) -> None:
-        """Registry is authoritative: set verify_required, keep ``expired`` as-is.
+        """Registry is authoritative: set verify_required for a genuine verify lock.
 
-        ``expired`` is a separate, stronger signal: a real credential expiry must
-        never be cleared by a verify-account verdict (Q1), so only
-        ``verify_required`` is written here.
+        Only called for an explicit upstream verify-account message, never for a
+        region-403 canary verdict. ``expired`` is a separate, stronger signal: a
+        real credential expiry must never be cleared by a verify verdict (Q1),
+        so only ``verify_required`` is written here.
         """
         try:
             self._store.update_account_refresh(account_id, verify_required=True)
@@ -444,13 +454,47 @@ class AccountKeepaliveService:
         recorder = getattr(rotator, "record_verify_required", None)
         if callable(recorder):
             try:
-                recorder(account_id, reason="region_403_account_bad")
+                recorder(account_id, reason="verify_account_upstream")
             except Exception as exc:
                 log.warning(
                     "[Keepalive] 更新 rotator verify 统计失败 account=%s: %s",
                     account_id,
                     exc,
                 )
+
+    @staticmethod
+    def _rotation_is_verify_account(result: Mapping[str, object]) -> bool:
+        """True only when the rotate response body explicitly says verify-account."""
+        if bool(result.get("deferred")) or bool(result.get("ok")):
+            return False
+        text = str(result.get("body") or result.get("error") or "")
+        return is_account_verification_required_message(text)
+
+    def _report_verify_account_event(self, account_id: str) -> None:
+        """Report one explicit verify-account observation (best effort)."""
+        arbiter = self._region_arbiter_handle()
+        resolver = getattr(arbiter, "resolver", None)
+        if resolver is None:
+            return
+        report = getattr(resolver, "report_event_nowait", None)
+        if not callable(report):
+            return
+        kind = self._arbitration_kind(account_id, arbiter)
+        exit_id = self._probe_exit_id(account_id, arbiter, kind) or ""
+        if not exit_id:
+            return
+        try:
+            report(
+                account_id=account_id,
+                exit_id=exit_id,
+                event_kind="verify_account",
+                canary="inconclusive",
+            )
+        except Exception as exc:
+            log.debug(
+                "[Keepalive] verify-account 事件上报失败，已忽略: %s",
+                type(exc).__name__,
+            )
 
     @staticmethod
     def _rotation_is_region_403(result: Mapping[str, object]) -> bool:
@@ -793,7 +837,8 @@ class AccountKeepaliveService:
         }
         for result in results:
             deferred = _is_deferred_result(result)
-            if getattr(result, "region_outcome", None) == "account_bad":
+            if getattr(result, "region_outcome", None) == "verify_account":
+                # Explicit upstream verify-account: lock the account.
                 self._persist_account_bad(str(result.account_id))
             self._store.mark_refresh_attempt(
                 str(result.account_id),
@@ -1245,6 +1290,13 @@ class AccountKeepaliveService:
                         rot_res.get("retry_after_s"), 0.0
                     )
                     account_no_capacity = True
+                elif self._rotation_is_verify_account(rot_res):
+                    # Explicit upstream verify-account body: this is the only
+                    # rotation/region path allowed to lock the account.
+                    _ensure_acc(account.id)
+                    self._persist_account_bad(account.id)
+                    self._report_verify_account_event(account.id)
+                    rotate_results.setdefault(account.id, []).append(False)
                 elif self._rotation_is_region_403(rot_res):
                     outcome = await self._arbitrate_region_once(
                         account.id,

@@ -29,6 +29,7 @@ import httpx
 from aistudio_api.config import settings
 from aistudio_api.domain.errors import (
     ExitBudgetWaitError,
+    is_account_verification_required_message,
     is_region_restricted_message,
 )
 from aistudio_api.infrastructure.account.benefit_tier import (
@@ -208,8 +209,9 @@ class RefreshResult:
     # never a completed refresh, a skip or an account failure/cooldown.
     deferred: bool = False
     retry_after_s: float = 0.0
-    # Canary verdict for a maintenance region 403 (exit_bad/account_bad/
-    # inconclusive); keepalive applies the account-level verify lock.
+    # Region classification for a maintenance 403 (exit_bad/region_suspect/
+    # inconclusive) or ``verify_account`` for an explicit upstream verify body.
+    # Only ``verify_account`` may lock the account; a canary verdict never does.
     region_outcome: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -833,6 +835,10 @@ class AccountInfoRefresher:
         in the same maintenance round.  ``probe_exit_id`` binds the canary to
         the exit the failing probe actually used; a different binding stays
         inconclusive so a false verify-account verdict can never be written.
+
+        A canary verdict is only a region/account **suspicion**: it never
+        writes ``verify_required``.  Only an explicit upstream verify-account
+        message (see ``_verify_required_response``) may lock the account.
         """
         if not account_id or account_id in once:
             return None
@@ -847,7 +853,6 @@ class AccountInfoRefresher:
             outcome = await cast("Any", arbiter).adjudicate(
                 account_id=account_id,
                 kind=self._arbitration_kind(account_id),
-                account_bad_event_kind="verify_account",
                 probe_exit_id=probe_exit_id,
             )
         except asyncio.CancelledError:
@@ -859,24 +864,103 @@ class AccountInfoRefresher:
                 type(exc).__name__,
             )
             return "inconclusive"
-        if outcome == "account_bad":
-            # Registry is authoritative; keepalive also refreshes rotator stats.
-            # ``expired`` is a separate, stronger signal and is left untouched
-            # so a real expiry is never cleared by a verify verdict (Q1).
-            try:
-                self._store.update_account_refresh(account_id, verify_required=True)
-            except Exception as exc:
-                logger.warning(
-                    "[Refresh] 持久化 verify_required 失败 account=%s: %s",
-                    account_id,
-                    exc,
-                )
+        if outcome in ("region_suspect", "account_bad"):
+            logger.warning(
+                "[Refresh] region 403 判定出口可用、账号可疑（region_suspect）；"
+                "不写 verify_required，仅短周期 defer account=%s",
+                account_id,
+            )
         logger.info(
             "[Refresh] region 403 canary 仲裁 account=%s outcome=%s",
             account_id,
             outcome,
         )
         return str(outcome)
+
+    def _verify_required_response(
+        self,
+        account_id: str,
+        response: TransportResponse,
+        *,
+        decision: ExitDecision | None,
+        session: object | None,
+        raw_transport: bool,
+        checked_at: str | None,
+    ) -> RefreshResult | None:
+        """Lock the account only for an explicit upstream verify-account body."""
+        if response.status != 403 or not is_account_verification_required_message(
+            response.body
+        ):
+            return None
+        try:
+            self._store.update_account_refresh(account_id, verify_required=True)
+        except Exception as exc:
+            logger.warning(
+                "[Refresh] 持久化 verify_required 失败 account=%s: %s",
+                account_id,
+                exc,
+            )
+        self._report_verify_account_event(
+            account_id,
+            self._probe_exit_id(
+                account_id, decision, session, raw_transport=raw_transport
+            ),
+        )
+        logger.error(
+            "[Refresh] %s 上游明确要求 verify-account，写入 verify_required",
+            account_id,
+        )
+        return RefreshResult(
+            account_id=account_id,
+            ok=False,
+            error="HTTP 403 verify-account required",
+            checked_at=checked_at,
+            region_outcome="verify_account",
+        )
+
+    def _report_verify_account_event(
+        self, account_id: str, probe_exit_id: str | None
+    ) -> None:
+        """Report one genuine upstream verify-account observation (best effort)."""
+        resolver = self._active_exit_resolver()
+        if resolver is None:
+            return
+        report = getattr(resolver, "report_event_nowait", None)
+        if not callable(report):
+            return
+        exit_id = probe_exit_id or ""
+        if not exit_id:
+            # An explicit verify body is account-level: report it against the
+            # current binding even when the probe transport could not prove it.
+            assignment_for = getattr(resolver, "assignment_for", None)
+            if callable(assignment_for):
+                try:
+                    assignment = assignment_for(
+                        account_id,
+                        kind=self._arbitration_kind(account_id),
+                        include_expired=True,
+                    )
+                except TypeError:
+                    assignment = assignment_for(
+                        account_id, kind=self._arbitration_kind(account_id)
+                    )
+                except Exception:
+                    assignment = None
+                exit_id = str(getattr(assignment, "exit_id", "") or "")
+        if not exit_id:
+            return
+        try:
+            report(
+                account_id=account_id,
+                exit_id=exit_id,
+                event_kind="verify_account",
+                canary="inconclusive",
+            )
+        except Exception as exc:
+            logger.debug(
+                "[Refresh] verify-account 事件上报失败，已忽略: %s",
+                type(exc).__name__,
+            )
 
     def _region_deferral(
         self,
@@ -1125,6 +1209,19 @@ class AccountInfoRefresher:
                     "skip", reason="probe_unavailable", external=True
                 )
             return self._skipped_result(account, decision, checked_at)
+        if response.status == 403 and is_account_verification_required_message(
+            response.body
+        ):
+            verify_result = self._verify_required_response(
+                account.id,
+                response,
+                decision=decision,
+                session=session,
+                raw_transport=not probe.signer_transport,
+                checked_at=checked_at,
+            )
+            if verify_result is not None:
+                return verify_result
         if response.status == 403 and is_region_restricted_message(response.body):
             outcome = await self._arbitrate_region_403(
                 account.id,
@@ -1455,6 +1552,25 @@ class AccountInfoRefresher:
                 "checked_at": None,
                 "skipped": True,
             }
+        if response.status == 403 and is_account_verification_required_message(
+            response.body
+        ):
+            verify_result = self._verify_required_response(
+                account.id,
+                response,
+                decision=decision,
+                session=session,
+                raw_transport=not probe.signer_transport,
+                checked_at=checked_at,
+            )
+            if verify_result is not None:
+                return {
+                    "tier": None,
+                    "expired": None,
+                    "error": verify_result.error,
+                    "checked_at": verify_result.checked_at,
+                    "region_outcome": verify_result.region_outcome,
+                }
         if response.status == 403 and is_region_restricted_message(response.body):
             outcome = await self._arbitrate_region_403(
                 account.id,

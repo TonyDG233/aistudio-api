@@ -1290,10 +1290,12 @@ class RoutingPipeline:
             )
             self._record_error("error", context, attempt, exc=exc)
             return await self._rebuild_for_new_exit(context, attempt, exc)
-        if outcome == "account_bad":
+        if outcome in ("account_bad", "region_suspect"):
             logger.warning(
-                "[routing] region 403 canary 判定 account_bad（出口可用）：不换出口，"
-                "按现有 403 逻辑切号 model=%s instance=%s account=%s",
+                "[routing] region 403 canary 判定 %s（出口可用，账号可疑）："
+                "不写 verify、不换出口，按现有 403 逻辑切号 model=%s instance=%s "
+                "account=%s",
+                outcome,
                 context.route.model,
                 attempt.instance_id,
                 attempt.account_id,

@@ -530,13 +530,13 @@ class BrowserlessEngineRuntime:
     ) -> ExitDecision:
         """Resolve one account's exit, or fail closed (never the global proxy).
 
-        Returns the lease decision whose ``proxy`` is the bound socks URL (or
-        ``None`` only for an explicit emergency direct fallback).  Raises
-        :class:`ExitBudgetWaitError` (HTTP 429 ``no_capacity`` + Retry-After)
-        when the manager has no call budget, and :class:`RoutingError` (HTTP
-        503) when no exit is available and ``AISTUDIO_EXIT_DIRECT_FALLBACK`` is
-        off, so a credential-bearing generation request never leaks onto WARP
-        and never masks a 429 as 503.
+        Returns the lease decision whose ``proxy`` is the bound socks URL.
+        Raises :class:`ExitBudgetWaitError` (HTTP 429 ``no_capacity`` +
+        Retry-After) when the manager has no call budget, and
+        :class:`RoutingError` (HTTP 503) when no exit is available **or when the
+        only decision is the emergency direct valve** (generation never leaves
+        from the host egress), so a credential-bearing generation request never
+        leaks onto WARP/direct and never masks a 429 as 503.
         """
         kind = surface if surface in ("chat", "build") else "chat"
         decision = await resolve_credential_exit(
@@ -556,6 +556,23 @@ class BrowserlessEngineRuntime:
             raise RoutingError(
                 "账号出口不可用，已拒绝本次生成请求（fail-closed）；"
                 "请检查出口池管理器或稍后重试。",
+                code="exit_unavailable",
+                surface=kind,
+            )
+        if decision.action == "direct_fallback":
+            # Generation must never leave from the host egress, even when the
+            # operator opened the emergency valve for maintenance probes.  The
+            # valve is intentionally not consulted here: this is a code-level
+            # invariant, not an environment switch.
+            log.warning(
+                "[engine] 生成请求拒绝直连应急阀（class=generation fail-closed）"
+                "account=%s surface=%s",
+                account_id or "-",
+                kind,
+            )
+            raise RoutingError(
+                "生成请求禁止使用直连应急出口（fail-closed）；"
+                "请等待出口池恢复或检查管理器。",
                 code="exit_unavailable",
                 surface=kind,
             )

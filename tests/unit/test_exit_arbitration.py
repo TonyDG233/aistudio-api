@@ -302,22 +302,18 @@ async def test_exit_bad_reports_invalidates_and_rebuilds_slot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_account_bad_event_kind_override_reports_verify_account() -> None:
-    probe = _FakeProbe("account_bad")
+async def test_region_suspect_reports_region_suspect_not_verify_account() -> None:
+    probe = _FakeProbe("region_suspect")
     arbitration, resolver = _arbitration(probe)
 
-    outcome = await arbitration.adjudicate(
-        account_id="acc-1",
-        kind="chat",
-        account_bad_event_kind="verify_account",
-    )
+    outcome = await arbitration.adjudicate(account_id="acc-1", kind="chat")
 
-    assert outcome == "account_bad"
+    assert outcome == "region_suspect"
     assert resolver.events == [
         {
             "account": "acc-1",
             "exit_id": "exit-1",
-            "kind": "verify_account",
+            "kind": "other_403",
             "canary": "account_bad",
         }
     ]
@@ -333,7 +329,6 @@ async def test_probe_exit_mismatch_stays_inconclusive() -> None:
     outcome = await arbitration.adjudicate(
         account_id="acc-1",
         kind="chat",
-        account_bad_event_kind="verify_account",
         probe_exit_id="exit-other",
     )
 
@@ -352,7 +347,6 @@ async def test_probe_exit_empty_string_stays_inconclusive() -> None:
     outcome = await arbitration.adjudicate(
         account_id="acc-1",
         kind="chat",
-        account_bad_event_kind="verify_account",
         probe_exit_id="",
     )
 
@@ -389,7 +383,6 @@ async def test_probe_exit_empty_string_short_circuits_before_canary() -> None:
     outcome = await arbitration.adjudicate(
         account_id="acc-1",
         kind="chat",
-        account_bad_event_kind="verify_account",
         probe_exit_id="",
     )
 
@@ -398,24 +391,23 @@ async def test_probe_exit_empty_string_short_circuits_before_canary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_exit_match_allows_account_bad() -> None:
-    probe = _FakeProbe("account_bad")
+async def test_probe_exit_match_allows_region_suspicion() -> None:
+    probe = _FakeProbe("region_suspect")
     arbitration, resolver = _arbitration(probe)
 
     outcome = await arbitration.adjudicate(
         account_id="acc-1",
         kind="chat",
-        account_bad_event_kind="verify_account",
         probe_exit_id="exit-1",
     )
 
-    assert outcome == "account_bad"
+    assert outcome == "region_suspect"
     assert probe.calls == [("socks5h://172.17.0.1:40001", "exit-1")]
     assert resolver.events == [
         {
             "account": "acc-1",
             "exit_id": "exit-1",
-            "kind": "verify_account",
+            "kind": "other_403",
             "canary": "account_bad",
         }
     ]
@@ -452,7 +444,7 @@ def test_default_arbitration_registered_when_built_without_resolver(
 
 @pytest.mark.asyncio
 async def test_account_bad_keeps_exit_and_uses_existing_switch_logic() -> None:
-    probe = _FakeProbe("account_bad")
+    probe = _FakeProbe("region_suspect")
     arbitration, resolver = _arbitration(probe)
     manager = _RestartManager([make_instance("inst-1", account_id="acc-1")])
     pipeline = _pipeline(manager, arbitration)
@@ -467,7 +459,16 @@ async def test_account_bad_keeps_exit_and_uses_existing_switch_logic() -> None:
     assert outcome == "retry_same"
     assert manager.restart_calls == []
     assert resolver.invalidated == []
-    assert resolver.events[0]["canary"] == "account_bad"
+    assert resolver.events == [
+        {
+            "account": "acc-1",
+            "exit_id": "exit-1",
+            "kind": "other_403",
+            "canary": "account_bad",
+        }
+    ]
+    # A region-class canary verdict must never become a verify_account event.
+    assert all(event["kind"] != "verify_account" for event in resolver.events)
 
 
 @pytest.mark.asyncio
@@ -836,7 +837,7 @@ class _FakeStore:
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [
-        (200, b"[[]]", "account_bad"),
+        (200, b"[[]]", "region_suspect"),
         (403, b'[7,"Region not supported."]', "exit_bad"),
         (403, b'[7,"permission denied"]', "inconclusive"),
         (500, b"boom", "inconclusive"),
@@ -931,7 +932,7 @@ async def test_signer_canary_probe_accepts_path_and_str_store(
         socks_url="socks5h://172.17.0.1:40001", exit_id="exit-1"
     )
 
-    assert verdict.outcome == "account_bad"
+    assert verdict.outcome == "region_suspect"
     assert len(runtime.calls) == 1
     assert session.requests == [("[]", LIST_MODELS_URL)]
 
@@ -957,7 +958,7 @@ async def test_signer_canary_probe_uses_account_auth_user(
 
     assert await probe.probe(
         socks_url="socks5h://172.17.0.1:40001", exit_id="exit-1"
-    ) == CanaryVerdict("account_bad", "list_models_ok")
+    ) == CanaryVerdict("region_suspect", "list_models_ok")
     assert runtime.calls[0]["auth_user"] == "1"
 
 
@@ -977,7 +978,7 @@ async def test_signer_canary_probe_uses_account_auth_user(
         (500, b"boom", "status_500"),
     ],
 )
-async def test_signer_canary_pollution_latch_stops_further_probes(
+async def test_signer_canary_contamination_is_per_exit_with_ttl(
     tmp_path: object,
     caplog: pytest.LogCaptureFixture,
     status: int,
@@ -991,30 +992,53 @@ async def test_signer_canary_pollution_latch_stops_further_probes(
     base = cast(Path, tmp_path)
     real_auth = base / "auth.json"
     real_auth.write_bytes(b'{"cookies":[{"name":"SAPISID","value":"secret"}]}')
-    runtime = _FakeCanaryRuntime(_FakeCanarySession(status, body))
+    now = [1000.0]
+    session = _FakeCanarySession(status, body)
+    runtime = _FakeCanaryRuntime(session)
     probe = SignerCanaryProbe(
         runtime_getter=lambda: runtime,
         account_store=_FakeStore(real_auth),
         canary_account="canary-acc",
         timeout_s=1.0,
+        clock=lambda: now[0],
+        contamination_ttl_s=600.0,
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         first = await probe.probe(
             socks_url="socks5h://172.17.0.1:40001", exit_id="exit-1"
         )
-        second = await probe.probe(
-            socks_url="socks5h://172.17.0.1:40001", exit_id="exit-2"
+        # Same exit inside the TTL: suppressed before building a session.
+        same_exit = await probe.probe(
+            socks_url="socks5h://172.17.0.1:40001", exit_id="exit-1"
+        )
+        # A different exit is not affected by exit-1's contamination.
+        other_exit = await probe.probe(
+            socks_url="socks5h://172.17.0.1:40002", exit_id="exit-2"
         )
 
+        # TTL expiry recovers probing inside the same process.
+        calls_before_recovery = len(runtime.calls)
+        now[0] += 601.0
+        session.status = 200
+        session.body = b"[[]]"
+        recovered = await probe.probe(
+            socks_url="socks5h://172.17.0.1:40001", exit_id="exit-1"
+        )
+
+    assert calls_before_recovery == 2
     assert first.outcome == "inconclusive"
     assert first.detail == f"canary-contaminated:{reason}"
-    assert second.outcome == "inconclusive"
-    assert second.detail == f"canary-contaminated:{reason}"
-    # The contaminated latch must stop before building another session.
-    assert len(runtime.calls) == 1
+    assert same_exit.outcome == "inconclusive"
+    assert same_exit.detail == f"canary-contaminated:{reason}"
+    assert other_exit.outcome == "inconclusive"
+    assert other_exit.detail == f"canary-contaminated:{reason}"
+
+    assert recovered.outcome == "region_suspect"
+    assert len(runtime.calls) == 3
     messages = [record.getMessage() for record in caplog.records]
     assert any("canary-acc" in message and reason in message for message in messages)
+    assert any("污染已过期，恢复探测" in message for message in messages)
     assert all("secret" not in message for message in messages)
 
 

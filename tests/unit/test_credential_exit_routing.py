@@ -1388,45 +1388,50 @@ def test_external_no_exit_rejects_session_without_global_proxy(
     assert signer.method_calls == []
 
 
-def test_external_direct_fallback_session_is_proxy_free(
+def test_external_direct_fallback_rejected_for_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """class=generation must fail closed even when the emergency valve is on."""
     monkeypatch.setattr(settings, "proxy_url", SENTINEL_GLOBAL)
     monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
-    runtime = _browserless_runtime(FakeExitResolver(fail=True))
+    signer = MagicMock()
+    runtime = _browserless_runtime(FakeExitResolver(fail=True), signer=signer)
 
-    build = asyncio.run(
-        runtime.create_session(
-            slot_id="s1",
-            auth_file=None,
-            auth_user="0",
-            tier="Pro",
-            account_id="acc1",
-            realm_id="r1",
-            surface="chat",
+    with pytest.raises(RoutingError) as excinfo:
+        asyncio.run(
+            runtime.create_session(
+                slot_id="s1",
+                auth_file=None,
+                auth_user="0",
+                tier="Pro",
+                account_id="acc1",
+                realm_id="r1",
+                surface="chat",
+            )
+        )
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "exit_unavailable"
+    # Zero upstream calls and no proxy-free session was ever built.
+    assert signer.method_calls == []
+
+
+def test_direct_fallback_still_allowed_for_maintenance_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emergency valve stays available for maintenance/probe callers."""
+    monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
+
+    decision = asyncio.run(
+        resolve_credential_exit(
+            "acc1",
+            category="maintenance",
+            resolver=FakeExitResolver(fail=True),
         )
     )
-    session = cast(BrowserlessSession, build.session)
-    assert session._proxy is None
-    assert session._external_exits is True
 
-    captured: list[str | None] = []
-
-    class _FakeClient:
-        def __init__(self, **kwargs: object) -> None:
-            captured.append(cast("str | None", kwargs.get("proxy")))
-
-        async def aclose(self) -> bool:
-            return True
-
-    monkeypatch.setattr(
-        "aistudio_api.infrastructure.waa.browserless_session.httpx.AsyncClient",
-        _FakeClient,
-    )
-    asyncio.run(session._get_direct_http())
-
-    assert captured == [None]
-    assert SENTINEL_GLOBAL not in captured
+    assert decision.action == "direct_fallback"
+    assert decision.proxy is None
 
 
 def test_off_mode_session_uses_global_proxy(
@@ -2379,10 +2384,10 @@ def test_cold_start_session_reuses_creation_lease_for_first_request() -> None:
     asyncio.run(_run())
 
 
-def test_direct_fallback_cold_start_does_not_grant_generation_credit(
+def test_direct_fallback_cold_start_is_rejected_for_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Q-11: only a successful create-time lease may be reused by request #1."""
+    """Even the create-time lease may not fall back to direct for generation."""
     monkeypatch.setenv("AISTUDIO_EXIT_DIRECT_FALLBACK", "1")
     resolver = _SequencedLeaseResolver(
         [LeaseResult("error", reason="manager_unreachable")]
@@ -2390,23 +2395,20 @@ def test_direct_fallback_cold_start_does_not_grant_generation_credit(
     runtime = _browserless_runtime(resolver)
 
     async def _run() -> None:
-        build = await runtime.create_session(
-            slot_id="slot-df",
-            auth_file=None,
-            auth_user="0",
-            tier="Free",
-            account_id="acc_direct",
-            realm_id="realm-df",
-            surface="chat",
-        )
+        with pytest.raises(RoutingError) as excinfo:
+            await runtime.create_session(
+                slot_id="slot-df",
+                auth_file=None,
+                auth_user="0",
+                tier="Free",
+                account_id="acc_direct",
+                realm_id="realm-df",
+                surface="chat",
+            )
+        assert excinfo.value.status_code == 503
         generation = [call for call in resolver.calls if call[2] == "generation"]
-        # The create-time decision fell back to direct (failed lease): the
-        # wrapper must not hand its first request a free generation credit.
+        # Exactly the refused create-time probe: no session credit was granted.
         assert len(generation) == 1
-        async with build.session.request_scope():
-            pass
-        generation = [call for call in resolver.calls if call[2] == "generation"]
-        assert len(generation) == 2
 
     asyncio.run(_run())
 
@@ -3008,10 +3010,9 @@ class _RecordingArbiter:
         *,
         account_id: str,
         kind: str,
-        account_bad_event_kind: str = "region_403",
         probe_exit_id: str | None = None,
     ) -> str:
-        del kind, account_bad_event_kind, probe_exit_id
+        del kind, probe_exit_id
         self.calls.append(account_id)
         return self.outcome
 
@@ -3048,10 +3049,10 @@ def _region_refresher(
     [
         ("exit_bad", ("acc1", "exit-1", "region_403", "exit_bad"), ["exit-1"], False),
         (
-            "account_bad",
-            ("acc1", "exit-1", "verify_account", "account_bad"),
+            "region_suspect",
+            ("acc1", "exit-1", "other_403", "account_bad"),
             [],
-            True,
+            False,
         ),
         (
             "inconclusive",
@@ -3277,12 +3278,12 @@ def test_pooled_session_probe_exit_mismatch_never_writes_verify(tmp_path: Any) -
     assert stored.verify_required is False
 
 
-def test_pooled_session_probe_exit_match_writes_verify(tmp_path: Any) -> None:
-    """A live session proven on the bound exit may be blamed for account_bad."""
+def test_pooled_session_probe_exit_match_reports_region_suspect(tmp_path: Any) -> None:
+    """A proven exit still must not turn a region 403 into verify_required."""
     reset_skip_log_throttle()
     store, accounts = _make_store(tmp_path)
     resolver = _ArbitrationResolver()
-    canary = _FixedCanary("account_bad")
+    canary = _FixedCanary("region_suspect")
     session = _BoundSignerSession()
     refresher = AccountInfoRefresher(
         store,
@@ -3302,13 +3303,13 @@ def test_pooled_session_probe_exit_match_writes_verify(tmp_path: Any) -> None:
     result = asyncio.run(refresher.refresh_account(accounts[0]))
 
     assert result.deferred is True
-    assert result.region_outcome == "account_bad"
-    # The session's bound exit equals the binding, so the canary may blame the
-    # account: the event is reported and verify_required is written.
-    assert resolver.events == [("acc1", "exit-1", "verify_account", "account_bad")]
+    assert result.region_outcome == "region_suspect"
+    # The exit is proven, but that only makes the account suspect: no verify
+    # lock and no verify_account event (which would burn the exit).
+    assert resolver.events == [("acc1", "exit-1", "other_403", "account_bad")]
     stored = store.get_account("acc1")
     assert stored is not None
-    assert stored.verify_required is True
+    assert stored.verify_required is False
 
 
 class _BuildOnlyArbitrationResolver(_ArbitrationResolver):
@@ -3331,10 +3332,9 @@ class _KindRecordingArbiter:
         *,
         account_id: str,
         kind: str,
-        account_bad_event_kind: str = "region_403",
         probe_exit_id: str | None = None,
     ) -> str:
-        del account_id, account_bad_event_kind, probe_exit_id
+        del account_id, probe_exit_id
         self.kinds.append(kind)
         return self.outcome
 
@@ -3360,24 +3360,44 @@ def test_region_arbitration_uses_bound_build_surface_kind(tmp_path: Any) -> None
     assert arbiter.kinds == ["build"]
 
 
-def test_account_bad_keeps_an_existing_expiry(tmp_path: Any) -> None:
+VERIFY_ACCOUNT_BODY = (
+    '{"error":{"message":"Account must be verified before it can continue '
+    'using the Gemini API. Visit aistudio.google.com/verify-account"}}'
+)
+
+
+class _BoundVerifySession(_BoundSignerSession):
+    """Browserless session returned by upstream with an explicit verify body."""
+
+    async def send_hooked_request(self, **kwargs: object) -> tuple[int, bytes]:
+        del kwargs
+        return 403, VERIFY_ACCOUNT_BODY.encode("utf-8")
+
+
+def test_explicit_verify_body_writes_verify_and_keeps_expiry(tmp_path: Any) -> None:
+    """Only an explicit upstream verify-account body may lock the account."""
     reset_skip_log_throttle()
     store, accounts = _make_store(tmp_path)
     store.update_account_refresh("acc1", expired=True)
-    refresher, resolver = _region_refresher(
+    resolver = _ArbitrationResolver()
+    refresher = AccountInfoRefresher(
         store,
-        _ArbitrationResolver(),
-        _FixedCanary("account_bad"),
-        session=_BoundSignerSession(),
+        transport=_RegionTransport(),
+        exit_resolver=cast(Any, resolver),
+        slot_provider=lambda: (
+            SimpleNamespace(account_id=accounts[0].id, session=_BoundVerifySession()),
+        ),
+        pacing_seconds=0.0,
     )
 
     result = asyncio.run(refresher.refresh_account(accounts[0]))
 
-    assert result.deferred is True
-    assert resolver.events == [("acc1", "exit-1", "verify_account", "account_bad")]
+    assert result.region_outcome == "verify_account"
+    assert result.deferred is False
+    assert resolver.events == [("acc1", "exit-1", "verify_account", "inconclusive")]
     stored = store.get_account("acc1")
     assert stored is not None
     # Q1: verify_required is written independently; the stronger real expiry is
-    # never cleared by an account_bad verdict.
+    # never cleared by a verify verdict.
     assert stored.verify_required is True
     assert stored.expired is True
