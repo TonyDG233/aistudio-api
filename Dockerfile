@@ -154,6 +154,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libxcb-dri3-0 \
     tzdata \
     locales \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # The waa-signer binary embeds Go's time/tzdata and resolves its locale from

@@ -37,4 +37,33 @@ if [ ! -f "$CONFIG_FILE" ]; then
     echo "=============================================================="
 fi
 
+# verify-account can run a headed Chromium (AISTUDIO_VERIFY_HEADED=1). A
+# container has no X display, so bring up a virtual framebuffer first. A
+# failure here must never block the server: the verify flow then stays
+# headless and only logs a warning.
+case "${AISTUDIO_VERIFY_HEADED:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        if command -v Xvfb >/dev/null 2>&1; then
+            VERIFY_DISPLAY="${AISTUDIO_VERIFY_DISPLAY:-:99}"
+            Xvfb "$VERIFY_DISPLAY" -screen 0 1280x900x24 -nolisten tcp \
+                >/tmp/xvfb.log 2>&1 &
+            XVFB_PID=$!
+            XVFB_SOCKET="/tmp/.X11-unix/X${VERIFY_DISPLAY#:}"
+            attempt=0
+            while [ "$attempt" -lt 25 ] && [ ! -S "$XVFB_SOCKET" ]; do
+                attempt=$((attempt + 1))
+                sleep 0.2
+            done
+            if [ -S "$XVFB_SOCKET" ]; then
+                export DISPLAY="$VERIFY_DISPLAY"
+                echo "[entrypoint] verify headed mode: Xvfb $DISPLAY (pid $XVFB_PID)"
+            else
+                echo "[entrypoint] WARNING: Xvfb did not start; verify stays headless" >&2
+            fi
+        else
+            echo "[entrypoint] WARNING: AISTUDIO_VERIFY_HEADED set but Xvfb is missing; verify stays headless" >&2
+        fi
+        ;;
+esac
+
 exec "$@"
