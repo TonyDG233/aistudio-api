@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     import httpx
@@ -19,6 +20,31 @@ if TYPE_CHECKING:
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("account")
+
+CookieRotationTransport = Literal["signer", "raw"]
+
+
+@dataclass(frozen=True, slots=True)
+class CookieRotationResult(Mapping[str, object]):
+    """RotateCookies outcome plus the transport the call actually used.
+
+    ``transport`` is decided exactly once, inside ``rotate_account_cookies``, so
+    callers never have to re-derive the signer gate (which could flip if the
+    session dies in between).  The mapping interface keeps the legacy payload
+    (``ok``/``status``/``updated``/``skipped``/...) intact for every consumer.
+    """
+
+    transport: CookieRotationTransport
+    payload: dict[str, object]
+
+    def __getitem__(self, key: str) -> object:
+        return self.payload[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.payload)
+
+    def __len__(self) -> int:
+        return len(self.payload)
 
 
 class AccountService:
@@ -151,7 +177,7 @@ class AccountService:
         session: object = None,
         *,
         client: httpx.AsyncClient | None = None,
-    ) -> dict[str, object]:
+    ) -> CookieRotationResult:
         """调用 Google RotateCookies 刷新指定账号的滚动 Cookie，并同步更新同源子账号与内存会话。"""
         from datetime import UTC, datetime
 
@@ -163,17 +189,27 @@ class AccountService:
 
         auth_path = self._store.get_auth_path(account_id)
         if not auth_path:
-            return {"ok": False, "status": 0, "updated": []}
+            return CookieRotationResult(
+                transport="raw", payload={"ok": False, "status": 0, "updated": []}
+            )
 
         cookies = load_cookies_from_auth_file(auth_path)
         if not cookies:
-            return {"ok": False, "status": 0, "updated": []}
+            return CookieRotationResult(
+                transport="raw", payload={"ok": False, "status": 0, "updated": []}
+            )
 
         result: dict[str, object]
         rotate_via_signer = getattr(session, "rotate_cookies_via_signer", None)
-        if self._session_can_rotate(session, account_id) and callable(
-            rotate_via_signer
-        ):
+        # Single gate: the transport is fixed here and never re-derived, so a
+        # session dying after this line cannot make a bare call report "signer".
+        transport: CookieRotationTransport = (
+            "signer"
+            if self._session_can_rotate(session, account_id)
+            and callable(rotate_via_signer)
+            else "raw"
+        )
+        if transport == "signer":
             try:
                 raw = await cast(
                     "Callable[[], Awaitable[dict[str, object]]]", rotate_via_signer
@@ -202,7 +238,9 @@ class AccountService:
             logger.warning(
                 "账号 %s RotateCookies 跳过：无可用出口（fail-closed）", account_id
             )
-            return {**result, "cookies": cookies}
+            return CookieRotationResult(
+                transport=transport, payload={**result, "cookies": cookies}
+            )
 
         if not result.get("ok") and result.get("skipped") != "missing_seed":
             # A missing rotation seed means no sibling merge can help (the
@@ -276,7 +314,9 @@ class AccountService:
                     updated_names,
                     len(updated_ids),
                 )
-        return {**result, "cookies": cookies}
+        return CookieRotationResult(
+            transport=transport, payload={**result, "cookies": cookies}
+        )
 
     def save_account_from_cookies(
         self,

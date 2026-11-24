@@ -15,7 +15,14 @@ from aistudio_api.application.account_keepalive import (
     AccountKeepaliveService,
     KeepaliveSettings,
 )
-from aistudio_api.application.account_service import AccountService
+from aistudio_api.application.account_service import (
+    AccountService,
+    CookieRotationResult,
+)
+from aistudio_api.application.exit_arbitration import (
+    CanaryVerdict,
+    ExitArbitration,
+)
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
     RefreshInProgressError,
@@ -25,7 +32,10 @@ from aistudio_api.infrastructure.account.account_store import (
     AccountMeta,
     AccountStore,
 )
-from aistudio_api.infrastructure.exit_pool.resolver import LeaseResult
+from aistudio_api.infrastructure.exit_pool.resolver import (
+    ExitAssignment,
+    LeaseResult,
+)
 
 
 def _settings(**overrides: object) -> KeepaliveSettings:
@@ -1629,9 +1639,11 @@ async def test_auth_update_rotate_region_403_triggers_canary_and_defers(
 
     async def fake_rotate(
         account_id: str, session: object = None, *, client: object = None
-    ) -> dict[str, object]:
+    ) -> CookieRotationResult:
         del account_id, session, client
-        return {"ok": False, "status": 403, "updated": []}
+        return CookieRotationResult(
+            transport="raw", payload={"ok": False, "status": 403, "updated": []}
+        )
 
     monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
     service = _service(
@@ -1651,6 +1663,371 @@ async def test_auth_update_rotate_region_403_triggers_canary_and_defers(
         stored = store.get_account(account_id)
         assert stored is not None
         assert stored.auth_saved_at is None
+
+
+SIGNER_EXIT_SOCKS = "socks5://127.0.0.1:40110"
+
+
+class ArbitrationResolver:
+    """Exit-manager double: one fixed binding plus the arbitration surface."""
+
+    def __init__(self, *, socks_url: str = SIGNER_EXIT_SOCKS) -> None:
+        self.assignment = ExitAssignment(
+            exit_id="exit-1", socks_url=socks_url, ttl_s=60
+        )
+        self.events: list[tuple[str, str, str, str]] = []
+        self.invalidated: list[str] = []
+
+    def assignment_for(
+        self, account_id: str, *, kind: str = "chat", include_expired: bool = False
+    ) -> ExitAssignment:
+        del account_id, kind, include_expired
+        return self.assignment
+
+    async def report_event(
+        self, *, account_id: str, exit_id: str, event_kind: str, canary: str
+    ) -> bool:
+        self.events.append((account_id, exit_id, event_kind, canary))
+        return True
+
+    def report_event_nowait(
+        self, *, account_id: str, exit_id: str, event_kind: str, canary: str
+    ) -> None:
+        self.events.append((account_id, exit_id, event_kind, canary))
+
+    def invalidate_exit(self, exit_id: str) -> None:
+        self.invalidated.append(exit_id)
+
+
+class CountingCanary:
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+        self.calls = 0
+
+    async def probe(self, *, socks_url: str, exit_id: str) -> CanaryVerdict:
+        del socks_url, exit_id
+        self.calls += 1
+        return CanaryVerdict(cast(Any, self.outcome))
+
+
+class ExternalRegionRefresher(FakeRefresher):
+    """External refresher double: only the exit-mode flag matters here."""
+
+    external_mode = True
+
+    def set_region_arbiter(self, arbiter: Any | None) -> None:
+        del arbiter
+
+
+class SignerRotateSession:
+    """Browserless session able to rotate cookies over the signer transport."""
+
+    engine = "browserless"
+    transport_state = "signer_rpc"
+    _bound_socks = SIGNER_EXIT_SOCKS
+    _cookie_dirty = False
+    _mint_updates = None
+    _rpc_set_cookies = None
+
+    def __init__(self, account_id: str) -> None:
+        self.account_id = account_id
+
+    async def save_current_cookies(self) -> bool:
+        return True
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def rotate_cookies_via_signer(self) -> dict[str, object]:
+        return {"ok": True, "status": 200, "updated": []}
+
+
+@pytest.mark.asyncio
+async def test_auth_update_bare_rotate_region_403_never_writes_verify(
+    tmp_path, monkeypatch
+):
+    """Q-2: a bare httpx RotateCookies 403 must stay inconclusive.
+
+    AccountService rotates cookies with a bare httpx client whenever no
+    browserless signer session can be used.  Such a call has no signer
+    fingerprint, so even a canary ``account_bad`` on the matching binding proves
+    nothing about the account: no event, no ``verify_required`` write, defer.
+    """
+    store = AccountStore(tmp_path)
+    _account(store, "acc_bare", "bare@example.com")
+    account_service = AccountService(store)
+    resolver = ArbitrationResolver()
+    canary = CountingCanary("account_bad")
+    arbiter = ExitArbitration(
+        resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+    )
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> CookieRotationResult:
+        del account_id, session, client
+        return CookieRotationResult(
+            transport="raw", payload={"ok": False, "status": 403, "updated": []}
+        )
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        refresher=ExternalRegionRefresher(),
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert result["deferred"] is True
+    assert result["deferred_accounts"] == ["acc_bare"]
+    assert result["retry_after_s"] == pytest.approx(300.0)
+    assert canary.calls == 0
+    assert resolver.events == []
+    stored = store.get_account("acc_bare")
+    assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
+
+
+@pytest.mark.asyncio
+async def test_auth_update_signer_rotate_region_403_account_bad_writes_verify(
+    tmp_path, monkeypatch
+):
+    """The signer rotation path keeps its proven-exit verdict (no over-block).
+
+    The slot session's bound exit equals the resolver binding, so the canary
+    verdict is attributable: the event is reported and ``verify_required`` is
+    written, exactly as before the bare-transport guard.
+    """
+    store = AccountStore(tmp_path)
+    _account(store, "acc_signer", "signer@example.com")
+    account_service = AccountService(store)
+    resolver = ArbitrationResolver()
+    canary = CountingCanary("account_bad")
+    arbiter = ExitArbitration(
+        resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+    )
+    session = SignerRotateSession("acc_signer")
+    manager = FakeManager([FakeSlot("slot-1", "acc_signer", session=session)])
+
+    async def fake_rotate(
+        account_id: str, session: object = None, *, client: object = None
+    ) -> CookieRotationResult:
+        del account_id, session, client
+        return CookieRotationResult(
+            transport="signer", payload={"ok": False, "status": 403, "updated": []}
+        )
+
+    monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
+    service = _service(
+        store,
+        refresher=ExternalRegionRefresher(),
+        manager=manager,
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert canary.calls == 1
+    assert resolver.events == [
+        ("acc_signer", "exit-1", "verify_account", "account_bad")
+    ]
+    stored = store.get_account("acc_signer")
+    assert stored is not None
+    assert stored.verify_required is True
+    assert stored.expired is False
+    assert result["deferred"] is True
+
+
+class Signer403RotateSession(SignerRotateSession):
+    """Signer session whose RotateCookies comes back 403 region-restricted."""
+
+    async def rotate_cookies_via_signer(self) -> dict[str, object]:
+        return {"ok": False, "status": 403, "updated": []}
+
+
+class DeathRaceSession:
+    """Session that passes the signer gate but has no signer call to make.
+
+    Models the TOCTOU window: the keepalive-side pre-check sees a live signer
+    while the actual rotation inside ``AccountService`` can no longer use it,
+    so the call falls back to bare httpx.
+    """
+
+    engine = "browserless"
+    transport_state = "signer_rpc"
+
+    def __init__(self, account_id: str) -> None:
+        self.account_id = account_id
+
+    async def save_current_cookies(self) -> bool:
+        return True
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def _spy_rotation_transport(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: list[str],
+) -> None:
+    """Record the transport each successful rotation reports."""
+
+    real_rotate = service.rotate_account_cookies
+
+    async def spy(
+        account_id: str,
+        session: object = None,
+        *,
+        client: Any = None,
+    ) -> CookieRotationResult:
+        result = await real_rotate(account_id, session=session, client=client)
+        seen.append(result.transport)
+        return result
+
+    monkeypatch.setattr(service, "rotate_account_cookies", spy)
+
+
+def _bare_rotates_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def rotate(cookies: dict[str, str], **kwargs: object) -> dict[str, object]:
+        del cookies, kwargs
+        return {"ok": False, "status": 403, "updated": []}
+
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.account.cookie_parser.rotate_google_cookies",
+        rotate,
+    )
+
+
+class _Region403CanaryArbiter:
+    @staticmethod
+    def build() -> tuple[ArbitrationResolver, CountingCanary, ExitArbitration]:
+        resolver = ArbitrationResolver()
+        canary = CountingCanary("account_bad")
+        arbiter = ExitArbitration(
+            resolver=cast(Any, resolver), canary_probe=canary, probe_cooldown_s=0.0
+        )
+        return resolver, canary, arbiter
+
+
+@pytest.mark.asyncio
+async def test_auth_update_reports_actual_raw_transport_when_signer_dies(
+    tmp_path, monkeypatch
+):
+    """P2-4: the reported transport is what ``AccountService`` actually used.
+
+    The keepalive pre-check reports a live signer (patched gate True) while the
+    session exposes no ``rotate_cookies_via_signer`` by the time the rotation
+    runs.  The bare 403 must therefore stay raw: no canary, no event, no
+    ``verify_required``, 300s defer.
+    """
+    store = AccountStore(tmp_path)
+    _account(store, "acc_race", "race@example.com")
+    account_service = AccountService(store)
+    resolver, canary, arbiter = _Region403CanaryArbiter.build()
+    session = DeathRaceSession("acc_race")
+    manager = FakeManager([FakeSlot("slot-race", "acc_race", session=session)])
+    transports: list[str] = []
+    _spy_rotation_transport(account_service, monkeypatch, transports)
+    _bare_rotates_403(monkeypatch)
+    monkeypatch.setattr(
+        AccountService,
+        "_session_can_rotate",
+        staticmethod(lambda session, account_id: True),
+    )
+    service = _service(
+        store,
+        refresher=ExternalRegionRefresher(),
+        manager=manager,
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert transports == ["raw"]
+    assert result["deferred"] is True
+    assert result["deferred_accounts"] == ["acc_race"]
+    assert result["retry_after_s"] == pytest.approx(300.0)
+    assert canary.calls == 0
+    assert resolver.events == []
+    stored = store.get_account("acc_race")
+    assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
+
+
+@pytest.mark.asyncio
+async def test_auth_update_reports_signer_transport_and_keeps_verify_verdict(
+    tmp_path, monkeypatch
+):
+    """The real signer rotation still proves the exit: account_bad writes verify."""
+    store = AccountStore(tmp_path)
+    _account(store, "acc_signer", "signer@example.com")
+    account_service = AccountService(store)
+    resolver, canary, arbiter = _Region403CanaryArbiter.build()
+    session = Signer403RotateSession("acc_signer")
+    manager = FakeManager([FakeSlot("slot-1", "acc_signer", session=session)])
+    transports: list[str] = []
+    _spy_rotation_transport(account_service, monkeypatch, transports)
+    service = _service(
+        store,
+        refresher=ExternalRegionRefresher(),
+        manager=manager,
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert transports == ["signer"]
+    assert canary.calls == 1
+    assert resolver.events == [
+        ("acc_signer", "exit-1", "verify_account", "account_bad")
+    ]
+    stored = store.get_account("acc_signer")
+    assert stored is not None
+    assert stored.verify_required is True
+    assert stored.expired is False
+    assert result["deferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_auth_update_bare_path_without_session_reports_raw(tmp_path, monkeypatch):
+    """No pooled session means the real call is bare: raw, no verify write."""
+    store = AccountStore(tmp_path)
+    _account(store, "acc_bare_real", "bare-real@example.com")
+    account_service = AccountService(store)
+    resolver, canary, arbiter = _Region403CanaryArbiter.build()
+    transports: list[str] = []
+    _spy_rotation_transport(account_service, monkeypatch, transports)
+    _bare_rotates_403(monkeypatch)
+    service = _service(
+        store,
+        refresher=ExternalRegionRefresher(),
+        account_service=account_service,
+        region_arbiter=arbiter,
+        clock=FakeClock(4_000.0),
+    )
+
+    result = await service.run_now("auth_update", settings=_settings())
+
+    assert transports == ["raw"]
+    assert result["deferred"] is True
+    assert canary.calls == 0
+    assert resolver.events == []
+    stored = store.get_account("acc_bare_real")
+    assert stored is not None
+    assert stored.verify_required is False
+    assert stored.expired is False
 
 
 @pytest.mark.asyncio
@@ -1873,12 +2250,16 @@ async def test_auth_region_deferrals_do_not_stop_round_and_rotate_cursor(
 
     async def fake_rotate(
         account_id: str, session: object = None, *, client: object = None
-    ) -> dict[str, object]:
+    ) -> CookieRotationResult:
         del session, client
         rotated.append(account_id)
         if account_id in {"acc01", "acc02", "acc03"}:
-            return {"ok": False, "status": 403, "updated": []}
-        return {"ok": True, "status": 200, "updated": ["SID"]}
+            return CookieRotationResult(
+                transport="raw", payload={"ok": False, "status": 403, "updated": []}
+            )
+        return CookieRotationResult(
+            transport="raw", payload={"ok": True, "status": 200, "updated": ["SID"]}
+        )
 
     monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
     arbiter = RecordingRegionArbiter("exit_bad")
@@ -1980,9 +2361,11 @@ async def test_auth_region_arbitration_uses_bound_build_surface(tmp_path, monkey
 
     async def fake_rotate(
         account_id: str, session: object = None, *, client: object = None
-    ) -> dict[str, object]:
+    ) -> CookieRotationResult:
         del account_id, session, client
-        return {"ok": False, "status": 403, "updated": []}
+        return CookieRotationResult(
+            transport="raw", payload={"ok": False, "status": 403, "updated": []}
+        )
 
     monkeypatch.setattr(account_service, "rotate_account_cookies", fake_rotate)
     arbiter = RecordingRegionArbiter("exit_bad")

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -317,7 +317,12 @@ class AccountKeepaliveService:
         return resolve_arbitration_kind(resolver, account_id)
 
     def _probe_exit_id(
-        self, account_id: str, arbiter: object | None, kind: str
+        self,
+        account_id: str,
+        arbiter: object | None,
+        kind: str,
+        *,
+        raw_transport: bool = False,
     ) -> str | None:
         """Exit the failing maintenance call actually used.
 
@@ -325,7 +330,21 @@ class AccountKeepaliveService:
         exit; a migrated/other binding must stay inconclusive.  ``""`` forces
         an inconclusive verdict when the live slot's exit cannot be proven to
         match the resolver binding.
+
+        ``raw_transport=True`` marks a bare httpx RotateCookies call (no signer
+        fingerprint or request shape).  In external mode such a call can never
+        prove its exit, so ``""`` short-circuits the canary: a 403 there says
+        nothing about the account, and blaming it would write a false
+        ``verify_required``.
         """
+        if raw_transport and self._external_runtime():
+            if skip_log_due(account_id, "untrusted_probe_transport"):
+                log.info(
+                    "[Keepalive] %s region 403 来自裸 httpx RotateCookies，"
+                    "出口无法证明匹配，按 inconclusive 处理，不进行 canary 归因",
+                    account_id or "-",
+                )
+            return ""
         resolver = getattr(arbiter, "resolver", None)
         assignment_for = getattr(resolver, "assignment_for", None)
         if not callable(assignment_for):
@@ -362,7 +381,13 @@ class AccountKeepaliveService:
             break
         return exit_id or None
 
-    async def _arbitrate_region_once(self, account_id: str, source: str) -> str | None:
+    async def _arbitrate_region_once(
+        self,
+        account_id: str,
+        source: str,
+        *,
+        raw_transport: bool = False,
+    ) -> str | None:
         """Run at most one region-403 canary per account per keepalive round."""
         if not account_id or account_id in self._region_arbitrated_round:
             return None
@@ -376,7 +401,9 @@ class AccountKeepaliveService:
                 account_id=account_id,
                 kind=kind,
                 account_bad_event_kind="verify_account",
-                probe_exit_id=self._probe_exit_id(account_id, arbiter, kind),
+                probe_exit_id=self._probe_exit_id(
+                    account_id, arbiter, kind, raw_transport=raw_transport
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -426,7 +453,7 @@ class AccountKeepaliveService:
                 )
 
     @staticmethod
-    def _rotation_is_region_403(result: dict[str, object]) -> bool:
+    def _rotation_is_region_403(result: Mapping[str, object]) -> bool:
         """RotateCookies returned 403: treat as an exit-region suspicion.
 
         The rotation client does not expose the response body, so any 403 is
@@ -1220,7 +1247,9 @@ class AccountKeepaliveService:
                     account_no_capacity = True
                 elif self._rotation_is_region_403(rot_res):
                     outcome = await self._arbitrate_region_once(
-                        account.id, "auth_update"
+                        account.id,
+                        "auth_update",
+                        raw_transport=rot_res.transport == "raw",
                     )
                     if outcome is None:
                         # No arbiter (off mode): keep the legacy failure path.
