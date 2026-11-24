@@ -861,11 +861,11 @@ def test_verify_chrome_command_has_low_memory_and_fingerprint_args(
     assert "--use-angle=swiftshader" in command
     assert "--no-zygote" in command
     assert "--disable-gpu-compositing" in command
-    disable_features = next(
-        arg for arg in command if arg.startswith("--disable-features=")
-    )
-    assert "Translate" in disable_features
-    assert "SitePerProcess" in disable_features
+    # Site isolation is disabled through the dedicated switch the bframe reader
+    # relies on; the blunt ``--disable-features=...`` list is dropped because it
+    # also removes subsystems the reCAPTCHA device flow expects.
+    assert "--disable-site-isolation-trials" in command
+    assert not any(arg.startswith("--disable-features=") for arg in command)
     # Previously verified args must stay.
     assert "--headless=new" in command
     assert "--mute-audio" in command
@@ -2829,7 +2829,7 @@ def test_headed_mode_drops_fixed_user_agent(
     assert not any(arg.startswith("--user-agent=") for arg in args)
 
 
-def test_headless_mode_keeps_fixed_user_agent(
+def test_headless_mode_also_uses_native_user_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
@@ -2839,4 +2839,42 @@ def test_headless_mode_keeps_fixed_user_agent(
         user_data_dir=str(tmp_path),
         proxy=None,
     )
-    assert f"--user-agent={verify_module.CHROME_UA}" in args
+    # A fixed UA contradicts the engine's own client hints (sec-ch-ua).
+    assert not any(arg.startswith("--user-agent=") for arg in args)
+
+
+def test_verify_browser_drops_recaptcha_breaking_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
+    args = verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome.exe",
+        port=9222,
+        user_data_dir=str(tmp_path),
+        proxy=None,
+    )
+    for forbidden in (
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-features=",
+        "--force-webrtc-ip-handling-policy=",
+    ):
+        assert not any(arg.startswith(forbidden) for arg in args), forbidden
+    # The bframe QR reader still needs the frames in the parent CDP session.
+    assert "--disable-site-isolation-trials" in args
+
+
+def test_windows_headed_run_restores_sandbox_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AISTUDIO_VERIFY_HEADED", "1")
+    args = verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome.exe",
+        port=9222,
+        user_data_dir=str(tmp_path),
+        proxy=None,
+    )
+    if __import__("os").name == "nt":
+        assert "--no-sandbox" not in args
+        assert "--disable-setuid-sandbox" not in args

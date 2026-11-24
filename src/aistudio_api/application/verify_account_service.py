@@ -87,10 +87,7 @@ log = get_logger("verify-account")
 VERIFY_ACCOUNT_URL = "https://aistudio.google.com/verify-account"
 DEFAULT_PROXY_ENV = "AISTUDIO_VERIFY_PROXY"
 CHROME_PATH_ENV = "AISTUDIO_VERIFY_CHROME_PATH"
-CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-)
+
 
 DEFAULT_TTL_SECONDS = 300.0
 # Real-device observation: the reCAPTCHA QR only lands at +22~24s on a weak
@@ -191,6 +188,9 @@ FULL_CAPTURE_DIR_ENV = "AISTUDIO_VERIFY_CAPTURE_DIR"
 FULL_CAPTURE_MAX_ENTRIES = 20000
 FULL_CAPTURE_MAX_BODIES = 600
 FULL_CAPTURE_BODY_LIMIT = 16384
+# Diagnostics: strip the stealth/low-memory flags from a headed verify browser
+# so it behaves like a stock install (reCAPTCHA depends on those channels).
+MINIMAL_FLAGS_ENV = "AISTUDIO_VERIFY_MINIMAL_FLAGS"
 
 _SHORT_CODE_RE = re.compile(r"recaptcha\.net/qr/([A-Za-z0-9_-]{6,32})")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -1765,6 +1765,11 @@ def _full_capture_enabled() -> bool:
     return os.getenv(FULL_CAPTURE_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _minimal_flags_enabled() -> bool:
+    """Diagnostics: launch a headed verify browser with stock-like flags only."""
+    return os.getenv(MINIMAL_FLAGS_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
 class _FullCaptureSink:
     """Append-only JSONL capture of one verify browsing session.
 
@@ -3066,12 +3071,10 @@ def _build_verify_chrome_command(
     #   ``settings.proxy_url`` fallback inside ``build_chromium_args`` is
     #   stripped when no explicit verify proxy is configured.
     headed = _verify_headed_enabled()
-    # Headless keeps the fixed public UA (no real user agent exists there); a
-    # headed run must NOT pretend to be a 13-major-versions-old Chrome while the
-    # engine is a current build — that mismatch is itself a bot signal.
+    # Never override the UA: the client hints (sec-ch-ua*) still describe the
+    # real engine, so a hard-coded "Chrome/133" on a 146 build is an internal
+    # contradiction.  The engine's own UA is consistent with its own hints.
     extra_args = ["--lang=en-US"]
-    if not headed:
-        extra_args.insert(0, f"--user-agent={CHROME_UA}")
     args = build_chromium_args(
         port=port,
         user_data_dir=user_data_dir,
@@ -3106,18 +3109,69 @@ def _build_verify_chrome_command(
             "--aggressive-cache-discard",
             "--fingerprint-timezone=",
         )
-        args = [
-            arg
-            for arg in args
-            if not any(
-                arg == prefix or arg.startswith(prefix) for prefix in drop_prefixes
-            )
-        ]
+        args = _drop_args(args, drop_prefixes)
+    args = _apply_verify_compat_args(args, is_windows=os.name == "nt")
     if headed and not any(arg.startswith("--window-size=") for arg in args):
         args.append("--window-size=1280,900")
     if proxy is None:
         args = [arg for arg in args if not arg.startswith("--proxy-server=")]
+    if headed and _minimal_flags_enabled():
+        # Escape hatch for future diagnosis: a stock-looking browser with only
+        # the switches CDP and the bframe reader need.
+        args = [
+            f"--remote-debugging-port={port}",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-site-isolation-trials",
+            "--window-size=1280,900",
+            "--lang=en-US",
+        ]
+        if user_data_dir:
+            args.append(f"--user-data-dir={user_data_dir}")
+        log.warning("[Verify] 验证浏览器以最小参数启动（诊断模式）")
     return [str(binary), *args]
+
+
+def _drop_args(args: list[str], prefixes: tuple[str, ...]) -> list[str]:
+    return [
+        arg
+        for arg in args
+        if not any(arg == prefix or arg.startswith(prefix) for prefix in prefixes)
+    ]
+
+
+def _apply_verify_compat_args(args: list[str], *, is_windows: bool) -> list[str]:
+    """Remove launcher flags that break reCAPTCHA's device-verification flow.
+
+    Real-device evidence (2026-11-24): with these flags the page shows
+    "Something went wrong while verifying your device … browser extensions",
+    and the QR never reaches Google's device check.  Dropping them yields the
+    same page state as a stock browser ("device already used / doesn't meet
+    device security requirements").  They are therefore removed for the verify
+    browser *unconditionally*, both headless and headed:
+
+    * ``--disable-background-networking`` / ``--disable-component-update`` /
+      ``--disable-default-apps``: reCAPTCHA's push channel and the Google
+      components that back the device check are exactly what these kill.
+    * ``--disable-features=…``: too blunt (it also disables SitePerProcess and
+      unrelated subsystems the page expects).
+    * ``--force-webrtc-ip-handling-policy=…``: changes network behaviour.
+    * ``--no-sandbox`` / ``--disable-setuid-sandbox`` on Windows: they surface
+      an "unsupported command-line flag" infobar and remove the sandbox a real
+      browser has.  In a Linux container (root) they are still required.
+    """
+    incompatible = (
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-speech-api",
+        "--force-webrtc-ip-handling-policy=",
+        "--disable-features=",
+    )
+    if is_windows:
+        incompatible += ("--no-sandbox", "--disable-setuid-sandbox")
+    return _drop_args(args, incompatible)
 
 
 def _free_port() -> int:
