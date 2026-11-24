@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -15,11 +16,13 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.waa.browserless_session import (
     BrowserlessSession,
     _map_signer_auth_error,
+    _normalize_proxy_scheme,
 )
 from aistudio_api.infrastructure.waa.signer_client import (
     MintProofResult,
     RpcResult,
     SignerAuthError,
+    SignerClient,
 )
 
 
@@ -948,3 +951,61 @@ async def test_capture_falls_back_when_prompt_contains_sentinel(
     parsed = json.loads(captured.body)
     assert parsed[4] == "!proof-abc"
     assert parsed[1][0][0][0][1] == prompt_with_sentinel
+
+
+def test_normalize_proxy_scheme_rewrites_socks5h() -> None:
+    """Exit leases use socks5h; the WAA signer only accepts socks5."""
+    assert _normalize_proxy_scheme("socks5h://u:p@172.17.0.1:31595") == (
+        "socks5://u:p@172.17.0.1:31595"
+    )
+    assert _normalize_proxy_scheme("socks5://172.17.0.1:40110") == (
+        "socks5://172.17.0.1:40110"
+    )
+    assert _normalize_proxy_scheme("http://127.0.0.1:10809") == (
+        "http://127.0.0.1:10809"
+    )
+    assert _normalize_proxy_scheme(None) is None
+
+
+class _FakeSignerRegionError(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_mint_region_denial_becomes_region_restricted_auth_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signer worker bootstrap can return Google's grpc-7 region denial."""
+    from aistudio_api.domain.errors import AuthError
+    from aistudio_api.infrastructure.waa import signer_client as signer_mod
+
+    reason = (
+        "初始化 SpiderMonkey WAA Worker 失败: AI Studio GetLoggingContext "
+        "返回 HTTP 403、协议错误码 7: Region not supported."
+    )
+
+    class _Signer:
+        async def mint_proof(self, **_kwargs: object) -> None:
+            raise signer_mod.SignerProtocolError(reason)
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "cookies": [{"name": "SAPISID", "value": "x", "domain": ".google.com"}],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = BrowserlessSession(
+        account_id="acc_test",
+        auth_file=str(auth_file),
+        signer=cast(SignerClient, _Signer()),
+        proxy="socks5h://u:p@172.17.0.1:31595",
+    )
+    with pytest.raises(AuthError) as excinfo:
+        await session.generate_snapshot([AistudioContent.from_user_prompt("hi")])
+    assert excinfo.value.region_restricted is True
+
+

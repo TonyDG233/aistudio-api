@@ -25,6 +25,7 @@ from aistudio_api.domain.errors import (
     AuthError,
     BrowserTransportError,
     SessionExpiredError,
+    is_region_restricted_message,
 )
 from aistudio_api.domain.model_access import tier_header_value
 from aistudio_api.infrastructure.account.account_store import (
@@ -92,6 +93,20 @@ _EXPIRED_REASON_MARKERS: tuple[str, ...] = (
     "需要重新登录",
     "请重新登录",
 )
+
+
+def _normalize_proxy_scheme(proxy: str | None) -> str | None:
+    """Make an exit proxy acceptable to the WAA signer.
+
+    Exit leases are rendered as ``socks5h://`` (proxy-side DNS), but the signer
+    rejects that spelling outright: "代理协议必须是 http、https 或 socks5".
+    Normalising here keeps one canonical form for every mint/rpc call.
+    """
+    if not proxy:
+        return proxy
+    if proxy.startswith("socks5h://"):
+        return "socks5://" + proxy[len("socks5h://") :]
+    return proxy
 
 
 def _map_signer_auth_error(exc: SignerAuthError) -> AuthError:
@@ -347,6 +362,11 @@ class BrowserlessSession:
         return sha256(self._account_id.encode("utf-8")).hexdigest()
 
     @property
+    def _signer_proxy(self) -> str | None:
+        """Proxy exactly as received, normalised for the WAA signer's scheme."""
+        return _normalize_proxy_scheme(self._proxy)
+
+    @property
     def transport_state(self) -> str:
         return self._transport_mode
 
@@ -560,12 +580,21 @@ class BrowserlessSession:
                     page_prompt=page_prompt,
                     digest=content_hash,
                     wire_contents=None,
-                    proxy=self._proxy,
+                    proxy=self._signer_proxy,
                     account_key=self.stable_account_key,
                 )
             except SignerAuthError as exc:
                 raise self._raise_signer_auth_error(exc) from exc
             except SignerError as exc:
+                text = str(exc)
+                if is_region_restricted_message(text):
+                    # The signer surfaces Google's region denial during worker
+                    # bootstrap (GetLoggingContext 403 / grpc 7).  Routing must
+                    # see this as a region error so the bound exit can be
+                    # arbitrated instead of returning a generic 500.
+                    region_error = AuthError(f"browserless proof mint failed: {text}")
+                    region_error.region_restricted = True
+                    raise region_error from exc
                 raise RuntimeError(f"browserless proof mint failed: {exc}") from exc
             if not result.proof:
                 raise RuntimeError("browserless proof mint returned empty proof")
@@ -624,7 +653,7 @@ class BrowserlessSession:
                 prompt="",
                 page_prompt="",
                 digest=sha256(b"").hexdigest(),
-                proxy=self._proxy,
+                proxy=self._signer_proxy,
                 account_key=self.stable_account_key,
             )
         except SignerAuthError as exc:
@@ -726,7 +755,7 @@ class BrowserlessSession:
                     auth_user=self._auth_user,
                     g1_tier=tier_header_value(self._tier) or "",
                     page_prompt=_first_text(body),
-                    proxy=self._proxy,
+                    proxy=self._signer_proxy,
                     account_key=self.stable_account_key,
                 )
             except SignerAuthError as exc:
@@ -762,7 +791,7 @@ class BrowserlessSession:
                     auth_user=self._auth_user,
                     g1_tier=tier_header_value(self._tier) or "",
                     page_prompt=_first_text(body),
-                    proxy=self._proxy,
+                    proxy=self._signer_proxy,
                     account_key=self.stable_account_key,
                     on_metadata=self._apply_rpc_metadata,
                 ):
