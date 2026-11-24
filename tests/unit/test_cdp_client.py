@@ -449,3 +449,43 @@ async def test_set_cookies_warns_missing_names_without_values(
     ):
         assert secret not in line
         assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_set_cookies_empty_readback_is_not_reported_as_missing(
+    caplog: pytest.LogCaptureFixture,
+):
+    """C: 页面尚未导航（getCookies 返回空）时不得误报缺失，注入流程照常完成。"""
+    caplog.set_level("DEBUG", logger="aistudio.cdp")
+    conn = MagicMock(spec=CDPConnection)
+
+    async def fake_send(method: str, params: object = None, **_kwargs: object):
+        if method == "Network.getCookies":
+            return {"cookies": []}
+        return {}
+
+    conn.send = AsyncMock(side_effect=fake_send)
+    page = CDPPage(conn, target_id="target-1")
+
+    await page.set_cookies(
+        [
+            {"name": "SID", "value": "SECRET-SID-VALUE"},
+            {"name": "__Secure-OSID", "value": "SECRET-SECURE-OSID-VALUE"},
+        ]
+    )
+
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno >= 30 and "Cookie 注入后缺失" in record.getMessage()
+    ], caplog.text
+    assert "Cookie 注入后暂不可见（页面尚未导航）" in caplog.text
+    assert "SECRET-SID-VALUE" not in caplog.text
+    assert "SECRET-SECURE-OSID-VALUE" not in caplog.text
+    assert not any(
+        "SECRET-SID-VALUE" in record.getMessage()
+        or "SECRET-SECURE-OSID-VALUE" in record.getMessage()
+        for record in caplog.records
+    )
+    assert "Network.setCookies" in [call.args[0] for call in conn.send.call_args_list]
+    assert set(page._cached_cookies or {}) == {"SID", "__Secure-OSID"}

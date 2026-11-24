@@ -706,97 +706,54 @@ async def test_probe_import_activates_first_account_and_registers_in_rotator(
     )
 
 
-def test_keep_osid_import_switch_parsing(monkeypatch):
-    from aistudio_api.infrastructure.account.cookie_parser import keep_osid_on_import
-
-    for value in ("1", "true", "TRUE", "YES", " yes "):
-        monkeypatch.setenv("AISTUDIO_IMPORT_KEEP_OSID", value)
-        assert keep_osid_on_import() is True
-
-    for value in ("0", "", "no", "off", "false", "2"):
-        monkeypatch.setenv("AISTUDIO_IMPORT_KEEP_OSID", value)
-        assert keep_osid_on_import() is False
-
-    monkeypatch.delenv("AISTUDIO_IMPORT_KEEP_OSID", raising=False)
-    assert keep_osid_on_import() is False
-
-
-def test_keep_osid_disabled_discards_like_before():
-    raw = "SID=sid; OSID=stale_osid; __Secure-OSID=stale_sec_osid"
-
-    default_state = parse_cookie_string(raw, discard_transient=True)
-    explicit_state = parse_cookie_string(raw, discard_transient=True, keep_osid=False)
-
-    default_cookies = default_state.get("cookies")
-    explicit_cookies = explicit_state.get("cookies")
-    assert isinstance(default_cookies, list)
-    assert isinstance(explicit_cookies, list)
-    default_names = {
-        cookie["name"] for cookie in default_cookies if isinstance(cookie, dict)
-    }
-    explicit_names = {
-        cookie["name"] for cookie in explicit_cookies if isinstance(cookie, dict)
-    }
-    assert default_names == explicit_names == {"SID"}
-
-
-def test_keep_osid_enabled_retains_device_bound_cookies():
+def test_import_discards_osid_but_keeps_bucket():
+    """A: 外部导入丢弃 OSID/__Secure-OSID，但保留 __Secure-BUCKET 及其它核心项。"""
+    # __Secure-BUCKET 的保留/丢弃属既有口径（引入开关之前即保留），本次不改。
     raw = (
-        "SID=sid; OSID=studio_osid; __Secure-OSID=secure_osid; "
-        "__Secure-BUCKET=bucket_val"
+        "SID=sid_val; OSID=studio_osid; __Secure-OSID=secure_osid; "
+        "__Secure-BUCKET=bucket_val; NID=nid_val; SIDCC=sidcc_val; "
+        "_ga=ga_val; _ga_ABC=ga_sub"
     )
-    state = parse_cookie_string(raw, discard_transient=True, keep_osid=True)
+
+    state = parse_cookie_string(raw, discard_transient=True)
     raw_cookies = state.get("cookies")
     assert isinstance(raw_cookies, list)
     by_name = {
         cookie["name"]: cookie for cookie in raw_cookies if isinstance(cookie, dict)
     }
+    names = set(by_name)
 
-    for name in ("OSID", "__Secure-OSID", "__Secure-BUCKET"):
-        assert name in by_name
-        assert by_name[name]["domain"] == "aistudio.google.com"
-
-
-def test_keep_osid_enabled_still_discards_other_transient_cookies():
-    raw = (
-        "SID=sid; OSID=studio_osid; __Secure-OSID=secure_osid; "
-        "__Secure-BUCKET=bucket_val; NID=nid_val; SIDCC=sidcc_val; "
-        "_ga=ga_val; _ga_ABC=ga_sub; __Secure-1PSIDCC=psidcc_val"
-    )
-    state = parse_cookie_string(raw, discard_transient=True, keep_osid=True)
-    raw_cookies = state.get("cookies")
-    assert isinstance(raw_cookies, list)
-    names = {cookie["name"] for cookie in raw_cookies if isinstance(cookie, dict)}
-
-    assert {"OSID", "__Secure-OSID", "__Secure-BUCKET"}.issubset(names)
+    assert "SID" in names
     for dropped in (
+        "OSID",
+        "__Secure-OSID",
         "NID",
         "SIDCC",
-        "__Secure-1PSIDCC",
         "_ga",
         "_ga_ABC",
     ):
         assert dropped not in names
 
+    assert "__Secure-BUCKET" in names
+    assert by_name["__Secure-BUCKET"]["domain"] == "aistudio.google.com"
 
-def test_keep_osid_enabled_log_never_leaks_cookie_values(caplog):
-    import logging
 
-    from aistudio_api.infrastructure.account.cookie_parser import keep_osid_on_import
+def test_import_keep_osid_switch_symbols_removed():
+    """B: 调查期的 AISTUDIO_IMPORT_KEEP_OSID 开关已整体移除。"""
+    import inspect
 
-    with caplog.at_level(logging.INFO, logger="aistudio.cookie_parser"):
-        state = parse_cookie_string(
-            "SID=sid_val; OSID=SECRET_OSID_VALUE; __Secure-OSID=SECRET_SEC_OSID",
-            discard_transient=True,
-            keep_osid=True,
-        )
+    from aistudio_api.infrastructure.account import cookie_parser
 
-    raw_cookies = state.get("cookies")
-    assert isinstance(raw_cookies, list)
-    names = {cookie["name"] for cookie in raw_cookies if isinstance(cookie, dict)}
-    assert "OSID" in names
-    assert keep_osid_on_import() is False  # env default off in this test
-    assert "外部导入保留设备绑定凭据" in caplog.text
-    assert "SECRET_OSID_VALUE" not in caplog.text
-    assert "SECRET_SEC_OSID" not in caplog.text
-    assert "sid_val" not in caplog.text
+    assert not hasattr(cookie_parser, "keep_osid_on_import")
+    for symbol in (
+        "_KEEP_OSID_IMPORT_ENV",
+        "_KEEP_OSID_TRUTHY_VALUES",
+        "_DEVICE_BOUND_IMPORT_COOKIE_NAMES",
+        "_should_discard_import_cookie",
+    ):
+        assert not hasattr(cookie_parser, symbol)
+    assert "keep_osid" not in inspect.signature(parse_cookie_string).parameters
+    assert (
+        "keep_osid"
+        not in inspect.signature(cookie_parser.parse_storage_state).parameters
+    )

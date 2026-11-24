@@ -738,6 +738,11 @@ class CDPPage:
         except Exception as exc:
             log.debug("Cookie 注入后缺失检查失败: %s", exc)
             return
+        if not rows:
+            # 页面尚未导航（如 about:blank）时 ``Network.getCookies`` 返回空，
+            # 不能据此判定注入失败，否则每次会话都会刷一条误报 WARNING。
+            log.debug("Cookie 注入后暂不可见（页面尚未导航）")
+            return
         present = {
             str(cookie.get("name") or "") for cookie in rows if isinstance(cookie, dict)
         }

@@ -50,7 +50,6 @@ from aistudio_api.infrastructure.account.benefit_tier import (
     parse_benefit_tier_envelope,
 )
 from aistudio_api.infrastructure.account.cookie_parser import (
-    keep_osid_on_import,
     parse_cookie_string,
     probe_account_benefit_tier,
     probe_account_email,
@@ -1781,7 +1780,7 @@ async def import_cookies(
 ) -> ImportCookiesResponse:
     """从 cookie 导入账号（支持 JSON 数组、Netscape、KV 或油猴导出的 JSON 对象）。"""
     _apply_tampermonkey_import_metadata(req)
-    storage_state = parse_cookie_string(req.cookies, keep_osid=keep_osid_on_import())
+    storage_state = parse_cookie_string(req.cookies)
     raw_cookies = storage_state.get("cookies")
     cookie_list: list[dict[str, object]] = (
         raw_cookies if isinstance(raw_cookies, list) else []
@@ -1938,16 +1937,13 @@ async def probe_and_import(
 ) -> ProbeAndImportResponse:
     """探测 Cookie 中的多个已登录账号并批量导入。"""
     from aistudio_api.infrastructure.account.cookie_parser import (
-        keep_osid_on_import,
         parse_cookie_string,
         probe_google_accounts_infinite,
     )
 
     sandbox = get_ui_sandbox(runtime_state)
     if sandbox is not None:
-        storage_state = parse_cookie_string(
-            req.cookies, keep_osid=keep_osid_on_import()
-        )
+        storage_state = parse_cookie_string(req.cookies)
         raw_cookies = storage_state.get("cookies")
         if not isinstance(raw_cookies, list) or not raw_cookies:
             raise HTTPException(status_code=400, detail="未解析到有效 cookie")
@@ -1972,7 +1968,7 @@ async def probe_and_import(
         )
 
     had_active_account = account_service.get_active_account() is not None
-    storage_state = parse_cookie_string(req.cookies, keep_osid=keep_osid_on_import())
+    storage_state = parse_cookie_string(req.cookies)
     prefix = req.name_prefix.strip() if req.name_prefix else "Google Account"
     import secrets
 
@@ -2215,7 +2211,6 @@ async def import_bundle(
     from pathlib import Path
 
     from aistudio_api.infrastructure.account.cookie_parser import (
-        keep_osid_on_import,
         parse_cookie_string,
         parse_storage_state,
     )
@@ -2271,27 +2266,19 @@ async def import_bundle(
         if isinstance(cookie_objects, list) and cookie_objects:
             storage_state = parse_storage_state({"cookies": cookie_objects})
             if storage_state is None:
-                storage_state = parse_cookie_string(
-                    cookie_objects, keep_osid=keep_osid_on_import()
-                )
+                storage_state = parse_cookie_string(cookie_objects)
         elif isinstance(cookies_val, list):
             storage_state = parse_storage_state(
                 {"cookies": cookies_val, "origins": item.get("origins", [])}
             )
             if storage_state is None:
-                storage_state = parse_cookie_string(
-                    cookies_val, keep_osid=keep_osid_on_import()
-                )
+                storage_state = parse_cookie_string(cookies_val)
         elif isinstance(cookies_val, dict):
             storage_state = parse_storage_state(cookies_val)
             if storage_state is None:
-                storage_state = parse_cookie_string(
-                    cookies_val, keep_osid=keep_osid_on_import()
-                )
+                storage_state = parse_cookie_string(cookies_val)
         elif isinstance(cookies_val, str) and cookies_val.strip():
-            storage_state = parse_cookie_string(
-                cookies_val, keep_osid=keep_osid_on_import()
-            )
+            storage_state = parse_cookie_string(cookies_val)
 
         if not storage_state or not storage_state.get("cookies"):
             continue

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 import uuid
@@ -132,55 +131,6 @@ DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
         "__Secure-OSID",
     }
 )
-
-# Device-bound Google session credentials that the verify-account QR flow needs.
-# ``__Secure-BUCKET`` is not in the discard set today, but it belongs to the
-# same device-binding family and must stay kept when the switch is on.
-_DEVICE_BOUND_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
-    {"OSID", "__Secure-OSID", "__Secure-BUCKET"}
-)
-
-_KEEP_OSID_IMPORT_ENV = "AISTUDIO_IMPORT_KEEP_OSID"
-_KEEP_OSID_TRUTHY_VALUES: frozenset[str] = frozenset({"1", "true", "yes"})
-
-
-def keep_osid_on_import() -> bool:
-    """Return True when ``AISTUDIO_IMPORT_KEEP_OSID`` enables keeping OSID cookies.
-
-    Only ``1`` / ``true`` / ``yes`` (case-insensitive, surrounding whitespace
-    ignored) turn the switch on; missing, empty or any other value keep the
-    legacy discard behaviour.  The env is read on every call so importing this
-    module has no side effects and callers can opt in per import.
-    """
-    return (
-        os.environ.get(_KEEP_OSID_IMPORT_ENV, "").strip().lower()
-        in _KEEP_OSID_TRUTHY_VALUES
-    )
-
-
-def _should_discard_import_cookie(name: str, *, keep_osid: bool) -> bool:
-    """Decide whether one cookie is dropped during an external import."""
-    if not (
-        name in DISCARDABLE_IMPORT_COOKIE_NAMES or name.startswith(("_ga_", "_gcl_"))
-    ):
-        return False
-    return not (keep_osid and name in _DEVICE_BOUND_IMPORT_COOKIE_NAMES)
-
-
-def _log_device_bound_keep_summary(cookies: object) -> None:
-    """Log which device-bound cookies survived, by name only (never values)."""
-    names: set[str] = set()
-    if isinstance(cookies, list):
-        for item in cookies:
-            if isinstance(item, dict) and isinstance(item.get("name"), str):
-                names.add(item["name"])
-    logger.info(
-        "外部导入保留设备绑定凭据: osid=%s secure_osid=%s bucket=%s",
-        "yes" if "OSID" in names else "no",
-        "yes" if "__Secure-OSID" in names else "no",
-        "yes" if "__Secure-BUCKET" in names else "no",
-    )
-
 
 ACCOUNT_HOST_ONLY_COOKIES: frozenset[str] = frozenset(
     {
@@ -471,7 +421,6 @@ def build_google_cookie_list(
     *,
     allow_url_targets: bool = False,
     discard_transient: bool = False,
-    keep_osid: bool = False,
 ) -> list[dict[str, object]]:
     """Build Playwright/CDP compatible cookies from name/value pairs."""
     now = int(time.time())
@@ -514,8 +463,9 @@ def build_google_cookie_list(
         else [(str(k), str(v)) for k, v in pairs]
     )
     for name, value in item_list:
-        if discard_transient and _should_discard_import_cookie(
-            name, keep_osid=keep_osid
+        if discard_transient and (
+            name in DISCARDABLE_IMPORT_COOKIE_NAMES
+            or name.startswith(("_ga_", "_gcl_"))
         ):
             continue
         targets = _DOMAIN_OVERRIDES.get(name)
@@ -528,7 +478,7 @@ def build_google_cookie_list(
 
 
 def parse_storage_state(
-    raw: object, *, discard_transient: bool = False, keep_osid: bool = False
+    raw: object, *, discard_transient: bool = False
 ) -> dict[str, object] | None:
     """识别 Playwright storage-state（cookies 数组带 domain），原样保留跨域值。
 
@@ -569,8 +519,9 @@ def parse_storage_state(
         value = item.get("value")
         if not name or value is None:
             continue
-        if discard_transient and _should_discard_import_cookie(
-            name, keep_osid=keep_osid
+        if discard_transient and (
+            name in DISCARDABLE_IMPORT_COOKIE_NAMES
+            or name.startswith(("_ga_", "_gcl_"))
         ):
             continue
         domain = str(item.get("domain") or "").lower()
@@ -650,29 +601,19 @@ def load_cookies_from_auth_file(auth_file: str | Path | None) -> dict[str, str]:
 
 
 def parse_cookie_string(
-    raw: object, *, discard_transient: bool = True, keep_osid: bool = False
+    raw: object, *, discard_transient: bool = True
 ) -> dict[str, object]:
     """将任意格式 cookie 解析为 storage state dict，包含 cookies 和 origins 字段。"""
-    state = parse_storage_state(
-        raw, discard_transient=discard_transient, keep_osid=keep_osid
-    )
+    state = parse_storage_state(raw, discard_transient=discard_transient)
     if state is not None:
-        if discard_transient and keep_osid:
-            _log_device_bound_keep_summary(state.get("cookies"))
         return state
     cookie_dict = parse_raw_cookies(raw)
-    result: dict[str, object] = {
+    return {
         "cookies": build_google_cookie_list(
-            cookie_dict,
-            allow_url_targets=False,
-            discard_transient=discard_transient,
-            keep_osid=keep_osid,
+            cookie_dict, allow_url_targets=False, discard_transient=discard_transient
         ),
         "origins": [],
     }
-    if discard_transient and keep_osid:
-        _log_device_bound_keep_summary(result.get("cookies"))
-    return result
 
 
 def parse_emails_from_ogs_html(
