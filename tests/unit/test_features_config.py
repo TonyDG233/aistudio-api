@@ -558,6 +558,89 @@ instances:
         validate_config(path)
 
 
+def test_empty_instances_rejected_without_env_switch(tmp_path, monkeypatch):
+    monkeypatch.delenv("AISTUDIO_ALLOW_EMPTY_INSTANCES", raising=False)
+    path = _write_config(tmp_path, "instances: []\n")
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        validate_config(path)
+
+    assert str(excinfo.value) == "配置校验失败：instances 未包含任何有效实例配置"
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_empty_instances_allowed_with_env_switch(tmp_path, monkeypatch, caplog, value):
+    monkeypatch.setenv("AISTUDIO_ALLOW_EMPTY_INSTANCES", value)
+    path = _write_config(tmp_path, "instances: []\n")
+
+    with caplog.at_level(logging.WARNING, logger="config"):
+        assert get_configured_instance_specs(path) == []
+        validate_config(path)
+
+    assert (
+        "已允许空实例配置（仅限本地调试，未启用实例池，不会创建请求实例）"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "", "no"])
+def test_empty_instances_rejected_with_falsey_env_switch(
+    tmp_path, monkeypatch, caplog, value
+):
+    monkeypatch.setenv("AISTUDIO_ALLOW_EMPTY_INSTANCES", value)
+    path = _write_config(tmp_path, "instances: []\n")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="config"),
+        pytest.raises(ConfigValidationError) as excinfo,
+    ):
+        validate_config(path)
+
+    assert str(excinfo.value) == "配置校验失败：instances 未包含任何有效实例配置"
+    assert "已允许空实例配置" not in caplog.text
+
+
+@pytest.mark.parametrize("switch", [None, "1"])
+def test_env_switch_does_not_change_non_empty_instances(tmp_path, monkeypatch, switch):
+    if switch is None:
+        monkeypatch.delenv("AISTUDIO_ALLOW_EMPTY_INSTANCES", raising=False)
+    else:
+        monkeypatch.setenv("AISTUDIO_ALLOW_EMPTY_INSTANCES", switch)
+
+    valid_path = tmp_path / "valid.yaml"
+    valid_path.write_text(
+        """
+instances:
+  - count: 1
+    surface: chat
+    only_tier: Free
+""",
+        encoding="utf-8",
+    )
+    invalid_path = tmp_path / "invalid.yaml"
+    invalid_path.write_text(
+        """
+instances:
+  - count: 0
+    surface: chat
+    min_tier: Pro
+""",
+        encoding="utf-8",
+    )
+
+    assert get_configured_instance_specs(valid_path) == [
+        {
+            "count": 1,
+            "surface": "chat",
+            "only_tier": "Free",
+            "min_tier": "Free",
+            "max_tier": "Free",
+        },
+    ]
+    with pytest.raises(ConfigValidationError, match="未包含任何有效实例"):
+        validate_config(invalid_path)
+
+
 @pytest.mark.parametrize(
     ("preset_yaml", "missing_field"),
     [

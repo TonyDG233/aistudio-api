@@ -408,6 +408,18 @@ def _apply_noncritical_fallbacks(config: dict[str, object]) -> dict[str, object]
     return config
 
 
+_ALLOW_EMPTY_INSTANCES_ENV = "AISTUDIO_ALLOW_EMPTY_INSTANCES"
+_ALLOW_EMPTY_INSTANCES_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _allow_empty_instances() -> bool:
+    """Read ``AISTUDIO_ALLOW_EMPTY_INSTANCES`` at call time (1/true/yes)."""
+    raw = os.environ.get(_ALLOW_EMPTY_INSTANCES_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in _ALLOW_EMPTY_INSTANCES_TRUTHY
+
+
 def _require_mapping(config: dict[str, object], key: str) -> dict[str, object]:
     value = config.get(key)
     if not isinstance(value, dict):
@@ -541,6 +553,11 @@ def _normalize_instance_specs(raw_instances: object) -> list[dict[str, object]]:
             normalized_by_key[key] = normalized
 
     if not merged_counts:
+        if not raw_instances and _allow_empty_instances():
+            logger.warning(
+                "已允许空实例配置（仅限本地调试，未启用实例池，不会创建请求实例）"
+            )
+            return []
         raise ConfigValidationError("配置校验失败：instances 未包含任何有效实例配置")
 
     normalized_specs: list[dict[str, object]] = []
