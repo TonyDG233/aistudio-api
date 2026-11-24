@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -106,6 +107,18 @@ def _start_control_warmup(
 ) -> asyncio.Task[object] | None:
     """Return the legacy control warmup task, or None when the pool is enabled."""
     if pool_enabled:
+        return None
+    # Debug escape hatch: a verify-only local run must not open a control page
+    # (that launches Chromium and runs BotGuard with a real account).  Opt-in and
+    # off by default; the pool path never reaches here anyway.
+    if os.getenv("AISTUDIO_SKIP_CONTROL_WARMUP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        logger.warning(
+            "AISTUDIO_SKIP_CONTROL_WARMUP 已开启：跳过控制面预热（仅限本地调试）"
+        )
         return None
     return asyncio.create_task(_warmup_control_session(client))
 
