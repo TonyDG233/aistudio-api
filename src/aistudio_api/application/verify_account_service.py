@@ -35,10 +35,11 @@ import shutil
 import signal
 import socket
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -172,6 +173,24 @@ QR_DIAG_URL_LIMIT = 120
 DRIVER_CLOSE_TIMEOUT_SECONDS = 7.0
 PAGE_CLOSE_TIMEOUT_SECONDS = 2.0
 CLIENT_CLOSE_TIMEOUT_SECONDS = 2.0
+
+# ---------------------------------------------------------------------------
+# 全量网络取证（仅本地排障用，默认关闭）
+#
+# 打开 AISTUDIO_VERIFY_FULL_CAPTURE=1 后，验证会话会把**整页**的网络交互按
+# JSONL 追加写盘：请求头、Cookie、Authorization、postData、响应头、
+# Set-Cookie、响应体、帧导航与控制台输出。为了避免"再猜一次"，这里刻意
+# *不做脱敏*——它能把 Google 拒绝的确切请求原样留下来。
+#
+# 代价与边界：
+# * 落盘内容包含可直接登录账号的凭据，只能在本机隔离目录使用；
+# * 默认关闭，未设置该环境变量时不注册任何额外监听，行为与之前一致；
+# * 单会话有条数/字节上限，避免弱机被拖垮。
+FULL_CAPTURE_ENV = "AISTUDIO_VERIFY_FULL_CAPTURE"
+FULL_CAPTURE_DIR_ENV = "AISTUDIO_VERIFY_CAPTURE_DIR"
+FULL_CAPTURE_MAX_ENTRIES = 20000
+FULL_CAPTURE_MAX_BODIES = 600
+FULL_CAPTURE_BODY_LIMIT = 16384
 
 _SHORT_CODE_RE = re.compile(r"recaptcha\.net/qr/([A-Za-z0-9_-]{6,32})")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -1741,6 +1760,81 @@ class VerifyAccountService:
         self._schedule_driver_close(driver, session)
 
 
+def _full_capture_enabled() -> bool:
+    """True only when the operator explicitly opts into full capture."""
+    return os.getenv(FULL_CAPTURE_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+class _FullCaptureSink:
+    """Append-only JSONL capture of one verify browsing session.
+
+    Deliberately *unredacted*: it exists to answer "what exactly did Google
+    reject" for a session that the same account completes in a real browser.
+    Enabled only by ``AISTUDIO_VERIFY_FULL_CAPTURE``; the file lives under the
+    data directory (gitignored) unless ``AISTUDIO_VERIFY_CAPTURE_DIR`` overrides
+    it, so the dump never leaves the operator's machine by itself.
+    """
+
+    def __init__(self, *, account_label: str, data_root: Path) -> None:
+        override = (os.getenv(FULL_CAPTURE_DIR_ENV) or "").strip()
+        root = Path(override) if override else data_root / "verify-capture"
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        self.path = (
+            root / f"verify-{account_label}-{stamp}-{uuid.uuid4().hex[:6]}.jsonl"
+        )
+        self._handle = self.path.open("w", encoding="utf-8")
+        self._lock = threading.Lock()
+        self._started_at = time.monotonic()
+        self._entries = 0
+        self._bodies = 0
+
+    def record(self, kind: str, payload: Mapping[str, object]) -> None:
+        try:
+            with self._lock:
+                if self._entries >= FULL_CAPTURE_MAX_ENTRIES:
+                    return
+                row: dict[str, object] = {
+                    "t": round(time.monotonic() - self._started_at, 3),
+                    "kind": kind,
+                }
+                row.update(payload)
+                self._handle.write(
+                    json.dumps(row, ensure_ascii=False, default=str) + "\n"
+                )
+                self._handle.flush()
+                self._entries += 1
+        except Exception:
+            # Capture must never break the verify flow.
+            pass
+
+    def take_body_slot(self) -> bool:
+        with self._lock:
+            if self._bodies >= FULL_CAPTURE_MAX_BODIES:
+                return False
+            self._bodies += 1
+            return True
+
+    def close(self) -> None:
+        try:
+            with self._lock:
+                self._handle.close()
+        except Exception:
+            pass
+
+
+def _capture_event_recorder(
+    sink: _FullCaptureSink, kind: str
+) -> Callable[[dict[str, object]], None]:
+    """Bind a CDP event kind to the capture sink (no scrubbing by design)."""
+
+    def _record(params: dict[str, object]) -> None:
+        payload = params if isinstance(params, dict) else {"raw": str(params)}
+        sink.record(kind, payload)
+
+    return _record
+
+
 class CdpVerifyBrowserDriver:
     """Headless CloakBrowser + CDP implementation of ``VerifyBrowserSession``."""
 
@@ -1794,6 +1888,9 @@ class CdpVerifyBrowserDriver:
         self._frame_nav_last_log_at = 0.0
         # "page" (on_frame_navigated), "cdp" (Page.frameNavigated) or "none".
         self._frame_nav_hook = "none"
+        # Optional full-session capture (see _FullCaptureSink); off by default.
+        self._capture: _FullCaptureSink | None = None
+        self._capture_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
     def _resolve_binary(self) -> Path:
@@ -1830,6 +1927,8 @@ class CdpVerifyBrowserDriver:
             user_data_dir=self._user_data_dir,
             proxy=self._proxy,
         )
+        if _verify_headed_enabled():
+            log.info("验证浏览器以有头模式启动")
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *command,
@@ -1845,6 +1944,7 @@ class CdpVerifyBrowserDriver:
             # ``_dump_net_trace`` to answer "did Google's callback reach us?".
             self._register_net_trace(page)
             self._register_frame_nav_trace(page)
+            self._start_full_capture(page)
         except Exception as exc:
             log.error(
                 "验证浏览器进程启动失败: error_type=%s error=%s",
@@ -1999,6 +2099,186 @@ class CdpVerifyBrowserDriver:
             return
         if callable(unsubscribe):
             self._net_unsubscribers.append(cast("Callable[[], None]", unsubscribe))
+
+    # ------------------------------------------------------------------
+    # Full-session capture (opt-in, local diagnostics only)
+    # ------------------------------------------------------------------
+
+    def _start_full_capture(self, page: object) -> None:
+        """Wire the unredacted JSONL capture when explicitly enabled.
+
+        Nothing is registered when ``AISTUDIO_VERIFY_FULL_CAPTURE`` is unset, so
+        production behaviour is unchanged.  Every failure here degrades to "no
+        capture" rather than aborting the session.
+        """
+        if not _full_capture_enabled():
+            return
+        try:
+            data_root = self._auth_file.parents[2]
+            sink = _FullCaptureSink(
+                account_label=self._auth_file.parent.name,
+                data_root=data_root,
+            )
+        except Exception as exc:
+            log.warning(
+                "[Verify] 全量取证初始化失败: error_type=%s", type(exc).__name__
+            )
+            return
+        self._capture = sink
+        log.warning(
+            "[Verify] 全量网络取证已开启（含 Cookie/Authorization/Set-Cookie 明文）: %s",
+            sink.path,
+        )
+
+        register = getattr(page, "on_request", None)
+        if callable(register):
+            try:
+                unsubscribe = register(
+                    lambda data: sink.record(
+                        "request",
+                        data if isinstance(data, dict) else {"raw": str(data)},
+                    )
+                )
+                if callable(unsubscribe):
+                    self._net_unsubscribers.append(
+                        cast("Callable[[], None]", unsubscribe)
+                    )
+            except Exception:
+                log.debug("验证会话全量取证: 请求订阅失败")
+
+        register = getattr(page, "on_response", None)
+        if callable(register):
+            try:
+                unsubscribe = register(self._on_capture_response)
+                if callable(unsubscribe):
+                    self._net_unsubscribers.append(
+                        cast("Callable[[], None]", unsubscribe)
+                    )
+            except Exception:
+                log.debug("验证会话全量取证: 响应订阅失败")
+
+        register = getattr(page, "on_loading_failed", None)
+        if callable(register):
+            try:
+                unsubscribe = register(
+                    lambda params: sink.record(
+                        "loading_failed",
+                        params if isinstance(params, dict) else {"raw": str(params)},
+                    )
+                )
+                if callable(unsubscribe):
+                    self._net_unsubscribers.append(
+                        cast("Callable[[], None]", unsubscribe)
+                    )
+            except Exception:
+                log.debug("验证会话全量取证: 失败事件订阅失败")
+
+        connection = getattr(page, "cdp", None)
+        if connection is None:
+            connection = getattr(page, "connection", None)
+        if connection is None:
+            connection = getattr(page, "_connection", None)
+        on_event = getattr(connection, "on", None) if connection is not None else None
+        if not callable(on_event):
+            log.warning("[Verify] 全量取证缺 Cookie/Set-Cookie 事件: 页面无 CDP 连接")
+            return
+        events = (
+            ("Network.requestWillBeSentExtraInfo", "request_extra"),
+            ("Network.responseReceivedExtraInfo", "response_extra"),
+            ("Page.frameNavigated", "frame_navigated"),
+            ("Runtime.consoleAPICalled", "console"),
+            ("Log.entryAdded", "log"),
+            ("Network.webSocketFrameSent", "ws_sent"),
+            ("Network.webSocketFrameReceived", "ws_recv"),
+        )
+        for event, kind in events:
+            try:
+                unsubscribe = on_event(
+                    event,
+                    _capture_event_recorder(sink, kind),
+                )
+            except Exception:
+                continue
+            if callable(unsubscribe):
+                self._net_unsubscribers.append(cast("Callable[[], None]", unsubscribe))
+        send = getattr(connection, "send", None)
+        if callable(send):
+
+            async def _enable_domain(domain: str) -> None:
+                with contextlib.suppress(Exception):
+                    await cast("Awaitable[object]", send(domain))
+
+            for domain in ("Runtime.enable", "Log.enable"):
+                try:
+                    task = asyncio.create_task(_enable_domain(domain))
+                except Exception:
+                    continue
+                self._capture_tasks.add(task)
+                task.add_done_callback(self._capture_tasks.discard)
+
+    def _on_capture_response(self, data: object) -> None:
+        """Record a response and schedule its body when it is text-like."""
+        sink = self._capture
+        if sink is None:
+            return
+        payload = data if isinstance(data, dict) else {"raw": str(data)}
+        sink.record("response", payload)
+        request_id = str(payload.get("request_id") or "")
+        mime = str(payload.get("mime_type") or "").lower()
+        if not request_id:
+            return
+        if not any(token in mime for token in ("json", "text", "javascript", "xml")):
+            return
+        page = self._page
+        if page is None:
+            return
+        try:
+            task = asyncio.create_task(
+                self._capture_body(
+                    sink, page, request_id, str(payload.get("url") or "")
+                )
+            )
+        except RuntimeError:
+            return
+        self._capture_tasks.add(task)
+        task.add_done_callback(self._capture_tasks.discard)
+
+    async def _capture_body(
+        self,
+        sink: _FullCaptureSink,
+        page: object,
+        request_id: str,
+        url: str,
+    ) -> None:
+        if not sink.take_body_slot():
+            return
+        getter = getattr(page, "get_response_body", None)
+        if not callable(getter):
+            return
+        try:
+            body = await cast("Awaitable[object]", getter(request_id))
+        except Exception as exc:
+            sink.record(
+                "body_error",
+                {
+                    "request_id": request_id,
+                    "url": url,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return
+        text = str(body or "")
+        truncated = len(text) > FULL_CAPTURE_BODY_LIMIT
+        sink.record(
+            "body",
+            {
+                "request_id": request_id,
+                "url": url,
+                "length": len(text),
+                "truncated": truncated,
+                "body": text[:FULL_CAPTURE_BODY_LIMIT],
+            },
+        )
 
     def _on_frame_navigated(self, data: dict[str, object]) -> None:
         """Store only whitelisted navigation URL + relative timestamp."""
@@ -2415,6 +2695,14 @@ class CdpVerifyBrowserDriver:
             self._dump_net_trace("session_close")
         user_data_dir = self._user_data_dir
         self._user_data_dir = None
+        capture = self._capture
+        self._capture = None
+        if capture is not None:
+            for task in list(self._capture_tasks):
+                task.cancel()
+            self._capture_tasks.clear()
+            capture.close()
+            log.info("[Verify] 全量取证已落盘: %s", capture.path)
         unsubscribers = self._net_unsubscribers
         self._net_unsubscribers = []
         for unsubscribe in unsubscribers:
@@ -2746,6 +3034,18 @@ def _read_auth_cookies(auth_file: Path) -> dict[str, str]:
     return cookies_for_google_rpc(raw)
 
 
+_VERIFY_HEADED_ENV = "AISTUDIO_VERIFY_HEADED"
+_VERIFY_HEADED_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _verify_headed_enabled() -> bool:
+    """Read ``AISTUDIO_VERIFY_HEADED`` at call time (1/true/yes, case-insensitive)."""
+    raw = os.environ.get(_VERIFY_HEADED_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in _VERIFY_HEADED_TRUTHY
+
+
 def _build_verify_chrome_command(
     *,
     binary: Path,
@@ -2765,20 +3065,26 @@ def _build_verify_chrome_command(
     # * egress stays direct unless ``AISTUDIO_VERIFY_PROXY`` is set, so the
     #   ``settings.proxy_url`` fallback inside ``build_chromium_args`` is
     #   stripped when no explicit verify proxy is configured.
+    headed = _verify_headed_enabled()
+    # Headless keeps the fixed public UA (no real user agent exists there); a
+    # headed run must NOT pretend to be a 13-major-versions-old Chrome while the
+    # engine is a current build — that mismatch is itself a bot signal.
+    extra_args = ["--lang=en-US"]
+    if not headed:
+        extra_args.insert(0, f"--user-agent={CHROME_UA}")
     args = build_chromium_args(
         port=port,
         user_data_dir=user_data_dir,
-        headless=True,
+        headless=not headed,
         proxy_url=proxy,
-        extra_args=[
-            f"--user-agent={CHROME_UA}",
-            "--lang=en-US",
-        ],
+        extra_args=extra_args,
     )
     args = [
         "--window-size=1280,900" if arg.startswith("--window-size=") else arg
         for arg in args
     ]
+    if headed and not any(arg.startswith("--window-size=") for arg in args):
+        args.append("--window-size=1280,900")
     if proxy is None:
         args = [arg for arg in args if not arg.startswith("--proxy-server=")]
     return [str(binary), *args]

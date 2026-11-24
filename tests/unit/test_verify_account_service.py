@@ -901,6 +901,64 @@ def test_verify_chrome_command_forwards_explicit_verify_proxy(tmp_path: Path) ->
     assert "--proxy-server=http://127.0.0.1:10809" in command
 
 
+@pytest.fixture(autouse=True)
+def _isolate_verify_headed_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
+
+
+def _build_command_for_headless_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> list[str]:
+    if value is None:
+        monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
+    else:
+        monkeypatch.setenv("AISTUDIO_VERIFY_HEADED", value)
+    return verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome",
+        port=9222,
+        user_data_dir=str(tmp_path / "profile"),
+        proxy=None,
+    )
+
+
+def test_verify_headed_flag_defaults_to_headless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = _build_command_for_headless_mode(tmp_path, monkeypatch, None)
+    assert "--headless=new" in command
+    assert "--hide-scrollbars" in command
+    assert "--start-maximized" not in command
+    assert "--ignore-gpu-blocklist" not in command
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_verify_headed_flag_enables_headed_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    command = _build_command_for_headless_mode(tmp_path, monkeypatch, value)
+    assert not any(arg.startswith("--headless") for arg in command)
+    assert "--hide-scrollbars" not in command
+    assert "--window-size=1280,900" in command
+    assert sum(arg.startswith("--window-size=") for arg in command) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "", "no"])
+def test_verify_headed_flag_falsy_values_stay_headless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    command = _build_command_for_headless_mode(tmp_path, monkeypatch, value)
+    assert "--headless=new" in command
+    assert "--start-maximized" not in command
+
+
+def test_verify_headed_flag_keeps_window_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = _build_command_for_headless_mode(tmp_path, monkeypatch, "1")
+    assert "--window-size=1280,900" in command
+    assert sum(arg.startswith("--window-size=") for arg in command) == 1
+
+
 def _write_verify_auth(tmp_path: Path) -> Path:
     auth = tmp_path / "auth.json"
     auth.write_text(
@@ -2675,3 +2733,110 @@ async def test_start_logs_cookie_names_at_both_stages_in_order(
     assert lines.index(injection) < lines.index(bootstrap)
     assert "SECRET-SID" not in caplog.text
     assert "SECRET-OSID" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Full-session capture (opt-in): must stay off by default and keep credentials
+# verbatim only when the operator asked for them.
+# ---------------------------------------------------------------------------
+
+
+def test_full_capture_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(verify_module.FULL_CAPTURE_ENV, raising=False)
+    assert verify_module._full_capture_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes"])
+def test_full_capture_enabled_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(verify_module.FULL_CAPTURE_ENV, value)
+    assert verify_module._full_capture_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["0", "", "no", "off"])
+def test_full_capture_falsey_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(verify_module.FULL_CAPTURE_ENV, value)
+    assert verify_module._full_capture_enabled() is False
+
+
+def test_full_capture_sink_writes_unredacted_payload(tmp_path: Path) -> None:
+    sink = verify_module._FullCaptureSink(account_label="acc_test", data_root=tmp_path)
+    try:
+        sink.record(
+            "request_extra",
+            {"headers": {"Cookie": "SID=secret-sid-value"}, "post": "payload"},
+        )
+        sink.record("response", {"status": 200})
+    finally:
+        sink.close()
+    assert sink.path.parent == tmp_path / "verify-capture"
+    rows = [
+        json.loads(line) for line in sink.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["kind"] for row in rows] == ["request_extra", "response"]
+    assert rows[0]["headers"]["Cookie"] == "SID=secret-sid-value"
+    assert rows[1]["status"] == 200
+
+
+def test_full_capture_dir_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "custom-capture"
+    monkeypatch.setenv(verify_module.FULL_CAPTURE_DIR_ENV, str(target))
+    sink = verify_module._FullCaptureSink(account_label="acc", data_root=tmp_path)
+    try:
+        assert sink.path.parent == target
+    finally:
+        sink.close()
+
+
+def test_full_capture_body_slots_are_bounded(tmp_path: Path) -> None:
+    sink = verify_module._FullCaptureSink(account_label="acc", data_root=tmp_path)
+    try:
+        for _ in range(verify_module.FULL_CAPTURE_MAX_BODIES):
+            assert sink.take_body_slot() is True
+        assert sink.take_body_slot() is False
+    finally:
+        sink.close()
+
+
+def test_full_capture_registers_nothing_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(verify_module.FULL_CAPTURE_ENV, raising=False)
+    auth_file = tmp_path / "accounts" / "acc_x" / "auth.json"
+    driver = verify_module.CdpVerifyBrowserDriver(auth_file=auth_file)
+    page = SimpleNamespace(
+        on_request=lambda _cb: pytest.fail("must not subscribe when disabled")
+    )
+    driver._start_full_capture(page)
+    assert driver._capture is None
+
+
+def test_headed_mode_drops_fixed_user_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AISTUDIO_VERIFY_HEADED", "1")
+    args = verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome.exe",
+        port=9222,
+        user_data_dir=str(tmp_path),
+        proxy=None,
+    )
+    assert not any(arg.startswith("--user-agent=") for arg in args)
+
+
+def test_headless_mode_keeps_fixed_user_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
+    args = verify_module._build_verify_chrome_command(
+        binary=tmp_path / "chrome.exe",
+        port=9222,
+        user_data_dir=str(tmp_path),
+        proxy=None,
+    )
+    assert f"--user-agent={verify_module.CHROME_UA}" in args
