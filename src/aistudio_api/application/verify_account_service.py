@@ -3482,6 +3482,27 @@ def _apply_verify_compat_args(args: list[str], *, is_windows: bool) -> list[str]
         "--disable-speech-api",
         "--force-webrtc-ip-handling-policy=",
         "--disable-features=",
+        # Linux container evidence (2026-11-25): with only the flags above
+        # removed, the container still reports the *browser-environment* error
+        # ("Something went wrong while verifying your device … browser
+        # extensions") and reCAPTCHA's ``enterprise/webworker.js`` request is
+        # the one that never lands.  The remaining deltas from a stock browser
+        # are the forced Windows fingerprint on a Linux kernel and the
+        # extension/sync suppression, so the verify browser drops those too and
+        # presents the host's native platform:
+        # * ``--fingerprint-platform=`` / ``--fingerprint-locale=``: a Win32
+        #   navigator on a Linux container contradicts fonts/GPU/driver and is
+        #   the most likely bot signal left.  On Windows this is a no-op
+        #   because the native platform already is Windows.
+        # * ``--disable-extensions`` /
+        #   ``--disable-component-extensions-with-background-pages`` /
+        #   ``--disable-sync``: same family as ``--disable-default-apps``;
+        #   they also suppress the background components reCAPTCHA can use.
+        "--fingerprint-platform=",
+        "--fingerprint-locale=",
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-sync",
     )
     if is_windows:
         incompatible += ("--no-sandbox", "--disable-setuid-sandbox")

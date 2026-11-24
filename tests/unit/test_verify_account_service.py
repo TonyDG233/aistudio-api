@@ -863,10 +863,14 @@ def test_verify_chrome_command_has_low_memory_and_fingerprint_args(
     assert "--js-flags=--max-old-space-size=128 --expose-gc --optimize-for-size" in (
         command
     )
-    assert "--fingerprint-platform=windows" in command
+    assert "--fingerprint-platform=windows" not in command
     assert f"--fingerprint-timezone={settings.timezone}" in command
-    # Aligned with browser_engine.build_chromium_args (P2-R5).
-    assert f"--fingerprint-locale={settings.locale}" in command
+    # Aligned with browser_engine.build_chromium_args (P2-R5), except the
+    # platform/locale spoof: the verify browser must present the host's native
+    # platform so a Linux container does not advertise Win32 (reCAPTCHA device
+    # check rejects that contradiction).
+    assert not any(arg.startswith("--fingerprint-platform=") for arg in command)
+    assert not any(arg.startswith("--fingerprint-locale=") for arg in command)
     assert "--use-gl=angle" in command
     assert "--use-angle=swiftshader" in command
     assert "--no-zygote" in command
@@ -3224,6 +3228,13 @@ def test_minimal_flags_switch_is_gone_and_headed_keeps_compat_args(
     assert "--disable-site-isolation-trials" in args
     assert not any(arg.startswith("--disable-background-networking") for arg in args)
     assert not any(arg.startswith("--disable-features=") for arg in args)
+    # A Linux container must not present a Win32 navigator on a Linux kernel,
+    # and reCAPTCHA's background components must not be suppressed.
+    assert not any(arg.startswith("--fingerprint-platform=") for arg in args)
+    assert not any(arg.startswith("--fingerprint-locale=") for arg in args)
+    assert "--disable-extensions" not in args
+    assert "--disable-component-extensions-with-background-pages" not in args
+    assert "--disable-sync" not in args
     assert not any(arg.startswith("--headless") for arg in args)
 
 
