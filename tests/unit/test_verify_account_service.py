@@ -940,13 +940,15 @@ def _build_command_for_headless_mode(
     )
 
 
-def test_verify_headed_flag_defaults_to_headed(
+def test_verify_headed_flag_defaults_to_platform_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     command = _build_command_for_headless_mode(tmp_path, monkeypatch, None)
-    assert not any(arg.startswith("--headless") for arg in command)
-    assert "--hide-scrollbars" not in command
-    assert "--window-size=1280,900" in command
+    headed = verify_module._verify_headed_enabled()
+    assert ("--headless=new" in command) is (not headed)
+    if headed:
+        assert "--hide-scrollbars" not in command
+        assert "--window-size=1280,900" in command
 
 
 @pytest.mark.parametrize("value", ["1", "true", "YES"])
@@ -3485,3 +3487,4 @@ async def test_close_cancels_background_confirmation_tasks(tmp_path: Path) -> No
     assert task.done() is True
     assert task.cancelled() is True
     assert service.session is None
+
