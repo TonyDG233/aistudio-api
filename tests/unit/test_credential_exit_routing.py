@@ -52,6 +52,7 @@ from aistudio_api.infrastructure.account.account_info_refresher import (
     RefreshResult,
     TransportResponse,
     reset_skip_log_throttle,
+    skip_log_due,
 )
 from aistudio_api.infrastructure.account.account_store import AccountStore
 from aistudio_api.infrastructure.account.cookie_parser import (
@@ -1916,6 +1917,14 @@ def test_exit_unavailable_does_not_advance_to_next_candidate() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_skip_log_due_first_call_logs_on_fresh_boot() -> None:
+    reset_skip_log_throttle()
+    # time.monotonic() is near zero on a freshly booted runner; the first skip
+    # must still be logged instead of being treated as "already logged".
+    assert skip_log_due("acc1", "no_exit", now=1.0) is True
+    assert skip_log_due("acc1", "no_exit", now=2.0) is False
+    assert skip_log_due("acc1", "no_exit", now=62.0) is True
+
 def test_refresher_skip_log_is_throttled_per_account_and_reason(
     tmp_path: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3410,3 +3419,4 @@ def test_explicit_verify_body_writes_verify_and_keeps_expiry(tmp_path: Any) -> N
     # never cleared by a verify verdict.
     assert stored.verify_required is True
     assert stored.expired is True
+

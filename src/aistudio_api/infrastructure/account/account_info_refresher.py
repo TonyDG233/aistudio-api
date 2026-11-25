@@ -163,8 +163,11 @@ def skip_log_due(account_id: str, reason: str, *, now: float | None = None) -> b
     """
     key = (account_id or "<none>", reason or "no_exit")
     current = time.monotonic() if now is None else now
-    last = _skip_log_at.get(key, 0.0)
-    if current - last < SKIP_LOG_INTERVAL_SECONDS:
+    # time.monotonic() starts near zero on a freshly booted host, so a 0.0
+    # sentinel silently suppressed the *first* skip log for the first minute of
+    # uptime (exactly what made CI flaky on brand-new runners).
+    last = _skip_log_at.get(key)
+    if last is not None and current - last < SKIP_LOG_INTERVAL_SECONDS:
         return False
     _skip_log_at[key] = current
     return True
