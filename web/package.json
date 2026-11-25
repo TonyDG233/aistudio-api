@@ -1,7 +1,7 @@
 {
   "name": "aistudio-api-web",
   "private": true,
-  "version": "2.1.7",
+  "version": "2.1.8",
   "type": "module",
   "scripts": {
     "dev": "bun --bun vite",
@@ -37,3 +37,4 @@
     "vue-tsc": "^2.2.12"
   }
 }
+

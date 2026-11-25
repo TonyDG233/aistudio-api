@@ -73,7 +73,7 @@
 本轮有效的推进顺序是：**直连 → 有头 → 真实 UA/GPU（去掉低配机专属参数）**；其后的 **系统浏览器 → 最小参数** 两步属调查期的**历史尝试记录**——"最小参数"档由 `AISTUDIO_VERIFY_MINIMAL_FLAGS` 驱动，该开关已在 2.1.6 移除，无法复现（系统浏览器仍可经 `AISTUDIO_VERIFY_CHROME_PATH` 复现，见下）。每一步只动一个维度，并记录该步的页面状态、网络记录与上游状态。
 
 - 直连：`AISTUDIO_VERIFY_PROXY` 留空时浏览器与 RPC 都直连（`CdpVerifyBrowserDriver.__init__` 读取代理：`:1934-1938`；`_build_verify_chrome_command` 无显式代理时剔除 `--proxy-server=`：`:3228-3229`；`confirm_verified` 的 httpx `proxy=`：`:2771`）。
-- 有头：`AISTUDIO_VERIFY_HEADED=1`（`_verify_headed_enabled`，`:3158-3163`）。
+- 有头：**桌面平台默认有头**；`AISTUDIO_VERIFY_HEADED=0/false/no` 可回退无头（该变量已废弃，仅保留作未来研究开关）。非桌面平台默认无头（`_verify_headed_enabled`）。
 - 真实 UA/GPU：有头模式会剔除 `--disable-gpu`、`--use-gl=`、`--use-angle=`、`--in-process-gpu`、`--js-flags=`、`--fingerprint-timezone=` 等低配机/指纹参数（`_build_verify_chrome_command`，`:3201-3224`）；**两种模式都不注入固定 UA**，使用内核原生 UA 与一致的 client hints（`:3186-3188`）；同时无条件剔除破坏 reCAPTCHA 的 `--disable-background-networking`、`--disable-component-update`、`--disable-features=` 等（`_apply_verify_compat_args`，`:3241-3271`）。
 - 系统浏览器：`AISTUDIO_VERIFY_CHROME_PATH` 指向宿主已安装的浏览器可执行文件（`CdpVerifyBrowserDriver.__init__`，`:1929-1933`；`_resolve_binary`，`:1972-1988`）。
 - 最小参数：这一档此前由 `AISTUDIO_VERIFY_MINIMAL_FLAGS` 驱动，**该变量已在 2.1.6 移除**，不要再依赖；最小参数仅作为方法论记录保留，需要时手工构造启动命令并在实测前告知用户。
@@ -131,7 +131,7 @@
 
 | 变量 | 真实默认值 | 作用 | 证据 |
 |---|---|---|---|
-| `AISTUDIO_VERIFY_HEADED` | 未设置 = `false`；仅 `1`/`true`/`yes`（不区分大小写）为真 | 以有头模式启动验证浏览器 | `_verify_headed_enabled`（`src/aistudio_api/application/verify_account_service.py:3158-3163`） |
+| `AISTUDIO_VERIFY_HEADED` | 桌面平台未设置 = **有头**；非桌面平台未设置 = 无头；`0`/`false`/`no` 强制无头 | 覆盖验证浏览器的有头/无头（已废弃，保留给未来 recaptcha 研究） | `_verify_headed_enabled` |\n| `AISTUDIO_VERIFY_FORCE` | 空 = 按平台判断（Windows/macOS 支持，Linux 不支持）；`1` 强制支持；`0` 强制不支持 | 能力门禁：不支持的平台隐藏入口并让 `verify/start` 返回 501 | `verify_capability` |
 | `AISTUDIO_VERIFY_DIAGNOSTICS` | 未设置 = `false`；`1`/`true`/`yes` 开启 | 诊断行级别：关时只保留出码就绪/会话就绪/最终结果/`VerifyUser` 非 2xx/清锁等关键行，其余降为 DEBUG；开时恢复全部诊断行 | `_verify_diagnostics_enabled`（`:251-260`）、`_log_diagnostic`（`:263-268`）、会话启动打印（`:916-919`） |
 | `AISTUDIO_VERIFY_CHROME_PATH` | 空 = 走 `find_chromium_executable()`（仓库 `.cloakbrowser/**/chrome` 或 Termux wrapper） | 指定验证浏览器可执行文件；显式设置但文件不存在会抛 `VerifyBrowserUnavailable` | `CdpVerifyBrowserDriver.__init__`（`:1929-1933`）、`_resolve_binary`（`:1972-1988`） |
 | `AISTUDIO_VERIFY_PROXY` | 空 = **直连**；浏览器与 `confirm_verified` 的 httpx 走同一出口 | 验证会话出口代理 | `CdpVerifyBrowserDriver.__init__`（`:1934-1938`）、`_build_verify_chrome_command`（`:3228-3229`）、`confirm_verified`（`:2771`） |
@@ -454,3 +454,4 @@ if __name__ == "__main__":
 5. 实测前必须告知用户，并在同一进程内完成；禁止反复重启服务或反复拉起浏览器（BotGuard 探针风险，`AGENT.md` §4.6）。
 6. 不得把 `AISTUDIO_VERIFY_MINIMAL_FLAGS`、`AISTUDIO_IMPORT_KEEP_OSID` 作为可用开关写进方案或脚本——两者已移除。
 7. 不得在同一个实测里同时改多个变量（§2.5）；也不得用单测/模拟结果替代实机证据（§2.2）。
+

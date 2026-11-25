@@ -25,6 +25,7 @@ import {
   isMobileUserAgent,
   TAMPERMONKEY_SCRIPT_URL,
 } from '@/utils/cookieImportHelper.ts'
+import { resolveVerifySupport } from '@/utils/verifySupport.ts'
 import {
   Plus,
   RotateCcw,
@@ -70,6 +71,8 @@ const bindMode = ref<'activate' | 'change'>('activate')
 const verifyModalOpen = ref(false)
 const verifyingAccount = ref<AccountWithStats | null>(null)
 
+const verifySupport = computed(() => resolveVerifySupport(systemStore.status?.verify))
+
 async function loadData() {
   await Promise.all([
     accountsStore.fetchAll(),
@@ -78,6 +81,8 @@ async function loadData() {
     instancesStore.fetchAll(),
     keepaliveStore.fetchStatus(),
     debugStore.fetchState(),
+    // Capability is static per host: fetch once, then rely on the cached store.
+    systemStore.status ? Promise.resolve() : systemStore.fetchStatus(),
   ])
 }
 
@@ -479,6 +484,8 @@ function onImportModalUpdate(val: boolean) {
     <VerifyAccountModal
       v-model="verifyModalOpen"
       :account="verifyingAccount"
+      :verify-supported="verifySupport.supported"
+      :verify-reason="verifySupport.reason"
     />
   </div>
 </template>

@@ -18,6 +18,7 @@ from aistudio_api.api.response_models import (
     HealthResponse,
     StatsResponse,
 )
+from aistudio_api.application.verify_account_service import verify_capability
 from aistudio_api.config import resolve_default_config_template
 from aistudio_api.infrastructure.gateway.model_defaults import (
     ConfigValidationError,
@@ -56,6 +57,12 @@ def _ui_debug_scenario(runtime_state: RuntimeState) -> str | None:
     if runtime_state.ui_debug and sandbox is not None:
         return str(getattr(sandbox, "scenario", "") or "") or None
     return None
+
+
+def _verify_capability_payload() -> dict[str, object]:
+    """Expose the QR device-verification capability as a plain JSON object."""
+    supported, reason = verify_capability()
+    return {"supported": supported, "reason": reason}
 
 
 async def _resolve_proxy_status(
@@ -310,6 +317,11 @@ async def system_status(
         "instances": instances,
         "formats": formats_status(runtime_state),
         "default_text_model": default_text_model(runtime_state),
+        "verify": (
+            {"supported": True, "reason": "sandbox"}
+            if runtime_state.ui_debug and runtime_state.ui_sandbox is not None
+            else _verify_capability_payload()
+        ),
         **engine_status,
     }
 

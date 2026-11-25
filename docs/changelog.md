@@ -3,6 +3,25 @@
 本文件记录用户可见与架构级变更，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 阶段审计细节、提交对照与逐项核对记录见 `docs/dev/rebuild/domains/`，不在此重复。
 
+## [2.1.8] - 2026-11-25
+
+把扫码验证收敛到真实桌面环境，并新增"导出凭证 + 电脑端独立扫码助手"，让 Linux 容器部署也能完成验证。
+
+### Added
+
+- **扫码能力检测与引导**：`verify_capability()` 按平台判定（Windows/macOS 支持；Linux 默认不支持，`AISTUDIO_VERIFY_FORCE=1/0` 可强制）。`/api/system/status` 下发 `verify: {supported, reason}`；不支持的平台 `verify/start` 返回 501，面板显示引导（导出凭证 → 电脑端助手扫码 → 直接验证账号），不再展示必然失败的有头浏览器流程。
+- **凭证导出**：`POST /api/accounts/{id}/credential-export` 只读导出该账号 `auth.json` 的 cookies；要求管理密码已启用（或显式 `AISTUDIO_ALLOW_CREDENTIAL_EXPORT=1`），日志只记账号与数量。
+- **独立扫码助手**：`tools/verify-helper/verify_helper.py`，在电脑上有头浏览器中注入凭证、完成 `Verify device` 扫码并报告页面结果；不依赖本项目运行时，退出码区分通过/设备级/环境级。
+
+### Changed
+
+- **验证浏览器默认有头**：桌面平台默认有头，`AISTUDIO_VERIFY_HEADED` 改为废弃覆盖开关（`0/false/no` 回退无头）；非桌面平台默认无头。
+- **实测结论固化**：同一 Windows 主机，有头 `VerifyUser 200 [2]`、无头 `403 [7]`；把无头换成有头参数集仍 403；Linux 容器即使有头（Xvfb）也 403。扫码入口只在桌面平台开放。
+
+### Fixed
+
+- 不支持的平台不再启动验证浏览器；前端 unsupported 模式不会调用 `verify/start`/`verify/cancel`，并禁用刷新二维码与检查扫码状态。
+- 导出凭据接口在免密管理面下默认拒绝（403），避免无鉴权端口读取登录 Cookie。
 ## [2.1.7] - 2026-11-24
 
 在 2.1.6 基础上修复出入口 region 403 的误归因、canary 污染的永久停摆与死槽抱死 503，并把出口隔离/轮换的权责收敛到宿主脚本。
@@ -291,3 +310,4 @@
 ## [0.1.0] - 2026-05-16
 
 - 初始开源版本：提供 Google AI Studio 的 OpenAI 兼容接口、账号 Cookie 管理与基础请求转发能力。
+

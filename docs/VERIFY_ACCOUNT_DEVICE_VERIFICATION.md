@@ -161,7 +161,7 @@ stateDiagram-v2
 ### 5.3 为什么保留这些参数
 
 - **`--disable-site-isolation-trials`（保留）**：bframe 取码依赖同进程帧/隔离世界的可读性；默认启动参数中即存在（`browser_engine.py:165`），验证浏览器不做额外剔除。
-- **内存相关参数（保留）**：`--renderer-process-limit=1`、`--in-process-gpu`、`--js-flags=--max-old-space-size=128 …`、SwiftShader 等仍是容器/弱机运行所需（`browser_engine.py:156-166`）。有头模式只在操作者本机额外剔除低配机专属参数，避免指纹自相矛盾（`_build_verify_chrome_command`，`verify_account_service.py:3201-3224`）。
+- **内存相关参数（保留）**：`--renderer-process-limit=1`、`--in-process-gpu`、`--js-flags=--max-old-space-size=128 …`、SwiftShader 等仍是容器/弱机运行所需（`browser_engine.py:156-166`）。桌面平台默认有头，并自动剔除这些低配机专属参数；非桌面平台默认无头（`_build_verify_chrome_command` / `_verify_headed_enabled`）。
 
 ### 5.4 不再注入固定 UA
 
@@ -169,7 +169,7 @@ stateDiagram-v2
 
 ### 5.5 诊断开关（不是启动参数逃生口）
 
-`AISTUDIO_VERIFY_MINIMAL_FLAGS` **已在 2.1.6 移除**，不要再使用；如未来需要极简参数档，请新增独立开关，不要复活旧名（原实现见 2.1.6 之前的提交历史：`git log -S AISTUDIO_VERIFY_MINIMAL_FLAGS`）。可用的调试开关是 `AISTUDIO_VERIFY_HEADED=1`（有头实机排查，`_verify_headed_enabled`，`:3158-3163`）与 `AISTUDIO_VERIFY_DIAGNOSTICS=1`（恢复全部诊断行，`_verify_diagnostics_enabled`，`:251-260`；默认关时只保留出码就绪/会话就绪/最终结果/`VerifyUser` 非 2xx/清锁等关键行）。
+`AISTUDIO_VERIFY_MINIMAL_FLAGS` **已在 2.1.6 移除**，不要再使用；如未来需要极简参数档，请新增独立开关，不要复活旧名。当前可用的开关：`AISTUDIO_VERIFY_HEADED`（已废弃，桌面默认有头，`0` 回退无头）、`AISTUDIO_VERIFY_FORCE`（`1`/`0` 强制能力判定）与 `AISTUDIO_VERIFY_DIAGNOSTICS=1`（恢复全部诊断行）。
 
 ---
 
@@ -196,7 +196,7 @@ stateDiagram-v2
 
 ## 7. 未解问题与边界
 
-1. **不得声称「面板扫码在所有环境都已闭环」**：本次闭环证据来自 Windows 本机的有头实机对照；容器内 headless 是否同样能通过，尚未实机验证。
+1. **容器内扫码已实测不可用（2026-11-25）**：同一 Windows 主机上，有头 `VerifyUser 200 [2]`、无头 `403 [7]`；即使把无头换成有头参数集仍是 403。VPS Linux 容器即使有头（Xvfb）也 403。因此默认只在桌面平台启用扫码；Linux 返回 501 并引导到电脑端扫码。
 2. **强依赖 iOS App Clip**：通过案例来自本仓 iOS 16.4+ 真实设备的一次实测；扫码设备不受本服务控制，安卓误杀属上游行为（社区资料：大面积误杀，未在本仓逐台复现）。
 3. **`VerifyUser` 403 `[7]` 的完整触发条件未完全解耦**：已知与「浏览器环境被参数破坏」「设备侧不满足」强相关，但具体到 IP、设备指纹、令牌来路的权重尚未逐项量化。
 4. **`GenerateAccessToken` 401 `[16]` 不是判据**：它可能反映 Cookie 未被完整接受（见 changelog 2.1.6 的 Cookie 合法化条目），也可能是旁支噪声；始终以 `GetUserVerificationStatus` 的 `2/3` 为准。
@@ -206,6 +206,22 @@ stateDiagram-v2
 
 ---
 
+### 7.1 电脑端独立扫码助手（tools/verify-helper）
+
+当服务运行在没有桌面浏览器的环境（Linux 容器等）时，`verify/start` 会返回 501 并在面板展示引导。完整流程：
+
+1. 在账号菜单点「导出扫码凭证」，得到 `scan-<account_id>-<date>.json`（含完整登录 Cookie）。
+2. 把 `tools/verify-helper/verify_helper.py` 拷到自己的电脑。
+3. 在电脑上执行（需 uv）：
+
+   ```bash
+   uv run --with "websockets>=13,<16" --with "segno>=1.6,<2" verify_helper.py scan-xxx.json
+   ```
+
+4. 助手会启动**有头**浏览器（临时 profile）、注入 Cookie、先访问 `accounts.google.com` 完成会话引导，再进入 `verify-account`、点击 `Verify device`，把二维码保存为临时 `qr.png` 并自动打开，最后按页面文案报告结果。
+5. 回到面板点「直接验证账号」复查上游状态并清锁（助手本身不修改账号状态）。
+
+退出码：`0` 页面通过；`2` 设备级拒绝；`3` 环境级失败/超时；`1` 参数、凭证或浏览器错误。凭证 JSON、`qr.png` 与保留的 profile 都含敏感信息，用完请删除。
 ## 8. 引用索引
 
 | 引用 | 位置 | 用途 |
@@ -245,3 +261,5 @@ stateDiagram-v2
 | `web/src/components/modals/VerifyAccountModal.vue:864-865` | 两类按钮语义 | 面板口径 |
 | `tests/unit/test_verify_account_service.py:1242-1252` | 断言 45s 预算 | 回归保护 |
 | `tests/unit/test_verify_account_service.py:877,2996` | 断言保留 site-isolation | 回归保护 |
+
+

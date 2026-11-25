@@ -127,6 +127,28 @@ export interface VerifyAccountCheckResponse {
   verify_required: boolean
 }
 
+export interface CredentialExportCookie {
+  name: string
+  value: string
+  /** Chrome export uses ``expires``; older exports may use ``expirationDate``. */
+  expires?: number | null
+  expirationDate?: number | null
+  domain?: string
+  path?: string
+  url?: string
+  secure?: boolean
+  httpOnly?: boolean
+  sameSite?: string | number
+}
+
+export interface CredentialExportResponse {
+  version: number
+  account_id: string
+  email: string | null
+  exported_at: string
+  cookies: CredentialExportCookie[]
+}
+
 export interface BatchDeleteResponse {
   deleted: number
 }
@@ -195,3 +217,4 @@ export interface ImportBundleResponse {
   imported_count: number
   accounts: Account[]
 }
+

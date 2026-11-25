@@ -39,7 +39,7 @@ const (
 )
 
 // signerVersion 是 /health 暴露的服务版本号
-const signerVersion = "2.1.7"
+const signerVersion = "2.1.8"
 
 const (
 	// defaultMaxWorkers 是同时存活的 WAA Worker 数量上限
@@ -1520,3 +1520,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+

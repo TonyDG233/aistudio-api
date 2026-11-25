@@ -35,6 +35,21 @@ async def test_health_endpoint():
 
 
 @pytest.mark.asyncio
+async def test_system_status_includes_verify_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aistudio_api.api import routes_system
+
+    monkeypatch.setattr(
+        routes_system, "verify_capability", lambda: (False, "no-desktop")
+    )
+    async with _client() as client:
+        resp = await client.get("/api/system/status")
+    assert resp.status_code == 200
+    assert resp.json()["verify"] == {"supported": False, "reason": "no-desktop"}
+
+
+@pytest.mark.asyncio
 async def test_auth_check_endpoint():
     async with _client() as client:
         resp = await client.get("/auth/check")

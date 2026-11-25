@@ -7,7 +7,9 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import platform
+import sys
 import tempfile
 import time
 from dataclasses import fields as dataclass_fields
@@ -850,8 +852,10 @@ async def test_close_removes_temp_dir_even_when_teardown_times_out(
 
 
 def test_verify_chrome_command_has_low_memory_and_fingerprint_args(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The low-memory profile belongs to the deprecated headless path.
+    monkeypatch.setenv("AISTUDIO_VERIFY_HEADED", "0")
     command = verify_module._build_verify_chrome_command(
         binary=tmp_path / "chrome",
         port=9222,
@@ -918,6 +922,7 @@ def test_verify_chrome_command_forwards_explicit_verify_proxy(tmp_path: Path) ->
 @pytest.fixture(autouse=True)
 def _isolate_verify_headed_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AISTUDIO_VERIFY_HEADED", raising=False)
+    monkeypatch.delenv(verify_module._VERIFY_FORCE_ENV, raising=False)
 
 
 def _build_command_for_headless_mode(
@@ -935,14 +940,13 @@ def _build_command_for_headless_mode(
     )
 
 
-def test_verify_headed_flag_defaults_to_headless(
+def test_verify_headed_flag_defaults_to_headed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     command = _build_command_for_headless_mode(tmp_path, monkeypatch, None)
-    assert "--headless=new" in command
-    assert "--hide-scrollbars" in command
-    assert "--start-maximized" not in command
-    assert "--ignore-gpu-blocklist" not in command
+    assert not any(arg.startswith("--headless") for arg in command)
+    assert "--hide-scrollbars" not in command
+    assert "--window-size=1280,900" in command
 
 
 @pytest.mark.parametrize("value", ["1", "true", "YES"])
@@ -956,7 +960,7 @@ def test_verify_headed_flag_enables_headed_mode(
     assert sum(arg.startswith("--window-size=") for arg in command) == 1
 
 
-@pytest.mark.parametrize("value", ["0", "", "no"])
+@pytest.mark.parametrize("value", ["0", "no"])
 def test_verify_headed_flag_falsy_values_stay_headless(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
@@ -965,12 +969,74 @@ def test_verify_headed_flag_falsy_values_stay_headless(
     assert "--start-maximized" not in command
 
 
+def test_verify_headed_flag_empty_uses_platform_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = _build_command_for_headless_mode(tmp_path, monkeypatch, "")
+    headed = verify_module._verify_headed_enabled()
+    assert ("--headless=new" in command) is (not headed)
+
+
 def test_verify_headed_flag_keeps_window_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     command = _build_command_for_headless_mode(tmp_path, monkeypatch, "1")
     assert "--window-size=1280,900" in command
     assert sum(arg.startswith("--window-size=") for arg in command) == 1
+
+
+def _set_platform(
+    monkeypatch: pytest.MonkeyPatch, *, os_name: str, sys_platform: str
+) -> None:
+    monkeypatch.setattr(os, "name", os_name)
+    monkeypatch.setattr(sys, "platform", sys_platform)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_verify_capability_force_enables(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(verify_module._VERIFY_FORCE_ENV, value)
+    _set_platform(monkeypatch, os_name="posix", sys_platform="linux")
+    assert verify_module.verify_capability() == (True, "forced")
+
+
+@pytest.mark.parametrize("value", ["0", "false", "No"])
+def test_verify_capability_force_disables(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(verify_module._VERIFY_FORCE_ENV, value)
+    _set_platform(monkeypatch, os_name="nt", sys_platform="win32")
+    assert verify_module.verify_capability() == (False, "forced_off")
+
+
+def test_verify_capability_desktop_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_platform(monkeypatch, os_name="nt", sys_platform="win32")
+    assert verify_module.verify_capability() == (True, "desktop")
+
+
+def test_verify_capability_desktop_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_platform(monkeypatch, os_name="posix", sys_platform="darwin")
+    assert verify_module.verify_capability() == (True, "desktop")
+
+
+def test_verify_capability_linux_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_platform(monkeypatch, os_name="posix", sys_platform="linux")
+    assert verify_module.verify_capability() == (False, "no-desktop")
+
+
+def test_verify_capability_unknown_force_value_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(verify_module._VERIFY_FORCE_ENV, "maybe")
+    _set_platform(monkeypatch, os_name="posix", sys_platform="linux")
+    assert verify_module.verify_capability() == (False, "no-desktop")
 
 
 def _write_verify_auth(tmp_path: Path) -> Path:

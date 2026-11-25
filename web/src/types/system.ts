@@ -81,6 +81,11 @@ export interface HealthCheckResponse {
 export type SystemFormatKey = 'gemini' | 'openai' | 'claude' | 'responses'
 export type SystemFormats = Record<SystemFormatKey, boolean>
 
+export interface VerifyCapabilityStatus {
+  supported: boolean
+  reason?: string | null
+}
+
 export interface SystemStatusResponse {
   status: string
   busy: boolean
@@ -90,6 +95,7 @@ export interface SystemStatusResponse {
   instances?: number
   formats?: SystemFormats
   default_text_model?: string
+  verify?: VerifyCapabilityStatus
   engine?: string
   engine_phase?: string
   engine_target?: string

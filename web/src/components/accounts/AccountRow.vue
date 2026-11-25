@@ -19,10 +19,14 @@ import {
   Play,
   ScanLine,
   ShieldAlert,
+  Download,
 } from 'lucide-vue-next'
+import { accountsApi } from '@/api/accounts.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useInstancesStore } from '@/stores/instances.ts'
+import { useToastStore } from '@/stores/toast.ts'
 import { accountStatus } from '@/utils/accountStatus.ts'
+import { downloadCredentialJson, scanCredentialFilename } from '@/utils/credentialExport.ts'
 import { instanceStateLabel, instanceStateTone, tierShortLabel } from '@/utils/instances.ts'
 
 const props = defineProps<{
@@ -64,10 +68,12 @@ const todayRequests = computed(() => {
 
 const accountsStore = useAccountsStore()
 const instancesStore = useInstancesStore()
+const toast = useToastStore()
 const detectingTier = ref(false)
 const togglingEnabled = ref(false)
 const editingGroup = ref(false)
 const groupInput = ref('')
+const exportingCredential = ref(false)
 
 const status = computed(() =>
   accountStatus(props.account, instancesStore.instances, accountsStore.activeId),
@@ -152,6 +158,24 @@ async function handleDetectTier() {
 async function handleRefresh() {
   if (refreshing.value) return
   await accountsStore.refreshAccount(props.account.id)
+}
+
+async function handleExportCredential() {
+  if (exportingCredential.value) return
+  const confirmed = confirm(
+    '导出文件包含该账号的完整登录凭据，拿到文件的人可直接登录该账号。请仅在本机使用，用完立即删除。是否继续？',
+  )
+  if (!confirmed) return
+  exportingCredential.value = true
+  try {
+    const payload = await accountsApi.exportCredential(props.account.id)
+    downloadCredentialJson(payload, scanCredentialFilename(props.account.id))
+    toast.success('扫码凭证已导出')
+  } catch (err: unknown) {
+    toast.error(err instanceof Error && err.message ? err.message : '导出扫码凭证失败')
+  } finally {
+    exportingCredential.value = false
+  }
 }
 </script>
 
@@ -401,6 +425,22 @@ async function handleRefresh() {
           >
             <ScanLine class="w-3 h-3" />
             <span>验证</span>
+          </button>
+
+          <!-- 导出扫码凭证（供桌面端 verify-helper 使用） -->
+          <button
+            v-if="isVerifyRequired"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            title="导出该账号的扫码凭证 JSON（含完整登录凭据，仅本机使用）"
+            :disabled="exportingCredential"
+            @click="handleExportCredential"
+          >
+            <Download
+              class="w-3 h-3"
+              :class="{ 'animate-pulse': exportingCredential }"
+            />
+            <span>{{ exportingCredential ? '导出中…' : '导出扫码凭证' }}</span>
           </button>
 
           <button

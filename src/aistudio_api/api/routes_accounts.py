@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -37,6 +38,7 @@ from aistudio_api.application.verify_account_service import (
     VerifySessionConflict,
     VerifySessionNotFound,
     get_verify_account_service,
+    verify_capability,
 )
 from aistudio_api.infrastructure.account.account_info_refresher import (
     AccountInfoRefresher,
@@ -587,6 +589,14 @@ class VerifyCheckResponse(BaseModel):
     message: str
     upstream_status: int | None = None
     verify_required: bool = False
+
+
+class CredentialExportResponse(BaseModel):
+    version: int = 1
+    account_id: str
+    email: str | None = None
+    exported_at: str
+    cookies: list[dict[str, Any]]
 
 
 class RefreshAccountsRequest(BaseModel):
@@ -1255,9 +1265,23 @@ async def detect_account_tier(
 async def start_account_verification(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
     controller: VerifyAccountController = Depends(get_verify_account_controller),
 ) -> VerifySessionResponse:
     """启动单账号扫码验证会话（全局同一时间只允许一个）。"""
+    # The ui-debug sandbox fakes the whole browser flow, so the host capability
+    # gate must not apply there (CI/UI review runs on Linux).
+    if get_ui_sandbox(runtime_state) is None:
+        supported, _reason = verify_capability()
+        if not supported:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "服务所在环境无法完成扫码验证（没有可用的桌面浏览器）。"
+                    "请在电脑上运行本服务扫码；或在账号菜单导出扫码凭证，"
+                    "在电脑端用 verify-helper 扫码后回来点「直接验证账号」复查。"
+                ),
+            )
     if account_service.get_account(account_id) is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     try:
@@ -1369,6 +1393,56 @@ async def check_account_verification(
         payload.get("upstream_status"),
     )
     return VerifyCheckResponse.model_validate(payload)
+
+
+@router.post("/{account_id}/credential-export", response_model=CredentialExportResponse)
+async def export_account_credential(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    account_service: AccountService = Depends(get_account_service),
+) -> CredentialExportResponse:
+    """导出该账号的扫码凭证（只读透传 auth.json 的 cookies 数组）。"""
+    from aistudio_api.config import settings
+
+    export_opt_in = (
+        os.environ.get("AISTUDIO_ALLOW_CREDENTIAL_EXPORT", "").strip().lower()
+    )
+    if not settings.auth_enabled and export_opt_in not in {"1", "true", "yes"}:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "导出扫码凭证需要先设置管理密码（AISTUDIO_WEB_PASSWORD）；"
+                "否则无鉴权端口可被直接读取登录凭据"
+            ),
+        )
+    account = account_service.get_account(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    auth_path = account_service.get_account_auth_path(account_id)
+    if auth_path is None or not auth_path.is_file():
+        raise HTTPException(status_code=404, detail="账号凭据文件不存在")
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="账号凭据文件不存在") from exc
+    except json.JSONDecodeError as exc:
+        log.warning("账号凭据文件格式损坏: id=%s", account_id)
+        raise HTTPException(status_code=500, detail="账号凭据文件格式损坏") from exc
+    raw_cookies = raw.get("cookies") if isinstance(raw, dict) else None
+    cookies = (
+        [item for item in raw_cookies if isinstance(item, dict)]
+        if isinstance(raw_cookies, list)
+        else []
+    )
+    if not cookies:
+        raise HTTPException(status_code=409, detail="账号凭据不含可用 Cookie")
+    log.info("账号凭证导出: id=%s, cookies=%d", account_id, len(cookies))
+    return CredentialExportResponse(
+        version=1,
+        account_id=account.id,
+        email=account.email,
+        exported_at=datetime.now(UTC).isoformat(),
+        cookies=cookies,
+    )
 
 
 @router.delete("/{account_id}")

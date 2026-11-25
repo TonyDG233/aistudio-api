@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -13,7 +15,7 @@ from aistudio_api.api.app import app
 from aistudio_api.api.routes_accounts import _account_status, to_account_response
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_service import AccountService
-from aistudio_api.infrastructure.account.account_store import AccountMeta
+from aistudio_api.infrastructure.account.account_store import AccountMeta, AccountStore
 
 
 @pytest.fixture(autouse=True)
@@ -257,3 +259,110 @@ def test_account_response_verify_required_defaults_false():
     assert response.verify_required is False
     assert response.session_expired is False
     assert response.is_available is True
+
+
+_EXPORT_COOKIES: list[dict[str, object]] = [
+    {
+        "name": "SAPISID",
+        "value": "secret-sapisid-value",
+        "domain": ".google.com",
+        "path": "/",
+        "secure": True,
+        "httpOnly": True,
+        "sameSite": "None",
+        "expirationDate": 1893456000.0,
+    },
+    {
+        "name": "SID",
+        "value": "secret-sid-value",
+        "domain": ".google.com",
+        "path": "/",
+        "secure": True,
+        "httpOnly": False,
+        "sameSite": "Lax",
+        "expirationDate": 1893456000.0,
+    },
+]
+
+
+def _export_store(tmp_path: Path) -> AccountStore:
+    store = AccountStore(tmp_path / "accounts")
+    store.save_account(
+        name="Export",
+        email="export@example.com",
+        storage_state={"cookies": _EXPORT_COOKIES, "origins": []},
+        account_id="acc_export",
+        auth_user="0",
+        tier="Free",
+    )
+    return store
+
+
+@pytest.mark.asyncio
+async def test_credential_export_passes_cookies_through(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AISTUDIO_ALLOW_CREDENTIAL_EXPORT", "1")
+    caplog.set_level(logging.INFO, logger="aistudio.accounts")
+    store = _export_store(tmp_path)
+    saved_service = runtime_state.account_service
+    runtime_state.account_service = AccountService(store)
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/accounts/acc_export/credential-export")
+    finally:
+        runtime_state.account_service = saved_service
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["version"] == 1
+    assert payload["account_id"] == "acc_export"
+    assert payload["email"] == "export@example.com"
+    assert isinstance(payload["exported_at"], str)
+    assert payload["cookies"] == _EXPORT_COOKIES
+    audit = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "aistudio.accounts" and "凭证导出" in record.getMessage()
+    ]
+    assert audit == ["账号凭证导出: id=acc_export, cookies=2"]
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "secret-sapisid-value" not in message
+        assert "secret-sid-value" not in message
+        assert "SAPISID" not in message
+
+
+@pytest.mark.asyncio
+async def test_credential_export_missing_account_returns_404(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AISTUDIO_ALLOW_CREDENTIAL_EXPORT", "1")
+    store = _export_store(tmp_path)
+    saved_service = runtime_state.account_service
+    runtime_state.account_service = AccountService(store)
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/accounts/acc_missing/credential-export")
+    finally:
+        runtime_state.account_service = saved_service
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_credential_export_missing_auth_file_returns_404(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AISTUDIO_ALLOW_CREDENTIAL_EXPORT", "1")
+    store = _export_store(tmp_path)
+    auth_path = store.get_auth_path_optional("acc_export")
+    assert auth_path is not None
+    auth_path.unlink()
+    saved_service = runtime_state.account_service
+    runtime_state.account_service = AccountService(store)
+    try:
+        async with _client() as client:
+            resp = await client.post("/api/accounts/acc_export/credential-export")
+    finally:
+        runtime_state.account_service = saved_service
+    assert resp.status_code == 404

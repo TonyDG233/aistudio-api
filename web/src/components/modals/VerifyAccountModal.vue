@@ -5,6 +5,7 @@ import { ApiError } from '@/api/client.ts'
 import { accountsApi } from '@/api/accounts.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useToastStore } from '@/stores/toast.ts'
+import { scanFlowButtonState, shouldOpenScanFlow } from '@/utils/verifySupport.ts'
 import type { AccountWithStats, VerifySessionResponse, VerifyState } from '@/types/accounts.ts'
 import {
   AlertCircle,
@@ -18,10 +19,25 @@ import {
   X,
 } from 'lucide-vue-next'
 
-const props = defineProps<{
-  modelValue: boolean
-  account: AccountWithStats | null
-}>()
+const props = withDefaults(
+  defineProps<{
+    modelValue: boolean
+    account: AccountWithStats | null
+    verifySupported?: boolean
+    verifyReason?: string | null
+  }>(),
+  {
+    verifySupported: true,
+    verifyReason: null,
+  },
+)
+
+const unsupportedReasonText = computed(() => {
+  if (props.verifyReason === 'forced_off') {
+    return '本机已通过 AISTUDIO_VERIFY_FORCE=0 关闭扫码验证。'
+  }
+  return '当前服务运行在没有桌面浏览器的环境（例如 Linux 容器），无法生成可用的扫码二维码。'
+})
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -82,8 +98,7 @@ let openedFor: string | null = null
 let startAbort: AbortController | null = null
 let closeHandled = false
 let cancelSettled = false
-
-const isPending = computed(() => phase.value === 'pending')
+let startAttempted = false
 
 const startingElapsed = computed(() => {
   if (!flowStartedAt.value) return 0
@@ -214,6 +229,15 @@ const toneClass = computed(() => {
 })
 
 const showQr = computed(() => phase.value === 'pending' && Boolean(qrUrl.value))
+
+const scanButtons = computed(() =>
+  scanFlowButtonState(
+    props.verifySupported,
+    phase.value,
+    busy.value,
+    checking.value,
+  ),
+)
 
 function maskEmail(email?: string | null): string {
   if (!email) return '未记录邮箱'
@@ -351,6 +375,7 @@ function describeError(err: unknown): string {
 
 async function startSession(): Promise<void> {
   if (!props.account) return
+  if (!shouldOpenScanFlow(props.verifySupported)) return
   const token = ++flowToken
   const accountId = props.account.id
   resetSession()
@@ -363,6 +388,7 @@ async function startSession(): Promise<void> {
     timedOut = true
     controller.abort()
   }, START_TIMEOUT_MS)
+  startAttempted = true
   try {
     const res = await accountsApi.startVerify(accountId, controller.signal)
     if (token !== flowToken || !props.modelValue) {
@@ -381,6 +407,8 @@ async function startSession(): Promise<void> {
       errorText.value = '验证浏览器启动超时（已等待 75 秒），请点击「刷新二维码」重试'
     } else if (err instanceof ApiError && err.status === 503) {
       errorText.value = detail || '验证浏览器不可用，请稍后重试'
+    } else if (err instanceof ApiError && err.status === 501) {
+      errorText.value = detail || '服务所在环境无法完成扫码验证'
     } else if (err instanceof ApiError && err.status === 409) {
       errorText.value = detail || '已有其它账号的验证会话正在进行，请先取消或等待结束'
     } else if (err instanceof ApiError && err.status === 404) {
@@ -449,6 +477,7 @@ async function pollStatus(manual = false): Promise<void> {
 
 async function cancelSession(accountId?: string): Promise<void> {
   abortStart()
+  if (!startAttempted || cancelSettled) return
   const id = accountId ?? props.account?.id
   const sid = sessionId.value
   sessionId.value = ''
@@ -539,7 +568,7 @@ async function closeModal(): Promise<void> {
   }
   const id = props.account?.id
   sessionId.value = ''
-  if (id && !cancelSettled) {
+  if (shouldOpenScanFlow(props.verifySupported) && startAttempted && id && !cancelSettled) {
     cancelSettled = true
     void accountsApi.cancelVerify(id).catch(() => {
       // fire-and-forget；关闭弹窗不等待
@@ -564,7 +593,7 @@ function startTicker(): void {
 }
 
 async function refreshQr(): Promise<void> {
-  if (busy.value) return
+  if (busy.value || !shouldOpenScanFlow(props.verifySupported)) return
   stopTimers()
   await cancelSession()
   startTicker()
@@ -575,6 +604,12 @@ async function openFlow(): Promise<void> {
   stopTimers()
   resetAccountCheck()
   resetSession()
+  if (!shouldOpenScanFlow(props.verifySupported)) {
+    // Guide mode: never launch a QR session on unsupported hosts.
+    phase.value = 'idle'
+    busy.value = false
+    return
+  }
   startTicker()
   await startSession()
 }
@@ -601,7 +636,7 @@ watch(
       openedFor = null
       stopTimers()
       flowToken += 1
-      if (!closeHandled) {
+      if (!closeHandled && shouldOpenScanFlow(props.verifySupported)) {
         void cancelSession()
       }
       closeHandled = false
@@ -610,6 +645,7 @@ watch(
       return
     }
     if (!accountId) return
+    startAttempted = false
     // Guard against duplicate triggers within the same open session (both props
     // may change in one tick) so only one start request ever reaches the backend.
     if (openedFor === accountId) return
@@ -636,7 +672,7 @@ watch(qrUrl, (url) => {
 onBeforeUnmount(() => {
   stopTimers()
   if (copyTimer) clearTimeout(copyTimer)
-  if (!cancelSettled) void cancelSession()
+  if (!cancelSettled && shouldOpenScanFlow(props.verifySupported)) void cancelSession()
 })
 </script>
 
@@ -650,8 +686,15 @@ onBeforeUnmount(() => {
       <div class="flex items-start justify-between gap-3 px-5 py-4 border-b border-gray-100">
         <div class="min-w-0">
           <h3 class="font-bold text-gray-900 text-base flex items-center gap-2">
-            <QrCode class="w-4 h-4 text-amber-600" />
-            <span>扫码验证账号</span>
+            <QrCode
+              v-if="verifySupported"
+              class="w-4 h-4 text-amber-600"
+            />
+            <AlertCircle
+              v-else
+              class="w-4 h-4 text-amber-600"
+            />
+            <span>{{ verifySupported ? '扫码验证账号' : '服务所在环境无法完成扫码验证' }}</span>
           </h3>
           <p class="mt-1 text-[11px] text-gray-500 font-mono truncate">
             {{ maskEmail(account?.email) }} · u/{{ account?.auth_user || '0' }} ·
@@ -670,45 +713,67 @@ onBeforeUnmount(() => {
 
       <!-- Body -->
       <div class="px-5 py-4 space-y-4 overflow-y-auto">
-        <!-- Status row -->
-        <div
-          class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl border text-xs font-semibold"
-          :class="toneClass"
-        >
-          <span class="inline-flex items-center gap-1.5">
-            <Loader2
-              v-if="phase === 'starting'"
-              class="w-3.5 h-3.5 animate-spin"
-            />
-            <CheckCircle2
-              v-else-if="phase === 'passed'"
-              class="w-3.5 h-3.5"
-            />
-            <AlertCircle
-              v-else-if="phase === 'failed' || phase === 'error' || phase === 'region_blocked' || phase === 'session_invalid'"
-              class="w-3.5 h-3.5"
-            />
-            <span
-              v-else
-              class="w-2 h-2 rounded-full bg-current"
-            />
-            <span>{{ phaseLabel }}</span>
-          </span>
-          <span
-            v-if="phase === 'pending'"
-            class="font-mono text-[11px] font-medium"
+        <template v-if="verifySupported">
+          <!-- Status row -->
+          <div
+            class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl border text-xs font-semibold"
+            :class="toneClass"
           >
-            剩余 {{ remainingLabel }}
-          </span>
-        </div>
+            <span class="inline-flex items-center gap-1.5">
+              <Loader2
+                v-if="phase === 'starting'"
+                class="w-3.5 h-3.5 animate-spin"
+              />
+              <CheckCircle2
+                v-else-if="phase === 'passed'"
+                class="w-3.5 h-3.5"
+              />
+              <AlertCircle
+                v-else-if="phase === 'failed' || phase === 'error' || phase === 'region_blocked' || phase === 'session_invalid'"
+                class="w-3.5 h-3.5"
+              />
+              <span
+                v-else
+                class="w-2 h-2 rounded-full bg-current"
+              />
+              <span>{{ phaseLabel }}</span>
+            </span>
+            <span
+              v-if="phase === 'pending'"
+              class="font-mono text-[11px] font-medium"
+            >
+              剩余 {{ remainingLabel }}
+            </span>
+          </div>
 
-        <!-- Last check hint -->
-        <p
-          v-if="(phase === 'starting' || phase === 'pending') && lastCheckedLabel"
-          class="-mt-2 text-[11px] text-gray-500"
+          <!-- Last check hint -->
+          <p
+            v-if="(phase === 'starting' || phase === 'pending') && lastCheckedLabel"
+            class="-mt-2 text-[11px] text-gray-500"
+          >
+            上次检查 {{ lastCheckedLabel }} · {{ statusHint }}
+          </p>
+        </template>
+
+        <!-- 不支持扫码的引导模式：不渲染二维码区域 -->
+        <div
+          v-else
+          class="space-y-3"
         >
-          上次检查 {{ lastCheckedLabel }} · {{ statusHint }}
-        </p>
+          <div class="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 leading-relaxed">
+            {{ unsupportedReasonText }}
+          </div>
+          <ol class="list-decimal pl-5 space-y-1.5 text-xs text-gray-700 leading-relaxed">
+            <li>在账号菜单点「导出扫码凭证」，得到该账号的 JSON 文件；</li>
+            <li>把仓库里的 <code class="font-mono">tools/verify-helper/verify_helper.py</code> 拷到电脑；</li>
+            <li>
+              在电脑上执行
+              <code class="font-mono break-all">uv run --with websockets --with segno verify_helper.py scan-账号.json</code>，
+              用手机扫生成的二维码；
+            </li>
+            <li>回到这里点「直接验证账号」复查并清锁。</li>
+          </ol>
+        </div>
 
         <!-- 账号真实状态（独立于扫码会话，无需二维码） -->
         <div
@@ -762,102 +827,107 @@ onBeforeUnmount(() => {
             v-else
             class="leading-relaxed opacity-80"
           >
-            尚未查询。点击「查询账号状态」可直接获取账号在 Google 上游的真实状态，无需二维码。
+            尚未查询。点击「{{ verifySupported ? '查询账号状态' : '直接验证账号' }}」可直接获取账号在 Google 上游的真实状态，无需二维码。
           </p>
         </div>
 
-        <!-- QR / skeleton -->
-        <div
-          v-if="phase === 'starting' || busy"
-          class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-dashed border-amber-300 bg-amber-50/50 flex flex-col items-center justify-center gap-2 px-4 text-center text-amber-700"
-        >
-          <Loader2 class="w-6 h-6 animate-spin" />
-          <span class="text-xs leading-relaxed">正在启动验证浏览器（首次约 20-30 秒）…</span>
-          <span
-            v-if="startingElapsed > 0"
-            class="font-mono text-[11px] text-amber-600"
-          >已等待 {{ startingElapsed }} 秒</span>
-        </div>
+        <template v-if="verifySupported">
+          <!-- QR / skeleton -->
+          <div
+            v-if="phase === 'starting' || busy"
+            class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-dashed border-amber-300 bg-amber-50/50 flex flex-col items-center justify-center gap-2 px-4 text-center text-amber-700"
+          >
+            <Loader2 class="w-6 h-6 animate-spin" />
+            <span class="text-xs leading-relaxed">正在启动验证浏览器（首次约 20-30 秒）…</span>
+            <span
+              v-if="startingElapsed > 0"
+              class="font-mono text-[11px] text-amber-600"
+            >已等待 {{ startingElapsed }} 秒</span>
+          </div>
 
-        <div
-          v-else-if="showQr"
-          class="space-y-3"
-        >
-          <div class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-gray-200 bg-white p-2 flex items-center justify-center">
-            <img
-              v-if="qrDataUrl"
-              :src="qrDataUrl"
-              alt="Google 扫码验证二维码"
-              class="w-full h-full object-contain"
-            >
+          <div
+            v-else-if="showQr"
+            class="space-y-3"
+          >
+            <div class="mx-auto w-56 sm:w-64 aspect-square rounded-2xl border border-gray-200 bg-white p-2 flex items-center justify-center">
+              <img
+                v-if="qrDataUrl"
+                :src="qrDataUrl"
+                alt="Google 扫码验证二维码"
+                class="w-full h-full object-contain"
+              >
+              <div
+                v-else
+                class="text-center text-[11px] text-gray-500 px-3 space-y-2"
+              >
+                <QrCode class="w-8 h-8 text-gray-300 mx-auto" />
+                <p>二维码图片渲染失败，可点击下方短码或链接继续验证。</p>
+                <a
+                  :href="qrUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="inline-block text-brand-600 hover:underline break-all"
+                >{{ qrUrl }}</a>
+              </div>
+            </div>
+
+            <p class="text-center text-xs text-gray-500 leading-relaxed">
+              用手机相机扫描二维码，并按手机上的提示完成 Google 移动设备验证。
+            </p>
+
             <div
-              v-else
-              class="text-center text-[11px] text-gray-500 px-3 space-y-2"
+              v-if="shortCode"
+              class="flex items-center justify-center gap-2 text-xs"
             >
-              <QrCode class="w-8 h-8 text-gray-300 mx-auto" />
-              <p>二维码图片渲染失败，可点击下方短码或链接继续验证。</p>
-              <a
-                :href="qrUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="inline-block text-brand-600 hover:underline break-all"
-              >{{ qrUrl }}</a>
+              <span class="text-gray-500">短码</span>
+              <code class="px-2 py-1 rounded-lg bg-gray-100 border border-gray-200 font-mono font-semibold tracking-wider text-gray-800 select-all">{{ shortCode }}</code>
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium text-gray-600 bg-white border border-gray-200 hover:bg-gray-50 transition-colors cursor-pointer"
+                title="复制短码"
+                @click="copyShortCode"
+              >
+                <Check
+                  v-if="copied"
+                  class="w-3 h-3 text-emerald-600"
+                />
+                <Copy
+                  v-else
+                  class="w-3 h-3"
+                />
+                <span>{{ copied ? '已复制' : '复制' }}</span>
+              </button>
             </div>
           </div>
 
-          <p class="text-center text-xs text-gray-500 leading-relaxed">
-            用手机相机扫描二维码，并按手机上的提示完成 Google 移动设备验证。
-          </p>
-
+          <!-- Passed -->
           <div
-            v-if="shortCode"
-            class="flex items-center justify-center gap-2 text-xs"
+            v-else-if="phase === 'passed'"
+            class="rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-6 text-center space-y-2"
           >
-            <span class="text-gray-500">短码</span>
-            <code class="px-2 py-1 rounded-lg bg-gray-100 border border-gray-200 font-mono font-semibold tracking-wider text-gray-800 select-all">{{ shortCode }}</code>
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium text-gray-600 bg-white border border-gray-200 hover:bg-gray-50 transition-colors cursor-pointer"
-              title="复制短码"
-              @click="copyShortCode"
-            >
-              <Check
-                v-if="copied"
-                class="w-3 h-3 text-emerald-600"
-              />
-              <Copy
-                v-else
-                class="w-3 h-3"
-              />
-              <span>{{ copied ? '已复制' : '复制' }}</span>
-            </button>
+            <CheckCircle2 class="w-10 h-10 text-emerald-600 mx-auto" />
+            <p class="text-sm font-semibold text-emerald-900">
+              验证通过
+            </p>
+            <p class="text-xs text-emerald-700">
+              账号已恢复调度，弹窗将在 2 秒后自动关闭。
+            </p>
           </div>
-        </div>
 
-        <!-- Passed -->
-        <div
-          v-else-if="phase === 'passed'"
-          class="rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-6 text-center space-y-2"
+          <!-- Terminal failure detail -->
+          <div
+            v-else-if="phase !== 'idle'"
+            class="rounded-2xl border px-4 py-3 text-xs leading-relaxed"
+            :class="toneClass"
+          >
+            {{ errorText || phaseDetail }}
+          </div>
+        </template>
+
+        <p
+          v-if="verifySupported"
+          class="text-[11px] text-gray-400 leading-relaxed"
         >
-          <CheckCircle2 class="w-10 h-10 text-emerald-600 mx-auto" />
-          <p class="text-sm font-semibold text-emerald-900">
-            验证通过
-          </p>
-          <p class="text-xs text-emerald-700">
-            账号已恢复调度，弹窗将在 2 秒后自动关闭。
-          </p>
-        </div>
-
-        <!-- Terminal failure detail -->
-        <div
-          v-else-if="phase !== 'idle'"
-          class="rounded-2xl border px-4 py-3 text-xs leading-relaxed"
-          :class="toneClass"
-        >
-          {{ errorText || phaseDetail }}
-        </div>
-
-        <p class="text-[11px] text-gray-400 leading-relaxed">
           ⓘ 验证成功后账号会自动恢复调度；二维码过期或失效时请点击「刷新二维码」。
           弹窗打开且处于等待状态时会每 2.5 秒自动查询一次结果。
           「检查扫码状态」只看当前扫码会话；「查询账号状态」直接查账号在 Google 上游的真实状态，
@@ -871,7 +941,8 @@ onBeforeUnmount(() => {
           v-if="phase !== 'passed'"
           type="button"
           class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          :disabled="busy"
+          :title="scanButtons.refreshTitle"
+          :disabled="scanButtons.refreshDisabled"
           @click="refreshQr"
         >
           <RefreshCw
@@ -895,13 +966,13 @@ onBeforeUnmount(() => {
             v-else
             class="w-3.5 h-3.5"
           />
-          <span>{{ checkingAccount ? '查询中…' : '查询账号状态' }}</span>
+          <span>{{ checkingAccount ? '查询中…' : scanButtons.primaryLabel }}</span>
         </button>
         <button
           type="button"
           class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white hover:bg-gray-50 border border-gray-200 rounded-lg transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          title="仅检查当前扫码会话的验证结果，需要二维码会话已创建"
-          :disabled="!isPending || checking || busy"
+          :title="scanButtons.checkTitle"
+          :disabled="scanButtons.checkDisabled"
           @click="pollStatus(true)"
         >
           <Loader2
@@ -926,3 +997,6 @@ onBeforeUnmount(() => {
     </div>
   </div>
 </template>
+
+
+

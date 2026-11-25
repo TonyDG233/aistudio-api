@@ -64,6 +64,14 @@ def _client() -> httpx.AsyncClient:
     )
 
 
+@pytest.fixture(autouse=True)
+def _force_verify_capability_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the route contract platform-independent; one test forces the off state."""
+    monkeypatch.setenv("AISTUDIO_VERIFY_FORCE", "1")
+
+
 def _add_account(store: AccountStore, account_id: str, *, enabled: bool = True) -> None:
     store.save_account(
         name=account_id,
@@ -196,6 +204,19 @@ async def test_verify_start_unknown_account_and_session(
             params={"session_id": "verify_missing"},
         )
         assert status.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_verify_start_rejects_unsupported_platform(
+    verify_route_env: RouteEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AISTUDIO_VERIFY_FORCE", "0")
+    async with _client() as client:
+        resp = await client.post("/api/accounts/acc_1/verify/start")
+    assert resp.status_code == 501
+    assert "无法完成扫码验证" in resp.json()["error"]["message"]
+    assert verify_route_env.drivers == []
+    assert verify_route_env.service.session is None
 
 
 @pytest.mark.asyncio

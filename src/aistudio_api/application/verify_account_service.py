@@ -39,6 +39,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -3368,16 +3369,53 @@ def _read_auth_cookies(auth_file: Path) -> dict[str, str]:
     return cookies_for_google_rpc(raw)
 
 
+_VERIFY_FORCE_ENV = "AISTUDIO_VERIFY_FORCE"
+_VERIFY_FORCE_TRUTHY = frozenset({"1", "true", "yes"})
+_VERIFY_FORCE_FALSY = frozenset({"0", "false", "no"})
+# Deprecated override: the verify browser is headed by default now.  The env
+# variable is kept (documented as deprecated) for future reCAPTCHA research;
+# only an explicit 0/false/no falls back to headless.
 _VERIFY_HEADED_ENV = "AISTUDIO_VERIFY_HEADED"
 _VERIFY_HEADED_TRUTHY = frozenset({"1", "true", "yes"})
+_VERIFY_HEADED_FALSY = frozenset({"0", "false", "no"})
+
+
+def verify_capability() -> tuple[bool, str]:
+    """Whether this host can run the QR device-verification browser.
+
+    ``AISTUDIO_VERIFY_FORCE=1/true/yes`` forces support and ``0/false/no``
+    forces unsupported (both report ``forced*``); otherwise only a desktop OS
+    (Windows/macOS) is supported.  Linux hosts are unsupported by default: the
+    in-container verification flow has never been observed to complete (see
+    ``docs/VERIFY_ACCOUNT_DEVICE_VERIFICATION.md`` §7).
+    """
+    raw = os.environ.get(_VERIFY_FORCE_ENV)
+    if raw is not None:
+        normalized = raw.strip().lower()
+        if normalized in _VERIFY_FORCE_TRUTHY:
+            return True, "forced"
+        if normalized in _VERIFY_FORCE_FALSY:
+            return False, "forced_off"
+    if os.name == "nt" or sys.platform == "darwin":
+        return True, "desktop"
+    return False, "no-desktop"
 
 
 def _verify_headed_enabled() -> bool:
-    """Read ``AISTUDIO_VERIFY_HEADED`` at call time (1/true/yes, case-insensitive)."""
+    """Read the deprecated ``AISTUDIO_VERIFY_HEADED`` override at call time.
+
+    On a desktop OS headed is the default and only an explicit 0/false/no
+    disables it.  On non-desktop hosts the default stays headless; setting the
+    variable to 1/true/yes still forces headed for future reCAPTCHA research.
+    """
     raw = os.environ.get(_VERIFY_HEADED_ENV)
-    if raw is None:
-        return False
-    return raw.strip().lower() in _VERIFY_HEADED_TRUTHY
+    if raw is not None:
+        normalized = raw.strip().lower()
+        if normalized in _VERIFY_HEADED_FALSY:
+            return False
+        if normalized in _VERIFY_HEADED_TRUTHY:
+            return True
+    return os.name == "nt" or sys.platform == "darwin"
 
 
 def _build_verify_chrome_command(
