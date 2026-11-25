@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 """独立扫码助手：在本机有头浏览器里完成 AI Studio 账号的 Verify device 流程。
 
 用法：uv run --with "websockets>=13,<16" --with "segno>=1.6,<2" verify_helper.py scan-xxx.json
@@ -21,6 +22,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any, NoReturn
 
 try:
     import segno
@@ -31,8 +33,9 @@ except ImportError as exc:
     ) from exc
 
 for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+    _reconfigure: Any = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8", errors="replace")
 
 VERIFY_URL = "https://aistudio.google.com/verify-account"
 BOOTSTRAP_URL = "https://accounts.google.com/"
@@ -238,13 +241,14 @@ def _browser_ws_url(port: int, proc: subprocess.Popen, deadline: float) -> str:
                     return ws
         with contextlib.suppress(Exception):
             created = _http_json(f"{base}/json/new?about:blank", 2.0, "PUT")
-            return str(created["webSocketDebuggerUrl"])
+            if isinstance(created, dict):
+                return str(created["webSocketDebuggerUrl"])
         time.sleep(0.25)
     raise HelperError("等待浏览器 DevTools 端口超时（30 秒）。")
 
 
 class CDP:
-    def __init__(self, ws: object) -> None:
+    def __init__(self, ws: Any) -> None:
         """保存 WebSocket 与自增请求 id。"""
         self.ws, self.next_id = ws, 0
 
@@ -370,17 +374,16 @@ def read_qr_code(cdp: CDP, worlds: dict[str, int]) -> str | None:
         context_id = worlds.get(frame_id)
         if context_id is None:
             try:
-                context_id = int(
-                    cdp.send(
-                        "Page.createIsolatedWorld",
-                        {
-                            "frameId": frame_id,
-                            "worldName": "verify_helper_qr",
-                            "grantUniveralAccess": True,
-                        },
-                        timeout=5.0,
-                    )["executionContextId"]
-                )
+                raw_context = cdp.send(
+                    "Page.createIsolatedWorld",
+                    {
+                        "frameId": frame_id,
+                        "worldName": "verify_helper_qr",
+                        "grantUniveralAccess": True,
+                    },
+                    timeout=5.0,
+                ).get("executionContextId")
+                context_id = int(str(raw_context))
                 worlds[frame_id] = context_id
             except (HelperError, KeyError, TypeError):
                 continue
@@ -532,7 +535,7 @@ def _cleanup_stale_profiles() -> None:
 class _ArgumentParser(argparse.ArgumentParser):
     """Argparse that reserves exit code 2 for device-level failures."""
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         print(f"[错误] {message}", file=sys.stderr)
         raise SystemExit(1)
 
