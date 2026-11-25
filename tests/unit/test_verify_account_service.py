@@ -572,11 +572,15 @@ class _FakeCdp:
     def __init__(self, owner: _FakeQrPage) -> None:
         self._owner = owner
         self.send_calls: list[str] = []
+        self.input_events: list[dict[str, object]] = []
 
     async def send(
         self, method: str, params: dict[str, object] | None = None
     ) -> dict[str, object]:
         self.send_calls.append(method)
+        if method == "Input.dispatchMouseEvent":
+            self.input_events.append(dict(params or {}))
+            return {}
         if method == "Page.getFrameTree":
             return {
                 "frameTree": {
@@ -619,10 +623,12 @@ class _FakeQrPage:
         fail_first_evaluate: bool = False,
         qr_after_click: bool = False,
         disabled_attempts: int = 0,
+        button_box: dict[str, object] | None = None,
     ) -> None:
         self.fail_first_evaluate = fail_first_evaluate
         self.qr_after_click = qr_after_click
         self.disabled_attempts = disabled_attempts
+        self.button_box = button_box
         self.worlds = 0
         self.evaluate_calls = 0
         self.click_attempts = 0
@@ -633,6 +639,13 @@ class _FakeQrPage:
         del args, kwargs
         if "window.location.href" in expression:
             return _VERIFY_URL
+        if "getBoundingClientRect" in expression:
+            return self.button_box or {
+                "found": True,
+                "clickable": True,
+                "x": 120,
+                "y": 240,
+            }
         if "verify device" in expression:
             self.click_attempts += 1
             # The in-page predicate finds only a disabled node for the first
@@ -656,6 +669,28 @@ def test_click_verify_device_js_filters_disabled_buttons() -> None:
     assert js.index("if (!match) return false;") < js.index("match.click()")
 
 
+@pytest.mark.asyncio
+async def test_verify_button_click_uses_trusted_mouse_events() -> None:
+    page = _FakeQrPage()
+    assert await verify_module._click_verify_device(page) is True  # type: ignore[arg-type]
+    # A trusted click must be a real Input event, not an isTrusted=false el.click().
+    assert page.clicked is False
+    types = [event.get("type") for event in page.cdp.input_events]
+    assert types == ["mouseMoved", "mousePressed", "mouseReleased"]
+    pressed = page.cdp.input_events[1]
+    assert (pressed["x"], pressed["y"]) == (120, 240)
+    assert pressed["button"] == "left"
+    assert pressed["clickCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_button_click_falls_back_when_box_is_hidden() -> None:
+    page = _FakeQrPage(button_box={"found": True, "clickable": False})
+    assert await verify_module._click_verify_device(page) is True  # type: ignore[arg-type]
+    assert page.clicked is True
+    assert page.cdp.input_events == []
+
+
 def test_verify_button_usable_rejects_disabled_nodes() -> None:
     usable = verify_module._verify_button_usable
     assert usable(disabled=False, aria_disabled=None) is True
@@ -666,7 +701,11 @@ def test_verify_button_usable_rejects_disabled_nodes() -> None:
 
 @pytest.mark.asyncio
 async def test_wait_for_qr_retries_disabled_click_until_enabled() -> None:
-    page = _FakeQrPage(qr_after_click=True, disabled_attempts=1)
+    page = _FakeQrPage(
+        qr_after_click=True,
+        disabled_attempts=1,
+        button_box={"found": True, "clickable": False},
+    )
     driver = CdpVerifyBrowserDriver(
         auth_file=Path("unused.json"), code_timeout_seconds=3.0
     )

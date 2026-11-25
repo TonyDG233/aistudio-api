@@ -325,6 +325,98 @@ _CLICK_VERIFY_DEVICE_JS = """
 })()
 """.replace("__USABLE__", _VERIFY_BUTTON_USABLE_PREDICATE)
 
+# ReCAPTCHA gates the device hand-off on a *trusted* user activation.  A
+# scripted ``el.click()`` produces ``isTrusted === false``, so the challenge
+# never opens the hand-off and the page ends with "this device … doesn't meet
+# device security requirements".  Read the button centre instead and replay a
+# real mouse sequence through ``Input.dispatchMouseEvent``.
+_VERIFY_BUTTON_POINT_JS = """
+(() => {
+  const nodes = Array.from(
+    document.querySelectorAll('button, a, [role="button"]')
+  );
+  const usable = (el) => __USABLE__;
+  const preferred = nodes.find(
+    (el) => usable(el) && el.hasAttribute('data-test-verify-button')
+  );
+  const byText = nodes.find((el) => {
+    const text = (el.textContent || '').trim().toLowerCase();
+    return usable(el) && text.includes('verify device');
+  });
+  const match = preferred || byText;
+  if (!match) return { found: false, clickable: false };
+  match.scrollIntoView({ block: 'center', inline: 'center' });
+  const rect = match.getBoundingClientRect();
+  if (!rect || rect.width < 2 || rect.height < 2) {
+    return { found: true, clickable: false };
+  }
+  return {
+    found: true,
+    clickable: true,
+    x: Math.round(rect.left + rect.width / 2),
+    y: Math.round(rect.top + rect.height / 2),
+  };
+})()
+""".replace("__USABLE__", _VERIFY_BUTTON_USABLE_PREDICATE)
+
+
+async def _click_verify_device(page: CDPPage) -> bool:
+    """Click ``Verify device`` with a trusted CDP mouse event.
+
+    Falls back to the scripted click only when the button has no measurable
+    box (e.g. a hidden duplicate), so the retry loop still makes progress.
+    """
+    point: object = None
+    with contextlib.suppress(Exception):
+        point = await page.evaluate(_VERIFY_BUTTON_POINT_JS)
+    if isinstance(point, dict) and point.get("clickable"):
+        x = point.get("x")
+        y = point.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            try:
+                await page.cdp.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseMoved",
+                        "x": x,
+                        "y": y,
+                        "button": "none",
+                        "buttons": 0,
+                    },
+                )
+                await page.cdp.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mousePressed",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": 1,
+                    },
+                )
+                await page.cdp.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseReleased",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": 1,
+                    },
+                )
+            except Exception as exc:
+                log.debug("受信点击失败，回退脚本点击: error=%s", type(exc).__name__)
+            else:
+                _log_diagnostic("[Verify] 验证按钮使用受信鼠标点击 x=%s y=%s", x, y)
+                return True
+    with contextlib.suppress(Exception):
+        if await page.evaluate(_CLICK_VERIFY_DEVICE_JS):
+            return True
+    return False
+
+
 _READ_QR_JS = """
 (() => {
   const button = document.getElementById('rc-mobile-verification-button');
@@ -3104,7 +3196,7 @@ class CdpVerifyBrowserDriver:
                 # success is only declared once the bframe actually yields a QR.
                 clicked = False
                 with contextlib.suppress(Exception):
-                    clicked = bool(await page.evaluate(_CLICK_VERIFY_DEVICE_JS))
+                    clicked = await _click_verify_device(page)
                 if clicked:
                     last_click_at = now
             await asyncio.sleep(0.5)
