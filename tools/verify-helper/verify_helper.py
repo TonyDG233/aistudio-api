@@ -118,6 +118,15 @@ def resolve_chrome(explicit: str | None) -> str:
     """按 --chrome、环境变量、系统安装路径的顺序解析浏览器。"""
     candidates = [explicit] if explicit else []
     if not explicit:
+        # Prefer the repo CloakBrowser: it is the only binary this flow has
+        # been verified with end-to-end. Edge can be judged as a broken
+        # browser environment by reCAPTCHA even when headed.
+        for root in (Path.cwd(), Path(__file__).resolve().parents[2]):
+            with contextlib.suppress(OSError):
+                for candidate in sorted(root.glob(".cloakbrowser/*/chrome*")):
+                    if candidate.name in {"chrome", "chrome.exe"} and candidate.is_file():
+                        candidates.append(str(candidate))
+    if not explicit:
         if env_path := os.environ.get("AISTUDIO_VERIFY_CHROME_PATH"):
             candidates.append(env_path)
         if os.name == "nt":
@@ -127,12 +136,12 @@ def resolve_chrome(explicit: str | None) -> str:
                 os.environ.get("LOCALAPPDATA"),
             )
             rels = (
-                r"Microsoft\Edge\Application\msedge.exe",
                 r"Google\Chrome\Application\chrome.exe",
+                r"Microsoft\Edge\Application\msedge.exe",
             )
             candidates += [
                 str(Path(root) / rel) for root in roots if root for rel in rels
-            ] + ["msedge", "chrome"]
+            ] + ["chrome", "msedge"]
         elif sys.platform == "darwin":
             candidates += [
                 f"/Applications/{name}.app/Contents/MacOS/{name}"
@@ -610,7 +619,7 @@ def main() -> int:
     )
     parser.add_argument("bundle", help="服务端导出的凭证 JSON 路径")
     parser.add_argument(
-        "--chrome", metavar="PATH", help="指定 Chrome/Edge 可执行文件路径"
+        "--chrome", metavar="PATH", help="指定浏览器可执行文件（优先使用仓库的 CloakBrowser；Edge 可能被 reCAPTCHA 判为环境异常）"
     )
     parser.add_argument(
         "--no-open", action="store_true", help="只保存 qr.png，不自动打开"
@@ -649,3 +658,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
